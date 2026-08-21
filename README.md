@@ -55,6 +55,17 @@ Enable AI features by setting `ANTHROPIC_API_KEY` (see `.env.example`). Without 
 
 First run: open http://localhost:5173, register with a company name, create a project, upload a drawing set PDF or an IFC model.
 
+### Deploy to production (Railway)
+
+The repo ships a production `Dockerfile` (API + SPA served same-origin from one container, migrations applied automatically at boot) and a `railway.json` that Railway auto-detects. The full operator runbook — Postgres + Bucket provisioning, exact environment variables, hardening checklist, rollback, and common failures — is **[docs/deployment.md](docs/deployment.md)**:
+
+```text
+# the short version: one service from this repo + Railway Postgres + a Railway Bucket
+AUTH_SECRET   = openssl rand -hex 32          (required — production refuses the dev default)
+DATABASE_URL  = ${{Postgres.DATABASE_URL}}    (the PRIVATE url, via Railway reference variable)
+STORAGE_DRIVER= s3                            (+ S3_* variables from the bucket)
+```
+
 ## Verification
 
 ```bash
@@ -67,7 +78,7 @@ CI runs all three on every push (`.github/workflows/ci.yml`).
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) · [Data model](docs/data-model.md) · [Security](docs/security.md)
+- [Architecture](docs/architecture.md) · [Data model](docs/data-model.md) · [Security](docs/security.md) · [Deployment](docs/deployment.md)
 - [Roadmap](docs/roadmap.md) — how the remaining spec volumes phase in
 - [ADRs](docs/adr/) — key decisions and their consequences
 - [Master specification](docs/master-specification.md) — the complete build reference

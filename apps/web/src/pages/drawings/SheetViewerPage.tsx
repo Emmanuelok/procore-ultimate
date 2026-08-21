@@ -387,8 +387,14 @@ export default function SheetViewerPage() {
           if (renderSeqRef.current !== seq) return;
           setRenderScale(eff);
         }
-      } catch {
-        /* render cancelled / transient */
+      } catch (err) {
+        // Cancelled / teardown-time renders are expected; anything else must
+        // stay observable instead of silently leaving a blank canvas.
+        const msg = err instanceof Error ? err.message : String(err);
+        const name = err instanceof Error ? err.name : "";
+        if (name !== "RenderingCancelledException" && !/destroyed/i.test(msg)) {
+          console.error("Sheet render failed:", err);
+        }
       }
     },
     [revision, compareOn, otherRevision, compareDoc],

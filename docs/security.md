@@ -179,8 +179,15 @@ administrator) an actor represents — party-aware separation is future work on 
   `packages/db/src/schema/documents.ts`) and per version in `file_versions` — the anchor for
   later verification and for `evidence.contentHash`.
 - Retrieval does not currently re-hash and compare (verification-on-retrieval is a gap, §8).
-- Local disk, single node, unencrypted at rest. The `StorageService` interface is narrow by
-  design so an S3/GCS/Azure driver (with SSE) can replace it without touching call sites.
+- Two drivers behind the narrow `StorageService` interface, selected by `STORAGE_DRIVER`
+  (`apps/api/src/config.ts`, wired in `app.ts`): `local` (disk, dev default) and `s3`
+  (`apps/api/src/lib/storage-s3.ts` — any S3-compatible store: Railway Buckets, AWS S3, R2,
+  MinIO). The S3 driver keeps the identical content-addressed key scheme
+  (`<companyId>/<sha2>/<sha256>`), records the sha256 as object metadata so the object
+  attests to its own integrity independently of our DB, and inherits the provider's
+  encryption at rest and replication. Production boot refuses `STORAGE_DRIVER=s3` with any
+  S3 variable missing (`config.ts`). The local driver remains single-node and unencrypted
+  at rest — dev use, or volume deployments documented in `docs/deployment.md` §1.1.
 
 ---
 
@@ -231,8 +238,11 @@ engine's job), or that the whole database was not replaced wholesale by its oper
 
 - All configuration is environment-driven through a zod schema (`apps/api/src/config.ts`);
   unknown shapes fail at boot, nothing secret is committed.
-- `AUTH_SECRET` (min 16 chars) **defaults to a dev-only value** — deployments must set it;
-  there is no production guard refusing the default yet (§8).
+- `AUTH_SECRET` (min 16 chars) defaults to a dev-only value for local runs, but
+  **production boot refuses the default**: `loadConfig` (`apps/api/src/config.ts`) throws
+  `Refusing to start: AUTH_SECRET is the development default` when `NODE_ENV=production` —
+  a misconfigured deployment fails loudly at boot instead of running with a guessable
+  signing key.
 - `ANTHROPIC_API_KEY` is optional and only ever read server-side.
 - The global error handler hides 5xx details when `NODE_ENV=production` (`app.ts`).
 - `docker-compose.yml` carries throwaway local Postgres credentials only.
@@ -241,27 +251,41 @@ engine's job), or that the whole database was not replaced wholesale by its oper
 
 ## 8. Known gaps — TODO register
 
+### 8.1 Resolved since the first audit
+
+Formerly open gaps, now implemented — kept here so the register shows movement, not just
+debt. Each row cites the enforcing code.
+
+| Was | Now implemented | Where |
+|---|---|---|
+| No rate limiting anywhere — credential stuffing unimpeded | Global per-IP limit (`RATE_LIMIT_MAX_PER_MINUTE`, default 300/min) via `@fastify/rate-limit`, plus a stricter per-IP limit on the credential endpoints (`AUTH_RATE_LIMIT_MAX_PER_MINUTE`, default 10/min) | `apps/api/src/app.ts` (registration), `apps/api/src/modules/identity/index.ts` (`authLimited` route config), `apps/api/src/config.ts` |
+| No security headers | Helmet with an explicit CSP tuned for the same-origin SPA (`default-src 'self'`; `wasm-unsafe-eval` for web-ifc, `blob:` workers/fetches for pdf.js; `object-src 'none'`, `frame-ancestors 'self'`) + helmet's defaults incl. HSTS | `apps/api/src/app.ts` |
+| Client IPs unusable behind a platform proxy (rate limits keyed on the proxy, `auth_events.ip` wrong) | `TRUST_PROXY` config honors `x-forwarded-*`; enabled in the production image | `apps/api/src/config.ts`, `apps/api/src/app.ts` (`trustProxy`), `Dockerfile` (`TRUST_PROXY=true`) |
+| Dev-default `AUTH_SECRET` accepted even in production | Boot-time refusal: production with the dev default throws before the server starts | `apps/api/src/config.ts` (`loadConfig`) |
+| Storage: single node, no path off local disk | S3-compatible content-addressed driver (Railway Buckets / AWS S3 / R2 / MinIO), same `<companyId>/<sha2>/<sha256>` keys, sha256 recorded as object metadata, provider-side encryption at rest; production boot refuses `s3` with missing S3 config | `apps/api/src/lib/storage-s3.ts`, `apps/api/src/app.ts` (driver selection), `apps/api/src/config.ts` |
+
+### 8.2 Open gaps
+
 Ordered roughly by risk. "Spec" references are `docs/master-specification.md`.
 
 | # | Gap | Notes / spec ref |
 |---|---|---|
-| 1 | **No rate limiting or lockout** on `/auth/login` or anywhere else — online credential stuffing is unimpeded | add `@fastify/rate-limit` + progressive lockout; auth_events already records failures |
-| 2 | **No MFA** | Vol I #22 |
-| 3 | **No external ledger anchoring/escrow** — tail-truncation and full-rewrite by a DB insider are undetectable | Domain S #860–861, #874; Merkle pack roots exist, publishing them does not |
-| 4 | **No trusted timestamping** — ledger `at` is app-server clock | Domain S #864 |
-| 5 | **No SSO (SAML) / SCIM** — blocks enterprise tenants | Vol I #20–21 |
-| 6 | Access-token revocation only via 1h expiry (no jti denylist); refresh-token **reuse detection** absent | §1.2–1.3 |
-| 7 | **No DB-level row security** — tenant isolation is a code convention; one missed `companyId` filter is a cross-tenant leak | add Postgres RLS keyed on a per-request setting as defense-in-depth |
-| 8 | CORS `origin: true` and open registration — fine for dev, must be tightened per deployment | `app.ts` |
-| 9 | Dev-default `AUTH_SECRET` accepted even in production | add a boot-time refusal |
-| 10 | Storage: single node, unencrypted at rest, no hash re-verification on read, no malware scanning of uploads | §4; Domain S #862 (retrieval half) |
-| 11 | Ledger coverage relies on module convention (no DB trigger writes entries for out-of-band changes); no automated drift job comparing row state to last `payloadHash` | §5 |
-| 12 | Overlapping operational + assurance roles for the same user are not forbidden | §2.4 |
-| 13 | Register route reveals email existence (409); no email verification flow | §1.1 |
-| 14 | No IP allowlisting, session timeout policy, or password policy configuration | Vol I #23–25 |
-| 15 | Read access is mostly unlogged (exceptions: `file_access_log`, ledger `access` entries); regulator access is read-all rather than record-scoped | Domain A #92 wants scoped regulator portals |
-| 16 | No field-level visibility control on financial data (tools are all-or-nothing per level) | Vol I #18 |
-| 17 | Refresh tokens and JWTs are bearer credentials over whatever TLS the deployment provides — the app itself does not enforce HTTPS/HSTS | reverse-proxy responsibility, must be documented per deployment |
+| 1 | **No MFA** | Vol I #22 |
+| 2 | **No external ledger anchoring/escrow** — tail-truncation and full-rewrite by a DB insider are undetectable | Domain S #860–861, #874; Merkle pack roots exist, publishing them does not |
+| 3 | **No trusted timestamping** — ledger `at` is app-server clock | Domain S #864 |
+| 4 | **No SSO (SAML) / SCIM** — blocks enterprise tenants | Vol I #20–21 |
+| 5 | Access-token revocation only via 1h expiry (no jti denylist); refresh-token **reuse detection** absent; no progressive lockout on top of the auth rate limit | §1.2–1.3 |
+| 6 | **No DB-level row security** — tenant isolation is a code convention; one missed `companyId` filter is a cross-tenant leak | add Postgres RLS keyed on a per-request setting as defense-in-depth |
+| 7 | CORS `origin: true` and open registration — fine for dev, must be tightened per deployment | `app.ts`; noted in `docs/deployment.md` §2.8 |
+| 8 | Storage: no hash re-verification on read, no malware scanning of uploads; local driver (dev/volume mode) unencrypted at rest | §4; Domain S #862 (retrieval half) |
+| 9 | Ledger coverage relies on module convention (no DB trigger writes entries for out-of-band changes); no automated drift job comparing row state to last `payloadHash` | §5 |
+| 10 | Overlapping operational + assurance roles for the same user are not forbidden | §2.4 |
+| 11 | Register route reveals email existence (409); no email verification flow | §1.1 |
+| 12 | **No IP allowlisting**, session timeout policy, or password policy configuration | Vol I #23–25 |
+| 13 | **No log forwarding pipeline** — app logs are stdout JSON only; platform retention is finite (~30 days on Railway Pro) and `auth_events`/ledger cover mutations, not infrastructure events | operational option (Vector sidecar) documented in `docs/deployment.md` §3.3 |
+| 14 | Read access is mostly unlogged (exceptions: `file_access_log`, ledger `access` entries); regulator access is read-all rather than record-scoped | Domain A #92 wants scoped regulator portals |
+| 15 | No field-level visibility control on financial data (tools are all-or-nothing per level) | Vol I #18 |
+| 16 | Refresh tokens and JWTs are bearer credentials — TLS termination is the platform's job (the app sends HSTS via helmet but cannot terminate TLS itself) | per-deployment TLS documented in `docs/deployment.md` §2.6 |
 
 None of these are silent: this register, `docs/roadmap.md` and the ADRs are the paper trail
 that they are known, scoped and sequenced.

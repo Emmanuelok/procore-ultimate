@@ -4,9 +4,12 @@
  * and a hook that manages document lifecycle per fileId.
  */
 import { useEffect, useRef, useState } from "react";
-import * as pdfjs from "pdfjs-dist";
+// Legacy build: the modern build relies on bleeding-edge JS APIs (e.g.
+// Map.prototype.getOrInsertComputed) that are missing in current browsers,
+// which makes canvas rendering fail silently. The legacy build polyfills them.
+import * as pdfjs from "pdfjs-dist/legacy/build/pdf.mjs";
 import type { PDFDocumentProxy } from "pdfjs-dist";
-import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import workerUrl from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
 import { fetchBlobUrl } from "../../lib/api";
 import type { PageSize } from "./types";
 

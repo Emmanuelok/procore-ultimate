@@ -48,6 +48,7 @@ pnpm workspace, Node ≥ 22, TypeScript 5.9 strict ESM throughout (`package.json
 | `apps/web` | `@constructos/web` | Vite 8 + React 19 + Tailwind v4 SPA. Route table `src/App.tsx`, API client `src/lib/api.ts`, auth context `src/lib/auth.tsx`, shared UI kit `src/ui/`, feature pages `src/pages/*/`. Client-side PDF rendering via `pdfjs-dist`, IFC via `web-ifc` + `three`. |
 | `docs/` | — | This documentation set plus the master specification. |
 | `docker-compose.yml` | — | Postgres 16 for production-like runs. |
+| `Dockerfile` / `railway.json` | — | Production image (API + SPA + migrations in one container; see §3 "Production packaging") and Railway build/healthcheck descriptor. Runbook: `docs/deployment.md`. |
 | `.github/workflows/ci.yml` | — | CI: pnpm install → `pnpm typecheck` → `pnpm build` → `pnpm test` on Node 22. |
 
 Dependency direction is strictly downward: `apps/*` → `packages/db` / `packages/ledger` /
@@ -93,12 +94,28 @@ flowchart LR
   `DATABASE_URL` set, `postgres-js` against real Postgres (see `docker-compose.yml`); unset,
   embedded PGlite — persisted to `PGLITE_DIR` in dev, purely in-memory under `NODE_ENV=test`.
   Migrations from `packages/db/drizzle` are applied automatically at startup in both modes.
-- **Storage**: local-disk, content-addressed (`apps/api/src/lib/storage.ts`). Objects live at
-  `<STORAGE_DIR>/<companyId>/<sha256[0:2]>/<sha256>`, so identical payloads dedupe and the
-  address attests to content (spec Domain S #862). The `StorageService` interface is narrow
-  by design so an S3/GCS driver can replace it without touching call sites.
-- **Web**: the Vite dev server proxies `/api` to the API (`apps/web/vite.config.ts`); in
-  production the SPA is a static build served alongside the API behind any reverse proxy.
+- **Storage — driver selection**: two content-addressed drivers behind the narrow
+  `StorageService` interface, chosen by `STORAGE_DRIVER` at composition time
+  (`apps/api/src/app.ts` decorates `app.storage` with one or the other):
+  `local` (`apps/api/src/lib/storage.ts`, dev default) writes
+  `<STORAGE_DIR>/<companyId>/<sha256[0:2]>/<sha256>`; `s3`
+  (`apps/api/src/lib/storage-s3.ts`, production) writes the identical key scheme to any
+  S3-compatible store (Railway Buckets, AWS S3, R2, MinIO) via `S3_*` config, recording the
+  sha256 as object metadata. Because the key scheme is shared, a stored `storageKey` never
+  changes when switching drivers, identical payloads dedupe in both, and the address
+  attests to content either way (spec Domain S #862).
+- **Web**: the Vite dev server proxies `/api` to the API (`apps/web/vite.config.ts`). In
+  production there is no proxy at all — **the API serves the built SPA same-origin**
+  (`apps/api/src/app.ts`): when `WEB_DIST_DIR` points at a build, `@fastify/static` serves
+  it with hashed `/assets/*` marked `immutable` and `index.html` `no-cache`, and a
+  not-found handler falls back to `index.html` for any non-`/api/` GET (client-side
+  routing). The SPA's absolute `/api/v1/...` calls therefore need no CORS and no rewrite,
+  and helmet's CSP (same file) covers app and API from one origin.
+- **Production packaging**: the repo-root `Dockerfile` builds one image containing the
+  pruned API bundle, the committed migrations (`/app/migrations`, applied automatically at
+  boot by `lib/db.ts`) and the built SPA (`/app/public`), running as non-root `USER node`
+  with `TRUST_PROXY=true`. `railway.json` declares the Dockerfile build and the
+  `/api/v1/health` healthcheck; the full operator runbook is `docs/deployment.md`.
 - **AI**: optional outbound dependency on the Anthropic API, gated on `ANTHROPIC_API_KEY`
   (`apps/api/src/modules/ai/service.ts`); see §12.
 - **Health**: `GET /api/v1/health` reports which database backend is live (`app.ts`).
