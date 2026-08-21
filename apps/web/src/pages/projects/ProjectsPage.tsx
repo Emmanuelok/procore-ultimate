@@ -122,7 +122,7 @@ export default function ProjectsPage() {
       if (form.country.trim()) payload["country"] = form.country.trim();
       if (form.startDate) payload["startDate"] = form.startDate;
       if (form.finishDate) payload["finishDate"] = form.finishDate;
-      if (form.value.trim()) payload["value"] = form.value.trim();
+      if (form.value.trim()) payload["value"] = Number(form.value.trim());
       if (form.currency.trim()) payload["currency"] = form.currency.trim().toUpperCase();
       if (form.description.trim()) payload["description"] = form.description.trim();
       await api.post("/api/v1/projects", payload);

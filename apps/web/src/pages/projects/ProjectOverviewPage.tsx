@@ -139,19 +139,21 @@ export default function ProjectOverviewPage() {
     setEditError(null);
     setBusy(true);
     try {
+      // The PATCH schema accepts string/number fields as optional (not nullable),
+      // so omit blank fields instead of sending null.
       const payload: Record<string, unknown> = {
         name: form.name.trim(),
-        number: form.number.trim() || null,
         stage: form.stage,
-        address: form.address.trim() || null,
-        city: form.city.trim() || null,
-        country: form.country.trim() || null,
-        startDate: form.startDate || null,
-        finishDate: form.finishDate || null,
-        value: form.value.trim() || null,
-        currency: form.currency.trim().toUpperCase() || null,
-        description: form.description.trim() || null,
       };
+      if (form.number.trim()) payload["number"] = form.number.trim();
+      if (form.address.trim()) payload["address"] = form.address.trim();
+      if (form.city.trim()) payload["city"] = form.city.trim();
+      if (form.country.trim()) payload["country"] = form.country.trim();
+      if (form.startDate) payload["startDate"] = form.startDate;
+      if (form.finishDate) payload["finishDate"] = form.finishDate;
+      if (form.value.trim()) payload["value"] = Number(form.value.trim());
+      if (form.currency.trim()) payload["currency"] = form.currency.trim().toUpperCase();
+      if (form.description.trim()) payload["description"] = form.description.trim();
       await api.patch(`/api/v1/projects/${projectId}`, payload);
       setEditOpen(false);
       await load();

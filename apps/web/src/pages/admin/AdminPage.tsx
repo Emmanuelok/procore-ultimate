@@ -71,6 +71,7 @@ function SectionCard({
 /* --------------------------- Permission templates --------------------------- */
 
 interface Template {
+  id: string;
   key: string;
   name: string;
   description?: string | null;
@@ -150,7 +151,7 @@ function TemplatesSection() {
         tools: form.tools,
       };
       if (editing) {
-        await api.patch(`/api/v1/permission-templates/${editing.key}`, {
+        await api.patch(`/api/v1/permission-templates/${editing.id}`, {
           name: payload.name,
           description: payload.description,
           tools: payload.tools,
@@ -170,7 +171,7 @@ function TemplatesSection() {
   async function onDelete(t: Template) {
     if (!window.confirm(`Delete template "${t.name}"?`)) return;
     try {
-      await api.del(`/api/v1/permission-templates/${t.key}`);
+      await api.del(`/api/v1/permission-templates/${t.id}`);
       await load();
     } catch (err) {
       setError(errMsg(err, "Failed to delete template"));
@@ -312,14 +313,16 @@ interface ProjectOption {
 }
 
 interface Membership {
+  id: string;
   userId: string;
-  name?: string | null;
-  email?: string | null;
+  userName?: string | null;
+  userEmail?: string | null;
   templateKey?: string | null;
 }
 
 interface CompanyUser {
-  userId: string;
+  /** users.id — the API's /company/users rows key users by `id` */
+  id: string;
   name?: string | null;
   email?: string | null;
   role?: string | null;
@@ -365,7 +368,7 @@ function MembershipsSection({
   }, [projectId, load]);
 
   const userLabel = (id: string, fallbackName?: string | null, fallbackEmail?: string | null) => {
-    const u = users.find((x) => x.userId === id);
+    const u = users.find((x) => x.id === id);
     return fallbackName ?? u?.name ?? fallbackEmail ?? u?.email ?? id;
   };
 
@@ -430,9 +433,9 @@ function MembershipsSection({
           </thead>
           <tbody className="divide-y divide-ink-100">
             {items.map((m) => (
-              <tr key={m.userId} className="hover:bg-ink-50/60">
-                <Td className="font-medium">{userLabel(m.userId, m.name, m.email)}</Td>
-                <Td>{m.email ?? users.find((u) => u.userId === m.userId)?.email ?? "—"}</Td>
+              <tr key={m.id} className="hover:bg-ink-50/60">
+                <Td className="font-medium">{userLabel(m.userId, m.userName, m.userEmail)}</Td>
+                <Td>{m.userEmail ?? users.find((u) => u.id === m.userId)?.email ?? "—"}</Td>
                 <Td>
                   <Badge tone="blue">
                     {templates.find((t) => t.key === m.templateKey)?.name ??
@@ -456,8 +459,8 @@ function MembershipsSection({
             >
               <option value="">Select user…</option>
               {users.map((u) => (
-                <option key={u.userId} value={u.userId}>
-                  {u.name ?? u.email ?? u.userId}
+                <option key={u.id} value={u.id}>
+                  {u.name ?? u.email ?? u.id}
                 </option>
               ))}
             </Select>
@@ -495,8 +498,8 @@ function MembershipsSection({
 interface AssuranceGrant {
   id: string;
   userId: string;
-  name?: string | null;
-  email?: string | null;
+  userName?: string | null;
+  userEmail?: string | null;
   role: string;
   projectId?: string | null;
   expiresAt?: string | null;
@@ -594,9 +597,9 @@ function GrantsSection({
             {items.map((g) => (
               <tr key={g.id} className="hover:bg-ink-50/60">
                 <Td className="font-medium">
-                  {g.name ??
-                    g.email ??
-                    users.find((u) => u.userId === g.userId)?.name ??
+                  {g.userName ??
+                    g.userEmail ??
+                    users.find((u) => u.id === g.userId)?.name ??
                     g.userId}
                 </Td>
                 <Td>
@@ -630,8 +633,8 @@ function GrantsSection({
             >
               <option value="">Select user…</option>
               {users.map((u) => (
-                <option key={u.userId} value={u.userId}>
-                  {u.name ?? u.email ?? u.userId}
+                <option key={u.id} value={u.id}>
+                  {u.name ?? u.email ?? u.id}
                 </option>
               ))}
             </Select>
@@ -688,11 +691,11 @@ interface AuthEvent {
   id: string;
   userId?: string | null;
   email?: string | null;
-  event?: string | null;
   kind?: string | null;
   ip?: string | null;
-  ipAddress?: string | null;
-  createdAt?: string | null;
+  userName?: string | null;
+  /** event timestamp — the API column is `at` */
+  at?: string | null;
 }
 
 function AuthEventsSection({ users }: { users: CompanyUser[] }) {
@@ -729,17 +732,17 @@ function AuthEventsSection({ users }: { users: CompanyUser[] }) {
           <tbody className="divide-y divide-ink-100">
             {items.map((e) => (
               <tr key={e.id} className="hover:bg-ink-50/60">
-                <Td className="whitespace-nowrap text-xs">{formatDateTime(e.createdAt)}</Td>
+                <Td className="whitespace-nowrap text-xs">{formatDateTime(e.at)}</Td>
                 <Td className="text-xs">
                   {e.email ??
-                    users.find((u) => u.userId === e.userId)?.email ??
+                    users.find((u) => u.id === e.userId)?.email ??
                     e.userId ??
                     "—"}
                 </Td>
                 <Td>
-                  <Badge tone="gray">{humanize(e.event ?? e.kind ?? "event")}</Badge>
+                  <Badge tone="gray">{humanize(e.kind ?? "event")}</Badge>
                 </Td>
-                <Td className="font-mono text-xs">{e.ip ?? e.ipAddress ?? "—"}</Td>
+                <Td className="font-mono text-xs">{e.ip ?? "—"}</Td>
               </tr>
             ))}
           </tbody>

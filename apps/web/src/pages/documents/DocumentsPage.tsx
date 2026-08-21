@@ -33,6 +33,25 @@ interface Folder {
   path?: string | null;
 }
 
+/** API folder node — GET /projects/:id/folders returns a tree of these as items. */
+interface FolderApiNode extends Folder {
+  children?: FolderApiNode[];
+}
+
+/** The API returns items as tree ROOTS (children nested); flatten for local use. */
+function flattenFolders(nodes: FolderApiNode[]): Folder[] {
+  const out: Folder[] = [];
+  const walk = (list: FolderApiNode[]) => {
+    for (const n of list) {
+      const { children, ...folder } = n;
+      out.push(folder);
+      if (children && children.length > 0) walk(children);
+    }
+  };
+  walk(nodes);
+  return out;
+}
+
 interface FileItem {
   id: string;
   name: string;
@@ -177,22 +196,23 @@ export default function DocumentsPage() {
   const loadFolders = useCallback(async () => {
     if (!projectId) return;
     try {
-      const res = await api.get<ListResponse<Folder>>(
-        `/api/v1/projects/${projectId}/folders?page=1&pageSize=500`,
+      const res = await api.get<ListResponse<FolderApiNode>>(
+        `/api/v1/projects/${projectId}/folders`,
       );
-      setFolders(res.items);
+      const flat = flattenFolders(res.items);
+      setFolders(flat);
       setSelectedFolderId((current) => {
-        if (current && res.items.some((f) => f.id === current)) return current;
-        const roots = res.items.filter(
-          (f) => !f.parentId || !res.items.some((x) => x.id === f.parentId),
+        if (current && flat.some((f) => f.id === current)) return current;
+        const roots = flat.filter(
+          (f) => !f.parentId || !flat.some((x) => x.id === f.parentId),
         );
         return roots[0]?.id ?? null;
       });
       setExpanded((prev) => {
         if (prev.size > 0) return prev;
         return new Set(
-          res.items
-            .filter((f) => !f.parentId || !res.items.some((x) => x.id === f.parentId))
+          flat
+            .filter((f) => !f.parentId || !flat.some((x) => x.id === f.parentId))
             .map((f) => f.id),
         );
       });

@@ -115,17 +115,18 @@ function VendorsTab() {
     setFormError(null);
     setBusy(true);
     try {
-      const payload = {
+      // vendor schema fields are optional strings (not nullable) — omit blanks
+      const payload: Record<string, unknown> = {
         name: form.name.trim(),
         tradeCodes: form.tradeCodes
           .split(",")
           .map((s) => s.trim())
           .filter(Boolean),
-        email: form.email.trim() || null,
-        phone: form.phone.trim() || null,
-        city: form.city.trim() || null,
-        country: form.country.trim() || null,
       };
+      if (form.email.trim()) payload["email"] = form.email.trim();
+      if (form.phone.trim()) payload["phone"] = form.phone.trim();
+      if (form.city.trim()) payload["city"] = form.city.trim();
+      if (form.country.trim()) payload["country"] = form.country.trim();
       if (editing) await api.patch(`/api/v1/vendors/${editing.id}`, payload);
       else await api.post("/api/v1/vendors", payload);
       setModalOpen(false);
@@ -338,15 +339,19 @@ function ContactsTab() {
     setFormError(null);
     setBusy(true);
     try {
-      const payload = {
-        name: form.name.trim(),
-        email: form.email.trim() || null,
-        phone: form.phone.trim() || null,
-        title: form.title.trim() || null,
-        vendorId: form.vendorId || null,
-      };
-      if (editing) await api.patch(`/api/v1/contacts/${editing.id}`, payload);
-      else await api.post("/api/v1/contacts", payload);
+      // contact schema fields are optional strings (not nullable) — omit blanks.
+      // Only vendorId accepts null, and only on PATCH (to clear the vendor).
+      const payload: Record<string, unknown> = { name: form.name.trim() };
+      if (form.email.trim()) payload["email"] = form.email.trim();
+      if (form.phone.trim()) payload["phone"] = form.phone.trim();
+      if (form.title.trim()) payload["title"] = form.title.trim();
+      if (editing) {
+        payload["vendorId"] = form.vendorId || null;
+        await api.patch(`/api/v1/contacts/${editing.id}`, payload);
+      } else {
+        if (form.vendorId) payload["vendorId"] = form.vendorId;
+        await api.post("/api/v1/contacts", payload);
+      }
       setModalOpen(false);
       await load();
     } catch (err) {
@@ -469,7 +474,8 @@ function ContactsTab() {
 /* ---------------------------------- Users ---------------------------------- */
 
 interface CompanyUser {
-  userId: string;
+  /** users.id — the API's /company/users rows key users by `id` */
+  id: string;
   name?: string | null;
   email?: string | null;
   role?: string | null;
@@ -572,7 +578,7 @@ function UsersTab() {
           </thead>
           <tbody className="divide-y divide-ink-100">
             {items.map((u) => (
-              <tr key={u.userId} className="hover:bg-ink-50/60">
+              <tr key={u.id} className="hover:bg-ink-50/60">
                 <Td className="font-medium">{u.name ?? "—"}</Td>
                 <Td>{u.email ?? "—"}</Td>
                 <Td>
@@ -669,6 +675,18 @@ interface GroupMember {
   email?: string | null;
 }
 
+/** Raw member row from GET /distribution-groups/:groupId */
+interface GroupMemberRow {
+  id: string;
+  userId?: string | null;
+  contactId?: string | null;
+  email?: string | null;
+  userName?: string | null;
+  userEmail?: string | null;
+  contactName?: string | null;
+  contactEmail?: string | null;
+}
+
 function GroupsTab() {
   const [items, setItems] = useState<Group[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -707,10 +725,18 @@ function GroupsTab() {
     setMembers(null);
     setMemberError(null);
     try {
-      const res = await api.get<ListResponse<GroupMember>>(
-        `/api/v1/distribution-groups/${groupId}/members`,
+      // group detail returns { ...group, members: [...] }
+      const res = await api.get<{ members: GroupMemberRow[] }>(
+        `/api/v1/distribution-groups/${groupId}`,
       );
-      setMembers(res.items);
+      setMembers(
+        (res.members ?? []).map((m) => ({
+          id: m.id,
+          userId: m.userId ?? null,
+          name: m.userName ?? m.contactName ?? null,
+          email: m.email ?? m.userEmail ?? m.contactEmail ?? null,
+        })),
+      );
     } catch (err) {
       setMembers([]);
       setMemberError(errMsg(err, "Failed to load members"));
@@ -759,7 +785,7 @@ function GroupsTab() {
     if (!expanded) return;
     setMemberError(null);
     try {
-      await api.del(`/api/v1/distribution-groups/${expanded}/members/${m.userId ?? m.id}`);
+      await api.del(`/api/v1/distribution-groups/${expanded}/members/${m.id}`);
       await loadMembers(expanded);
     } catch (err) {
       setMemberError(errMsg(err, "Failed to remove member"));
@@ -838,10 +864,10 @@ function GroupsTab() {
                           >
                             <option value="">Add a member…</option>
                             {users
-                              .filter((u) => !members.some((m) => m.userId === u.userId))
+                              .filter((u) => !members.some((m) => m.userId === u.id))
                               .map((u) => (
-                                <option key={u.userId} value={u.userId}>
-                                  {u.name ?? u.email ?? u.userId}
+                                <option key={u.id} value={u.id}>
+                                  {u.name ?? u.email ?? u.id}
                                 </option>
                               ))}
                           </Select>

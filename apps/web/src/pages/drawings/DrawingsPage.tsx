@@ -460,7 +460,11 @@ export default function DrawingsPage() {
                             <Button
                               size="sm"
                               onClick={() => void confirmReview(sheet)}
-                              disabled={savingReview === sheet.id || !draft.number.trim()}
+                              disabled={
+                                savingReview === sheet.id ||
+                                !draft.number.trim() ||
+                                !draft.title.trim()
+                              }
                             >
                               {savingReview === sheet.id ? "Saving…" : "Confirm"}
                             </Button>

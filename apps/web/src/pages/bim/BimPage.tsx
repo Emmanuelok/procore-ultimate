@@ -495,7 +495,11 @@ export default function BimPage() {
                   </thead>
                   <tbody className="divide-y divide-ink-100">
                     {issues.map((issue) => {
-                      const next = ISSUE_NEXT_STATUSES[issue.status] ?? [];
+                      // the API rejects open → assigned without an assignee; this
+                      // page has no assignee picker, so hide the dead-end option
+                      const next = (ISSUE_NEXT_STATUSES[issue.status] ?? []).filter(
+                        (s) => s !== "assigned" || issue.assigneeId !== null,
+                      );
                       return (
                         <tr key={issue.id}>
                           <Td className="tabular-nums text-ink-400">{issue.number}</Td>
