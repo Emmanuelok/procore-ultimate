@@ -49,6 +49,25 @@ Use S3. The local driver exists for development and as an escape hatch.
 
 ## 2. Runbook
 
+> **Fast path — one command.** Everything in §2.1–§2.6 is scripted:
+>
+> ```bash
+> npm i -g @railway/cli && railway login
+> ./scripts/railway-provision.sh          # project + Postgres (PITR, backup
+>                                         # schedules) + bucket + app service
+>                                         # with all variables + deploy + domain
+> ./scripts/post-deploy-smoke.sh https://<your-domain>
+> ```
+>
+> The provisioning script is safe to re-run after a partial failure, prints
+> what it skipped, and never destroys anything. Options (`ENABLE_HA=1`,
+> `BUCKET_REGION=ams|sjc|iad|sin`, `ANTHROPIC_API_KEY=...`) are documented in
+> its header. The smoke script verifies the live deployment end-to-end —
+> including that the app is really on Postgres (not the embedded fallback)
+> and that a file survives an upload/download round-trip through the bucket
+> byte-for-byte. The manual steps below remain the reference for what the
+> script does and for anyone provisioning through the dashboard.
+
 ### 2.1 Create the project
 
 1. Railway dashboard → **New Project** (start empty; we add components explicitly).
