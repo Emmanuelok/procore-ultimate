@@ -15,6 +15,13 @@
       "when": 1787309811078,
       "tag": "0001_wakeful_scorpion",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1787323576505,
+      "tag": "0002_petite_human_torch",
+      "breakpoints": true
     }
   ]
 }

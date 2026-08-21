@@ -20,6 +20,8 @@ const tabs = [
   { to: "punch", label: "Punch" },
   { to: "photos", label: "Photos" },
   { to: "documents", label: "Documents" },
+  { to: "commercial", label: "Commercial" },
+  { to: "contracts", label: "Contracts" },
   { to: "assurance", label: "Assurance" },
   { to: "ai", label: "AI" },
 ];

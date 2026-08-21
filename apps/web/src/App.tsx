@@ -27,6 +27,9 @@ const DailyLogsPage = lazy(() => import("./pages/dailylogs/DailyLogsPage"));
 const PunchPage = lazy(() => import("./pages/punch/PunchPage"));
 const PhotosPage = lazy(() => import("./pages/photos/PhotosPage"));
 const AssurancePage = lazy(() => import("./pages/assurance/AssurancePage"));
+const CommercialPage = lazy(() => import("./pages/commercial/CommercialPage"));
+const ContractsPage = lazy(() => import("./pages/contracts/ContractsPage"));
+const ContractDetailPage = lazy(() => import("./pages/contracts/ContractDetailPage"));
 const CompanyAssurancePage = lazy(() => import("./pages/assurance/CompanyAssurancePage"));
 const AiPage = lazy(() => import("./pages/ai/AiPage"));
 
@@ -221,6 +224,30 @@ export default function App() {
                 element={
                   <S>
                     <PhotosPage />
+                  </S>
+                }
+              />
+              <Route
+                path="commercial"
+                element={
+                  <S>
+                    <CommercialPage />
+                  </S>
+                }
+              />
+              <Route
+                path="contracts"
+                element={
+                  <S>
+                    <ContractsPage />
+                  </S>
+                }
+              />
+              <Route
+                path="contracts/:contractId"
+                element={
+                  <S>
+                    <ContractDetailPage />
                   </S>
                 }
               />

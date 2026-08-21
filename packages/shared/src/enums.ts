@@ -257,6 +257,122 @@ export const AI_REVIEW_STATUSES = ["pending", "approved", "rejected", "supersede
 export type AiReviewStatus = (typeof AI_REVIEW_STATUSES)[number];
 
 /* ------------------------------------------------------------------ */
+/* Commercial — measurement & valuation (spec Vol II Domain B / M7)    */
+/* ------------------------------------------------------------------ */
+
+export const BOQ_METHODS = ["nrm2", "smm7", "cesmm4", "pomi", "custom"] as const;
+export type BoqMethod = (typeof BOQ_METHODS)[number];
+
+export const BOQ_LEVELS = ["bill", "section", "item"] as const;
+export type BoqLevel = (typeof BOQ_LEVELS)[number];
+
+export const BOQ_ITEM_TYPES = [
+  "measured",
+  "provisional_defined",
+  "provisional_undefined",
+  "prime_cost",
+  "prelims_fixed",
+  "prelims_time",
+  "daywork",
+  "contingency",
+  "spot",
+] as const;
+export type BoqItemType = (typeof BOQ_ITEM_TYPES)[number];
+
+export const BOQ_STATUSES = ["draft", "issued", "agreed"] as const;
+export type BoqStatus = (typeof BOQ_STATUSES)[number];
+
+export const VALUATION_BASES = ["remeasure", "percent", "milestone"] as const;
+export type ValuationBasis = (typeof VALUATION_BASES)[number];
+
+export const VALUATION_STATUSES = ["draft", "submitted", "certified", "paid"] as const;
+export type ValuationStatus = (typeof VALUATION_STATUSES)[number];
+
+export const CERTIFICATE_STATUSES = ["issued", "paid", "withdrawn"] as const;
+export type CertificateStatus = (typeof CERTIFICATE_STATUSES)[number];
+
+export const VARIATION_STATUSES = [
+  "proposed",
+  "instructed",
+  "valued",
+  "agreed",
+  "rejected",
+  "withdrawn",
+] as const;
+export type VariationStatus = (typeof VARIATION_STATUSES)[number];
+
+/** Variation valuation bases (spec Domain B #168-171). */
+export const VARIATION_BASES = ["bq_rates", "pro_rata", "star_rate", "daywork"] as const;
+export type VariationBasis = (typeof VARIATION_BASES)[number];
+
+/* ------------------------------------------------------------------ */
+/* Contract intelligence (spec Vol II Domain C / M8)                   */
+/* ------------------------------------------------------------------ */
+
+export const CONTRACT_FORMS = [
+  "fidic_red_1999",
+  "fidic_red_2017",
+  "fidic_yellow_2017",
+  "fidic_silver_2017",
+  "nec3_ecc",
+  "nec4_ecc",
+  "jct_sbc_2016",
+  "jct_db_2016",
+  "bespoke",
+] as const;
+export type ContractForm = (typeof CONTRACT_FORMS)[number];
+
+export const NEC_OPTIONS = ["A", "B", "C", "D", "E", "F"] as const;
+export type NecOption = (typeof NEC_OPTIONS)[number];
+
+export const CONTRACT_STATUSES = ["draft", "executed", "completed", "terminated"] as const;
+export type ContractStatus = (typeof CONTRACT_STATUSES)[number];
+
+export const CONTRACT_EVENT_KINDS = [
+  "early_warning",
+  "claim_notice",
+  "compensation_event",
+  "variation_instruction",
+  "eot_claim",
+  "payment_notice",
+  "pay_less_notice",
+  "delay_event",
+  "other",
+] as const;
+export type ContractEventKind = (typeof CONTRACT_EVENT_KINDS)[number];
+
+export const CONTRACT_EVENT_STATUSES = [
+  "open",
+  "notice_served",
+  "time_barred",
+  "resolved",
+  "withdrawn",
+] as const;
+export type ContractEventStatus = (typeof CONTRACT_EVENT_STATUSES)[number];
+
+export const EOT_STATUSES = [
+  "notified",
+  "submitted",
+  "assessed",
+  "agreed",
+  "rejected",
+  "referred",
+] as const;
+export type EotStatus = (typeof EOT_STATUSES)[number];
+
+export const CLAUSE_CATEGORIES = [
+  "notice",
+  "payment",
+  "time",
+  "variation",
+  "risk",
+  "termination",
+  "dispute",
+  "general",
+] as const;
+export type ClauseCategory = (typeof CLAUSE_CATEGORIES)[number];
+
+/* ------------------------------------------------------------------ */
 /* Notifications                                                       */
 /* ------------------------------------------------------------------ */
 

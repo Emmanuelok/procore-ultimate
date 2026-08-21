@@ -40,6 +40,8 @@ export const TOOLS = [
   "commitments",
   "change_management",
   "invoicing",
+  "commercial",
+  "contracts",
   "assurance",
   "ai",
   "admin",

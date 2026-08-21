@@ -23,6 +23,8 @@ import { fieldModule } from "./modules/field/index.js";
 import { notificationsModule } from "./modules/notifications/index.js";
 import { assuranceModule } from "./modules/assurance/index.js";
 import { aiModule } from "./modules/ai/index.js";
+import { commercialModule } from "./modules/commercial/index.js";
+import { contractsModule } from "./modules/contracts/index.js";
 
 export interface BuildAppOptions {
   config?: Config;
@@ -106,6 +108,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
   await app.register(notificationsModule, { prefix });
   await app.register(assuranceModule, { prefix });
   await app.register(aiModule, { prefix });
+  await app.register(commercialModule, { prefix });
+  await app.register(contractsModule, { prefix });
 
   return {
     app,

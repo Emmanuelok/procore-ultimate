@@ -148,9 +148,15 @@ const authPlugin: FastifyPluginAsync = async (app) => {
             ),
           )
           .limit(1);
-        const template =
-          (templateRow[0]?.tools as ToolPermissionMap | undefined) ??
-          BUILTIN_PERMISSION_TEMPLATES.find((t) => t.key === membership[0]!.templateKey)?.tools;
+        // Merge the builtin template underneath the stored one so tenants
+        // seeded before a tool existed still inherit its builtin level.
+        const builtin = BUILTIN_PERMISSION_TEMPLATES.find(
+          (t) => t.key === membership[0]!.templateKey,
+        )?.tools;
+        const stored = templateRow[0]?.tools as ToolPermissionMap | undefined;
+        const template: ToolPermissionMap | undefined = stored
+          ? { ...(builtin ?? {}), ...stored }
+          : builtin;
         const effective = resolveLevel(
           tool,
           template,
