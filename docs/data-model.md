@@ -176,6 +176,7 @@ The eight Volume III §4 primitives; mapping below. Supporting notes:
 same actor through the same pathway. The moment the contractor can author both sides of a
 reconciliation, the product is worthless. This constraint is the entire architecture."
 Current enforcement: `evidence.submittedBy` and `assertions.claimantId` are always recorded;
-reconciliation creation rejects evidence sets wholly submitted by the claimant (with an
-explicit, ledgered override); evidence packs flag `selfCertified` items. Full pathway-level
+reconciliation creation rejects evidence sets wholly submitted by the claimant (only an
+`integrity_reviewer` may knowingly override); obligation satisfaction records a
+`selfCertified` flag in its ledger payload. Full pathway-level
 separation (independent ingestion channels) is Tier-1 roadmap work — see `docs/roadmap.md`.

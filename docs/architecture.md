@@ -167,7 +167,7 @@ Key properties, all visible in `plugins/auth.ts`:
 - Tenant context is explicit per request (`x-company-id`), never inferred from the token.
 - **Every table that stores tenant data carries a `companyId` column, and every query is
   scoped by it** (convention enforced in review; there is no row-level security in the
-  database — see `docs/security.md` §4). Project-scoped tables additionally carry and are
+  database — see `docs/security.md` §3 and §8). Project-scoped tables additionally carry and are
   filtered by `projectId`, which `requireTool` has already proven belongs to the tenant.
 - Storage keys are prefixed with `companyId` (`lib/storage.ts`), so blobs are physically
   partitioned per tenant.
@@ -260,8 +260,10 @@ Properties:
 of evidence content-hashes under a single Merkle root, with per-leaf inclusion proofs
 (odd nodes promoted, not duplicated, so a leaf cannot appear included twice). The root is a
 single hash that can be escrowed with a third party or anchored externally — the committed
-foundation for spec Domain S #860–861, #874, #882. Packs also flag self-certified evidence
-(`selfCertified: ev.submittedBy === requester`, `modules/assurance/index.ts`).
+foundation for spec Domain S #860–861, #874, #882. Self-certification is surfaced on the
+obligation path: satisfying an obligation records `selfCertified: ev.submittedBy === req.user.id`
+in the ledger payload (`modules/assurance/index.ts`, obligation `/satisfy` route), so a reviewer
+can weigh it later.
 
 What the chain does and does not prove is analysed honestly in `docs/security.md` §5.
 
