@@ -50,6 +50,8 @@ export const workflowInstances = pgTable(
     recordId: text("record_id").notNull(),
     status: text("status").default("running").notNull(), // WorkflowInstanceStatus
     currentPosition: integer("current_position").default(0).notNull(),
+    /** field values captured at start; step conditions evaluate against this */
+    context: jsonb("context").$type<Record<string, unknown>>().default({}).notNull(),
     startedBy: text("started_by").notNull(),
     completedAt: timestamp("completed_at", { withTimezone: true, mode: "string" }),
     createdAt: createdAt(),

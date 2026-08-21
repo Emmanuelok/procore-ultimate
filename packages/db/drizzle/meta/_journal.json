@@ -8,6 +8,13 @@
       "when": 1787309463774,
       "tag": "0000_freezing_monster_badoon",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1787309811078,
+      "tag": "0001_wakeful_scorpion",
+      "breakpoints": true
     }
   ]
 }
