@@ -1,0 +1,12 @@
+**/node_modules
+**/dist
+**/.turbo
+**/coverage
+.git
+.github
+.pglite
+data
+docs
+*.md
+.env
+.env.*

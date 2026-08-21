@@ -1,11 +1,17 @@
+import { existsSync } from "node:fs";
+import path from "node:path";
 import Fastify, { type FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
+import helmet from "@fastify/helmet";
 import multipart from "@fastify/multipart";
+import rateLimit from "@fastify/rate-limit";
+import fastifyStatic from "@fastify/static";
 import { ZodError } from "zod";
 import "./types.js";
 import { loadConfig, type Config } from "./config.js";
 import { createDb, type DbHandle } from "./lib/db.js";
 import { createLocalStorage } from "./lib/storage.js";
+import { createS3Storage } from "./lib/storage-s3.js";
 import { AppError } from "./lib/errors.js";
 import authPlugin from "./plugins/auth.js";
 
@@ -44,7 +50,35 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
         ? false
         : { level: config.LOG_LEVEL },
     bodyLimit: 32 * 1024 * 1024,
+    trustProxy: config.TRUST_PROXY,
   });
+
+  // Security headers. CSP is tuned for the SPA the API serves same-origin:
+  // pdf.js needs blob: workers and blob: fetches, web-ifc needs WebAssembly
+  // compilation ('wasm-unsafe-eval'), and viewers render into blob: images.
+  await app.register(helmet, {
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'wasm-unsafe-eval'"],
+        workerSrc: ["'self'", "blob:"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", "data:", "blob:"],
+        connectSrc: ["'self'", "blob:"],
+        fontSrc: ["'self'", "data:"],
+        objectSrc: ["'none'"],
+        frameAncestors: ["'self'"],
+      },
+    },
+    crossOriginEmbedderPolicy: false,
+  });
+
+  if (config.RATE_LIMIT_ENABLED && config.NODE_ENV !== "test") {
+    await app.register(rateLimit, {
+      max: config.RATE_LIMIT_MAX_PER_MINUTE,
+      timeWindow: "1 minute",
+    });
+  }
 
   await app.register(cors, { origin: true, credentials: true });
   await app.register(multipart, {
@@ -53,7 +87,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
 
   const dbHandle: DbHandle = await createDb(config);
   app.decorate("db", dbHandle.db);
-  app.decorate("storage", createLocalStorage(config.STORAGE_DIR));
+  app.decorate(
+    "storage",
+    config.STORAGE_DRIVER === "s3" ? createS3Storage(config) : createLocalStorage(config.STORAGE_DIR),
+  );
   app.decorate("appConfig", config);
 
   await app.register(authPlugin);
@@ -110,6 +147,38 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
   await app.register(aiModule, { prefix });
   await app.register(commercialModule, { prefix });
   await app.register(contractsModule, { prefix });
+
+  // Same-origin SPA serving (production): the built web app is copied into
+  // the container and served by the API, so the client's absolute
+  // /api/v1/... paths need no proxy and no CORS. Hashed /assets/* are
+  // immutable; index.html is never cached; any non-API GET falls back to
+  // index.html for client-side routing.
+  const webRoot = config.WEB_DIST_DIR ? path.resolve(config.WEB_DIST_DIR) : null;
+  if (webRoot && existsSync(path.join(webRoot, "index.html"))) {
+    await app.register(fastifyStatic, {
+      root: webRoot,
+      wildcard: true,
+      index: "index.html",
+      setHeaders: (reply, filePath) => {
+        if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+          void reply.header("cache-control", "public, max-age=31536000, immutable");
+        } else {
+          void reply.header("cache-control", "no-cache");
+        }
+      },
+    });
+    app.setNotFoundHandler((req, reply) => {
+      const wantsApi = req.raw.url?.startsWith("/api/");
+      if (!wantsApi && (req.method === "GET" || req.method === "HEAD")) {
+        return reply.header("cache-control", "no-cache").sendFile("index.html");
+      }
+      return reply.status(404).send({
+        statusCode: 404,
+        error: "NotFound",
+        message: `Route ${req.method} ${req.url} not found`,
+      });
+    });
+  }
 
   return {
     app,

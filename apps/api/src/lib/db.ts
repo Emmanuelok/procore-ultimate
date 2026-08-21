@@ -21,7 +21,8 @@ export type Db = PgDatabase<PgQueryResultHKT, typeof schema>;
 const here = path.dirname(fileURLToPath(import.meta.url));
 
 /** Locate the committed drizzle migrations folder (packages/db/drizzle). */
-export function migrationsFolder(): string {
+export function migrationsFolder(override?: string): string {
+  if (override && existsSync(override)) return override;
   const candidates = [
     path.resolve(here, "../../../../packages/db/drizzle"),
     path.resolve(here, "../../../packages/db/drizzle"),
@@ -42,16 +43,17 @@ export interface DbHandle {
 }
 
 export async function createDb(cfg: Config): Promise<DbHandle> {
+  const folder = migrationsFolder(cfg.MIGRATIONS_DIR);
   if (cfg.DATABASE_URL) {
     const client = postgres(cfg.DATABASE_URL, { max: 10 });
     const db = drizzlePostgres(client, { schema });
-    await migratePostgres(db, { migrationsFolder: migrationsFolder() });
+    await migratePostgres(db, { migrationsFolder: folder });
     return { db: db as unknown as Db, close: () => client.end() };
   }
   // Embedded fallback: in-memory for tests, persisted directory otherwise.
   const target = cfg.NODE_ENV === "test" ? undefined : cfg.PGLITE_DIR;
   const client = target ? new PGlite(target) : new PGlite();
   const db = drizzlePglite(client, { schema });
-  await migratePglite(db, { migrationsFolder: migrationsFolder() });
+  await migratePglite(db, { migrationsFolder: folder });
   return { db: db as unknown as Db, close: () => client.close() };
 }

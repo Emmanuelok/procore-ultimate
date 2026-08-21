@@ -57,6 +57,19 @@ function slugify(name: string): string {
 }
 
 export const identityModule: FastifyPluginAsync = async (app) => {
+  /** Stricter per-IP limits on credential endpoints (brute-force guard). */
+  const authLimited =
+    app.appConfig.RATE_LIMIT_ENABLED && app.appConfig.NODE_ENV !== "test"
+      ? {
+          config: {
+            rateLimit: {
+              max: app.appConfig.AUTH_RATE_LIMIT_MAX_PER_MINUTE,
+              timeWindow: "1 minute",
+            },
+          },
+        }
+      : {};
+
   async function issueTokens(user: { id: string; email: string }) {
     const accessToken = await app.signAccessToken(user);
     const refreshToken = newId("rt") + newId();
@@ -105,7 +118,7 @@ export const identityModule: FastifyPluginAsync = async (app) => {
     return { id: companyId, name, slug };
   }
 
-  app.post("/auth/register", async (req, reply) => {
+  app.post("/auth/register", authLimited, async (req, reply) => {
     const body = registerSchema.parse(req.body);
     const existing = await app.db
       .select({ id: users.id })
@@ -145,7 +158,7 @@ export const identityModule: FastifyPluginAsync = async (app) => {
     });
   });
 
-  app.post("/auth/login", async (req) => {
+  app.post("/auth/login", authLimited, async (req) => {
     const body = loginSchema.parse(req.body);
     const rows = await app.db.select().from(users).where(eq(users.email, body.email)).limit(1);
     const user = rows[0];
@@ -167,7 +180,7 @@ export const identityModule: FastifyPluginAsync = async (app) => {
     return { user: { id: user.id, email: user.email, name: user.name }, ...tokens };
   });
 
-  app.post("/auth/refresh", async (req) => {
+  app.post("/auth/refresh", authLimited, async (req) => {
     const body = refreshSchema.parse(req.body);
     const hash = sha256Hex(body.refreshToken);
     const rows = await app.db
