@@ -106,11 +106,32 @@ Use S3. The local driver exists for development and as an escape hatch.
 
 ### 2.4 Create the app service from GitHub
 
+> **⚠️ ONE service, rooted at `/`. Do not let Railway split the monorepo.**
+> Railway's GitHub import may detect the pnpm workspace and offer to create
+> per-package services (`@constructos/api`, `@constructos/web`). **Decline that.**
+> Those services build the packages in isolation with Railway's auto-builder,
+> which cannot work here — the web app is served *by the API* from one
+> container, and a package-rooted service never sees the root `railway.json`
+> or `Dockerfile`. Symptoms of the wrong setup: builder shows "Railpack"
+> instead of "Dockerfile"; the web service dies at *Create container* with
+> ``The executable `pnpm` could not be found``; commits show
+> *SKIPPED — no changes to watched files* because the split services were
+> given per-package watch paths.
+>
+> **Recovery if this already happened:** delete both broken services
+> (service → Settings → Danger → Delete, or `railway service "@constructos/api" delete`),
+> then either run `./scripts/railway-provision.sh` from a linked local
+> checkout (fastest — it also adds Postgres + the bucket), or re-create one
+> service from the repo with its **Root Directory left at `/`** and continue
+> below. The check that you got it right: the service's build settings show
+> **Dockerfile**, not Railpack.
+
 1. Project canvas → **Create → GitHub Repo** → select **`Emmanuelok/procore-ultimate`**
    (authorize the Railway GitHub app for the repo if prompted). Choose the branch you
-   deploy from (`main` unless you have a release branch).
-2. Railway reads **`railway.json`** at the repo root automatically. You should see, without
-   configuring anything by hand:
+   deploy from (`main` unless you have a release branch). If the import flow asks which
+   app/package to deploy, choose the repository root — never an individual package.
+2. With the service rooted at `/`, Railway reads **`railway.json`** at the repo root
+   automatically. You should see, without configuring anything by hand:
    - builder: **Dockerfile** (`Dockerfile` at repo root)
    - healthcheck path: **`/api/v1/health`**, timeout 180 s
    - restart policy: on-failure, max 5 retries
