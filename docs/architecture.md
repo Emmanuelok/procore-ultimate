@@ -44,7 +44,7 @@ pnpm workspace, Node ≥ 22, TypeScript 5.9 strict ESM throughout (`package.json
 | `packages/shared` | `@constructos/shared` | Domain vocabulary: enums (`src/enums.ts`), RBAC model + built-in permission templates (`src/permissions.ts`), wire types (`src/types.ts`), the eight assurance primitive interfaces (`src/primitives.ts`). No runtime dependencies. |
 | `packages/ledger` | `@constructos/ledger` | Pure crypto core: RFC 8785-style canonical JSON (`src/canonical.ts`), SHA-256 helpers (`src/hash.ts`), hash chain build/verify (`src/chain.ts`), Merkle root/proof (`src/merkle.ts`). Unit-tested in `src/ledger.test.ts`. |
 | `packages/db` | `@constructos/db` | Drizzle ORM schema, one file per domain (`src/schema/*.ts`), committed SQL migrations (`drizzle/`). Postgres dialect; no FK constraints — relationships are by convention (see `docs/data-model.md`). |
-| `apps/api` | `@constructos/api` | Fastify 5 API. Composition root `src/app.ts`, env config `src/config.ts`, auth plugin `src/plugins/auth.ts`, helpers `src/lib/*.ts`, thirteen feature modules `src/modules/*/`, test harness `src/test/helpers.ts`. |
+| `apps/api` | `@constructos/api` | Fastify 5 API. Composition root `src/app.ts`, env config `src/config.ts`, auth plugin `src/plugins/auth.ts`, helpers `src/lib/*.ts`, fifteen feature modules `src/modules/*/`, test harness `src/test/helpers.ts`. |
 | `apps/web` | `@constructos/web` | Vite 8 + React 19 + Tailwind v4 SPA. Route table `src/App.tsx`, API client `src/lib/api.ts`, auth context `src/lib/auth.tsx`, shared UI kit `src/ui/`, feature pages `src/pages/*/`. Client-side PDF rendering via `pdfjs-dist`, IFC via `web-ifc` + `three`. |
 | `docs/` | — | This documentation set plus the master specification. |
 | `docker-compose.yml` | — | Postgres 16 for production-like runs. |
@@ -64,7 +64,7 @@ flowchart LR
     end
     subgraph API["apps/api (Fastify, port 4000)"]
         AUTH["auth plugin<br/>plugins/auth.ts"]
-        MODS["13 feature modules<br/>modules/*/index.ts"]
+        MODS["15 feature modules<br/>modules/*/index.ts"]
         LEDGER["appendLedger<br/>lib/ledger.ts"]
         STORE["content-addressed storage<br/>lib/storage.ts"]
     end
@@ -100,7 +100,7 @@ flowchart LR
 - **Web**: the Vite dev server proxies `/api` to the API (`apps/web/vite.config.ts`); in
   production the SPA is a static build served alongside the API behind any reverse proxy.
 - **AI**: optional outbound dependency on the Anthropic API, gated on `ANTHROPIC_API_KEY`
-  (`apps/api/src/modules/ai/service.ts`); see §10.
+  (`apps/api/src/modules/ai/service.ts`); see §12.
 - **Health**: `GET /api/v1/health` reports which database backend is live (`app.ts`).
 
 ---
@@ -179,7 +179,7 @@ Key properties, all visible in `plugins/auth.ts`:
 
 ## 6. Module inventory
 
-Thirteen Fastify plugins, each `apps/api/src/modules/<name>/index.ts`, all registered in
+Fifteen Fastify plugins, each `apps/api/src/modules/<name>/index.ts`, all registered in
 `src/app.ts` under the `/api/v1` prefix. "Tool" is the `requireTool` key from
 `packages/shared/src/permissions.ts`; tables are from `packages/db/src/schema/`. Sibling
 modules are being developed concurrently — the contracts below come from route registration
@@ -200,6 +200,8 @@ and schema, not implementation internals.
 | `notifications` | authenticated user | `notifications` | `GET /notifications`, `/unread-count`, `POST /:id/read`, `/read-all` | Vol I §0.5 #93–97 |
 | `assurance` | `assurance` + `requireAssuranceRole` on dispositions | `assertions`, `evidence`, `reconciliations`, `obligations`, `events`, `entities`, `entityRelationships`, `signals`, `ledgerEntries` | `/projects/:id/{assertions,evidence,reconciliations,obligations,events,signals}`, `/entities` (+graph, scan), `/projects/:id/detectors/run`, `/projects/:id/evidence-packs`, `/ledger`, `/ledger/verify` | Vol III §4 (all 8 primitives); Domain A detectors subset; Domain S #859, #862, #871–872, #882 |
 | `ai` | `ai` (read/standard) | `aiRuns`, `aiReviewQueue` | `/projects/:id/ai/{search,assist,submittal-review,daily-log-draft,rfi-evaluate,sheet-name,photo-intel}`, `/ai/review` (+`approve/reject`), `/ai/runs` | Vol I §6.4 #759–775 subset; Domain X #1019–1021 |
+| `commercial` | `commercial` | `boqs`, `boqItems`, `takeoffLines`, `valuations`, `valuationLines`, `paymentCertificates`, `variations` | `/projects/:id/boqs`, `/boqs/:id` (+`summary`), `/boqs/:id/items`, `/boq-items/:id/takeoff` (+`apply`), `/projects/:id/valuations`, `/valuations/:id/{lines,submit,certify}`, `/projects/:id/certificates`, `/projects/:id/variations` (+`status`, `value`), `/projects/:id/commercial/summary` | Vol II Domain B (M7) #115–116, #135–140, #145/149, #162–171, #179–180, #184 seed |
+| `contracts` | `contracts` | `contracts`, `contractEvents`, `eotClaims` (+ writes assurance `obligations`, `signals`) | `/contract-forms` (+`/:form/clauses`), `/projects/:id/contracts` (+`status`, `deadlines`), `/contracts/:contractId/events` (+`serve-notice`, `status`), `/contracts/:contractId/eot-claims` (+`status`), `/contracts/:contractId/ld-exposure` | Vol II Domain C (M8) #193–196, #200–204 subset, #214–215, #225–231, #237–238, #249–250, #260 |
 
 Shared helpers used by all modules (`apps/api/src/lib/`): `ids.ts` (prefixed nanoid),
 `numbering.ts` (atomic per-project record counters, spec #72), `pagination.ts`
@@ -284,7 +286,7 @@ Upload → extraction → sheet/revision model → markups/pins. All in
    the sheet number and title from each page's text stream and classify discipline from the
    number prefix (A→architectural, S→structural, …) — spec Vol I #257–258, #266. Low-confidence
    extractions set `drawing_sheets.needsReview = 1`, feeding the human naming-review queue
-   (#258); the AI `sheet_naming` agent (§10) can propose corrections.
+   (#258); the AI `sheet_naming` agent (§12) can propose corrections.
 4. **Sheet/revision model**: a `drawing_sheets` row is the logical sheet, unique per
    `(projectId, number)`; each upload appends a `drawing_revisions` row (revision label,
    source set, `pageIndex`, extracted text, calibration) and supersedes the previous one
@@ -346,7 +348,138 @@ IFC ingest → elements → CDE states → assets/sensors → COBie. Split acros
 
 ---
 
-## 10. AI layer
+## 10. Commercial engine (M7)
+
+Measurement & valuation (spec Vol II Domain B), the first Tier-2 module. Routes in
+`apps/api/src/modules/commercial/` (`boqs.ts`, `valuations.ts`, `variations.ts`,
+`summary.ts`), schema `packages/db/src/schema/commercial.ts`, web UI
+`apps/web/src/pages/commercial/` (tabbed page: BoQ / Valuations / Certificates / Variations).
+The design premise is the spec's: the BoQ is a **contractual measurement instrument**, not an
+import format — so every quantity has provenance and every certified value becomes a
+reconcilable claim.
+
+```mermaid
+flowchart LR
+    TO["takeoff_lines<br/>timesing × L × W × D<br/>drawingSheetId provenance"] -- "takeoff/apply<br/>qty = Σ lines" --> BQI["boq_items<br/>bill > section > item<br/>rate build-up sheet"]
+    BQI --> V["valuations<br/>lines: qty or % to date"]
+    V -- "submit (submittedBy)" --> C["certify — different user,<br/>commercial admin level"]
+    C --> PC["payment_certificates<br/>variance vs application"]
+    PC -- "netCertified" --> A["assertions (kind: cost)<br/>assurance layer"]
+    VAR["variations<br/>bq_rates | pro_rata |<br/>star_rate | daywork"] --> SUM["commercial/summary<br/>CVR seed: forecastFinal"]
+    BQI --> SUM
+    PC --> SUM
+```
+
+1. **BoQ hierarchy** (#115–116): `boqs` carries a declared method of measurement
+   (`nrm2 | smm7 | cesmm4 | pomi | custom` — metadata, not a rules engine yet) and a
+   forward-only lifecycle `draft → issued → agreed`; an agreed BoQ is immutable. `boq_items`
+   form a `bill > section > item` tree via `parentId` + materialized `path` (small BQs may
+   hang items directly off a bill — a documented relaxation of #116). Item types cover
+   measured, provisional (defined/undefined), prime cost, prelims fixed/time-related,
+   daywork, contingency and spot items (`BOQ_ITEM_TYPES`).
+2. **Rate build-up** (#145, #149): an item's rate may be a build-up sheet of
+   labour/material/plant/overhead/profit components (`rateBuildUp` jsonb). The item rate is
+   Σ component amounts, and an explicit rate disagreeing by more than 0.01 is a 400
+   (`resolveRate`, `boqs.ts`) — the build-up is the audit trail for the rate, so they must
+   reconcile.
+3. **Taking-off provenance** (#135–140): `takeoff_lines` are dimension-sheet rows
+   (`timesing × length × width × depth`, manual overrides recorded with `isManual`), each
+   optionally citing the `drawingSheetId` it was measured from (validated against the
+   project's drawing register). `POST /boq-items/:id/takeoff/apply` sets the item quantity
+   to Σ of its lines — after which the quantity is traceable drawing → dimension → bill item.
+4. **Valuation** (#162–167): a valuation snapshots one line per BQ leaf item, seeded from the
+   latest *certified* valuation of that BoQ. Each line takes exactly one of `qtyToDate`
+   (remeasure × BQ rate, #163) or `percentToDate` (% × BQ item amount, #164);
+   `recomputeValuation` (`valuations.ts`) derives work done, retention, materials on/off
+   site, previous net and `netDue`. Submission stamps `submittedBy` — that identity is
+   load-bearing for the next step.
+5. **Certification** (#179–180): `POST /valuations/:id/certify` requires `commercial`
+   **admin** and rejects the valuation's own submitter (403) — see
+   `docs/adr/0008-certification-independence.md` and `docs/security.md` §2.4. The
+   certificate persists the certifier's determination *and* the variance from the
+   application with its reason (#180). In the same transaction the certified net value is
+   written into the assurance layer as an `assertions` row
+   (`kind: "cost"`, `sourceType: "payment_certificate"`) — **a certificate is a claim to be
+   reconciled against independent evidence, not a fact**. This is the delivery→assurance
+   bridge for money, the exact hook Phase-2/Tier-1 reconciliation work consumes.
+6. **Variations** (#168–171): lifecycle `proposed → instructed → valued → agreed` with
+   basis discipline — `bq_rates` demands the exact BQ item rate (±0.01, else the API tells
+   you to use a `star_rate` fair valuation), `pro_rata` requires BQ item references,
+   `star_rate`/`daywork` are fair-valuation bases. The valuation build-up is ledgered with
+   full payload — the rate-derivation audit trail of #171.
+7. **Commercial summary** (#184 seed): `GET /projects/:id/commercial/summary` rolls up BoQ
+   total, certified to date, retention held (latest certificate per BoQ), variation
+   register position and `forecastFinal` — the CVR seed, deliberately no more than that
+   (full CVR/WIP is roadmap, `docs/roadmap.md`).
+
+Sub-resource routes without `:projectId` (e.g. `/boqs/:boqId`) resolve the owning project
+from the record and re-run the same `requireTool("commercial", …)` gate
+(`requireCommercialLevel`, `modules/commercial/shared.ts`) — no permission short-cut through
+the flat URLs. Money rounds to 2 dp, measured quantities to 3 dp (`round2`/`round3`).
+
+---
+
+## 11. Contract intelligence (M8)
+
+Spec Vol II Domain C. Routes in `apps/api/src/modules/contracts/index.ts`, clause library in
+`modules/contracts/clause-library.ts`, schema `packages/db/src/schema/contracts.ts`, web UI
+`apps/web/src/pages/contracts/` (register with 30-day time-bar radar; detail page with
+Overview / Clauses / Events / EOT tabs).
+
+```mermaid
+flowchart LR
+    LIB["CLAUSE_LIBRARY (code)<br/>8 forms, timeBarDays,<br/>standingObligation"] -- "clausesForForm ⊕<br/>particularConditions" --> EFF["effectiveClauses<br/>(amended flagged)"]
+    EV["contract_events<br/>kind + clauseRef + eventDate"] -- "findClause →<br/>eventDate + timeBarDays" --> DL["noticeDeadline"]
+    DL --> OBL["obligations<br/>deadline + warnDaysBefore"]
+    DL -- "served in time" --> OK["notice_served<br/>obligation satisfied"]
+    DL -- "sweep: deadline past" --> TB["time_barred<br/>obligation breached"]
+    TB --> SIG["signals<br/>time_bar_missed (critical)"]
+    OK -- "served late" --> SIG2["signals<br/>time_bar_breach_risk (high)"]
+```
+
+1. **Clause library in code** (#193–196, #203, #214–215): `CLAUSE_LIBRARY` is a typed
+   constant — FIDIC Red 1999/2017, Yellow 2017, Silver 2017, NEC3/NEC4 ECC, JCT SBC/DB 2016
+   (plus `bespoke`, which by definition has no library clauses). Each `ClauseDef` carries a
+   summary, category, notice party, an optional `timeBarDays` (set **only** where the form
+   itself imposes a day-counted deadline from the event/awareness date — FIDIC 20.2's 28
+   days, NEC 61.3's 56 days) and an optional `standingObligation`. It is reference data, not
+   tenant data — rationale in `docs/adr/0007-contract-clause-library-in-code.md`. Served
+   read-only at `GET /contract-forms` and `/contract-forms/:form/clauses`.
+2. **Particular Conditions overlay** (#201–202): per-contract amendments live in
+   `contracts.particularConditions` (`[{clauseRef, amendment}]`). The contract detail
+   response computes `effectiveClauses` = library ⊕ overlay, flagging amended clauses —
+   amendments are visible against the standard form, never silently replacing it.
+3. **Obligation materialization** (#260): creating a contract inserts one assurance
+   `obligations` row per `standingObligation` clause of its form (programme submission,
+   certification duties, payment duties, early-warning duty …) — the contract obligation
+   register and the assurance layer are the same table, not a mirror.
+4. **Time-bar engine** (#225–231): creating a `contract_events` row whose `clauseRef`
+   resolves to a time-barred clause computes `noticeDeadline = eventDate + timeBarDays` and
+   materializes a deadline `obligations` row (`warnDaysBefore` for early warning, per
+   spec #229). `GET /projects/:id/contracts/deadlines` is the time-bar radar (soonest
+   first, `daysRemaining` signed). Serving notice (#227–228) records method
+   (email/letter/portal/registered post), reference and timestamp, satisfies the obligation
+   — and if served after the deadline, raises a high-severity `time_bar_breach_risk` signal
+   without un-breaching the register. A lazy sweep (`sweepTimeBars`) marks open events whose
+   deadline fully elapsed as `time_barred`, breaches the linked obligation and raises a
+   critical `time_bar_missed` signal, exactly once (#230).
+5. **EOT claims** (#237–238): lifecycle `notified → submitted → assessed →
+   agreed | rejected | referred`, claims cite clause and supporting event ids. Assessment
+   requires `daysAwarded` and **must not be performed by the user who raised the claim**
+   (403 — `docs/security.md` §2.4). Agreement of an assessed award moves the contract
+   completion date forward by the awarded days, with the movement ledgered against the
+   claim as cause.
+6. **LD exposure** (#249–250): `GET …/ld-exposure` computes accrued liquidated damages from
+   `ldRatePerDay` × days past completion, capped at `ldCap` with `capReached` flagged — a
+   live read model, nothing persisted.
+
+Every consequential mutation (contract create/patch/status, event create/serve/status,
+EOT transitions, time-bar sweeps) appends to the evidence ledger, so the notice history that
+decides a claim's survival is itself tamper-evident (§7).
+
+---
+
+## 12. AI layer
 
 `modules/ai/` (service in `service.ts`), schema `packages/db/src/schema/ai.ts`. Design rules
 come from spec Domain X: **citations always (#1019), human-in-the-loop for consequential
@@ -375,7 +508,7 @@ outputs (#1020), full audit trail (#1021).**
 
 ---
 
-## 11. Integration surface
+## 13. Integration surface
 
 **Today (implemented):**
 
@@ -400,7 +533,7 @@ outputs (#1020), full audit trail (#1021).**
 
 ---
 
-## 12. Verification & test strategy
+## 14. Verification & test strategy
 
 - `packages/ledger` has pure unit tests (`src/ledger.test.ts`).
 - Every API module colocates `<name>.test.ts` using `buildTestApp()`

@@ -1,18 +1,24 @@
 # ConstructOS — Roadmap
 
-Maps the committed codebase (called **Phase 0/1 — Foundation** here) onto the master
-specification (`docs/master-specification.md`), then lays out the phased build mirroring the
+Maps the committed codebase onto the master specification
+(`docs/master-specification.md`), then lays out the remaining build mirroring the
 Volume III module tiers. Function numbers cite the spec: Vol I numbers are the Procore
 inventory (#1–804), Vol II numbers run continuously across the gap domains (#1–~1100,
-Domain A starting at #1, Domain S at #859, Domain X at #995).
+Domain A starting at #1, Domain B at #115, Domain C at #193, Domain S at #859, Domain X
+at #995).
 
-The sequencing follows spec Vol III §5 deliberately: the assurance core before commercial
-depth, commercial depth before governance, and Volume I parity **last** — the spec's "parity
-trap" warning (Vol III §1) is treated as binding.
+Two increments are delivered: **Phase 0/1 — Foundation** (the delivery subset + assurance
+skeleton) and **Phase 2 — Tier-2 commercial seed (M7 + M8)**. Phase 2 is a deliberate
+deviation from the spec Vol III §5 ordering (assurance core before commercial depth): the
+commercial engine landed before the Tier-1 ingestion layer (M6). The deviation is contained
+— M7 was built so that every certified value crosses into the assurance layer as an
+`Assertion`, so nothing shipped that Tier-1 will have to unwind; but **M6 remains the gate
+to the sellable assurance claim** and is called out as such below. The "parity trap"
+warning (Vol III §1) is still treated as binding: Volume I parity stays last.
 
 ---
 
-## Phase 0/1 — Foundation (this codebase)
+## Phase 0/1 — Foundation (delivered)
 
 An honest inventory. The foundation is a working Procore-class delivery subset **plus** the
 assurance skeleton: all eight Vol III §4 primitives as live tables with routes, a
@@ -57,18 +63,111 @@ small subsets of their spec sections.
 | M4 Entity Graph | **Seeded** — entities, typed relationships, graph walk, shared-identifier scan (`POST /entities/scan`), vendor→entity mirror |
 | M5 Assurance Workspace | **Seeded** — the three roles wired through auth; assurance pages in the web app; time-boxed regulator grants |
 | M6 Ingestion Layer | **Not started** — today all data arrives through ConstructOS's own API |
-| M7–M19 | Not started |
+| M7 Measurement & valuation | **Delivered (Phase 2, subset)** — BoQ/taking-off/valuation/certification/variations; see the Phase 2 section for the exact function-number in/out list |
+| M8 Contract intelligence | **Delivered (Phase 2, subset)** — clause library in code, PC overlay, time-bar engine, EOT, LD exposure, obligation register; see Phase 2 section |
+| M9–M19 | Not started |
 
 Not implemented at all (deliberately): Vol I §1.1–1.3 (bid/estimating/prequal), §2.2 specs,
 §2.6 schedule, §2.9/2.11–2.13, §3 financial suite, §4 quality & safety, §5 resources,
-§6 analytics; Vol II domains B–K, M–R, T–Z beyond the seeds listed above.
+§6 analytics; Vol II domains D–K, M–R, T–Z beyond the seeds listed above (Domains B and C
+gained real coverage in Phase 2, below).
 
 ---
 
-## Phase 2 — Assurance core complete (Vol III Tier 1: M1–M6)
+## Phase 2 — Delivered: Tier-2 commercial seed (M7 + M8)
+
+Committed and tested: `apps/api/src/modules/commercial/` + `modules/contracts/` (with
+colocated test suites), schema `packages/db/src/schema/commercial.ts` / `contracts.ts`,
+web pages `apps/web/src/pages/commercial/` / `pages/contracts/`. Architecture write-up in
+`docs/architecture.md` §10–11; table catalogs in `docs/data-model.md` §12–13; new
+segregation-of-duties rules in `docs/security.md` §2.4; ADRs 0007 (clause library in code)
+and 0008 (certification independence).
+
+Precision matters here — this is a *subset* of Domains B and C, and the boundary is drawn
+function-by-function:
+
+### M7 — Measurement & valuation (Domain B)
+
+**In:**
+
+| Spec functions | What shipped |
+|---|---|
+| #115–116 | BoQ as a contractual object with forward-only `draft → issued → agreed` lifecycle; hierarchy `bill > section > item` (three levels — no work-section/sub-item tiers; items may hang off bills in small BQs, a documented relaxation) |
+| #128–130, #132–134 (as item types) | prelims fixed vs time-related, provisional sums defined/undefined, prime cost, daywork, contingency, spot items — classification and totals by type, not the full procedural machinery (no percentage-addition daywork schedules, no nominated-subcontractor handling #131) |
+| #135–136 subset | taking-off lines with timesing/length/width/depth dimension columns and manual-override capture; no waste-calculation dimension paper |
+| #139–140 | quantity provenance: taking-off lines cite `drawingSheetId`; `takeoff/apply` makes the item quantity Σ of its lines — drawing → dimension → bill item is traceable |
+| #145, #149 | rate build-up sheets (labour/material/plant/overhead/profit) with enforced reconciliation to the item rate (±0.01) |
+| #162–164, #166–167 subset | interim valuations on remeasure and %-of-item bases; materials on/off site as values (no vesting certificates #166 or off-site bonds #167); `milestone` is an accepted basis label with no activity-schedule mechanics behind it (#165) |
+| #168–171 | variation valuation at BQ rates (exact-rate discipline), pro-rata, star rates, dayworks; the value build-up ledgered with full payload — the rate-derivation audit trail |
+| #179–180 | payment certificates with certifier ≠ submitter enforcement, and the certificate-vs-application variance statement persisted with reason |
+| #184 (seed only) | `commercial/summary` — boqTotal / certifiedToDate / retentionHeld / variations position / forecastFinal. **This is the whole of CVR today** |
+
+**Out (explicitly not built):** #117–126 measurement-standard rules engines and validation
+(`method` is declared metadata — nrm2/smm7/cesmm4/pomi/custom — nothing validates item
+coding against the standard); #137–138 abstracting/billing and query sheets; #141–144
+automated quantity extraction from 2D/BIM; #146–148 all-in labour/plant/material rate
+build-ups; #150–161 rate libraries, price books, elemental cost planning; #172–173
+provisional-quantity remeasurement and provisional-sum adjustment; **#174–178 fluctuation
+formulae** (NEDO/BCIS, FIDIC 13.8, index ingestion, currency adjustment); #181–183 final
+account; #185–192 CVR beyond the summary (WIP/accruals, over/under-certification statement,
+cash-flow S-curve, earned value, subcontract package control, BQ interchange export,
+cross-project rate benchmarking).
+
+### M8 — Contract intelligence (Domain C)
+
+**In:**
+
+| Spec functions | What shipped |
+|---|---|
+| #193–196, #203, #214–215 | clause-level library for FIDIC Red 1999/2017, Yellow 2017, Silver 2017, NEC3/NEC4 ECC, JCT SBC/DB 2016 — **in versioned code, not the database** (ADR 0007); ~80 clauses with categories, notice parties, time bars, standing obligations |
+| #200 (partial) | 1999-vs-2017 variance is modelled as separate forms with delta clause sets (e.g. FIDIC 20.1 28-day contractor-only bar vs 20.2 mutual bar); no 2022 amendments |
+| #201–202 | Particular Conditions overlay on the contract record; effective-clause view flags amendments against the standard form |
+| #204 (recorded) | NEC option A–F required on NEC forms; no option-variant pricing logic behind it |
+| #205 (partial), #206 | early-warning events in the register (no register meetings); compensation-event lifecycle with the NEC 61.3 eight-week bar |
+| #225–230 | **the time-bar engine**: automatic notice deadline from event date + clause; per-clause notice-requirement data; service method + proof-of-service capture; breach warning *before* expiry (deadline radar + `warnDaysBefore` obligations); breach recording where missed (`time_barred` + breached obligation + critical signal) |
+| #231 (partial) | condition-precedent compliance is trackable through the obligation status trail (open/satisfied/breached), not a dedicated register |
+| #237–238 | EOT claim lifecycle mapped to clause and supporting events; assessment independence (assessor ≠ raiser); agreed awards move the completion date, ledgered |
+| #249–250 | LD accrual from rate × days late with cap monitoring |
+| #260 | contract obligation register — standing obligations materialized into assurance `obligations` at contract creation; notice obligations at event creation. The register *is* the assurance table, not a mirror |
+
+**Out (explicitly not built):** #197–199 FIDIC Green/Gold/Emerald; #207–213 NEC
+quotation/Defined Cost/SCC/Accepted Programme machinery; #216–224 further forms (JCT
+Intermediate/Minor Works, PPC2000, AS4000/AS2124, Hong Kong GCC, PSSCOC/REDAS, CPWD/NHAI,
+Gulf forms); #232–236 the determination register proper (EOT `assessedBy` is the only
+determination captured; no reasoning publication or notices of dissatisfaction); #239–248
+concurrent-delay apportionment, risk-event classification, force-majeure register semantics
+(an event `kind` exists, nothing more), change in law, suspension/termination sequences,
+taking-over/sectional completion, DNP and performance certificates; #251–259 bonuses,
+performance security, guarantees, retention substitution, warranties, novation,
+back-to-back flow-down; #261–264 obligation dashboard, clause-tagged correspondence,
+privilege segregation. **No statutory payment engines** — HGCRA / Security-of-Payment
+regimes are Domain F (M10); deadlines that count backwards from a payment date (JCT Pay
+Less) are described in the clause library but deliberately carry no computed time bar.
+
+### Phase-2 status against the old Tier-2 acceptance criteria
+
+1. *"A certified interim valuation traced item-by-item to BQ lines and evidence (B#140)"* —
+   **half met**: item-by-item tracing to BQ lines, taking-off sheets and source drawings is
+   live; tracing to *independent evidence* waits on M6 ingestion + M3 reconciliation. The
+   hook exists: every certificate already lands as a `cost` Assertion (ADR 0008).
+2. *"A time-bar warning fired before expiry on a live contract (C#229)"* — **mechanism
+   delivered** (deadline radar + `warnDaysBefore` obligations + `/obligations/upcoming`);
+   firing it on a *live* contract is a deployment milestone, not an engineering one.
+3. *"One delay analysis assembled solely from ledgered contemporaneous records (D domain)"*
+   — **not started**; that is M9.
+
+---
+
+## Tier 1 — Assurance core completion (M1–M6) — open
+
+*(This section was headed "Phase 2 — Assurance core complete" in earlier revisions; ADR
+0004 and `docs/security.md` refer to its content as Tier-1 roadmap work. The Phase 2 that
+actually shipped is the commercial seed above; the work below is unchanged and remains the
+gate to the sellable assurance product.)*
 
 Goal: turn the seeds into the sellable assurance product of spec Vol III §2 — "every
-certified payment … reconciled against independent evidence."
+certified payment … reconciled against independent evidence." M7's certificates now
+generate exactly the assertions this tier must reconcile.
 
 | Workstream | Representative spec functions | Notes |
 |---|---|---|
@@ -90,27 +189,54 @@ certified payment … reconciled against independent evidence."
 
 ---
 
-## Phase 3 — Commercial depth (Vol III Tier 2: M7–M11)
+## Tier 2 remainder — M9–M11
 
 "A variance is an observation; a variance mapped to a FIDIC sub-clause with a live time bar
-is an action" (spec Vol III §5 Phase 3).
+is an action" (spec Vol III §5 Phase 3). M7 and M8 (delivered above) built the sub-clause
+and the live time bar; the remaining Tier-2 modules build the forensics and the money
+protection around them.
 
-| Module | Domain / representative functions | Foundation hooks already in place |
-|---|---|---|
-| M7 Measurement & valuation | B#115–126 BQ + methods of measurement, #139–140 taking-off audit trail & quantity provenance, #151+ valuation/certification | `assertions.kind = quantity/rate`, cost codes/WBS in `core.ts` |
-| M8 Contract intelligence | C#193–229 clause engine, notices, **time bars** (#229 breach warning before expiry) | `obligations` with `deadline` + `warnDaysBefore` and `/obligations/upcoming` are the primitive |
-| M9 Delay & disruption forensics | D#265–320: as-planned vs as-built, window analysis, concurrent delay, contemporaneous records | `events` with `detectedOrReported` + `causalLinks`; daily logs; ledger timestamps |
-| M10 Payment security | F#358–393: statutory payment regimes, payment-chain visibility | `assertions.kind = entitlement/cost`; invoicing tool key reserved in `TOOLS` |
-| M11 Independent benchmarking | R#821–858: independent rate/productivity benchmarks | anonymized cross-tenant aggregates over assertions/reconciliations |
-
-**Acceptance criteria:** a certified interim valuation traced item-by-item to BQ lines and
-evidence (B#140); a time-bar warning fired *before* expiry on a live contract (C#229); one
-delay analysis assembled solely from ledgered contemporaneous records (D domain), exported as
-an evidence pack.
+| Module | Status | Domain / representative functions | Hooks now in place |
+|---|---|---|---|
+| M7 Measurement & valuation | **Delivered (subset — see Phase 2)** | B#115–192 | — |
+| M8 Contract intelligence | **Delivered (subset — see Phase 2)** | C#193–264 | — |
+| M9 Delay & disruption forensics | Open | D#265–320: as-planned vs as-built, window analysis, concurrent delay, contemporaneous records | `contract_events` (kind `delay_event`, cost/time impact estimates, clause refs), `eot_claims.eventIds`, `variations.timeImpactDays`, daily logs, ledger timestamps — the contemporaneous record D-domain analysis feeds on now exists as structured data |
+| M10 Payment security | Open | F#358–393: statutory payment regimes (HGCRA/SOP), payment-chain visibility | `payment_certificates` with `dueDate` + variance statements; `contract_events` kinds `payment_notice`/`pay_less_notice`; the clause library already describes payment-clause mechanics it declines to compute (JCT 4.9) — exactly the gap M10 fills with real regime engines |
+| M11 Independent benchmarking | Open | R#821–858: independent rate/productivity benchmarks | BQ rates + `rateBuildUp` components and variation star rates are the raw material; anonymized cross-tenant aggregates over assertions/reconciliations |
 
 ---
 
-## Phase 4 — Programme & capital governance (Vol III Tier 3: M12–M15)
+## Next phase — recommendation
+
+**Recommended: complete Tier 2 with M9 (delay & disruption forensics) + M10 (payment
+security), with M6 ingestion run in parallel if the next engagement is assurance-led.**
+
+Reasoning, grounded in the spec's own guidance:
+
+1. **M9 and M10 compound what Phase 2 just built.** Delay forensics consumes the contract
+   event register, EOT claims and ledgered contemporaneous records M8 now produces; payment
+   security consumes the certificates, due dates and payment-notice events M7/M8 now
+   produce. Building them next converts existing structured data into the two highest-value
+   dispute artifacts (D and F domains) with no new substrate.
+2. **Tier 3 stays demand-driven.** Spec Vol III §5 Phase 4 is explicit: Tier-3/4 modules
+   are "built in the order your first three institutional customers contractually require
+   them. Do not speculate." Absent that contractual pull, starting M12–M15 before Tier 2 is
+   complete would be speculation.
+3. **The standing caveat: M6 is still the gate.** The spec's sequencing (assurance core
+   first) exists because the sellable claim is reconciliation against *independent*
+   evidence. Phase 2 kept faith with that by making every certified value an Assertion, but
+   until M6 lands there is nothing independent to reconcile it against. If a real
+   engagement materializes, M6 + the Tier-1 acceptance criteria jump the queue — that was
+   true before Phase 2 and remains true after it.
+
+**Tier-2 completion criteria carried forward:** the delay-analysis criterion (one analysis
+assembled solely from ledgered contemporaneous records, exported as an evidence pack) and
+the outstanding halves of the Phase-2 criteria above (evidence-side tracing of certified
+valuations; a live-contract time-bar save).
+
+---
+
+## Tier 3 — Programme & capital governance (M12–M15)
 
 | Module | Domain / representative functions |
 |---|---|
@@ -128,7 +254,7 @@ order your first three institutional customers contractually require them. Do no
 
 ---
 
-## Phase 5 — Safeguards & sustainability (Vol III Tier 4: M16–M19)
+## Tier 4 — Safeguards & sustainability (M16–M19)
 
 | Module | Domain / representative functions |
 |---|---|
@@ -143,7 +269,7 @@ attendance vs. access-control logs).
 
 ---
 
-## Phase 6 — Parity (Vol III Tier 5) — deliberately last
+## Tier 5 — Parity — deliberately last
 
 Vol I Sections 1–5 remainder (~650 functions): schedule, full financial suite, quality &
 safety, resources, meetings, correspondence, specifications, forms. Per spec Vol III §3
@@ -159,6 +285,6 @@ is tool-agnostic.
 
 | Kill risk | Mitigation in this plan |
 |---|---|
-| Evidence independence collapses | M6 ingestion first in Phase 2; `independenceScore` + separation rule already enforced; contractual evidence mandates at project setup |
-| False-positive fatigue | Precision measured before a detector ships (Phase 2 acceptance #3); reviewer feedback loop live since foundation |
-| Procurement cycle length | Services-led entry: the Phase 2 retrospective detection run *is* the first engagement deliverable |
+| Evidence independence collapses | M6 ingestion is the first Tier-1 workstream and jumps the queue on any assurance-led engagement; `independenceScore` + separation rule already enforced; certification/EOT separation-of-duties added in Phase 2 (`docs/security.md` §2.4); contractual evidence mandates at project setup |
+| False-positive fatigue | Precision measured before a detector ships (Tier-1 acceptance #3); reviewer feedback loop live since foundation. Phase 2 added two deterministic detectors (`time_bar_missed`, `time_bar_breach_risk`) whose precision is 1.0 by construction — date arithmetic, not inference |
+| Procurement cycle length | Services-led entry: the Tier-1 retrospective detection run *is* the first engagement deliverable |

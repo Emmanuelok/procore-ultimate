@@ -180,3 +180,34 @@ reconciliation creation rejects evidence sets wholly submitted by the claimant (
 `integrity_reviewer` may knowingly override); obligation satisfaction records a
 `selfCertified` flag in its ledger payload. Full pathway-level
 separation (independent ingestion channels) is Tier-1 roadmap work — see `docs/roadmap.md`.
+
+## 12. Commercial — `commercial.ts`
+
+Measurement & valuation engine (spec Vol II Domain B / M7); served by
+`apps/api/src/modules/commercial/`. Money is `doublePrecision` rounded to 2 dp at write time
+(`round2`, `modules/commercial/shared.ts`), measured quantities to 3 dp (`round3`) —
+adequate for the foundation, a `numeric` migration is the known upgrade path if ledger-grade
+arithmetic ever demands it.
+
+| Table | Purpose | Key columns | Relationships |
+|---|---|---|---|
+| `boqs` | Bill of Quantities as a first-class contractual object (#115) | `method` (BoqMethod: nrm2/smm7/cesmm4/pomi/custom — declared standard, not a rules engine), `status` forward-only draft→issued→agreed, `currency`, `version`, optional `contractId` | project 1—n; boq 1—n items/valuations; agreed BoQs are immutable (`boqs.ts`) |
+| `boq_items` | BQ hierarchy bill > section > item (#116) | `parentId` + materialized `path`, `level` (BoqLevel), `code`, `unit`/`quantity`/`rate`/`amount` (amount persisted = qty × rate), `itemType` (measured/provisional_defined/provisional_undefined/prime_cost/prelims_fixed/prelims_time/daywork/contingency/spot), `rateBuildUp` jsonb (labour/material/plant/overhead/profit components, #145–149) | boq 1—n; leaf items are the valuation and taking-off targets |
+| `takeoff_lines` | Dimension-sheet rows behind an item quantity (#135–140) | `timesing`/`length`/`width`/`depth`, computed `quantity` (manual overrides carry `isManual = 1`), **`drawingSheetId`** provenance to the drawings register | item 1—n; `takeoff/apply` sets item qty = Σ lines — quantity provenance (#140) |
+| `valuations` | Interim valuations / payment applications (#162–167) | unique `(boqId, number)`; `basis` (remeasure/percent/milestone), `status` draft→submitted→certified→paid, retention %/held, materials on/off site, `previousNet` (Σ prior non-withdrawn certificates), `netDue`, **`submittedBy`/`submittedAt`** (the identity certification checks against) | boq 1—n; valuation 1—n lines, 1—1 certificate |
+| `valuation_lines` | Per-item progress on a valuation | unique `(valuationId, boqItemId)`; exactly one of `qtyToDate` (#163 remeasure) or `percentToDate` (#164); `amountToDate`, `previousAmount`, `thisPeriod` | seeded one per BQ leaf item from the latest certified valuation |
+| `payment_certificates` | Certifier's determination vs the application (#179–180) | unique `(projectId, number)`; certified work done/materials, retention, `previousCertified`, `netCertified`, **`varianceFromApplication` + `varianceReason`** (#180), `dueDate`, `status` issued/paid/withdrawn, `issuedBy` | valuation 1—1; **certification also inserts an `assertions` row (kind `cost`, sourceType `payment_certificate`)** — the delivery→assurance bridge (`valuations.ts`; ADR 0008) |
+| `variations` | Variation register with valuation-basis discipline (#168–171) | unique `(projectId, number)`; `status` proposed→instructed→valued→agreed (rejected/withdrawn pre-agreement), `basis` (bq_rates/pro_rata/star_rate/daywork), `clauseRef`, `instructionRef`/`instructedAt`, `costEstimate`/`agreedValue`, `timeImpactDays`, `boqItemRefs` jsonb[] | bq_rates valuations must match BQ rates ±0.01; the value build-up is ledgered with full payload — the rate-derivation audit trail (#171) |
+
+## 13. Contracts — `contracts.ts`
+
+Contract intelligence (spec Vol II Domain C / M8); served by `apps/api/src/modules/contracts/`.
+The standard-form clause library is deliberately **not** in the database — it is versioned
+code (`modules/contracts/clause-library.ts`, ~80 clauses across 8 forms); see
+`docs/adr/0007-contract-clause-library-in-code.md`. The tables below hold only tenant data.
+
+| Table | Purpose | Key columns | Relationships |
+|---|---|---|---|
+| `contracts` | Contract instance of a standard form | `form` (ContractForm: FIDIC Red 1999/2017, Yellow/Silver 2017, NEC3/NEC4 ECC, JCT SBC/DB 2016, bespoke), `necOption` (A–F, required iff NEC), `parties` jsonb (employer/contractor/administrator), base/commencement/completion dates, `contractSum`, retention %/cap, `defectsPeriodMonths`, `ldRatePerDay`/`ldCap` (#249–250), **`particularConditions` jsonb** (`[{clauseRef, amendment}]` — the PC overlay, #201–202), `status` draft→executed→completed\|terminated | project 1—n; creation materializes the form's standing obligations into assurance `obligations` (#260); agreed EOT awards move `completionDate` (ledgered) |
+| `contract_events` | Event / notice register (#225–231) | unique `(contractId, number)`; `kind` (early_warning/claim_notice/compensation_event/variation_instruction/eot_claim/payment_notice/pay_less_notice/delay_event/other), `clauseRef`, `eventDate`, **`noticeDeadline`** (computed `eventDate + timeBarDays` from the clause library at creation, #225), notice served at/method/reference (#227–228), `status` open/notice_served/**time_barred**/resolved/withdrawn, **`obligationId`** → the materialized deadline obligation, cost/time impact estimates | contract 1—n; the lazy sweep (`sweepTimeBars`) time-bars stale open events, breaches the linked obligation and raises a critical `time_bar_missed` signal (#230) |
+| `eot_claims` | Extension-of-time claims (#237–238) | unique `(contractId, number)`; `clauseRef`, `eventIds` jsonb[] (supporting contract events, validated to belong to the contract), `daysClaimed`/`daysAwarded`, `status` notified→submitted→assessed→agreed\|rejected\|referred, **`assessedBy`/`assessedAt`** (assessor ≠ creator enforced, `modules/contracts/index.ts`), `narrative` | contract 1—n; agreement of an assessed award extends the contract completion date |

@@ -90,10 +90,10 @@ proposals (`gateReviewer`, `modules/ai/index.ts`).
 
 ### 2.2 Layer 2 — per-tool permission levels
 
-`none < read < standard < admin` (`PERMISSION_LEVELS`, ordered by `meetsLevel`) over the 21
+`none < read < standard < admin` (`PERMISSION_LEVELS`, ordered by `meetsLevel`) over the 23
 tools in `TOOLS` (directory, projects, documents, drawings, specifications, bim, twin, rfis,
 submittals, daily_logs, punch, photos, meetings, workflow, budget, commitments,
-change_management, invoicing, assurance, ai, admin).
+change_management, invoicing, commercial, contracts, assurance, ai, admin).
 
 Resolution (`resolveLevel`): per-user `overrides` on the `project_memberships` row beat the
 membership's template (`permission_templates` row, falling back to the shared
@@ -133,13 +133,19 @@ Effect on operational tools: an unexpired grant satisfies any `requireTool(…, 
 | Self-certification is recorded, not hidden: satisfying an obligation with evidence the caller submitted writes `selfCertified: true` into the ledger payload | obligation `/satisfy` route, same file |
 | Detector runs are restricted to assurance-role holders or company owner/admin | `POST /projects/:projectId/detectors/run` |
 | AI proposals require a human with the *target tool's* `standard` permission to apply — approving an AI-drafted daily log needs the same right as writing one | `gateReviewer`, `modules/ai/index.ts` |
-| Evidence records always carry `submittedBy`; assertions always carry `claimantId` — the separation is checkable after the fact even where not blocked | `packages/db/src/schema/assurance.ts` |
+| **Payment certification requires a different human than the application's submitter** — `POST /valuations/:valuationId/certify` returns `403 The certifier must not be the valuation's submitter` when the caller is `valuations.submittedBy`. Level separation stacks on identity separation: submitting needs `commercial` `standard`, certifying needs `commercial` **admin**. The certificate persists the variance from the application with a reason (spec B#180), and the certified value is simultaneously written to the assurance layer as a `cost` Assertion claimed by the *certifier* — so certification is itself a reconcilable claim, not a settled fact (see `docs/adr/0008-certification-independence.md`) | `modules/commercial/valuations.ts`, certify route |
+| **EOT assessment independence** — an extension-of-time claim cannot be moved to `assessed` by the user who raised it (`403 An EOT claim cannot be assessed by the user who raised it`); `assessedBy`/`assessedAt` are stamped on the row and the transition is ledgered with the days awarded | `modules/contracts/index.ts`, EOT status route |
+| **Time-bar obligations cannot be quietly rewritten** — a contract event under a time-barred clause materializes an assurance `obligations` row at creation (deadline + `warnDaysBefore`). Serving notice satisfies an *open* obligation only; once the sweep has marked an event `time_barred` and breached its obligation, late service raises a `time_bar_breach_risk` signal and leaves the breach standing — the register records what happened, not what the operator wishes had happened | `sweepTimeBars` + serve-notice route, `modules/contracts/index.ts` |
 
 Residual weakness stated plainly: a company **owner/admin can hold operational admin and be
 granted an assurance role by another admin** — the platform does not yet forbid overlapping
 grants, and evidence/assertions still arrive through the same API pathway (independent
 ingestion channels are Tier-1 roadmap work, `docs/roadmap.md`). The rules above make abuse
-detectable and attributable, not impossible.
+detectable and attributable, not impossible. The certification and EOT rules are
+*identity-level* checks inside one tenant: submitter and certifier can be colleagues in the
+same organization, and nothing yet models the contractual *party* (employer / contractor /
+administrator) an actor represents — party-aware separation is future work on top of the
+`contracts.parties` field.
 
 ---
 
