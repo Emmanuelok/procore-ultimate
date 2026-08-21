@@ -1,0 +1,29 @@
+{
+  "name": "constructos",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ConstructOS — AI-native construction delivery & assurance platform (Procore-class capability with an evidence-first architecture)",
+  "license": "UNLICENSED",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm -r --workspace-concurrency=1 build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "lint": "pnpm -r lint",
+    "dev": "concurrently -n api,web -c blue,green \"pnpm --filter @constructos/api dev\" \"pnpm --filter @constructos/web dev\"",
+    "db:generate": "pnpm --filter @constructos/db generate",
+    "db:migrate": "pnpm --filter @constructos/api db:migrate"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.5",
+    "typescript": "~5.9.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}
