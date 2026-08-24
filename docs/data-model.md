@@ -211,3 +211,46 @@ code (`modules/contracts/clause-library.ts`, ~80 clauses across 8 forms); see
 | `contracts` | Contract instance of a standard form | `form` (ContractForm: FIDIC Red 1999/2017, Yellow/Silver 2017, NEC3/NEC4 ECC, JCT SBC/DB 2016, bespoke), `necOption` (A–F, required iff NEC), `parties` jsonb (employer/contractor/administrator), base/commencement/completion dates, `contractSum`, retention %/cap, `defectsPeriodMonths`, `ldRatePerDay`/`ldCap` (#249–250), **`particularConditions` jsonb** (`[{clauseRef, amendment}]` — the PC overlay, #201–202), `status` draft→executed→completed\|terminated | project 1—n; creation materializes the form's standing obligations into assurance `obligations` (#260); agreed EOT awards move `completionDate` (ledgered) |
 | `contract_events` | Event / notice register (#225–231) | unique `(contractId, number)`; `kind` (early_warning/claim_notice/compensation_event/variation_instruction/eot_claim/payment_notice/pay_less_notice/delay_event/other), `clauseRef`, `eventDate`, **`noticeDeadline`** (computed `eventDate + timeBarDays` from the clause library at creation, #225), notice served at/method/reference (#227–228), `status` open/notice_served/**time_barred**/resolved/withdrawn, **`obligationId`** → the materialized deadline obligation, cost/time impact estimates | contract 1—n; the lazy sweep (`sweepTimeBars`) time-bars stale open events, breaches the linked obligation and raises a critical `time_bar_missed` signal (#230) |
 | `eot_claims` | Extension-of-time claims (#237–238) | unique `(contractId, number)`; `clauseRef`, `eventIds` jsonb[] (supporting contract events, validated to belong to the contract), `daysClaimed`/`daysAwarded`, `status` notified→submitted→assessed→agreed\|rejected\|referred, **`assessedBy`/`assessedAt`** (assessor ≠ creator enforced, `modules/contracts/index.ts`), `narrative` | contract 1—n; agreement of an assessed award extends the contract completion date |
+
+## 14. Schedule — `schedule.ts`
+
+Native schedule core (spec Vol I §2.6 subset / Phase 3); served by
+`apps/api/src/modules/schedule/`. The defining property: **dates are computed, then
+persisted.** The pure CPM engine (`apps/api/src/lib/cpm.ts`) derives every date from
+durations + dependencies + constraints + actuals, and `recomputeSchedule` writes the
+result back after every task/dependency mutation — so lists, the Gantt and forensic
+comparisons read stored columns and never run a live CPM pass
+(`docs/adr/0009-cpm-engine-and-persisted-dates.md`).
+
+| Table | Purpose | Key columns | Relationships |
+|---|---|---|---|
+| `schedules` | Schedule container; one active per project | `projectStart` (ISO date = CPM day 0), `isActive` (first schedule auto-activates; `/activate` swaps atomically), **`computedFinish`/`computedDurationDays`/`lastComputedAt`** stamped on every recompute | project 1—n; schedule 1—n tasks/dependencies/baselines; delete cascades all three in one transaction |
+| `schedule_tasks` | Task/milestone rows | `durationDays` (0 = milestone), `constraintType` (TaskConstraintType) + `constraintDate` (required for dated constraints), `actualStart`/`actualFinish` (pin the CPM passes; finish requires start), `percentComplete`, `responsibleId` (#360), `locationId`, `sortOrder`; **computed & persisted:** `startDate`, `finishDate` (inclusive last day), `totalFloat`, `isCritical` | schedule 1—n; referenced by `delay_events.taskId` as the fragnet insertion point |
+| `schedule_dependencies` | Typed logic links (#354) | `depType` FS/SS/FF/SF (DependencyType), `lagDays` (may be negative = lead); unique `(predecessorId, successorId, depType)` | creation is cycle-guarded: the engine runs over existing + candidate **before** insert; a cycle is a 409 naming its members |
+| `schedule_baselines` | Immutable as-planned snapshots (#355–357) | `snapshot` jsonb — one row per task `{taskId, name, wbsCode, durationDays, startDate, finishDate, totalFloat, isCritical}` captured after a forced recompute; `projectStart` + `computedFinish` frozen with it; `capturedBy` | schedule 1—n; the comparison substrate for `/baselines/:id/compare` and the forensics as-planned-vs-as-built view |
+
+## 15. Forensics — `forensics.ts`
+
+Delay & disruption forensics (spec Vol II Domain D / M9); served by
+`apps/api/src/modules/forensics/`. Delay events are the atoms; claims assemble events
+into the cause → effect → entitlement → quantum chain with evidence links.
+
+| Table | Purpose | Key columns | Relationships |
+|---|---|---|---|
+| `delay_events` | Delay event register with entitlement classification (#265–268) | unique `(projectId, number)`; `cause` (DelayCause), `excusable`/`compensable` int flags (**compensable ⇒ excusable enforced at the API**), `status` (DelayEventStatus: open/assessed/withdrawn/closed), `startDate` + `durationDays` (the modelled delay), **`taskId`/`scheduleId`** — the fragnet insertion point (a bare taskId resolves against the active schedule and the resolved scheduleId is stored), `contractEventId` (the notice raised, validated), `evidenceIds` jsonb[] (assurance evidence, validated — #306), **`tiaResult`** jsonb `{completionDeltaDays, beforeFinish, afterFinish, computedAt}` — persisted by `/tia`, nulled when dates or insertion point change | project 1—n; referenced by `forensic_claims.delayEventIds`; TIA runs the pure fragnet insertion in `modules/forensics/tia.ts` |
+| `forensic_claims` | Claims workspace (#304–320 subset) | unique `(projectId, number)`; `kind` (ClaimKind: delay/disruption/prolongation/acceleration), `status` (ClaimStatus) draft→submitted→assessed→agreed\|rejected (withdrawn pre-agreement), `contractId`/`clauseRef`, `delayEventIds` jsonb[] (validated), **`chain`** jsonb `{cause, effect, entitlement, quantum}` (#305 — frozen with `delayEventIds` once the claim leaves draft), claimed vs assessed days/amounts, `prolongation` jsonb build-up `{prelimsRatePerDay, compensableDays, amount, derivation}`, **`chronology`** jsonb + `chronologyAt` — auto-assembled from platform records (#318) and cached with its generation time, **`assessedBy`** (assessor ≠ `createdBy` enforced — 403) | project 1—n; chronology reads delay events, contract events, RFIs, daily-log delay sections and instructed variations |
+
+## 16. Payments — `payments.ts`
+
+Statutory payment security (spec Vol II Domain F / M10); served by
+`apps/api/src/modules/payments/`. Regime rules (day counts, deemed rules, interest,
+suspension notice periods) live in **code** — `modules/payments/regimes.ts`, five
+regimes (UK HGCRA / SG SOPA / NSW SOPA / MY CIPAA / NZ CCA); see
+`docs/adr/0010-statutory-payment-regimes-in-code.md`. The tables hold only tenant data:
+served claims and responses with their computed statutory timelines.
+
+| Table | Purpose | Key columns | Relationships |
+|---|---|---|---|
+| `payment_claims` | Statutory payment claims (#358–360) | unique `(projectId, number)`; `regime` (PaymentRegime), `referenceDate` (the statutory reference date the timeline runs from), `claimedAmount`/`currency`, service record (`servedAt`, `serviceMethod` email/portal/registered_post/letter, `serviceReference`), **computed on serve:** `responseDeadline` + `finalPaymentDate` (both from the later of referenceDate and service date), `status` (PaymentClaimStatus: draft/served/responded/**deemed**/paid/suspended/referred — `referred` has no workflow behind it yet), **`obligationId`** → the materialized response-deadline obligation, `paidAt`/`paidAmount`; index `(status, responseDeadline)` serves the deemed sweep | project 1—n; optional links to `contracts` and `valuations` (validated); the lazy sweep (`sweepDeemed`) flips overdue unanswered served claims to `deemed`, breaches the obligation and raises a critical `payment_deemed_liability` signal exactly once |
+| `payment_responses` | Payment notices / pay-less notices (#359, #365) | `kind` (PaymentResponseKind), `amount`, `reasons` (**required when a pay-less notice pays less than claimed** — ground-stating), `breakdown` jsonb[], `servedAt`, **`late`** int — served after the statutory deadline (a late response is recorded, breaches the obligation, raises a high `late_payment_response` signal and rescues no status), `servedBy` | claim 1—n; the latest **on-time** response amount values the outstanding book and the interest base |
+| `suspension_notices` | Right-to-suspend notices (#362) | `servedAt`, **`effectiveFrom`** = service + the regime's statutory notice period, `liftedAt` (lifting returns the claim to `deemed` — the liability is unaffected), `servedBy` | claim 1—n; only a `deemed` claim can be suspended (documented simplification) |

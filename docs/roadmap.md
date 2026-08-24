@@ -4,17 +4,20 @@ Maps the committed codebase onto the master specification
 (`docs/master-specification.md`), then lays out the remaining build mirroring the
 Volume III module tiers. Function numbers cite the spec: Vol I numbers are the Procore
 inventory (#1–804), Vol II numbers run continuously across the gap domains (#1–~1100,
-Domain A starting at #1, Domain B at #115, Domain C at #193, Domain S at #859, Domain X
-at #995).
+Domain A starting at #1, Domain B at #115, Domain C at #193, Domain D at #265, Domain F
+at #358, Domain S at #859, Domain X at #995).
 
-Two increments are delivered: **Phase 0/1 — Foundation** (the delivery subset + assurance
-skeleton) and **Phase 2 — Tier-2 commercial seed (M7 + M8)**. Phase 2 is a deliberate
-deviation from the spec Vol III §5 ordering (assurance core before commercial depth): the
-commercial engine landed before the Tier-1 ingestion layer (M6). The deviation is contained
-— M7 was built so that every certified value crosses into the assurance layer as an
-`Assertion`, so nothing shipped that Tier-1 will have to unwind; but **M6 remains the gate
-to the sellable assurance claim** and is called out as such below. The "parity trap"
-warning (Vol III §1) is still treated as binding: Volume I parity stays last.
+Three increments are delivered: **Phase 0/1 — Foundation** (the delivery subset +
+assurance skeleton), **Phase 2 — Tier-2 commercial seed (M7 + M8)**, and **Phase 3 —
+Tier-2 forensics & payment security (M9 + M10, on a native §2.6 schedule core)**.
+Phases 2–3 are a deliberate deviation from the spec Vol III §5 ordering (assurance core
+before commercial depth): the commercial/forensic engines landed before the Tier-1
+ingestion layer (M6). The deviation is contained — M7 was built so that every certified
+value crosses into the assurance layer as an `Assertion`, and M9/M10 materialize their
+deadlines and breaches into the same `obligations`/`signals` tables, so nothing shipped
+that Tier-1 will have to unwind; but **M6 remains the gate to the sellable assurance
+claim** and is called out as such below. The "parity trap" warning (Vol III §1) is still
+treated as binding: Volume I parity stays last.
 
 ---
 
@@ -65,12 +68,15 @@ small subsets of their spec sections.
 | M6 Ingestion Layer | **Not started** — today all data arrives through ConstructOS's own API |
 | M7 Measurement & valuation | **Delivered (Phase 2, subset)** — BoQ/taking-off/valuation/certification/variations; see the Phase 2 section for the exact function-number in/out list |
 | M8 Contract intelligence | **Delivered (Phase 2, subset)** — clause library in code, PC overlay, time-bar engine, EOT, LD exposure, obligation register; see Phase 2 section |
-| M9–M19 | Not started |
+| M9 Delay & disruption forensics | **Delivered (Phase 3, subset)** — delay events, fragnet TIA, as-planned vs as-built, scoped windows attribution, prolongation seed, claims chain + chronology; see Phase 3 section |
+| M10 Payment security | **Delivered (Phase 3, subset)** — five statutory regimes in code, deadline engine, deemed-liability sweep, suspension, interest; see Phase 3 section |
+| M11–M19 | Not started |
 
 Not implemented at all (deliberately): Vol I §1.1–1.3 (bid/estimating/prequal), §2.2 specs,
-§2.6 schedule, §2.9/2.11–2.13, §3 financial suite, §4 quality & safety, §5 resources,
-§6 analytics; Vol II domains D–K, M–R, T–Z beyond the seeds listed above (Domains B and C
-gained real coverage in Phase 2, below).
+§2.9/2.11–2.13, §3 financial suite, §4 quality & safety, §5 resources,
+§6 analytics; Vol II domains E, G–K, M–R, T–Z beyond the seeds listed above (Domains B and
+C gained real coverage in Phase 2, Domains D and F plus the §2.6 schedule core in Phase 3,
+below).
 
 ---
 
@@ -143,6 +149,9 @@ back-to-back flow-down; #261–264 obligation dashboard, clause-tagged correspon
 privilege segregation. **No statutory payment engines** — HGCRA / Security-of-Payment
 regimes are Domain F (M10); deadlines that count backwards from a payment date (JCT Pay
 Less) are described in the clause library but deliberately carry no computed time bar.
+*(That gap is now filled by Phase 3's M10 — the statutory clocks run in
+`modules/payments/regimes.ts`, not in the clause library, which keeps its refusal to
+compute what it cannot compute correctly.)*
 
 ### Phase-2 status against the old Tier-2 acceptance criteria
 
@@ -154,7 +163,99 @@ Less) are described in the clause library but deliberately carry no computed tim
    delivered** (deadline radar + `warnDaysBefore` obligations + `/obligations/upcoming`);
    firing it on a *live* contract is a deployment milestone, not an engineering one.
 3. *"One delay analysis assembled solely from ledgered contemporaneous records (D domain)"*
-   — **not started**; that is M9.
+   — **mechanism delivered in Phase 3**: the claims chronology assembler reads only
+   platform records that were ledgered when written (delay events, contract events/notices,
+   RFIs, daily-log delay entries, instructed variations), and TIA runs are persisted and
+   ledgered. Running it on a *live* dispute is a deployment milestone, as with criterion 2.
+
+---
+
+## Phase 3 — Delivered: Tier-2 forensics & payment security (M9 + M10 + schedule core)
+
+Committed and tested: `apps/api/src/lib/cpm.ts` (pure CPM engine) +
+`apps/api/src/modules/schedule/` + `modules/forensics/` + `modules/payments/` (with
+colocated test suites), schema `packages/db/src/schema/schedule.ts` / `forensics.ts` /
+`payments.ts`, web pages `apps/web/src/pages/schedule/` / `pages/forensics/` /
+`pages/payments/`. Architecture write-up in `docs/architecture.md` §12–14; table catalogs
+in `docs/data-model.md` §14–16; segregation-of-duties additions in `docs/security.md`
+§2.4; ADRs 0009 (pure CPM engine, persisted computed dates) and 0010 (statutory regimes
+in code).
+
+The completed criterion 3 mechanism above rests on the schedule core: delay analysis
+needs a programme, so a **Vol I §2.6 subset** shipped alongside the Vol II modules —
+#351 native creation/editing, #352–353 Gantt + critical path (pure-SVG client side),
+#354 FS/SS/FF/SF dependencies with lag, #355–357 baselines & comparison, #358/#361
+progress, #359 lookahead, #360 assignment, #371 health indicators (a DCMA-style
+ten-check subset that also serves Domain D #283). Not built from §2.6: #349–350 XER/MPP
+import, #362–365 cross-tool linkage (submittal/RFI/inspection/action-plan), #366
+milestone tracking beyond zero-duration tasks, #367–370 calendar view, change
+notifications, narrative attachments, resource loading. No working calendars — durations
+are calendar days (ADR 0009).
+
+As with Phase 2, the boundary is drawn function-by-function:
+
+### M9 — Delay & disruption forensics (Domain D)
+
+**In:**
+
+| Spec functions | What shipped |
+|---|---|
+| #265, #267 | delay event register with cause classification (10 `DELAY_CAUSES`) and excusable/compensable entitlement classification, compensable ⇒ excusable enforced |
+| #266 (partial), #268 (partial) | delay → contract-clause mapping via the linked `contractEventId` (the served notice carries the clause); culpability attribution rests on the classification flags + validated assurance `evidenceIds` per event — no dedicated attribution workflow |
+| #269 | as-planned vs as-built against a captured baseline, actuals preferred over forecast, per-task and headline slip |
+| #272 | Time Impact Analysis by fragnet insertion (`modules/forensics/tia.ts`): virtual fragnet after the struck task, `start_no_earlier_than` on the delay start, before/after completion delta persisted per event |
+| #273 (scoped) | windows attribution with configurable boundaries — events bucketed by start date, classification days and per-event TIA deltas summed per window; the API response itself states the method limitation |
+| #283 | programme quality assessment — the DCMA-style subset in `modules/schedule/quality.ts` |
+| #299 (seed) | prolongation from time-related preliminaries: explicit rate or derived from `prelims_time` BQ items over the programme duration, derivation string returned |
+| #304–306 | claims workspace with the enforced cause-effect-entitlement-quantum chain (frozen after draft), delay-event linking, evidence linking via events |
+| #310 (partial — the response side) | claim assessment with enforced independence: assessor ≠ creator (403), `assessedBy` stamped, assessed days/amount ledgered with the transition (the code cites #310 at the enforcement point, `modules/forensics/index.ts`) |
+| #318 | claim chronology auto-assembly from platform records (delay events, contract events + notices, RFIs, daily-log delay sections, instructed variations), cached with generation time |
+
+**Out (explicitly not built):** #270–271 impacted-as-planned and collapsed as-built
+methods; **#274–277 retrospective longest path, time slice, SCL Protocol (2nd ed.)
+methodology alignment and AACE RP 29R-03 method selection** — the platform runs *one*
+prospective method (fragnet TIA) and labels its windows view honestly rather than
+claiming protocol coverage; #278–282 concurrency, pacing, float ownership/consumption,
+critical-path migration tracking; #284–288 programme-revision forensics
+(out-of-sequence, logic-change, constraint-manipulation, duration-change detection,
+baseline integrity verification); #289–298 disruption as a discipline — **#290 measured
+mile**, earned-value quantification, industry curves, cumulative impact, trade stacking,
+learning curve, acceleration build-ups; #300–303 site/head-office overheads —
+**#301 Hudson/Emden/Eichleay formulae** (named out of scope in
+`modules/forensics/prolongation.ts`), loss of profit, finance charges; #307–309 record
+sufficiency scoring, gap identification, submission package assembly; #310's structured
+rebuttal management beyond the assess/reject transition; #311–320 counterclaims,
+valuation ranges, success-probability modelling, global/total-cost claim warnings,
+expert-report schedules, Scott Schedules, portfolio claim roll-up.
+
+### M10 — Payment security (Domain F)
+
+**In:**
+
+| Spec functions | What shipped |
+|---|---|
+| #358–360 | statutory payment claims per regime with the deadline engine: response deadline + final payment date computed from the later of the statutory reference date and service, calendar or business day basis per regime |
+| #361 | deemed-liability consequence: lazy sweep flips unanswered served claims to `deemed`, breaches the materialized obligation, raises a critical `payment_deemed_liability` signal embedding the regime's deemed rule; deadline radar + `warnDaysBefore` obligations give the pre-expiry warning |
+| #362 | right-to-suspend notices with the regime's statutory notice period (`effectiveFrom`), lift returning the claim to `deemed` |
+| #364–366, #367 (NSW only), #368–369 | five regimes in code (`modules/payments/regimes.ts`): UK HGCRA (+#365 payment notice / pay-less engine with ground-stating), Singapore SOPA, NSW SOPA, Malaysia CIPAA (deemed = disputed, modelled honestly), NZ CCA — each with documented simplifications (ADR 0010) |
+| #386 (seed) | days-to-pay analytics: status mix, avg served→paid days, outstanding book valued at on-time response amounts, deemed exposure |
+| #387 | late-payment interest: simple ACT/365 at the regime's pinned modelled rate on the outstanding amount, statutory formula quoted in the response |
+
+**Out (explicitly not built):** #363 entitlement calculation per statute (the claimed
+amount is operator-entered, optionally linked to a valuation); #367 Australian
+state-by-state variants beyond NSW; #370–372 Ireland CCA, Canadian prompt payment,
+US prompt-payment statutes; **#373–377 the lien family** (mechanic's lien deadline
+engines, preliminary notices, notices of intent, filings/releases, stop notices);
+**#378–381 retention trusts and project bank accounts** (PBA integration, cascading
+payment verification, tier-2/3 visibility); #382 pay-when-paid validity checking;
+#383–384 retention release deadlines and bond substitution; #385, #388 supply-chain
+payment reporting duties; #389–391 insolvency early warning and financial-health
+monitoring; #392–393 set-off justification register and unlawful-deduction detection.
+**No adjudication case management** — that is Domain E (#329–333, module M15); the
+`referred` claim status exists in `PAYMENT_CLAIM_STATUSES` with no workflow behind it,
+and each regime's `adjudicationNote` is descriptive only. Statutory day counts are an
+engineering model (no public-holiday calendars, pinned interest rates, single-base-date
+timelines) — documented in the regime file header and ADR 0010, and not legal advice.
 
 ---
 
@@ -189,50 +290,66 @@ generate exactly the assertions this tier must reconcile.
 
 ---
 
-## Tier 2 remainder — M9–M11
+## Tier 2 remainder — M11
 
 "A variance is an observation; a variance mapped to a FIDIC sub-clause with a live time bar
-is an action" (spec Vol III §5 Phase 3). M7 and M8 (delivered above) built the sub-clause
-and the live time bar; the remaining Tier-2 modules build the forensics and the money
-protection around them.
+is an action" (spec Vol III §5 Phase 3). M7–M10 (delivered above) built the sub-clause,
+the live time bar, the forensic method and the statutory clocks; one Tier-2 module
+remains.
 
 | Module | Status | Domain / representative functions | Hooks now in place |
 |---|---|---|---|
 | M7 Measurement & valuation | **Delivered (subset — see Phase 2)** | B#115–192 | — |
 | M8 Contract intelligence | **Delivered (subset — see Phase 2)** | C#193–264 | — |
-| M9 Delay & disruption forensics | Open | D#265–320: as-planned vs as-built, window analysis, concurrent delay, contemporaneous records | `contract_events` (kind `delay_event`, cost/time impact estimates, clause refs), `eot_claims.eventIds`, `variations.timeImpactDays`, daily logs, ledger timestamps — the contemporaneous record D-domain analysis feeds on now exists as structured data |
-| M10 Payment security | Open | F#358–393: statutory payment regimes (HGCRA/SOP), payment-chain visibility | `payment_certificates` with `dueDate` + variance statements; `contract_events` kinds `payment_notice`/`pay_less_notice`; the clause library already describes payment-clause mechanics it declines to compute (JCT 4.9) — exactly the gap M10 fills with real regime engines |
+| M9 Delay & disruption forensics | **Delivered (subset — see Phase 3)** | D#265–320 | — |
+| M10 Payment security | **Delivered (subset — see Phase 3)** | F#358–393 | — |
 | M11 Independent benchmarking | Open | R#821–858: independent rate/productivity benchmarks | BQ rates + `rateBuildUp` components and variation star rates are the raw material; anonymized cross-tenant aggregates over assertions/reconciliations |
 
 ---
 
 ## Next phase — recommendation
 
-**Recommended: complete Tier 2 with M9 (delay & disruption forensics) + M10 (payment
-security), with M6 ingestion run in parallel if the next engagement is assurance-led.**
+**Recommended: open Tier 3 with M13 (quantitative risk — QSRA/QCRA) paired with M12
+(business case & stage gates), with M6 ingestion still jumping the queue on any
+assurance-led engagement.**
 
 Reasoning, grounded in the spec's own guidance:
 
-1. **M9 and M10 compound what Phase 2 just built.** Delay forensics consumes the contract
-   event register, EOT claims and ledgered contemporaneous records M8 now produces; payment
-   security consumes the certificates, due dates and payment-notice events M7/M8 now
-   produce. Building them next converts existing structured data into the two highest-value
-   dispute artifacts (D and F domains) with no new substrate.
-2. **Tier 3 stays demand-driven.** Spec Vol III §5 Phase 4 is explicit: Tier-3/4 modules
-   are "built in the order your first three institutional customers contractually require
-   them. Do not speculate." Absent that contractual pull, starting M12–M15 before Tier 2 is
-   complete would be speculation.
-3. **The standing caveat: M6 is still the gate.** The spec's sequencing (assurance core
-   first) exists because the sellable claim is reconciliation against *independent*
-   evidence. Phase 2 kept faith with that by making every certified value an Assertion, but
-   until M6 lands there is nothing independent to reconcile it against. If a real
-   engagement materializes, M6 + the Tier-1 acceptance criteria jump the queue — that was
-   true before Phase 2 and remains true after it.
+1. **M13 pairs naturally with the schedule Phase 3 just built.** Quantitative schedule
+   risk analysis (H#457 QSRA Monte Carlo, #458 QCRA) needs exactly the substrate that now
+   exists: a native CPM network with typed dependencies, durations, persisted float and a
+   pure, side-effect-free engine (`apps/api/src/lib/cpm.ts`) that can be run thousands of
+   times over sampled durations without touching the database — the engine's purity was
+   ADR 0009's trade-off and Monte Carlo is where it pays. Three-point estimates and
+   per-risk distributions (H#459–460) are inputs on the existing task rows, P50/P80/P90
+   outputs (H#465) drop out of the iteration loop, and contingency setting/drawdown
+   discipline (H#469–473) reconciles against the commercial summary M7 already computes.
+2. **M12 supplies the governance frame the assurance thesis sells into.** Stage gates,
+   gateway reviews and evidence-pack-backed gate decisions (G#408–413) are direct
+   consumers of the existing obligations/signals/evidence-pack machinery — gate review
+   packs are Merkle evidence packs with a decision register on top. Owner-side capital
+   governance is the buyer the platform is built for.
+3. **The alternative is M11 benchmarking** (R#821–858) — it completes Tier 2 and the raw
+   material (BQ rates, rate build-ups, star rates) exists — but it is only honest as a
+   *cross-tenant* product, which needs more tenants and the M6 ingestion pathway before
+   its benchmarks mean anything. Sequence it behind real multi-tenant data.
+4. **Tier 3 order remains demand-driven in principle.** Spec Vol III §5 Phase 4:
+   modules are "built in the order your first three institutional customers contractually
+   require them. Do not speculate." The M13+M12 recommendation is the default absent that
+   pull — contractual pull overrides it, and either M14 (disbursement, a direct M3
+   consumer) or M15 (dispute support, a direct consumer of M9's claims and chronologies)
+   could be demanded first.
+5. **The standing caveat: M6 is still the gate.** Every phase since the foundation has
+   kept the assurance hooks warm — certificates land as Assertions, payment and notice
+   deadlines land as Obligations, breaches land as Signals — but until M6 lands there is
+   nothing *independent* to reconcile any of it against. A real engagement still moves
+   M6 + the Tier-1 acceptance criteria to the front. That was true before Phase 3 and
+   remains true after it.
 
-**Tier-2 completion criteria carried forward:** the delay-analysis criterion (one analysis
-assembled solely from ledgered contemporaneous records, exported as an evidence pack) and
-the outstanding halves of the Phase-2 criteria above (evidence-side tracing of certified
-valuations; a live-contract time-bar save).
+**Tier-2 completion criteria carried forward:** evidence-side tracing of certified
+valuations (waits on M6+M3); a live-contract time-bar save; and exporting a Phase 3 delay
+analysis as a Merkle evidence pack on a live dispute — the mechanisms exist, the live
+runs are deployment milestones.
 
 ---
 
@@ -286,5 +403,5 @@ is tool-agnostic.
 | Kill risk | Mitigation in this plan |
 |---|---|
 | Evidence independence collapses | M6 ingestion is the first Tier-1 workstream and jumps the queue on any assurance-led engagement; `independenceScore` + separation rule already enforced; certification/EOT separation-of-duties added in Phase 2 (`docs/security.md` §2.4); contractual evidence mandates at project setup |
-| False-positive fatigue | Precision measured before a detector ships (Tier-1 acceptance #3); reviewer feedback loop live since foundation. Phase 2 added two deterministic detectors (`time_bar_missed`, `time_bar_breach_risk`) whose precision is 1.0 by construction — date arithmetic, not inference |
+| False-positive fatigue | Precision measured before a detector ships (Tier-1 acceptance #3); reviewer feedback loop live since foundation. Phase 2 added two deterministic detectors (`time_bar_missed`, `time_bar_breach_risk`) and Phase 3 two more (`payment_deemed_liability`, `late_payment_response`) whose precision is 1.0 by construction — date arithmetic, not inference |
 | Procurement cycle length | Services-led entry: the Tier-1 retrospective detection run *is* the first engagement deliverable |

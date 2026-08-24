@@ -90,10 +90,13 @@ proposals (`gateReviewer`, `modules/ai/index.ts`).
 
 ### 2.2 Layer 2 — per-tool permission levels
 
-`none < read < standard < admin` (`PERMISSION_LEVELS`, ordered by `meetsLevel`) over the 23
+`none < read < standard < admin` (`PERMISSION_LEVELS`, ordered by `meetsLevel`) over the 26
 tools in `TOOLS` (directory, projects, documents, drawings, specifications, bim, twin, rfis,
 submittals, daily_logs, punch, photos, meetings, workflow, budget, commitments,
-change_management, invoicing, commercial, contracts, assurance, ai, admin).
+change_management, invoicing, commercial, contracts, schedule, forensics, payments,
+assurance, ai, admin). The three Phase 3 tools inherit the built-in template baselines via
+the `all(…)` spreads in `permissions.ts` — e.g. `project_manager` gets `standard`,
+`subcontractor` gets `none` — with no per-tool carve-outs added.
 
 Resolution (`resolveLevel`): per-user `overrides` on the `project_memberships` row beat the
 membership's template (`permission_templates` row, falling back to the shared
@@ -136,16 +139,24 @@ Effect on operational tools: an unexpired grant satisfies any `requireTool(…, 
 | **Payment certification requires a different human than the application's submitter** — `POST /valuations/:valuationId/certify` returns `403 The certifier must not be the valuation's submitter` when the caller is `valuations.submittedBy`. Level separation stacks on identity separation: submitting needs `commercial` `standard`, certifying needs `commercial` **admin**. The certificate persists the variance from the application with a reason (spec B#180), and the certified value is simultaneously written to the assurance layer as a `cost` Assertion claimed by the *certifier* — so certification is itself a reconcilable claim, not a settled fact (see `docs/adr/0008-certification-independence.md`) | `modules/commercial/valuations.ts`, certify route |
 | **EOT assessment independence** — an extension-of-time claim cannot be moved to `assessed` by the user who raised it (`403 An EOT claim cannot be assessed by the user who raised it`); `assessedBy`/`assessedAt` are stamped on the row and the transition is ledgered with the days awarded | `modules/contracts/index.ts`, EOT status route |
 | **Time-bar obligations cannot be quietly rewritten** — a contract event under a time-barred clause materializes an assurance `obligations` row at creation (deadline + `warnDaysBefore`). Serving notice satisfies an *open* obligation only; once the sweep has marked an event `time_barred` and breached its obligation, late service raises a `time_bar_breach_risk` signal and leaves the breach standing — the register records what happened, not what the operator wishes had happened | `sweepTimeBars` + serve-notice route, `modules/contracts/index.ts` |
+| **Forensic claim assessment independence** — a delay/disruption claim cannot be moved to `assessed` by the user who created it (`403 A claim cannot be assessed by the user who created it`); `assessedBy` is stamped, the assessed days/amount are ledgered with the transition, and the claim's cause-effect-entitlement-quantum chain and supporting event set are frozen once it leaves `draft` — the narrative that was submitted is the narrative that gets assessed. Same identity-level pattern as EOT assessment and payment certification (ADR 0008) | `modules/forensics/index.ts`, claim status route |
+| **Payment response authority is grounds-based and time-boxed** — a pay-less notice for less than the claimed amount without stated reasons is a 400 (statutory ground-stating, spec F#365); a response served after the statutory deadline is recorded with `late = 1`, **rescues no status** (a deemed claim stays deemed), breaches the response obligation and raises a high `late_payment_response` signal; served claims are immutable (only drafts can be edited). The payer cannot retroactively construct a compliant response history | `modules/payments/index.ts`, respond route |
+| **Deemed-liability signal path** — the same materialization pattern as time bars: serving a payment claim creates an assurance `obligations` row for the statutory response deadline (`warnDaysBefore: 3`), so the payment clock and the obligation register agree on one date. The lazy sweep (`sweepDeemed`, run on every read of the register) flips an unanswered served claim to `deemed` exactly once, breaches the obligation and raises a **critical `payment_deemed_liability` signal** whose explanation embeds the regime's statutory deemed rule. Payment satisfies an *open* obligation only — paying late does not un-breach the register | `sweepDeemed` + serve/respond/mark-paid routes, `modules/payments/index.ts` |
 
 Residual weakness stated plainly: a company **owner/admin can hold operational admin and be
 granted an assurance role by another admin** — the platform does not yet forbid overlapping
 grants, and evidence/assertions still arrive through the same API pathway (independent
 ingestion channels are Tier-1 roadmap work, `docs/roadmap.md`). The rules above make abuse
-detectable and attributable, not impossible. The certification and EOT rules are
-*identity-level* checks inside one tenant: submitter and certifier can be colleagues in the
-same organization, and nothing yet models the contractual *party* (employer / contractor /
-administrator) an actor represents — party-aware separation is future work on top of the
-`contracts.parties` field.
+detectable and attributable, not impossible. The certification, EOT and forensic-claim
+rules are *identity-level* checks inside one tenant: submitter and certifier (or claim
+author and assessor) can be colleagues in the same organization, and nothing yet models
+the contractual *party* (employer / contractor / administrator) an actor represents —
+party-aware separation is future work on top of the `contracts.parties` field. The same
+caveat applies with more force in payments: the platform records both sides of a payment
+claim (claimant service and payer response) through one tenant's `payments` tool with no
+party-role check on who may respond — the statutes' teeth (deadlines, ground-stating,
+deemed liability) are enforced mechanically, but *who* is entitled to author a response
+is an organizational matter until party modelling lands.
 
 ---
 

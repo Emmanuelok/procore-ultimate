@@ -44,7 +44,7 @@ pnpm workspace, Node ≥ 22, TypeScript 5.9 strict ESM throughout (`package.json
 | `packages/shared` | `@constructos/shared` | Domain vocabulary: enums (`src/enums.ts`), RBAC model + built-in permission templates (`src/permissions.ts`), wire types (`src/types.ts`), the eight assurance primitive interfaces (`src/primitives.ts`). No runtime dependencies. |
 | `packages/ledger` | `@constructos/ledger` | Pure crypto core: RFC 8785-style canonical JSON (`src/canonical.ts`), SHA-256 helpers (`src/hash.ts`), hash chain build/verify (`src/chain.ts`), Merkle root/proof (`src/merkle.ts`). Unit-tested in `src/ledger.test.ts`. |
 | `packages/db` | `@constructos/db` | Drizzle ORM schema, one file per domain (`src/schema/*.ts`), committed SQL migrations (`drizzle/`). Postgres dialect; no FK constraints — relationships are by convention (see `docs/data-model.md`). |
-| `apps/api` | `@constructos/api` | Fastify 5 API. Composition root `src/app.ts`, env config `src/config.ts`, auth plugin `src/plugins/auth.ts`, helpers `src/lib/*.ts`, fifteen feature modules `src/modules/*/`, test harness `src/test/helpers.ts`. |
+| `apps/api` | `@constructos/api` | Fastify 5 API. Composition root `src/app.ts`, env config `src/config.ts`, auth plugin `src/plugins/auth.ts`, helpers `src/lib/*.ts` (incl. the pure CPM engine `src/lib/cpm.ts`), eighteen feature modules `src/modules/*/`, test harness `src/test/helpers.ts`. |
 | `apps/web` | `@constructos/web` | Vite 8 + React 19 + Tailwind v4 SPA. Route table `src/App.tsx`, API client `src/lib/api.ts`, auth context `src/lib/auth.tsx`, shared UI kit `src/ui/`, feature pages `src/pages/*/`. Client-side PDF rendering via `pdfjs-dist`, IFC via `web-ifc` + `three`. |
 | `docs/` | — | This documentation set plus the master specification. |
 | `docker-compose.yml` | — | Postgres 16 for production-like runs. |
@@ -65,7 +65,7 @@ flowchart LR
     end
     subgraph API["apps/api (Fastify, port 4000)"]
         AUTH["auth plugin<br/>plugins/auth.ts"]
-        MODS["15 feature modules<br/>modules/*/index.ts"]
+        MODS["18 feature modules<br/>modules/*/index.ts"]
         LEDGER["appendLedger<br/>lib/ledger.ts"]
         STORE["content-addressed storage<br/>lib/storage.ts"]
     end
@@ -117,7 +117,7 @@ flowchart LR
   with `TRUST_PROXY=true`. `railway.json` declares the Dockerfile build and the
   `/api/v1/health` healthcheck; the full operator runbook is `docs/deployment.md`.
 - **AI**: optional outbound dependency on the Anthropic API, gated on `ANTHROPIC_API_KEY`
-  (`apps/api/src/modules/ai/service.ts`); see §12.
+  (`apps/api/src/modules/ai/service.ts`); see §15.
 - **Health**: `GET /api/v1/health` reports which database backend is live (`app.ts`).
 
 ---
@@ -196,7 +196,7 @@ Key properties, all visible in `plugins/auth.ts`:
 
 ## 6. Module inventory
 
-Fifteen Fastify plugins, each `apps/api/src/modules/<name>/index.ts`, all registered in
+Eighteen Fastify plugins, each `apps/api/src/modules/<name>/index.ts`, all registered in
 `src/app.ts` under the `/api/v1` prefix. "Tool" is the `requireTool` key from
 `packages/shared/src/permissions.ts`; tables are from `packages/db/src/schema/`. Sibling
 modules are being developed concurrently — the contracts below come from route registration
@@ -219,6 +219,9 @@ and schema, not implementation internals.
 | `ai` | `ai` (read/standard) | `aiRuns`, `aiReviewQueue` | `/projects/:id/ai/{search,assist,submittal-review,daily-log-draft,rfi-evaluate,sheet-name,photo-intel}`, `/ai/review` (+`approve/reject`), `/ai/runs` | Vol I §6.4 #759–775 subset; Domain X #1019–1021 |
 | `commercial` | `commercial` | `boqs`, `boqItems`, `takeoffLines`, `valuations`, `valuationLines`, `paymentCertificates`, `variations` | `/projects/:id/boqs`, `/boqs/:id` (+`summary`), `/boqs/:id/items`, `/boq-items/:id/takeoff` (+`apply`), `/projects/:id/valuations`, `/valuations/:id/{lines,submit,certify}`, `/projects/:id/certificates`, `/projects/:id/variations` (+`status`, `value`), `/projects/:id/commercial/summary` | Vol II Domain B (M7) #115–116, #135–140, #145/149, #162–171, #179–180, #184 seed |
 | `contracts` | `contracts` | `contracts`, `contractEvents`, `eotClaims` (+ writes assurance `obligations`, `signals`) | `/contract-forms` (+`/:form/clauses`), `/projects/:id/contracts` (+`status`, `deadlines`), `/contracts/:contractId/events` (+`serve-notice`, `status`), `/contracts/:contractId/eot-claims` (+`status`), `/contracts/:contractId/ld-exposure` | Vol II Domain C (M8) #193–196, #200–204 subset, #214–215, #225–231, #237–238, #249–250, #260 |
+| `schedule` | `schedule` | `schedules`, `scheduleTasks`, `scheduleDependencies`, `scheduleBaselines` | `/projects/:id/schedules` (+`activate`, `compute`), `…/schedules/:id/tasks` (+`reorder`), `/schedule-tasks/:taskId`, `…/schedules/:id/dependencies`, `…/baselines` (+`compare`), `…/lookahead`, `…/quality` | Vol I §2.6 #351, #353–361; #371 / Domain D #283 (health check) |
+| `forensics` | `forensics` | `delayEvents`, `forensicClaims` (+ reads schedule, contracts, commercial, field, assurance tables) | `/projects/:id/delay-events` (+`status`, `tia`), `/projects/:id/forensics/{as-planned-vs-as-built,windows,prolongation}`, `/projects/:id/claims` (+`status`, `chronology`) | Vol II Domain D (M9) #265, #267–269, #272–273 (scoped), #283, #299, #304–306, #310, #318 |
+| `payments` | `payments` (regime library: authenticated only) | `paymentClaims`, `paymentResponses`, `suspensionNotices` (+ writes assurance `obligations`, `signals`) | `/payment-regimes` (+`/:regime`), `/projects/:id/payment-claims` (+`serve`, `respond`, `suspend`, `mark-paid`, `interest`), `/projects/:id/suspension-notices/:id/lift`, `/projects/:id/payments/{deadlines,analytics}` | Vol II Domain F (M10) #358–362, #364–369 subset, #386–387 |
 
 Shared helpers used by all modules (`apps/api/src/lib/`): `ids.ts` (prefixed nanoid),
 `numbering.ts` (atomic per-project record counters, spec #72), `pagination.ts`
@@ -303,7 +306,7 @@ Upload → extraction → sheet/revision model → markups/pins. All in
    the sheet number and title from each page's text stream and classify discipline from the
    number prefix (A→architectural, S→structural, …) — spec Vol I #257–258, #266. Low-confidence
    extractions set `drawing_sheets.needsReview = 1`, feeding the human naming-review queue
-   (#258); the AI `sheet_naming` agent (§12) can propose corrections.
+   (#258); the AI `sheet_naming` agent (§15) can propose corrections.
 4. **Sheet/revision model**: a `drawing_sheets` row is the logical sheet, unique per
    `(projectId, number)`; each upload appends a `drawing_revisions` row (revision label,
    source set, `pageIndex`, extracted text, calibration) and supersedes the previous one
@@ -496,7 +499,217 @@ decides a claim's survival is itself tamper-evident (§7).
 
 ---
 
-## 12. AI layer
+## 12. Schedule core & CPM
+
+Spec Vol I §2.6 subset, built in Phase 3 as the substrate the delay-forensics module (§13)
+runs on. Engine `apps/api/src/lib/cpm.ts` (+ `cpm.test.ts`), routes
+`apps/api/src/modules/schedule/index.ts`, DCMA-style health check
+`modules/schedule/quality.ts`, schema `packages/db/src/schema/schedule.ts`, web workspace
+`apps/web/src/pages/schedule/` (editable task table + dependency editor, pure-SVG Gantt
+with baseline ghost bars/critical bars/float whiskers, baseline-compare, lookahead and
+health panels).
+
+1. **The engine is pure** — `computeCpm(tasks, deps, {projectStart})` does no I/O and is
+   unit-tested against hand-computed textbook networks (`lib/cpm.test.ts`). Its conventions
+   are the module's law (see `docs/adr/0009-cpm-engine-and-persisted-dates.md`):
+   time is whole days from `projectStart` (day 0); a task occupies `[start, start + d)` —
+   the **finish is exclusive internally**, which keeps dependency math uniform
+   (FS: `succ.ES = pred.EF + lag`), while the reported `finishDate` is the **inclusive**
+   last day of work (`= startDate` for zero-duration milestones). All four dependency
+   types (FS/SS/FF/SF, `DEPENDENCY_TYPES`) with positive or negative lag (leads).
+   Constraints (`TASK_CONSTRAINT_TYPES`): `start_no_earlier_than` bounds the forward pass,
+   `must_start_on` pins both passes (and can create **negative float — a real signal, not
+   an error**), `finish_no_later_than` caps the late finish and goes negative when
+   breached. Actuals pin the passes: `actualStart` pins ES, `actualFinish` pins EF and
+   overrides duration. Dependency cycles abort the computation and report the member ids.
+2. **Computed dates are persisted, not derived on read.** `recomputeSchedule`
+   (`modules/schedule/index.ts`) is the single recompute code path: it runs the engine and
+   persists per-task `startDate`/`finishDate`/`totalFloat`/`isCritical` plus the schedule
+   header's `computedFinish`/`computedDurationDays`/`lastComputedAt`. It is called after
+   **every** task/dependency mutation (and by the explicit `POST …/compute`), so stored
+   dates are never stale — and reads (lists, Gantt, forensic comparisons) never pay a live
+   CPM pass. Trade-off analysis in ADR 0009.
+3. **Cycles cannot be persisted**: creating a dependency runs the engine over
+   existing + candidate *before* the insert and returns 409 naming the cycle members —
+   a link that cannot schedule never lands. (A cycle can still be *reported* defensively
+   by the compute summary; the recompute path then leaves existing dates untouched.)
+4. **Baselines are immutable snapshots** (#355–357): `scheduleBaselines.snapshot` stores
+   every task's computed dates/float/criticality at capture time (capture forces a fresh
+   recompute first). `GET …/baselines/:id/compare` reports per-task start/finish variance,
+   float change, critical-path churn (`becameCritical`/`droppedCritical`), added/removed
+   tasks and the headline `completionMovementDays` — the as-planned record forensic
+   comparisons run against.
+5. **Progress & lookahead** (#358–361, #359): `percentComplete` + actuals on the task
+   (validated: finish ≥ start, finish requires start); `GET …/lookahead?weeks=N` returns
+   incomplete tasks starting/finishing inside the window.
+6. **Health check** (#371 / Domain D #283): `GET …/quality` runs
+   `assessScheduleQuality` — a pure DCMA-14-point-style subset of ten checks (missing
+   predecessors/successors with the schedule start/finish excluded, leads, lags, FS ratio
+   ≥ 90%, hard constraints, high float > 44d, negative float, high duration > 44d,
+   invalid progress) with documented thresholds, per-check offending ids and an overall
+   score.
+
+Not built (deliberately): XER/MPP import (#349–350), resource loading (#370), calendars —
+durations are calendar days; working-calendar arithmetic is future work the pure engine
+was shaped to absorb.
+
+---
+
+## 13. Delay & disruption forensics (M9)
+
+Spec Vol II Domain D, the first forensic module — the one Procore's own customer cannot
+ask its vendor for (Domain D's classification note). Routes
+`apps/api/src/modules/forensics/index.ts`, pure analysis helpers `tia.ts` and
+`prolongation.ts` (both unit-tested), schema `packages/db/src/schema/forensics.ts`, web UI
+`apps/web/src/pages/forensics/` (Delay Events / Analysis / Claims tabs).
+
+```mermaid
+flowchart LR
+    DE["delay_events<br/>cause + excusable/compensable<br/>evidenceIds, contractEventId"] -- "taskId = fragnet<br/>insertion point" --> TIA["runFragnetTia<br/>before vs after CPM"]
+    TIA -- "completionDeltaDays<br/>persisted on event" --> WIN["windows attribution<br/>by start date"]
+    BSL["schedule_baselines"] --> APAB["as-planned vs as-built<br/>per-task slip"]
+    DE --> CLM["forensic_claims<br/>cause-effect-entitlement-quantum"]
+    PRO["prolongation calculator<br/>prelims_time BQ ÷ programme days"] --> CLM
+    PLAT["contract events, RFIs,<br/>daily-log delays, variations"] -- "chronology<br/>auto-assembly" --> CLM
+```
+
+1. **Delay event register** (#265–268): numbered per project (`nextRecordNumber`), cause
+   classified over `DELAY_CAUSES` (client change, late design information, exceptional
+   weather, unforeseen ground, statutory, contractor performance, subcontractor default,
+   supply chain, force majeure, other), entitlement classified excusable/compensable with
+   the rule **compensable ⇒ excusable enforced as a 400** (#267). Events cite the contract
+   event (notice) raised for them and assurance `evidenceIds` substantiating them (#306) —
+   both validated to belong to the project. A bare `taskId` resolves against the project's
+   active schedule and the resolved `scheduleId` is stored, so the fragnet insertion point
+   is stable even if the active schedule later changes.
+2. **Time Impact Analysis by fragnet insertion** (#272): `POST …/delay-events/:id/tia`
+   models the delay as a virtual fragnet task inserted after the struck task
+   (`struck --FS--> fragnet --FS--> each successor`), carrying `start_no_earlier_than` on
+   the delay's real-world start date; original logic is preserved and the fragnet path
+   competes with (and, when the delay bites, dominates) existing paths (`tia.ts`). The
+   result — `completionDeltaDays`, before/after finish — is persisted on the event
+   (`tiaResult`) and ledgered; editing the delay's dates or insertion point voids the
+   stale TIA (`tiaResult` nulled on those PATCHes). Because the engine is pure and dates
+   are persisted, the run is reproducible from the row + the ledger entry.
+3. **As-planned vs as-built** (#269): `GET …/forensics/as-planned-vs-as-built` compares a
+   captured baseline (default: the earliest — the closest thing to the as-planned
+   programme) against current tasks, preferring **actuals over forecast dates** per task,
+   reporting per-task start/finish slip and the headline `totalSlipDays`.
+4. **Windows attribution** (#273 — honestly scoped): `GET …/forensics/windows` buckets
+   delay events into caller-supplied window boundaries **by event start date** and sums
+   excusable/compensable/non-excusable days and per-event TIA deltas per window. The
+   response carries its own `method` string stating the limitation verbatim: this is
+   *attribution of events to windows quantified by per-event TIA against the current
+   programme*, **not** a full retrospective windows TIA with per-window schedule updates
+   and critical-path re-analysis (#274–275 are not built). The honest label is in the API
+   payload, not just the docs.
+5. **Prolongation calculator** (#299 seed): `POST …/forensics/prolongation` computes
+   compensable days × time-related prelims rate; the rate is explicit or derived from the
+   project's `prelims_time` BQ items spread over the programme duration
+   (`prolongation.ts`), with the derivation string returned. Head-office overhead formulae
+   (#301 Hudson/Emden/Eichleay) are deliberately out of scope.
+6. **Claims workspace** (#304–320 subset): numbered claims over `CLAIM_KINDS`
+   (delay/disruption/prolongation/acceleration) with the four-limb
+   **cause–effect–entitlement–quantum chain** (#305) as a structured `chain` object,
+   supporting `delayEventIds` (validated), claimed vs assessed days/amounts and lifecycle
+   `draft → submitted → assessed → agreed | rejected` (withdrawn pre-agreement). The chain
+   and event set **freeze once the claim leaves draft** — the submitted narrative is the
+   narrative that gets assessed — and **assessment rejects the claim's creator (403)**
+   (#310; `docs/security.md` §2.4). `POST …/claims/:id/chronology` (#318) auto-assembles
+   a dated chronology from platform records — delay events, contract events + notice
+   service, RFIs raised/answered, daily-log delay entries, instructed variations — and
+   caches it on the claim with its generation time.
+
+Every mutation is ledgered (delay-event creation and claim creation with full payload),
+which is the point: the Tier-2 acceptance criterion is a delay analysis assembled solely
+from ledgered contemporaneous records, and the chronology assembler reads exactly those.
+
+**Scope note.** This is the Domain D *foundation*: SCL-Protocol method selection (#276–277),
+concurrency/pacing/float-ownership (#278–281), programme-revision forensics (#284–288),
+measured mile and the disruption family (#289–298), and claim packaging beyond the chain +
+chronology (#307–309, #311–320) are not built — the boundary is drawn function-by-function
+in `docs/roadmap.md`.
+
+---
+
+## 14. Statutory payment security (M10)
+
+Spec Vol II Domain F — the security-of-payment regimes that govern most of the
+Commonwealth and Asia, where a missed response deadline creates real liability. Routes
+`apps/api/src/modules/payments/index.ts`, regime library
+`modules/payments/regimes.ts`, schema `packages/db/src/schema/payments.ts`, web UI
+`apps/web/src/pages/payments/` (regime reference cards, claim register with deadline
+radar and deemed-liability surfacing, analytics, and a claim drawer with the statutory
+timeline and state-driven actions).
+
+```mermaid
+flowchart LR
+    LIB["REGIME_LIBRARY (code)<br/>5 regimes: response + payment<br/>day counts, deemed rules"] -- "computeTimeline<br/>base = max(referenceDate, served)" --> TL["responseDeadline<br/>finalPaymentDate"]
+    CLM["payment_claims<br/>draft → served"] --> TL
+    TL --> OBL["obligations<br/>deadline + warnDaysBefore 3"]
+    TL -- "on-time response" --> OK["responded<br/>obligation satisfied"]
+    TL -- "sweep: deadline past,<br/>no response" --> DM["deemed<br/>obligation breached"]
+    DM --> SIG["signals<br/>payment_deemed_liability (critical)"]
+    OK -. "late response" .-> SIG2["signals<br/>late_payment_response (high)"]
+    DM --> SUS["suspension notice<br/>effectiveFrom = today + notice days"]
+```
+
+1. **Regimes in code** (#364–369 subset): `REGIME_LIBRARY` is a typed constant covering
+   UK HGCRA 1996/2011, Singapore SOPA 2004, NSW SOPA 1999, Malaysia CIPAA 2012 and NZ CCA
+   2002 — the same reference-data-not-tenant-data decision as the Phase 2 clause library
+   (ADR 0007), argued for this domain in
+   `docs/adr/0010-statutory-payment-regimes-in-code.md`. Each `RegimeDef` carries one
+   response deadline and one final payment date (day count + calendar/business basis), a
+   suspension notice period, a pinned interest rate with the true statutory formula in
+   `interestNote`, and a `deemedRule` narrative — including the CIPAA divergence, where
+   "deemed" marks an adjudication-ready *dispute*, not automatic liability. The
+   simplifications (no public-holiday calendars; single-base-date model; pinned rates) are
+   documented in the file header and per-regime comments, and the library is served
+   read-only at `GET /payment-regimes`. `libraryCoversAllRegimes()` keeps the enum and
+   library from drifting (asserted in tests).
+2. **Timeline computation** (#359–360): serving a claim
+   (`POST …/payment-claims/:id/serve`) computes both statutory clocks via
+   `computeTimeline` from a single base date — the **later** of the statutory
+   `referenceDate` and the service date, so a clock never starts before service and an
+   early claim waits for its reference date. Business-day regimes count Mon–Fri
+   (`addBusinessDays`). Served claims are immutable; only drafts can be edited.
+3. **Obligation materialization — the same pattern as time bars** (§11.4): service
+   inserts an assurance `obligations` row for the response deadline (`warnDaysBefore: 3`)
+   and stores its id on the claim, so the payment clock and the obligation register agree
+   on one date. On-time responses satisfy it; the sweep or a late response breaches it;
+   payment moots an *open* obligation only — **a breached obligation stays breached; the
+   register records what happened**.
+4. **Deemed sweep** (#361): `sweepDeemed` runs lazily on reads (list, radar, analytics,
+   claim detail) and before suspension — a served claim whose response deadline has fully
+   elapsed with no response on file flips to `deemed`, breaches its obligation and raises
+   a **critical `payment_deemed_liability` signal** whose explanation embeds the regime's
+   `deemedRule`, exactly once (guarded on the status flip). A **late** response never
+   rescues status: it is recorded with `late: 1`, breaches the obligation and raises a
+   high `late_payment_response` signal — statutory ineffectiveness, surfaced.
+5. **Ground-stating** (#365): a pay-less notice for less than the claimed amount without
+   stated reasons is a 400 — withholding without grounds is exactly what these statutes
+   exist to prevent.
+6. **Suspension & interest** (#362, #387): suspension is available on deemed claims only
+   (a documented simplification — suspension for non-payment past the final date is not
+   modelled), with `effectiveFrom` = today + the regime's notice period; lifting returns
+   the claim to `deemed` (the liability is unaffected). `GET …/interest` computes simple
+   ACT/365 interest at the regime's modelled rate on the outstanding amount — the latest
+   *on-time* response amount where one exists, else the claimed amount (late responses do
+   not reduce the base) — with the derivation and the statutory formula note in the
+   response.
+7. **Analytics** (#386): status mix, average served→paid days, the outstanding book
+   (valued at on-time response amounts where they exist) and deemed exposure
+   (deemed + suspended — suspension does not extinguish the liability).
+
+Not built: liens (#373–377), retention trusts / project bank accounts (#378–381),
+adjudication case management (Domain E #329–333 — the `referred` claim status exists in
+the enum with no workflow behind it), pay-when-paid validity (#382), supply-chain payment
+reporting (#385, #388–391). See `docs/roadmap.md` and the disclaimer in ADR 0010: the
+library is an engineering model of the statutes, not jurisdictional legal advice.
+
+---
+
+## 15. AI layer
 
 `modules/ai/` (service in `service.ts`), schema `packages/db/src/schema/ai.ts`. Design rules
 come from spec Domain X: **citations always (#1019), human-in-the-loop for consequential
@@ -525,7 +738,7 @@ outputs (#1020), full audit trail (#1021).**
 
 ---
 
-## 13. Integration surface
+## 16. Integration surface
 
 **Today (implemented):**
 
@@ -550,9 +763,12 @@ outputs (#1020), full audit trail (#1021).**
 
 ---
 
-## 14. Verification & test strategy
+## 17. Verification & test strategy
 
-- `packages/ledger` has pure unit tests (`src/ledger.test.ts`).
+- `packages/ledger` has pure unit tests (`src/ledger.test.ts`); so do the pure analysis
+  cores in the API — the CPM engine (`apps/api/src/lib/cpm.test.ts`, hand-computed
+  networks incl. the fragnet-TIA primitive) and the prolongation calculator
+  (`modules/forensics/prolongation.test.ts`).
 - Every API module colocates `<name>.test.ts` using `buildTestApp()`
   (`apps/api/src/test/helpers.ts`): a full Fastify app over in-memory PGlite with migrations
   applied — integration tests with zero external services, exercising the real auth chain via
