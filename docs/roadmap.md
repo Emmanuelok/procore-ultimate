@@ -8,20 +8,81 @@ Domain A starting at #1, Domain B at #115, Domain C at #193, Domain D at #265,
 Domain E at #321, Domain F at #358, Domain G at #394, Domain H at #447, Domain O at
 #729, Domain S at #859, Domain X at #995).
 
-Four increments are delivered: **Phase 0/1 — Foundation** (the delivery subset +
+Five increments are delivered: **Phase 0/1 — Foundation** (the delivery subset +
 assurance skeleton), **Phase 2 — Tier-2 commercial seed (M7 + M8)**, **Phase 3 —
-Tier-2 forensics & payment security (M9 + M10, on a native §2.6 schedule core)**, and
-**Phase 4 — Tier-3 programme & capital governance (M12–M15)**.
-Phases 2–4 are a deliberate deviation from the spec Vol III §5 ordering (assurance core
-before commercial depth): the commercial/forensic/governance engines landed before the
-Tier-1 ingestion layer (M6). The deviation is contained — M7 was built so that every
-certified value crosses into the assurance layer as an `Assertion`; M9/M10 materialize
-their deadlines and breaches into the same `obligations`/`signals` tables; and Phase 4
-extended the identical pattern to lender conditions, gate conditions and dispute
-timetables (ADR 0012), so nothing shipped that Tier-1 will have to unwind; but **M6
-remains the gate to the sellable assurance claim** and is called out as such below. The
-"parity trap" warning (Vol III §1) is still treated as binding: Volume I parity stays
-last.
+Tier-2 forensics & payment security (M9 + M10, on a native §2.6 schedule core)**,
+**Phase 4 — Tier-3 programme & capital governance (M12–M15)**, and **Phase 5 — Tier-4
+safeguards & sustainability (M16–M19) plus the Vol I §6 reporting layer**.
+Phases 2–5 are a deliberate deviation from the spec Vol III §5 ordering (assurance core
+before commercial depth): the commercial/forensic/governance/safeguard engines landed
+before the Tier-1 ingestion layer (M6). The deviation is contained — M7 was built so that
+every certified value crosses into the assurance layer as an `Assertion`; M9/M10
+materialize their deadlines and breaches into the same `obligations`/`signals` tables;
+Phase 4 extended the identical pattern to lender conditions, gate conditions and dispute
+timetables (ADR 0012); and Phase 5 extended it again to grievance SLAs, labour
+corrective-action plans and permit determinations, while M17 built the platform's first
+genuine **two-stream reconciliation** (ADR 0014) — so nothing shipped that Tier-1 will
+have to unwind. But **M6 remains the gate to the sellable assurance claim** and is called
+out as such below. The "parity trap" warning (Vol III §1) is still treated as binding:
+Volume I parity stays last.
+
+---
+
+## Status at the end of Phase 5
+
+**The Vol III module map is now entered end to end.** Nineteen modules (M1–M19) plus the
+Vol I §6 reporting layer: seventeen have shipped code, two do not
+(**M6 Ingestion** — not started, and **M11 Independent benchmarking** — not started).
+Concretely, on `main`:
+
+| | |
+|---|---|
+| API modules | **29** Fastify plugins (`apps/api/src/modules/*/index.ts`) |
+| Tables | **130** across 25 domain schema files (`packages/db/src/schema/`) |
+| Tests | **539** passing — 526 API integration/unit tests on in-memory PGlite + 13 ledger unit tests (`pnpm test`) |
+| Web workspaces | one page per tool under `apps/web/src/pages/` |
+| Docs | architecture, data model, roadmap, security, deployment, retrospective-detection run, 14 ADRs |
+
+What has landed, by spec volume:
+
+- **Vol III Tier 2** (commercial depth): M7 measurement & valuation, M8 contract
+  intelligence, M9 delay & disruption forensics, M10 payment security — delivered as
+  documented subsets (Phases 2–3). M11 benchmarking is open, and is the one Tier-2 module
+  that needs multi-tenant data before it can honestly exist.
+- **Vol III Tier 3** (programme & capital governance): M12 business case & stage gates,
+  M13 quantitative risk, M14 disbursement & lender conditionality, M15 dispute support —
+  delivered as documented subsets (Phase 4).
+- **Vol III Tier 4** (safeguards & sustainability): M16 land/resettlement/community, M17
+  workforce rights & welfare, M18 carbon/ESG/social value, M19 multi-jurisdiction
+  operations — delivered as documented subsets (Phase 5, below).
+- **Vol I §6.1–6.2** (360 reporting and dashboards): the whitelisted report builder,
+  saved definitions, CSV export, role dashboards and recorded-but-not-dispatched
+  schedules — delivered (Phase 5). §6.3 insights & benchmarking is M11 territory and is
+  not built.
+- **Vol III §7** (the retrospective detection run): the *harness* exists —
+  `apps/api/src/scripts/retrodetect.ts` plants known schemes through the public API into a
+  seeded project, runs the shipped detectors, and reports precision and recall against a
+  clean control project (`pnpm --filter @constructos/api eval:retrodetect`; methodology in
+  `docs/retrospective-detection.md`). What it measures is a **synthetic** scope: the
+  spec's actual artefact needs one completed real project with a known integrity outcome
+  and third-party records, which requires M6 and a willing institution.
+- **Vol III Tier 1** (the assurance core, M1–M5) remains as it was — real but seeded: the
+  ledger, the eight primitives, the entity graph, the three assurance roles, and a
+  detector set that has grown from six to **thirty-two distinct signal detectors** — the
+  six statistical/pattern detectors in `modules/assurance/detectors.ts` plus deterministic
+  threshold-and-date detectors embedded across the domain modules (Phase 5 alone added
+  sixteen: `land_blocks_programme`, `grievance_sla_breach`, `ghost_worker`,
+  `payroll_overclaim`, `wage_underpayment`, `underage_worker_blocked`,
+  `labour_rights_indicator`, `accommodation_overcrowding`, `welfare_standard_failure`,
+  `labour_cap_overdue`, plus the ESG/jurisdiction family
+  `carbon_budget_exceeded`, `social_value_shortfall`, `permit_determination_overdue`,
+  `permit_expired`, `permit_blocks_programme`, `local_content_shortfall`).
+  **M6 has not started.** Everything still arrives through ConstructOS's own API.
+
+The honest headline: **the platform now has more machinery than input.** Phase 5 did not
+change that — it deepened it, and in M17 it built the first module whose value depends
+entirely on the two sides of a reconciliation arriving through different channels (ADR
+0014). That is the argument for what comes next.
 
 ---
 
@@ -74,18 +135,22 @@ small subsets of their spec sections.
 | M8 Contract intelligence | **Delivered (Phase 2, subset)** — clause library in code, PC overlay, time-bar engine, EOT, LD exposure, obligation register; see Phase 2 section |
 | M9 Delay & disruption forensics | **Delivered (Phase 3, subset)** — delay events, fragnet TIA, as-planned vs as-built, scoped windows attribution, prolongation seed, claims chain + chronology; see Phase 3 section |
 | M10 Payment security | **Delivered (Phase 3, subset)** — five statutory regimes in code, deadline engine, deemed-liability sweep, suspension, interest; see Phase 3 section |
-| M11 Independent benchmarking | Not started (sequenced behind multi-tenant data; see Tier 2 remainder) |
+| M11 Independent benchmarking | **Not started** (sequenced behind multi-tenant data; see Tier 2 remainder) |
 | M12 Business case & stage gates | **Delivered (Phase 4, subset)** — five-case model, CBA to NPV/BCR, stage gates + decision register, conditions as obligations, benefits register; see Phase 4 section |
 | M13 Quantitative risk | **Delivered (Phase 4, subset)** — seeded QCRA/QSRA Monte Carlo, reproducibility endpoint, contingency drawdown discipline; see Phase 4 section |
 | M14 Disbursement & conditionality | **Delivered (Phase 4, subset)** — facility register, CP gate on submission, evidence-backed satisfaction, covenant signals; see Phase 4 section |
 | M15 Dispute support | **Delivered (Phase 4, subset)** — dispute register + timetable obligations, pleadings, Merkle-manifest bundles + verify, settlement modelling; see Phase 4 section |
-| M16–M19 | Not started |
+| M16 Land, resettlement & community | **Delivered (Phase 5, subset)** — parcel register with customary/communal tenure, evidenced compensation, PAP census with cut-off enforcement, GRM with SLA obligations and complainant-verified closure, consent-to-programme risk; see Phase 5 section |
+| M17 Workforce rights & welfare | **Delivered (Phase 5, subset)** — verified worker register, **ghost-worker reconciliation of payroll against independent site access**, ILO risk indicators, subcontractor modern-slavery scoring, welfare inspections, audits with CAP obligations; see Phase 5 section |
+| M18 Carbon, ESG & social value | **Delivered (Phase 5, subset)** — EN 15978 modules, factor library with product-specific flagging, carbon off the BoQ, budgets with drawdown, waste diversion, social value tender-vs-delivered; see Phase 5 section |
+| M19 Multi-jurisdiction operations | **Delivered (Phase 5, subset)** — FIDIC 14.15 currency portions and FX variance, rate provenance, permits blocking the programme, local content/ICV; see Phase 5 section |
+| *(Vol I §6 reporting layer — not a Vol III module)* | **Delivered (Phase 5, subset)** — whitelisted report builder, saved definitions, CSV export, role dashboards, recorded schedules; see Phase 5 section and ADR 0013 |
 
 Not implemented at all (deliberately): Vol I §1.1–1.3 (bid/estimating/prequal), §2.2 specs,
-§2.9/2.11–2.13, §3 financial suite, §4 quality & safety, §5 resources,
-§6 analytics; Vol II domains I–K, M–N, P–R, T–Z beyond the seeds listed above (Domains B
-and C gained real coverage in Phase 2, Domains D and F plus the §2.6 schedule core in
-Phase 3, Domains E, G, H and O in Phase 4, below).
+§2.9/2.11–2.13, §3 financial suite, §4 quality & safety, §5 resources, §6.3 insights &
+benchmarking; Vol II domains N, P–R, T–Z beyond the seeds listed above (Domains B and C
+gained real coverage in Phase 2, Domains D and F plus the §2.6 schedule core in Phase 3,
+Domains E, G, H and O in Phase 4, Domains I, J, K and M plus Vol I §6.1–6.2 in Phase 5).
 
 ---
 
@@ -418,6 +483,185 @@ tracking, recovery-vs-cost analysis, outcome database and root-cause analytics.
 
 ---
 
+## Phase 5 — Delivered: Tier 4 safeguards (M16–M19) + the Vol I §6 reporting layer
+
+Committed and tested: `apps/api/src/modules/{land,workforce,esg,jurisdiction,analytics}/`
+with colocated suites (**153 tests**), schema
+`packages/db/src/schema/{land,workforce,esg,jurisdiction,analytics}.ts` (25 tables), web
+workspaces `apps/web/src/pages/{land,workforce,esg,jurisdiction,analytics}/`. Architecture
+write-ups in `docs/architecture.md` §19–23; table catalogs in `docs/data-model.md` §21–25;
+new controls in `docs/security.md` §2.4; ADRs 0013 (whitelisted report builder) and 0014
+(independent evidence streams).
+
+This is the tier the spec sequences by contractual pull — *"built in the order your first
+three institutional customers contractually require them. Do not speculate."* (Vol III §5
+Phase 4). Building all four together is a deviation from that rule, taken deliberately to
+close the module map; the consequence is that each module is a **breadth-first subset** of
+its domain, drawn function-by-function below rather than a deep implementation of any one.
+
+### M16 — Land, resettlement & community (Domain J)
+
+**In:** #547–551 parcel register with tenure including customary, communal and informal,
+encumbrances, and a transition-guarded acquisition flow; #553–554 valuation and
+compensation where **`compensated` is reachable only through an evidenced route** that
+demands validated assurance `evidence` ids; #555–557 PAP census with household baseline
+and vulnerability screening; #558 (reporting half) `land/rap-progress` — the supervision
+view a lender's E&S mission asks for; #561 livelihood programme fields; #564 cut-off-date
+declaration (a `land` **admin** act) with census-after-cut-off refused as encroachment;
+#565 physical/economic displacement classification; #566 entitlement matrix with a
+server-recomputed total; #569–574 the full GRM — multi-channel intake including genuinely
+anonymous (identity **stripped at intake**), severity-driven SLA materialized as an
+assurance Obligation, a lazy breach sweep raising `grievance_sla_breach`, closure verified
+*with* the complainant (a rejection reopens the grievance), and analytics by type,
+location, severity and time; #575 FPIC consent status on engagements; #579–584 stakeholder
+register with influence/interest quadrants and the consultation log with feedback
+disposition; #591 consent-to-programme dependency mapping with the
+`land_blocks_programme` signal.
+
+**Out (explicitly not built):** #552 compulsory purchase / eminent domain process
+management; #558's RAP document lifecycle and #568 independent monitoring and completion
+audit as workflow; #559–560 IFC PS5 / ESS5 as separately tracked compliance frames (they
+are the design frame, not a checklist object); #562–563 replacement housing and
+resettlement-site development monitoring; #567 compensation-at-replacement-cost
+verification; #576–578 indigenous peoples plans, cultural heritage chance-find and
+archaeological stop-work protocols; #592 regulator correspondence register. Permits
+(#585–590) are implemented in M19 because they share the permit/consent clock.
+
+### M17 — Workforce rights & welfare (Domain M)
+
+**In:** #667–668 verified worker register with identity and biometric-enrolment flags (never
+document images); #669 **ghost-worker elimination** — the module's flagship and the
+platform's first two-stream reconciliation (ADR 0014): employer payroll claims against an
+independent site-access stream, classifying `ghost` / `overclaim` / `underpaid` / `ok` with
+value-at-risk and wage shortfall quantified, raising `ghost_worker` (critical),
+`payroll_overclaim` and `wage_underpayment` (high) signals idempotently, with a read-only
+replay endpoint that writes nothing; #670 age verification as a **blocked write** that
+still raises `underage_worker_blocked`; #671–675 recruitment-fee, passport-retention,
+contract-substitution and related indicators with severity derived from the indicator
+rather than the reporter; #676 WPS reference capture; #677 wage-versus-hours verification
+against the agreed daily rate; #683–688 welfare inspection scoring across eight areas with
+occupancy-density compliance and corrective actions; #694 modern-slavery composite scoring
+at subcontractor level with every component returned; #697–699 the audit programme with
+unannounced scheduling and **corrective-action plans tracked as assurance obligations**.
+
+**Out (explicitly not built):** #678–682 minimum wage by jurisdiction, overtime limits, rest
+day / maximum consecutive days, deduction-legality checking and late-payment escalation —
+each needs a per-jurisdiction rule library of the kind M8/M10 built for clauses and
+statutes, and none is modelled; #689–693 the **employer-independent** worker grievance
+channel, anonymous multilingual worker voice, retaliation monitoring, freedom-of-association
+recording and migrant vulnerability screening (the community GRM in M16 is not a substitute
+— an employer-independent worker channel needs its own identity path, and building it
+inside the employer's tenant would defeat it); #695–696 ILO core convention and IFC PS2
+compliance mapping as tracked frames; #700 lender welfare KPI reporting; #701–702
+independent fatality reporting and statistical under-reporting detection; #703–704
+demographic, turnover and skills-pathway analytics.
+
+### M18 — Carbon, ESG & social value (Domain I)
+
+**In:** #491–492 embodied carbon to the EN 15978 life-cycle module split; #494–495 carbon
+budgets by element with drawdown bands and a `carbon_budget_exceeded` signal; #496 factor
+library (ICE-derived seed set); #498 product-specific versus generic flagging surfaced as
+**`productSpecificSharePercent`** — a data-quality measure of the assessment itself, not a
+compliance number; #501 carbon riding the BoQ (bulk generation from bill items with the
+`boqItemId` as provenance, unit checking, and unconvertible items **skipped and reported**);
+#505–508 GHG-Protocol scope reporting alongside the life-cycle split; #513–514 waste by
+stream and destination with diversion-from-landfill and the narrower recycled share;
+#527–528 UK Social Value Model / TOMs commitments; #538 proxy financial valuation;
+#539–540 the tender-commitment-versus-delivered reconciliation with a
+`social_value_shortfall` signal after a 30-day grace period.
+
+**Out (explicitly not built):** #493 PAS 2080 as a tracked frame; #497 EPD *ingestion and
+verification* as a pipeline (the reference field exists; parsing and verifying EPD
+documents does not); #499–500 design-option carbon comparison and marginal abatement cost;
+#502–504 transport carbon from supplier location and mode, site energy and fuel capture,
+plant emissions by equipment hours (the last of these is a telematics use case — ADR 0014);
+#509–511 SBTi tracking, offset register, operational carbon handover; #512 water; #515–516
+material passports and reuse tracking; #517–526 biodiversity net gain, habitat compliance,
+noise/dust/vibration and air-quality monitoring integration, environmental incidents and
+regulator notification, environmental permits (M19 holds the generic permit register),
+EMP compliance, ISO 14001 evidence assembly and BREEAM/LEED/Green Star/Estidama credit
+tracking; #529–537 the individual social-value measure families (local employment,
+apprenticeship weeks, local spend by radius, SME/VCSE spend, indigenous participation,
+diverse supplier spend, community investment, volunteering) beyond the generic
+commitment/delivery model; #541–546 CSRD/ESRS, IFRS S1/S2, EU Taxonomy, TCFD, Modern
+Slavery Act statement evidence and CSDDD supply-chain due diligence.
+
+### M19 — Multi-currency & multi-jurisdiction operation (Domain K)
+
+**In:** #593–595 multi-currency contracts with defined currency proportions and a
+base-date rate per FIDIC Sub-Clause 14.15, validated to exhaust the payment; #596 payment
+splitting across the portions; #597 exchange-rate source configuration with a dated,
+attributed, immutable rate register and an explicit
+`identity → direct → inverse → triangulated` resolution ladder that reports the path and
+the governing quote date; #599 unrealised FX gain/loss against the contractual rates, with
+unquoted currencies named rather than dropped; #585–590 permit and consent register with
+authority, statutory determination period, grant conditions and expiry, plus two sweeps
+(`permit_determination_overdue`, `permit_expired`); #591 permits blocking the programme
+(`permit_blocks_programme`); #608 and #614 as permit kinds (customs clearance, work
+permits and visas); #612–615 local content / ICV targets with dated readings and a
+`local_content_shortfall` signal.
+
+**Out (explicitly not built):** #598's dispute *handling* workflow (the audit trail that
+wins one is built; the process is not); #600–601 hedging instrument register and
+effectiveness, currency control and repatriation restrictions; #602–607 multi-entity
+consolidation with FX translation, functional versus presentation currency,
+inflation-adjusted and IAS 29 hyperinflationary reporting, country charts of accounts and
+multi-jurisdiction statutory reporting — this family belongs with a general ledger the
+platform does not have; #609–611 customs bonds and temporary import, port-clearance delay
+logging with claim linkage, border and logistics delay attribution; #616–626 the whole
+emerging-market client stack (offline-first architecture, SMS/USSD capture, feature-phone
+support, low-bandwidth delta sync, intermittent-power tolerance, paper-to-digital OCR,
+non-Latin and RTL languages, regional formats, metric/imperial dual display, local holiday
+calendars, regional data residency). That last family is an **application-shell
+programme**, not a module: it touches the SPA, the API and the deployment topology, and it
+is sequenced separately below.
+
+### Vol I §6 — 360 reporting & Analytics 2.0
+
+**In:** #731–733 cross-tool report builder with column selection, filters and grouping over
+a registry of twelve datasets spanning delivery, commercial, forensic, financial and
+safeguard tables; #735 pre-built definitions (seeded with the role dashboards); #736 report
+scheduling — **recorded, not dispatched**, and every response says so; #737 sharing and
+permissions; #738 paged execution with honest truncation and CSV export; #739 project- and
+company-level scope; #741–742 pre-built role dashboards (PM / commercial / assurance) and
+custom dashboards; #749 drill-through identifiers on widget rows; #751 row-level security
+enforced by the executor from request context, never by the stored definition.
+
+**Out (explicitly not built):** #734 calculated columns — an arbitrary user expression is
+user-authored SQL by another name, and the shape that would preserve the ADR 0013
+invariant (a registry of *named* derived columns) is described there; #738's PDF and Excel
+targets (CSV only); #740 inactive-project tracking; #743 direct BI-tool connection (the
+REST surface and the dataset catalog are the only exposure); #744–748 portfolio
+aggregation, cross-project trend analysis and the whole predictive-field family (predicted
+spend, predicted schedule risk) — the platform has the Monte Carlo engine for the honest
+version of this and should not ship a regression dressed as a prediction; #750 historical
+comparison; #752 scheduled data refresh (nothing is materialized — every run is live); all
+of §6.3 (#753–758) insights and benchmarking, which is M11.
+
+### Phase-5 status against the Tier 4 acceptance criterion
+
+*"Welfare and safeguard records held to the same evidentiary standard as financial ones —
+hashed, ledgered, reconciled against independent sources (e.g. M17 attendance vs.
+access-control logs)."*
+
+- **Ledgered: met.** Every consequential mutation across all four modules appends to the
+  company's hash chain, with full payloads on the records an auditor comes back for
+  (compensation payments, closure verifications, reconciliation runs, carbon entries,
+  permit determinations).
+- **Reconciled against independent sources: mechanism met, independence not yet
+  guaranteed.** M17 implements exactly the reconciliation the criterion names, as two
+  separate tables with two separate write routes and a pure engine over both (ADR 0014).
+  What the platform cannot yet guarantee is that the access stream *arrives through a
+  different channel from the payroll* — both post through the same API with the same
+  token until M6 lands. The `site_access_records.source` column is where that provenance
+  will attach.
+- **Hashed: partially met.** File-backed safeguard evidence inherits content-addressed
+  storage and `evidence.contentHash` (`docs/security.md` §4). Bulk-ingested access and
+  payroll rows are ledgered but are not themselves hashed-at-ingest artefacts — that is
+  M6/S#862 work.
+
+---
+
 ## Tier 1 — Assurance core completion (M1–M6) — open
 
 *(This section was headed "Phase 2 — Assurance core complete" in earlier revisions; ADR
@@ -427,13 +671,18 @@ gate to the sellable assurance product.)*
 
 Goal: turn the seeds into the sellable assurance product of spec Vol III §2 — "every
 certified payment … reconciled against independent evidence." M7's certificates now
-generate exactly the assertions this tier must reconcile.
+generate exactly the assertions this tier must reconcile, and Phase 5 added the first
+*complete* consumer of the missing half: M17's ghost-worker reconciliation
+(`modules/workforce/reconcile.ts`) is a finished engine that reads two tables, one of
+which is meant to be fed by a system the claimant does not control. Its accuracy is an
+engineering property today and an evidentiary one only after M6 — the sharpest available
+statement of why this tier is still the gate (ADR 0014).
 
 | Workstream | Representative spec functions | Notes |
 |---|---|---|
 | M6 Ingestion layer (build first — spec Phase 0 is "ingest and prove") | Domain N #705–711 (API export/import, open schemas), #715 (foreign-system record mirroring); hash-at-ingest per S#862 | Procore/Aconex/CSV connectors landing as `evidence` + `assertions` with provenance; this also delivers the **pathway separation** the §4 design rule requires |
 | M1 hardening | S#860–861 notarisation & anchoring, #864 trusted time, #873–874 attestation & hash escrow, #871 forensic export format | Publish Merkle roots + chain heads to an external escrow on a schedule |
-| M2 detector build-out | Domain A #1–35 (bid-pattern family), #53–71 (ghost vendor/worker, duplicate payment, certification-vs-evidence family), #93–99 (risk scores, red-flag register, false-positive loop) | Ship detectors with measured precision (Vol III §6.2: "ship five that work rather than fifty that fire") |
+| M2 detector build-out | Domain A #1–35 (bid-pattern family), #53–71 (ghost vendor/worker, duplicate payment, certification-vs-evidence family), #93–99 (risk scores, red-flag register, false-positive loop) | Ship detectors with measured precision (Vol III §6.2: "ship five that work rather than fifty that fire"). 32 detectors now write signals, but only the six statistical ones in `modules/assurance/detectors.ts` are *inference*; the rest are deterministic rules whose precision is 1.0 by construction — the domain's hard families (#1–35, #53–71) remain unbuilt |
 | M3 methods | Domain A #65–71 quantity/progress/plant/labour reconciliations; X#1017 evidence sufficiency scoring | Method plug-ins beyond mean-variance |
 | M4 graph depth | A#9–11 shared bank/address/contact detection, #44 undeclared relationships, #45–50 PEP/sanctions/debarment screening & shell indicators | External registry integrations |
 | M5 workspace | A#90–92 full reviewer/auditor/regulator workspaces, #100–101 case files & chain-of-custody, S#882 completeness certification | Case-file assembly over evidence packs |
@@ -443,6 +692,8 @@ generate exactly the assertions this tier must reconcile.
    reconciliation report of certified quantities vs. independent evidence produced end-to-end.
 2. A **retrospective detection run** on a completed project with a known integrity outcome,
    reporting precision/recall per detector — the spec's bar for "a plan becomes a company".
+   *(The harness now exists and passes on synthetic data — `docs/retrospective-detection.md`.
+   What is missing is real third-party input, i.e. criterion 1.)*
 3. Every detector ships with a measured precision figure and a reviewer feedback loop
    (`false_positive` dispositions feed detector tuning).
 4. Ledger heads/Merkle roots escrowed externally; a truncation attack becomes detectable.
@@ -466,62 +717,136 @@ remains.
 
 ---
 
-## Next phase — recommendation
+## What remains — the honest inventory
 
-**Recommended: make the spec §7 retrospective detection run the next milestone — a
-product deliverable that pulls the Tier-1 workstreams (M6 first) through in its service —
-rather than opening Tier 4 or building analytics.**
+The module map is entered; the specification is not finished. Two kinds of absence, kept
+apart because they carry different risk: **structural holes** (things the platform claims
+to be but cannot yet do) and **breadth** (spec surface deliberately not built). Function
+numbers are from `docs/master-specification.md`.
 
-Reasoning, grounded in the spec's own guidance:
+### Structural holes — the two that matter
 
-1. **The spec names this as the single highest-value next artefact.** Vol III §7,
-   verbatim: *"The single highest-value next artefact is not more specification. It is a
-   retrospective detection run: take one completed public project with a known integrity
-   outcome, ingest its procurement and payment record, and measure how many of Domain A's
-   114 detectors would have fired before the outcome was known."* It is also Tier-1
-   acceptance criterion 2 above, and the risk register's answer to procurement-cycle
-   length — *"the retrospective detection run is the first engagement deliverable."*
-   Treating it as a product milestone (with a willing audit institution or public client)
-   rather than a background engineering task is what §6.2's services-led entry means.
-2. **Four phases of engines now exist; none of them has independent input.** The
-   platform's imbalance after Phase 4 is not missing machinery — it is that certificates
-   land as Assertions, and time bars, payment deadlines, lender conditions, gate
-   conditions and dispute timetables all land as Obligations (ADR 0012), while everything
-   still arrives through ConstructOS's own API. Both Tier-3 acceptance criteria stalled
-   on exactly this: the reconciliation-gated drawdown waits on M6 + M3, and bundle
-   verification against an escrowed head waits on M1 anchoring. The retrospective run
-   forces precisely those three workstreams — M6 ingestion with hash-at-ingest, M2
-   detectors with measured precision, M1 escrow for the credibility of the result — in a
-   context where each has a customer-visible payoff.
-3. **Against opening Tier 4 (M16–M19 safeguards):** the build-order rule for Tiers 3–4
-   (Vol III §5 Phase 4) is *"built in the order your first three institutional customers
-   contractually require them. Do not speculate."* No such pull exists in-repo, and the
-   safeguard modules are at their best when they hold welfare records to the evidentiary
-   standard — M17's attendance-vs-access-control reconciliation *is* an ingestion + M3
-   use case. Building M16–M19 before M6 would add a fifth tier of registers to the same
-   imbalance. Contractual pull overrides this — if a DFI engagement demands M16 or M17,
-   that module jumps, per the rule.
-4. **Against Analytics/360 reporting (Vol I §6 #731–758):** it is parity surface — the
-   cross-tool report builder, dashboards and BI exposure are exactly the Tier-5 territory
-   the spec warns against entering early (Vol III §3: *"Do not start here"*), and the
-   platform's differentiated reporting story (report on *integrity* — reconciliation
-   coverage, obligation breaches, signal dispositions — not just activity) gets
-   dramatically stronger once ingestion and reconciliations carry real data. The one
-   §6-adjacent artefact worth building early, board-grade governance reporting (G#443),
-   should be assembled from the M12 gate/benefit registers when a customer asks for it.
-5. **What the milestone looks like concretely:** the Tier-1 table below is the
-   engineering content, M6 first; the deliverable is the §7 run — one completed project,
-   records ingested from the third-party system with provenance and hashes, detectors
-   run retrospectively, precision/recall reported per detector, methodology published
-   (spec §7: publish methodology, not findings), ledger heads escrowed so the result is
-   itself verifiable. Exit = Tier-1 acceptance criteria 1–4 below.
+| # | What is missing | Why it is structural |
+|---|---|---|
+| 1 | **M6 Ingestion layer** (Vol III Tier 1; Domain N #705–711, #715; S#862 hash-at-ingest) | Every record still arrives through ConstructOS's own API. ADR 0004 enforces the assertion/evidence rule at *actor* level; the spec demands *pathway* level, and ADR 0014 now names the tables that are shaped to receive independent feeds (`site_access_records.source` first among them). Until M6, "reconciled against independent evidence" is a property of the customer's process, not of the product. |
+| 2 | **M1 anchoring & escrow** (Domain S #860–861, #864, #873–874) | The chain is tamper-evident against edits and internally verifiable, but a DB insider can truncate the tail or rewrite the whole chain undetectably, and `at` is the app-server clock. Both Tier-3 acceptance criteria and the credibility of any published retrospective run rest on this. Tracked as open gaps 2–3 in `docs/security.md` §8.2. |
 
-**Completion criteria carried forward:** evidence-side tracing of certified valuations
-(waits on M6+M3); a live-contract time-bar save; a live dispute bundle produced and
-verified by a receiving party (the Phase 4 mechanism exists; escrowed-head verification
-waits on M1 anchoring); the reconciliation-gated drawdown (waits on M6+M3). The
-mechanisms exist — the live runs are deployment milestones, and the retrospective run is
-the engagement that creates them.
+Everything else on this page is scope. These two are the difference between a very good
+system of record and the product Vol III describes.
+
+### Vol II — gap domains still absent
+
+| Domain | Range | Status |
+|---|---|---|
+| **M11 / Domain R — Independent benchmarking** | #821–858 | Not started. The *service* needs an independent-benchmark database by asset class (#821), and the spec's own classification is the constraint: *"the benchmark must be independent of the benchmarked."* The raw material exists in-repo (BQ rates with `rateBuildUp` components, star rates, certified valuations, delay-event durations), but a benchmark built from one tenant's data is a mirror, not a benchmark — this needs anonymized cross-tenant aggregation, a stated methodology, and enough tenants for k-anonymity to mean something. Sequenced behind customers, not behind code. |
+| **Domain P — Insurance & bonding lifecycle** | #771–797 | Not started. Insurance programme register (CAR/EAR, TPL, PI, employer's liability, marine cargo, DSU), certificate collection and expiry, bond register and call tracking, claims notification against policy conditions. The natural fit is obvious — insurance notification periods are Obligations (ADR 0012) and a lapsed certificate is a signal — which is exactly why it is cheap to add later and unnecessary to speculate on now. |
+| **Domain Q — Tax & statutory deduction** | #798–820 | Not started. VAT/GST by jurisdiction and supply type, reverse charge, CIS/withholding regimes, permanent establishment exposure. This is the family M19 explicitly did not open (#606–607), and it is the one place where a wrong answer creates liability directly rather than through a claim — it wants the same code-resident-regime-library treatment as ADR 0007/0010 and a specialist review. |
+| **Domain U — Supply chain, logistics & offsite manufacture** | #913–947 | Not started. Multi-tier supply chain mapping, offsite/modular production tracking, logistics and delivery sequencing, material traceability. M18's waste and carbon models and M16's parcel logistics touch its edges; the module itself is not built. |
+| **Domain V — Commissioning & systems turnover** | #948–975 | Not started. Systems/subsystems breakdown, commissioning plans, pre-functional and functional test records, turnover packages, performance verification. The twin module (`modules/twin`) holds the asset register and delivery milestones this would hand over into — the seam is designed, the module is not. |
+| **Domain W — Organisational learning** | #976–994 | Not started. Lessons-learned capture with mandatory triggers, cross-project knowledge retrieval, post-project review. Classification (S): the incumbent's incentive is against it. The platform has the corpus (ledgered records across every domain) and the AI layer to search it — this is a small module with an unusually good substrate. |
+| Domain Z — miscellaneous critical absences | #1048+ | Not started (bid/no-bid win-probability modelling and the rest). |
+
+### Vol II — depth still missing inside delivered domains
+
+Delivered ≠ complete: each phase drew its boundary function-by-function above. The largest
+remaining depth, worst first:
+
+- **Domain A — the detector programme** (#1–114). Six statistical detectors shipped in the
+  foundation; the domain specifies 114. The families that matter and are unbuilt: bid
+  patterns (#1–35), the ghost-vendor / duplicate-payment / certification-vs-evidence
+  family (#53–71 — M17's ghost-*worker* reconciliation is one member of it), risk scoring
+  and the red-flag register (#93–99). The spec's own rule governs: *"ship five that work
+  rather than fifty that fire"* (Vol III §6.2), which is why this is sequenced with M6 and
+  measured precision rather than shipped as a batch.
+- **Domain D — forensic method** (#274–298): full retrospective windows analysis with
+  per-window schedule updates, SCL-Protocol method selection, concurrency/pacing/float
+  ownership, measured mile and the disruption family.
+- **Domain B — measurement depth** (#117–134, #150–161, #172–192): full method-of-measurement
+  rule engines, remeasurement and dayworks depth, CVR/WIP beyond the summary seed.
+- **Domain F** (#373–393): liens, retention trusts and project bank accounts, adjudication
+  case management, supply-chain payment reporting.
+- **Domain O** (#734, #736–738, #744–768): DFI withdrawal-application formats,
+  designated-account reconciliation, LTA/independent-engineer certification, PPP models.
+- **Domains G/H/E/I/J/K/M**: the exclusion lists in each phase section above.
+
+### Vol I — parity surface still absent
+
+Per Vol III §3 Tier 5 this is *deliberately* last (*"Do not start here … even then consider
+acquiring rather than building"*). Named honestly so nobody discovers it in a demo:
+
+| Spec area | Range | Note |
+|---|---|---|
+| §1.1 Bid management | #155–183 | Bid packages, invitations, bidder comparison, levelling. Nothing built. |
+| §1.2 Estimating & takeoff | #184–208 | Digital plan takeoff from PDFs, assemblies, estimate→budget conversion. The *measurement* half exists commercially (M7 takeoff lines with drawing provenance, `docs/architecture.md` §10.3) but the estimating tool does not. |
+| §1.3 Prequalification | #209–230 | Questionnaire builder, financial screening, scoring, expiry. Adjacent to Domain A vendor screening and to M17's vendor risk score — a natural pairing when it lands. |
+| §3.1–3.5 The financial suite | #479–585 | **Budget, prime contracts, commitments (subcontracts/POs), change management, invoicing.** This is the single largest parity hole: ConstructOS has BoQ→valuation→certificate (M7) and facility→disbursement (M14) but no budget/commitment ledger between them. Tool keys `budget`, `commitments`, `change_management`, `invoicing` are already reserved in `packages/shared/src/permissions.ts`. |
+| §3.6–3.8 Pay, T&M tickets, timecards | #586–616 | Not built. Timecards are the parity-side twin of M17's payroll/access streams and should be built so that the two do not become one author (ADR 0014). |
+| §4.1, §4.3–4.4 Inspections, incidents, safety programme | #617–633, #647–675 | Not built. §4.2 observations (#634–646) are partially covered by the field module's punch/photo surface, not as a first-class observation object. Incident reporting has an assurance twin in M#701–702 (independent fatality reporting, under-reporting detection) that is also unbuilt. |
+| §5.1–5.4 Resource, equipment & materials management | #676–730 | Not built. Equipment (#700–718) is where telematics enters the platform — the third independent evidence stream named in ADR 0014, and the reason this section is more interesting than its parity label suggests. |
+| §0.6 Mobile & field | #104–118 | No native iOS/Android apps and no offline mode. The web app is responsive; that is not the same claim. Compounded by Domain K #616–626 (offline-first, SMS/USSD, low-bandwidth sync) — together they are an **application-shell programme**, not a module. |
+| §0.7 Integration & extensibility | #119–142 | REST API (#119) and rate limiting (#122) exist. **Absent: OAuth2 for machine callers (#120), webhooks (#121), developer sandbox (#123), the app marketplace (#124–125), MCP/agentic API exposure (#126–127), embedded experiences (#128–129), and the whole ERP connector framework (#130–133) plus P6/MS Project/Bluebeam/Autodesk exchange (#134–137).** The webhook emitter has an obvious home — the ledger append path already sees every consequential mutation. |
+| §6.3 Insights & benchmarking | #753–758 | See M11. |
+| §7 Owner & portfolio | #776–789 | Partially met sideways: portfolios, stage gates (M12), portfolio contingency (M13) and cross-project reporting (Phase 5 analytics) exist; a dedicated owner/portfolio workspace does not. |
+
+---
+
+## Recommended next sequence
+
+The recommendation has not changed since Phase 4, and Phase 5 strengthened it rather than
+displacing it. **Build M6 ingestion, in service of the spec §7 retrospective detection run
+on real data, and anchor the ledger while doing it.** Then, and only then, take demand-led
+work.
+
+**1. M6 Ingestion + hash-at-ingest (Domain N #705–711, #715; S#862).** *Reasoning:* it is
+the only remaining item that changes what the product *is* rather than what it covers.
+Five phases of engines exist and none of them has an independent input. The spec's design
+rule — *"Assertion and Evidence must never be created by the same actor through the same
+pathway"* — is enforced at actor level and unenforceable at pathway level until records
+arrive through a channel the claimant does not control (ADR 0004, ADR 0014). Phase 5 made
+this concrete rather than theoretical: M17's ghost-worker reconciliation is a finished
+engine whose entire value rests on the site-access stream not being authored by the party
+filing the payroll. First connectors, in order of evidentiary value per unit of work:
+site access-control systems (feeds M17 directly), bank/payment files (feeds M14 and
+Domain A's duplicate-payment family), telematics (feeds plant and daywork claims), then
+Procore/Aconex/CSV for the incumbent-migration story.
+
+**2. M1 anchoring & escrow (S#860–861, #864, #873–874).** *Reasoning:* cheap, bounded, and
+it is the difference between "we verified our own chain" and "a third party can verify
+it." Publishing chain heads and Merkle roots on a schedule closes `docs/security.md` §8.2
+gaps 2–3, completes the Tier-3 dispute-bundle acceptance criterion (the mechanism already
+exists — only escrowed-head verification is missing), and is a precondition for anyone
+believing the numbers in step 3.
+
+**3. The §7 retrospective detection run, on a real completed project.** *Reasoning:* the
+spec names it as the single highest-value next artefact and the thing that *"converts this
+document from a plan into a company."* The harness is built and green
+(`docs/retrospective-detection.md`); what it lacks is real input, which is exactly what
+step 1 supplies. Run it with an audit institution or public client, publish the
+methodology (not the findings, per §7), and let it pull M2 detector build-out behind it
+with measured precision per detector.
+
+**4. Then demand-led, in whichever order the first institutional customers actually
+require** — the Vol III §5 Phase 4 rule, which Phase 5 deliberately broke to close the map
+and which now resumes:
+
+- **Depth inside a delivered safeguard module** beats a new one. A DFI engagement that
+  bought M17 will want #678–682 (wage/overtime/rest-day rule engines by jurisdiction) and
+  #689–691 (the employer-independent worker voice channel) long before it wants Domain P.
+- **Domain W organisational learning** (#976–994) is the cheapest genuinely-differentiated
+  module left: the corpus is already ledgered and the AI layer already cites sources.
+- **Domain P insurance/bonding** and **Domain Q tax** are the two that most often appear as
+  hard contractual conditions; both fit existing primitives (Obligations, code-resident
+  regime libraries) and neither should be speculated on.
+- **The §3 financial suite** is the largest parity hole and the one customers will name
+  first when asked to run two systems — and per Vol III §3, still the last thing to build,
+  and a candidate for acquisition rather than construction.
+
+**Completion criteria carried forward** (unchanged, all waiting on steps 1–2): evidence-side
+tracing of certified valuations; a live-contract time-bar save; a live dispute bundle
+produced and verified by a receiving party against an escrowed chain head; the
+reconciliation-gated drawdown; and now **a ghost-worker reconciliation run against an
+access-control feed the employer does not control** — the Tier-4 acceptance criterion in
+its full form.
 
 ---
 
@@ -544,35 +869,51 @@ reconciliations (O domain); a dispute bundle exported with chain-of-custody docu
 Status: the first is evidence-gated but not yet reconciliation-gated (M6+M3); the second
 is delivered except escrowed-head verification (M1 anchoring) — see the Phase 4 section.
 
-Build order within Tier 4 remains demand-driven per spec Vol III §5 Phase 4: "built in the
-order your first three institutional customers contractually require them. Do not speculate."
-
 ---
 
-## Tier 4 — Safeguards & sustainability (M16–M19)
+## Tier 4 — Safeguards & sustainability (M16–M19) — delivered (subset)
 
-| Module | Domain / representative functions |
-|---|---|
-| M16 Land, resettlement & grievance | J#547–592 |
-| M17 Worker welfare & labour rights | M#667–704 (biometric/attendance evidence feeds ghost-worker detection A#54) |
-| M18 Carbon, ESG & social value | I#491–546 |
-| M19 Multi-jurisdiction operations | K#593–626 (multi-currency, local statutory regimes) |
+*(Delivered as Phase 5, above — the function-by-function boundary, the named exclusions
+(J#552, #562–563, #567, #576–578; M#678–682, #689–693, #700–704; I#493, #497, #499–500,
+#502–504, #509–526, #541–546; K#600–611, #616–626) and the honest status against this
+tier's acceptance criterion are in that section.)*
 
-**Acceptance criteria:** welfare and safeguard records held to the same evidentiary standard
+| Module | Domain / representative functions | Status |
+|---|---|---|
+| M16 Land, resettlement & grievance | J#547–592 | Delivered subset — see Phase 5 |
+| M17 Worker welfare & labour rights | M#667–704 (biometric/attendance evidence feeds ghost-worker detection A#54) | Delivered subset — see Phase 5 |
+| M18 Carbon, ESG & social value | I#491–546 | Delivered subset — see Phase 5 |
+| M19 Multi-jurisdiction operations | K#593–626 (multi-currency, local statutory regimes) | Delivered subset — see Phase 5 |
+
+**Acceptance criterion:** welfare and safeguard records held to the same evidentiary standard
 as financial ones — hashed, ledgered, reconciled against independent sources (e.g. M17
-attendance vs. access-control logs).
+attendance vs. access-control logs). Status: **ledgered — met; reconciled — the mechanism is
+built (ADR 0014) but the two streams still share an API pathway until M6; hashed — file-backed
+evidence only.** Full analysis at the end of the Phase 5 section.
+
+Build order *within* this tier was supposed to be demand-driven per spec Vol III §5 Phase 4
+(*"built in the order your first three institutional customers contractually require them.
+Do not speculate."*). Phase 5 built all four together to close the module map — a deliberate
+deviation, whose cost is that each module is a breadth-first subset. The rule resumes for
+everything after it: see "Recommended next sequence" above.
 
 ---
 
 ## Tier 5 — Parity — deliberately last
 
-Vol I Sections 1–5 remainder (~650 functions): schedule, full financial suite, quality &
-safety, resources, meetings, correspondence, specifications, forms. Per spec Vol III §3
-Tier 5: *"Do not start here … even then consider acquiring rather than building."* Entered
-only when a customer refuses to run two systems. The foundation keeps this option open —
-tool keys for budget/commitments/change_management/invoicing/meetings are already reserved in
+Vol I Sections 1–5 remainder (~600 functions): bid management, estimating & takeoff,
+prequalification, the full §3 financial suite, quality & safety, resources & equipment,
+meetings, correspondence, specifications, forms — plus §0.6 mobile/offline and the §0.7
+integration surface (webhooks, OAuth2, marketplace, ERP connectors). Enumerated with
+section and function numbers under "What remains" above. Per spec Vol III §3 Tier 5:
+*"Do not start here … even then consider acquiring rather than building."* Entered only
+when a customer refuses to run two systems. The foundation keeps this option open — tool
+keys for budget/commitments/change_management/invoicing/meetings are already reserved in
 `packages/shared/src/permissions.ts`, and the record-links/custom-fields/workflow substrate
-is tool-agnostic.
+is tool-agnostic. Note the two exceptions already taken deliberately: the §2.6 schedule
+core (Phase 3, because delay forensics needs a programme to run on) and §6.1–6.2 reporting
+(Phase 5, because every domain now has something worth reporting on) — both parity surface,
+both built because a gap module depended on them.
 
 ---
 
@@ -580,6 +921,6 @@ is tool-agnostic.
 
 | Kill risk | Mitigation in this plan |
 |---|---|
-| Evidence independence collapses | M6 ingestion is the first Tier-1 workstream and jumps the queue on any assurance-led engagement; `independenceScore` + separation rule already enforced; certification/EOT separation-of-duties added in Phase 2 (`docs/security.md` §2.4); contractual evidence mandates at project setup |
-| False-positive fatigue | Precision measured before a detector ships (Tier-1 acceptance #3); reviewer feedback loop live since foundation. Phase 2 added two deterministic detectors (`time_bar_missed`, `time_bar_breach_risk`), Phase 3 two more (`payment_deemed_liability`, `late_payment_response`) and Phase 4 four more (`contingency_exhaustion`, `facility_condition_overdue`, `covenant_breach`, `dispute_deadline_missed`) — all with precision 1.0 by construction: threshold and date arithmetic, not inference |
+| Evidence independence collapses | M6 ingestion is the first Tier-1 workstream and jumps the queue on any assurance-led engagement; `independenceScore` + separation rule already enforced; certification/EOT separation-of-duties added in Phase 2 (`docs/security.md` §2.4); Phase 5 raised the stake and named the law — `docs/adr/0014-independent-evidence-streams.md` makes two-stream separation a design rule with M17's payroll-vs-site-access reconciliation as its first instance, and states plainly that both streams share an API pathway until M6; contractual evidence mandates at project setup |
+| False-positive fatigue | Precision measured before a detector ships (Tier-1 acceptance #3); reviewer feedback loop live since foundation. Phase 2 added two deterministic detectors (`time_bar_missed`, `time_bar_breach_risk`), Phase 3 two more (`payment_deemed_liability`, `late_payment_response`) Phase 4 four more (`contingency_exhaustion`, `facility_condition_overdue`, `covenant_breach`, `dispute_deadline_missed`) and Phase 5 sixteen more across the safeguard modules — all with precision 1.0 by construction: threshold and date arithmetic, not inference. The retrospective harness (`docs/retrospective-detection.md`) exits non-zero if recall drops below 100% **or the clean control project raises any signal at all** — a runnable false-positive gate (`pnpm --filter @constructos/api eval:retrodetect`; not yet wired into `.github/workflows/ci.yml`) |
 | Procurement cycle length | Services-led entry: the Tier-1 retrospective detection run *is* the first engagement deliverable |

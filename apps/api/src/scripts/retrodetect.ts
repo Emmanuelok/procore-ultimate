@@ -46,11 +46,18 @@ interface PlantedScheme {
 }
 
 /**
- * The 11 planted schemes. Schemes 1-3 deliberately share one fabricated
- * cost-assertion population (see plantFabricatedCostBook): a manually
- * invented payment book is exactly the kind of dataset that trips the
+ * The 17 planted schemes.
+ *
+ * Schemes 1-3 deliberately share one fabricated cost-assertion population: a
+ * manually invented payment book is exactly the kind of dataset that trips the
  * round-number, duplicate and Benford detectors at once, and each detector
  * keys on a different signature within it.
+ *
+ * Schemes 12-14 likewise share one payroll run (see PERIOD below): the same
+ * reconciliation pass over employer payroll against the independent
+ * site-access stream raises a different detector for each of three workers —
+ * one paid with no attendance at all, one billing more days than the gate
+ * recorded, one paid materially below the rate on their own contract.
  */
 const GROUND_TRUTH: PlantedScheme[] = [
   {
@@ -141,7 +148,68 @@ const GROUND_TRUTH: PlantedScheme[] = [
     scope: "project",
     plant: plantContingencyBurn,
   },
+  /* ----- Phase 5 (Tier 4 safeguards: Domains J, M, K) ----- */
+  {
+    id: "ghost_worker",
+    name: "Ghost worker (18 days of payroll, zero site-access records)",
+    specRef: "Domain M #668-669 (M17 biometric-to-payroll reconciliation)",
+    expectedDetector: "ghost_worker",
+    scope: "project",
+    plant: plantGhostWorker,
+  },
+  {
+    id: "payroll_overclaim",
+    name: "Payroll overclaim (22 days claimed against 12 evidenced)",
+    specRef: "Domain M #669, #676 (M17 payroll vs access reconciliation)",
+    expectedDetector: "payroll_overclaim",
+    scope: "project",
+    plant: plantPayrollOverclaim,
+  },
+  {
+    id: "wage_underpayment",
+    name: "Wage underpayment (paid GBP 210/day against a GBP 300 agreed rate)",
+    specRef: "Domain M #677, #682 (M17 wage-versus-hours verification)",
+    expectedDetector: "wage_underpayment",
+    scope: "project",
+    plant: plantWageUnderpayment,
+  },
+  {
+    id: "grievance_sla_breach",
+    name: "Grievance SLA breach (critical community grievance 20 days old, unresolved)",
+    specRef: "Domain J #569-572 (M16 grievance redress SLA sweep)",
+    expectedDetector: "grievance_sla_breach",
+    scope: "project",
+    plant: plantGrievanceSlaBreach,
+  },
+  {
+    id: "land_blocks_programme",
+    name: "Un-acquired land blocking imminent works (parcel identified, task starts in 10 days)",
+    specRef: "Domain J #547, #551, #591 (M16 consent-to-programme dependency)",
+    expectedDetector: "land_blocks_programme",
+    scope: "project",
+    plant: plantLandBlocksProgramme,
+  },
+  {
+    id: "permit_expired",
+    name: "Lapsed consent (road-closure permit granted, expiry 35 days past)",
+    specRef: "Domain J #585-587 (M19 permit register expiry sweep)",
+    expectedDetector: "permit_expired",
+    scope: "project",
+    plant: plantExpiredPermit,
+  },
 ];
+
+/**
+ * The single payroll/reconciliation window shared by schemes 12-14 and by the
+ * clean control's honest payroll. Fixed once at start-up so the plant phase
+ * and the run phase can never disagree about which period is being scored.
+ */
+const PERIOD = { start: addDaysISO(todayISO(), -27), end: todayISO() };
+
+/** The `n` calendar days immediately before today, most recent first. */
+function recentDates(n: number): string[] {
+  return Array.from({ length: n }, (_, i) => addDaysISO(todayISO(), -(i + 1)));
+}
 
 /* ------------------------------------------------------------------ */
 /* Harness context + tiny API helpers                                  */
@@ -165,6 +233,10 @@ interface Ctx {
   cleanProjectId: string;
   plantedContractId: string;
   cleanContractId: string;
+  /** labour supplier employing the workers on each project (M17 rolls risk
+   *  up to the EMPLOYER, so every worker needs one) */
+  plantedVendorId: string;
+  cleanVendorId: string;
 }
 
 /** Populated by setup() before any plant runs. */
@@ -228,6 +300,89 @@ async function startWorkflow(
 
 async function approveStep(actor: Actor, stepId: string): Promise<void> {
   await post(actor, `/workflow-steps/${stepId}/decide`, { decision: "approved" });
+}
+
+/* ----- M17 workforce helpers (used by schemes 12-14 and the control) ----- */
+
+/** Enrol one worker on a project's register (#667). */
+async function enrolWorker(
+  projectId: string,
+  vendorId: string,
+  worker: { reference: string; fullName: string; trade: string; agreedDailyRate: number },
+): Promise<void> {
+  await post(ctx.ownerA, `/projects/${projectId}/workers`, {
+    ...worker,
+    vendorId,
+    currency: "GBP",
+    idVerified: true,
+    biometricEnrolled: true,
+    contractIssued: true,
+    contractLanguage: "en",
+    inductedAt: addDaysISO(todayISO(), -60),
+  });
+}
+
+/** Push turnstile/biometric access days — the INDEPENDENT evidence stream. */
+async function ingestAccess(
+  projectId: string,
+  workerReference: string,
+  dates: string[],
+): Promise<void> {
+  await post(ctx.ownerA, `/projects/${projectId}/site-access`, {
+    records: dates.map((accessDate) => ({
+      workerReference,
+      accessDate,
+      firstIn: "07:00",
+      lastOut: "16:30",
+      hoursOnSite: 9,
+      source: "biometric",
+    })),
+  });
+}
+
+/** Push the employer's own payroll claim for the shared window. */
+async function ingestPayroll(
+  projectId: string,
+  entry: { workerReference: string; daysClaimed: number; grossPay: number; deductions?: number },
+): Promise<void> {
+  const deductions = entry.deductions ?? 0;
+  await post(ctx.ownerA, `/projects/${projectId}/payroll`, {
+    entries: [
+      {
+        workerReference: entry.workerReference,
+        periodStart: PERIOD.start,
+        periodEnd: PERIOD.end,
+        daysClaimed: entry.daysClaimed,
+        grossPay: entry.grossPay,
+        deductions,
+        netPay: Math.round((entry.grossPay - deductions) * 100) / 100,
+        currency: "GBP",
+        paidAt: PERIOD.end,
+      },
+    ],
+  });
+}
+
+/**
+ * A schedule with a single works task starting `startsInDays` from today —
+ * the thing an un-acquired parcel or an ungranted consent blocks (#591).
+ * Returns the task id. A task with no predecessors starts on projectStart.
+ */
+async function scheduleTaskStartingIn(
+  projectId: string,
+  startsInDays: number,
+  taskName: string,
+): Promise<string> {
+  const schedule = (await post(ctx.ownerA, `/projects/${projectId}/schedules`, {
+    name: "Main works programme",
+    projectStart: addDaysISO(todayISO(), startsInDays),
+  })) as unknown as { id: string };
+  const task = (await post(
+    ctx.ownerA,
+    `/projects/${projectId}/schedules/${schedule.id}/tasks`,
+    { name: taskName, durationDays: 45, wbsCode: "2.1" },
+  )) as unknown as { id: string };
+  return task.id;
 }
 
 /* ------------------------------------------------------------------ */
@@ -445,6 +600,148 @@ async function plantContingencyBurn(): Promise<void> {
 }
 
 /* ------------------------------------------------------------------ */
+/* Phase 5 schemes — Tier 4 safeguards (Domains J, M, K)               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Schemes 12-14 — the padded payroll run. All three land in one payroll file
+ * for PERIOD, reconciled in the run phase by a single
+ * POST /workforce/reconcile. Each worker is shaped to trip exactly one
+ * condition of the M17 engine, so the three detectors are separable:
+ *
+ *   RI-W-101  18 days claimed,  0 access days           -> ghost_worker
+ *   RI-W-102  22 days claimed, 12 access days (1.83x)   -> payroll_overclaim
+ *   RI-W-103  20 days claimed, 20 access days, GBP 210/day
+ *             against a GBP 300 contract rate           -> wage_underpayment
+ *
+ * Nothing here needs a database write: payroll and gate logs are historical
+ * records by nature, and the API accepts past periods and access dates.
+ */
+async function plantGhostWorker(): Promise<void> {
+  // A name on the payroll that the turnstile has never seen. No site-access
+  // batch is ingested for this worker at all — that absence IS the scheme.
+  await enrolWorker(ctx.plantedProjectId, ctx.plantedVendorId, {
+    reference: "RI-W-101",
+    fullName: "Ade Okonjo",
+    trade: "Steel fixer",
+    agreedDailyRate: 300,
+  });
+  await ingestPayroll(ctx.plantedProjectId, {
+    workerReference: "RI-W-101",
+    daysClaimed: 18,
+    grossPay: 5400,
+  });
+}
+
+async function plantPayrollOverclaim(): Promise<void> {
+  // Billed at the correct rate — so the wage check stays silent — but for ten
+  // days the gate log does not support (22 / 12 = 1.83x, tolerance 1.15x).
+  await enrolWorker(ctx.plantedProjectId, ctx.plantedVendorId, {
+    reference: "RI-W-102",
+    fullName: "Tomasz Brzezinski",
+    trade: "Formwork carpenter",
+    agreedDailyRate: 300,
+  });
+  await ingestAccess(ctx.plantedProjectId, "RI-W-102", recentDates(12));
+  await ingestPayroll(ctx.plantedProjectId, {
+    workerReference: "RI-W-102",
+    daysClaimed: 22,
+    grossPay: 6600,
+  });
+}
+
+async function plantWageUnderpayment(): Promise<void> {
+  // Attendance reconciles exactly (20 claimed, 20 evidenced), so this is not
+  // a fraud against the employer — it is wage theft from the worker: GBP 4200
+  // for 20 days is GBP 210/day against the GBP 300 on their own contract.
+  await enrolWorker(ctx.plantedProjectId, ctx.plantedVendorId, {
+    reference: "RI-W-103",
+    fullName: "Rukmini Devi",
+    trade: "General operative",
+    agreedDailyRate: 300,
+  });
+  await ingestAccess(ctx.plantedProjectId, "RI-W-103", recentDates(20));
+  await ingestPayroll(ctx.plantedProjectId, {
+    workerReference: "RI-W-103",
+    daysClaimed: 20,
+    grossPay: 4200,
+  });
+}
+
+async function plantGrievanceSlaBreach(): Promise<void> {
+  // A critical community grievance carries a 7-day resolution SLA. This one
+  // was received 20 days ago and never acknowledged or assigned, so it is 13
+  // days past its published deadline. The intake API computes the SLA from
+  // receivedAt (the date the community raised it, not the keying-in date) and
+  // legitimately accepts past dates, so no DB write is needed to age it.
+  await post(ctx.ownerA, `/projects/${ctx.plantedProjectId}/grievances`, {
+    channel: "community_meeting",
+    complainantName: "Mrs A. Nwosu (Riverside Farmers' Association)",
+    complainantContact: "+44 7700 900412",
+    category: "access",
+    severity: "critical",
+    description:
+      "Haul road diversion at CH 2+800 has cut the only vehicle access to twelve smallholdings; " +
+      "produce is spoiling before it reaches market and an ambulance could not reach the hamlet.",
+    receivedAt: addDaysISO(todayISO(), -20),
+  });
+}
+
+async function plantLandBlocksProgramme(): Promise<void> {
+  // Embankment works are ten days from starting on a parcel that is still
+  // only "identified" — no survey, no negotiation, no title. The dependency
+  // is recorded honestly on the parcel; the detector reads it against the
+  // programme when the schedule-risk view is opened in the run phase.
+  const taskId = await scheduleTaskStartingIn(
+    ctx.plantedProjectId,
+    10,
+    "Embankment construction CH 3+000 to CH 3+800",
+  );
+  await post(ctx.ownerA, `/projects/${ctx.plantedProjectId}/parcels`, {
+    reference: "RI-LP-014",
+    description: "Riparian strip east of the interchange, required for the embankment toe",
+    areaSqm: 14800,
+    tenureType: "customary",
+    ownerName: "Nwosu family (customary holding, unregistered)",
+    valuationAmount: 268000,
+    currency: "GBP",
+    blockingTaskIds: [taskId],
+  });
+}
+
+async function plantExpiredPermit(): Promise<void> {
+  // A temporary road-closure consent granted 395 days ago on a 360-day term:
+  // it lapsed 35 days ago and nobody renewed it. Recording a historic consent
+  // with a past grant and a past expiry is a legitimate API operation (that is
+  // how an existing project's permit register is loaded), so this needs no DB
+  // write either. The permit deliberately carries NO blockingTaskIds: an
+  // expired permit that blocks a task would also — correctly — raise
+  // permit_blocks_programme, and this scheme is scored on permit_expired.
+  const permit = (await post(ctx.ownerA, `/projects/${ctx.plantedProjectId}/permits`, {
+    kind: "road_closure",
+    title: "Temporary closure of Riverside Approach for deck erection",
+    authority: "Riverside County Highways",
+    jurisdiction: "GB-ENG",
+    reference: "TTRO/2024/0418",
+    appliedAt: addDaysISO(todayISO(), -420),
+    expectedDays: 20,
+  })) as unknown as { id: string };
+  // Granted immediately after application, before any permit list read: the
+  // grant discharges the determination obligation, so the determination-
+  // overdue sweep never sees this permit awaiting a decision.
+  await post(
+    ctx.ownerA,
+    `/projects/${ctx.plantedProjectId}/permits/${permit.id}/status`,
+    {
+      status: "granted",
+      grantedAt: addDaysISO(todayISO(), -395),
+      expiresAt: addDaysISO(todayISO(), -35),
+      reference: "TTRO/2024/0418-G",
+    },
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* Clean control — innocent data on a second project                   */
 /* ------------------------------------------------------------------ */
 
@@ -569,6 +866,130 @@ async function seedCleanControl(): Promise<void> {
     jurisdiction: "GB",
     identifiers: { company_number: "10904417", bank_account: "GB57-BARC-2201-9976-5410-22" },
   });
+
+  /* ----- Phase 5 controls (Domains J, M, K) ----- */
+
+  // Three honest workers over the SAME payroll window as schemes 12-14, each
+  // sitting just inside a different tolerance of the M17 engine — the control
+  // that proves the detectors key on the breach, not on the shape of the data:
+  //   HQ-W-201  20 claimed / 20 evidenced, paid the agreed rate exactly
+  //   HQ-W-202  18 claimed / 17 evidenced (1.06x — one manual gate-log gap,
+  //             inside the 1.15x overclaim tolerance)
+  //   HQ-W-203  15 claimed / 15 evidenced at GBP 312 against a GBP 320
+  //             agreed rate (0.975x — a part-day at the period edge, inside
+  //             the 0.95x underpayment tolerance), with a lawful deduction
+  const honest = [
+    { reference: "HQ-W-201", fullName: "Grace Adeyemi", trade: "Steel fixer", rate: 300, claimed: 20, access: 20, gross: 6000, deductions: 0 },
+    { reference: "HQ-W-202", fullName: "Michal Nowak", trade: "Formwork carpenter", rate: 280, claimed: 18, access: 17, gross: 5040, deductions: 0 },
+    { reference: "HQ-W-203", fullName: "Priya Raman", trade: "General operative", rate: 320, claimed: 15, access: 15, gross: 4680, deductions: 468 },
+  ];
+  for (const w of honest) {
+    await enrolWorker(projectId, ctx.cleanVendorId, {
+      reference: w.reference,
+      fullName: w.fullName,
+      trade: w.trade,
+      agreedDailyRate: w.rate,
+    });
+    await ingestAccess(projectId, w.reference, recentDates(w.access));
+    await ingestPayroll(projectId, {
+      workerReference: w.reference,
+      daysClaimed: w.claimed,
+      grossPay: w.gross,
+      deductions: w.deductions,
+    });
+  }
+
+  // A critical grievance (same 7-day SLA as the planted one) received three
+  // days ago, acknowledged, resolved and closed WITH the complainant — the
+  // full #572-573 ladder, well inside its deadline.
+  const settled = (await post(ctx.ownerA, `/projects/${projectId}/grievances`, {
+    channel: "in_person",
+    complainantName: "Mr K. Whitlock",
+    complainantContact: "k.whitlock@example.org",
+    category: "access",
+    severity: "critical",
+    description: "Quay Lane pedestrian route closed without notice; school run blocked.",
+    receivedAt: addDaysISO(today, -3),
+  })) as unknown as { id: string };
+  await post(ctx.ownerA, `/projects/${projectId}/grievances/${settled.id}/acknowledge`, {
+    note: "Acknowledged by the community liaison officer on the day of receipt.",
+  });
+  await post(ctx.ownerA, `/projects/${projectId}/grievances/${settled.id}/assign`, {
+    assigneeId: ctx.memberB.userId,
+  });
+  await post(ctx.ownerA, `/projects/${projectId}/grievances/${settled.id}/resolve`, {
+    resolution: "Signed pedestrian diversion installed via Harbour Street; route reopened.",
+  });
+  await post(ctx.ownerA, `/projects/${projectId}/grievances/${settled.id}/verify-closure`, {
+    complainantSatisfied: true,
+    note: "Complainant walked the diversion with the CLO and confirmed it works.",
+  });
+
+  // An OPEN grievance still inside its SLA — the harder control: the sweep
+  // must look at the deadline, not merely at whether a grievance is open.
+  await post(ctx.ownerA, `/projects/${projectId}/grievances`, {
+    channel: "phone",
+    category: "dust",
+    severity: "medium",
+    description: "Dust from the haul road settling on washing lines at Quay Cottages.",
+    receivedAt: addDaysISO(today, -4),
+  });
+
+  // A parcel blocking works that start in 14 days — but taken all the way
+  // through survey, negotiation, EVIDENCED compensation and title transfer,
+  // so the project actually holds the land. Acquired parcels drop out of the
+  // schedule-risk population entirely.
+  const cleanTaskId = await scheduleTaskStartingIn(
+    projectId,
+    14,
+    "Bridge pier 3 excavation and blinding",
+  );
+  const parcel = (await post(ctx.ownerA, `/projects/${projectId}/parcels`, {
+    reference: "HQ-LP-007",
+    description: "Quayside yard required for the pier 3 working platform",
+    areaSqm: 9200,
+    tenureType: "freehold",
+    ownerName: "Harbour Quay Estates Ltd",
+    valuationAmount: 415000,
+    currency: "GBP",
+    blockingTaskIds: [cleanTaskId],
+  })) as unknown as { id: string };
+  for (const status of ["surveyed", "under_negotiation"]) {
+    await post(ctx.ownerA, `/projects/${projectId}/parcels/${parcel.id}/status`, { status });
+  }
+  const payment = (await post(ctx.ownerA, `/projects/${projectId}/evidence`, {
+    kind: "bank_transaction",
+    source: "Beneficiary-verified CHAPS confirmation, Harbour Quay Estates Ltd",
+    independenceScore: 0.9,
+    metadata: { amount: 415000, currency: "GBP", reference: "CHAPS/HQ/0442" },
+  })) as unknown as { id: string };
+  await post(ctx.ownerA, `/projects/${projectId}/parcels/${parcel.id}/compensate`, {
+    amount: 415000,
+    paidAt: addDaysISO(today, -21),
+    evidenceIds: [payment.id],
+    note: "Compensation at valuation, paid to the registered proprietor.",
+  });
+  await post(ctx.ownerA, `/projects/${projectId}/parcels/${parcel.id}/status`, {
+    status: "acquired",
+    note: "Transfer registered; possession taken.",
+  });
+
+  // A granted, in-date consent: applied 20 days ago inside its determination
+  // period, granted 5 days ago, valid for another year.
+  const permit = (await post(ctx.ownerA, `/projects/${projectId}/permits`, {
+    kind: "road_closure",
+    title: "Temporary closure of Quay Lane for pier 3 deliveries",
+    authority: "Harbour Borough Highways",
+    jurisdiction: "GB-ENG",
+    appliedAt: addDaysISO(today, -20),
+    expectedDays: 30,
+  })) as unknown as { id: string };
+  await post(ctx.ownerA, `/projects/${projectId}/permits/${permit.id}/status`, {
+    status: "granted",
+    grantedAt: addDaysISO(today, -5),
+    expiresAt: addDaysISO(today, 360),
+    reference: "TTRO/2026/0119-G",
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -647,6 +1068,18 @@ async function setup(): Promise<void> {
     })) as unknown as { id: string };
   ctx.plantedContractId = (await mkContract(planted.id)).id;
   ctx.cleanContractId = (await mkContract(clean.id)).id;
+
+  // One labour supplier per project. M17 attaches modern-slavery exposure to
+  // the EMPLOYER, so a worker without a vendor would be unattributable.
+  const mkVendor = async (name: string, registrationNumber: string) =>
+    (await post(ctx.ownerA, "/vendors", {
+      name,
+      tradeCodes: ["labour_supply"],
+      country: "GB",
+      registrationNumber,
+    })) as unknown as { id: string };
+  ctx.plantedVendorId = (await mkVendor("Kestrel Labour Supply Ltd", "12447801")).id;
+  ctx.cleanVendorId = (await mkVendor("Heron Site Services Ltd", "09338152")).id;
 }
 
 /* ------------------------------------------------------------------ */
@@ -675,12 +1108,42 @@ async function runDetectorsAndSweeps(): Promise<void> {
     `entities/scan: ${String(scan["entitiesScanned"])} entities, ` +
       `${String(scan["signalsCreated"])} signal(s)`,
   );
-  // Lazy sweeps fire on list reads: contract events (time bars) and payment
-  // claims (deemed liability) on both projects.
-  await get(r, `/projects/${ctx.plantedProjectId}/contracts/${ctx.plantedContractId}/events`);
-  await get(r, `/projects/${ctx.cleanProjectId}/contracts/${ctx.cleanContractId}/events`);
-  await get(r, `/projects/${ctx.plantedProjectId}/payment-claims`);
-  await get(r, `/projects/${ctx.cleanProjectId}/payment-claims`);
+  // The M17 payroll reconciliation is an operational (standard-level) route,
+  // not a read: an assurance grant is read-only by design, so the reviewer
+  // cannot run it — the operator does, and the reviewer reads the signals it
+  // raises. Run over the SAME window on both projects.
+  for (const projectId of [ctx.plantedProjectId, ctx.cleanProjectId]) {
+    const rec = (await post(ctx.ownerA, `/projects/${projectId}/workforce/reconcile`, {
+      periodStart: PERIOD.start,
+      periodEnd: PERIOD.end,
+    })) as unknown as {
+      workers: number;
+      ghosts: number;
+      overclaims: number;
+      underpayments: number;
+      signalsRaised: number;
+    };
+    const label = projectId === ctx.plantedProjectId ? "planted" : "clean";
+    console.log(
+      `workforce/reconcile (${label}): ${rec.workers} worker(s), ${rec.ghosts} ghost(s), ` +
+        `${rec.overclaims} overclaim(s), ${rec.underpayments} underpayment(s), ` +
+        `${rec.signalsRaised} signal(s)`,
+    );
+  }
+  // Lazy sweeps fire on list reads: contract events (time bars), payment
+  // claims (deemed liability), grievances (GRM SLA breach), land schedule
+  // risk (un-acquired land blocking works) and permits (lapsed consents,
+  // overdue determinations). Every one is hit on BOTH projects.
+  for (const [projectId, contractId] of [
+    [ctx.plantedProjectId, ctx.plantedContractId],
+    [ctx.cleanProjectId, ctx.cleanContractId],
+  ] as const) {
+    await get(r, `/projects/${projectId}/contracts/${contractId}/events`);
+    await get(r, `/projects/${projectId}/payment-claims`);
+    await get(r, `/projects/${projectId}/grievances`);
+    await get(r, `/projects/${projectId}/land/schedule-risk`);
+    await get(r, `/projects/${projectId}/permits`);
+  }
 }
 
 async function collectSignals(): Promise<SignalRow[]> {

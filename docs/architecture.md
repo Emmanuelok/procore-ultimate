@@ -44,7 +44,7 @@ pnpm workspace, Node ≥ 22, TypeScript 5.9 strict ESM throughout (`package.json
 | `packages/shared` | `@constructos/shared` | Domain vocabulary: enums (`src/enums.ts`), RBAC model + built-in permission templates (`src/permissions.ts`), wire types (`src/types.ts`), the eight assurance primitive interfaces (`src/primitives.ts`). No runtime dependencies. |
 | `packages/ledger` | `@constructos/ledger` | Pure crypto core: RFC 8785-style canonical JSON (`src/canonical.ts`), SHA-256 helpers (`src/hash.ts`), hash chain build/verify (`src/chain.ts`), Merkle root/proof (`src/merkle.ts`). Unit-tested in `src/ledger.test.ts`. |
 | `packages/db` | `@constructos/db` | Drizzle ORM schema, one file per domain (`src/schema/*.ts`), committed SQL migrations (`drizzle/`). Postgres dialect; no FK constraints — relationships are by convention (see `docs/data-model.md`). |
-| `apps/api` | `@constructos/api` | Fastify 5 API. Composition root `src/app.ts`, env config `src/config.ts`, auth plugin `src/plugins/auth.ts`, helpers `src/lib/*.ts` (incl. the pure CPM engine `src/lib/cpm.ts` and the seeded Monte Carlo engine `src/lib/montecarlo.ts`), twenty-two feature modules `src/modules/*/`, test harness `src/test/helpers.ts`. |
+| `apps/api` | `@constructos/api` | Fastify 5 API. Composition root `src/app.ts`, env config `src/config.ts`, auth plugin `src/plugins/auth.ts`, helpers `src/lib/*.ts` (incl. the pure CPM engine `src/lib/cpm.ts` and the seeded Monte Carlo engine `src/lib/montecarlo.ts`), twenty-nine feature modules `src/modules/*/` (several with their own pure engines — `workforce/reconcile.ts`, `jurisdiction/fx.ts`, `esg/carbon.ts`, `analytics/datasets.ts`), the retrospective-detection harness `src/scripts/retrodetect.ts`, test harness `src/test/helpers.ts`. |
 | `apps/web` | `@constructos/web` | Vite 8 + React 19 + Tailwind v4 SPA. Route table `src/App.tsx`, API client `src/lib/api.ts`, auth context `src/lib/auth.tsx`, shared UI kit `src/ui/`, feature pages `src/pages/*/`. Client-side PDF rendering via `pdfjs-dist`, IFC via `web-ifc` + `three`. |
 | `docs/` | — | This documentation set plus the master specification. |
 | `docker-compose.yml` | — | Postgres 16 for production-like runs. |
@@ -65,7 +65,7 @@ flowchart LR
     end
     subgraph API["apps/api (Fastify, port 4000)"]
         AUTH["auth plugin<br/>plugins/auth.ts"]
-        MODS["22 feature modules<br/>modules/*/index.ts"]
+        MODS["29 feature modules<br/>modules/*/index.ts"]
         LEDGER["appendLedger<br/>lib/ledger.ts"]
         STORE["content-addressed storage<br/>lib/storage.ts"]
     end
@@ -117,7 +117,7 @@ flowchart LR
   with `TRUST_PROXY=true`. `railway.json` declares the Dockerfile build and the
   `/api/v1/health` healthcheck; the full operator runbook is `docs/deployment.md`.
 - **AI**: optional outbound dependency on the Anthropic API, gated on `ANTHROPIC_API_KEY`
-  (`apps/api/src/modules/ai/service.ts`); see §19.
+  (`apps/api/src/modules/ai/service.ts`); see §24.
 - **Health**: `GET /api/v1/health` reports which database backend is live (`app.ts`).
 
 ---
@@ -196,7 +196,7 @@ Key properties, all visible in `plugins/auth.ts`:
 
 ## 6. Module inventory
 
-Twenty-two Fastify plugins, each `apps/api/src/modules/<name>/index.ts`, all registered in
+Twenty-nine Fastify plugins, each `apps/api/src/modules/<name>/index.ts`, all registered in
 `src/app.ts` under the `/api/v1` prefix. "Tool" is the `requireTool` key from
 `packages/shared/src/permissions.ts`; tables are from `packages/db/src/schema/`. Sibling
 modules are being developed concurrently — the contracts below come from route registration
@@ -226,6 +226,11 @@ and schema, not implementation internals.
 | `governance` | `governance` | `businessCases`, `stageGates`, `gateReviews`, `benefits`, `benefitReadings` (+ writes assurance `obligations`, `events`) | `/projects/:id/business-cases` (+`options`, `select-option`, `submit`, `approve`, `reject`), `/projects/:id/stage-gates` (+`reviews`), `/gate-reviews/:id/conditions/:id/close`, `/projects/:id/governance/conditions`, `/projects/:id/benefits` (+`readings`) | Vol II Domain G (M12) #394–399, #401–402, #408–409, #412–418, #420 subset |
 | `finance` | `finance` | `fundingFacilities`, `facilityConditions`, `disbursements`, `covenants`, `covenantReadings` (+ writes assurance `obligations`, `signals`) | `/projects/:id/facilities` (+`conditions`, `disbursements`, `covenants`, `statement{,.csv}`), `/facility-conditions/:id/{satisfy,waive}`, `/disbursements/:id/{submit,approve,disburse,reject}`, `/covenants/:id/readings`, `/projects/:id/finance/summary` | Vol II Domain O (M14) #729–733, #735, #739–743, #769 subset |
 | `disputes` | `disputes` | `disputes`, `disputeSubmissions`, `disputeBundles`, `settlementOffers` (+ writes assurance `obligations`, `signals`) | `/projects/:id/disputes` (+`status`, `timetable/:stepId/complete`, `submissions`, `offers`, `settlement-analysis`), `/dispute-bundles/:id/{items,chronological,generate,verify,issue,manifest.csv}`, `/settlement-offers/:id/status` | Vol II Domain E (M15) #321 partial, #325, #329–330, #334–339, #343–344, #349–352 subset |
+| `land` | `land` | `landParcels`, `affectedPersons`, `grievances`, `stakeholders`, `engagements` (+ writes assurance `obligations`, `signals`) | `/land/reference`, `/projects/:id/parcels` (+`status`, `compensate`), `/projects/:id/land/{parcel-summary,schedule-risk,cut-off,rap-progress}`, `/projects/:id/affected-persons` (+`entitlements`, `compensate`, `status`), `/projects/:id/grievances` (+`acknowledge`, `assign`, `resolve`, `verify-closure`, `escalate`, `analytics`), `/projects/:id/stakeholders` (+`matrix`), `/projects/:id/engagements` | Vol II Domain J (M16) #547–559, #561, #564–575, #579–584, #591 subset |
+| `workforce` | `workforce` | `workers`, `siteAccessRecords`, `payrollEntries`, `labourRiskFlags`, `welfareInspections`, `labourAudits` (+ writes assurance `obligations`, `signals`) | `/projects/:id/workers` (+`status`), `/projects/:id/{site-access,payroll}` (bulk ingest), `/projects/:id/workforce/{reconcile,reconciliations,vendor-risk}`, `/projects/:id/labour-risk-flags` (+`resolve`), `/projects/:id/welfare-inspections` (+`actions/:id/close`), `/projects/:id/labour-audits` (+`report`, `findings/:id/close`) | Vol II Domain M (M17) #667–677, #683–688, #694, #697–699 subset |
+| `esg` | `esg` (factor library: `requireCompany` + company role) | `carbonFactors`, `carbonBudgets`, `carbonEntries`, `wasteRecords`, `socialValueCommitments`, `socialValueDeliveries` (+ writes assurance `signals`) | `/carbon-factors` (+`seed-defaults`, company-scoped), `/projects/:id/carbon-budgets`, `/projects/:id/carbon-entries` (+`from-boq`), `/projects/:id/carbon/{summary,report.csv}`, `/projects/:id/waste-records` (+`waste/summary`), `/projects/:id/social-value` (+`deliveries`, `summary`) | Vol II Domain I (M18) #491–498, #501, #505–508, #513–514, #527–540 subset |
+| `jurisdiction` | `jurisdiction` (FX rate register: `requireCompany`) | `currencyConfigs`, `fxRates`, `permits`, `localContentTargets`, `localContentReadings` (+ writes assurance `obligations`, `signals`) | `/fx-rates` (+`latest`, company-scoped), `/projects/:id/currency-configs` (+`split`), `/projects/:id/fx/{convert,exposure}`, `/projects/:id/permits` (+`status`, `conditions/:id/close`, `schedule-risk`), `/projects/:id/local-content-targets` (+`readings`) | Vol II Domain K (M19) #585–591, #593–599, #608, #612–615 subset |
+| `analytics` | `requireCompany` + per-report project reach (the `analytics` tool key is reserved in `TOOLS` but the module deliberately does not use `requireTool` — reports cross projects) | `reportDefinitions`, `dashboards`, `reportSchedules` (reads the registered datasets) | `/analytics/datasets`, `/analytics/reports` (+`preview`, `run`, `export.csv`, `schedules`), `/analytics/dashboards` (+`data`, `seed-defaults`) | Vol I §6.1–6.2 #731–733, #735–739, #741–742, #749, #751 |
 
 Shared helpers used by all modules (`apps/api/src/lib/`): `ids.ts` (prefixed nanoid),
 `numbering.ts` (atomic per-project record counters, spec #72), `pagination.ts`
@@ -310,7 +315,7 @@ Upload → extraction → sheet/revision model → markups/pins. All in
    the sheet number and title from each page's text stream and classify discipline from the
    number prefix (A→architectural, S→structural, …) — spec Vol I #257–258, #266. Low-confidence
    extractions set `drawing_sheets.needsReview = 1`, feeding the human naming-review queue
-   (#258); the AI `sheet_naming` agent (§19) can propose corrections.
+   (#258); the AI `sheet_naming` agent (§24) can propose corrections.
 4. **Sheet/revision model**: a `drawing_sheets` row is the logical sheet, unique per
    `(projectId, number)`; each upload appends a `drawing_revisions` row (revision label,
    source set, `pageIndex`, extracted text, calibration) and supersedes the previous one
@@ -950,7 +955,409 @@ Timeline / Submissions / Bundles / Settlement tabs; bundle builder).
 
 ---
 
-## 19. AI layer
+## 19. Land, resettlement & community (M16)
+
+Spec Vol II Domain J — *"this is a category of work Procore has no concept of"*, and
+frequently the single largest source of delay on internationally financed infrastructure.
+Routes `apps/api/src/modules/land/` (`parcels.ts`, `paps.ts`, `grievances.ts`,
+`engagement.ts`, shared helpers `shared.ts`, code-resident reference data `reference.ts`),
+schema `packages/db/src/schema/land.ts`, web workspace `apps/web/src/pages/land/` (RAP
+dashboard / Parcels / Affected households / Grievances / Stakeholders). The compliance
+frame is IFC Performance Standard 5 and World Bank ESS5, named in the module header.
+
+```mermaid
+flowchart LR
+    PAR["land_parcels<br/>tenure incl. customary,<br/>communal, informal"] -- "blockingTaskIds" --> SR["land/schedule-risk<br/>tasks starting on<br/>un-acquired land"]
+    SR -- "≤ 30 days out" --> SIG["signals<br/>land_blocks_programme (high)"]
+    PAR -- "compensate:<br/>evidenceIds REQUIRED" --> PAID["compensated<br/>ledgered w/ payload"]
+    PAP["affected_persons<br/>census + vulnerability<br/>+ entitlement matrix"] --> PAID
+    CUT["cut-off date<br/>(project settings, admin)"] -- "census after cut-off<br/>= encroachment (400)" --> PAP
+    GRV["grievances<br/>severity → SLA"] --> OBL["obligations<br/>resolveDueAt, warn 2d"]
+    OBL -- "sweep: SLA elapsed" --> BR["breached + signal<br/>grievance_sla_breach"]
+    GRV -- "resolve → verify-closure" --> VER{"complainant<br/>satisfied?"}
+    VER -- "yes" --> CLOSED["closed_verified"]
+    VER -- "no" --> REOPEN["back to investigating"]
+```
+
+1. **Parcel register with real tenure** (#547–551): `land_parcels` carries a cadastral
+   `reference` (unique per project), area, owner (optionally an assurance `entities` id),
+   encumbrances and — the point — a `tenureType` from `TENURE_TYPES` that includes
+   `customary`, `communal` and `informal`. A title-only model cannot represent the majority
+   of land on the projects this module exists for. Status moves along an explicit
+   transition table (`PARCEL_TRANSITIONS`, `reference.ts`): `identified → surveyed →
+   under_negotiation → agreed → … → acquired`, with `disputed` reachable and an illegal
+   move refused with the allowed set named.
+2. **Compensation cannot be asserted, only evidenced** (#553–554): `compensated` is
+   unreachable through the status route (400 telling you which route to use). The only path
+   is `POST …/parcels/:id/compensate` (and its PAP twin), which requires **at least one
+   validated assurance `evidence` id** — a bank transaction, a signed receipt, a
+   beneficiary-verified payment record — merges them onto the parcel and ledgers the
+   payment with full payload. Same rule, same reason as lender-condition satisfaction
+   (§17.2): a payment to a displaced household is discharged by pointing at documents.
+3. **PAP census with a cut-off that bites** (#555–557, #564–566): `affected_persons` holds
+   the household census, `vulnerabilities[]` screening (elderly, disabled, female-headed,
+   landless, indigenous, below poverty line, child-headed) that drives enhanced
+   entitlements under PS5, the socio-economic `baseline` bag (#556), the entitlement matrix
+   as `entitlements[]` with a server-recomputed `compensationTotal`, and displacement
+   classified `physical | economic | both | none` (#565). The **cut-off date** is declared
+   once per project (`POST …/land/cut-off`, `land` **admin**, stored in project settings)
+   and a census dated after it is a 400 — *"households recorded after the cut-off are
+   encroachment, not project-affected persons"*. That single rule is the classic
+   compensation-fraud vector on a resettlement programme, closed in code.
+4. **Land blocking the programme** (#591): a parcel lists the `blockingTaskIds` it stands
+   under. `GET …/land/schedule-risk?days=N` joins those ids to the project's schedule tasks
+   and returns every works package due to start on land the project does not hold, soonest
+   first with `daysUntilStart` signed. Anything inside 30 days raises a high
+   `land_blocks_programme` signal, idempotent per `(parcelId, taskId)` carried in
+   `evidenceRefs`, whose explanation names the exposure (trespass, injunction, lender
+   non-compliance) — the same read-model-plus-signal shape as the contract time-bar radar
+   (§11.4). `land/rap-progress` rolls the two registers into the supervision view a lender's
+   E&S mission asks for: parcels and PAPs by status, physical vs economic displacement,
+   vulnerable households, and compensation committed vs paid.
+5. **The grievance mechanism is SLA-driven and obligation-backed** (#569–574): intake over
+   eight channels including genuinely anonymous — an anonymous grievance has its
+   complainant name and contact **stripped at intake**, not merely hidden, so they cannot
+   leak through a later read or a ledger payload. Severity selects the published service
+   standard (`GRIEVANCE_SLA` in `reference.ts`: critical 1/7 days, high 2/14, medium 3/30,
+   low 5/45, each with its rationale), which computes `acknowledgeDueAt`/`resolveDueAt` and
+   materializes an assurance `obligations` row for the resolution deadline
+   (`warnDaysBefore: 2`) — ADR 0012's primitive again. A lazy sweep breaches overdue
+   grievances exactly once (obligation breached + `grievance_sla_breach` signal). **Closure
+   is verified with the complainant** (#573): `POST …/verify-closure` moves a resolved
+   grievance to `closed_verified` only when `complainantSatisfied` is true; a rejection
+   reopens it to `investigating`, nulls `resolvedAt` and ledgers
+   `closure_rejected_reopened` with the rejected resolution. `…/grievances/analytics`
+   is #574 — by type, location, severity and time.
+6. **Stakeholders & engagement** (#575, #579–584): the register with 1–5 influence/interest
+   scores mapped to quadrants (`…/stakeholders/matrix`), and the consultation log carrying
+   attendance, feedback with its disposition (#582), attached files and an FPIC
+   `consentStatus` (`pending | granted | conditional | refused`, #575).
+
+Not built (Domain J remainder): #552 compulsory-purchase process management, #558's full RAP
+document lifecycle and #568 independent monitoring/completion audit as workflow, #560 ESS5
+as a distinct tracked frame, #562–563 replacement housing and resettlement-site delivery,
+#567 replacement-cost verification, #576–578 indigenous peoples plans and cultural-heritage
+chance finds, #592 regulator correspondence. Permits (#585–590) live in the jurisdiction
+module (§22) because they share the permit/consent clock.
+
+---
+
+## 20. Workforce rights & welfare (M17)
+
+Spec Vol II Domain M — *"Procore tracks labour as cost and hours. It does not track labour
+as people with rights."* Routes `apps/api/src/modules/workforce/index.ts`, pure engines
+`modules/workforce/reconcile.ts` (age verification, reconciliation, vendor scoring — all
+unit-testable without a database), schema `packages/db/src/schema/workforce.ts`, web
+workspace `apps/web/src/pages/workforce/` (Worker register / Payroll reconciliation /
+Rights indicators / Subcontractor risk / Welfare / Labour audits).
+
+```mermaid
+flowchart LR
+    PAY["payroll_entries<br/>employer's CLAIM<br/>daysClaimed, grossPay"] --> REC["reconcileWorkforce<br/>(pure)"]
+    ACC["site_access_records<br/>INDEPENDENT stream<br/>turnstile / biometric"] --> REC
+    REC -- "0 evidenced days" --> G["signals: ghost_worker (critical)"]
+    REC -- "> 1.15× evidenced" --> O["signals: payroll_overclaim (high)"]
+    REC -- "rate < 0.95× agreed" --> U["signals: wage_underpayment (high)"]
+    FLAG["labour_risk_flags<br/>10 ILO indicators"] --> VR["vendor-risk<br/>100-pt composite"]
+    G --> VR
+    O --> VR
+    AUD["labour_audits<br/>findings + CAP dates"] --> OBL["obligations<br/>warn 7d → labour_cap_overdue"]
+    WEL["welfare_inspections<br/>8 scored areas"] --> WS["signals: welfare_standard_failure,<br/>accommodation_overcrowding"]
+```
+
+1. **The flagship: ghost-worker reconciliation** (#669, #677). Two streams, two write
+   routes, two authors — the design law of `docs/adr/0014-independent-evidence-streams.md`.
+   `payroll_entries` is the employer's *claim* (`daysClaimed`, `grossPay`, `submittedBy`,
+   optional Gulf `wpsReference` per #676); `site_access_records` is the *independent
+   evidence* (one row per worker per date, unique on `(workerId, accessDate)`, tagged
+   `turnstile | biometric | manual | gate_log`). Both ingest in bulk (up to 5000 rows,
+   addressable by `workerId` or `workerReference`). `POST …/workforce/reconcile` runs the
+   pure engine over a period and classifies each worker:
+
+   | Classification | Test | What it means |
+   |---|---|---|
+   | `ghost` | pay claimed, **zero** evidenced days | the whole gross pay is value at risk |
+   | `overclaim` | claimed days > 1.15 × evidenced days (`OVERCLAIM_TOLERANCE`) | unmatched days × the implied daily rate is value at risk |
+   | `underpaid` | implied daily rate < 0.95 × the agreed rate (`UNDERPAYMENT_TOLERANCE`) | the wage shortfall is money owed *to* the worker (#677) |
+
+   Conditions are evaluated independently (a worker can be both overclaimed and underpaid)
+   while the table shows the worst single label — because a ghost and an underpaid worker
+   are different wrongs with different remedies. Findings become `ghost_worker` (critical),
+   `payroll_overclaim` and `wage_underpayment` (high) signals, idempotent per
+   `(detector, workerId, period)`, and the run is ledgered with its totals.
+   `GET …/workforce/reconciliations` replays the identical engine and **writes nothing**
+   (`persisted: false`) so a reviewer can look without changing the record. The engine's
+   own header states its false negatives: a ten-minute swipe counts as a day present, and
+   period-edge payroll is counted whole — which is why the 1.15× tolerance is deliberately
+   generous.
+2. **Child labour is a blocked write, not a report** (#670): enrolling or patching a worker
+   whose date of birth puts them under `MINIMUM_WORKING_AGE` (18, ILO C138) is refused —
+   *and the refused attempt raises a critical `underage_worker_blocked` signal first*, so
+   the attempt is on the record even though the row never lands.
+3. **Rights indicators drive severity, not the reporter** (#671–675, #694): a
+   `labour_risk_flags` row names an indicator from `LABOUR_RISK_INDICATORS` (recruitment fee
+   paid, passport retained, contract substituted, wage withheld, excessive overtime, no rest
+   day, underage, no contract in language, movement restricted, debt bondage) against a
+   worker or an employer, sourced `audit | worker_report | detector | inspection`. Severity
+   is derived from the indicator (`CRITICAL_LABOUR_INDICATORS` — passport retention, debt
+   bondage, underage, movement restriction are treated as direct forced-labour evidence
+   under the ILO framework), never from who filed it. Every flag raises a
+   `labour_rights_indicator` signal and stores the signal id back on the flag.
+4. **Modern-slavery scoring at subcontractor level** (#694): `…/workforce/vendor-risk`
+   ranks employers on a documented 100-point composite — open flags (45, weighted 12
+   critical / 6 other), reconciliation findings (25, 6 per ghost / 3 per overclaim),
+   contract-issuance coverage (18, #674) and identity verification (12, #667) — with every
+   component returned alongside the score and band (`low | medium | high | critical`). The
+   weights are the author's calibration, not a published standard, and the response says so.
+   A vendor with no workers scores 0: an empty denominator must not manufacture risk.
+5. **Welfare inspections are scored and consequential** (#683–688): eight areas
+   (`WELFARE_INSPECTION_AREAS` — accommodation, sanitation, catering, potable water,
+   transport, heat stress, PPE, medical) scored 1–5 with notes and photo ids. Occupancy
+   above the operator's own declared capacity raises a high `accommodation_overcrowding`
+   signal with the arithmetic (#684); any area at or below 2 raises
+   `welfare_standard_failure` and demands a dated corrective action.
+6. **Audits with corrective-action plans on the obligation clock** (#697–699): audits are
+   scheduled per vendor (`isUnannounced` for #698) and reported once. **Every finding with
+   a CAP due date materializes an assurance `obligations` row** (`warnDaysBefore: 7`,
+   evidence requirement stated) — ADR 0012 again — and a lazy sweep breaches overdue CAPs
+   exactly once, guarded by the finding's own `capBreachedAt` marker, raising
+   `labour_cap_overdue`. Closing a finding satisfies an *open* obligation only.
+
+Not built (Domain M remainder): #678–682 minimum-wage/overtime/rest-day/deduction-legality
+rule engines by jurisdiction and late-payment escalation, #689–693 the employer-independent
+grievance channel and worker voice (the community GRM in §19 is not it — an
+employer-independent worker channel needs its own identity path), #695–696 ILO/PS2
+compliance mapping as a tracked frame, #700 lender KPI reporting, #701–702 independent
+fatality reporting and statistical under-reporting detection, #703–704 demographic,
+turnover and skills analytics.
+
+---
+
+## 21. Carbon, ESG & social value (M18)
+
+Spec Vol II Domain I — carbon reporting is becoming a contractual condition in the UK, EU
+and Gulf, and social value is a *scored tender criterion* in UK public procurement. Routes
+`apps/api/src/modules/esg/index.ts`, pure calculation core `modules/esg/carbon.ts` (unit
+conversion, `computeTco2e`, budget drawdown bands, waste diversion, commitment status,
+the seed factor library), schema `packages/db/src/schema/esg.ts`, web workspace
+`apps/web/src/pages/esg/` (Carbon / Waste / Social value / Factors).
+
+1. **EN 15978 life-cycle modules are the accounting spine** (#491–492): every
+   `carbon_entries` row is attributed to a `lifecycleModule` from `CARBON_MODULES`
+   (`A1-A3` product, `A4` transport, `A5` construction, `B1-B7` in use, `C1-C4` end of
+   life, `D` beyond the boundary) and optionally to a GHG-Protocol `scope`
+   (`scope_1 | scope_2 | scope_3`, #505–508). `…/carbon/summary` reports `byModule` and
+   `byScope` side by side — the RICS whole-life split and the GHG split are different cuts
+   of the same rows, not different data.
+2. **Factor provenance is a first-class measure of the assessment's maturity** (#496–498).
+   `carbon_factors` is tenant reference data (company-scoped, gated on company role rather
+   than a project tool level) with `source ∈ epd | ice_database | generic | supplier |
+   custom`, an `isProductSpecific` flag and an `epdReference`. The summary returns
+   **`productSpecificSharePercent`** — the share of the reported footprint standing on a
+   product-specific EPD rather than a generic library figure — and the code says why in as
+   many words: *a low number is not an error; it is the honest maturity of the
+   assessment.* `POST /carbon-factors/seed-defaults` seeds an ICE-database-derived starter
+   set so a project is not blocked on library curation.
+3. **Carbon rides the BoQ** (#501). `POST …/carbon-entries/from-boq` takes mappings of
+   `{factorId, boqItemId | codePrefix}`, walks the bill's items, and generates A1-A3 /
+   scope-3 entries with the `boqItemId` recorded as provenance and units checked through
+   `normaliseUnit`/`unitsMatch` (so `m³`/`m3`/`cum` agree and a genuine mismatch still
+   fails). Items that cannot be converted are **skipped and reported with a reason**, never
+   silently guessed: a carbon figure with no quantity behind it is worse than a missing one.
+   This is the same provenance discipline as taking-off → BQ quantity (§10.3), applied to
+   emissions: the carbon model is a view of the commercial model, not a parallel
+   spreadsheet.
+4. **Budgets with drawdown and an exceedance signal** (#494–495): `carbon_budgets` hold a
+   baseline and target in tCO2e per element; `budgetDrawdown` bands the position
+   (`on_track` < 80%, `at_risk` 80–100%, `exceeded` > 100%, with a non-positive target
+   treated as instantly exceeded by any emission), and crossing the target raises
+   `carbon_budget_exceeded` exactly once. The summary also reports `unbudgetedTco2e` —
+   unattributed emissions are as material as attributed ones — and `intensityPerSqm`
+   (kgCO2e/m² GIA, the RICS reporting unit) when the project's GIA is set.
+5. **Waste with the number that is actually audited** (#513–514): movements by
+   `WASTE_STREAMS` × `WASTE_DESTINATIONS` with tonnage, carrier and duty-of-care
+   consignment note. `wasteDiversion` computes diversion-from-landfill and, separately, the
+   narrow `recycledPercent` — with the taxonomy boundary documented: energy-from-waste
+   belongs in `recovered`, so `incinerated` is counted as diverted and a site that books it
+   wrongly gets a flattering number it can be challenged on.
+6. **Social value: tender promise against delivery** (#527–540). `social_value_commitments`
+   are numbered per project, themed over the UK Social Value Model (`SOCIAL_VALUE_THEMES`,
+   PPN 06/20) with an optional TOMs `measureRef`, a unit, a target and an optional
+   `proxyValuePerUnit` for proxy financial valuation (#538). Deliveries are separate rows
+   carrying their own dates and assurance `evidenceIds`, and the commitment's
+   `deliveredValue` and `status` are recomputed server-side by `commitmentStatus`:
+   delivered at or above target whatever the date; `at_risk` past due and under 70%;
+   **`shortfall`** past due + 30 days and still short — which raises
+   `social_value_shortfall`. #539's reconciliation is the whole point of the sub-module:
+   the tender score was bought with the promise, and the shortfall is the number the
+   client's compliance team asks for.
+
+Not built (Domain I remainder): #493 PAS 2080 as a tracked frame, #497 EPD ingestion and
+verification as a pipeline (the reference field exists; parsing EPD documents does not),
+#499–500 design-option comparison and marginal abatement cost, #502–504 transport carbon
+from supplier location, site energy and plant emissions by equipment hours, #509–511 SBTi,
+offsets and operational carbon handover, #512 water, #515–516 material passports and reuse,
+#517–526 biodiversity, environmental monitoring/incidents/permits/ISO 14001 and
+BREEAM/LEED credit tracking, #529–537 the individual social-value measure families beyond
+the generic commitment/delivery model, #541–546 CSRD/ESRS, IFRS S1/S2, EU Taxonomy, TCFD,
+Modern Slavery Act statements and CSDDD due diligence.
+
+---
+
+## 22. Multi-jurisdiction operations (M19)
+
+Spec Vol II Domain K — *"Procore is a single-currency, single-tax-regime system with locale
+skins on top. Internationally financed projects run three or four currencies simultaneously
+with contractual exchange mechanics."* Routes
+`apps/api/src/modules/jurisdiction/index.ts`, pure FX engine `modules/jurisdiction/fx.ts`,
+schema `packages/db/src/schema/jurisdiction.ts`, web workspace
+`apps/web/src/pages/jurisdiction/`.
+
+1. **Contractual currency portions, not a converter** (#593–595). A `currency_configs` row
+   fixes, at a base date, the share of each payment settled in each currency and the rate
+   applied to that share — FIDIC Sub-Clause 14.15. `validatePortions` requires the
+   proportions to exhaust the payment (sum to 100% within `PORTION_SUM_TOLERANCE` 0.01),
+   because a split that does not add up is not a contract term. The rate direction is one
+   convention the whole engine depends on and it is stated in the file header: a rate
+   `from → to` is **units of `to` bought by one unit of `from`**, so
+   `foreignAmount = baseAmount × baseRate`.
+2. **FX variance is the deliverable** (#596, #599). `POST …/currency-configs/:id/split`
+   splits a payment across the portions and values each share against the market:
+   `contractualAmount = baseAmount × baseRate` versus `marketAmount = baseAmount ×
+   marketRate`, plus the base-currency cost *today* of buying the contractual foreign
+   entitlement (`contractualAmount ÷ marketRate`) against the base share it was meant to
+   settle. That difference is the unrealised gain/loss the project is carrying. A portion
+   with no usable quote is returned with nulls and named in `missingRates` with a `note`
+   — a partially-quoted contract still produces a usable statement rather than a silent
+   half-answer. `…/fx/exposure` rolls every config (and its linked contract sum) into the
+   project-level position.
+3. **Rate provenance, because #598 is won on the audit trail** (#597). `fx_rates` are dated
+   quotes, unique per `(company, from, to, date, source)` with `source ∈ contractual |
+   central_bank | market | manual` and a `sourceReference`. `resolveRate` walks an explicit
+   ladder — `identity → direct → inverse → triangulated` through a pivot — and **reports
+   which path it took**, the quote dates used (the staler leg for a triangulation) and the
+   legs themselves. A converted number that cannot say where its rate came from is not
+   evidence.
+4. **Permits that block the programme** (#585–591, #608, #614). `permits` are numbered per
+   project over `PERMIT_KINDS` (work permit, visa, import licence, customs clearance, road
+   closure, environmental consent, planning condition, utility wayleave) with the authority,
+   jurisdiction, the application date and an `expectedDays` statutory determination period
+   that computes `dueAt` — and that date materializes an assurance `obligations` row
+   (`warnDaysBefore: 7`, evidence requirement: a written determination from the authority),
+   kept in step when the application date or period is edited. Two sweeps run lazily on
+   reads: a determination past `dueAt` while still `applied`/`in_review` breaches that
+   obligation and raises `permit_determination_overdue` (medium, with the advice that
+   authority delay is normally an employer-risk event and the chase correspondence is what
+   the entitlement argument later rests on); a `granted` permit past `expiresAt` flips to
+   `expired` and raises `permit_expired` (high). Conditions attached to a grant are tracked
+   as closable items on the permit with their own due dates and a live `openConditions`
+   count (#586–587) — they are **not** obligation-backed today, a deliberate boundary noted
+   in `docs/roadmap.md`. `…/permits/schedule-risk` is the twin of the land analysis in
+   §19.4: permits that are not granted, joined to the `blockingTaskIds` they gate, sorted by
+   how soon the work starts, raising `permit_blocks_programme` inside the horizon (#591).
+5. **Local content and ICV** (#612–615): a target names its jurisdiction and metric
+   (`local_spend_percent | local_headcount_percent | icv_score | national_quota`) and takes
+   dated readings. Every one of these metrics is a floor — higher is better — so compliance
+   is `value >= targetValue` with no operator to configure, and a reading below the floor
+   raises `local_content_shortfall` with the gap and the consequence (penalties, withheld
+   certificates, exclusion from future Gulf ICV tenders).
+
+Not built (Domain K remainder): #600–601 hedging instruments and repatriation restrictions,
+#602–607 multi-entity consolidation, functional/presentation currency, inflation and IAS 29,
+country charts of accounts and multi-jurisdiction statutory reporting, #609–611 customs
+bonds, port-clearance delay logging and border delay attribution, #616–626 the
+emerging-market client stack (offline-first, SMS/USSD, low-bandwidth sync, OCR paper
+capture, RTL and non-Latin scripts, regional formats, holiday calendars, data residency)
+— that last family is an application-shell programme, not a module, and is sequenced in
+`docs/roadmap.md`.
+
+---
+
+## 23. Analytics & 360 reporting (Vol I §6)
+
+Spec Vol I §6.1–6.2. Routes `apps/api/src/modules/analytics/index.ts`, dataset registry and
+query builder `modules/analytics/datasets.ts`, schema
+`packages/db/src/schema/analytics.ts`, web workspace `apps/web/src/pages/analytics/`.
+This is the one Phase-5 module that is *parity* surface rather than gap surface, and it is
+built the way the rest of the platform is: declaratively, with the security model living
+in a registry rather than in a filter.
+
+1. **A registry, not a query language** (#731–733). `DATASETS` in `datasets.ts` is the
+   single source of truth for what is reportable: one entry per `REPORT_DATASETS` member
+   (twelve today, spanning delivery, commercial, forensic, financial and safeguard tables —
+   `rfis`, `submittals`, `punch_items`, `daily_logs`, `delay_events`, `risks`, `signals`,
+   `payment_claims`, `variations`, `disbursements`, `grievances`, `workers`), each with its
+   drizzle table, its company/project columns and a map of column keys to
+   `{label, drizzle column, type, enum vocabulary, filterable, groupable, aggregatable}`.
+   `GET /analytics/datasets` serves the same constant to the builder UI as the catalog, so
+   the field list a user sees and the fields the executor accepts cannot drift.
+2. **Why there is no raw SQL — and why that is the whole design.** A report definition is
+   stored user input describing a query, and *identifiers cannot be parameterized*. So no
+   identifier is ever taken from the user: dataset, column, filter field, group-by,
+   aggregation field and sort are all **keys looked up in the registry** (via
+   `Object.hasOwn`, not bare indexing — `__proto__` and `constructor` would otherwise
+   resolve), and a key that does not resolve is a 400 that echoes the offending key back
+   without ever putting it in a query. Aggregation aliases — the only user string that
+   reaches the SQL text — must match `[A-Za-z][A-Za-z0-9_]{0,40}`. Filter values are
+   coerced to the registered column's type (enums checked against their vocabulary, `in`
+   capped at 200) and bound as parameters by drizzle. Full argument and the accepted
+   trade-off in `docs/adr/0013-whitelisted-report-builder.md`.
+3. **Scope is applied by the executor, never by the definition** (#739, #751).
+   `executeReport` pushes `eq(companyColumn, companyId)` **first**, then the project
+   predicate, and ANDs the definition's own filters *beneath* them — so a stored definition
+   that names another tenant returns nothing instead of escaping. For a company-wide run,
+   `reachableProjectIds` mirrors `requireTool`'s model (owner/admin and company-wide
+   assurance grants unrestricted; everyone else gets memberships plus project-scoped
+   grants) and an empty reach renders as a literal `false` predicate, not "everything".
+   Analytics crosses projects by design, so its routes gate on `requireCompany` and check
+   project reach per
+   report rather than carrying a `:projectId` tool gate — it is never a wider door than the
+   module it reports on. (The `analytics` tool key is reserved in `TOOLS` and inherited by
+   every permission template, but the module deliberately does not gate on it: a per-tool
+   level keyed to one project cannot express "may read across projects". The reach check
+   is the gate, and keeping it in step with `requireTool`'s model is a review-and-test
+   obligation, not a type-system one — `docs/security.md` §2.4.)
+4. **Definitions, preview and execution** (#734 partial, #735–738): saved
+   `report_definitions` (project- or company-scoped, `isShared` for #737, editable only by
+   creator or company admin), `POST …/reports/preview` for an unsaved spec, `POST
+   …/reports/:id/run` for paged execution with an honest `truncated` flag (the executor
+   fetches one row beyond the window rather than silently cutting), and
+   `GET …/reports/:id/export.csv` (#738 — CSV only; PDF and Excel are not built).
+   Calculated columns (#734) are deliberately absent: an arbitrary user expression is
+   user-authored SQL by another name — see ADR 0013 for the shape that would preserve the
+   invariant.
+5. **Dashboards** (#741–742, #749): `dashboards` hold widgets (`WIDGET_KINDS`:
+   `stat | bar | line | donut | table`) bound either to a report definition or to one of a
+   small set of code-defined `METRICS` (`open_obligations`, `open_signals` — the assurance
+   counts that no single dataset expresses). `…/dashboards/:id/data` executes every widget
+   under the caller's scope, and `POST …/dashboards/seed-defaults` idempotently seeds three
+   role dashboards from real definitions — **PM** (open RFIs, punch by status, RFI ageing),
+   **Commercial** (variations by status, payment claims by status, disbursement register)
+   and **Assurance** (signals by severity, open obligations, grievances by status). Each
+   widget result carries its dataset key alongside the rows, and row-mode definitions
+   project the record's own identifying columns — which is what the client needs to drill
+   from a chart back to the record (#749). Widget execution is fault-isolated: a widget
+   whose report was deleted or whose project the viewer cannot reach comes back with
+   `data: null` and an `error` string rather than failing the whole dashboard.
+6. **Scheduled delivery is recorded, not dispatched** (#736) — stated plainly because the
+   alternative is a user believing a report is arriving. `report_schedules` stores the
+   cadence, the recipients and a maintained `nextRunAt` (computed for 06:00 UTC), and
+   **nothing happens when that instant passes**: this deployment runs a single API process
+   with no worker, queue or cron and no mail transport. Every schedule response carries a
+   `delivery: {enabled: false, note}` block saying so, and the module header names the work
+   to wire it (a scheduler polling `report_schedules` for due rows, executing the report,
+   handing the CSV to a transport).
+
+Not built from §6: #740 inactive-project tracking, #743 direct BI-tool data-model exposure
+(the REST surface is the only exposure), #744–748 portfolio aggregation, trend analysis and
+the predictive-field family, #750 historical comparison, #752 scheduled data refresh
+(nothing is materialized — every run is live), and all of §6.3 insights & benchmarking
+(#753–758), which is M11 territory and needs a benchmark independent of the benchmarked
+(`docs/roadmap.md`).
+
+---
+
+## 24. AI layer
 
 `modules/ai/` (service in `service.ts`), schema `packages/db/src/schema/ai.ts`. Design rules
 come from spec Domain X: **citations always (#1019), human-in-the-loop for consequential
@@ -979,7 +1386,7 @@ outputs (#1020), full audit trail (#1021).**
 
 ---
 
-## 20. Integration surface
+## 25. Integration surface
 
 **Today (implemented):**
 
@@ -992,8 +1399,15 @@ outputs (#1020), full audit trail (#1021).**
   forensically exportable surface (spec Domain S #871–872).
 - COBie CSV/JSON export (twin module) — the open handover format (spec Domain N adjacent).
 - CSV exports for external counterparties: the facility statement of expenditure
-  (`…/facilities/:id/statement.csv`, spec O#735) and the frozen bundle manifest with
-  per-tab content hashes (`…/dispute-bundles/:id/manifest.csv`, spec E#343).
+  (`…/facilities/:id/statement.csv`, spec O#735), the frozen bundle manifest with per-tab
+  content hashes (`…/dispute-bundles/:id/manifest.csv`, spec E#343), the whole-life carbon
+  report (`…/carbon/report.csv`, spec I#491–492) and any saved report definition
+  (`/analytics/reports/:id/export.csv`, spec Vol I #738 — CSV only; PDF/Excel are not
+  built).
+- The analytics dataset catalog (`GET /analytics/datasets`) is the closest thing to a
+  published data model today: labels, types, enum vocabularies and per-column capability
+  flags for every reportable column (spec Vol I #743 wants direct BI-tool connection; the
+  REST surface is the only exposure — see §23).
 - CORS is open (`origin: true` in `app.ts`) to keep third-party browser clients possible in
   dev; tighten per deployment.
 
@@ -1007,7 +1421,7 @@ outputs (#1020), full audit trail (#1021).**
 
 ---
 
-## 21. Verification & test strategy
+## 26. Verification & test strategy
 
 - `packages/ledger` has pure unit tests (`src/ledger.test.ts`); so do the pure analysis
   cores in the API — the CPM engine (`apps/api/src/lib/cpm.test.ts`, hand-computed
@@ -1015,8 +1429,16 @@ outputs (#1020), full audit trail (#1021).**
   (`modules/forensics/prolongation.test.ts`), the Monte Carlo engine
   (`apps/api/src/lib/montecarlo.test.ts`: seed determinism, distribution means, QCRA/QSRA
   behaviour against hand-reasoned cases), the appraisal mathematics
-  (`modules/governance/appraisal.test.ts`) and the settlement expected-value model
-  (exercised via `modules/disputes/disputes.test.ts`).
+  (`modules/governance/appraisal.test.ts`), the settlement expected-value model
+  (exercised via `modules/disputes/disputes.test.ts`), the carbon calculation core
+  (`modules/esg/carbon.test.ts`), the multi-currency engine
+  (`modules/jurisdiction/fx.test.ts`: rate-direction conventions, the
+  identity/direct/inverse/triangulated ladder, portion validation, payment splitting) and
+  the analytics registry and resolver (`modules/analytics/datasets.test.ts`, which asserts
+  the injection invariants of ADR 0013 directly: unknown keys, prototype-chain keys,
+  non-groupable fields, out-of-vocabulary enum values and alias patterns).
+  The ghost-worker reconciliation engine (`modules/workforce/reconcile.ts`) is pure and is
+  exercised through `modules/workforce/workforce.test.ts` against hand-worked periods.
 - Every API module colocates `<name>.test.ts` using `buildTestApp()`
   (`apps/api/src/test/helpers.ts`): a full Fastify app over in-memory PGlite with migrations
   applied — integration tests with zero external services, exercising the real auth chain via
