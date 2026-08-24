@@ -29,6 +29,10 @@ const PhotosPage = lazy(() => import("./pages/photos/PhotosPage"));
 const AssurancePage = lazy(() => import("./pages/assurance/AssurancePage"));
 const CommercialPage = lazy(() => import("./pages/commercial/CommercialPage"));
 const SchedulePage = lazy(() => import("./pages/schedule/SchedulePage"));
+const RiskPage = lazy(() => import("./pages/risk/RiskPage"));
+const GovernancePage = lazy(() => import("./pages/governance/GovernancePage"));
+const FinancePage = lazy(() => import("./pages/finance/FinancePage"));
+const DisputesPage = lazy(() => import("./pages/disputes/DisputesPage"));
 const ForensicsPage = lazy(() => import("./pages/forensics/ForensicsPage"));
 const PaymentsPage = lazy(() => import("./pages/payments/PaymentsPage"));
 const ContractsPage = lazy(() => import("./pages/contracts/ContractsPage"));
@@ -235,6 +239,38 @@ export default function App() {
                 element={
                   <S>
                     <SchedulePage />
+                  </S>
+                }
+              />
+              <Route
+                path="risk"
+                element={
+                  <S>
+                    <RiskPage />
+                  </S>
+                }
+              />
+              <Route
+                path="governance"
+                element={
+                  <S>
+                    <GovernancePage />
+                  </S>
+                }
+              />
+              <Route
+                path="finance"
+                element={
+                  <S>
+                    <FinancePage />
+                  </S>
+                }
+              />
+              <Route
+                path="disputes"
+                element={
+                  <S>
+                    <DisputesPage />
                   </S>
                 }
               />

@@ -447,6 +447,139 @@ export const PAYMENT_RESPONSE_KINDS = ["payment_notice", "pay_less_notice"] as c
 export type PaymentResponseKind = (typeof PAYMENT_RESPONSE_KINDS)[number];
 
 /* ------------------------------------------------------------------ */
+/* Quantitative risk (spec Vol II Domain H / M13)                      */
+/* ------------------------------------------------------------------ */
+
+export const RISK_CATEGORIES = [
+  "technical",
+  "commercial",
+  "external",
+  "organisational",
+  "environmental",
+  "political",
+] as const;
+export type RiskCategory = (typeof RISK_CATEGORIES)[number];
+
+export const RISK_STATUSES = ["open", "mitigating", "closed", "realised"] as const;
+export type RiskStatus = (typeof RISK_STATUSES)[number];
+
+export const DISTRIBUTION_KINDS = [
+  "triangular",
+  "pert",
+  "uniform",
+  "normal",
+  "lognormal",
+  "discrete",
+] as const;
+export type DistributionKind = (typeof DISTRIBUTION_KINDS)[number];
+
+export const SIMULATION_KINDS = ["qcra", "qsra"] as const;
+export type SimulationKind = (typeof SIMULATION_KINDS)[number];
+
+/* ------------------------------------------------------------------ */
+/* Capital governance (spec Vol II Domain G / M12)                     */
+/* ------------------------------------------------------------------ */
+
+export const BUSINESS_CASE_STAGES = ["strategic_outline", "outline", "full"] as const;
+export type BusinessCaseStage = (typeof BUSINESS_CASE_STAGES)[number];
+
+export const BUSINESS_CASE_STATUSES = ["draft", "submitted", "approved", "rejected"] as const;
+export type BusinessCaseStatus = (typeof BUSINESS_CASE_STATUSES)[number];
+
+export const GATE_DECISIONS = [
+  "proceed",
+  "proceed_with_conditions",
+  "hold",
+  "stop",
+] as const;
+export type GateDecision = (typeof GATE_DECISIONS)[number];
+
+export const RAG_RATINGS = ["green", "amber_green", "amber", "amber_red", "red"] as const;
+export type RagRating = (typeof RAG_RATINGS)[number];
+
+export const BENEFIT_STATUSES = ["planned", "tracking", "realised", "at_risk", "missed"] as const;
+export type BenefitStatus = (typeof BENEFIT_STATUSES)[number];
+
+/* ------------------------------------------------------------------ */
+/* Project finance & disbursement (spec Vol II Domain O / M14)         */
+/* ------------------------------------------------------------------ */
+
+export const FACILITY_INSTRUMENTS = [
+  "loan",
+  "grant",
+  "equity",
+  "guarantee",
+  "blended",
+] as const;
+export type FacilityInstrument = (typeof FACILITY_INSTRUMENTS)[number];
+
+export const FACILITY_CONDITION_KINDS = ["precedent", "subsequent"] as const;
+export type FacilityConditionKind = (typeof FACILITY_CONDITION_KINDS)[number];
+
+export const FACILITY_CONDITION_STATUSES = ["open", "satisfied", "waived", "breached"] as const;
+export type FacilityConditionStatus = (typeof FACILITY_CONDITION_STATUSES)[number];
+
+export const DISBURSEMENT_STATUSES = [
+  "draft",
+  "submitted",
+  "approved",
+  "disbursed",
+  "rejected",
+] as const;
+export type DisbursementStatus = (typeof DISBURSEMENT_STATUSES)[number];
+
+export const COVENANT_OPERATORS = ["gte", "lte"] as const;
+export type CovenantOperator = (typeof COVENANT_OPERATORS)[number];
+
+/* ------------------------------------------------------------------ */
+/* Dispute support (spec Vol II Domain E / M15)                        */
+/* ------------------------------------------------------------------ */
+
+export const DISPUTE_KINDS = [
+  "adjudication",
+  "daab",
+  "mediation",
+  "arbitration",
+  "expert_determination",
+  "litigation",
+] as const;
+export type DisputeKind = (typeof DISPUTE_KINDS)[number];
+
+export const DISPUTE_STATUSES = [
+  "notified",
+  "referred",
+  "submissions",
+  "hearing",
+  "decided",
+  "settled",
+  "withdrawn",
+] as const;
+export type DisputeStatus = (typeof DISPUTE_STATUSES)[number];
+
+export const SUBMISSION_KINDS = [
+  "referral",
+  "response",
+  "reply",
+  "rejoinder",
+  "witness_statement",
+  "expert_report",
+  "decision",
+  "award",
+  "other",
+] as const;
+export type SubmissionKind = (typeof SUBMISSION_KINDS)[number];
+
+export const BUNDLE_STATUSES = ["draft", "generated", "issued"] as const;
+export type BundleStatus = (typeof BUNDLE_STATUSES)[number];
+
+export const SETTLEMENT_OFFER_BASES = [
+  "without_prejudice",
+  "without_prejudice_save_as_to_costs",
+  "open",
+] as const;
+export type SettlementOfferBasis = (typeof SETTLEMENT_OFFER_BASES)[number];
+
+/* ------------------------------------------------------------------ */
 /* Notifications                                                       */
 /* ------------------------------------------------------------------ */
 

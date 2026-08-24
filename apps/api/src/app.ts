@@ -34,6 +34,10 @@ import { contractsModule } from "./modules/contracts/index.js";
 import { scheduleModule } from "./modules/schedule/index.js";
 import { forensicsModule } from "./modules/forensics/index.js";
 import { paymentsModule } from "./modules/payments/index.js";
+import { riskModule } from "./modules/risk/index.js";
+import { governanceModule } from "./modules/governance/index.js";
+import { financeModule } from "./modules/finance/index.js";
+import { disputesModule } from "./modules/disputes/index.js";
 
 export interface BuildAppOptions {
   config?: Config;
@@ -153,6 +157,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
   await app.register(scheduleModule, { prefix });
   await app.register(forensicsModule, { prefix });
   await app.register(paymentsModule, { prefix });
+  await app.register(riskModule, { prefix });
+  await app.register(governanceModule, { prefix });
+  await app.register(financeModule, { prefix });
+  await app.register(disputesModule, { prefix });
 
   // Same-origin SPA serving (production): the built web app is copied into
   // the container and served by the API, so the client's absolute

@@ -14,3 +14,7 @@ export * from "./contracts.js";
 export * from "./schedule.js";
 export * from "./forensics.js";
 export * from "./payments.js";
+export * from "./risk.js";
+export * from "./governance.js";
+export * from "./finance.js";
+export * from "./disputes.js";

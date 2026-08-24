@@ -25,6 +25,10 @@ const tabs = [
   { to: "contracts", label: "Contracts" },
   { to: "forensics", label: "Forensics" },
   { to: "payments", label: "Payments" },
+  { to: "risk", label: "Risk" },
+  { to: "governance", label: "Governance" },
+  { to: "finance", label: "Finance" },
+  { to: "disputes", label: "Disputes" },
   { to: "assurance", label: "Assurance" },
   { to: "ai", label: "AI" },
 ];
