@@ -580,6 +580,238 @@ export const SETTLEMENT_OFFER_BASES = [
 export type SettlementOfferBasis = (typeof SETTLEMENT_OFFER_BASES)[number];
 
 /* ------------------------------------------------------------------ */
+/* Land, resettlement & community (spec Vol II Domain J / M16)         */
+/* ------------------------------------------------------------------ */
+
+export const TENURE_TYPES = [
+  "freehold",
+  "leasehold",
+  "customary",
+  "communal",
+  "informal",
+  "state",
+] as const;
+export type TenureType = (typeof TENURE_TYPES)[number];
+
+export const PARCEL_STATUSES = [
+  "identified",
+  "surveyed",
+  "under_negotiation",
+  "agreed",
+  "compensated",
+  "acquired",
+  "disputed",
+] as const;
+export type ParcelStatus = (typeof PARCEL_STATUSES)[number];
+
+/** Physical vs economic displacement (spec #565). */
+export const DISPLACEMENT_TYPES = ["physical", "economic", "both", "none"] as const;
+export type DisplacementType = (typeof DISPLACEMENT_TYPES)[number];
+
+export const PAP_STATUSES = [
+  "registered",
+  "surveyed",
+  "entitlement_agreed",
+  "compensated",
+  "resettled",
+  "livelihood_restored",
+  "grievance_open",
+] as const;
+export type PapStatus = (typeof PAP_STATUSES)[number];
+
+export const GRIEVANCE_CHANNELS = [
+  "in_person",
+  "phone",
+  "sms",
+  "email",
+  "suggestion_box",
+  "community_meeting",
+  "anonymous",
+  "third_party",
+] as const;
+export type GrievanceChannel = (typeof GRIEVANCE_CHANNELS)[number];
+
+export const GRIEVANCE_SEVERITIES = ["low", "medium", "high", "critical"] as const;
+export type GrievanceSeverity = (typeof GRIEVANCE_SEVERITIES)[number];
+
+export const GRIEVANCE_STATUSES = [
+  "received",
+  "acknowledged",
+  "investigating",
+  "resolved",
+  "closed_verified",
+  "escalated",
+  "rejected",
+] as const;
+export type GrievanceStatus = (typeof GRIEVANCE_STATUSES)[number];
+
+export const CONSENT_STATUSES = ["pending", "granted", "conditional", "refused"] as const;
+export type ConsentStatus = (typeof CONSENT_STATUSES)[number];
+
+/* ------------------------------------------------------------------ */
+/* Workforce rights & welfare (spec Vol II Domain M / M17)             */
+/* ------------------------------------------------------------------ */
+
+export const WORKER_STATUSES = ["active", "inactive", "demobilised", "blocked"] as const;
+export type WorkerStatus = (typeof WORKER_STATUSES)[number];
+
+/** Modern-slavery / forced-labour indicators (spec #671-675, #694). */
+export const LABOUR_RISK_INDICATORS = [
+  "recruitment_fee_paid",
+  "passport_retained",
+  "contract_substituted",
+  "wage_withheld",
+  "excessive_overtime",
+  "no_rest_day",
+  "underage",
+  "no_contract_in_language",
+  "movement_restricted",
+  "debt_bondage",
+] as const;
+export type LabourRiskIndicator = (typeof LABOUR_RISK_INDICATORS)[number];
+
+export const WELFARE_INSPECTION_AREAS = [
+  "accommodation",
+  "sanitation",
+  "catering",
+  "potable_water",
+  "transport",
+  "heat_stress",
+  "ppe",
+  "medical",
+] as const;
+export type WelfareInspectionArea = (typeof WELFARE_INSPECTION_AREAS)[number];
+
+export const LABOUR_AUDIT_STATUSES = ["scheduled", "in_progress", "reported", "closed"] as const;
+export type LabourAuditStatus = (typeof LABOUR_AUDIT_STATUSES)[number];
+
+/* ------------------------------------------------------------------ */
+/* Carbon, ESG & social value (spec Vol II Domain I / M18)             */
+/* ------------------------------------------------------------------ */
+
+/** EN 15978 life-cycle modules (spec #492). */
+export const CARBON_MODULES = [
+  "A1-A3",
+  "A4",
+  "A5",
+  "B1-B7",
+  "C1-C4",
+  "D",
+] as const;
+export type CarbonModule = (typeof CARBON_MODULES)[number];
+
+export const CARBON_SCOPES = ["scope_1", "scope_2", "scope_3"] as const;
+export type CarbonScope = (typeof CARBON_SCOPES)[number];
+
+export const CARBON_FACTOR_SOURCES = ["epd", "ice_database", "generic", "supplier", "custom"] as const;
+export type CarbonFactorSource = (typeof CARBON_FACTOR_SOURCES)[number];
+
+export const WASTE_STREAMS = [
+  "inert",
+  "non_hazardous",
+  "hazardous",
+  "metal",
+  "timber",
+  "plasterboard",
+  "packaging",
+  "mixed",
+] as const;
+export type WasteStream = (typeof WASTE_STREAMS)[number];
+
+export const WASTE_DESTINATIONS = [
+  "reused",
+  "recycled",
+  "recovered",
+  "incinerated",
+  "landfill",
+] as const;
+export type WasteDestination = (typeof WASTE_DESTINATIONS)[number];
+
+/** UK Social Value Model themes (PPN 06/20, spec #528). */
+export const SOCIAL_VALUE_THEMES = [
+  "covid_recovery",
+  "economic_inequality",
+  "fighting_climate_change",
+  "equal_opportunity",
+  "wellbeing",
+] as const;
+export type SocialValueTheme = (typeof SOCIAL_VALUE_THEMES)[number];
+
+export const COMMITMENT_STATUSES = ["committed", "on_track", "at_risk", "delivered", "shortfall"] as const;
+export type CommitmentStatus = (typeof COMMITMENT_STATUSES)[number];
+
+/* ------------------------------------------------------------------ */
+/* Multi-jurisdiction operations (spec Vol II Domain K / M19)          */
+/* ------------------------------------------------------------------ */
+
+export const FX_RATE_SOURCES = ["contractual", "central_bank", "market", "manual"] as const;
+export type FxRateSource = (typeof FX_RATE_SOURCES)[number];
+
+export const PERMIT_KINDS = [
+  "work_permit",
+  "visa",
+  "import_licence",
+  "customs_clearance",
+  "road_closure",
+  "environmental_consent",
+  "planning_condition",
+  "utility_wayleave",
+  "other",
+] as const;
+export type PermitKind = (typeof PERMIT_KINDS)[number];
+
+export const PERMIT_STATUSES = [
+  "not_started",
+  "applied",
+  "in_review",
+  "granted",
+  "refused",
+  "expired",
+] as const;
+export type PermitStatus = (typeof PERMIT_STATUSES)[number];
+
+/* ------------------------------------------------------------------ */
+/* Analytics & reporting (spec Vol I §6)                               */
+/* ------------------------------------------------------------------ */
+
+/** Datasets a custom report can be built over. */
+export const REPORT_DATASETS = [
+  "rfis",
+  "submittals",
+  "punch_items",
+  "daily_logs",
+  "delay_events",
+  "risks",
+  "signals",
+  "payment_claims",
+  "variations",
+  "disbursements",
+  "grievances",
+  "workers",
+] as const;
+export type ReportDataset = (typeof REPORT_DATASETS)[number];
+
+export const REPORT_FILTER_OPERATORS = [
+  "eq",
+  "ne",
+  "gt",
+  "gte",
+  "lt",
+  "lte",
+  "contains",
+  "in",
+  "is_null",
+  "not_null",
+] as const;
+export type ReportFilterOperator = (typeof REPORT_FILTER_OPERATORS)[number];
+
+export const REPORT_AGGREGATIONS = ["count", "sum", "avg", "min", "max"] as const;
+export type ReportAggregation = (typeof REPORT_AGGREGATIONS)[number];
+
+export const WIDGET_KINDS = ["stat", "bar", "line", "donut", "table"] as const;
+export type WidgetKind = (typeof WIDGET_KINDS)[number];
+
+/* ------------------------------------------------------------------ */
 /* Notifications                                                       */
 /* ------------------------------------------------------------------ */
 

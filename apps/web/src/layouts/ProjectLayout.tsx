@@ -29,6 +29,11 @@ const tabs = [
   { to: "governance", label: "Governance" },
   { to: "finance", label: "Finance" },
   { to: "disputes", label: "Disputes" },
+  { to: "land", label: "Land & Community" },
+  { to: "workforce", label: "Workforce" },
+  { to: "esg", label: "ESG & Carbon" },
+  { to: "jurisdiction", label: "Jurisdiction" },
+  { to: "analytics", label: "Analytics" },
   { to: "assurance", label: "Assurance" },
   { to: "ai", label: "AI" },
 ];

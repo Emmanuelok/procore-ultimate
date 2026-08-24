@@ -18,3 +18,8 @@ export * from "./risk.js";
 export * from "./governance.js";
 export * from "./finance.js";
 export * from "./disputes.js";
+export * from "./land.js";
+export * from "./workforce.js";
+export * from "./esg.js";
+export * from "./jurisdiction.js";
+export * from "./analytics.js";

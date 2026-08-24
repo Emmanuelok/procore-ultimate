@@ -30,6 +30,11 @@ const AssurancePage = lazy(() => import("./pages/assurance/AssurancePage"));
 const CommercialPage = lazy(() => import("./pages/commercial/CommercialPage"));
 const SchedulePage = lazy(() => import("./pages/schedule/SchedulePage"));
 const RiskPage = lazy(() => import("./pages/risk/RiskPage"));
+const LandPage = lazy(() => import("./pages/land/LandPage"));
+const WorkforcePage = lazy(() => import("./pages/workforce/WorkforcePage"));
+const EsgPage = lazy(() => import("./pages/esg/EsgPage"));
+const JurisdictionPage = lazy(() => import("./pages/jurisdiction/JurisdictionPage"));
+const AnalyticsPage = lazy(() => import("./pages/analytics/AnalyticsPage"));
 const GovernancePage = lazy(() => import("./pages/governance/GovernancePage"));
 const FinancePage = lazy(() => import("./pages/finance/FinancePage"));
 const DisputesPage = lazy(() => import("./pages/disputes/DisputesPage"));
@@ -247,6 +252,46 @@ export default function App() {
                 element={
                   <S>
                     <RiskPage />
+                  </S>
+                }
+              />
+              <Route
+                path="land"
+                element={
+                  <S>
+                    <LandPage />
+                  </S>
+                }
+              />
+              <Route
+                path="workforce"
+                element={
+                  <S>
+                    <WorkforcePage />
+                  </S>
+                }
+              />
+              <Route
+                path="esg"
+                element={
+                  <S>
+                    <EsgPage />
+                  </S>
+                }
+              />
+              <Route
+                path="jurisdiction"
+                element={
+                  <S>
+                    <JurisdictionPage />
+                  </S>
+                }
+              />
+              <Route
+                path="analytics"
+                element={
+                  <S>
+                    <AnalyticsPage />
                   </S>
                 }
               />
