@@ -44,7 +44,7 @@ pnpm workspace, Node ≥ 22, TypeScript 5.9 strict ESM throughout (`package.json
 | `packages/shared` | `@constructos/shared` | Domain vocabulary: enums (`src/enums.ts`), RBAC model + built-in permission templates (`src/permissions.ts`), wire types (`src/types.ts`), the eight assurance primitive interfaces (`src/primitives.ts`). No runtime dependencies. |
 | `packages/ledger` | `@constructos/ledger` | Pure crypto core: RFC 8785-style canonical JSON (`src/canonical.ts`), SHA-256 helpers (`src/hash.ts`), hash chain build/verify (`src/chain.ts`), Merkle root/proof (`src/merkle.ts`). Unit-tested in `src/ledger.test.ts`. |
 | `packages/db` | `@constructos/db` | Drizzle ORM schema, one file per domain (`src/schema/*.ts`), committed SQL migrations (`drizzle/`). Postgres dialect; no FK constraints — relationships are by convention (see `docs/data-model.md`). |
-| `apps/api` | `@constructos/api` | Fastify 5 API. Composition root `src/app.ts`, env config `src/config.ts`, auth plugin `src/plugins/auth.ts`, helpers `src/lib/*.ts` (incl. the pure CPM engine `src/lib/cpm.ts`), eighteen feature modules `src/modules/*/`, test harness `src/test/helpers.ts`. |
+| `apps/api` | `@constructos/api` | Fastify 5 API. Composition root `src/app.ts`, env config `src/config.ts`, auth plugin `src/plugins/auth.ts`, helpers `src/lib/*.ts` (incl. the pure CPM engine `src/lib/cpm.ts` and the seeded Monte Carlo engine `src/lib/montecarlo.ts`), twenty-two feature modules `src/modules/*/`, test harness `src/test/helpers.ts`. |
 | `apps/web` | `@constructos/web` | Vite 8 + React 19 + Tailwind v4 SPA. Route table `src/App.tsx`, API client `src/lib/api.ts`, auth context `src/lib/auth.tsx`, shared UI kit `src/ui/`, feature pages `src/pages/*/`. Client-side PDF rendering via `pdfjs-dist`, IFC via `web-ifc` + `three`. |
 | `docs/` | — | This documentation set plus the master specification. |
 | `docker-compose.yml` | — | Postgres 16 for production-like runs. |
@@ -65,7 +65,7 @@ flowchart LR
     end
     subgraph API["apps/api (Fastify, port 4000)"]
         AUTH["auth plugin<br/>plugins/auth.ts"]
-        MODS["18 feature modules<br/>modules/*/index.ts"]
+        MODS["22 feature modules<br/>modules/*/index.ts"]
         LEDGER["appendLedger<br/>lib/ledger.ts"]
         STORE["content-addressed storage<br/>lib/storage.ts"]
     end
@@ -117,7 +117,7 @@ flowchart LR
   with `TRUST_PROXY=true`. `railway.json` declares the Dockerfile build and the
   `/api/v1/health` healthcheck; the full operator runbook is `docs/deployment.md`.
 - **AI**: optional outbound dependency on the Anthropic API, gated on `ANTHROPIC_API_KEY`
-  (`apps/api/src/modules/ai/service.ts`); see §15.
+  (`apps/api/src/modules/ai/service.ts`); see §19.
 - **Health**: `GET /api/v1/health` reports which database backend is live (`app.ts`).
 
 ---
@@ -196,7 +196,7 @@ Key properties, all visible in `plugins/auth.ts`:
 
 ## 6. Module inventory
 
-Eighteen Fastify plugins, each `apps/api/src/modules/<name>/index.ts`, all registered in
+Twenty-two Fastify plugins, each `apps/api/src/modules/<name>/index.ts`, all registered in
 `src/app.ts` under the `/api/v1` prefix. "Tool" is the `requireTool` key from
 `packages/shared/src/permissions.ts`; tables are from `packages/db/src/schema/`. Sibling
 modules are being developed concurrently — the contracts below come from route registration
@@ -222,6 +222,10 @@ and schema, not implementation internals.
 | `schedule` | `schedule` | `schedules`, `scheduleTasks`, `scheduleDependencies`, `scheduleBaselines` | `/projects/:id/schedules` (+`activate`, `compute`), `…/schedules/:id/tasks` (+`reorder`), `/schedule-tasks/:taskId`, `…/schedules/:id/dependencies`, `…/baselines` (+`compare`), `…/lookahead`, `…/quality` | Vol I §2.6 #351, #353–361; #371 / Domain D #283 (health check) |
 | `forensics` | `forensics` | `delayEvents`, `forensicClaims` (+ reads schedule, contracts, commercial, field, assurance tables) | `/projects/:id/delay-events` (+`status`, `tia`), `/projects/:id/forensics/{as-planned-vs-as-built,windows,prolongation}`, `/projects/:id/claims` (+`status`, `chronology`) | Vol II Domain D (M9) #265, #267–269, #272–273 (scoped), #283, #299, #304–306, #310, #318 |
 | `payments` | `payments` (regime library: authenticated only) | `paymentClaims`, `paymentResponses`, `suspensionNotices` (+ writes assurance `obligations`, `signals`) | `/payment-regimes` (+`/:regime`), `/projects/:id/payment-claims` (+`serve`, `respond`, `suspend`, `mark-paid`, `interest`), `/projects/:id/suspension-notices/:id/lift`, `/projects/:id/payments/{deadlines,analytics}` | Vol II Domain F (M10) #358–362, #364–369 subset, #386–387 |
+| `risk` | `risk` | `risks`, `riskSimulations`, `contingencies`, `contingencyDrawdowns` (+ writes assurance `signals`) | `/projects/:id/risks` (+`status`, `mitigation-value`), `/projects/:id/risk/simulations/{qcra,qsra}`, `/projects/:id/risk-simulations/:id` (+`rerun`), `/projects/:id/contingencies` (+`drawdowns`, `drawdown-curve`) | Vol II Domain H (M13) #447–450, #452–455, #457–460, #464–471, #473–474 subset |
+| `governance` | `governance` | `businessCases`, `stageGates`, `gateReviews`, `benefits`, `benefitReadings` (+ writes assurance `obligations`, `events`) | `/projects/:id/business-cases` (+`options`, `select-option`, `submit`, `approve`, `reject`), `/projects/:id/stage-gates` (+`reviews`), `/gate-reviews/:id/conditions/:id/close`, `/projects/:id/governance/conditions`, `/projects/:id/benefits` (+`readings`) | Vol II Domain G (M12) #394–399, #401–402, #408–409, #412–418, #420 subset |
+| `finance` | `finance` | `fundingFacilities`, `facilityConditions`, `disbursements`, `covenants`, `covenantReadings` (+ writes assurance `obligations`, `signals`) | `/projects/:id/facilities` (+`conditions`, `disbursements`, `covenants`, `statement{,.csv}`), `/facility-conditions/:id/{satisfy,waive}`, `/disbursements/:id/{submit,approve,disburse,reject}`, `/covenants/:id/readings`, `/projects/:id/finance/summary` | Vol II Domain O (M14) #729–733, #735, #739–743, #769 subset |
+| `disputes` | `disputes` | `disputes`, `disputeSubmissions`, `disputeBundles`, `settlementOffers` (+ writes assurance `obligations`, `signals`) | `/projects/:id/disputes` (+`status`, `timetable/:stepId/complete`, `submissions`, `offers`, `settlement-analysis`), `/dispute-bundles/:id/{items,chronological,generate,verify,issue,manifest.csv}`, `/settlement-offers/:id/status` | Vol II Domain E (M15) #321 partial, #325, #329–330, #334–339, #343–344, #349–352 subset |
 
 Shared helpers used by all modules (`apps/api/src/lib/`): `ids.ts` (prefixed nanoid),
 `numbering.ts` (atomic per-project record counters, spec #72), `pagination.ts`
@@ -306,7 +310,7 @@ Upload → extraction → sheet/revision model → markups/pins. All in
    the sheet number and title from each page's text stream and classify discipline from the
    number prefix (A→architectural, S→structural, …) — spec Vol I #257–258, #266. Low-confidence
    extractions set `drawing_sheets.needsReview = 1`, feeding the human naming-review queue
-   (#258); the AI `sheet_naming` agent (§15) can propose corrections.
+   (#258); the AI `sheet_naming` agent (§19) can propose corrections.
 4. **Sheet/revision model**: a `drawing_sheets` row is the logical sheet, unique per
    `(projectId, number)`; each upload appends a `drawing_revisions` row (revision label,
    source set, `pageIndex`, extracted text, calibration) and supersedes the previous one
@@ -709,7 +713,244 @@ library is an engineering model of the statutes, not jurisdictional legal advice
 
 ---
 
-## 15. AI layer
+## 15. Quantitative risk (M13)
+
+Spec Vol II Domain H — the probabilistic discipline Procore does not have ("Cost certainty
+in major projects is a probabilistic discipline and Procore is deterministic", Domain H
+preamble). Engine `apps/api/src/lib/montecarlo.ts` (+ `montecarlo.test.ts`), routes
+`apps/api/src/modules/risk/index.ts`, distribution wire-format validation and analytic
+means in `modules/risk/distributions.ts`, schema `packages/db/src/schema/risk.ts`, web UI
+`apps/web/src/pages/risk/` (register with 5×5 heatmap, quantification drawer, pure-SVG
+simulation charts — histogram, S-curve percentiles, tornado — and the contingency
+drawdown curve).
+
+```mermaid
+flowchart LR
+    REG["risks<br/>P×I scores pre/post +<br/>occurrenceProbability,<br/>costImpact / durationImpact"] -- "quantified subset" --> QCRA["runQcra<br/>total-cost distribution"]
+    REG -- "scheduleTaskId links" --> QSRA["runQsra<br/>CPM per iteration<br/>(lib/cpm.ts)"]
+    SEED["seed + iterations"] --> QCRA
+    SEED --> QSRA
+    QCRA --> SIM["risk_simulations<br/>seed + input snapshot +<br/>results, ledgered"]
+    QSRA --> SIM
+    SIM -- "rerun: replay snapshot,<br/>deep-equal percentiles" --> VER["reproduced: true/false"]
+    SIM -- "P50/P80/P90" --> CTG["contingencies<br/>confidenceLevel + simulationId"]
+    CTG --> DD["contingency_drawdowns<br/>over-draw refused (409)"]
+    DD -- "crosses 20% remaining" --> SIG["signals<br/>contingency_exhaustion (high)"]
+```
+
+1. **The engine is pure, seeded and deterministic** (`lib/montecarlo.ts`): all randomness
+   flows from a caller-supplied seed through a mulberry32 PRNG, so same inputs + seed ⇒
+   bit-identical percentiles — the property that makes a P80 defensible in front of a gate
+   review or an auditor. Six distribution kinds (`DISTRIBUTION_KINDS`): triangular, PERT
+   (Marsaglia–Tsang beta), uniform, normal (Box–Muller), lognormal, discrete — the spec's
+   three-point estimating (#459) and distribution selection (#460). Full rationale in
+   `docs/adr/0011-seeded-monte-carlo.md`.
+2. **Risk register** (#447–455 subset): numbered risks over six categories (#449),
+   qualitative pre/post-mitigation 1–5 scoring (#450) with derived `preScore`/`postScore`,
+   owner assignment (#452), mitigation actions with cost (#453). Quantification is
+   optional per risk: `occurrenceProbability` + `costImpact` distribution for QCRA;
+   `scheduleTaskId` (validated against the project's schedules) + `durationImpact` for
+   QSRA (#455). `GET …/risks/:id/mitigation-value` (#454) compares mitigation cost to the
+   analytic expected value (`analyticMean`, no sampling), scaling post-mitigation EV by
+   the qualitative score ratio — a documented proxy, stated in the response's `method`.
+3. **QCRA** (#458, #465–466): per iteration, each risk occurs with its probability and
+   samples its impact; totals are summarized to mean/stdDev/percentiles/histogram.
+   Per-risk expected value, occurrence share and |correlation with total| give the tornado
+   ranking (#466). `contingencyAt` reports P50/P80/P90 (#465, #469).
+4. **QSRA rides the CPM engine** (#457, #467–468): task duration distributions come from
+   linked risks (applied unconditionally — occurrence probability is a QCRA concept, a
+   documented simplification) with per-request `taskUncertainties` overrides; each
+   iteration runs `computeCpm` over the sampled network. Outputs: completion-duration
+   distribution mapped to ISO completion dates per percentile, criticality index (#467)
+   and duration sensitivity (#468) per task. This is the payoff of ADR 0009's pure engine
+   — thousands of CPM passes per request, no I/O.
+5. **The reproducibility endpoint** (#464): every run persists seed + full input snapshot
+   + results to `risk_simulations` and is ledgered with its headline percentiles.
+   `POST …/risk-simulations/:id/rerun` replays the snapshot and reports whether fresh
+   percentiles deep-equal the stored ones, ledgering the verification — the audit answer
+   to "prove that P80". A failed rerun means tampering or engine drift, both of which
+   deserve surfacing.
+6. **Contingency drawdown discipline** (#469–474): contingencies cite the confidence level
+   and simulation they were set from (#469), separate management reserve from risk
+   contingency (#474), and refuse over-draws (409 with the arithmetic). Drawdowns cite the
+   realised risk (#470), are ledgered with full payload, and build the cumulative
+   drawdown-curve read model (#471 — actuals only; a planned curve is not modelled). The
+   draw that crosses 20% remaining raises a high `contingency_exhaustion` signal, exactly
+   once (#473). A contingency with recorded drawdowns cannot be deleted.
+7. **The honest limitation, in the payload**: correlation between risks is **not**
+   modelled (#461–462 out of scope) — independent sampling understates spread under
+   positive correlation, so every QCRA/QSRA result carries `correlationModelled: false`
+   for UIs and reports to surface. The Iman–Conover rank-correlation stage is the named
+   roadmap item (ADR 0011).
+
+---
+
+## 16. Capital governance (M12)
+
+Spec Vol II Domain G — the owner-side instruments ("Public clients and development finance
+institutions run on exactly these instruments", Domain G preamble). Routes
+`apps/api/src/modules/governance/index.ts`, pure appraisal mathematics in
+`modules/governance/appraisal.ts` (+ `appraisal.test.ts`), schema
+`packages/db/src/schema/governance.ts`, web UI `apps/web/src/pages/governance/` (Business
+Cases / Stage Gates / Benefits tabs).
+
+1. **Five-case business cases** (#394–395): `business_cases` carry the HM Treasury
+   five-case narratives (strategic/economic/commercial/financial/management) through the
+   SOC → OBC → FBC stages (`BUSINESS_CASE_STAGES`) and a `draft → submitted →
+   approved | rejected` lifecycle. An approved/rejected case is immutable; stage and
+   appraisal changes are draft-only.
+2. **The CBA math lives in `modules/governance/appraisal.ts`** — pure, unit-tested, no
+   I/O: per-option `capexAdjusted = capex × (1 + optimism-bias %)` (uplift applied to
+   capex only, the dominant Green Book case — #402, documented in the file), discounted
+   present values of annual benefit/cost series, NPV and BCR (#398–399), simple
+   undiscounted payback. The discount rate defaults to 3.5% — the Green Book social time
+   preference rate — and is configurable per case (#401). The server owns the computed
+   block: options are appraised on write (`PUT …/options`), a draft-only appraisal change
+   recomputes every stored option, and the counterfactual is a first-class flag (#397).
+   Approval requires a preferred option and **a decider who is not the author** (403 —
+   `docs/security.md` §2.4).
+3. **Stage gates & reviews** (#408–414): Gateway 0–5-style gates (unique per project
+   gate number) with criteria; a review must return findings covering **every** criterion
+   (400 listing what is missing), a RAG delivery-confidence rating over the five-point
+   scale (#414), and a decision from `GATE_DECISIONS`
+   (`proceed | proceed_with_conditions | hold | stop`). Every review is retained — the
+   decision register (#412) — and a `stop` lands in the assurance `events` graph as a
+   project-level `gate_stop` event.
+4. **Gate conditions → obligations** (#413): each condition of approval materializes an
+   assurance `obligations` row at review creation (`warnDaysBefore: 7`); closing the
+   condition satisfies the obligation, and `GET …/governance/conditions` is the
+   open-conditions radar across all gates, soonest due first (#415 seed). One
+   deadline primitive across the platform — `docs/adr/0012-conditionality-as-obligations.md`.
+5. **Benefits register** (#416–418, #420): numbered benefits with owner, measurement
+   method, baseline/target/date; disbenefits are direction-aware negatives (#420 —
+   the signed-denominator progress formula in `appraisal.ts` handles reduction targets).
+   Realisation readings recompute status against documented thresholds
+   (`planned → tracking → realised / at_risk / missed`), transitions are ledgered, and
+   moves into `at_risk`/`missed` notify the benefit owner.
+
+---
+
+## 17. Disbursement & conditionality (M14)
+
+Spec Vol II Domain O — "Procore models cost. It does not model money — where it comes
+from, on what conditions, and what happens when conditions are breached" (Domain O
+preamble). Routes `apps/api/src/modules/finance/index.ts`, schema
+`packages/db/src/schema/finance.ts`, web UI `apps/web/src/pages/finance/` (facility
+register, facility detail with conditions/disbursements/covenants, covenant headroom
+chart, evidence picker).
+
+```mermaid
+flowchart LR
+    FAC["funding_facilities<br/>lender + instrument +<br/>category limits"] --> CP["facility_conditions<br/>precedent / subsequent<br/>→ obligations"]
+    CP -- "sweep: dueDate past" --> BR["breached<br/>+ high signal"]
+    CP -- "satisfy WITH evidenceIds" --> OK["satisfied<br/>obligation satisfied"]
+    DR["disbursements<br/>draft"] -- "submit" --> GATE{"any CP<br/>open/breached?"}
+    GATE -- "yes: 409 + snapshot<br/>+ ledgered attempt" --> DR
+    GATE -- "no: snapshot + headroom<br/>checks pass" --> SUB["submitted"]
+    SUB -- "approve: admin,<br/>not the requester" --> APP["approved"] --> DSB["disbursed"]
+    COV["covenants + readings<br/>computed compliant/headroom"] -- "breach" --> SIG["signals<br/>covenant_breach (critical)"]
+```
+
+1. **Facility register** (#729, #739–741): facilities per lender and instrument
+   (`FACILITY_INSTRUMENTS`: loan/grant/equity/guarantee/blended) with allocation
+   categories whose limits may not exceed the committed amount (#739), closing-date
+   monitoring (`daysToClosing`, #741) and live aggregates (disbursed, undisbursed,
+   per-category remaining). A category with non-rejected requests against it cannot be
+   removed.
+2. **Conditions precedent/subsequent, obligation-backed** (#730–731): every condition
+   materializes an assurance `obligations` row (ADR 0012). A lazy sweep
+   (`sweepOverdueConditions`, run on reads and before every conditionality check) flips
+   overdue open conditions to `breached`, breaches the obligation and raises a high
+   `facility_condition_overdue` signal, exactly once. **Satisfaction requires evidence**:
+   `/satisfy` demands at least one validated assurance `evidence` id (#731) — a condition
+   is discharged by pointing at documents, not by asserting it. Late satisfaction unblocks
+   the pipeline but never un-breaches the obligation; only an explicit **waiver**
+   (finance `admin`, reason required, ledgered) supersedes a breach.
+3. **The CP gate on submission — the module's core rule** (#733–734 subset): a
+   disbursement request assembles expenditure evidence (#732) as a draft, and `/submit`
+   first re-sweeps, then verifies **no condition precedent on the facility is open or
+   breached**. The verification is snapshotted onto the request either way
+   (`conditionality: {verifiedAt, openConditions[]}`) — the record shows what was checked
+   and when. A blocked submission is a 409 listing the open CPs **and is itself ledgered**
+   (`submit_blocked_by_conditionality`): attempted circumvention is on the record. A
+   passing submission then enforces headroom — the pipeline (submitted + approved +
+   disbursed) may exceed neither the committed amount nor a category limit.
+4. **Approval workflow with separation of duties**: approve/reject require finance
+   **admin** and the approver must not be the request's creator (403 —
+   `docs/security.md` §2.4); disbursing requires an approved request. Every transition is
+   ledgered with payload.
+5. **Statement of expenditure** (#735, #769 seed): `GET …/facilities/:id/statement{,.csv}`
+   renders the numbered request history with totals — the SoE the lender's reporting cycle
+   consumes.
+6. **Covenant breach signals** (#742–743): covenants are threshold tests
+   (`gte`/`lte`); readings compute `compliant` and **signed headroom** (negative = depth
+   of breach) at write time. A breaching reading raises a **critical `covenant_breach`
+   signal** explaining the test, the headroom and the draw-stop consequence. Covenants are
+   deliberately not obligations — a continuous test, not a dated duty (ADR 0012). The
+   project `finance/summary` rolls up committed/disbursed/undisbursed, per-category
+   positions, open conditions and worst-case covenant status.
+
+Not built (see `docs/roadmap.md`): #734 World Bank/ADB/AfDB withdrawal-application
+formats, #736–738 designated-account reconciliation and eligibility classification,
+#744–751 LTA/independent-engineer certification and finance modelling, #752–756 PPP
+models, #757–768 equity/procurement-compliance/fiduciary tracking. Covenant reading
+values are operator-entered — the ratio itself is not yet derived from platform records.
+
+---
+
+## 18. Dispute support (M15)
+
+Spec Vol II Domain E — "The moment a project turns contentious — precisely when the
+record matters most — the platform is abandoned" (Domain E preamble). Routes
+`apps/api/src/modules/disputes/index.ts`, pure settlement arithmetic in
+`modules/disputes/settlement.ts`, schema `packages/db/src/schema/disputes.ts`, web UI
+`apps/web/src/pages/disputes/` (register with next-deadline radar; dispute drawer with
+Timeline / Submissions / Bundles / Settlement tabs; bundle builder).
+
+1. **Dispute register across forums** (#321 partial, #329, #334–337): numbered disputes
+   over `DISPUTE_KINDS` (adjudication, DAAB, mediation, arbitration, expert
+   determination, litigation) with forum and institutional-rules fields (#337), linked
+   contract, referred forensic claims (validated — the M9 claims workspace feeds
+   directly in), a counterparty from the assurance entity graph, and amount in dispute.
+   The escalation ladder is forward-only
+   (`notified → referred → submissions → hearing → decided`, settle/withdraw from any
+   live state); recording a decision requires an outcome (#349 partial).
+2. **Timetable obligations** (#325, #330, #338): every dated procedural step materializes
+   an assurance `obligations` row (`warnDaysBefore: 3` — dispute clocks are short;
+   ADR 0012). Timetable edits keep obligations in step (new deadline → materialize;
+   moved → update; removed → waive). A lazy sweep breaches overdue undone steps —
+   obligation breached, high `dispute_deadline_missed` signal explaining why missed
+   procedural deadlines are fatal in adjudication — exactly once, guarded by the step's
+   `breachedAt` marker. Completing a step satisfies an *open* obligation only: a breach,
+   as everywhere on the platform, stays on the register.
+3. **Pleadings register** (#339): submissions typed over `SUBMISSION_KINDS` (referral,
+   response, reply, rejoinder, witness statement, expert report, decision, award) per
+   party, dated, optionally file-backed.
+4. **Merkle-manifest bundles + verify — the evidentiary integrity story applied to
+   production** (#343–344): a draft bundle assembles items from platform records (RFIs,
+   delay events, contract events, forensic claims, assurance evidence) or stored files;
+   `/chronological` sorts by date (#344). **Generation freezes the bundle**: sequential
+   tab numbers, a per-item content hash — file-backed items reuse the content-addressed
+   `files.sha256` (§4 of `docs/security.md`), record-backed items hash the record's
+   canonical JSON (`hashPayload`, `@constructos/ledger`) — and a **Merkle root over the
+   hashes** (`merkleRoot`, the same primitive as evidence packs, §7). The manifest is the
+   tamper-evident commitment to exactly what was produced to the tribunal, exportable as
+   the hyperlinked-index CSV (#343). `POST …/verify` recomputes every item hash from
+   today's files/records and the root from the manifest, reporting per-tab mismatches —
+   so the receiving party's question "is this bundle what the record said it was?" has a
+   mechanical answer, and the check itself is ledgered. Issuance is a state change on a
+   generated (frozen) bundle only.
+5. **Settlement offers & modelling** (#350–352): an offer register over
+   `SETTLEMENT_OFFER_BASES` (open / without prejudice / WP save as to costs — #351's
+   bases recorded, its costs-consequence engine not built); accepting a received offer
+   settles the dispute with the amount in the outcome, ledgered. The expected-value
+   analysis (`settlement.ts`, pure and unit-tested) compares
+   `winProbability × expectedAward − legalCosts` against the best open received offer
+   and states its recommendation with the arithmetic in the rationale (#352).
+
+---
+
+## 19. AI layer
 
 `modules/ai/` (service in `service.ts`), schema `packages/db/src/schema/ai.ts`. Design rules
 come from spec Domain X: **citations always (#1019), human-in-the-loop for consequential
@@ -738,7 +979,7 @@ outputs (#1020), full audit trail (#1021).**
 
 ---
 
-## 16. Integration surface
+## 20. Integration surface
 
 **Today (implemented):**
 
@@ -750,6 +991,9 @@ outputs (#1020), full audit trail (#1021).**
 - Ledger export/verify (`GET /ledger`, `GET /ledger/verify`) and Merkle evidence packs — the
   forensically exportable surface (spec Domain S #871–872).
 - COBie CSV/JSON export (twin module) — the open handover format (spec Domain N adjacent).
+- CSV exports for external counterparties: the facility statement of expenditure
+  (`…/facilities/:id/statement.csv`, spec O#735) and the frozen bundle manifest with
+  per-tab content hashes (`…/dispute-bundles/:id/manifest.csv`, spec E#343).
 - CORS is open (`origin: true` in `app.ts`) to keep third-party browser clients possible in
   dev; tighten per deployment.
 
@@ -763,12 +1007,16 @@ outputs (#1020), full audit trail (#1021).**
 
 ---
 
-## 17. Verification & test strategy
+## 21. Verification & test strategy
 
 - `packages/ledger` has pure unit tests (`src/ledger.test.ts`); so do the pure analysis
   cores in the API — the CPM engine (`apps/api/src/lib/cpm.test.ts`, hand-computed
-  networks incl. the fragnet-TIA primitive) and the prolongation calculator
-  (`modules/forensics/prolongation.test.ts`).
+  networks incl. the fragnet-TIA primitive), the prolongation calculator
+  (`modules/forensics/prolongation.test.ts`), the Monte Carlo engine
+  (`apps/api/src/lib/montecarlo.test.ts`: seed determinism, distribution means, QCRA/QSRA
+  behaviour against hand-reasoned cases), the appraisal mathematics
+  (`modules/governance/appraisal.test.ts`) and the settlement expected-value model
+  (exercised via `modules/disputes/disputes.test.ts`).
 - Every API module colocates `<name>.test.ts` using `buildTestApp()`
   (`apps/api/src/test/helpers.ts`): a full Fastify app over in-memory PGlite with migrations
   applied — integration tests with zero external services, exercising the real auth chain via

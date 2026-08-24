@@ -254,3 +254,65 @@ served claims and responses with their computed statutory timelines.
 | `payment_claims` | Statutory payment claims (#358–360) | unique `(projectId, number)`; `regime` (PaymentRegime), `referenceDate` (the statutory reference date the timeline runs from), `claimedAmount`/`currency`, service record (`servedAt`, `serviceMethod` email/portal/registered_post/letter, `serviceReference`), **computed on serve:** `responseDeadline` + `finalPaymentDate` (both from the later of referenceDate and service date), `status` (PaymentClaimStatus: draft/served/responded/**deemed**/paid/suspended/referred — `referred` has no workflow behind it yet), **`obligationId`** → the materialized response-deadline obligation, `paidAt`/`paidAmount`; index `(status, responseDeadline)` serves the deemed sweep | project 1—n; optional links to `contracts` and `valuations` (validated); the lazy sweep (`sweepDeemed`) flips overdue unanswered served claims to `deemed`, breaches the obligation and raises a critical `payment_deemed_liability` signal exactly once |
 | `payment_responses` | Payment notices / pay-less notices (#359, #365) | `kind` (PaymentResponseKind), `amount`, `reasons` (**required when a pay-less notice pays less than claimed** — ground-stating), `breakdown` jsonb[], `servedAt`, **`late`** int — served after the statutory deadline (a late response is recorded, breaches the obligation, raises a high `late_payment_response` signal and rescues no status), `servedBy` | claim 1—n; the latest **on-time** response amount values the outstanding book and the interest base |
 | `suspension_notices` | Right-to-suspend notices (#362) | `servedAt`, **`effectiveFrom`** = service + the regime's statutory notice period, `liftedAt` (lifting returns the claim to `deemed` — the liability is unaffected), `servedBy` | claim 1—n; only a `deemed` claim can be suspended (documented simplification) |
+
+## 17. Quantitative risk — `risk.ts`
+
+Quantitative risk (spec Vol II Domain H / M13); served by `apps/api/src/modules/risk/`.
+The engine (`apps/api/src/lib/montecarlo.ts`) is pure and seeded — the tables persist
+what makes a simulation replayable: the seed, the full input snapshot and the results
+(`docs/adr/0011-seeded-monte-carlo.md`). Distribution jsonb columns are validated on the
+wire against the engine's `Distribution` union (`modules/risk/distributions.ts`), and a
+corrupt stored distribution is a 400 at sampling time, not a crash.
+
+| Table | Purpose | Key columns | Relationships |
+|---|---|---|---|
+| `risks` | Risk register: qualitative + quantitative in one row (#447–455) | unique `(projectId, number)`; `category` (RiskCategory, #449), `status` (RiskStatus: open/mitigating/closed/realised), qualitative 1–5 `probabilityScore`/`impactScore` + post-mitigation pair (#450), **QCRA inputs:** `occurrenceProbability` (0..1) + `costImpact` distribution jsonb (#458–460), **QSRA inputs:** `scheduleTaskId` (validated against the project's schedules, #455) + `durationImpact` distribution jsonb (#457), `mitigations` jsonb[] + `mitigationCost` (#453–454) | project 1—n; quantified subsets feed the simulation routes; drawdowns may cite the realised risk |
+| `risk_simulations` | Persisted, reproducible simulation runs (#457–458, #464–466) | `kind` (SimulationKind: qcra/qsra), **`seed`** (32-bit int) + `iterations`, **`inputs`** jsonb — the full snapshot (QCRA: sampled risk set; QSRA: tasks/deps/projectStart/distribution sources), **`results`** jsonb (summary + perRisk/perTask + contingencyAt/completionDates, incl. `correlationModelled: false`), `runBy` | project 1—n; `/rerun` replays `inputs` with `seed` and deep-compares percentiles; `contingencies.simulationId` cites the run a budget was set from |
+| `contingencies` | Contingency register set at a stated confidence (#469, #474) | `amount` + `currency`, `confidenceLevel` (e.g. "p80") + `simulationId` — the budget's provenance, `isManagementReserve` int (management reserve held apart from risk contingency, #474) | project 1—n; 1—n drawdowns; cannot be deleted once drawn against |
+| `contingency_drawdowns` | Drawdown discipline (#470–473) | `amount` (over-draw beyond remaining is a 409), `reason` required, `riskId` — the realised risk drawn against (#470), `drawnAt` ISO date, **`approvedBy`** (the caller, recorded and ledgered) | contingency 1—n; ordered rows build the cumulative drawdown curve (#471); the draw crossing 20% remaining raises the `contingency_exhaustion` signal (#473) |
+
+## 18. Capital governance — `governance.ts`
+
+Owner-side capital programme governance (spec Vol II Domain G / M12); served by
+`apps/api/src/modules/governance/`. The CBA arithmetic (NPV/BCR/payback, optimism bias,
+benefit progress) is pure code in `modules/governance/appraisal.ts`; the tables persist
+configs and server-computed results so the stored appraisal never drifts from its config.
+
+| Table | Purpose | Key columns | Relationships |
+|---|---|---|---|
+| `business_cases` | Five-case business case per stage (#394–395) | `stage` (BusinessCaseStage: SOC/OBC/FBC), `status` draft→submitted→approved\|rejected (approved/rejected = immutable), `cases` jsonb — the five narratives, `appraisal` jsonb `{discountRatePercent (default 3.5, #401), appraisalYears, optimismBiasPercent (#402)}`, **`options`** jsonb[] — each with cashflows + server-computed `{capexAdjusted, pvBenefits, pvCosts, npv, bcr, paybackYear}` (#396–399) and an `isCounterfactual` flag (#397), `preferredOptionId`, **`approvedBy`/`approvedAt`** (approver ≠ author enforced; approval requires a preferred option) | project 1—n; options recomputed on any draft appraisal change |
+| `stage_gates` | Gate definitions, Gateway 0–5 style (#408–409) | unique `(projectId, gateNumber)` (0–5); `criteria` jsonb[] `{id, text, evidenceRequired}`, `plannedDate`, `status` pending→in_review→decided | project 1—n; 1—n reviews; a decided gate is no longer editable but may be re-reviewed |
+| `gate_reviews` | Decision register (#412, #414) | `rag` (RagRating, five-point, #414), `decision` (GateDecision: proceed/proceed_with_conditions/hold/stop), `findings` jsonb[] — must cover every gate criterion, **`conditions`** jsonb[] `{id, text, dueDate, obligationId, closed, closedAt/By, closeNote}` — each condition materializes an assurance `obligations` row (#413, ADR 0012), `reviewedBy` | gate 1—n (every review retained; latest governs); a `stop` decision also inserts a `gate_stop` row into assurance `events` |
+| `benefits` | Benefits register (#416–417, #420) | unique `(projectId, number)`; owner, `measurementMethod`, `unit`, `baselineValue`/`targetValue`/`targetDate`, `isDisbenefit` int (reduction targets — the signed progress formula handles direction, #420), `status` (BenefitStatus) recomputed from the latest reading against documented thresholds | project 1—n; 1—n readings; at_risk/missed transitions notify the owner |
+| `benefit_readings` | Realisation readings over time (#418) | `readingDate`, `value`, `recordedBy` | benefit 1—n; reached through the tenant-checked benefit (no `projectId` column) |
+
+## 19. Project finance & disbursement — `finance.ts`
+
+Disbursement & lender conditionality (spec Vol II Domain O / M14); served by
+`apps/api/src/modules/finance/`. The core discipline: **money moves only when conditions
+are verifiably satisfied** — conditions materialize as assurance `obligations`
+(`docs/adr/0012-conditionality-as-obligations.md`), the submit route is gated on open
+conditions precedent, and covenant breaches raise critical signals.
+
+| Table | Purpose | Key columns | Relationships |
+|---|---|---|---|
+| `funding_facilities` | Facility register (#729, #739, #741) | `lender`, `instrument` (FacilityInstrument: loan/grant/equity/guarantee/blended), `committedAmount` + `currency`, `availabilityEndDate` (closing-date monitoring, #741), `categories` jsonb[] `{id, name, limit}` — limits may not exceed the committed amount (#739); a category with non-rejected requests cannot be removed | project 1—n; 1—n conditions/disbursements/covenants |
+| `facility_conditions` | Conditions precedent/subsequent (#730–731) | `kind` (precedent/subsequent), `status` (open/satisfied/waived/breached), `dueDate`, **`evidenceIds`** jsonb[] — satisfaction requires ≥ 1 validated assurance evidence id (#731), **`obligationId`** → the materialized obligation, `satisfiedAt`/`satisfiedBy` | facility 1—n; the lazy sweep breaches overdue open conditions (obligation breached + high `facility_condition_overdue` signal, once); waiver is finance-admin with reason; late satisfaction never un-breaches the obligation |
+| `disbursements` | Withdrawal/disbursement requests (#732–734 subset, #740) | unique `(facilityId, number)`; `amount`, `categoryId`, `purpose`, `status` (DisbursementStatus: draft→submitted→approved→disbursed, rejected from submitted/approved), `evidenceIds` jsonb[] (#732), **`conditionality`** jsonb — the verification snapshot stamped at submission `{verifiedAt, openConditions[]}` (#733; a blocked submit is a 409 and is itself ledgered), `submittedBy`, **`approvedBy`** (≠ `createdBy` enforced, finance admin), `disbursedAt`, `rejectionReason` | facility 1—n; the pipeline (submitted+approved+disbursed) may exceed neither the committed amount nor a category limit; numbered rows build the statement of expenditure (#735, `statement{,.csv}`) |
+| `covenants` | Financial covenant definitions (#742) | `operator` (CovenantOperator: gte/lte), `threshold`, `unit` | facility 1—n; deliberately **not** obligation-backed — a continuous test, not a dated duty (ADR 0012) |
+| `covenant_readings` | Periodic covenant tests (#743) | `readingDate`, `value` (operator-entered — not yet derived from platform records), **computed at write:** `compliant` int + signed `headroom` (negative = depth of breach), `recordedBy` | covenant 1—n; a breaching reading raises a critical `covenant_breach` signal; latest reading per covenant drives the facility view and the summary's worst-case `covenantStatus` |
+
+## 20. Disputes — `disputes.ts`
+
+Dispute avoidance & resolution (spec Vol II Domain E / M15); served by
+`apps/api/src/modules/disputes/`. Timetable deadlines materialize as assurance
+`obligations` (ADR 0012); bundles freeze a Merkle-rooted manifest over content hashes —
+the evidence-pack primitive (`packages/ledger/src/merkle.ts`) applied to tribunal
+production.
+
+| Table | Purpose | Key columns | Relationships |
+|---|---|---|---|
+| `disputes` | Dispute register across forums (#321 partial, #329, #334–337) | unique `(projectId, number)`; `kind` (DisputeKind: adjudication/daab/mediation/arbitration/expert_determination/litigation), `forum` + `rules` (institutional rules, #337), `contractId` + `claimIds` jsonb[] (validated forensic claims — the M9 workspace feeds in), `counterpartyEntityId` (assurance entity graph), `amountInDispute`, `status` (DisputeStatus) forward-only `notified→referred→submissions→hearing→decided` (settled/withdrawn from any live state; decided requires an outcome), **`timetable`** jsonb[] `{id, name, dueDate, obligationId, done, doneAt, breachedAt}` (#330, #338) | project 1—n; the lazy sweep breaches overdue undone steps (obligation breached + high `dispute_deadline_missed` signal, once — `breachedAt` is the idempotency marker); timetable edits materialize/update/waive obligations in step |
+| `dispute_submissions` | Pleadings register (#339) | `kind` (SubmissionKind: referral/response/reply/rejoinder/witness_statement/expert_report/decision/award/other), `party` (claimant/respondent/tribunal), `servedAt`, `fileId` | dispute 1—n; reached through the tenant-checked dispute |
+| `dispute_bundles` | Tamper-evident hearing bundles (#343–344) | `status` (BundleStatus: draft→generated→issued), `items` jsonb[] — drawn from platform records (rfi/delay_event/contract_event/claim/evidence) or files, sortable chronologically (#344); **`manifest`** jsonb frozen at generation `{generatedAt, itemCount, merkleRoot, index[{tab, title, date, source, sha256}]}` — sequential tab numbers, per-item content hashes (file items reuse content-addressed `files.sha256`; record items hash canonical JSON) under one Merkle root (#343) | dispute 1—n; generated bundles are frozen; `/verify` recomputes every hash + the root and reports mismatches; manifest exports as CSV |
+| `settlement_offers` | Offer register (#350–352) | `direction` (made/received), `basis` (SettlementOfferBasis: open / without_prejudice / WP save as to costs — #351 bases recorded, costs-consequence engine not built), `amount`, `offeredAt`/`expiresAt`, `status` open→accepted\|rejected\|lapsed\|withdrawn | dispute 1—n; accepting a received offer settles the dispute with the amount in the outcome; the expected-value analysis (`modules/disputes/settlement.ts`, #352) reads the open received offers |

@@ -90,12 +90,13 @@ proposals (`gateReviewer`, `modules/ai/index.ts`).
 
 ### 2.2 Layer 2 — per-tool permission levels
 
-`none < read < standard < admin` (`PERMISSION_LEVELS`, ordered by `meetsLevel`) over the 26
+`none < read < standard < admin` (`PERMISSION_LEVELS`, ordered by `meetsLevel`) over the 30
 tools in `TOOLS` (directory, projects, documents, drawings, specifications, bim, twin, rfis,
 submittals, daily_logs, punch, photos, meetings, workflow, budget, commitments,
-change_management, invoicing, commercial, contracts, schedule, forensics, payments,
-assurance, ai, admin). The three Phase 3 tools inherit the built-in template baselines via
-the `all(…)` spreads in `permissions.ts` — e.g. `project_manager` gets `standard`,
+change_management, invoicing, commercial, contracts, schedule, forensics, payments, risk,
+governance, finance, disputes, assurance, ai, admin). The three Phase 3 tools and the four
+Phase 4 tools (risk, governance, finance, disputes) inherit the built-in template baselines
+via the `all(…)` spreads in `permissions.ts` — e.g. `project_manager` gets `standard`,
 `subcontractor` gets `none` — with no per-tool carve-outs added.
 
 Resolution (`resolveLevel`): per-user `overrides` on the `project_memberships` row beat the
@@ -142,6 +143,11 @@ Effect on operational tools: an unexpired grant satisfies any `requireTool(…, 
 | **Forensic claim assessment independence** — a delay/disruption claim cannot be moved to `assessed` by the user who created it (`403 A claim cannot be assessed by the user who created it`); `assessedBy` is stamped, the assessed days/amount are ledgered with the transition, and the claim's cause-effect-entitlement-quantum chain and supporting event set are frozen once it leaves `draft` — the narrative that was submitted is the narrative that gets assessed. Same identity-level pattern as EOT assessment and payment certification (ADR 0008) | `modules/forensics/index.ts`, claim status route |
 | **Payment response authority is grounds-based and time-boxed** — a pay-less notice for less than the claimed amount without stated reasons is a 400 (statutory ground-stating, spec F#365); a response served after the statutory deadline is recorded with `late = 1`, **rescues no status** (a deemed claim stays deemed), breaches the response obligation and raises a high `late_payment_response` signal; served claims are immutable (only drafts can be edited). The payer cannot retroactively construct a compliant response history | `modules/payments/index.ts`, respond route |
 | **Deemed-liability signal path** — the same materialization pattern as time bars: serving a payment claim creates an assurance `obligations` row for the statutory response deadline (`warnDaysBefore: 3`), so the payment clock and the obligation register agree on one date. The lazy sweep (`sweepDeemed`, run on every read of the register) flips an unanswered served claim to `deemed` exactly once, breaches the obligation and raises a **critical `payment_deemed_liability` signal** whose explanation embeds the regime's statutory deemed rule. Payment satisfies an *open* obligation only — paying late does not un-breach the register | `sweepDeemed` + serve/respond/mark-paid routes, `modules/payments/index.ts` |
+| **Business-case determination independence** — a submitted business case cannot be approved or rejected by its author (`403 Determination independence: the author of a business case cannot decide it`); approval additionally requires a preferred option (an approval that endorses no option is not a decision), the decision is ledgered with the preferred option, and an approved/rejected case is **immutable** — the appraisal a decision was made on cannot be re-shaped afterwards (options and appraisal config are draft-only edits). Same identity-level pattern as certification and EOT/claim assessment (ADR 0008) | `modules/governance/index.ts`, approve/reject + PATCH/options routes |
+| **Disbursement approval separation** — a disbursement request cannot be approved by its creator (`403 Separation of duties: a disbursement request cannot be approved by its creator`). Level separation stacks on identity separation: drafting/submitting needs `finance` `standard`, approve/reject need `finance` **admin** — as does waiving a facility condition, which also requires a stated reason and is ledgered with it. Disbursing requires a previously approved request; every transition is ledgered with payload | `modules/finance/index.ts`, approve/reject/waive routes |
+| **The conditionality gate is a control, not a convenience** — a disbursement request cannot be *submitted* while any condition precedent on its facility is open **or breached** (409 listing the blocking conditions); the verification snapshot (`{verifiedAt, openConditions[]}`) is persisted on the request whether or not it passed, and **a blocked submission attempt is itself ledgered** (`submit_blocked_by_conditionality`) — circumvention attempts are on the record. Condition satisfaction requires validated assurance evidence ids (never a bare assertion); late satisfaction unblocks the pipeline but a breached obligation stays breached — only an explicit admin-level waiver supersedes it. Headroom is enforced at the same gate: the pipeline may exceed neither the facility's committed amount nor a category limit | `modules/finance/index.ts`, submit route + `sweepOverdueConditions`; ADR 0012 |
+| **Contingency drawdown authority is recorded and bounded** — a drawdown exceeding the remaining contingency is refused (409 with the arithmetic); every draw records `approvedBy` and is ledgered with full payload (amount, reason, linked risk, remaining-after); a contingency with recorded drawdowns cannot be deleted; and the draw that takes remaining cover under 20% raises a high `contingency_exhaustion` signal exactly once. Stated plainly: there is **no separate release-approval workflow yet** (spec H#472) — `approvedBy` is the caller, gated only at `risk` `standard`, so drawdown authority is attributable and bounded but not yet two-person | `modules/risk/index.ts`, drawdowns route |
+| **Dispute timetables and bundles cannot be quietly rewritten** — overdue timetable steps are breached by the lazy sweep (obligation breached + high `dispute_deadline_missed` signal, exactly once via the step's `breachedAt` marker) and completing a step satisfies an *open* obligation only — a missed deadline stays on the register. A generated hearing bundle is **frozen**: its manifest commits tab order and per-item content hashes under a Merkle root, `/verify` recomputes every hash and the root against today's records (the check is ledgered as an `access` entry), and only a generated bundle can be issued | `modules/disputes/index.ts`, sweep + complete/generate/verify/issue routes |
 
 Residual weakness stated plainly: a company **owner/admin can hold operational admin and be
 granted an assurance role by another admin** — the platform does not yet forbid overlapping
@@ -156,7 +162,18 @@ caveat applies with more force in payments: the platform records both sides of a
 claim (claimant service and payer response) through one tenant's `payments` tool with no
 party-role check on who may respond — the statutes' teeth (deadlines, ground-stating,
 deemed liability) are enforced mechanically, but *who* is entitled to author a response
-is an organizational matter until party modelling lands.
+is an organizational matter until party modelling lands. Phase 4 widens the same caveat
+in two places. **Gate reviews enforce no reviewer independence**: `reviewedBy` is stamped
+and ledgered, but nothing prevents the project's own team recording its own gate decision
+— the independent assurance reviewer workspace (spec G#411) is not built, and until it is,
+independence at a gate is process, not code (the business-*case* decision, by contrast,
+is code — see the table). And **the lender is not a principal**: facility conditions,
+waivers, disbursement approvals and covenant readings are all recorded by the borrower's
+tenant through the `finance` tool. The gates are enforced mechanically and every action is
+attributable, but nothing models *the lender* as the party entitled to waive a condition
+or accept a covenant reading — today a lender gets visibility via a read-only assurance
+grant, and lender-side authority is an organizational control until party modelling
+lands.
 
 ---
 
