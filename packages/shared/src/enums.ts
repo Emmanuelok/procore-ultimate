@@ -373,6 +373,80 @@ export const CLAUSE_CATEGORIES = [
 export type ClauseCategory = (typeof CLAUSE_CATEGORIES)[number];
 
 /* ------------------------------------------------------------------ */
+/* Schedule & delay forensics (spec Vol I §2.6, Vol II Domain D / M9)  */
+/* ------------------------------------------------------------------ */
+
+export const DEPENDENCY_TYPES = ["FS", "SS", "FF", "SF"] as const;
+export type DependencyType = (typeof DEPENDENCY_TYPES)[number];
+
+export const TASK_CONSTRAINT_TYPES = [
+  "asap",
+  "start_no_earlier_than",
+  "finish_no_later_than",
+  "must_start_on",
+] as const;
+export type TaskConstraintType = (typeof TASK_CONSTRAINT_TYPES)[number];
+
+/** Delay cause classification (spec Domain D #265). */
+export const DELAY_CAUSES = [
+  "client_change",
+  "late_design_information",
+  "exceptional_weather",
+  "unforeseen_ground_conditions",
+  "authority_or_statutory",
+  "contractor_performance",
+  "subcontractor_default",
+  "supply_chain",
+  "force_majeure",
+  "other",
+] as const;
+export type DelayCause = (typeof DELAY_CAUSES)[number];
+
+export const DELAY_EVENT_STATUSES = ["open", "assessed", "withdrawn", "closed"] as const;
+export type DelayEventStatus = (typeof DELAY_EVENT_STATUSES)[number];
+
+export const CLAIM_KINDS = ["delay", "disruption", "prolongation", "acceleration"] as const;
+export type ClaimKind = (typeof CLAIM_KINDS)[number];
+
+export const CLAIM_STATUSES = [
+  "draft",
+  "submitted",
+  "assessed",
+  "agreed",
+  "rejected",
+  "withdrawn",
+] as const;
+export type ClaimStatus = (typeof CLAIM_STATUSES)[number];
+
+/* ------------------------------------------------------------------ */
+/* Statutory payment security (spec Vol II Domain F / M10)             */
+/* ------------------------------------------------------------------ */
+
+/** Security-of-payment statutory regimes modelled in code. */
+export const PAYMENT_REGIMES = [
+  "uk_hgcra",
+  "sg_sopa",
+  "au_nsw_sopa",
+  "my_cipaa",
+  "nz_cca",
+] as const;
+export type PaymentRegime = (typeof PAYMENT_REGIMES)[number];
+
+export const PAYMENT_CLAIM_STATUSES = [
+  "draft",
+  "served",
+  "responded",
+  "deemed", // no valid response in time — deemed liability
+  "paid",
+  "suspended", // right-to-suspend exercised
+  "referred", // referred to adjudication
+] as const;
+export type PaymentClaimStatus = (typeof PAYMENT_CLAIM_STATUSES)[number];
+
+export const PAYMENT_RESPONSE_KINDS = ["payment_notice", "pay_less_notice"] as const;
+export type PaymentResponseKind = (typeof PAYMENT_RESPONSE_KINDS)[number];
+
+/* ------------------------------------------------------------------ */
 /* Notifications                                                       */
 /* ------------------------------------------------------------------ */
 

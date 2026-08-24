@@ -11,3 +11,6 @@ export * from "./assurance.js";
 export * from "./ai.js";
 export * from "./commercial.js";
 export * from "./contracts.js";
+export * from "./schedule.js";
+export * from "./forensics.js";
+export * from "./payments.js";
