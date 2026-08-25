@@ -51,6 +51,8 @@ interface ActionItem {
   detail: string;
   date: string | null;
   dateLabel: string;
+  /** what the chip says when there is no countdown to show */
+  unknownLabel?: string;
   target?: { tab: InsuranceTabKey; recordId?: string; vendorId?: string };
   fatal?: boolean;
 }
@@ -144,6 +146,11 @@ export default function RadarTab({
 
   const items = report ? buildActionList(report, claims ?? []) : [];
   const gapsUnknown = report ? !report.coverRequirementsKnown : false;
+  const expiringCount = report
+    ? report.policiesExpiring.length +
+      report.certificatesExpiring.length +
+      report.bondsExpiring.length
+    : 0;
 
   return (
     <div>
@@ -248,10 +255,16 @@ export default function RadarTab({
             <StatCard
               label="Needs action today"
               value={report.actionableCount}
-              tone={report.actionableCount > 0 ? "red" : "green"}
+              tone={
+                report.actionableCount > 0 ? "red" : gapsUnknown ? "amber" : "green"
+              }
               emphasized
-              hint="Lapsed policies, expired certificates, bonds past their demand deadline and cover gaps"
-              title="actionableCount — the four conditions the expiry engine treats as already wrong, not merely approaching."
+              hint={
+                gapsUnknown
+                  ? "Lapsed policies, expired certificates and bonds past their demand deadline. Cover gaps are NOT included — they were not computed."
+                  : "Lapsed policies, expired certificates, bonds past their demand deadline and cover gaps"
+              }
+              title="actionableCount — the four conditions the expiry engine treats as already wrong, not merely approaching. With no requirement set recorded, the cover-gap component of this count is absent rather than zero."
             />
             <StatCard
               label="Bonds past demand deadline"
@@ -283,12 +296,8 @@ export default function RadarTab({
             />
             <StatCard
               label={`Expiring in ${days}d`}
-              value={
-                report.policiesExpiring.length +
-                report.certificatesExpiring.length +
-                report.bondsExpiring.length
-              }
-              tone="amber"
+              value={expiringCount}
+              tone={expiringCount > 0 ? "amber" : undefined}
               hint="Policies, certificates and bonds inside the window"
             />
           </div>
@@ -371,10 +380,16 @@ export default function RadarTab({
                     </div>
                     <div className="flex shrink-0 items-center gap-3">
                       <div className="text-right">
-                        <DeadlineChip days={item.days} fatal={item.fatal} />
-                        <div className="mt-0.5 text-[11px] text-ink-400">
-                          {item.dateLabel} {item.date ? formatDate(item.date) : "—"}
-                        </div>
+                        <DeadlineChip
+                          days={item.days}
+                          fatal={item.fatal}
+                          {...(item.unknownLabel ? { unknownLabel: item.unknownLabel } : {})}
+                        />
+                        {item.date ? (
+                          <div className="mt-0.5 text-[11px] text-ink-400">
+                            {item.dateLabel} {formatDate(item.date)}
+                          </div>
+                        ) : null}
                       </div>
                       {item.target ? (
                         <Button
@@ -692,7 +707,8 @@ function buildActionList(report: ExpiryReport, outstandingClaims: ClaimRow[]): A
       title: `${g.vendorName} — ${policyTypeLabel(g.policyType)}`,
       detail: `${COVER_GAP_REASON_DETAIL[g.reason] ?? g.reason} At work per ${VENDOR_SOURCE_LABELS[g.source] ?? g.source}.`,
       date: g.lastValidTo,
-      dateLabel: "last valid to",
+      dateLabel: "last certificate to",
+      unknownLabel: "open now",
       target: { tab: "certificates", vendorId: g.vendorId },
     });
   }
@@ -773,6 +789,7 @@ function buildActionList(report: ExpiryReport, outstandingClaims: ClaimRow[]): A
       detail: `In-date evidence exists but nobody independent of the party who submitted it has confirmed it.`,
       date: g.lastValidTo,
       dateLabel: "valid to",
+      unknownLabel: "unverified",
       target: { tab: "certificates", vendorId: g.vendorId },
     });
   }

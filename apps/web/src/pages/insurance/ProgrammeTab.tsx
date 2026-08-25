@@ -124,8 +124,18 @@ export default function ProgrammeTab() {
         <StatCard
           label="Radar actionable"
           value={radar ? radar.actionableCount : "—"}
-          tone={radar && radar.actionableCount > 0 ? "red" : undefined}
-          hint="Company-wide, 30-day window"
+          tone={
+            radar && radar.actionableCount > 0
+              ? "red"
+              : radar && !radar.coverRequirementsKnown
+                ? "amber"
+                : undefined
+          }
+          hint={
+            radar && !radar.coverRequirementsKnown
+              ? "Company-wide, 30-day window — cover gaps are not part of this count because they were not computed"
+              : "Company-wide, 30-day window"
+          }
         />
       </div>
       <ErrorAlert message={radarError} />
