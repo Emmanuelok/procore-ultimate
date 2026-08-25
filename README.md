@@ -2,7 +2,7 @@
 
 **An AI-native construction delivery & assurance platform.** ConstructOS pairs Procore-class project execution (drawings, BIM, RFIs, submittals, daily logs, punch, documents, workflow) with something the incumbent structurally cannot build: an owner-side **assurance layer** where every consequential claim is reconciled against independent evidence on an append-only, hash-chained ledger.
 
-Built phase-by-phase against the [master specification](docs/master-specification.md) (1,900+ enumerated functions across Volumes I–III). Five phases are delivered, and the Volume III module map (M1–M19) is now entered end to end: **29 API modules, 130 tables, 539 tests**. Two modules remain unstarted and are named as such — **M6 ingestion** and **M11 benchmarking** — because the first of them is the difference between an evidentiary product and a very good system of record. The full accounting is in [docs/roadmap.md](docs/roadmap.md).
+Built phase-by-phase against the [master specification](docs/master-specification.md) (1,900+ enumerated functions across Volumes I–III). Six phases are delivered, and every module in the Volume III module map (M1–M19) now has shipped code: **29 API modules, 136 tables, 593 tests**. Phase 6 closed the last two open modules — **M6 ingestion**, because it is the difference between an evidentiary product and a very good system of record, and **M11 benchmarking** — with their caveats stated rather than buried: the Procore/Aconex connectors are fixture-tested scaffolds whose pull route returns 501 until credentials and a network route exist, and the benchmark seed distributions are labelled illustrative because that is what they are. The full accounting is in [docs/roadmap.md](docs/roadmap.md).
 
 ## What's in the platform
 
@@ -14,9 +14,11 @@ Built phase-by-phase against the [master specification](docs/master-specificatio
 | **Programme & forensics** | `forensics` | Delay event register with excusable/compensable discipline, Time Impact Analysis by fragnet insertion, as-planned vs as-built, windows attribution (honestly scoped in the payload), prolongation calculator, claims workspace with the cause–effect–entitlement–quantum chain and auto-assembled chronology |
 | **Capital & risk** | `governance` `risk` `finance` `disputes` | Five-case business cases with Green Book NPV/BCR and author≠approver; Gateway-style stage gates whose conditions are Obligations; benefits register. Seeded, reproducible Monte Carlo (QCRA/QSRA) with a replay-and-verify endpoint and contingency drawdown discipline. Funding facilities where disbursement is blocked by open conditions precedent and blocked attempts are ledgered; covenant breach signals. Dispute register with procedural-timetable Obligations and Merkle-manifest hearing bundles that a receiving party can verify |
 | **Safeguards** | `land` `workforce` `esg` `jurisdiction` | Land parcels with customary/communal tenure, PAP census with cut-off enforcement, compensation that cannot be recorded without payment evidence, a grievance mechanism on published SLAs closed only with the complainant, and land blocking the programme. Worker register with **ghost-worker reconciliation of payroll against independent site-access records**, ILO rights indicators, subcontractor modern-slavery scoring, welfare inspections, audits with CAP obligations. EN 15978 whole-life carbon riding the BoQ with factor provenance, budgets, waste diversion, and social value reconciled tender-promise vs delivered. FIDIC 14.15 currency portions with FX variance, permits blocking the programme, local content/ICV |
-| **Assurance** | `assurance` | The 8 primitives from spec Vol III §4 — Assertion, Evidence (hashed at ingest), **Reconciliation**, Obligation, Event, Entity graph, Signal, Ledger Entry. Six statistical detectors (Benford, duplicate/round-number clustering, approval velocity, segregation-of-duties, over-certification) plus 26 more raised directly by the domain modules — deterministic threshold-and-date rules with precision 1.0 by construction (time bars, deemed liability, covenant breaches, ghost workers, grievance SLAs, permit expiry, carbon budgets …). Entity shared-identifier scanning, Merkle evidence packs, full-chain verification |
+| **Assurance** | `assurance` | The 8 primitives from spec Vol III §4 — Assertion, Evidence (hashed at ingest), **Reconciliation**, Obligation, Event, Entity graph, Signal, Ledger Entry. Six statistical detectors (Benford, duplicate/round-number clustering, approval velocity, segregation-of-duties, over-certification) plus 28 more raised directly by the domain modules — deterministic threshold-and-date rules with precision 1.0 by construction (time bars, deemed liability, covenant breaches, ghost workers, grievance SLAs, permit expiry, carbon budgets …). Entity shared-identifier scanning, Merkle evidence packs, full-chain verification |
 | **AI** | `ai` | Claude-powered agents (document search with citations, RFI evaluation, submittal review, daily-log drafting, sheet naming, photo intelligence, assistant) — every run audited, every consequential output routed through a human-in-the-loop review queue that re-checks the target tool's permission |
 | **Analytics** | `analytics` | Cross-tool report builder over a **whitelisted dataset registry** (no raw SQL from definitions, ever), saved and shared definitions, live preview, paged execution with honest truncation, CSV export, role dashboards (PM / commercial / assurance), and report schedules that are recorded rather than dispatched — and say so |
+| **Ingestion** | `ingestion` | Staged-commit migration and evidence intake: CSV upload **hashed at ingest** → column mapping against a code-resident dataset registry (8 datasets) → validation with a per-row rejection report → explicit, ledgered commit that forward-links every staged row to the real record it created. Dataset-scoped API tokens (SHA-256-stored, shown once) give evidence streams like site access and payroll **a machine pathway the claimant's users do not share** (ADR 0014/0015); re-presented batches raise a duplicate-replay signal; OCDS export with an honest partial-mapping note. Procore/Aconex connectors are scaffolds — mapping fixture-tested, pull returning 501 with the exact missing requirements |
+| **Benchmarking** | `benchmarks` | Code-resident metric registry (7 cost/schedule/field metrics computed from the project's own records, with the inputs persisted for audit — or an honest 422 naming exactly what is missing), **contribute-to-access** cross-tenant distributions with min-n suppression and always-disclosed sample size, an anonymization boundary contributor ids never cross, adverse-percentile outlier signals, and seed distributions labelled *illustrative — not derived from real project data* on every response that includes them |
 
 **Two design rules** (from the spec, enforced in code): *an Assertion and the Evidence used to test it must never be created by the same actor through the same pathway* ([ADR 0004](docs/adr/0004-assertion-evidence-separation.md)) — and where the platform reconciles, the two sides are **separate streams with separate write paths** ([ADR 0014](docs/adr/0014-independent-evidence-streams.md)).
 
@@ -26,16 +28,17 @@ pnpm monorepo, TypeScript end-to-end:
 
 ```
 packages/
-  shared/    domain enums, RBAC model (35 tools), assurance primitive types
+  shared/    domain enums, RBAC model (37 tools), assurance primitive types
   ledger/    hash-chained append-only ledger + merkle proofs (pure, tested)
-  db/        drizzle schema — 130 tables across 25 domains + migrations
+  db/        drizzle schema — 136 tables across 27 domains + migrations
 apps/
   api/       Fastify 5 · zod v4 · drizzle · JWT/RBAC · content-addressed storage
              29 feature modules + pure engines (CPM, Monte Carlo, FX, carbon,
-             workforce reconciliation, the analytics query registry)
+             workforce reconciliation, the analytics query registry, the
+             ingestion dataset registry, benchmark statistics)
   web/       Vite 8 · React 19 · Tailwind v4 · PDF.js drawing viewer · three.js/web-ifc BIM viewer
 docs/        master specification, architecture, data model, roadmap, security,
-             deployment, the retrospective detection run, 14 ADRs
+             deployment, the retrospective detection run, 16 ADRs
 ```
 
 The API runs against **PostgreSQL** in production and **embedded PGlite** (WASM Postgres) when `DATABASE_URL` is unset — zero-dependency local development and fully isolated in-memory integration tests.
@@ -74,7 +77,7 @@ STORAGE_DRIVER= s3                            (+ S3_* variables from the bucket)
 
 ```bash
 pnpm typecheck   # strict TS across every package
-pnpm test        # vitest: ledger chain/merkle + API integration suites on PGlite (539 tests)
+pnpm test        # vitest: ledger chain/merkle + API integration suites on PGlite (593 tests)
 pnpm build
 ```
 

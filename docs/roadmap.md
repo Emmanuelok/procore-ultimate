@@ -8,47 +8,56 @@ Domain A starting at #1, Domain B at #115, Domain C at #193, Domain D at #265,
 Domain E at #321, Domain F at #358, Domain G at #394, Domain H at #447, Domain O at
 #729, Domain S at #859, Domain X at #995).
 
-Five increments are delivered: **Phase 0/1 — Foundation** (the delivery subset +
+Six increments are delivered: **Phase 0/1 — Foundation** (the delivery subset +
 assurance skeleton), **Phase 2 — Tier-2 commercial seed (M7 + M8)**, **Phase 3 —
 Tier-2 forensics & payment security (M9 + M10, on a native §2.6 schedule core)**,
-**Phase 4 — Tier-3 programme & capital governance (M12–M15)**, and **Phase 5 — Tier-4
-safeguards & sustainability (M16–M19) plus the Vol I §6 reporting layer**.
-Phases 2–5 are a deliberate deviation from the spec Vol III §5 ordering (assurance core
+**Phase 4 — Tier-3 programme & capital governance (M12–M15)**, **Phase 5 — Tier-4
+safeguards & sustainability (M16–M19) plus the Vol I §6 reporting layer**, and
+**Phase 6 — Tier-1 ingestion + Tier-2 benchmarking (M6 + M11)**.
+Phases 2–5 were a deliberate deviation from the spec Vol III §5 ordering (assurance core
 before commercial depth): the commercial/forensic/governance/safeguard engines landed
-before the Tier-1 ingestion layer (M6). The deviation is contained — M7 was built so that
+before the Tier-1 ingestion layer (M6). The deviation was contained — M7 was built so that
 every certified value crosses into the assurance layer as an `Assertion`; M9/M10
 materialize their deadlines and breaches into the same `obligations`/`signals` tables;
 Phase 4 extended the identical pattern to lender conditions, gate conditions and dispute
 timetables (ADR 0012); and Phase 5 extended it again to grievance SLAs, labour
 corrective-action plans and permit determinations, while M17 built the platform's first
-genuine **two-stream reconciliation** (ADR 0014) — so nothing shipped that Tier-1 will
-have to unwind. But **M6 remains the gate to the sellable assurance claim** and is called
-out as such below. The "parity trap" warning (Vol III §1) is still treated as binding:
-Volume I parity stays last.
+genuine **two-stream reconciliation** (ADR 0014) — so nothing shipped that Tier-1 had
+to unwind. Phase 6 then built M6 itself. **The gate to the sellable assurance claim is
+now entered, not passed**: the machinery for records to arrive hashed, staged and through
+a pathway the claimant's users do not share exists in code, and what it still lacks — a
+real third-party feed actually connected to it, working connector transports, an anchored
+ledger — is named plainly below. The "parity trap" warning (Vol III §1) is still treated
+as binding: Volume I parity stays last.
 
 ---
 
-## Status at the end of Phase 5
+## Status at the end of Phase 6
 
-**The Vol III module map is now entered end to end.** Nineteen modules (M1–M19) plus the
-Vol I §6 reporting layer: seventeen have shipped code, two do not
-(**M6 Ingestion** — not started, and **M11 Independent benchmarking** — not started).
-Concretely, on `main`:
+**Every module in the Vol III module map now has shipped code.** Nineteen modules
+(M1–M19) plus the Vol I §6 reporting layer: all nineteen ship code, the last two
+(**M6 Ingestion** and **M11 Independent benchmarking**) landing in Phase 6 as documented
+subsets with their limits stated — the Procore/Aconex connector transports return 501,
+and the only benchmark distributions on offer until tenants contribute are
+clearly-labelled illustrative seed data. Concretely, on `main`:
 
 | | |
 |---|---|
-| API modules | **29** Fastify plugins (`apps/api/src/modules/*/index.ts`) |
-| Tables | **130** across 25 domain schema files (`packages/db/src/schema/`) |
-| Tests | **539** passing — 526 API integration/unit tests on in-memory PGlite + 13 ledger unit tests (`pnpm test`) |
+| API modules | **29** Fastify plugins (`apps/api/src/modules/*/index.ts`) — none of them stubs any more |
+| Tables | **136** across 27 domain schema files (`packages/db/src/schema/`) |
+| Tests | **593** passing — 580 API integration/unit tests on in-memory PGlite + 13 ledger unit tests (`pnpm test`) |
 | Web workspaces | one page per tool under `apps/web/src/pages/` |
-| Docs | architecture, data model, roadmap, security, deployment, retrospective-detection run, 14 ADRs |
+| Docs | architecture, data model, roadmap, security, deployment, retrospective-detection run, 16 ADRs |
 
 What has landed, by spec volume:
 
 - **Vol III Tier 2** (commercial depth): M7 measurement & valuation, M8 contract
   intelligence, M9 delay & disruption forensics, M10 payment security — delivered as
-  documented subsets (Phases 2–3). M11 benchmarking is open, and is the one Tier-2 module
-  that needs multi-tenant data before it can honestly exist.
+  documented subsets (Phases 2–3). M11 benchmarking landed in Phase 6: the machinery
+  (metric registry, auditable snapshots, contribute-to-access distributions with min-n
+  suppression) is real and tested, and the caveat that used to keep it un-started now
+  travels with it instead — until multiple tenants contribute, the only distributions on
+  offer are seed data labelled illustrative on every response that includes them.
 - **Vol III Tier 3** (programme & capital governance): M12 business case & stage gates,
   M13 quantitative risk, M14 disbursement & lender conditionality, M15 dispute support —
   delivered as documented subsets (Phase 4).
@@ -57,18 +66,20 @@ What has landed, by spec volume:
   operations — delivered as documented subsets (Phase 5, below).
 - **Vol I §6.1–6.2** (360 reporting and dashboards): the whitelisted report builder,
   saved definitions, CSV export, role dashboards and recorded-but-not-dispatched
-  schedules — delivered (Phase 5). §6.3 insights & benchmarking is M11 territory and is
-  not built.
+  schedules — delivered (Phase 5). §6.3 insights & benchmarking is M11 territory — its
+  cross-project distribution half landed in Phase 6; per-metric insights depth has not.
 - **Vol III §7** (the retrospective detection run): the *harness* exists —
   `apps/api/src/scripts/retrodetect.ts` plants known schemes through the public API into a
   seeded project, runs the shipped detectors, and reports precision and recall against a
   clean control project (`pnpm --filter @constructos/api eval:retrodetect`; methodology in
   `docs/retrospective-detection.md`). What it measures is a **synthetic** scope: the
   spec's actual artefact needs one completed real project with a known integrity outcome
-  and third-party records, which requires M6 and a willing institution.
+  and third-party records — which requires a willing institution, and since Phase 6 no
+  longer waits on missing machinery: the ingestion pathway to receive those third-party
+  records exists (`docs/adr/0015-staged-commit-ingestion.md`).
 - **Vol III Tier 1** (the assurance core, M1–M5) remains as it was — real but seeded: the
   ledger, the eight primitives, the entity graph, the three assurance roles, and a
-  detector set that has grown from six to **thirty-two distinct signal detectors** — the
+  detector set that has grown from six to **thirty-four distinct signal detectors** — the
   six statistical/pattern detectors in `modules/assurance/detectors.ts` plus deterministic
   threshold-and-date detectors embedded across the domain modules (Phase 5 alone added
   sixteen: `land_blocks_programme`, `grievance_sla_breach`, `ghost_worker`,
@@ -76,13 +87,17 @@ What has landed, by spec volume:
   `labour_rights_indicator`, `accommodation_overcrowding`, `welfare_standard_failure`,
   `labour_cap_overdue`, plus the ESG/jurisdiction family
   `carbon_budget_exceeded`, `social_value_shortfall`, `permit_determination_overdue`,
-  `permit_expired`, `permit_blocks_programme`, `local_content_shortfall`).
-  **M6 has not started.** Everything still arrives through ConstructOS's own API.
+  `permit_expired`, `permit_blocks_programme`, `local_content_shortfall`; Phase 6 added
+  `ingestion_duplicate_replay` and `benchmark_outlier`).
+  **M6 is now built** (Phase 6): staged, hash-at-ingest CSV migration and a
+  dataset-scoped machine-token push inlet. What no deployment has yet done is receive a
+  real third-party feed through it.
 
-The honest headline: **the platform now has more machinery than input.** Phase 5 did not
-change that — it deepened it, and in M17 it built the first module whose value depends
-entirely on the two sides of a reconciliation arriving through different channels (ADR
-0014). That is the argument for what comes next.
+The honest headline: **the platform now has an inlet, and still has more machinery than
+input.** Phase 6 built the pathway ADR 0014 was waiting for — an evidence stream can now
+arrive hashed at ingest, through a machine credential the claimant's users do not share —
+but a pathway with nothing connected to it changes what the product *can* be, not yet
+what any deployment *is*. Connecting one real feed is the argument for what comes next.
 
 ---
 
@@ -130,12 +145,12 @@ small subsets of their spec sections.
 | M3 Reconciliation Engine | **Seeded** — assertion/evidence/reconciliation CRUD, automatic variance scoring (±5%/±15% thresholds), independence rule enforced |
 | M4 Entity Graph | **Seeded** — entities, typed relationships, graph walk, shared-identifier scan (`POST /entities/scan`), vendor→entity mirror |
 | M5 Assurance Workspace | **Seeded** — the three roles wired through auth; assurance pages in the web app; time-boxed regulator grants |
-| M6 Ingestion Layer | **Not started** — today all data arrives through ConstructOS's own API |
+| M6 Ingestion Layer | **Delivered (Phase 6, subset)** — staged CSV migration with hash-at-ingest, the code-resident dataset registry, ledgered commits with per-row provenance, dataset-scoped machine tokens + the push inlet (ADR 0014 pathway separation), duplicate-replay signal, OCDS export. Procore/Aconex connectors are fixture-tested scaffolds whose pull returns 501; see the Phase 6 section |
 | M7 Measurement & valuation | **Delivered (Phase 2, subset)** — BoQ/taking-off/valuation/certification/variations; see the Phase 2 section for the exact function-number in/out list |
 | M8 Contract intelligence | **Delivered (Phase 2, subset)** — clause library in code, PC overlay, time-bar engine, EOT, LD exposure, obligation register; see Phase 2 section |
 | M9 Delay & disruption forensics | **Delivered (Phase 3, subset)** — delay events, fragnet TIA, as-planned vs as-built, scoped windows attribution, prolongation seed, claims chain + chronology; see Phase 3 section |
 | M10 Payment security | **Delivered (Phase 3, subset)** — five statutory regimes in code, deadline engine, deemed-liability sweep, suspension, interest; see Phase 3 section |
-| M11 Independent benchmarking | **Not started** (sequenced behind multi-tenant data; see Tier 2 remainder) |
+| M11 Independent benchmarking | **Delivered (Phase 6, subset)** — metric registry, auditable snapshots, contribute-to-access distributions with min-n suppression and disclosed n, anonymization boundary, outlier signals. Seed data is labelled illustrative; genuine benchmarks still require contributing tenants; see the Phase 6 section |
 | M12 Business case & stage gates | **Delivered (Phase 4, subset)** — five-case model, CBA to NPV/BCR, stage gates + decision register, conditions as obligations, benefits register; see Phase 4 section |
 | M13 Quantitative risk | **Delivered (Phase 4, subset)** — seeded QCRA/QSRA Monte Carlo, reproducibility endpoint, contingency drawdown discipline; see Phase 4 section |
 | M14 Disbursement & conditionality | **Delivered (Phase 4, subset)** — facility register, CP gate on submission, evidence-backed satisfaction, covenant signals; see Phase 4 section |
@@ -147,10 +162,11 @@ small subsets of their spec sections.
 | *(Vol I §6 reporting layer — not a Vol III module)* | **Delivered (Phase 5, subset)** — whitelisted report builder, saved definitions, CSV export, role dashboards, recorded schedules; see Phase 5 section and ADR 0013 |
 
 Not implemented at all (deliberately): Vol I §1.1–1.3 (bid/estimating/prequal), §2.2 specs,
-§2.9/2.11–2.13, §3 financial suite, §4 quality & safety, §5 resources, §6.3 insights &
-benchmarking; Vol II domains N, P–R, T–Z beyond the seeds listed above (Domains B and C
-gained real coverage in Phase 2, Domains D and F plus the §2.6 schedule core in Phase 3,
-Domains E, G, H and O in Phase 4, Domains I, J, K and M plus Vol I §6.1–6.2 in Phase 5).
+§2.9/2.11–2.13, §3 financial suite, §4 quality & safety, §5 resources; Vol II domains
+P, Q, T–Z beyond the seeds listed above (Domains B and C gained real coverage in Phase 2,
+Domains D and F plus the §2.6 schedule core in Phase 3, Domains E, G, H and O in Phase 4,
+Domains I, J, K and M plus Vol I §6.1–6.2 in Phase 5, and Domains N and R plus §6.3's
+cross-project distribution half in Phase 6).
 
 ---
 
@@ -231,8 +247,10 @@ compute what it cannot compute correctly.)*
 
 1. *"A certified interim valuation traced item-by-item to BQ lines and evidence (B#140)"* —
    **half met**: item-by-item tracing to BQ lines, taking-off sheets and source drawings is
-   live; tracing to *independent evidence* waits on M6 ingestion + M3 reconciliation. The
-   hook exists: every certificate already lands as a `cost` Assertion (ADR 0008).
+   live; tracing to *independent evidence* waits on M3 reconciliation methods over a real
+   ingested feed (the M6 machinery landed in Phase 6). The hook exists: every certificate
+   already lands as a `cost` Assertion (ADR 0008), and `cost_assertions` is an ingestion
+   dataset.
 2. *"A time-bar warning fired before expiry on a live contract (C#229)"* — **mechanism
    delivered** (deadline radar + `warnDaysBefore` obligations + `/obligations/upcoming`);
    firing it on a *live* contract is a deployment milestone, not an engineering one.
@@ -471,9 +489,10 @@ tracking, recovery-vs-cost analysis, outcome database and root-cause analytics.
    — **partially met, honestly short of the bar**: the conditionality gate blocks
    submission on open CPs and satisfaction demands assurance evidence, but conditions are
    discharged by *evidence*, not by `supported` *reconciliations* — the reconciliation-
-   gated drawdown waits on M6 ingestion + M3 methods producing reconciliations worth
-   gating on. The hook is in place: condition satisfaction already points at `evidence`
-   rows, and the disbursement carries its verification snapshot.
+   gated drawdown waits on M3 methods producing reconciliations worth gating on, fed by a
+   real ingested stream (the M6 machinery landed in Phase 6). The hook is in place:
+   condition satisfaction already points at `evidence` rows, and the disbursement carries
+   its verification snapshot.
 2. *"A dispute bundle exported with chain-of-custody documentation (E domain + S#872),
    verifiable by the receiving party against the escrowed chain head"* — **mechanism
    delivered except escrow**: the frozen manifest (tabs, content hashes, Merkle root),
@@ -651,18 +670,116 @@ access-control logs)."*
 - **Reconciled against independent sources: mechanism met, independence not yet
   guaranteed.** M17 implements exactly the reconciliation the criterion names, as two
   separate tables with two separate write routes and a pure engine over both (ADR 0014).
-  What the platform cannot yet guarantee is that the access stream *arrives through a
-  different channel from the payroll* — both post through the same API with the same
-  token until M6 lands. The `site_access_records.source` column is where that provenance
-  will attach.
+  What the platform could not guarantee at the end of Phase 5 was that the access stream
+  *arrives through a different channel from the payroll* — both posted through the same
+  API with the same token. *(Phase 6 note: that channel now exists —
+  `POST /ingestion/push/site_access` with a dataset-scoped machine token is a pathway no
+  user session shares, and pushed rows land in `site_access_records` with run-level token
+  provenance. Who holds the token is the remaining assumption — see the Phase 6 section
+  and `docs/security.md` §8.2 gap 17.)*
 - **Hashed: partially met.** File-backed safeguard evidence inherits content-addressed
   storage and `evidence.contentHash` (`docs/security.md` §4). Bulk-ingested access and
-  payroll rows are ledgered but are not themselves hashed-at-ingest artefacts — that is
-  M6/S#862 work.
+  payroll rows are ledgered but are not themselves hashed-at-ingest artefacts. *(Phase 6
+  note: rows migrated through an M6 file run now are — the raw upload is retained
+  content-addressed and its sha256 travels with the run and its ledger entries. Rows
+  arriving through the workforce module's own bulk routes, or through a token push — which
+  has no file — remain ledgered-with-counts rather than file-hashed.)*
 
 ---
 
-## Tier 1 — Assurance core completion (M1–M6) — open
+## Phase 6 — Delivered: Tier-1 ingestion + Tier-2 benchmarking (M6 + M11)
+
+Committed and tested: `apps/api/src/modules/{ingestion,benchmarks}/` with colocated
+suites (**52 tests**), schema `packages/db/src/schema/{ingestion,benchmarks}.ts`
+(6 tables), web workspaces `apps/web/src/pages/{ingestion,benchmarks}/`. Architecture
+write-ups in `docs/architecture.md` §24–25; table catalogs in `docs/data-model.md`
+§26–27; the token model in `docs/security.md` §1.5; ADRs 0015 (staged-commit ingestion)
+and 0016 (benchmark anonymization boundary).
+
+These are the two modules every earlier phase named as not started, and they were held
+back for opposite reasons: M6 because it changes what the product *is* (the difference
+between an evidentiary product and a system of record), M11 because it cannot honestly
+exist without data from more than one tenant. Phase 6 built both as machinery and kept
+the second constraint visible in the output rather than pretending it away.
+
+### M6 — Data ingestion & migration (Domain N #705–711, #715; S#862; A#109)
+
+**In:** the staged-commit pipeline — CSV upload retained content-addressed with its
+sha256 **hashed at ingest** (S#862, ingest half) → column mapping against a code-resident
+dataset registry (`modules/ingestion/datasets.ts`; 8 datasets: vendors, cost_assertions,
+site_access, payroll, rfis, schedule_tasks, evidence, fx_rates — a field not in the
+registry cannot be mapped, staged or committed) → validation with typed coercion,
+cross-field checks and per-row rejection reasons → an explicit, ledgered commit that
+writes real records and per-row provenance in one transaction, forward-linking every
+staged row to the record it created (`committedRecordId`) and back-linking assertions and
+evidence to the run (`sourceType/sourceId`); rejected rows stay behind as the honest
+record of what the file contained. Re-presented `externalId`s are rejected *and* raise an
+`ingestion_duplicate_replay` signal — a replayed batch is a finding, not just an error.
+**Machine tokens** (`cok_` + 40 hex, stored only as SHA-256 + display prefix, shown once)
+scoped to named datasets drive `POST /ingestion/push/:dataset` — the ADR 0014 inlet: no
+JWT, no user session, run `startedBy` is the token id and the ledger entry's `actorId` is
+null with the token identified in the payload. Out-of-scope pushes are 403; revocation is
+immediate. Site-access and payroll pushes resolve `workerReference` against the project's
+worker register and **skip** (with a per-row reason) rather than invent workers. Plus an
+OCDS 1.1 export (A#109) whose `x_scopeNote` states exactly which sections are absent and
+why. All of it ledgered; verified live end-to-end (hash match, counts, chain intact).
+
+**Out (explicitly not built, stated in the product):** the Procore/Aconex **connector
+transports**. `modules/ingestion/connectors.ts` is honest scaffolding — an injectable
+HTTP client, the vendors' documented request paths, and pure fixture-tested mapping
+functions into the ingestion datasets — but this deployment has no network route to
+either vendor and holds no credentials, so `POST /ingestion/sources/:id/pull` returns
+**501** with the exact credential and config requirements rather than pretending.
+Also out: Domain N's open-schema import/export family beyond OCDS, scheduled/incremental
+pulls, per-row trusted-source attestation (what arrived is attributable to a token, not
+yet to an attested device), and any write path for credentials — source `config` refuses
+credential-shaped keys outright.
+
+### M11 — Independent benchmarking (Domain R #821–858 subset; Vol I §6.3 half)
+
+**In:** a code-resident registry of **7 metrics** (cost per GFA m², cost growth, schedule
+growth, median RFI response days, variation rate, punch open rate, median payment cycle
+days) computed from the project's own records with the exact inputs persisted for audit —
+or a **422 that names every missing input** rather than a fabricated zero; project metric
+snapshots frozen at computation time; **contribute-to-access** (#855): a company sees a
+metric's contributed distribution only after contributing a snapshot to it (an
+admin-of-the-tool act — the value leaves the tenant's walls, anonymized, forever);
+distributions with **min-n suppression** (fewer than 5 contributed samples in a cell:
+statistics withheld, n still disclosed — #831 is unconditional); the **anonymization
+boundary**: contributor company/project ids are stored only to enforce
+contribute-to-access and min-n counting, and no read path selects them; percentile
+comparison with an adverse-tail `benchmark_outlier` signal; every seed-backed response
+carries `healthWarning: "Illustrative seed distribution — not derived from real project
+data"` verbatim.
+
+**Out (explicitly not built):** the rate/productivity benchmark family the domain
+ultimately wants (#821 onward — BQ rates, `rateBuildUp` components and star rates are
+still raw material, not benchmarks); a write path for `projects.settings.gfaM2`, which
+makes `cost_per_gfa_m2` uncomputable through the API alone today — the 422 names the
+missing input, and making project settings writable is a projects-module design decision
+deliberately not taken from inside M11; any claim of independence for the seed data (it is
+hand-authored, deterministic, and labelled); k-anonymity beyond the min-n floor —
+suppression at n < 5 protects contributors from casual inference, not from a determined
+differential attack, and region/asset class are self-declared (ADR 0016 states the
+boundary and its limits); external/third-party benchmark import. The spec's own
+constraint stands: *"the benchmark must be independent of the benchmarked"* — with one
+tenant contributing, a distribution is a mirror, and the module says so by suppressing
+it. Genuine benchmarks are sequenced behind customers, exactly as before; what changed is
+that their arrival no longer requires new code.
+
+### Phase-6 status against the Tier 1 acceptance criteria
+
+Phase 6 moves criterion 1 (*"one real project's records ingested from a third-party
+system, hashed at ingest, and a reconciliation report … produced end-to-end"*) from
+**blocked** to **waiting on a counterparty**: every mechanical step — third-party-shaped
+intake, hash-at-ingest, staged commit, reconciliation — now exists and is tested, and
+what is missing is a real external system on the other end of the wire. Criteria 2–4
+(retrospective run on real data, measured detector precision, escrowed chain heads) are
+unchanged — see "Recommended next sequence".
+
+---
+
+## Tier 1 — Assurance core completion (M1–M6) — M6 delivered, remainder open
 
 *(This section was headed "Phase 2 — Assurance core complete" in earlier revisions; ADR
 0004 and `docs/security.md` refer to its content as Tier-1 roadmap work. The Phase 2 that
@@ -670,17 +787,18 @@ actually shipped is the commercial seed above; the work below is unchanged and r
 gate to the sellable assurance product.)*
 
 Goal: turn the seeds into the sellable assurance product of spec Vol III §2 — "every
-certified payment … reconciled against independent evidence." M7's certificates now
+certified payment … reconciled against independent evidence." M7's certificates
 generate exactly the assertions this tier must reconcile, and Phase 5 added the first
 *complete* consumer of the missing half: M17's ghost-worker reconciliation
 (`modules/workforce/reconcile.ts`) is a finished engine that reads two tables, one of
-which is meant to be fed by a system the claimant does not control. Its accuracy is an
-engineering property today and an evidentiary one only after M6 — the sharpest available
-statement of why this tier is still the gate (ADR 0014).
+which is meant to be fed by a system the claimant does not control. Phase 6 built that
+feed's pathway (the Phase 6 section above): the engine's accuracy becomes an evidentiary
+property the day a system the employer does not control actually posts through it. The
+remaining workstreams below still gate the sellable claim.
 
 | Workstream | Representative spec functions | Notes |
 |---|---|---|
-| M6 Ingestion layer (build first — spec Phase 0 is "ingest and prove") | Domain N #705–711 (API export/import, open schemas), #715 (foreign-system record mirroring); hash-at-ingest per S#862 | Procore/Aconex/CSV connectors landing as `evidence` + `assertions` with provenance; this also delivers the **pathway separation** the §4 design rule requires |
+| M6 Ingestion layer | Domain N #705–711 (API export/import, open schemas), #715 (foreign-system record mirroring); hash-at-ingest per S#862 | **Delivered (Phase 6, subset — see the Phase 6 section)**: staged CSV migration lands as `evidence` + `assertions` (and six more datasets) with hash-at-ingest and per-row provenance, and the machine-token push inlet delivers the **pathway separation** the §4 design rule requires. Still open inside M6: working Procore/Aconex transports (the pull returns 501 pending credentials and a network route) and a production deployment receiving a real third-party feed |
 | M1 hardening | S#860–861 notarisation & anchoring, #864 trusted time, #873–874 attestation & hash escrow, #871 forensic export format | Publish Merkle roots + chain heads to an external escrow on a schedule |
 | M2 detector build-out | Domain A #1–35 (bid-pattern family), #53–71 (ghost vendor/worker, duplicate payment, certification-vs-evidence family), #93–99 (risk scores, red-flag register, false-positive loop) | Ship detectors with measured precision (Vol III §6.2: "ship five that work rather than fifty that fire"). 32 detectors now write signals, but only the six statistical ones in `modules/assurance/detectors.ts` are *inference*; the rest are deterministic rules whose precision is 1.0 by construction — the domain's hard families (#1–35, #53–71) remain unbuilt |
 | M3 methods | Domain A #65–71 quantity/progress/plant/labour reconciliations; X#1017 evidence sufficiency scoring | Method plug-ins beyond mean-variance |
@@ -692,28 +810,28 @@ statement of why this tier is still the gate (ADR 0014).
    reconciliation report of certified quantities vs. independent evidence produced end-to-end.
 2. A **retrospective detection run** on a completed project with a known integrity outcome,
    reporting precision/recall per detector — the spec's bar for "a plan becomes a company".
-   *(The harness now exists and passes on synthetic data — `docs/retrospective-detection.md`.
-   What is missing is real third-party input, i.e. criterion 1.)*
+   *(The harness exists and passes on synthetic data — `docs/retrospective-detection.md`.
+   What is missing is real third-party input, i.e. criterion 1 — which since Phase 6 waits
+   on a counterparty, not on code.)*
 3. Every detector ships with a measured precision figure and a reviewer feedback loop
    (`false_positive` dispositions feed detector tuning).
 4. Ledger heads/Merkle roots escrowed externally; a truncation attack becomes detectable.
 
 ---
 
-## Tier 2 remainder — M11
+## Tier 2 — complete as documented subsets (M7–M11)
 
 "A variance is an observation; a variance mapped to a FIDIC sub-clause with a live time bar
-is an action" (spec Vol III §5 Phase 3). M7–M10 (delivered above) built the sub-clause,
-the live time bar, the forensic method and the statutory clocks; one Tier-2 module
-remains.
+is an action" (spec Vol III §5 Phase 3). M7–M10 built the sub-clause, the live time bar,
+the forensic method and the statutory clocks; Phase 6 closed the tier with M11.
 
-| Module | Status | Domain / representative functions | Hooks now in place |
+| Module | Status | Domain / representative functions | Notes |
 |---|---|---|---|
 | M7 Measurement & valuation | **Delivered (subset — see Phase 2)** | B#115–192 | — |
 | M8 Contract intelligence | **Delivered (subset — see Phase 2)** | C#193–264 | — |
 | M9 Delay & disruption forensics | **Delivered (subset — see Phase 3)** | D#265–320 | — |
 | M10 Payment security | **Delivered (subset — see Phase 3)** | F#358–393 | — |
-| M11 Independent benchmarking | Open | R#821–858: independent rate/productivity benchmarks | BQ rates + `rateBuildUp` components and variation star rates are the raw material; anonymized cross-tenant aggregates over assertions/reconciliations |
+| M11 Independent benchmarking | **Delivered (subset — see Phase 6)** | R#821–858: outcome-metric distributions with contribute-to-access and min-n suppression | The rate/productivity benchmark family is still open depth (see "What remains"); BQ rates + `rateBuildUp` components and variation star rates remain the raw material for it |
 
 ---
 
@@ -728,7 +846,7 @@ numbers are from `docs/master-specification.md`.
 
 | # | What is missing | Why it is structural |
 |---|---|---|
-| 1 | **M6 Ingestion layer** (Vol III Tier 1; Domain N #705–711, #715; S#862 hash-at-ingest) | Every record still arrives through ConstructOS's own API. ADR 0004 enforces the assertion/evidence rule at *actor* level; the spec demands *pathway* level, and ADR 0014 now names the tables that are shaped to receive independent feeds (`site_access_records.source` first among them). Until M6, "reconciled against independent evidence" is a property of the customer's process, not of the product. |
+| 1 | **A real third-party feed through M6** (Vol III Tier 1; Domain N #705–711, #715; S#862) | Phase 6 built the pathway: records can now arrive staged, hashed at ingest and — via dataset-scoped machine tokens — through a channel the operator's user sessions do not share (`POST /ingestion/push/:dataset`; ADR 0014, ADR 0015). What no deployment has yet done is connect one: the Procore/Aconex transports return 501 pending credentials, and no turnstile vendor, bank or telematics provider posts to a production instance. The hole is smaller than it was — a capability gap became a deployment gap — but until a real feed flows, "reconciled against independent evidence" is a capability of the product exercised by nobody, and the platform still cannot prove who holds a token (`docs/security.md` §8.2 gap 17). |
 | 2 | **M1 anchoring & escrow** (Domain S #860–861, #864, #873–874) | The chain is tamper-evident against edits and internally verifiable, but a DB insider can truncate the tail or rewrite the whole chain undetectably, and `at` is the app-server clock. Both Tier-3 acceptance criteria and the credibility of any published retrospective run rest on this. Tracked as open gaps 2–3 in `docs/security.md` §8.2. |
 
 Everything else on this page is scope. These two are the difference between a very good
@@ -736,9 +854,12 @@ system of record and the product Vol III describes.
 
 ### Vol II — gap domains still absent
 
+Domain R (independent benchmarking) left this table in Phase 6 — the delivered subset and
+its stated limits are in the Phase 6 section, and the depth still missing is listed under
+"depth still missing" below.
+
 | Domain | Range | Status |
 |---|---|---|
-| **M11 / Domain R — Independent benchmarking** | #821–858 | Not started. The *service* needs an independent-benchmark database by asset class (#821), and the spec's own classification is the constraint: *"the benchmark must be independent of the benchmarked."* The raw material exists in-repo (BQ rates with `rateBuildUp` components, star rates, certified valuations, delay-event durations), but a benchmark built from one tenant's data is a mirror, not a benchmark — this needs anonymized cross-tenant aggregation, a stated methodology, and enough tenants for k-anonymity to mean something. Sequenced behind customers, not behind code. |
 | **Domain P — Insurance & bonding lifecycle** | #771–797 | Not started. Insurance programme register (CAR/EAR, TPL, PI, employer's liability, marine cargo, DSU), certificate collection and expiry, bond register and call tracking, claims notification against policy conditions. The natural fit is obvious — insurance notification periods are Obligations (ADR 0012) and a lapsed certificate is a signal — which is exactly why it is cheap to add later and unnecessary to speculate on now. |
 | **Domain Q — Tax & statutory deduction** | #798–820 | Not started. VAT/GST by jurisdiction and supply type, reverse charge, CIS/withholding regimes, permanent establishment exposure. This is the family M19 explicitly did not open (#606–607), and it is the one place where a wrong answer creates liability directly rather than through a claim — it wants the same code-resident-regime-library treatment as ADR 0007/0010 and a specialist review. |
 | **Domain U — Supply chain, logistics & offsite manufacture** | #913–947 | Not started. Multi-tier supply chain mapping, offsite/modular production tracking, logistics and delivery sequencing, material traceability. M18's waste and carbon models and M16's parcel logistics touch its edges; the module itself is not built. |
@@ -756,8 +877,16 @@ remaining depth, worst first:
   patterns (#1–35), the ghost-vendor / duplicate-payment / certification-vs-evidence
   family (#53–71 — M17's ghost-*worker* reconciliation is one member of it), risk scoring
   and the red-flag register (#93–99). The spec's own rule governs: *"ship five that work
-  rather than fifty that fire"* (Vol III §6.2), which is why this is sequenced with M6 and
-  measured precision rather than shipped as a batch.
+  rather than fifty that fire"* (Vol III §6.2), which is why this is sequenced with real
+  ingested data (the M6 pathway now exists to supply it) and measured precision rather
+  than shipped as a batch.
+- **Domain R — the benchmark *service*** (#821–858 beyond the Phase 6 subset): the
+  rate/productivity benchmark database by asset class (#821) built from BQ rates,
+  `rateBuildUp` components and star rates; methodology review; and the thing no code
+  ships — enough contributing tenants that suppression lifts and the spec's constraint
+  (*"the benchmark must be independent of the benchmarked"*) is satisfied by population
+  rather than by a seed-data label. The Phase 6 machinery (contribute-to-access, min-n,
+  the anonymization boundary) is the container this fills.
 - **Domain D — forensic method** (#274–298): full retrospective windows analysis with
   per-window schedule updates, SCL-Protocol method selection, concurrency/pacing/float
   ownership, measured mile and the disruption family.
@@ -785,30 +914,30 @@ acquiring rather than building"*). Named honestly so nobody discovers it in a de
 | §5.1–5.4 Resource, equipment & materials management | #676–730 | Not built. Equipment (#700–718) is where telematics enters the platform — the third independent evidence stream named in ADR 0014, and the reason this section is more interesting than its parity label suggests. |
 | §0.6 Mobile & field | #104–118 | No native iOS/Android apps and no offline mode. The web app is responsive; that is not the same claim. Compounded by Domain K #616–626 (offline-first, SMS/USSD, low-bandwidth sync) — together they are an **application-shell programme**, not a module. |
 | §0.7 Integration & extensibility | #119–142 | REST API (#119) and rate limiting (#122) exist. **Absent: OAuth2 for machine callers (#120), webhooks (#121), developer sandbox (#123), the app marketplace (#124–125), MCP/agentic API exposure (#126–127), embedded experiences (#128–129), and the whole ERP connector framework (#130–133) plus P6/MS Project/Bluebeam/Autodesk exchange (#134–137).** The webhook emitter has an obvious home — the ledger append path already sees every consequential mutation. |
-| §6.3 Insights & benchmarking | #753–758 | See M11. |
+| §6.3 Insights & benchmarking | #753–758 | See M11 — the cross-project distribution half was delivered in Phase 6; predictive insights were not. |
 | §7 Owner & portfolio | #776–789 | Partially met sideways: portfolios, stage gates (M12), portfolio contingency (M13) and cross-project reporting (Phase 5 analytics) exist; a dedicated owner/portfolio workspace does not. |
 
 ---
 
 ## Recommended next sequence
 
-The recommendation has not changed since Phase 4, and Phase 5 strengthened it rather than
-displacing it. **Build M6 ingestion, in service of the spec §7 retrospective detection run
+The recommendation has not changed in substance since Phase 4 — Phase 6 delivered its
+first step *as machinery*, which shifts the emphasis without changing the order.
+**Connect a real feed through M6, in service of the spec §7 retrospective detection run
 on real data, and anchor the ledger while doing it.** Then, and only then, take demand-led
 work.
 
-**1. M6 Ingestion + hash-at-ingest (Domain N #705–711, #715; S#862).** *Reasoning:* it is
-the only remaining item that changes what the product *is* rather than what it covers.
-Five phases of engines exist and none of them has an independent input. The spec's design
-rule — *"Assertion and Evidence must never be created by the same actor through the same
-pathway"* — is enforced at actor level and unenforceable at pathway level until records
-arrive through a channel the claimant does not control (ADR 0004, ADR 0014). Phase 5 made
-this concrete rather than theoretical: M17's ghost-worker reconciliation is a finished
-engine whose entire value rests on the site-access stream not being authored by the party
-filing the payroll. First connectors, in order of evidentiary value per unit of work:
-site access-control systems (feeds M17 directly), bank/payment files (feeds M14 and
-Domain A's duplicate-payment family), telematics (feeds plant and daywork claims), then
-Procore/Aconex/CSV for the incumbent-migration story.
+**1. A real independent feed through M6 (Domain N #705–711, #715; S#862).** *Reasoning:*
+Phase 6 built the staged pipeline, the hash-at-ingest provenance and the machine-token
+inlet — the only item that changed what the product *is* rather than what it covers. What
+it could not build is the other end of the wire: the Procore/Aconex transports return 501
+pending credentials and a network route, and the highest-value feeds were never incumbent
+connectors anyway. In order of evidentiary value per unit of work: site access-control
+systems (feeds M17 directly — `POST /ingestion/push/site_access` is live for exactly
+this), bank/payment files (feeds M14 and Domain A's duplicate-payment family), telematics
+(feeds plant and daywork claims), then completing the Procore/Aconex transports for the
+incumbent-migration story. This step is now integration and counterparty work more than
+platform code — which is the point: the code stopped being the blocker (ADR 0015).
 
 **2. M1 anchoring & escrow (S#860–861, #864, #873–874).** *Reasoning:* cheap, bounded, and
 it is the difference between "we verified our own chain" and "a third party can verify
@@ -866,8 +995,9 @@ acceptance criteria are in that section.)*
 **Acceptance criteria:** a drawdown certificate generated only from `supported`
 reconciliations (O domain); a dispute bundle exported with chain-of-custody documentation
 (E domain + S#872), verifiable by the receiving party against the escrowed chain head.
-Status: the first is evidence-gated but not yet reconciliation-gated (M6+M3); the second
-is delivered except escrowed-head verification (M1 anchoring) — see the Phase 4 section.
+Status: the first is evidence-gated but not yet reconciliation-gated (M3 methods over a
+real ingested feed — the M6 machinery landed in Phase 6); the second is delivered except
+escrowed-head verification (M1 anchoring) — see the Phase 4 section.
 
 ---
 
@@ -887,9 +1017,12 @@ tier's acceptance criterion are in that section.)*
 
 **Acceptance criterion:** welfare and safeguard records held to the same evidentiary standard
 as financial ones — hashed, ledgered, reconciled against independent sources (e.g. M17
-attendance vs. access-control logs). Status: **ledgered — met; reconciled — the mechanism is
-built (ADR 0014) but the two streams still share an API pathway until M6; hashed — file-backed
-evidence only.** Full analysis at the end of the Phase 5 section.
+attendance vs. access-control logs). Status: **ledgered — met; reconciled — the mechanism
+is built (ADR 0014) and since Phase 6 the evidence side has its own machine pathway
+(dataset-scoped tokens, `POST /ingestion/push/site_access`), with token custody the stated
+residual assumption; hashed — file-backed evidence and M6 file runs; pushed rows are
+ledgered per run, not file-hashed.** Full analysis at the end of the Phase 5 section, with
+the Phase 6 notes inline.
 
 Build order *within* this tier was supposed to be demand-driven per spec Vol III §5 Phase 4
 (*"built in the order your first three institutional customers contractually require them.
@@ -921,6 +1054,6 @@ both built because a gap module depended on them.
 
 | Kill risk | Mitigation in this plan |
 |---|---|
-| Evidence independence collapses | M6 ingestion is the first Tier-1 workstream and jumps the queue on any assurance-led engagement; `independenceScore` + separation rule already enforced; certification/EOT separation-of-duties added in Phase 2 (`docs/security.md` §2.4); Phase 5 raised the stake and named the law — `docs/adr/0014-independent-evidence-streams.md` makes two-stream separation a design rule with M17's payroll-vs-site-access reconciliation as its first instance, and states plainly that both streams share an API pathway until M6; contractual evidence mandates at project setup |
-| False-positive fatigue | Precision measured before a detector ships (Tier-1 acceptance #3); reviewer feedback loop live since foundation. Phase 2 added two deterministic detectors (`time_bar_missed`, `time_bar_breach_risk`), Phase 3 two more (`payment_deemed_liability`, `late_payment_response`) Phase 4 four more (`contingency_exhaustion`, `facility_condition_overdue`, `covenant_breach`, `dispute_deadline_missed`) and Phase 5 sixteen more across the safeguard modules — all with precision 1.0 by construction: threshold and date arithmetic, not inference. The retrospective harness (`docs/retrospective-detection.md`) exits non-zero if recall drops below 100% **or the clean control project raises any signal at all** — a runnable false-positive gate (`pnpm --filter @constructos/api eval:retrodetect`; not yet wired into `.github/workflows/ci.yml`) |
+| Evidence independence collapses | M6 shipped in Phase 6 (staged commits, hash-at-ingest, dataset-scoped machine tokens — ADR 0015), so the two streams no longer *must* share an API pathway; connecting a claimant-independent feed jumps the queue on any assurance-led engagement; `independenceScore` + separation rule already enforced; certification/EOT separation-of-duties added in Phase 2 (`docs/security.md` §2.4); Phase 5 raised the stake and named the law — `docs/adr/0014-independent-evidence-streams.md` makes two-stream separation a design rule with M17's payroll-vs-site-access reconciliation as its first instance, and stated plainly that both streams shared an API pathway until M6 — the pathway Phase 6 now provides, leaving token custody as the stated assumption (`docs/security.md` §8.2 gap 17); contractual evidence mandates at project setup |
+| False-positive fatigue | Precision measured before a detector ships (Tier-1 acceptance #3); reviewer feedback loop live since foundation. Phase 2 added two deterministic detectors (`time_bar_missed`, `time_bar_breach_risk`), Phase 3 two more (`payment_deemed_liability`, `late_payment_response`) Phase 4 four more (`contingency_exhaustion`, `facility_condition_overdue`, `covenant_breach`, `dispute_deadline_missed`), Phase 5 sixteen more across the safeguard modules and Phase 6 two more (`ingestion_duplicate_replay`, `benchmark_outlier`) — all with precision 1.0 by construction: threshold and date arithmetic, not inference. The retrospective harness (`docs/retrospective-detection.md`) exits non-zero if recall drops below 100% **or the clean control project raises any signal at all** — a runnable false-positive gate (`pnpm --filter @constructos/api eval:retrodetect`; not yet wired into `.github/workflows/ci.yml`) |
 | Procurement cycle length | Services-led entry: the Tier-1 retrospective detection run *is* the first engagement deliverable |

@@ -44,7 +44,7 @@ pnpm workspace, Node ≥ 22, TypeScript 5.9 strict ESM throughout (`package.json
 | `packages/shared` | `@constructos/shared` | Domain vocabulary: enums (`src/enums.ts`), RBAC model + built-in permission templates (`src/permissions.ts`), wire types (`src/types.ts`), the eight assurance primitive interfaces (`src/primitives.ts`). No runtime dependencies. |
 | `packages/ledger` | `@constructos/ledger` | Pure crypto core: RFC 8785-style canonical JSON (`src/canonical.ts`), SHA-256 helpers (`src/hash.ts`), hash chain build/verify (`src/chain.ts`), Merkle root/proof (`src/merkle.ts`). Unit-tested in `src/ledger.test.ts`. |
 | `packages/db` | `@constructos/db` | Drizzle ORM schema, one file per domain (`src/schema/*.ts`), committed SQL migrations (`drizzle/`). Postgres dialect; no FK constraints — relationships are by convention (see `docs/data-model.md`). |
-| `apps/api` | `@constructos/api` | Fastify 5 API. Composition root `src/app.ts`, env config `src/config.ts`, auth plugin `src/plugins/auth.ts`, helpers `src/lib/*.ts` (incl. the pure CPM engine `src/lib/cpm.ts` and the seeded Monte Carlo engine `src/lib/montecarlo.ts`), twenty-nine feature modules `src/modules/*/` (several with their own pure engines — `workforce/reconcile.ts`, `jurisdiction/fx.ts`, `esg/carbon.ts`, `analytics/datasets.ts`), the retrospective-detection harness `src/scripts/retrodetect.ts`, test harness `src/test/helpers.ts`. |
+| `apps/api` | `@constructos/api` | Fastify 5 API. Composition root `src/app.ts`, env config `src/config.ts`, auth plugin `src/plugins/auth.ts`, helpers `src/lib/*.ts` (incl. the pure CPM engine `src/lib/cpm.ts` and the seeded Monte Carlo engine `src/lib/montecarlo.ts`), twenty-nine feature modules `src/modules/*/` (several with their own pure engines — `workforce/reconcile.ts`, `jurisdiction/fx.ts`, `esg/carbon.ts`, `analytics/datasets.ts`, `ingestion/datasets.ts`, `benchmarks/metrics.ts`), the retrospective-detection harness `src/scripts/retrodetect.ts`, test harness `src/test/helpers.ts`. |
 | `apps/web` | `@constructos/web` | Vite 8 + React 19 + Tailwind v4 SPA. Route table `src/App.tsx`, API client `src/lib/api.ts`, auth context `src/lib/auth.tsx`, shared UI kit `src/ui/`, feature pages `src/pages/*/`. Client-side PDF rendering via `pdfjs-dist`, IFC via `web-ifc` + `three`. |
 | `docs/` | — | This documentation set plus the master specification. |
 | `docker-compose.yml` | — | Postgres 16 for production-like runs. |
@@ -117,7 +117,7 @@ flowchart LR
   with `TRUST_PROXY=true`. `railway.json` declares the Dockerfile build and the
   `/api/v1/health` healthcheck; the full operator runbook is `docs/deployment.md`.
 - **AI**: optional outbound dependency on the Anthropic API, gated on `ANTHROPIC_API_KEY`
-  (`apps/api/src/modules/ai/service.ts`); see §24.
+  (`apps/api/src/modules/ai/service.ts`); see §26.
 - **Health**: `GET /api/v1/health` reports which database backend is live (`app.ts`).
 
 ---
@@ -231,6 +231,8 @@ and schema, not implementation internals.
 | `esg` | `esg` (factor library: `requireCompany` + company role) | `carbonFactors`, `carbonBudgets`, `carbonEntries`, `wasteRecords`, `socialValueCommitments`, `socialValueDeliveries` (+ writes assurance `signals`) | `/carbon-factors` (+`seed-defaults`, company-scoped), `/projects/:id/carbon-budgets`, `/projects/:id/carbon-entries` (+`from-boq`), `/projects/:id/carbon/{summary,report.csv}`, `/projects/:id/waste-records` (+`waste/summary`), `/projects/:id/social-value` (+`deliveries`, `summary`) | Vol II Domain I (M18) #491–498, #501, #505–508, #513–514, #527–540 subset |
 | `jurisdiction` | `jurisdiction` (FX rate register: `requireCompany`) | `currencyConfigs`, `fxRates`, `permits`, `localContentTargets`, `localContentReadings` (+ writes assurance `obligations`, `signals`) | `/fx-rates` (+`latest`, company-scoped), `/projects/:id/currency-configs` (+`split`), `/projects/:id/fx/{convert,exposure}`, `/projects/:id/permits` (+`status`, `conditions/:id/close`, `schedule-risk`), `/projects/:id/local-content-targets` (+`readings`) | Vol II Domain K (M19) #585–591, #593–599, #608, #612–615 subset |
 | `analytics` | `requireCompany` + per-report project reach (the `analytics` tool key is reserved in `TOOLS` but the module deliberately does not use `requireTool` — reports cross projects) | `reportDefinitions`, `dashboards`, `reportSchedules` (reads the registered datasets) | `/analytics/datasets`, `/analytics/reports` (+`preview`, `run`, `export.csv`, `schedules`), `/analytics/dashboards` (+`data`, `seed-defaults`) | Vol I §6.1–6.2 #731–733, #735–739, #741–742, #749, #751 |
+| `ingestion` | company owner/admin on all mutating routes; `ingestion` `read` on the OCDS export; the push route is gated by **API token**, not JWT | `ingestionSources`, `ingestionRuns`, `ingestedRecords`, `apiTokens` (+ writes real records across `vendors`, `assertions`, `evidence`, `siteAccessRecords`, `payrollEntries`, `rfis`, `scheduleTasks`, `fxRates`, and `signals`) | `/ingestion/sources` (+`pull` — 501 scaffold), `/ingestion/datasets`, `/ingestion/runs` (multipart CSV; +`map`, `validate`, `commit`, `discard`, `records`), `/ingestion/tokens` (+`revoke`), `POST /ingestion/push/:dataset` (bearer `cok_…`), `/projects/:id/export/ocds` | Vol III M6 / Domain N #705–711, #715; S#862 (ingest half); A#109; ADR 0015 |
+| `benchmarks` | `benchmarks` read/standard per project; **admin to contribute** (the value leaves the tenant); catalog + distributions are company-scoped (`requireCompany`) | `benchmarkSamples`, `projectMetricSnapshots` (+ writes `signals`; reads contracts, variations, schedules, RFIs, punch, payment claims, project settings) | `/benchmarks/metrics`, `/benchmarks/distributions`, `/projects/:id/benchmarks/snapshots` (+`:snapshotId/contribute`), `/projects/:id/benchmarks/compare` | Vol II Domain R (M11) #821–858 subset; Vol I §6.3 half; ADR 0016 |
 
 Shared helpers used by all modules (`apps/api/src/lib/`): `ids.ts` (prefixed nanoid),
 `numbering.ts` (atomic per-project record counters, spec #72), `pagination.ts`
@@ -315,7 +317,7 @@ Upload → extraction → sheet/revision model → markups/pins. All in
    the sheet number and title from each page's text stream and classify discipline from the
    number prefix (A→architectural, S→structural, …) — spec Vol I #257–258, #266. Low-confidence
    extractions set `drawing_sheets.needsReview = 1`, feeding the human naming-review queue
-   (#258); the AI `sheet_naming` agent (§24) can propose corrections.
+   (#258); the AI `sheet_naming` agent (§26) can propose corrections.
 4. **Sheet/revision model**: a `drawing_sheets` row is the logical sheet, unique per
    `(projectId, number)`; each upload appends a `drawing_revisions` row (revision label,
    source set, `pageIndex`, extracted text, calibration) and supersedes the previous one
@@ -1351,13 +1353,151 @@ in a registry rather than in a filter.
 Not built from §6: #740 inactive-project tracking, #743 direct BI-tool data-model exposure
 (the REST surface is the only exposure), #744–748 portfolio aggregation, trend analysis and
 the predictive-field family, #750 historical comparison, #752 scheduled data refresh
-(nothing is materialized — every run is live), and all of §6.3 insights & benchmarking
-(#753–758), which is M11 territory and needs a benchmark independent of the benchmarked
-(`docs/roadmap.md`).
+(nothing is materialized — every run is live), and §6.3's predictive-insights family
+(#753–758 beyond the distribution half) — the cross-project distributions themselves are
+M11, built in Phase 6 (§25), still bound by the constraint that a benchmark must be
+independent of the benchmarked (`docs/roadmap.md`).
 
 ---
 
-## 24. AI layer
+## 24. Data ingestion & migration (M6)
+
+Routes and commit writers `apps/api/src/modules/ingestion/index.ts`; the pure dataset
+registry, row coercion and CSV parser `modules/ingestion/datasets.ts`; connector
+scaffolds `modules/ingestion/connectors.ts`; schema
+`packages/db/src/schema/ingestion.ts`; web workspace `apps/web/src/pages/ingestion/`.
+Spec Vol III M6 / Domain N; S#862 hash-at-ingest; ADR 0015. The module's one rule:
+**nothing external writes a real record directly** — everything stages first, and only an
+explicit, ledgered commit crosses into the real tables.
+
+### 24.1 The staged-commit pipeline
+
+```mermaid
+flowchart LR
+    UP["POST /ingestion/runs<br/>multipart CSV"] --> HASH["hash-at-ingest<br/>file retained content-addressed,<br/>sha256 on the run"]
+    HASH --> MAP["/map<br/>columnMap vs registry —<br/>(re)builds staging from the raw file"]
+    MAP --> STAGE[("ingested_records<br/>status: staged")]
+    STAGE --> VAL["/validate<br/>coerceRow + cross-field<br/>+ externalId dedupe"]
+    VAL --> REJ[("rejected rows stay,<br/>reasons verbatim")]
+    VAL --> COMMIT["/commit — one transaction"]
+    COMMIT --> REAL[("real records:<br/>vendors, assertions, evidence,<br/>site access, payroll, RFIs,<br/>schedule tasks, FX rates")]
+    COMMIT --> LEDGER["ledger entry:<br/>counts + fileSha256"]
+    VAL -. "replayed externalIds" .-> SIG["ingestion_duplicate_replay<br/>signal"]
+```
+
+1. **Upload is hash-at-ingest** (S#862, the ingest half). The raw CSV is retained
+   content-addressed through the normal storage service, a `files` row is written, and
+   the sha256 lands on the run (`fileSha256`) and in every ledger entry about it — the
+   provenance anchor an auditor can recompute years later. Caps: 20,000 data rows per
+   run; header names must be unique and non-empty.
+2. **The registry is the single authority** (`DATASET_REGISTRY`, one entry per
+   `INGESTION_DATASETS` member — 8 datasets). It declares each dataset's fields, types,
+   required flags, enum vocabularies, cross-field checks (payroll's net = gross −
+   deductions to ±0.01; FX rates positive with distinct 3-letter codes; site-access hours
+   0–24) and where committed rows land, in prose the mapping UI shows verbatim. A column
+   that maps to no registry field cannot be staged; a field not in the registry does not
+   exist. Mapping (and re-mapping) rebuilds the staging area from the retained file, so
+   the staged rows always derive from the artifact the hash fixes.
+3. **Validation rejects rows, not files.** `coerceRow` types each staged payload or
+   returns precise per-field reasons; failures become `rejected` rows with the reasons
+   stored verbatim and a run-level `report` (capped at 200 entries). `externalId`s are
+   deduped within the run **and against rows already committed for the dataset** — a
+   re-presented batch is rejected *and* raises a medium `ingestion_duplicate_replay`
+   signal, because a replayed export can be a double migration or an attempt to rewrite
+   history through the import pathway.
+4. **Commit is explicit, transactional and ledgered.** The commit writers (one per
+   dataset) insert real records, stamp each staged row `committed` with a
+   `committedRecordId` forward-link, and finalize the run's counts in one transaction —
+   a failure marks the run `failed` with nothing half-committed. Assertions and evidence
+   carry `sourceType: "ingestion_run"` / `sourceId` back-links; evidence rows are
+   content-hashed over their typed payload. Dataset-specific honesty is preserved rather
+   than smoothed over: RFIs take real per-project numbers (pre-allocated, so a failed
+   commit burns numbers rather than nesting transactions), `schedule_tasks` refuses to
+   commit when the project has no active schedule, site-access and payroll rows resolve
+   `workerReference` against the project's worker register and **skip with a per-row
+   reason** rather than invent workers, FX-rate duplicates are skipped rather than
+   overwritten, and site-access rows upsert on `(workerId, accessDate)` exactly like the
+   workforce module's own route.
+
+### 24.2 The machine-token inlet
+
+`POST /ingestion/push/:dataset` is the pathway ADR 0014 asked for: a turnstile vendor or
+payroll bureau holds a `cok_…` bearer token — verified by SHA-256 lookup, no JWT, no user
+session — scoped to named ingestion datasets and to nothing else on the platform.
+An out-of-scope dataset is a 403 before anything is written; revocation is immediate;
+expiry is enforced; `lastUsedAt` is stamped. The push stages, validates and commits in
+one pass through the same pipeline as the wizard, on an implicit per-token source and
+run whose `startedBy` is the **token id, not a person**, and whose ledger entries carry
+`actorId: null` with the token identified in the payload — the record itself preserves
+that no operator session authored these rows. Raw tokens are stored only as hashes,
+returned once in the creation response, and never logged (`docs/security.md` §1.5).
+
+### 24.3 Connector scaffolds — honest 501
+
+`ProcoreConnector` / `AconexConnector` are the typed shells of two vendor connectors: an
+injectable HTTP client, the request paths each vendor documents, and pure mapping
+functions from vendor payloads into ingestion-dataset rows, unit-tested against recorded
+fixtures. What they are not is a working integration — this deployment has no network
+route to either vendor and holds no credentials, so `POST /ingestion/sources/:id/pull`
+returns **501** listing the exact credentials and config a real pull needs, instead of
+pretending. Source `config` refuses credential-shaped keys outright
+(`assertNoCredentialKeys`): secrets live in env or `api_tokens`, never in a source row.
+When credentials and connectivity exist, the `pull*` methods become real by constructing
+the connector with a live client — no mapping code changes.
+
+The module also ships the OCDS 1.1 export (Domain A #109):
+`GET /projects/:projectId/export/ocds` maps contracts, agreed variations and payment
+certificates onto OCDS releases, ledgers the export as an `access` entry, and carries an
+`x_scopeNote` stating exactly which OCDS sections are absent and why — a partial mapping
+that says it is one.
+
+---
+
+## 25. Independent benchmarking (M11)
+
+Routes `apps/api/src/modules/benchmarks/index.ts`; pure statistics and the metric
+registry `modules/benchmarks/metrics.ts`; code-resident seed data
+`modules/benchmarks/seed.ts`; schema `packages/db/src/schema/benchmarks.ts`; web
+workspace `apps/web/src/pages/benchmarks/`. Spec Vol II Domain R (M11) #821–858 subset;
+Vol I §6.3's distribution half; ADR 0016.
+
+1. **Metrics are code, computed from the project's own records** (7 today: cost per GFA
+   m², cost growth, schedule growth, median RFI response days, variation rate, punch open
+   rate, median payment cycle days). Each metric declares its inputs in prose and its
+   direction of merit, and its `compute` returns either a value **with the exact figures
+   it read persisted as `inputs`**, or `value: null` with reasons — surfaced as a 422
+   naming every missing input. The platform never fabricates a zero to make a chart
+   render.
+2. **Snapshots freeze the comparison.** `POST /projects/:id/benchmarks/snapshots` stores
+   the computed value, unit and inputs; compare always runs against the latest snapshot,
+   so "your project vs the distribution" is the number that was actually contributed, not
+   a moving target.
+3. **Contribute-to-access** (#855). A company sees a metric's *contributed* distribution
+   only after contributing a snapshot to that metric — an admin-of-the-tool act, because
+   the value leaves the tenant's walls (anonymized) forever. Contribution is idempotent
+   per snapshot. Before contributing, a tenant sees only the seed distribution, marked
+   `accessLevel: "seed_only"` with an upgrade note.
+4. **The anonymization boundary is a choke point, not a convention.**
+   `contributorCompanyId`/`contributorProjectId` are read in exactly one place — a WHERE
+   clause enforcing contribute-to-access — and returned in none: distribution queries
+   select only `{value, dataYear, methodology}`, and the single row-returning path passes
+   through `viewSample`, which does not know the contributor columns exist (ADR 0016).
+5. **Min-n suppression with unconditional disclosure** (#831). A cell with fewer than
+   `MIN_SAMPLE_N` (5) contributed samples returns `{n, suppressed: true}` — no
+   statistics — because aggregates over a handful of contributors would let one infer
+   another's number. `n` itself is disclosed in every branch, seed data is shown at any n
+   (it is fictional and protects nobody), and every seed-backed response carries
+   `healthWarning: "Illustrative seed distribution — not derived from real project
+   data"` verbatim.
+6. **Compare raises signals on the adverse tail.** `GET …/benchmarks/compare` reports the
+   snapshot's percentile rank in its cell; a value beyond the adverse p90 (or below p10
+   where higher is better) raises a medium `benchmark_outlier` signal, idempotent per
+   snapshot, with the arithmetic in the explanation. Under suppression the percentile is
+   withheld along with everything else.
+
+---
+
+## 26. AI layer
 
 `modules/ai/` (service in `service.ts`), schema `packages/db/src/schema/ai.ts`. Design rules
 come from spec Domain X: **citations always (#1019), human-in-the-loop for consequential
@@ -1386,7 +1526,7 @@ outputs (#1020), full audit trail (#1021).**
 
 ---
 
-## 25. Integration surface
+## 27. Integration surface
 
 **Today (implemented):**
 
@@ -1408,6 +1548,11 @@ outputs (#1020), full audit trail (#1021).**
   published data model today: labels, types, enum vocabularies and per-column capability
   flags for every reportable column (spec Vol I #743 wants direct BI-tool connection; the
   REST surface is the only exposure — see §23).
+- Staged data ingestion (M6, §24): multipart CSV migration runs with hash-at-ingest and
+  ledgered commits, the ingestion dataset catalog (`GET /ingestion/datasets`), and
+  `POST /ingestion/push/:dataset` — a bearer-token machine inlet for evidence streams,
+  scoped per dataset (`docs/security.md` §1.5). OCDS 1.1 export with an honest
+  partial-mapping scope note (`GET /projects/:id/export/ocds`).
 - CORS is open (`origin: true` in `app.ts`) to keep third-party browser clients possible in
   dev; tighten per deployment.
 
@@ -1415,13 +1560,17 @@ outputs (#1020), full audit trail (#1021).**
 
 - Webhooks for event-driven integration (spec Vol I #121) — the natural emitter is the ledger
   append path, which already sees every consequential mutation.
-- OAuth2 client credentials for machine callers (#120); today only user JWTs exist.
-- Ingestion connectors (Procore/Aconex/ERP/spreadsheets — spec Vol III M6), the Tier-1 module
-  that feeds the assurance layer with third-party records. See `docs/roadmap.md`.
+- OAuth2 client credentials for machine callers (#120); today user JWTs and the
+  ingestion push tokens (§24.2) are the only machine credentials, and the tokens authorize
+  dataset pushes only — not general API access.
+- Working connector transports for Procore/Aconex (the mapping layer is written and
+  fixture-tested; the pull route returns 501 naming the missing credentials and network
+  route — §24.3) and the wider ERP family. What remains of M6 is a counterparty on the
+  other end of the wire, not module code. See `docs/roadmap.md`.
 
 ---
 
-## 26. Verification & test strategy
+## 28. Verification & test strategy
 
 - `packages/ledger` has pure unit tests (`src/ledger.test.ts`); so do the pure analysis
   cores in the API — the CPM engine (`apps/api/src/lib/cpm.test.ts`, hand-computed
@@ -1438,7 +1587,14 @@ outputs (#1020), full audit trail (#1021).**
   the injection invariants of ADR 0013 directly: unknown keys, prototype-chain keys,
   non-groupable fields, out-of-vocabulary enum values and alias patterns).
   The ghost-worker reconciliation engine (`modules/workforce/reconcile.ts`) is pure and is
-  exercised through `modules/workforce/workforce.test.ts` against hand-worked periods.
+  exercised through `modules/workforce/workforce.test.ts` against hand-worked periods; the
+  Phase 6 pure cores — the ingestion dataset registry, row coercion and CSV parser
+  (`modules/ingestion/datasets.ts`), the fixture-backed connector mappers
+  (`modules/ingestion/connectors.ts`) and the benchmark statistics and metric
+  computations (`modules/benchmarks/metrics.ts`) — are exercised through the colocated
+  suites `ingestion.test.ts` and `benchmarks.test.ts`, which also assert the invariants
+  the modules' ADRs claim (hash-at-ingest, scope enforcement, show-once tokens,
+  contributor ids never leaving the database, min-n suppression).
 - Every API module colocates `<name>.test.ts` using `buildTestApp()`
   (`apps/api/src/test/helpers.ts`): a full Fastify app over in-memory PGlite with migrations
   applied — integration tests with zero external services, exercising the real auth chain via

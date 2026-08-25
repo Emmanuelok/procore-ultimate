@@ -55,6 +55,34 @@ owners/admins at `GET /api/v1/company/auth-events` (`modules/admin/index.ts`). T
 operational log in a normal table — the tamper-evident record is the ledger (§5), which
 auth events do not currently flow into.
 
+### 1.5 Ingestion API tokens (machine credentials)
+
+`modules/ingestion/index.ts`, table `api_tokens` (`packages/db/src/schema/ingestion.ts`).
+The platform's second credential type, added in Phase 6 for machine evidence streams
+(turnstile feeds, payroll exports — ADR 0014/0015). Deliberately narrow:
+
+- **Format & storage**: `cok_` + 40 hex chars (160 bits from `randomBytes`). Only the
+  **SHA-256** of the token is persisted (`tokenHash`), plus the first 8 characters for
+  display (`tokenPrefix`) — a database read yields nothing usable, same discipline as
+  refresh tokens (§1.3).
+- **Show-once**: the raw token appears exactly once, in the `POST /ingestion/tokens` 201
+  response, and never again — every read path strips `tokenHash`, the module writes no
+  logs, and the tests grep a live server log for the raw value and the `cok_[0-9a-f]{40}`
+  pattern to keep it that way.
+- **Dataset scopes, nothing else**: `scopes` names the ingestion datasets the token may
+  push to. A token authorizes `POST /ingestion/push/:dataset` and **nothing else on the
+  platform** — it is not a user, holds no tool levels, and an out-of-scope dataset is a
+  403 before anything is written.
+- **Lifecycle**: creation and revocation are company owner/admin acts, both ledgered
+  (payload carries the prefix, never the hash). Revocation is immediate — the next push
+  is a 401 — as is expiry (`expiresAt`); `lastUsedAt` is stamped on every accepted push.
+- **Attribution is honest**: a push authenticates by hash lookup with no JWT and no
+  session; the implicit run's `startedBy` is the **token id**, and its ledger entries
+  carry `actorId: null` with the token identified in the payload — the record preserves
+  that no human session authored these rows (real committed records carry the token
+  creator's user id, because the columns demand a user; the run and the ledger carry the
+  pathway).
+
 ---
 
 ## 2. Authorization — the three-layer RBAC model
@@ -90,13 +118,14 @@ proposals (`gateReviewer`, `modules/ai/index.ts`).
 
 ### 2.2 Layer 2 — per-tool permission levels
 
-`none < read < standard < admin` (`PERMISSION_LEVELS`, ordered by `meetsLevel`) over the 35
+`none < read < standard < admin` (`PERMISSION_LEVELS`, ordered by `meetsLevel`) over the 37
 tools in `TOOLS` (directory, projects, documents, drawings, specifications, bim, twin, rfis,
 submittals, daily_logs, punch, photos, meetings, workflow, budget, commitments,
 change_management, invoicing, commercial, contracts, schedule, forensics, payments, risk,
-governance, finance, disputes, **land, workforce, esg, jurisdiction, analytics**, assurance,
-ai, admin). The Phase 3 and Phase 4 tools (risk, governance, finance, disputes) and the five
-Phase 5 tools (land, workforce, esg, jurisdiction, analytics) inherit the built-in template
+governance, finance, disputes, **land, workforce, esg, jurisdiction, analytics, ingestion,
+benchmarks**, assurance, ai, admin). The Phase 3 and Phase 4 tools (risk, governance,
+finance, disputes), the five Phase 5 tools (land, workforce, esg, jurisdiction, analytics)
+and the two Phase 6 tools (ingestion, benchmarks) inherit the built-in template
 baselines via the `all(…)` spreads in `permissions.ts` — e.g. `project_manager` gets
 `standard`, `subcontractor` gets `none` — with no per-tool carve-outs added. That default is
 worth stating out loud now that the tool list includes safeguard data: **a subcontractor
@@ -104,6 +133,10 @@ template gets `none` on `workforce` and `land`, and a `read_only`/`owner_stakeho
 template gets `read` on both** — so worker personal data and PAP vulnerability flags are
 visible to every read-all template on the project. There is no field-level masking (gaps 15
 and 18); tenants that need tighter handling must build it with per-user `overrides`.
+Two Phase 6 routes deliberately sit above their tool's levels: the ingestion module's
+mutating routes gate on **company owner/admin**, not `ingestion` levels (bulk migration
+and machine credentials are tenant-administration acts), and benchmark *contribution*
+requires `benchmarks` **admin** (§2.4).
 
 Resolution (`resolveLevel`): per-user `overrides` on the `project_memberships` row beat the
 membership's template (`permission_templates` row, falling back to the shared
@@ -161,11 +194,15 @@ Effect on operational tools: an unexpired grant satisfies any `requireTool(…, 
 | **Child labour is a blocked write that still leaves a record** (M#670) — enrolling or patching a worker whose date of birth puts them under 18 (ILO C138, `MINIMUM_WORKING_AGE`) is refused, and the **refused attempt raises a critical `underage_worker_blocked` signal first**, so the attempt is on the register even though the row never lands. Labour-rights indicator severity is likewise derived from the **indicator** (`CRITICAL_LABOUR_INDICATORS`: passport retention, debt bondage, underage, movement restriction), never from who reported it — a subcontractor cannot downgrade a passport-retention finding by filing it themselves. Labour-audit findings with a CAP due date materialize assurance `obligations` (ADR 0012) and the sweep breaches overdue plans once (`labour_cap_overdue`) | `modules/workforce/index.ts`, worker create/patch, risk-flag and audit-report routes |
 | **The analytics builder is an injection control by construction** — a report definition is stored user input describing a query, and SQL identifiers cannot be parameterized, so **no identifier is ever taken from the user**: dataset, columns, filter fields, group-by, aggregation fields and sort are keys looked up in a code registry (via `Object.hasOwn`, so prototype-chain keys like `__proto__`/`constructor` do not resolve), an unresolved key is a 400 that echoes the key back without using it, aggregation aliases are pattern-locked to `[A-Za-z][A-Za-z0-9_]{0,40}`, and filter values are type-coerced (enums checked against their vocabulary, `in` capped at 200) and bound as parameters. **Scope is appended by the executor from the request, first, with the definition's own filters ANDed beneath it** — a stored definition naming another tenant returns nothing rather than escaping the tenant, and a company-wide run by a non-admin is narrowed to `reachableProjectIds` (memberships + grants), with an empty reach rendered as `false` rather than "everything" (spec #751). Calculated columns (#734) are deliberately unsupported for the same reason. Rationale and trade-off: `docs/adr/0013-whitelisted-report-builder.md` | `modules/analytics/datasets.ts` (`lookupDataset`/`lookupColumn`/`resolveReport`/`executeReport`), `modules/analytics/index.ts` (`reachableProjectIds`, `assertProjectReadable`) |
 | **Permit and consent clocks cannot be quietly reset** — a permit's statutory determination period materializes an assurance `obligations` row at application, kept in step when the application date or period is edited; a determination past its due date breaches that obligation and raises `permit_determination_overdue`, and a granted permit past `expiresAt` is flipped to `expired` with a high `permit_expired` signal by the same lazy sweep. FX rates are an append-only dated register attributed to a source (`contractual` / `central_bank` / `market` / `manual`) and unique per `(company, pair, date, source)`, and every conversion reports the path it took and the quote dates behind it — a rate-of-exchange dispute (K#598) is won on the audit trail, not on the number | `modules/jurisdiction/index.ts` (`sweepPermits`), `modules/jurisdiction/fx.ts` (`resolveRate`) |
+| **Machine pushes are scoped, staged and never impersonate a person** — an ingestion push authenticates by the SHA-256 of a dataset-scoped token (§1.5), is refused with 403 for any dataset outside the token's scopes before anything is written, lands in staging and passes the same validation as the migration wizard, and is recorded as authored by the *token*: run `startedBy` is the token id and the ledger entries carry `actorId: null` with the token identified in the payload. This is ADR 0014's pathway separation made concrete — payroll filed by a user session and site access pushed by a token are distinguishable in the record forever. Nothing external writes a real record directly: staged rows cross into real tables only through an explicit, transactional, ledgered commit with per-row provenance, and a re-presented batch (`externalId` already committed) is rejected *and* raises `ingestion_duplicate_replay` | `modules/ingestion/index.ts`, push route + `runValidation`/`runCommit`; ADR 0015 |
+| **Benchmark contribution crosses the tenant wall exactly once, anonymized, at admin level** — contributing a metric snapshot requires `benchmarks` **admin** (the value leaves the company's walls forever); the contributor's company/project ids are stored only to enforce contribute-to-access and min-n counting, are read in exactly one WHERE clause, and are returned by no read path — distribution queries select aggregate-safe columns only and the row view is whitelisted. Cells with fewer than 5 contributed samples are suppressed (statistics withheld, `n` still disclosed), and every seed-backed response carries the verbatim health warning that the data is illustrative | `modules/benchmarks/index.ts` (`hasContributed`, `cellRows`, `viewSample`); ADR 0016 |
 
 Residual weakness stated plainly: a company **owner/admin can hold operational admin and be
 granted an assurance role by another admin** — the platform does not yet forbid overlapping
-grants, and evidence/assertions still arrive through the same API pathway (independent
-ingestion channels are Tier-1 roadmap work, `docs/roadmap.md`). The rules above make abuse
+grants. And while Phase 6 gave evidence streams their own machine pathway (§1.5), nothing
+forces a deployment to use it: evidence posted by a logged-in user still shares the
+operator's pathway, and a token handed to the wrong party reproduces the shared-pathway
+condition exactly (gap 17). The rules above make abuse
 detectable and attributable, not impossible. The certification, EOT and forensic-claim
 rules are *identity-level* checks inside one tenant: submitter and certifier (or claim
 author and assessor) can be colleagues in the same organization, and nothing yet models
@@ -191,11 +228,16 @@ lands.
 **Phase 5 widens the same caveat in its own directions, and one of them is sharper than
 the rest.** The workforce reconciliation is the platform's first control whose value
 depends on *where the data came from*, not on who clicked what: payroll and site access are
-separate tables with separate routes, but **both still post through the same API with the
-same tenant token**, so an employer who administers the turnstile feed can author both
-sides. The engine's arithmetic is honest; its independence is currently a property of the
-customer's process, and stays that way until M6 gives the evidence side its own pathway
-(`docs/adr/0014-independent-evidence-streams.md`, `docs/roadmap.md`). Three narrower
+separate tables with separate routes, and at the end of Phase 5 both still posted through
+the same API with the same tenant token, so an employer who administered the turnstile
+feed could author both sides. **Phase 6 built the missing pathway** — a dataset-scoped
+machine token (§1.5) lets the access stream arrive with no user session at all, and the
+record distinguishes the two pathways forever. What the platform still cannot do is prove
+*who operates the pushing system*: token custody is a contractual and deployment matter,
+the user-facing bulk route (`POST …/site-access`) remains open, and a deployment can
+simply not use the independent inlet. Independence went from impossible to available;
+it is not yet attested (`docs/adr/0014-independent-evidence-streams.md`, ADR 0015,
+§8.2 gap 17). Three narrower
 caveats belong beside it. **Welfare inspection is self-inspection**: `occupancyCount`
 against `capacity` compares the operator's own count to the operator's own declared
 capacity, and the platform models no independent inspector role — the scores are
@@ -350,10 +392,11 @@ Ordered roughly by risk. "Spec" references are `docs/master-specification.md`.
 | 14 | Read access is mostly unlogged (exceptions: `file_access_log`, ledger `access` entries); regulator access is read-all rather than record-scoped | Domain A #92 wants scoped regulator portals |
 | 15 | No field-level visibility control on financial data (tools are all-or-nothing per level) | Vol I #18 |
 | 16 | Refresh tokens and JWTs are bearer credentials — TLS termination is the platform's job (the app sends HSTS via helmet but cannot terminate TLS itself) | per-deployment TLS documented in `docs/deployment.md` §2.6 |
-| 17 | **The two reconciliation streams share one ingest pathway** — payroll claims and site-access evidence both arrive through the same API with the same tenant token, so M17's ghost-worker control is independent only to the extent the customer's process makes it so. This is the highest-consequence gap on the list: it is the difference between an evidentiary product and a very good system of record | ADR 0004, ADR 0014; closed by M6 (`docs/roadmap.md`, "Recommended next sequence" step 1); `site_access_records.source` is where feed provenance will attach |
+| 17 | **Evidence-pathway independence is available but not provable** — Phase 6 narrowed what was the highest-consequence gap on this list: evidence streams now have a separate machine inlet (`POST /ingestion/push/:dataset`, dataset-scoped SHA-256-stored tokens, §1.5), so payroll and site access no longer *must* share a pathway, and the record distinguishes the pathways forever. What remains: nothing attests **who operates the pushing system** — a token handed to the employer's own administrator reproduces the shared-pathway condition exactly; the workforce module's user-facing bulk route (`POST …/site-access`) stays open; and no deployment yet receives a real third-party feed. Independence became a product capability; it is still a deployment property | ADR 0004, ADR 0014, ADR 0015; `site_access_records.source` + per-run token provenance is where feed attestation attaches next (`docs/roadmap.md`, "Recommended next sequence" step 1) |
 | 18 | **Personal data of workers and affected households is now held with no lifecycle tooling** — `workers` carries date of birth, nationality, employer and pay rate; `payroll_entries` carries pay; `affected_persons` carries household composition, socio-economic baselines and **vulnerability flags** (disability, indigeneity, poverty, child-headed household). There is no data-subject export or erasure path, no retention policy, no consent record, and no field-level masking; deletion is whatever the module's routes happen to allow. Tool-level permissions are the only control, and they are all-or-nothing (see gap 15) | Vol I §0.2 data residency & compliance (#29–48) is unimplemented as a section; the schema deliberately stores verification *flags* rather than identity-document images (`workers.idVerified`/`biometricEnrolled`), which limits but does not remove the exposure |
 | 19 | **Anonymity is structural at intake but not end-to-end** — an anonymous grievance has its complainant name and contact stripped before the row is written (not merely hidden), but the free-text `description`, the `locationId` and the linked `papId` can still identify a complainant in a small community, and nothing redacts them. Retaliation monitoring (M#691) is not built | `modules/land/grievances.ts`, intake route |
 | 20 | **No independent inspector or complainant-facing role** — welfare inspections, grievance closure verification and gate reviews are all recorded by users inside the tenant being assessed. Assurance grants give an outsider read access, never the ability to *author* the verifying record | §2.4 residual weakness; Domain M #689–692, Domain G #411 |
+| 21 | **Benchmark anonymization is aggregation + min-n, not differential privacy** — a contributed sample is protected by never returning contributor ids and by suppressing cells below n = 5, which defeats casual inference, not a determined adversary: a contributor comparing a small cell's statistics before and after another contribution can bound the newcomer's value, and `assetClass`/`region` are self-declared, so a contributor also chooses how identifying its cell is. Stated in the ADR rather than discovered later | ADR 0016; `MIN_SAMPLE_N` in `modules/benchmarks/metrics.ts` |
 
 None of these are silent: this register, `docs/roadmap.md` and the ADRs are the paper trail
 that they are known, scoped and sequenced.

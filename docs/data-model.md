@@ -400,3 +400,44 @@ up in a code registry**; nothing a user writes ever reaches SQL text
 | `report_definitions` | A saved report as a declarative spec (#731–734, #737, #739) | `projectId` **nullable** (null = company-wide across projects), `dataset` (ReportDataset — one of twelve registered datasets), **`columns`** jsonb[] of column *keys*, **`filters`** jsonb[] `[{field, operator: ReportFilterOperator, value}]`, `groupBy`, **`aggregations`** jsonb[] `[{field, fn: ReportAggregation, alias}]` (alias pattern-locked to `[A-Za-z][A-Za-z0-9_]{0,40}`), `sortBy`/`sortDir`, `limitRows` (clamped to 5000), **`isShared`** (#737), `createdBy` | company 1—n; **every key is resolved against `DATASETS` or the request is a 400**; scope predicates are appended by `executeReport` from the caller's context and the definition's own filters are ANDed *beneath* them, so a definition cannot widen its own reach (#751); editing/deleting is creator-or-company-admin |
 | `dashboards` | Saved dashboards of widgets (#741–742, #749) | `projectId` nullable, `audience` (pm/commercial/owner/assurance — #741), **`widgets`** jsonb[] `[{id, kind: WidgetKind (stat/bar/line/donut/table), title, reportId ⊕ metric, span}]` — exactly one of `reportId` (validated readable by the caller) or `metric` (a code-defined counter: `open_obligations`, `open_signals`), `isDefault` | company 1—n; `…/dashboards/:id/data` executes every widget under the caller's scope; `POST …/dashboards/seed-defaults` idempotently seeds the three role dashboards and their backing definitions per project |
 | `report_schedules` | Scheduled delivery (#736) — **recorded, not dispatched** | `reportId`, `cadence` (daily/weekly/monthly), `dayOfPeriod`, `recipients` jsonb[], `lastRunAt`, **`nextRunAt`** (computed for 06:00 UTC), `isActive` | report 1—n; this deployment has no worker, queue or mail transport, so nothing happens when `nextRunAt` passes — every schedule response carries a `delivery: {enabled: false, note}` block saying exactly that (`modules/analytics/index.ts`, `DELIVERY_NOTICE`) |
+
+## 26. Data ingestion & migration — `ingestion.ts`
+
+Everything that enters the platform from outside (spec Vol III M6 / Domain N; S#862;
+ADR 0015); served by `apps/api/src/modules/ingestion/`. The defining structural property
+is that **nothing external writes a real record directly**: every inbound row — CSV
+upload, connector pull, machine push — lands in staging (`ingested_records`), is
+validated against the code-resident dataset registry
+(`modules/ingestion/datasets.ts` — pure; a field not in the registry cannot be mapped,
+staged or committed), and reaches a real table only through an explicit, ledgered commit
+that records per-row provenance in both directions. The registry, the CSV parser and the
+row coercion are pure code; the Procore/Aconex connector shells
+(`modules/ingestion/connectors.ts`) are fixture-tested mapping with no live transport —
+the pull route returns 501 saying so.
+
+| Table | Purpose | Key columns | Relationships |
+|---|---|---|---|
+| `ingestion_sources` | Where a feed comes from | `kind` (IngestionSourceKind: csv/procore/aconex/api_token), `projectId` **nullable** (null = company-level source usable across projects), **`config`** jsonb — connector configuration that **refuses credential-shaped keys outright** (`assertNoCredentialKeys`; secrets live in env or `api_tokens`, never in a source row), `isActive` | company 1—n; run n—1; an `api_token` source is created implicitly on a token's first push |
+| `ingestion_runs` | One staged batch: an uploaded file or a push, validated then committed | `dataset` (IngestionDataset — one of 8: vendors, cost_assertions, site_access, payroll, rfis, schedule_tasks, evidence, fx_rates), `status` (IngestionRunStatus: staging→validated→committing→committed / failed / discarded), **`fileSha256`** + `fileId` — **hash-at-ingest**: the raw upload is retained content-addressed and its sha256 travels with the run and into every ledger entry about it (S#862), **`columnMap`** jsonb `{targetField: sourceColumn}`, `totalRows`/`stagedCount`/`committedCount`/`rejectedCount`/`skippedCount` (the counts must add up, and the tests check they do), **`report`** jsonb[] `[{row, field, code, message}]` capped at 200 entries, **`startedBy`** — a user id *or an api_token id* (a machine push is never attributed to a human session, ADR 0014), `committedBy`/`committedAt` | source 1—n; record 1—n; commit writes real records + provenance + the run's final state in **one transaction** — a failure marks the run `failed` with nothing half-committed |
+| `ingested_records` | A single staged row awaiting (or after) commit | `rowNumber`, **`externalId`** (source-system id — duplicates are rejected within a run *and* against rows already committed for the dataset, and a re-presented batch raises `ingestion_duplicate_replay`), `payload` jsonb (replaced by the typed coercion at validation), `status` (StagedRecordStatus: staged/committed/rejected/skipped), **`reason`** (the verbatim rejection/skip explanation), **`committedRecordId`** — forward-link to the real record created at commit | run 1—n; the real record links back via `sourceType: "ingestion_run"` / `sourceId` where its table carries provenance columns (assertions, evidence) |
+| `api_tokens` | Machine credentials for evidence-stream pushes (site access, payroll, sensor feeds) | **`tokenHash`** — only the SHA-256 of the token is stored; the raw `cok_`+40-hex value is shown once at creation and never again, **`tokenPrefix`** (first 8 chars, display only), **`scopes`** jsonb[] — the ingestion datasets this token may push to and *nothing else on the platform* (out-of-scope push = 403), `expiresAt`, `lastUsedAt`, **`revokedAt`** (revocation is immediate: next push = 401) | company 1—n; `POST /ingestion/push/:dataset` authenticates by hash lookup — no JWT, no session — and stages+validates+commits in one pass, ledgered with `actorId` null and the token identified in the payload (`docs/security.md` §1.5) |
+
+## 27. Independent benchmarking — `benchmarks.ts`
+
+Cross-project distributions from anonymized contributed samples plus clearly-labelled
+seed data (spec Vol II Domain R / M11; ADR 0016); served by
+`apps/api/src/modules/benchmarks/`. The statistics and the 7-metric computation registry
+(`modules/benchmarks/metrics.ts`) are pure; a metric that cannot be computed returns
+`value: null` with reasons, never a fabricated zero. **The anonymization boundary is the
+schema's load-bearing comment**: `contributorCompanyId`/`contributorProjectId` exist
+*only* to enforce contribute-to-access (#855) and min-n counting, are null on seed rows,
+and are never exposed through any read path — distribution queries select only
+`{value, dataYear, methodology}`, and the single row-returning path is whitelisted
+through a view that does not know the contributor columns exist. Any cell with fewer
+than `MIN_SAMPLE_N` (5) contributed samples is suppressed; the sample size itself is
+disclosed in every branch (#831).
+
+| Table | Purpose | Key columns | Relationships |
+|---|---|---|---|
+| `benchmark_samples` | One anonymized data point in a distribution cell | `metric` (a key from the code-resident registry), `assetClass` + `region` (self-declared; region normalized to upper case), `value` + `unit` (unit denormalized from the registry at write time on purpose), **`source`** (contributed \| seed), **`contributorCompanyId`/`contributorProjectId`** — the **anonymization boundary** (see above): enforcement-only, null for seed rows, never returned, **`methodology`** — shown verbatim in disclosures; every seed row carries the exact string *"Illustrative seed distribution — not derived from real project data"*, which every seed-backed response repeats as `healthWarning`, `dataYear` (staleness disclosure) | cell = `(metric, assetClass, region)`; seed cells are lazily materialized from code-resident `SEED_DISTRIBUTIONS` on first query (deterministic, ledgered) |
+| `project_metric_snapshots` | A project's own computed metric value, frozen at computation time | `metric`, `value` + `unit`, **`inputs`** jsonb — the exact figures the computation read, persisted for auditability (a 422 refusal likewise returns the reasons and zeroed inputs rather than storing anything), **`contributedSampleId`** — the `benchmark_samples` row this snapshot became, once contributed (idempotent: a snapshot contributes at most one sample), `computedBy` | project 1—n; contribution requires `benchmarks` **admin** (the value leaves the tenant's walls, anonymized, forever); compare runs against the latest snapshot so "your project vs the distribution" is the number that was actually contributed, not a moving target |
