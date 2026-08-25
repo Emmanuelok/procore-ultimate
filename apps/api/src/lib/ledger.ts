@@ -166,7 +166,16 @@ export async function appendLedger(db: Db, write: LedgerWrite): Promise<void> {
   }
 }
 
-/** Verify the integrity of a company's full chain. */
+/**
+ * Verify the integrity of a company's full chain.
+ *
+ * `at` is normalized back to the ISO-8601 form it was HASHED in. Timestamp
+ * columns are `mode: "string"`, so Postgres and PGlite return their own
+ * spelling — "2026-01-01 00:00:00+00" — while the value that went into
+ * `computeEntryHash` came from `toISOString()`. Passing the round-tripped
+ * string through unchanged reported a false chain break on the very first
+ * entry of every company.
+ */
 export async function verifyCompanyLedger(db: Db, companyId: string) {
   const rows = await db
     .select()
@@ -180,7 +189,7 @@ export async function verifyCompanyLedger(db: Db, companyId: string) {
     objectType: r.objectType,
     objectId: r.objectId,
     payloadHash: r.payloadHash,
-    at: typeof r.at === "string" ? r.at : new Date(r.at as unknown as string).toISOString(),
+    at: new Date(r.at).toISOString(),
     prevHash: r.prevHash,
     entryHash: r.entryHash,
   }));

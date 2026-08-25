@@ -49,7 +49,14 @@ const authPlugin: FastifyPluginAsync = async (app) => {
   app.decorate("authenticate", async (req: FastifyRequest) => {
     const header = req.headers.authorization;
     if (!header?.startsWith("Bearer ")) throw unauthorized("Missing bearer token");
-    if (await machineAuth.resolve(app.db, req, header.slice(7))) return;
+    if (await machineAuth.resolve(app.db, req, header.slice(7))) {
+      // A machine caller's authority is its tool:level scopes, so a route with
+      // no tool gate has nothing to check it against. Refused HERE rather than
+      // only in requireCompany, because a route gated `[authenticate]` alone
+      // never reaches requireCompany — see machineGuardRoute.
+      machineAuth.guardRoute(req);
+      return;
+    }
     let sub: string | undefined;
     try {
       const { payload } = await jwtVerify(header.slice(7), secret);

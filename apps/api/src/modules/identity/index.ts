@@ -15,6 +15,7 @@ import { sha256Hex } from "@constructos/ledger";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, conflict, unauthorized } from "../../lib/errors.js";
+import { isExpired } from "../../lib/time.js";
 import type { Db } from "../../lib/db.js";
 
 const registerSchema = z.object({
@@ -190,7 +191,11 @@ export const identityModule: FastifyPluginAsync = async (app) => {
       .limit(1);
     const token = rows[0];
     const now = new Date().toISOString();
-    if (!token || token.revokedAt || token.expiresAt <= now) {
+    // Instant comparison, not string comparison — see lib/time.ts. Postgres
+    // returns "2026-09-24 23:00:00+00" while `now` is "…T10:00:00.000Z", and a
+    // space sorts before "T": on a token's expiry day every refresh was
+    // rejected from midnight onwards, logging people out a day early.
+    if (!token || token.revokedAt || isExpired(token.expiresAt, Date.now())) {
       throw unauthorized("Invalid refresh token");
     }
     // rotate: revoke old, issue new

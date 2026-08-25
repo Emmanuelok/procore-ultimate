@@ -326,6 +326,9 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
       objectType: r.objectType,
       objectId: r.objectId,
       payloadHash: r.payloadHash,
+      // Carried so classifyChain can re-derive the snapshot's own hash: the
+      // chain covers `payloadHash`, never the snapshot it was taken over.
+      payload: r.payload,
       at: isoOf(r.at),
       prevHash: r.prevHash,
       entryHash: r.entryHash,
@@ -527,8 +530,44 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
       keyId: string | null;
       derivedFromAuthSecret: boolean;
       weakening: string | null;
+      /** the newest seal was signed under the key this process currently holds */
+      heldByProcess: boolean;
     };
+    /**
+     * Key ids that seals were signed under which this process does NOT hold.
+     * Their public halves could only come from `signing_keys`, so their
+     * signatures are checkable but not attributable. See
+     * {@link FOREIGN_KEY_LIMITATION}.
+     */
+    keyIdsNotHeldByThisProcess: string[];
     limitations: string[];
+  }
+
+  /**
+   * The one limit the signature check cannot state for itself.
+   *
+   * A seal's whole strength is that the private half of its key is outside the
+   * database. That only helps a verifier who knows which PUBLIC key to expect.
+   * `publicKeyMap` merges the keys on record in `signing_keys` — a table inside
+   * the very database the seal exists to police — so an attacker with database
+   * write access can register a key of their own, re-sign a rewritten chain
+   * under it, and every signature will verify. The process cannot tell that
+   * apart from a legitimate rotation, and must not pretend otherwise: what it
+   * CAN say is which key it holds itself, and that anything else came from the
+   * database. Everything under a key this process does not hold is checkable,
+   * not attributable.
+   */
+  function foreignKeyLimitation(keyIds: string[]): string {
+    return (
+      `Seal(s) here are signed under key id(s) ${keyIds.join(", ")}, which is not the key this ` +
+      "deployment holds. Their public halves came from `signing_keys`, a table inside the same " +
+      "database the seal exists to police, so those signatures prove the seal bodies are " +
+      "internally consistent — they do NOT prove who made them: anyone able to write to this " +
+      "database could have registered that key and re-signed a rewritten chain under it. Either " +
+      "the deployment's signing key was rotated, or this chain was re-sealed by something else. " +
+      "Compare the key fingerprint (GET /api/v1/ledger/keys) against an independently held copy " +
+      "before relying on this verdict."
+    );
   }
 
   /**
@@ -536,9 +575,14 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
    * of the result, not documentation: a verdict of "intact" carried without
    * them would be read as more than it is.
    */
-  function limitationsFor(derived: boolean, sealCount: number): string[] {
+  function limitationsFor(
+    derived: boolean,
+    sealCount: number,
+    foreignKeyIds: string[] = [],
+  ): string[] {
     const out: string[] = [];
     if (derived) out.push(DERIVED_NOTE_FALLBACK);
+    if (foreignKeyIds.length > 0) out.push(foreignKeyLimitation(foreignKeyIds));
     out.push(
       "sealedAt is this application's own clock; no timestamp authority is configured, so " +
         "seals establish order, not wall-clock time.",
@@ -556,6 +600,18 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
     return out;
   }
 
+  /** The key id this process holds right now, or null when it holds none. */
+  function heldKeyId(): string | null {
+    const state = anchorKeyState(anchorEnv());
+    return state.available ? state.record.keyId : null;
+  }
+
+  /** Distinct seal key ids that are not the key this process holds. */
+  function foreignKeyIdsOf(seals: SealRecord[]): string[] {
+    const held = heldKeyId();
+    return [...new Set(seals.map((s) => s.keyId))].filter((id) => id !== held);
+  }
+
   async function classifyCompany(companyId: string): Promise<VerdictResult> {
     const [entries, sealRows, keys] = await Promise.all([
       loadEntries(companyId),
@@ -566,14 +622,17 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
     const result = classifyChain({ entries, seals, publicKeys: keys });
     const latestKeyId = seals[seals.length - 1]?.keyId ?? null;
     const derived = seals.some((s) => derivedKeyId(s.keyId));
+    const foreign = foreignKeyIdsOf(seals);
     return {
       ...result,
       key: {
         keyId: latestKeyId,
         derivedFromAuthSecret: derived,
         weakening: derived ? DERIVED_NOTE_FALLBACK : null,
+        heldByProcess: latestKeyId !== null && latestKeyId === heldKeyId(),
       },
-      limitations: limitationsFor(derived, seals.length),
+      keyIdsNotHeldByThisProcess: foreign,
+      limitations: limitationsFor(derived, seals.length, foreign),
     };
   }
 
@@ -894,10 +953,19 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
 
     // The single-seal verdict is the whole-chain classification restricted to
     // this seal, so one seal and the chain as a whole can never disagree.
+    //
+    // "Restricted to this seal" means the seal chain UP TO AND INCLUDING it,
+    // not the seal alone: `verifySealChain` requires sequences contiguous from
+    // 1, so classifying seal 3 by itself reported "seal_broken — a seal is
+    // missing" on a perfectly intact chain. A seal is also only as good as the
+    // seals it chains to, so its predecessors belong in its own verdict.
+    const sealChainToHere = (await loadSeals(req.companyId!))
+      .filter((s) => s.sequence <= row.sequence)
+      .map(toSealRecord);
     const whole = classifyChain({
       entries,
-      seals: [record],
-      publicKeys: key.publicKeyPem ? { [key.keyId]: key.publicKeyPem } : {},
+      seals: sealChainToHere,
+      publicKeys: await publicKeyMap(req.companyId!),
     });
 
     return {
@@ -924,8 +992,13 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
         fingerprint: key.fingerprint,
         derivedFromAuthSecret: key.derivedFromAuthSecret,
         weakening: key.weakening,
+        heldByProcess: key.keyId === heldKeyId(),
       },
-      limitations: limitationsFor(key.derivedFromAuthSecret, 1),
+      limitations: limitationsFor(
+        key.derivedFromAuthSecret,
+        1,
+        foreignKeyIdsOf(sealChainToHere),
+      ),
     };
   });
 
@@ -1634,6 +1707,8 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
         fingerprint: doc.key.fingerprint,
         /** the receipt's key matches a key this platform has published */
         recognized: keyRecognized,
+        /** …and is the key this process actually holds, not merely one on record */
+        heldByProcess: doc.key.keyId === heldKeyId(),
         derivedFromAuthSecret: derived,
         weakening: derived ? (doc.key.weakening ?? DERIVED_NOTE_FALLBACK) : null,
       },
@@ -1647,7 +1722,11 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
               "be a tenant-isolation breach, so it was not read.",
           },
       limitations: [
-        ...limitationsFor(derived, sameCompany ? 1 : 0),
+        ...limitationsFor(
+          derived,
+          sameCompany ? 1 : 0,
+          doc.key.keyId === heldKeyId() ? [] : [doc.key.keyId],
+        ),
         keyRecognized
           ? "The receipt's public key matches a key published by this platform."
           : "The receipt's public key is NOT on this platform's key register. The signature " +

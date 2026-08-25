@@ -438,6 +438,26 @@ describe("classifyChain", () => {
     expect(result.notes.join(" ")).toMatch(/could not be checked/);
   });
 
+  it("catches a payload snapshot that no longer hashes to its payloadHash", () => {
+    // The chain covers `payloadHash`, not the snapshot the hash was taken
+    // over: rewrite the snapshot alone and every entry hash, every prevHash
+    // link and every sealed Merkle root still verifies. Supplying `payload`
+    // is what closes that.
+    const { entries, seals } = sealedFixture();
+    const honest = entries.map((e) => ({ ...e, payload: { n: e.seq } }));
+    expect(classifyChain({ entries: honest, seals, publicKeys: keys }).verdict).toBe("intact");
+
+    const doctored = honest.map((e, i) => (i === 2 ? { ...e, payload: { n: 9999 } } : e));
+    const result = classifyChain({ entries: doctored, seals, publicKeys: keys });
+    expect(result.verdict).toBe("entry_altered");
+    expect(result.failedEntrySeq).toBe(doctored[2]!.seq);
+    expect(result.reason).toMatch(/no longer hashes to its payloadHash/);
+
+    // an entry that simply stored no snapshot is not a finding
+    const unstored = honest.map((e, i) => (i === 2 ? { ...e, payload: null } : e));
+    expect(classifyChain({ entries: unstored, seals, publicKeys: keys }).verdict).toBe("intact");
+  });
+
   it("is input-order independent", () => {
     const { entries, seals } = sealedFixture();
     const shuffledEntries = [entries[3]!, entries[0]!, ...entries.slice(1, 3), ...entries.slice(4)];

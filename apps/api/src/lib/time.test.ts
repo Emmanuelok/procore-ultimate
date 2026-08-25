@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { loadConfig } from "../config.js";
 import { epochMs, isExpired, isFuture } from "./time.js";
 
 /**
@@ -43,5 +44,29 @@ describe("timestamp comparison", () => {
   it("treats an unparseable value as no expiry rather than as expired", () => {
     expect(epochMs("not a timestamp")).toBeNull();
     expect(isExpired("not a timestamp")).toBe(false);
+  });
+});
+
+/**
+ * The same class of bug one layer down: an env var is a string, and JavaScript
+ * truthiness reads "false" as true. `RATE_LIMIT_ENABLED=false` and
+ * `TRUST_PROXY=false` are documented switches in .env.example, and under
+ * `z.coerce.boolean()` neither could ever be turned off by setting it to false.
+ */
+describe("boolean environment variables", () => {
+  it("reads the words operators actually write", () => {
+    for (const off of ["false", "FALSE", "0", "no", "off", "", " false "]) {
+      expect(loadConfig({ NODE_ENV: "test", RATE_LIMIT_ENABLED: off }).RATE_LIMIT_ENABLED).toBe(
+        false,
+      );
+    }
+    for (const on of ["true", "1", "yes", "on"]) {
+      expect(loadConfig({ NODE_ENV: "test", TRUST_PROXY: on }).TRUST_PROXY).toBe(true);
+    }
+  });
+
+  it("keeps its declared default when the variable is absent", () => {
+    expect(loadConfig({ NODE_ENV: "test" }).RATE_LIMIT_ENABLED).toBe(true);
+    expect(loadConfig({ NODE_ENV: "test" }).TRUST_PROXY).toBe(false);
   });
 });

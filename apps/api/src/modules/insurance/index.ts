@@ -26,6 +26,7 @@ import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
+import { isExpired } from "../../lib/time.js";
 import { isoDateSchema, todayISO } from "../field/dates.js";
 import {
   bondCurrentExposure,
@@ -482,11 +483,13 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
           eq(assuranceGrants.userId, req.user!.id),
         ),
       );
-    const now = new Date().toISOString();
+    // Instant comparison, not string comparison — see lib/time.ts: a grant
+    // live until 23:00 read as expired at 10:00 on its own expiry day.
+    const nowMs = Date.now();
     return rows.some(
       (g) =>
         roles.includes(g.role as AssuranceRole) &&
-        (!g.expiresAt || g.expiresAt > now) &&
+        !isExpired(g.expiresAt, nowMs) &&
         (!g.projectId || !projectId || g.projectId === projectId),
     );
   }

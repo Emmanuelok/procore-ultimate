@@ -132,6 +132,27 @@ function routeIsToolGated(req: FastifyRequest): boolean {
   return toolGatedRoutes.has(`${req.method} ${pattern}`);
 }
 
+const NOT_TOOL_SCOPED =
+  "This route is not tool-scoped, so an OAuth client cannot be authorised for it — its " +
+  "authority is its tool:level scopes, and there is no tool here to check them against. " +
+  "Machine callers may only call routes governed by a tool permission check; this one " +
+  "needs a human session.";
+
+/**
+ * Refuse a machine caller on any route that carries no tool gate.
+ *
+ * This runs in `authenticate`, not only in `requireCompany`, because a route
+ * gated `[authenticate]` alone never reaches `requireCompany` at all — and
+ * `POST /companies` is exactly that shape. An OAuth client with one narrow
+ * scope could create tenants and be written into `company_memberships` as
+ * their owner: a company-level WRITE performed with no scope whatsoever. The
+ * rule was always "machine callers reach tool-gated routes and nothing else";
+ * enforcing it here is what makes that true rather than nearly true.
+ */
+export function machineGuardRoute(req: FastifyRequest): void {
+  if (!routeIsToolGated(req)) throw forbidden(NOT_TOOL_SCOPED);
+}
+
 /** Update lastUsedAt at most once a minute — visibility without a write storm. */
 const LAST_USED_THROTTLE_MS = 60_000;
 
@@ -234,14 +255,10 @@ export function machineRequireCompany(req: FastifyRequest): void {
   if (typeof header === "string" && header !== "" && header !== client.companyId) {
     throw forbidden("Access token is not issued for the requested company");
   }
-  if (!routeIsToolGated(req)) {
-    throw forbidden(
-      "This route is not tool-scoped, so an OAuth client cannot be authorised for it — its " +
-        "authority is its tool:level scopes, and there is no tool here to check them against. " +
-        "Machine callers may only call routes governed by a tool permission check; this one " +
-        "needs a human session.",
-    );
-  }
+  // Belt and braces: `authenticate` already refused an untool-gated route via
+  // machineGuardRoute. Kept here so the rule survives any future caller that
+  // reaches requireCompany by another path.
+  machineGuardRoute(req);
   req.companyId = client.companyId;
 }
 
@@ -280,6 +297,7 @@ export async function machineRequireTool(
 /** The single import surface plugins/auth.ts touches. */
 export const machineAuth = {
   resolve: resolveMachineCaller,
+  guardRoute: machineGuardRoute,
   company: machineRequireCompany,
   tool: machineRequireTool,
   markToolGate,

@@ -529,6 +529,134 @@ describe("chain verdicts", () => {
     expect(afterBody.checks.entriesPresent).toBe(false);
     expect(afterBody.checks.entryCountNow).toBeLessThan(afterBody.checks.entryCountSealed);
   });
+
+  it("per-seal verify is intact for EVERY seal of an intact multi-seal chain", async () => {
+    // Regression: classifying a seal on its own made `verifySealChain` — which
+    // requires sequences contiguous from 1 — report "seal_broken, a seal is
+    // missing" for every seal after the first, on a chain with nothing wrong
+    // with it. The per-seal view is the one an auditor reads seal by seal.
+    const actor = await registerActor(app);
+    const sealIds: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      await grow(actor.companyId, actor.userId, 3);
+      const res = await seal(actor);
+      expect(res.statusCode).toBe(201);
+      sealIds.push((res.json() as { id: string; sequence: number }).id);
+    }
+    expect((await verdict(actor))["verdict"]).toBe("intact");
+    for (const [i, id] of sealIds.entries()) {
+      const res = await app.inject({
+        method: "GET",
+        url: url(`/ledger/seals/${id}/verify`),
+        headers: actor.headers,
+      });
+      const body = res.json() as Record<string, any>;
+      expect(body.sequence).toBe(i + 1);
+      expect(body.verdict).toBe("intact");
+      expect(body.ok).toBe(true);
+      expect(body.key.heldByProcess).toBe(true);
+    }
+  });
+
+  it("catches a payload snapshot edited while every chain hash was left valid", async () => {
+    // The chain hashes `payloadHash`, never the snapshot it was taken over, so
+    // an insider can rewrite what an entry SAYS and leave the chain — and every
+    // seal over it — verifying perfectly.
+    const actor = await registerActor(app);
+    await grow(actor.companyId, actor.userId, 4);
+    await appendLedger(app.db, {
+      companyId: actor.companyId,
+      actorId: actor.userId,
+      action: "create",
+      objectType: "variation",
+      objectId: newId("var"),
+      payload: { value: 12_500, description: "Additional piling" },
+      storePayload: true,
+    });
+    expect((await seal(actor)).statusCode).toBe(201);
+    expect((await verdict(actor))["verdict"]).toBe("intact");
+
+    const [target] = await app.db
+      .select({ seq: ledgerEntries.seq })
+      .from(ledgerEntries)
+      .where(
+        and(
+          eq(ledgerEntries.companyId, actor.companyId),
+          eq(ledgerEntries.objectType, "variation"),
+        ),
+      )
+      .limit(1);
+    await app.db
+      .update(ledgerEntries)
+      .set({ payload: { value: 125_000, description: "Additional piling" } })
+      .where(eq(ledgerEntries.seq, target!.seq));
+
+    const result = await verdict(actor);
+    expect(result["verdict"]).toBe("entry_altered");
+    expect(result["failedEntrySeq"]).toBe(Number(target!.seq));
+    expect(String(result["reason"])).toMatch(/no longer hashes to its payloadHash/);
+  });
+
+  it("says so when seals were signed under a key this process does not hold", async () => {
+    // A seal's strength is that the private half is outside the database. The
+    // PUBLIC half is looked up in `signing_keys`, which is INSIDE it — so an
+    // attacker who can write to the database can register a key of their own
+    // and re-sign a rewritten chain under it, and every signature verifies.
+    // The process cannot tell that from a rotation; it can and must say that
+    // the key is not the one it holds.
+    const actor = await registerActor(app);
+    await grow(actor.companyId, actor.userId, 4);
+    expect((await seal(actor)).statusCode).toBe(201);
+    expect((await verdict(actor))["key"]).toMatchObject({ heldByProcess: true });
+
+    const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+    const pem = publicKey.export({ type: "spki", format: "pem" }).toString().trim() + "\n";
+    const fingerprint = sha256Hex(publicKey.export({ type: "spki", format: "der" }));
+    const foreignKeyId = `ank_${fingerprint.slice(0, 16)}`;
+    await app.db.insert(signingKeys).values({
+      id: newId("skey"),
+      companyId: null,
+      keyId: foreignKeyId,
+      algorithm: "ed25519",
+      publicKeyPem: pem,
+      fingerprint,
+    });
+    const [row] = await app.db
+      .select()
+      .from(chainSeals)
+      .where(eq(chainSeals.companyId, actor.companyId))
+      .limit(1);
+    const body = buildSealBody({
+      companyId: row!.companyId,
+      sequence: row!.sequence,
+      fromEntrySeq: row!.fromEntrySeq,
+      toEntrySeq: row!.toEntrySeq,
+      entryCount: row!.entryCount,
+      headHash: row!.headHash,
+      merkleRoot: row!.merkleRoot,
+      prevSealHash: row!.prevSealHash,
+      sealedAt: new Date(Date.parse(row!.sealedAt)).toISOString(),
+      keyId: foreignKeyId,
+    });
+    await app.db
+      .update(chainSeals)
+      .set({
+        keyId: foreignKeyId,
+        bodyHash: sealBodyHash(body),
+        signature: signSealBody(body, privateKey),
+      })
+      .where(eq(chainSeals.id, row!.id));
+
+    const result = await verdict(actor);
+    // The signature genuinely verifies under the key it names — so the verdict
+    // stays "intact" — but the verdict must not let that pass as attribution.
+    expect(result["verdict"]).toBe("intact");
+    expect(result["keyIdsNotHeldByThisProcess"]).toEqual([foreignKeyId]);
+    expect(result["key"]).toMatchObject({ heldByProcess: false });
+    expect((result["limitations"] as string[]).join(" ")).toMatch(
+      /not the key this deployment holds/,
+    );
+  });
 });
 
 /* ------------------------------------------------------------------ */

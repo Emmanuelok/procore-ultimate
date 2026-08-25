@@ -1,5 +1,19 @@
 import { z } from "zod";
 
+/**
+ * An env-var boolean. NOT `z.coerce.boolean()`, which is JavaScript truthiness
+ * on a string: it reads "false", "0" and "off" as TRUE, so the documented
+ * switches in .env.example (RATE_LIMIT_ENABLED=false, TRUST_PROXY=false) could
+ * never be turned off by setting them to false — only by unsetting them.
+ */
+const envBool = (fallback: boolean) =>
+  z
+    .union([z.boolean(), z.string()])
+    .default(fallback)
+    .transform((v) =>
+      typeof v === "boolean" ? v : !["false", "0", "no", "off", ""].includes(v.trim().toLowerCase()),
+    );
+
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   PORT: z.coerce.number().default(4000),
@@ -19,15 +33,15 @@ const envSchema = z.object({
   S3_BUCKET: z.string().optional(),
   S3_ACCESS_KEY_ID: z.string().optional(),
   S3_SECRET_ACCESS_KEY: z.string().optional(),
-  S3_FORCE_PATH_STYLE: z.coerce.boolean().default(false),
+  S3_FORCE_PATH_STYLE: envBool(false),
   /** absolute or cwd-relative path to the built SPA; when set and present,
    *  the API serves it same-origin with an SPA fallback */
   WEB_DIST_DIR: z.string().optional(),
   /** override the drizzle migrations folder (set in the container image) */
   MIGRATIONS_DIR: z.string().optional(),
   /** honor x-forwarded-* from the platform proxy (Railway, ALB, …) */
-  TRUST_PROXY: z.coerce.boolean().default(false),
-  RATE_LIMIT_ENABLED: z.coerce.boolean().default(true),
+  TRUST_PROXY: envBool(false),
+  RATE_LIMIT_ENABLED: envBool(true),
   RATE_LIMIT_MAX_PER_MINUTE: z.coerce.number().default(300),
   AUTH_RATE_LIMIT_MAX_PER_MINUTE: z.coerce.number().default(10),
   ANTHROPIC_API_KEY: z.string().optional(),

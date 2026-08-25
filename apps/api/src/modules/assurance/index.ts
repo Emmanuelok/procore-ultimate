@@ -38,6 +38,7 @@ import { appendLedger } from "../../lib/ledger.js";
 import type { Db } from "../../lib/db.js";
 import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
+import { isExpired } from "../../lib/time.js";
 import {
   DETECTOR_NAMES,
   approvalVelocity,
@@ -176,11 +177,12 @@ const ledgerListSchema = pageQuerySchema.extend({
 /**
  * Verify a company's hash chain.
  *
- * Equivalent to lib/ledger.ts verifyCompanyLedger, except the `at` timestamp
- * is normalised back to the exact ISO-8601 form it was hashed in. Postgres/
- * PGlite round-trip "2026-01-01T00:00:00.000Z" as "2026-01-01 00:00:00+00",
- * which makes the un-normalised lib helper report false chain breaks. We may
- * not edit lib/*, so the corrected verification lives here.
+ * The `at` timestamp is normalised back to the exact ISO-8601 form it was
+ * hashed in: Postgres/PGlite round-trip "2026-01-01T00:00:00.000Z" as
+ * "2026-01-01 00:00:00+00", and hashing the round-tripped spelling reports a
+ * false chain break on the first entry. `lib/ledger.ts verifyCompanyLedger`
+ * now normalises identically; this stays because the route also wants the
+ * count, and the two must not drift.
  */
 async function verifyLedgerNormalized(db: Db, companyId: string) {
   const rows = await db
@@ -230,11 +232,15 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
           eq(assuranceGrants.userId, req.user!.id),
         ),
       );
-    const now = new Date().toISOString();
+    // Instant comparison, not string comparison: Postgres returns
+    // "2026-08-25 23:00:00+00" and toISOString() produces
+    // "2026-08-25T10:00:00.000Z", and a space sorts before "T" — so a grant
+    // live until 23:00 read as expired at 10:00 on its own expiry day.
+    const nowMs = Date.now();
     return rows.some(
       (g) =>
         roles.includes(g.role as AssuranceRole) &&
-        (!g.expiresAt || g.expiresAt > now) &&
+        !isExpired(g.expiresAt, nowMs) &&
         (!g.projectId || !projectId || g.projectId === projectId),
     );
   }

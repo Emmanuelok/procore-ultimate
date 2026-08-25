@@ -33,7 +33,7 @@
 import { createPublicKey, sign as cryptoSign, verify as cryptoVerify } from "node:crypto";
 import type { KeyObject } from "node:crypto";
 import { canonicalize } from "./canonical.js";
-import { sha256Hex } from "./hash.js";
+import { hashPayload, sha256Hex } from "./hash.js";
 import { merkleRoot } from "./merkle.js";
 import { computeEntryHash, type ChainedEntry } from "./chain.js";
 
@@ -299,6 +299,17 @@ export function verifySealChain(seals: SealRecord[]): SealChainResult {
 /** A live ledger entry plus its database sequence number. */
 export interface SealedChainEntry extends ChainedEntry {
   seq: number;
+  /**
+   * The stored payload SNAPSHOT, where the entry kept one.
+   *
+   * The chain hashes `payloadHash`, not the snapshot, so an insider who edits
+   * the snapshot alone — rewriting what the record SAYS while leaving every
+   * hash valid — is invisible to the chain and to every seal over it. Supply
+   * it and {@link classifyChain} re-derives its hash and compares. Omit it
+   * (undefined) and nothing is claimed about it either way; `null` means the
+   * entry stored no snapshot, which is not a finding.
+   */
+  payload?: unknown;
 }
 
 export interface ClassifyChainInput {
@@ -362,6 +373,20 @@ function findEntryBreak(entries: SealedChainEntry[]): EntryBreak | null {
         seq: entry.seq,
         reason: `entry seq ${entry.seq} content does not hash to its stored entryHash`,
       };
+    }
+    // The snapshot, when one was supplied. The chain covers `payloadHash`; it
+    // does NOT cover the snapshot the hash was taken over, so without this an
+    // insider can rewrite what an entry says and leave every hash verifying.
+    if (entry.payload !== undefined && entry.payload !== null) {
+      if (hashPayload(entry.payload) !== entry.payloadHash) {
+        return {
+          index: i,
+          seq: entry.seq,
+          reason:
+            `entry seq ${entry.seq} stores a payload snapshot that no longer hashes to its ` +
+            "payloadHash — the recorded content was edited while the chain was left intact",
+        };
+      }
     }
     prev = entry.entryHash;
   }
@@ -511,7 +536,12 @@ export function classifyChain(input: ClassifyChainInput): ChainClassification {
   /* 4. truncation by count ---------------------------------------- */
   for (const seal of seals) {
     if (entries.length < seal.entryCount) {
+      // The EARLIEST seal to notice localizes the break furthest back, which is
+      // what an investigator wants. Its shortfall is not the whole loss, though
+      // — the newest seal committed to more — so both numbers are stated, or
+      // the prose would understate what `sealedEntryCount` already reports.
       const missing = seal.entryCount - entries.length;
+      const newestMissing = latest.entryCount - entries.length;
       return {
         ...base,
         verdict: "tail_truncated",
@@ -525,7 +555,12 @@ export function classifyChain(input: ClassifyChainInput): ChainClassification {
         reason:
           `Seal ${seal.sequence} committed to ${seal.entryCount} entries up to seq ` +
           `${seal.toEntrySeq}; the chain now holds ${entries.length}. ${missing} sealed ` +
-          `entr${missing === 1 ? "y is" : "ies are"} missing. The remaining chain still ` +
+          `entr${missing === 1 ? "y is" : "ies are"} missing` +
+          (latest.sequence === seal.sequence
+            ? ""
+            : `, and ${newestMissing} against the newest seal ${latest.sequence}, which ` +
+              `committed to ${latest.entryCount}`) +
+          ". The remaining chain still " +
           "verifies internally — that is exactly the attack sealing exists to catch.",
         signaturesChecked,
         unknownKeyIds,
@@ -631,10 +666,10 @@ export function classifyChain(input: ClassifyChainInput): ChainClassification {
   }
 
   if (entries.length > latest.entryCount) {
+    const newer = entries.length - latest.entryCount;
     notes.push(
-      `${entries.length - latest.entryCount} entr${
-        entries.length - latest.entryCount === 1 ? "y is" : "ies are"
-      } newer than the last seal and are covered only by the hash chain until the next seal.`,
+      `${newer} entr${newer === 1 ? "y is" : "ies are"} newer than the last seal and ` +
+        `${newer === 1 ? "is" : "are"} covered only by the hash chain until the next seal.`,
     );
   }
 

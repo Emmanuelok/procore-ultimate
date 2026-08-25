@@ -827,6 +827,36 @@ describe("machine callers", () => {
     expect(human.statusCode).toBe(200);
   });
 
+  it("is refused on routes gated by authenticate ALONE — it cannot create a company", async () => {
+    // Regression: the tool-gate check lived in the machine branch of
+    // `requireCompany`, so a route gated `[authenticate]` on its own never
+    // reached it. `POST /companies` is exactly that shape: a client with one
+    // narrow read scope could create tenants and be written into
+    // `company_memberships` as their OWNER — a company-level write performed
+    // with no scope at all. The check now runs in `authenticate` itself.
+    const m = await machine(["rfis:read"]);
+    const created = await app.inject({
+      method: "POST",
+      url: url("/companies"),
+      headers: m.headers,
+      payload: { name: "Machine Made Tenant" },
+    });
+    expect(created.statusCode).toBe(403);
+    expect((created.json() as { message: string }).message).toContain("not tool-scoped");
+
+    for (const path of ["/me", "/companies", "/contract-forms"]) {
+      const res = await app.inject({ method: "GET", url: url(path), headers: m.headers });
+      expect(res.statusCode).toBe(403);
+    }
+    // and the route it IS scoped for still answers
+    const allowed = await app.inject({
+      method: "GET",
+      url: url(`/projects/${projectId}/rfis`),
+      headers: m.headers,
+    });
+    expect(allowed.statusCode).toBe(200);
+  });
+
   it("stamps lastUsedAt on both the token and the client", async () => {
     const m = await machine(["rfis:read"]);
     await app.inject({
