@@ -88,6 +88,82 @@ export interface AnchorKeyEnv {
   AUTH_SECRET: string;
   /** PKCS8 PEM (newlines may be escaped as \n), or base64 of the PEM/DER */
   ANCHOR_SIGNING_KEY?: string | undefined;
+  /**
+   * Comma- or whitespace-separated SHA-256 fingerprints of the public keys a
+   * verifier is willing to trust. See {@link trustAnchor}.
+   */
+  ANCHOR_TRUSTED_FINGERPRINTS?: string | undefined;
+}
+
+/* ------------------------------------------------------------------ */
+/* The trust anchor                                                    */
+/* ------------------------------------------------------------------ */
+
+export interface TrustAnchor {
+  /** true when the operator has pinned the keys out of band */
+  pinned: boolean;
+  /** normalized lowercase hex fingerprints, empty when unpinned */
+  fingerprints: string[];
+  /** where a verifier's trust comes from, in one word */
+  source: "env" | "database";
+  /** stated on every verdict when unpinned — this is the residual hole */
+  note: string;
+}
+
+const UNPINNED_NOTE =
+  "No trusted key fingerprints are pinned (ANCHOR_TRUSTED_FINGERPRINTS is unset), so signature " +
+  "checking takes its trust anchor from `signing_keys` — a table inside the same database the " +
+  "seal exists to police. Anyone able to write to this database can register a key of their own " +
+  "and re-sign a rewritten chain under it, and the result will verify. Sealing therefore " +
+  "defeats a database-only attacker who does not also register a key. Pin the fingerprints " +
+  "out of band to close this: set ANCHOR_TRUSTED_FINGERPRINTS to the fingerprint(s) from " +
+  "GET /api/v1/ledger/keys, held somewhere the database cannot reach.";
+
+const PINNED_NOTE =
+  "Trusted key fingerprints are pinned out of band, so a key registered in `signing_keys` by " +
+  "anyone who did not also hold the pinned fingerprint cannot be used to verify a seal: seals " +
+  "signed under an unpinned key are reported as forged rather than accepted.";
+
+/** Normalize a fingerprint for comparison: lowercase hex, no colons or spaces. */
+export function normalizeFingerprint(value: string): string {
+  return value.trim().toLowerCase().replace(/[\s:]/g, "");
+}
+
+/**
+ * Where signature verification takes its trust from.
+ *
+ * A seal's strength is that the PRIVATE half of its key is outside the
+ * database. That only helps a verifier who already knows which PUBLIC key to
+ * expect. Without a pin, the public half is read from `signing_keys` — inside
+ * the database under attack — so an attacker with write access registers their
+ * own key, re-signs a rewritten chain, and every signature verifies. Pinning
+ * the fingerprints in the environment moves the trust anchor out of reach of
+ * the store being policed, which is the only thing that actually closes it.
+ */
+export function trustAnchor(env: AnchorKeyEnv): TrustAnchor {
+  const raw = env.ANCHOR_TRUSTED_FINGERPRINTS?.trim();
+  if (!raw) {
+    return { pinned: false, fingerprints: [], source: "database", note: UNPINNED_NOTE };
+  }
+  const fingerprints = Array.from(
+    new Set(
+      raw
+        .split(/[,\s]+/)
+        .map(normalizeFingerprint)
+        .filter((f) => f.length > 0),
+    ),
+  );
+  if (fingerprints.length === 0) {
+    return { pinned: false, fingerprints: [], source: "database", note: UNPINNED_NOTE };
+  }
+  return { pinned: true, fingerprints, source: "env", note: PINNED_NOTE };
+}
+
+/** True when this fingerprint is one the operator pinned. Unpinned trusts all. */
+export function fingerprintTrusted(anchor: TrustAnchor, fingerprint: string | null): boolean {
+  if (!anchor.pinned) return true;
+  if (!fingerprint) return false;
+  return anchor.fingerprints.includes(normalizeFingerprint(fingerprint));
 }
 
 /* ------------------------------------------------------------------ */

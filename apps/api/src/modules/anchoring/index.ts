@@ -80,6 +80,9 @@ import { AppError, badRequest, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import {
   anchorKeyState,
+  fingerprintTrusted,
+  trustAnchor,
+  type TrustAnchor,
   listVisibleKeys,
   registerPublicKey,
   requireAnchorKey,
@@ -297,6 +300,7 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
       NODE_ENV: app.appConfig.NODE_ENV,
       AUTH_SECRET: app.appConfig.AUTH_SECRET,
       ANCHOR_SIGNING_KEY: process.env["ANCHOR_SIGNING_KEY"],
+      ANCHOR_TRUSTED_FINGERPRINTS: process.env["ANCHOR_TRUSTED_FINGERPRINTS"],
       ANCHOR_TSA_URL: process.env["ANCHOR_TSA_URL"],
       ANCHOR_OTS_CALENDAR_URL: process.env["ANCHOR_OTS_CALENDAR_URL"],
     };
@@ -359,12 +363,24 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
    * registered yet — a seal must be verifiable the instant it is made).
    */
   async function publicKeyMap(companyId: string): Promise<Record<string, string>> {
+    const anchor = trustAnchor(anchorEnv());
     const map: Record<string, string> = {};
     for (const row of await listVisibleKeys(app.db, companyId)) {
+      // With fingerprints pinned, a key registered in the database is only
+      // usable if the operator vouched for it out of band. This is what stops
+      // an attacker with write access from registering their own key and
+      // re-signing a rewritten chain under it — without the pin, that attack
+      // verifies clean, and no amount of checking inside the database finds it.
+      if (!fingerprintTrusted(anchor, row.fingerprint)) continue;
       map[row.keyId] = row.publicKeyPem;
     }
     const state = anchorKeyState(anchorEnv());
-    if (state.available) map[state.record.keyId] = state.record.publicKeyPem;
+    // The process's own key is subject to the same pin: an operator who pins
+    // fingerprints and then runs with a key outside that set has a
+    // configuration error, and silently trusting it would defeat the pin.
+    if (state.available && fingerprintTrusted(anchor, state.record.fingerprint)) {
+      map[state.record.keyId] = state.record.publicKeyPem;
+    }
     return map;
   }
 
@@ -540,6 +556,12 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
      * {@link FOREIGN_KEY_LIMITATION}.
      */
     keyIdsNotHeldByThisProcess: string[];
+    /**
+     * Where signature checking took its trust from. Unpinned, it came from a
+     * table inside the database being policed, and the verdict must be read
+     * with that bound — see {@link TrustAnchor}.
+     */
+    trustAnchor: TrustAnchor;
     limitations: string[];
   }
 
@@ -582,6 +604,11 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
   ): string[] {
     const out: string[] = [];
     if (derived) out.push(DERIVED_NOTE_FALLBACK);
+    // Where the verifier's trust comes from is the first thing a reader needs,
+    // because it bounds everything below it: unpinned, the whole signature
+    // check rests on a table the attacker can write to.
+    const anchor = trustAnchor(anchorEnv());
+    if (!anchor.pinned) out.push(anchor.note);
     if (foreignKeyIds.length > 0) out.push(foreignKeyLimitation(foreignKeyIds));
     out.push(
       "sealedAt is this application's own clock; no timestamp authority is configured, so " +
@@ -619,7 +646,26 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
       publicKeyMap(companyId),
     ]);
     const seals = sealRows.map(toSealRecord);
-    const result = classifyChain({ entries, seals, publicKeys: keys });
+    let result = classifyChain({ entries, seals, publicKeys: keys });
+    // classifyChain treats a key it has never seen as UNCHECKABLE, which is
+    // right when trust comes from the database: an unregistered key id is
+    // usually a rotation nobody wrote down. Under a pin it means the opposite.
+    // The operator has said which keys they will accept, so a seal signed
+    // under anything else is not merely unverified — it is a seal made by
+    // something the operator does not vouch for, which is what a forgery is.
+    const pin = trustAnchor(anchorEnv());
+    if (pin.pinned && result.unknownKeyIds.length > 0) {
+      result = {
+        ...result,
+        verdict: "seal_forged",
+        ok: false,
+        reason:
+          `Seal(s) are signed under key id(s) ${result.unknownKeyIds.join(", ")}, whose public ` +
+          "half is not among the fingerprints pinned in ANCHOR_TRUSTED_FINGERPRINTS. A key " +
+          "registered in the database cannot vouch for itself: under a pin, a seal signed by " +
+          "an unpinned key is treated as forged rather than as merely uncheckable.",
+      };
+    }
     const latestKeyId = seals[seals.length - 1]?.keyId ?? null;
     const derived = seals.some((s) => derivedKeyId(s.keyId));
     const foreign = foreignKeyIdsOf(seals);
@@ -632,6 +678,7 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
         heldByProcess: latestKeyId !== null && latestKeyId === heldKeyId(),
       },
       keyIdsNotHeldByThisProcess: foreign,
+      trustAnchor: trustAnchor(anchorEnv()),
       limitations: limitationsFor(derived, seals.length, foreign),
     };
   }
@@ -664,6 +711,19 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
     opts: { heartbeat?: boolean; force?: boolean; note?: string | undefined } = {},
   ): Promise<SealOutcome> {
     const key = requireAnchorKey(anchorEnv());
+    // Sealing under a key the operator has pinned against would produce seals
+    // that fail their own verification the moment they are read. Refuse loudly
+    // at the point of the mistake rather than quietly minting evidence nobody
+    // can use.
+    const anchor = trustAnchor(anchorEnv());
+    if (!fingerprintTrusted(anchor, key.record.fingerprint)) {
+      throw badRequest(
+        `Refusing to seal: this deployment's signing key (fingerprint ${key.record.fingerprint}) is ` +
+          "not among the fingerprints pinned in ANCHOR_TRUSTED_FINGERPRINTS. Seals made with " +
+          "it would be reported as forged by every verifier honouring that pin. Either add " +
+          "this fingerprint to the pin, or run with a key that is already in it.",
+      );
+    }
     const entries = await loadEntries(companyId);
     if (entries.length === 0) {
       throw badRequest(

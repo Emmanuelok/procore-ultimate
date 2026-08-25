@@ -1,4 +1,4 @@
-import { generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, asc, eq, gt } from "drizzle-orm";
@@ -1186,5 +1186,161 @@ describe("offline receipt verifier", () => {
   it("refuses a file that is not a receipt", () => {
     expect(verifyReceiptDocument({ hello: "world" }).ok).toBe(false);
     expect(verifyReceiptDocument(null).summary).toMatch(/does not contain a JSON object/);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* The trust anchor                                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The attack an adversarial pass found, and the pin that closes it.
+ *
+ * A seal's private half is outside the database — but the PUBLIC half used to
+ * check it was read from `signing_keys`, a table inside the database the seal
+ * exists to police. So an attacker with write access and nothing else could
+ * rewrite the chain from genesis, generate their own Ed25519 key, register its
+ * public half under a fresh key id, re-sign every seal, and the verdict came
+ * back `intact` — reporting a STRONGER guarantee than the honest chain, since
+ * a key id without the derived prefix carries no weakening note.
+ *
+ * The only real remedy is to stop taking the trust anchor from the store under
+ * attack. ANCHOR_TRUSTED_FINGERPRINTS pins the acceptable public keys in the
+ * environment, where a database-only attacker cannot reach them.
+ */
+describe("trust anchor", () => {
+  /** Register an attacker-controlled public key and re-sign every seal under it. */
+  async function forgeUnderNewKey(companyId: string): Promise<string> {
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    const publicKeyPem = publicKey.export({ type: "spki", format: "pem" }).toString();
+    const fingerprint = createHash("sha256")
+      .update(publicKey.export({ type: "spki", format: "der" }) as Buffer)
+      .digest("hex");
+    const keyId = `ank_${randomBytes(8).toString("hex")}`;
+    await app.db.insert(signingKeys).values({
+      id: newId("sk"),
+      companyId,
+      keyId,
+      algorithm: "ed25519",
+      publicKeyPem,
+      fingerprint,
+    });
+    const seals = await app.db
+      .select()
+      .from(chainSeals)
+      .where(eq(chainSeals.companyId, companyId));
+    for (const seal of seals) {
+      const body = buildSealBody({
+        companyId: seal.companyId,
+        sequence: seal.sequence,
+        fromEntrySeq: seal.fromEntrySeq,
+        toEntrySeq: seal.toEntrySeq,
+        entryCount: seal.entryCount,
+        headHash: seal.headHash,
+        merkleRoot: seal.merkleRoot,
+        prevSealHash: seal.prevSealHash,
+        sealedAt: seal.sealedAt,
+        keyId,
+        algorithm: "ed25519",
+      });
+      await app.db
+        .update(chainSeals)
+        .set({ keyId, signature: signSealBody(body, privateKey), bodyHash: sealBodyHash(body) })
+        .where(eq(chainSeals.id, seal.id));
+    }
+    return fingerprint;
+  }
+
+  it("unpinned: an attacker-registered key verifies, and the verdict says why that is possible", async () => {
+    const { actor } = await sealedCompany();
+    await forgeUnderNewKey(actor.companyId);
+
+    const result = await verdict(actor);
+    // Unpinned, the signature really does check out — the honest position is
+    // to say so and to name the reason, not to claim a detection we do not have.
+    expect(result["verdict"]).toBe("intact");
+    const anchor = result["trustAnchor"] as Record<string, unknown>;
+    expect(anchor["pinned"]).toBe(false);
+    expect(anchor["source"]).toBe("database");
+    expect((result["limitations"] as string[]).join(" ")).toMatch(
+      /ANCHOR_TRUSTED_FINGERPRINTS is unset/,
+    );
+    // and it must not be silent about the key being one this process never held
+    expect((result["keyIdsNotHeldByThisProcess"] as string[]).length).toBeGreaterThan(0);
+  });
+
+  it("pinned: the same attack is reported as a forgery", async () => {
+    const { actor } = await sealedCompany();
+    const honest = await app
+      .inject({
+        method: "GET",
+        url: url("/ledger/keys"),
+        headers: actor.headers,
+      })
+      .then((r) => r.json() as Record<string, unknown>);
+    const honestFingerprint = (honest["current"] as Record<string, unknown>)[
+      "fingerprint"
+    ] as string;
+
+    await forgeUnderNewKey(actor.companyId);
+
+    process.env["ANCHOR_TRUSTED_FINGERPRINTS"] = honestFingerprint;
+    try {
+      const result = await verdict(actor);
+      // The attacker's key is not pinned, so it is not a key we will check
+      // against — the seal it signed is a forgery, and says so.
+      expect(result["verdict"]).toBe("seal_forged");
+      expect(result["ok"]).toBe(false);
+      const anchor = result["trustAnchor"] as Record<string, unknown>;
+      expect(anchor["pinned"]).toBe(true);
+      expect(anchor["source"]).toBe("env");
+    } finally {
+      delete process.env["ANCHOR_TRUSTED_FINGERPRINTS"];
+    }
+  });
+
+  it("pinned: an honest chain still verifies under its own pinned fingerprint", async () => {
+    const { actor } = await sealedCompany();
+    const keys = await app
+      .inject({
+        method: "GET",
+        url: url("/ledger/keys"),
+        headers: actor.headers,
+      })
+      .then((r) => r.json() as Record<string, unknown>);
+    const fingerprint = (keys["current"] as Record<string, unknown>)["fingerprint"] as string;
+
+    // Pinning accepts colons and mixed case, as an operator pasting a
+    // fingerprint from anywhere else will produce.
+    process.env["ANCHOR_TRUSTED_FINGERPRINTS"] = fingerprint.toUpperCase();
+    try {
+      const result = await verdict(actor);
+      expect(result["verdict"]).toBe("intact");
+      expect((result["trustAnchor"] as Record<string, unknown>)["pinned"]).toBe(true);
+      // the unpinned warning is gone, because it no longer applies
+      expect((result["limitations"] as string[]).join(" ")).not.toMatch(
+        /ANCHOR_TRUSTED_FINGERPRINTS is unset/,
+      );
+    } finally {
+      delete process.env["ANCHOR_TRUSTED_FINGERPRINTS"];
+    }
+  });
+
+  it("refuses to seal under a key the operator pinned against", async () => {
+    const actor = await registerActor(app);
+    await grow(actor.companyId, actor.userId, 3);
+    process.env["ANCHOR_TRUSTED_FINGERPRINTS"] = "a".repeat(64);
+    try {
+      const res = await app.inject({
+        method: "POST",
+        url: url("/ledger/seals"),
+        headers: actor.headers,
+        payload: {},
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().message as string).toMatch(/ANCHOR_TRUSTED_FINGERPRINTS/);
+    } finally {
+      delete process.env["ANCHOR_TRUSTED_FINGERPRINTS"];
+    }
   });
 });
