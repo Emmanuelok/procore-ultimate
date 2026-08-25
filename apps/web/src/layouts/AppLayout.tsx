@@ -8,6 +8,9 @@ const navItems = [
   { to: "/assurance", label: "Assurance" },
   { to: "/ingestion", label: "Ingestion" },
   { to: "/benchmarks", label: "Benchmarks" },
+  { to: "/ledger", label: "Ledger" },
+  { to: "/learning", label: "Learning" },
+  { to: "/integrations", label: "Integrations" },
   { to: "/notifications", label: "Notifications" },
   { to: "/admin", label: "Admin" },
 ];

@@ -25,3 +25,7 @@ export * from "./jurisdiction.js";
 export * from "./analytics.js";
 export * from "./ingestion.js";
 export * from "./benchmarks.js";
+export * from "./anchoring.js";
+export * from "./insurance.js";
+export * from "./learning.js";
+export * from "./integrations.js";

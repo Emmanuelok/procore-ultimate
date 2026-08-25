@@ -866,6 +866,176 @@ export const BENCHMARK_SAMPLE_SOURCES = ["contributed", "seed"] as const;
 export type BenchmarkSampleSource = (typeof BENCHMARK_SAMPLE_SOURCES)[number];
 
 /* ------------------------------------------------------------------ */
+/* Ledger anchoring & escrow (spec Vol II Domain S / M1)               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * How a sealed chain head is witnessed outside the application database.
+ * `local_signed` is the always-available provider: an Ed25519 signature made
+ * with a key whose private half never enters the database. The remaining
+ * providers require external infrastructure and report themselves unavailable
+ * rather than pretending — see docs/adr/0017.
+ */
+export const ANCHOR_PROVIDERS = [
+  "local_signed",
+  "rfc3161",
+  "opentimestamps",
+  "counterparty",
+] as const;
+export type AnchorProvider = (typeof ANCHOR_PROVIDERS)[number];
+
+export const ANCHOR_STATUSES = [
+  "pending",
+  "anchored",
+  "unavailable",
+  "failed",
+] as const;
+export type AnchorStatus = (typeof ANCHOR_STATUSES)[number];
+
+/** Outcome of verifying a chain against its seals. */
+export const CHAIN_VERDICTS = [
+  "intact",
+  "tail_truncated",
+  "entry_altered",
+  "seal_forged",
+  "seal_broken",
+  "no_seals",
+] as const;
+export type ChainVerdict = (typeof CHAIN_VERDICTS)[number];
+
+/* ------------------------------------------------------------------ */
+/* Insurance & bonding (spec Vol II Domain P)                          */
+/* ------------------------------------------------------------------ */
+
+export const POLICY_TYPES = [
+  "contractors_all_risks",
+  "erection_all_risks",
+  "third_party_liability",
+  "professional_indemnity",
+  "employers_liability",
+  "marine_cargo",
+  "delay_in_startup",
+  "contractors_plant",
+  "environmental_impairment",
+  "decennial",
+  "other",
+] as const;
+export type PolicyType = (typeof POLICY_TYPES)[number];
+
+export const POLICY_STATUSES = [
+  "draft",
+  "active",
+  "expired",
+  "lapsed",
+  "cancelled",
+] as const;
+export type PolicyStatus = (typeof POLICY_STATUSES)[number];
+
+export const BOND_TYPES = [
+  "performance",
+  "advance_payment",
+  "retention",
+  "bid",
+  "warranty",
+  "payment",
+  "customs",
+  "parent_company_guarantee",
+] as const;
+export type BondType = (typeof BOND_TYPES)[number];
+
+export const BOND_STATUSES = [
+  "draft",
+  "issued",
+  "active",
+  "called",
+  "released",
+  "expired",
+] as const;
+export type BondStatus = (typeof BOND_STATUSES)[number];
+
+export const INSURANCE_CLAIM_STATUSES = [
+  "notified",
+  "acknowledged",
+  "under_assessment",
+  "accepted",
+  "repudiated",
+  "settled",
+  "withdrawn",
+] as const;
+export type InsuranceClaimStatus = (typeof INSURANCE_CLAIM_STATUSES)[number];
+
+/* ------------------------------------------------------------------ */
+/* Organisational learning (spec Vol II Domain W)                      */
+/* ------------------------------------------------------------------ */
+
+export const LESSON_CATEGORIES = [
+  "design",
+  "procurement",
+  "commercial",
+  "programme",
+  "construction",
+  "safety",
+  "quality",
+  "stakeholder",
+  "environmental",
+  "governance",
+  "contractual",
+] as const;
+export type LessonCategory = (typeof LESSON_CATEGORIES)[number];
+
+/**
+ * Events that make lesson capture MANDATORY (#977). A trigger raises an
+ * obligation; the lesson is the only thing that discharges it.
+ */
+export const LESSON_TRIGGER_KINDS = [
+  "dispute_closed",
+  "variation_threshold",
+  "signal_confirmed",
+  "delay_event_closed",
+  "claim_settled",
+  "gate_review",
+  "project_closeout",
+  "manual",
+] as const;
+export type LessonTriggerKind = (typeof LESSON_TRIGGER_KINDS)[number];
+
+export const LESSON_STATUSES = [
+  "draft",
+  "submitted",
+  "validated",
+  "published",
+  "superseded",
+  "rejected",
+] as const;
+export type LessonStatus = (typeof LESSON_STATUSES)[number];
+
+export const REVIEW_STATUSES = [
+  "scheduled",
+  "in_progress",
+  "completed",
+  "signed_off",
+  "cancelled",
+] as const;
+export type ReviewStatus = (typeof REVIEW_STATUSES)[number];
+
+/* ------------------------------------------------------------------ */
+/* Integration surface (spec Vol I §0.7)                               */
+/* ------------------------------------------------------------------ */
+
+export const WEBHOOK_DELIVERY_STATUSES = [
+  "pending",
+  "delivered",
+  "failed",
+  "exhausted",
+  "skipped",
+] as const;
+export type WebhookDeliveryStatus = (typeof WEBHOOK_DELIVERY_STATUSES)[number];
+
+/** OAuth2 grants the platform issues to machine callers (#120). */
+export const OAUTH_GRANT_TYPES = ["client_credentials"] as const;
+export type OauthGrantType = (typeof OAUTH_GRANT_TYPES)[number];
+
+/* ------------------------------------------------------------------ */
 /* Notifications                                                       */
 /* ------------------------------------------------------------------ */
 

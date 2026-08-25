@@ -46,6 +46,10 @@ const CompanyAssurancePage = lazy(() => import("./pages/assurance/CompanyAssuran
 const AiPage = lazy(() => import("./pages/ai/AiPage"));
 const IngestionPage = lazy(() => import("./pages/ingestion/IngestionPage"));
 const BenchmarksPage = lazy(() => import("./pages/benchmarks/BenchmarksPage"));
+const LedgerPage = lazy(() => import("./pages/ledger/LedgerPage"));
+const LearningPage = lazy(() => import("./pages/learning/LearningPage"));
+const IntegrationsPage = lazy(() => import("./pages/integrations/IntegrationsPage"));
+const InsurancePage = lazy(() => import("./pages/insurance/InsurancePage"));
 
 function S({ children }: { children: ReactNode }) {
   return <Suspense fallback={<Spinner />}>{children}</Suspense>;
@@ -125,6 +129,30 @@ export default function App() {
               element={
                 <S>
                   <BenchmarksPage />
+                </S>
+              }
+            />
+            <Route
+              path="ledger"
+              element={
+                <S>
+                  <LedgerPage />
+                </S>
+              }
+            />
+            <Route
+              path="learning"
+              element={
+                <S>
+                  <LearningPage />
+                </S>
+              }
+            />
+            <Route
+              path="integrations"
+              element={
+                <S>
+                  <IntegrationsPage />
                 </S>
               }
             />
@@ -302,6 +330,14 @@ export default function App() {
                 element={
                   <S>
                     <JurisdictionPage />
+                  </S>
+                }
+              />
+              <Route
+                path="insurance"
+                element={
+                  <S>
+                    <InsurancePage />
                   </S>
                 }
               />
