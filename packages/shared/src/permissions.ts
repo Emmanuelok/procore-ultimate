@@ -54,6 +54,8 @@ export const TOOLS = [
   "esg",
   "jurisdiction",
   "analytics",
+  "ingestion",
+  "benchmarks",
   "assurance",
   "ai",
   "admin",

@@ -44,6 +44,8 @@ const ContractsPage = lazy(() => import("./pages/contracts/ContractsPage"));
 const ContractDetailPage = lazy(() => import("./pages/contracts/ContractDetailPage"));
 const CompanyAssurancePage = lazy(() => import("./pages/assurance/CompanyAssurancePage"));
 const AiPage = lazy(() => import("./pages/ai/AiPage"));
+const IngestionPage = lazy(() => import("./pages/ingestion/IngestionPage"));
+const BenchmarksPage = lazy(() => import("./pages/benchmarks/BenchmarksPage"));
 
 function S({ children }: { children: ReactNode }) {
   return <Suspense fallback={<Spinner />}>{children}</Suspense>;
@@ -107,6 +109,22 @@ export default function App() {
               element={
                 <S>
                   <CompanyAssurancePage />
+                </S>
+              }
+            />
+            <Route
+              path="ingestion"
+              element={
+                <S>
+                  <IngestionPage />
+                </S>
+              }
+            />
+            <Route
+              path="benchmarks"
+              element={
+                <S>
+                  <BenchmarksPage />
                 </S>
               }
             />

@@ -151,8 +151,20 @@ export function Th({ children, className }: { children?: ReactNode; className?: 
   );
 }
 
-export function Td({ children, className }: { children?: ReactNode; className?: string }) {
-  return <td className={cx("px-4 py-2.5 text-ink-800", className)}>{children}</td>;
+export function Td({
+  children,
+  className,
+  title,
+}: {
+  children?: ReactNode;
+  className?: string;
+  title?: string;
+}) {
+  return (
+    <td className={cx("px-4 py-2.5 text-ink-800", className)} title={title}>
+      {children}
+    </td>
+  );
 }
 
 /* ---------------------------------- Badge ---------------------------------- */

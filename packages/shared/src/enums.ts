@@ -812,6 +812,60 @@ export const WIDGET_KINDS = ["stat", "bar", "line", "donut", "table"] as const;
 export type WidgetKind = (typeof WIDGET_KINDS)[number];
 
 /* ------------------------------------------------------------------ */
+/* Ingestion layer (spec Vol III M6 / Domain N, Domain Y #1045-1047)   */
+/* ------------------------------------------------------------------ */
+
+export const INGESTION_SOURCE_KINDS = ["csv", "procore", "aconex", "api_token"] as const;
+export type IngestionSourceKind = (typeof INGESTION_SOURCE_KINDS)[number];
+
+export const INGESTION_RUN_STATUSES = [
+  "staging",
+  "validated",
+  "committing",
+  "committed",
+  "failed",
+  "discarded",
+] as const;
+export type IngestionRunStatus = (typeof INGESTION_RUN_STATUSES)[number];
+
+export const STAGED_RECORD_STATUSES = ["staged", "committed", "rejected", "skipped"] as const;
+export type StagedRecordStatus = (typeof STAGED_RECORD_STATUSES)[number];
+
+/** Datasets external data can be ingested into, with full provenance. */
+export const INGESTION_DATASETS = [
+  "vendors",
+  "cost_assertions",
+  "site_access",
+  "payroll",
+  "rfis",
+  "schedule_tasks",
+  "evidence",
+  "fx_rates",
+] as const;
+export type IngestionDataset = (typeof INGESTION_DATASETS)[number];
+
+/* ------------------------------------------------------------------ */
+/* Independent benchmarking (spec Vol II Domain R / M11)               */
+/* ------------------------------------------------------------------ */
+
+export const ASSET_CLASSES = [
+  "hospital",
+  "school",
+  "road",
+  "rail",
+  "water",
+  "power",
+  "commercial",
+  "residential",
+  "industrial",
+  "other",
+] as const;
+export type AssetClass = (typeof ASSET_CLASSES)[number];
+
+export const BENCHMARK_SAMPLE_SOURCES = ["contributed", "seed"] as const;
+export type BenchmarkSampleSource = (typeof BENCHMARK_SAMPLE_SOURCES)[number];
+
+/* ------------------------------------------------------------------ */
 /* Notifications                                                       */
 /* ------------------------------------------------------------------ */
 

@@ -23,3 +23,5 @@ export * from "./workforce.js";
 export * from "./esg.js";
 export * from "./jurisdiction.js";
 export * from "./analytics.js";
+export * from "./ingestion.js";
+export * from "./benchmarks.js";
