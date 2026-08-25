@@ -42,9 +42,9 @@ pnpm workspace, Node ≥ 22, TypeScript 5.9 strict ESM throughout (`package.json
 | Path | Package | Contents |
 |---|---|---|
 | `packages/shared` | `@constructos/shared` | Domain vocabulary: enums (`src/enums.ts`), RBAC model + built-in permission templates (`src/permissions.ts`), wire types (`src/types.ts`), the eight assurance primitive interfaces (`src/primitives.ts`). No runtime dependencies. |
-| `packages/ledger` | `@constructos/ledger` | Pure crypto core: RFC 8785-style canonical JSON (`src/canonical.ts`), SHA-256 helpers (`src/hash.ts`), hash chain build/verify (`src/chain.ts`), Merkle root/proof (`src/merkle.ts`). Unit-tested in `src/ledger.test.ts`. |
+| `packages/ledger` | `@constructos/ledger` | Pure crypto core: RFC 8785-style canonical JSON (`src/canonical.ts`), SHA-256 helpers (`src/hash.ts`), hash chain build/verify (`src/chain.ts`), Merkle root/proof (`src/merkle.ts`), and chain **sealing** — canonical seal body, Ed25519 sign/verify, seal-chain walk and the `classifyChain` verdict (`src/seal.ts`, §26). Deliberately depends on nothing, not even `@constructos/shared`, so an offline verifier can use it. Unit-tested in `src/ledger.test.ts` and `src/seal.test.ts` (43 tests). |
 | `packages/db` | `@constructos/db` | Drizzle ORM schema, one file per domain (`src/schema/*.ts`), committed SQL migrations (`drizzle/`). Postgres dialect; no FK constraints — relationships are by convention (see `docs/data-model.md`). |
-| `apps/api` | `@constructos/api` | Fastify 5 API. Composition root `src/app.ts`, env config `src/config.ts`, auth plugin `src/plugins/auth.ts`, helpers `src/lib/*.ts` (incl. the pure CPM engine `src/lib/cpm.ts` and the seeded Monte Carlo engine `src/lib/montecarlo.ts`), twenty-nine feature modules `src/modules/*/` (several with their own pure engines — `workforce/reconcile.ts`, `jurisdiction/fx.ts`, `esg/carbon.ts`, `analytics/datasets.ts`, `ingestion/datasets.ts`, `benchmarks/metrics.ts`), the retrospective-detection harness `src/scripts/retrodetect.ts`, test harness `src/test/helpers.ts`. |
+| `apps/api` | `@constructos/api` | Fastify 5 API. Composition root `src/app.ts`, env config `src/config.ts`, auth plugin `src/plugins/auth.ts`, helpers `src/lib/*.ts` (incl. the pure CPM engine `src/lib/cpm.ts` and the seeded Monte Carlo engine `src/lib/montecarlo.ts`), thirty-three feature modules `src/modules/*/` (several with their own pure engines — `workforce/reconcile.ts`, `jurisdiction/fx.ts`, `esg/carbon.ts`, `analytics/datasets.ts`, `ingestion/datasets.ts`, `benchmarks/metrics.ts`, `insurance/expiry.ts`, `learning/{triggers,relevance,metrics}.ts`, `integrations/{signing,events,oauth}.ts`), timestamp comparison helpers `src/lib/time.ts`, the retrospective-detection harness `src/scripts/retrodetect.ts`, the standalone escrow-receipt verifier `src/scripts/verify-receipt.ts`, test harness `src/test/helpers.ts`. |
 | `apps/web` | `@constructos/web` | Vite 8 + React 19 + Tailwind v4 SPA. Route table `src/App.tsx`, API client `src/lib/api.ts`, auth context `src/lib/auth.tsx`, shared UI kit `src/ui/`, feature pages `src/pages/*/`. Client-side PDF rendering via `pdfjs-dist`, IFC via `web-ifc` + `three`. |
 | `docs/` | — | This documentation set plus the master specification. |
 | `docker-compose.yml` | — | Postgres 16 for production-like runs. |
@@ -65,9 +65,10 @@ flowchart LR
     end
     subgraph API["apps/api (Fastify, port 4000)"]
         AUTH["auth plugin<br/>plugins/auth.ts"]
-        MODS["29 feature modules<br/>modules/*/index.ts"]
+        MODS["33 feature modules<br/>modules/*/index.ts"]
         LEDGER["appendLedger<br/>lib/ledger.ts"]
         STORE["content-addressed storage<br/>lib/storage.ts"]
+        DISP["webhook dispatcher<br/>modules/integrations/dispatcher.ts"]
     end
     subgraph Data
         PG[("Postgres 16<br/>DATABASE_URL set")]
@@ -75,6 +76,7 @@ flowchart LR
         FS[["STORAGE_DIR<br/>&lt;companyId&gt;/&lt;sha2&gt;/&lt;sha256&gt;"]]
     end
     ANTH["Anthropic API<br/>(optional, ANTHROPIC_API_KEY)"]
+    SUBS["subscriber endpoints<br/>(operator-nominated URLs)"]
 
     SPA -- "/api proxied by Vite dev server" --> AUTH
     AUTH --> MODS
@@ -85,6 +87,8 @@ flowchart LR
     MODS -.-> PGL
     STORE --> FS
     MODS -. "modules/ai/service.ts" .-> ANTH
+    LEDGER -- "emit hook, after commit" --> DISP
+    DISP -. "signed POST, retried" .-> SUBS
 ```
 
 - **API process**: `apps/api/src/index.ts` builds the app via `buildApp()` (`src/app.ts`) and
@@ -117,7 +121,12 @@ flowchart LR
   with `TRUST_PROXY=true`. `railway.json` declares the Dockerfile build and the
   `/api/v1/health` healthcheck; the full operator runbook is `docs/deployment.md`.
 - **AI**: optional outbound dependency on the Anthropic API, gated on `ANTHROPIC_API_KEY`
-  (`apps/api/src/modules/ai/service.ts`); see §26.
+  (`apps/api/src/modules/ai/service.ts`); see §29.
+- **Egress**: two further outbound paths exist and both are opt-in. Webhook deliveries leave
+  for operator-nominated URLs on an in-process timer (§30); anchor submissions reach an RFC
+  3161 authority or an OpenTimestamps calendar only when `ANCHOR_TSA_URL` /
+  `ANCHOR_OTS_CALENDAR_URL` are set, and record `unavailable` rather than fabricating a proof
+  when they are not (§26).
 - **Health**: `GET /api/v1/health` reports which database backend is live (`app.ts`).
 
 ---
@@ -172,7 +181,18 @@ Key properties, all visible in `plugins/auth.ts`:
   production.
 - **Ledger append** (`lib/ledger.ts`) runs after the operational write, in the same request.
   A failed append fails the request: an unledgered mutation is treated as worse than a
-  rolled-back one.
+  rolled-back one. Since Phase 7 the append also fires the **webhook emit hook** once the
+  chain transaction has committed — awaited, and with every throw swallowed, so a subscriber's
+  bookkeeping can never fail a valuation (§30).
+- **Machine callers** take this same chain, not a parallel one (Vol I §0.7 #120, ADR 0018).
+  `authenticate` resolves an OAuth2 access token to `req.machineClient` before it tries the
+  JWT path; `requireCompany` and `requireTool` then branch to the machine equivalents, and
+  `requireTool` answers from the client's scopes instead of a project membership. The
+  consequence worth stating: a machine caller is admitted **only to routes that carry a
+  `requireTool` gate**, because a route gated by `authenticate + requireCompany` alone means
+  "any member of this tenant" and an OAuth client is not one — admitting it there would hand
+  every client company-wide reads regardless of its scopes. An `onRoute` hook records which
+  route patterns carry a tool gate; everything else refuses machines outright (§30).
 
 ---
 
@@ -196,11 +216,12 @@ Key properties, all visible in `plugins/auth.ts`:
 
 ## 6. Module inventory
 
-Twenty-nine Fastify plugins, each `apps/api/src/modules/<name>/index.ts`, all registered in
-`src/app.ts` under the `/api/v1` prefix. "Tool" is the `requireTool` key from
-`packages/shared/src/permissions.ts`; tables are from `packages/db/src/schema/`. Sibling
-modules are being developed concurrently — the contracts below come from route registration
-and schema, not implementation internals.
+Thirty-three Fastify plugins, each `apps/api/src/modules/<name>/index.ts`, all registered in
+`src/app.ts` under the `/api/v1` prefix (the integrations module is registered **last**, for
+the reason given in §30). "Tool" is the `requireTool` key from
+`packages/shared/src/permissions.ts` — forty of them; tables are from
+`packages/db/src/schema/`. Sibling modules are being developed concurrently — the contracts
+below come from route registration and schema, not implementation internals.
 
 | Module | Tool gate(s) | Key tables | Representative routes | Spec coverage |
 |---|---|---|---|---|
@@ -233,10 +254,15 @@ and schema, not implementation internals.
 | `analytics` | `requireCompany` + per-report project reach (the `analytics` tool key is reserved in `TOOLS` but the module deliberately does not use `requireTool` — reports cross projects) | `reportDefinitions`, `dashboards`, `reportSchedules` (reads the registered datasets) | `/analytics/datasets`, `/analytics/reports` (+`preview`, `run`, `export.csv`, `schedules`), `/analytics/dashboards` (+`data`, `seed-defaults`) | Vol I §6.1–6.2 #731–733, #735–739, #741–742, #749, #751 |
 | `ingestion` | company owner/admin on all mutating routes; `ingestion` `read` on the OCDS export; the push route is gated by **API token**, not JWT | `ingestionSources`, `ingestionRuns`, `ingestedRecords`, `apiTokens` (+ writes real records across `vendors`, `assertions`, `evidence`, `siteAccessRecords`, `payrollEntries`, `rfis`, `scheduleTasks`, `fxRates`, and `signals`) | `/ingestion/sources` (+`pull` — 501 scaffold), `/ingestion/datasets`, `/ingestion/runs` (multipart CSV; +`map`, `validate`, `commit`, `discard`, `records`), `/ingestion/tokens` (+`revoke`), `POST /ingestion/push/:dataset` (bearer `cok_…`), `/projects/:id/export/ocds` | Vol III M6 / Domain N #705–711, #715; S#862 (ingest half); A#109; ADR 0015 |
 | `benchmarks` | `benchmarks` read/standard per project; **admin to contribute** (the value leaves the tenant); catalog + distributions are company-scoped (`requireCompany`) | `benchmarkSamples`, `projectMetricSnapshots` (+ writes `signals`; reads contracts, variations, schedules, RFIs, punch, payment claims, project settings) | `/benchmarks/metrics`, `/benchmarks/distributions`, `/projects/:id/benchmarks/snapshots` (+`:snapshotId/contribute`), `/projects/:id/benchmarks/compare` | Vol II Domain R (M11) #821–858 subset; Vol I §6.3 half; ADR 0016 |
+| `anchoring` | company member to read; **company owner/admin to seal, rotate, anchor or escrow** — no project tool key, because a chain is a tenant-level object | `signingKeys`, `chainSeals`, `anchorSubmissions`, `escrowReceipts` (+ reads `ledgerEntries`, writes `signals`) | `/ledger/keys` (+`rotate`), `/ledger/seals` (+`/:id`, `/:id/verify`, `/:id/anchor`, `/:id/escrow`), `/ledger/chain-verdict`, `/ledger/anchors` (+`/:id/confirm`), `/ledger/escrow-receipts` (+`/:id/document`), `POST /ledger/escrow/verify` | Vol II Domain S (M1) #860–861, #864, #873–874; ADR 0017; §26 |
+| `insurance` | `insurance` (read/standard/admin) on project routes; company-wide list/summary on `requireCompany` | `insurancePolicies`, `insuranceCertificates`, `bonds`, `bondCalls`, `insuranceClaims` (+ writes assurance `obligations`, `signals`; reads `vendors`, `workers`, `contracts`, `files`) | `/projects/:id/insurance/{policies,certificates,bonds,claims,expiring,summary}` (+`policies/:id/status`, `certificates/:id/{verify,file}`, `bonds/:id/{status,reduce,release,call}`, `bond-calls/:id/outcome`, `claims/:id/{notify,status}`), company-scoped `/insurance/{policies,expiring,summary}` | Vol II Domain P #771–797 subset; ADR 0012 (obligations), ADR 0004 (certificate as evidence); §27 |
+| `learning` | `learning` read/standard/**admin** on project routes (publication company-wide is the admin act); the company-wide register, search, summary and trigger rules on `requireCompany`; supersession on owner/admin | `lessons`, `lessonApplications`, `lessonTriggers`, `postProjectReviews` (+ writes assurance `obligations`; reads disputes, forensic claims, delay events, variations, signals, gate reviews, contracts, schedules, payment certificates, RFIs, punch) | `/projects/:id/learning/{lessons,relevant,triggers,reviews}` (+`lessons/:id/{submit,validate,reject,publish,apply}`, `triggers/{sweep,:id/capture,:id/dismiss}`, `reviews/:id/{compute-metrics,transition,sign-off}`), `/learning/{lessons,search,summary}` (+`lessons/:id/{impact,supersede}`, `triggers/rules`) | Vol II Domain W #976–994 subset; §28 |
+| `integrations` | company owner/admin on every webhook and OAuth-client route; the event catalogue and scope catalogue on `requireCompany`; `POST /oauth/token` and `/oauth/revoke` are **unauthenticated by definition** and rate-limited | `webhookEndpoints`, `webhookDeliveries`, `oauthClients`, `oauthAccessTokens` (+ reads `ledgerEntries` for the derived event catalogue) | `/integrations/webhooks` (+`/:id/test`, `/:id/deliveries`, `/deliveries/:id/retry`, `/webhooks/status`), `/integrations/events`, `/integrations/oauth/{scopes,clients,introspect}` (+`clients/:id/revoke`, `clients/:id/tokens`, `tokens/:id/revoke`), `POST /oauth/token`, `POST /oauth/revoke` | Vol I §0.7 #120–121; ADR 0018; §30 |
 
 Shared helpers used by all modules (`apps/api/src/lib/`): `ids.ts` (prefixed nanoid),
 `numbering.ts` (atomic per-project record counters, spec #72), `pagination.ts`
-(`page`/`pageSize` → `{items,total,page,pageSize}`), `errors.ts`, `ledger.ts`, `storage.ts`.
+(`page`/`pageSize` → `{items,total,page,pageSize}`), `errors.ts`, `ledger.ts`, `storage.ts`,
+and `time.ts` — the instant-comparison helpers every expiry check goes through (§31).
 
 ---
 
@@ -275,9 +301,13 @@ Properties:
 
 - **Append-only by contract**: rows in `ledger_entries` are never updated or deleted
   (schema comment, `packages/db/src/schema/assurance.ts`); the API exposes no mutating route.
-- **Tamper-evident**: editing any historical row breaks every `entryHash` after it;
-  `verifyChain` returns the index of the first break. Exposed as
+- **Tamper-evident against edits**: editing any historical row breaks every `entryHash` after
+  it; `verifyChain` returns the index of the first break. Exposed as
   `GET /api/v1/ledger/verify` (assurance module) and `verifyCompanyLedger` in `lib/ledger.ts`.
+  Against *edits* is the whole of what a chain can do by itself — truncating the tail or
+  rewriting the chain from genesis both produce something that verifies perfectly. **§26**
+  is the layer that closes those two, and it is the section to read before quoting the
+  paragraph below.
 - **Concurrency-safe**: appends run in a transaction that reads the current chain head, so
   concurrent writers serialize per company (`lib/ledger.ts`).
 - **Payload-optional**: the chain always stores `payloadHash`; the full canonical snapshot is
@@ -292,13 +322,15 @@ Properties:
 `POST /projects/:projectId/evidence-packs` in the assurance module). A pack commits to a set
 of evidence content-hashes under a single Merkle root, with per-leaf inclusion proofs
 (odd nodes promoted, not duplicated, so a leaf cannot appear included twice). The root is a
-single hash that can be escrowed with a third party or anchored externally — the committed
-foundation for spec Domain S #860–861, #874, #882. Self-certification is surfaced on the
+single hash that can be escrowed with a third party or anchored externally — the same
+primitive §26 uses over *entry* hashes to seal the whole chain (spec Domain S #860–861,
+#874, #882). Self-certification is surfaced on the
 obligation path: satisfying an obligation records `selfCertified: ev.submittedBy === req.user.id`
 in the ledger payload (`modules/assurance/index.ts`, obligation `/satisfy` route), so a reviewer
 can weigh it later.
 
-What the chain does and does not prove is analysed honestly in `docs/security.md` §5.
+What the chain does and does not prove is analysed honestly in `docs/security.md` §5, and
+what **sealing** adds on top of it — plus the two limits sealing does not remove — is §26.
 
 ---
 
@@ -317,7 +349,7 @@ Upload → extraction → sheet/revision model → markups/pins. All in
    the sheet number and title from each page's text stream and classify discipline from the
    number prefix (A→architectural, S→structural, …) — spec Vol I #257–258, #266. Low-confidence
    extractions set `drawing_sheets.needsReview = 1`, feeding the human naming-review queue
-   (#258); the AI `sheet_naming` agent (§26) can propose corrections.
+   (#258); the AI `sheet_naming` agent (§29) can propose corrections.
 4. **Sheet/revision model**: a `drawing_sheets` row is the logical sheet, unique per
    `(projectId, number)`; each upload appends a `drawing_revisions` row (revision label,
    source set, `pageIndex`, extracted text, calibration) and supersedes the previous one
@@ -1432,18 +1464,24 @@ run whose `startedBy` is the **token id, not a person**, and whose ledger entrie
 that no operator session authored these rows. Raw tokens are stored only as hashes,
 returned once in the creation response, and never logged (`docs/security.md` §1.5).
 
-### 24.3 Connector scaffolds — honest 501
+### 24.3 The Procore / Aconex connectors
 
-`ProcoreConnector` / `AconexConnector` are the typed shells of two vendor connectors: an
-injectable HTTP client, the request paths each vendor documents, and pure mapping
-functions from vendor payloads into ingestion-dataset rows, unit-tested against recorded
-fixtures. What they are not is a working integration — this deployment has no network
-route to either vendor and holds no credentials, so `POST /ingestion/sources/:id/pull`
-returns **501** listing the exact credentials and config a real pull needs, instead of
-pretending. Source `config` refuses credential-shaped keys outright
+Phase 6 shipped these as typed shells; **Phase 7 completed the transports.**
+`ProcoreConnector` / `AconexConnector` now carry the whole path behind an injected HTTP
+client — credential resolution from the environment, the Procore OAuth2 client-credentials
+exchange, the Aconex Basic + application-key scheme, the documented endpoint paths,
+page-by-page pagination with a page cap, and pure mapping into the ingestion datasets. A pull
+stages a real ingestion run with per-row provenance; the operator validates and commits it
+through the same routes as a CSV. Unconfigured, `POST /ingestion/sources/:id/pull` still
+returns **501 naming the exact environment variables and config keys** a real pull needs,
+instead of half-succeeding. Source `config` refuses credential-shaped keys outright
 (`assertNoCredentialKeys`): secrets live in env or `api_tokens`, never in a source row.
-When credentials and connectivity exist, the `pull*` methods become real by constructing
-the connector with a live client — no mapping code changes.
+
+The limit is not the code. **Neither transport has ever been exercised against a live
+vendor** — this deployment has no route to either and holds no credentials, and the fixtures
+behind the tests were *authored from published API shapes, not captured from real traffic*. The
+honest expectation for the first live pull is that it adjusts field names, not architecture;
+§30.4 states what is fixture-proven and what is not.
 
 The module also ships the OCDS 1.1 export (Domain A #109):
 `GET /projects/:projectId/export/ocds` maps contracts, agreed variations and payment
@@ -1497,7 +1535,258 @@ Vol I §6.3's distribution half; ADR 0016.
 
 ---
 
-## 26. AI layer
+## 26. Ledger sealing, anchoring & escrow (M1)
+
+Pure sealing core `packages/ledger/src/seal.ts`; key custody
+`apps/api/src/modules/anchoring/keys.ts`; anchor providers `…/providers.ts`; routes
+`…/index.ts`; schema `packages/db/src/schema/anchoring.ts`; web workspace
+`apps/web/src/pages/ledger/`; standalone verifier
+`apps/api/src/scripts/verify-receipt.ts`. Spec Vol II Domain S #860–861, #864, #873–874;
+**ADR 0017**; `docs/security.md` §8.2 gaps 2–3.
+
+### 26.1 What a hash chain does not defeat
+
+§7 makes each entry's hash cover its predecessor's, so editing entry *k* invalidates *k…n*.
+That is tamper-evidence against **edits**, and it is the whole of what a chain can do on its
+own. Two attacks walk straight through it, and both belong to whoever controls the database —
+which, on a self-hosted deployment, is the party whose record is under scrutiny:
+
+- **Tail truncation.** Delete the last N entries. The remainder verifies perfectly, genesis to
+  head, with no gap and no contradiction: nothing inside a chain records how long it is
+  supposed to be. The most incriminating window of a project's history is also the cheapest to
+  remove, and `GET /ledger/verify` would have returned `valid: true` on what was left.
+- **Wholesale rewrite.** Recompute every hash from genesis over a different history. Internal
+  consistency is a property anyone with write access can manufacture, because the chain is
+  self-referential: it proves its entries are consistent *with each other*, not that they are
+  the entries originally written.
+
+Both share one root cause — verification asked the database to attest to itself. Every input
+to the check came from the store the attacker controls.
+
+### 26.2 What a seal is, and why seals chain to each other
+
+A **seal** is a signed commitment to the whole state of one company's chain at a moment
+(`buildSealBody` in `seal.ts`), canonicalized with the same RFC-8785-style helper the ledger
+uses so the exact signed bytes can be reproduced years later — including with
+`openssl pkeyutl -verify`:
+
+| Field | What it closes |
+|---|---|
+| `entryCount` | Truncation stops being a judgement call and becomes arithmetic: "seal 4 committed to 1,203 entries and 1,180 exist." |
+| `merkleRoot` over every entry hash | A rewrite of any entry, anywhere in history, changes the root. |
+| `headHash`, `fromEntrySeq`/`toEntrySeq` | Fixes what the head *was* and the range committed (the whole chain, not the delta). |
+| `prevSealHash` | The hash of the previous seal's canonical body — **seals form their own chain**. |
+| Ed25519 `signature` over the canonical body | The one input an attacker with database access cannot manufacture. |
+
+The signature is the whole design. Everything above it is arithmetic the attacker could
+recompute; the signature is not, because `signing_keys` holds the **public half only**
+(`assertPublicOnly` refuses private material on every write) and the private half lives in
+`ANCHOR_SIGNING_KEY`, in process memory, never in a response — it is deliberately not a
+property of the serializable key record, so no route can leak it by accident.
+
+Seals chain to one another for a specific reason: once truncation and rewrite are closed, the
+attacker's next move is to delete the seals that would have noticed. `verifySealChain` walks
+seals in order, requires sequences contiguous from 1, and compares each `prevSealHash` against
+the **recomputed** body hash of its predecessor — recomputed, not the stored `bodyHash`, so
+editing a stored hash to match a forged link does not help.
+
+### 26.3 Verdicts, not booleans
+
+`classifyChain` returns one of six states — `intact`, `tail_truncated`, `entry_altered`,
+`seal_forged`, `seal_broken`, `no_seals` — and names the exact seal or entry sequence at which
+it failed, because "something is wrong" is not actionable. The checks run in the order an
+investigator would want to hear them, and the first failure decides: signatures, then seal
+linkage, then entry count against the seals, then entry-by-entry hash recomputation, then the
+sealed Merkle roots. That last step distinguishes a prefix that was **cut and refilled** from
+one **rewritten in place**, by asking whether the entry now standing at the sealed head
+position carries the sequence the seal recorded — a distinction that matters because the two
+imply different attackers.
+
+`GET /ledger/chain-verdict` is the auditor's endpoint. It deliberately does **not** append an
+`access` ledger entry, unlike the assurance module's `/ledger/verify`: an endpoint that grows
+the chain in proportion to how closely it is watched would defeat the heartbeat's own "nothing
+changed" test. A non-intact verdict raises a critical signal — `ledger_truncation_detected`,
+`ledger_entry_altered`, `chain_seal_broken` or `chain_seal_forged` — fingerprinted by *what
+the finding is about* (the offending entry, or the seal that caught it) rather than by the
+surviving head, which moves on every append and would otherwise raise a fresh critical signal
+on every poll.
+
+### 26.4 Heartbeat seals
+
+Seals are written on a schedule even when nothing has been appended
+(`ANCHOR_HEARTBEAT_HOURS`, default 24), swept lazily on the reads that care — the same pattern
+as the payments deemed-liability, finance overdue-condition and permit sweeps, because this
+deployment runs no scheduler. The reason is specific: a seal bounds truncation only up to the
+entries it covers, so a tenant that seals once and then goes quiet leaves an unbounded tail
+that can be cut invisibly, and an attacker's best move is simply to wait for the next seal to
+be far away. A heartbeat re-commits to the head every interval, so **the window in which a
+truncation can hide is one heartbeat**. The sweep never throws: a monitoring read must not
+500 because sealing is unavailable.
+
+### 26.5 Anchoring and escrow — reaching outside the deployment
+
+Four providers, ordered by how far outside the deployment the witness reaches:
+`local_signed` (the signature itself — defeats a database-only attacker, reaches no further
+than the host, and is not a time source), `rfc3161` (a Time-Stamp Authority countersigns the
+body hash — the one that closes trusted time), `opentimestamps` (the body hash aggregated into
+a Bitcoin transaction; strongest reach without a commercial relationship, slowest to confirm)
+and `counterparty` (an adverse third party acknowledges a reference — no cryptography beyond
+the seal, and in a dispute often the one that actually gets used).
+
+**Escrow** is what turns "we verified our own chain" into "a third party can verify it". A
+receipt is self-contained — seal body, signature, public key, fingerprint, the verification
+procedure in words, and explicit `proves` / `doesNotProve` lists — issued to a named
+recipient who can present it back at `POST /ledger/escrow/verify` (ledgered: presentation is a
+consequential act by an identified party) **or verify it with no access to this platform at
+all** via `pnpm --filter @constructos/api verify:receipt`, because a verification tool the
+operator hosts is a verification tool the operator controls. Verification returns
+`signatureValid` separately from `key.recognized`: a forged receipt signed with an attacker's
+own key is fully self-consistent, and collapsing the two into one pass/fail would hide exactly
+the case that matters.
+
+### 26.6 What this still does not prove
+
+The two attacks above are closed and tested against **real corrupted database state**, not
+mocks — truncating the tail, altering a historical entry, forging a signature and removing a
+middle seal each produce their specific verdict with the offending sequence named. The
+boundaries are carried in the API responses themselves, not only here, because a limitation
+stated in a document nobody reads is a limitation concealed:
+
+- **The derived key is the weak case, and it is the local default.** With
+  `ANCHOR_SIGNING_KEY` unset outside production, the key is HKDF-derived from `AUTH_SECRET`
+  and is therefore held by **the same operator that runs the application**. Such a seal proves
+  integrity against a database-only attacker and **not against the operator**, who can
+  re-derive the key and re-sign a rewritten chain. Every key record, seal, verdict, anchor
+  proof and receipt carries `derivedFromAuthSecret: true` with a plain-English note; key ids
+  are prefixed `ankd_` rather than `ank_`, so a seal made months ago still reports the custody
+  that applied when it was made; and in production, sealing without a real key is a 503 naming
+  the command that generates one (ADR 0017; `docs/security.md` §8.2 gap 2).
+- **Time is still self-asserted.** `sealedAt` is the application server's clock, so seals prove
+  **order, not wall-clock time**. The RFC 3161 and OpenTimestamps providers carry real wire
+  implementations behind an injected client — a genuine DER `TimeStampReq` and a genuine
+  `TimeStampResp` reader — but with no endpoint configured they record `unavailable` naming
+  the exact missing variable **rather than fabricating a proof**, and a successful
+  OpenTimestamps submission records `pending`, because a calendar receipt is not yet a Bitcoin
+  attestation. Gap 3 is narrowed, not closed: what remains is configuration and a network
+  route, not code.
+- **A seal covers integrity, not accuracy.** Nothing here says a record was true when written.
+  That is the reconciliation engine's job (ADR 0004, ADR 0014); sealing only guarantees that
+  what you are reconciling is what was recorded.
+
+---
+
+## 27. Insurance & bonding (Domain P)
+
+Routes `apps/api/src/modules/insurance/index.ts`; the pure expiry engine
+`modules/insurance/expiry.ts`; schema `packages/db/src/schema/insurance.ts`; web workspace
+`apps/web/src/pages/insurance/` (Radar, Policies, Certificates, Bonds, Claims, Programme).
+Spec Vol II Domain P #771–797 subset.
+
+The module is built **on** the platform's primitives rather than beside them, which is most of
+why it needed no new machinery: a policy's claim-notification period is an `obligations` row with a hard date
+(ADR 0012 — the same machinery as a FIDIC time bar), a certificate that expires while the
+works continue is a `signals` row, and a bond call is a ledgered event with evidence
+references. The certificate/policy split is ADR 0004 applied to cover: the policy record is
+the **Assertion** that cover exists, the collected certificate is the **Evidence** that tests
+it, and `verificationMethod` records how hard anyone looked (insurer confirmation beats a PDF).
+
+1. **The expiry engine is pure and dated.** Every function in `expiry.ts` takes an explicit
+   `asOf` and touches no clock and no database, so it is unit-tested exhaustively and the
+   sweep that consumes it stays idempotent. It answers three questions about time running out:
+   what is about to lapse inside a window (policies, certificates, bonds); where there is a
+   **hole** — a vendor performing work with no in-date evidence of a required policy type
+   (#778); and which bonds are past the last date a demand can be made (#794).
+2. **The demand deadline, not expiry, is the operative date.** Many bonds die on the demand
+   deadline weeks before they expire, and a demand made a day late is simply not paid, so
+   `bondsPastDemandDeadline` and the expiring window key off it and fall back to expiry only
+   when no deadline is recorded.
+3. **Five detectors, swept lazily and idempotently:** `insurance_certificate_expired`,
+   `insurance_cover_gap`, `bond_demand_deadline_passed`, `policy_lapsed_during_works` (a
+   policy period ending while the project is in `course_of_construction` or `warranty`) and
+   `insurance_notification_missed`. Each carries a stable dedupe key so re-running the sweep
+   raises nothing twice.
+
+Three refusals are the honest part of the module, and each is stated on the response rather
+than left to be inferred:
+
+- **Cover requirements are inferred, not declared.** The required policy types for a scope are
+  derived from the programme itself — the distinct types of policies carrying a
+  `requiredByClause` — or supplied explicitly per request. When nothing is recorded the
+  analysis returns **`requirementsKnown: false` with a note**, not an empty gap list: a silent
+  "no gaps" is the dangerous answer here. In-date cover that nobody independent has verified is
+  reported separately as `unverified` rather than counted as clear.
+- **There is no FX anywhere in this module.** Bond exposure, claim reserves and settlements are
+  grouped **per currency and never summed across currencies**, and the summary says so in
+  words. `jurisdiction.ts`'s FX engine is deliberately not reached for: a converted insurance
+  limit implies a precision the contract does not have.
+- **Bonding-line headroom (#796) is refused, not estimated.** Utilisation per surety is
+  computed; headroom is not, because no agreed facility limit is recorded anywhere in the
+  data. Reporting utilisation without the denominator is honest; inventing the denominator
+  would invite the reader to infer a headroom that does not exist.
+
+Smaller boundaries in the same spirit: a policy programme total is labelled a **floor** when
+some in-force policies record no limit; `currentExposure` (triggered milestone reductions
+applied) is reported beside `faceAmount` rather than instead of it; and a claim whose policy
+records no `notificationDays` has **no computed deadline and is counted as neither in time nor
+late**, with the count of such claims disclosed.
+
+---
+
+## 28. Organisational learning (Domain W)
+
+Routes `apps/api/src/modules/learning/index.ts`; three pure cores —
+`modules/learning/triggers.ts` (mandatory-capture rules), `relevance.ts` (ranking) and
+`metrics.ts` (post-project outturn); schema `packages/db/src/schema/learning.ts`; web
+workspace `apps/web/src/pages/learning/` (Health, Register, Triggers, Capture & review,
+Search). Spec Vol II Domain W #976–994 subset.
+
+Lessons-learned registers fail everywhere for one reason: **capture is voluntary and retrieval
+is nobody's job.** This module inverts both, using assets the platform already has.
+
+1. **Capture is triggered by records, not by goodwill** (#977). `scanTriggers` reads the
+   registers other modules already maintain and raises a `lesson_triggers` row when one of
+   seven rules fires — a dispute closing, a forensic claim settling, a delay event closing, a
+   variation crossing a configurable value threshold (`settings.learning.variationTriggerThreshold`
+   on the project, then the company, then a code default of 50,000), a signal confirmed, a gate
+   review, project closeout. Each trigger raises an **`obligations`** row with a deadline
+   (ADR 0012), which is what makes it unignorable, and carries a `rationale` saying in words
+   why it crossed the threshold. A trigger has exactly three states — `open`, `captured` (a
+   lesson discharged it, satisfying the obligation) and `dismissed` (which demands a named
+   dismisser and a recorded reason, and waives the obligation). **There is no fourth state: a
+   trigger cannot quietly expire.**
+2. **Retrieval is bound to the record being created**, not to a search box. `GET
+   …/learning/relevant` ranks the published register against what the user is doing *now* —
+   the tool they are in, the category and phase of the record, its tags — and returns, for
+   every hit, **the reasons it was surfaced** (`category_match`, `tool_affinity`, `phase_match`,
+   `tag_overlap`, `impact_magnitude`, `recency`, `previously_applied`) with the points each
+   contributed. Every component is an integer and every input including `now` is supplied by
+   the caller, so ranking is deterministic and testable, and a user can argue with it.
+3. **Validation is a second pair of eyes.** A lesson is drafted, submitted, validated by
+   someone who is not its author, and only then published company-wide (the `learning` **admin**
+   act — publication nulls `projectId` while retaining `originProjectId`). Superseding a
+   published lesson is company owner/admin.
+4. **Applications are the half every register omits.** `POST …/lessons/:id/apply` binds a
+   published lesson to a later record on another project — the only evidence that learning
+   crossed a project boundary, and the input to the `/impact` view and to the ranker's
+   `previously_applied` component.
+5. **Post-project review metrics are read, not recalled** (#991). `computeReviewMetrics` reads
+   contracts and agreed variations for budget, non-withdrawn payment certificates for outturn,
+   the earliest schedule baseline against recorded task actual finishes for programme, and the
+   signal, obligation, RFI, punch, lesson and trigger registers for the rest — persisting the
+   exact figures each computation read.
+
+Two honesty rules, both visible in the stored `metrics` blob. **A figure the platform cannot
+compute returns `value: null` with the reasons it is null, never a fabricated zero** — the same
+contract as `modules/benchmarks/metrics.ts` (§25), with the shape deliberately identical so a
+reader who knows one knows both. And **there is no budget table on this platform**, so
+"approved budget" is *derived*: executed or completed contract sums as the original budget plus
+agreed variations as the approved growth. A project with no executed contract carrying a
+contract sum reports `approved_budget: null` with that sentence attached, and the cost-variance
+metric is withheld rather than computed against nothing.
+
+---
+
+## 29. AI layer
 
 `modules/ai/` (service in `service.ts`), schema `packages/db/src/schema/ai.ts`. Design rules
 come from spec Domain X: **citations always (#1019), human-in-the-loop for consequential
@@ -1526,53 +1815,184 @@ outputs (#1020), full audit trail (#1021).**
 
 ---
 
-## 27. Integration surface
+## 30. Integration surface
 
-**Today (implemented):**
+Vol I §0.7 (#119–142). Two halves: the **published surface** any client can call, and the
+**event and machine-caller surface** delivered in Phase 7 (`apps/api/src/modules/integrations/`,
+the emit hook in `apps/api/src/lib/ledger.ts`, machine-caller resolution in
+`apps/api/src/plugins/auth.ts`, schema `packages/db/src/schema/integrations.ts`). **ADR 0018**
+carries the reasoning.
+
+The operator-facing surface for it is `apps/web/src/pages/integrations/`, built over the same
+routes described below: endpoints are created, subscribed to event kinds drawn from the derived
+catalogue, pinged with a synthetic delivery before anything real is trusted, and then watched
+through the delivery log — with the secret shown once at creation, `sharedCustody` surfaced
+wherever the key source is reported, and OAuth clients managed the same way. What the page
+cannot do is re-reveal a secret: no route re-derives one into a response.
+
+### 30.1 The published surface
 
 - REST API under `/api/v1`, JSON bodies, zod-validated, bearer auth + `x-company-id` tenant
   header; uniform error envelope `{statusCode, error, message, details?}` (`app.ts`);
   uniform pagination `{items, total, page, pageSize}` (`lib/pagination.ts`).
 - Multipart binary upload on documents/drawings/BIM routes; streamed binary download
   (`/files/:id/download`, `/drawing-files/:id/pdf`).
-- Ledger export/verify (`GET /ledger`, `GET /ledger/verify`) and Merkle evidence packs — the
-  forensically exportable surface (spec Domain S #871–872).
+- Ledger export/verify (`GET /ledger`, `GET /ledger/verify`), Merkle evidence packs, and since
+  Phase 7 the sealing surface — `GET /ledger/chain-verdict`, seals, anchors and escrow receipts
+  downloadable as self-contained JSON verifiable offline (§26). This is the forensically
+  exportable surface (spec Domain S #871–872).
 - COBie CSV/JSON export (twin module) — the open handover format (spec Domain N adjacent).
 - CSV exports for external counterparties: the facility statement of expenditure
   (`…/facilities/:id/statement.csv`, spec O#735), the frozen bundle manifest with per-tab
   content hashes (`…/dispute-bundles/:id/manifest.csv`, spec E#343), the whole-life carbon
   report (`…/carbon/report.csv`, spec I#491–492) and any saved report definition
-  (`/analytics/reports/:id/export.csv`, spec Vol I #738 — CSV only; PDF/Excel are not
-  built).
-- The analytics dataset catalog (`GET /analytics/datasets`) is the closest thing to a
-  published data model today: labels, types, enum vocabularies and per-column capability
-  flags for every reportable column (spec Vol I #743 wants direct BI-tool connection; the
-  REST surface is the only exposure — see §23).
+  (`/analytics/reports/:id/export.csv`, spec Vol I #738 — CSV only; PDF/Excel are not built).
+- The analytics dataset catalog (`GET /analytics/datasets`) and the ingestion dataset catalog
+  (`GET /ingestion/datasets`) are the closest thing to a published data model: labels, types,
+  enum vocabularies and per-column capability flags (spec Vol I #743 wants direct BI-tool
+  connection; the REST surface is the only exposure — see §23).
 - Staged data ingestion (M6, §24): multipart CSV migration runs with hash-at-ingest and
-  ledgered commits, the ingestion dataset catalog (`GET /ingestion/datasets`), and
-  `POST /ingestion/push/:dataset` — a bearer-token machine inlet for evidence streams,
-  scoped per dataset (`docs/security.md` §1.5). OCDS 1.1 export with an honest
-  partial-mapping scope note (`GET /projects/:id/export/ocds`).
+  ledgered commits, and `POST /ingestion/push/:dataset` — a bearer-token machine inlet for
+  evidence streams, scoped per dataset (`docs/security.md` §1.5). OCDS 1.1 export with an
+  honest partial-mapping scope note (`GET /projects/:id/export/ocds`).
 - CORS is open (`origin: true` in `app.ts`) to keep third-party browser clients possible in
-  dev; tighten per deployment.
+  dev; tighten per deployment (`docs/security.md` §8.2 gap 7).
 
-**Planned (not yet in code):**
+### 30.2 Webhooks subscribe to the ledger, not to a taxonomy (#121)
 
-- Webhooks for event-driven integration (spec Vol I #121) — the natural emitter is the ledger
-  append path, which already sees every consequential mutation.
-- OAuth2 client credentials for machine callers (#120); today user JWTs and the
-  ingestion push tokens (§24.2) are the only machine credentials, and the tokens authorize
-  dataset pushes only — not general API access.
-- Working connector transports for Procore/Aconex (the mapping layer is written and
-  fixture-tested; the pull route returns 501 naming the missing credentials and network
-  route — §24.3) and the wider ERP family. What remains of M6 is a counterparty on the
-  other end of the wire, not module code. See `docs/roadmap.md`.
+The usual way to build webhooks is a hand-maintained list of event names emitted by
+hand-placed calls at the points someone remembered. That list drifts from the truth
+immediately and **silently** — a module added later emits nothing, a refactored route loses
+its emit call, and no test fails, because the taxonomy is the only thing claiming the event
+should exist. Subscribers then believe they are seeing everything.
+
+ConstructOS had an unusual asset here: ADR 0003 made every consequential mutation append to
+the hash-chained ledger, and five phases of module discipline kept that true. The ledger is
+therefore not a log *of* the events — it **is** the complete, enforced enumeration of them. So:
+
+- **The emit hook hangs off `appendLedger`** (`lib/ledger.ts`), fires *after* the chain
+  transaction commits, and is **awaited** — an event is never lost to a dropped promise and
+  emission is deterministic under test. It **swallows every throw**: `appendLedger`'s contract
+  is that it never fails a business transaction, and a webhook subscriber must never be able to
+  break a valuation. Emitter failures land on health counters (`GET /integrations/webhooks/status`)
+  rather than propagating.
+- **The event catalogue is derived** (`modules/integrations/events.ts`): the distinct
+  `(objectType, action)` pairs *this tenant's own ledger* has recorded, with counts and
+  last-seen times, unioned with the fixed `LEDGER_ACTIONS` vocabulary. It cannot drift from what
+  the platform does. The honest consequence is stated on the response: a kind the tenant has
+  never produced does not appear — subscribing to it is allowed and simply waits for the first
+  one. Subscriptions accept `objectType.action`, `objectType.*`, `*.action`, `*`, and an
+  **empty list means every kind**.
+- **The envelope carries identity and hashes, never the ledger payload**: `objectType`,
+  `objectId`, `actorId`, `ledgerSeq`, `payloadHash`, `entryHash`. A payload is frequently
+  unstored and can hold commercially sensitive state; shipping it to an operator-nominated URL
+  would make every subscription a data export. `payloadHash` lets a receiver verify a record it
+  subsequently fetches through the authenticated API — the same trust move the rest of the
+  platform makes.
+- **Signatures** are HMAC-SHA256 over `v1:{timestamp}:{deliveryId}:{rawBody}` under a secret
+  derived per endpoint, sent as `x-constructos-signature: v1=<hex>` alongside delivery, endpoint,
+  company, event, timestamp and attempt headers. The **delivery id is bound into the
+  string-to-sign**, so a body captured from one delivery cannot be replayed as another.
+  `verifySignature` in `modules/integrations/signing.ts` is exported as executable
+  documentation for integrators.
+- **Secret custody: the database holds no usable secret.** A secret is HKDF-derived from an
+  env-held master key plus the endpoint id, returned **exactly once** in the creation response,
+  and re-derived at send time; the row stores only a sha256 fingerprint. Rotating the master
+  key deliberately invalidates every derived secret — `secretFingerprintMatches` goes false on
+  a read, which is how an operator finds out.
+
+### 30.3 Machine callers go through the same gates, not around them (#120)
+
+The usual answer here is a parallel path: API keys with their own scope model checked by their
+own middleware, next to the human permission system. Two authorization systems over one set of
+records is a standing invitation for them to disagree, and the disagreement is always
+discovered as a leak. So an OAuth2 client-credentials token resolves to a caller whose
+permissions **are** its scopes — `tool:level` pairs drawn from the same `TOOLS` ×
+`PERMISSION_LEVELS` vocabulary humans are governed by — and those scopes are then checked by
+`requireTool`, the same function, not a parallel one (§4).
+
+- `POST /oauth/token` (client credentials, rate-limited, unauthenticated by definition) issues
+  a `cot_…` bearer stored **as a SHA-256 hash only**, with scopes frozen at issue and a
+  configurable TTL; `POST /oauth/revoke` and the per-token/per-client revoke routes take effect
+  on the next request.
+- **A client can never hold more than its creator held.** Since clients are created by owners
+  and admins, who bypass tool checks, the ceiling bites precisely where company role does not
+  confer access — `assurance`. An owner without a live assurance grant cannot mint a client
+  that reads assurance records: ADR 0004's segregation surviving contact with automation.
+- **Building this surfaced a privilege escalation the parallel-path design would have hidden.**
+  Admitting a machine caller means setting `req.companyId`, and that alone would have admitted
+  *any* client to every route gated only by `authenticate + requireCompany` — company-wide reads
+  of projects, ingestion sources and notifications, regardless of scopes. The fix follows from
+  the decision: machine callers are admitted **only** to routes carrying a `requireTool` gate,
+  detected by labelling each gate at construction and recording the tool-gated route patterns
+  through an `onRoute` hook. Everything else refuses them. Reusing the human authorization path
+  is what made the hole visible.
+- An OAuth client holds **no company role**, so `requireCompanyRole(["owner","admin"])` refuses
+  it outright: a machine caller can never mint credentials, its own or anyone else's.
+
+### 30.4 Connectors: fixture-proven, not vendor-proven
+
+`modules/ingestion/connectors.ts` now carries the **complete transport** for both vendors
+behind an injected HTTP client: credential resolution from the environment, the Procore OAuth2
+client-credentials exchange, the Aconex Basic + application-key scheme, the documented endpoint
+paths, page-by-page pagination with a page cap, and pure mapping into the ingestion datasets. A
+pull stages a real ingestion run with per-row provenance, which the operator then validates and
+commits through the existing routes (§24). Unconfigured, `POST /ingestion/sources/:id/pull`
+still returns **501 naming the exact environment variables and config keys** required.
+
+What is proven by fixtures: URL construction, per-vendor auth headers, the token exchange and
+its response parsing, page-walking and its termination conditions, error propagation on
+non-200s, and every mapping function. What has **never been exercised against a live vendor:
+all of it.** This deployment has no network route to either vendor and holds no credentials,
+and **the fixtures were authored from the vendors' published API shapes, not captured from real
+traffic.** Two consequences, stated rather than discovered: field names and envelope shapes are
+our best reading of the documentation — where a shape is known to vary (Aconex renders its XML
+search envelopes to JSON differently across versions) the extractor deliberately accepts
+several documented forms rather than claiming certainty — and **the first live pull should be
+treated as a discovery exercise.** Expect to adjust field names, not architecture.
+
+### 30.5 Known costs
+
+All three are in `docs/security.md` §8.2 as gaps 22–23, and all three are reported on the API
+responses that create the exposure:
+
+- **Secret custody defaults to shared.** With `WEBHOOK_SIGNING_KEY` unset the HKDF falls back
+  to `AUTH_SECRET`, so anyone who can read the application's JWT secret can forge a signature a
+  receiver would accept. Every endpoint read reports `keySource` with `sharedCustody: true` and
+  the remedy, so an operator is told rather than left to assume.
+- **Outbound webhooks are an egress path out of the tenant boundary.** A delivery leaves for an
+  operator-nominated URL and **endpoint URLs are not allowlisted** — no SSRF-style guard forbids
+  internal addresses — so a company admin can authorise what is effectively an exfiltration
+  channel. Per-company scoping, signing, delivery logging and auto-disable after consecutive
+  failures limit the blast radius; they do not close the class.
+- **Dispatch is an in-process timer, not a broker.** The alternative — draining the queue when
+  someone opens the deliveries page — was rejected because the operators who most need retries
+  are the ones not watching. The cost: with N API replicas the drain runs N times and the
+  re-entrancy guard is per-process, so **a receiver can see the same delivery twice.** That is
+  why every delivery carries a stable id and **dedupe on `x-constructos-delivery` is the
+  published contract** rather than something integrators are left to discover. Retries re-send
+  identical bytes and an identical signature (the timestamp is fixed at enqueue), so a
+  receiver's freshness window must cover the whole retry budget — attempts × max backoff, under
+  an hour by default. `SELECT … FOR UPDATE SKIP LOCKED` is the upgrade path and does not change
+  the wire format.
+
+### 30.6 Still absent
+
+Vol I §0.7's remaining surface is unbuilt and named so nobody discovers it in a demo: the
+developer sandbox (#123), the app marketplace (#124–125), MCP/agentic API exposure (#126–127),
+embedded experiences (#128–129), the wider **ERP connector framework** (#130–133) and
+P6/MS Project/Bluebeam/Autodesk exchange (#134–137). See `docs/roadmap.md`.
 
 ---
 
-## 28. Verification & test strategy
+## 31. Verification & test strategy
 
-- `packages/ledger` has pure unit tests (`src/ledger.test.ts`); so do the pure analysis
+**870 tests pass** on `pnpm test`: 827 in `apps/api` across 46 files (full-stack integration
+against in-memory PGlite) plus 43 in `packages/ledger` across 2 files (pure unit tests over the
+chain, Merkle and sealing cores). The retrospective-detection harness runs separately and is
+unchanged at **17/17 recall with 100% precision** (`docs/retrospective-detection.md`).
+
+- `packages/ledger` has pure unit tests (`src/ledger.test.ts`, `src/seal.test.ts`); so do the pure analysis
   cores in the API — the CPM engine (`apps/api/src/lib/cpm.test.ts`, hand-computed
   networks incl. the fragnet-TIA primitive), the prolongation calculator
   (`modules/forensics/prolongation.test.ts`), the Monte Carlo engine
@@ -1594,10 +2014,30 @@ outputs (#1020), full audit trail (#1021).**
   computations (`modules/benchmarks/metrics.ts`) — are exercised through the colocated
   suites `ingestion.test.ts` and `benchmarks.test.ts`, which also assert the invariants
   the modules' ADRs claim (hash-at-ingest, scope enforcement, show-once tokens,
-  contributor ids never leaving the database, min-n suppression).
+  contributor ids never leaving the database, min-n suppression). The Phase 7 pure cores are
+  covered the same way: sealing and `classifyChain` in `packages/ledger/src/seal.test.ts`,
+  the dated expiry engine in `modules/insurance/expiry.test.ts`, the mandatory-capture rules
+  in `modules/learning/triggers.test.ts`, and the delivery state machine in
+  `modules/integrations/dispatcher.test.ts` — the dispatcher never calls `fetch` directly, so
+  success, a 500 followed by a success, retry exhaustion and a connection that throws are all
+  driven through one injected transport, deterministically and in milliseconds.
 - Every API module colocates `<name>.test.ts` using `buildTestApp()`
   (`apps/api/src/test/helpers.ts`): a full Fastify app over in-memory PGlite with migrations
   applied — integration tests with zero external services, exercising the real auth chain via
   `registerActor()` and `app.inject()`.
+- **Adversarial tests where the claim is adversarial.** `modules/anchoring/anchoring.test.ts`
+  corrupts real database state rather than mocking a verifier: it truncates the tail, alters a
+  historical entry, forges a signature and removes a middle seal, and asserts each produces its
+  specific verdict with the offending sequence named. It also asserts the custody boundary
+  directly — that no route and no table ever yields private key material.
+- **One regression test pins a bug rather than merely fixing it.** Timestamp columns are
+  `mode: "string"`, so Postgres returns `2026-08-25 23:00:00+00` while the application produces
+  `2026-08-25T23:00:00Z`. Compared as strings the date halves agree and the **separator**
+  decides — a space (0x20) sorts before `T` (0x54) — so a credential valid until 23:00 read as
+  already expired at 10:00. It was invisible on every day except the one that mattered, it
+  affected assurance grants and ingestion API tokens, and it **failed closed** (access refused,
+  never wrongly granted). Every expiry comparison now goes through `epochMs`/`isExpired`/
+  `isFuture` in `apps/api/src/lib/time.ts`, and `lib/time.test.ts` asserts the *wrong*
+  comparison is wrong, so nobody reintroduces it believing it works.
 - CI (`.github/workflows/ci.yml`) runs typecheck, build and the full test suite on Node 22
   with a frozen lockfile.
