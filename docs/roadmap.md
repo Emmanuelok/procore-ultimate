@@ -842,15 +842,17 @@ apart because they carry different risk: **structural holes** (things the platfo
 to be but cannot yet do) and **breadth** (spec surface deliberately not built). Function
 numbers are from `docs/master-specification.md`.
 
-### Structural holes — the two that matter
+### Structural holes — one closed, one now a deployment condition
 
 | # | What is missing | Why it is structural |
 |---|---|---|
 | 1 | **A real third-party feed through M6** (Vol III Tier 1; Domain N #705–711, #715; S#862) | Phase 6 built the pathway: records can now arrive staged, hashed at ingest and — via dataset-scoped machine tokens — through a channel the operator's user sessions do not share (`POST /ingestion/push/:dataset`; ADR 0014, ADR 0015). What no deployment has yet done is connect one: the Procore/Aconex transports return 501 pending credentials, and no turnstile vendor, bank or telematics provider posts to a production instance. The hole is smaller than it was — a capability gap became a deployment gap — but until a real feed flows, "reconciled against independent evidence" is a capability of the product exercised by nobody, and the platform still cannot prove who holds a token (`docs/security.md` §8.2 gap 17). |
-| 2 | **M1 anchoring & escrow** (Domain S #860–861, #864, #873–874) | The chain is tamper-evident against edits and internally verifiable, but a DB insider can truncate the tail or rewrite the whole chain undetectably, and `at` is the app-server clock. Both Tier-3 acceptance criteria and the credibility of any published retrospective run rest on this. Tracked as open gaps 2–3 in `docs/security.md` §8.2. |
+| 2 | ~~**M1 anchoring & escrow**~~ — **closed in Phase 7** (Domain S #860–861, #864, #873–874) | Seals commit to `entryCount` and a Merkle root over every entry hash, signed Ed25519 with a key whose private half never enters the database and chained to one another, so tail truncation and wholesale rewrite are now detected — tested against real corrupted database state, not mocks — and escrow receipts let a third party verify offline. What is left is not a hole but a **custody** condition: with `ANCHOR_SIGNING_KEY` unset the key is derived from `AUTH_SECRET` and proves integrity against a database-only attacker, not against the operator; and without a timestamp authority configured, seals prove order rather than wall-clock time. Both are carried in the API responses themselves. See ADR 0017 and `docs/security.md` §8.2 gaps 2–3, rewritten accordingly. |
 
-Everything else on this page is scope. These two are the difference between a very good
-system of record and the product Vol III describes.
+Everything else on this page is scope. These two were the difference between a very good
+system of record and the product Vol III describes. Phase 7 closed the second outright.
+The first is no longer a capability gap either — what remains of it is counterparty work:
+connecting a feed, and attesting who operates the system that pushes it.
 
 ### Vol II — gap domains still absent
 
