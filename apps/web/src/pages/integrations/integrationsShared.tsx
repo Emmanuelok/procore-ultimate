@@ -568,7 +568,7 @@ export function DefRow({ label, children }: { label: string; children: ReactNode
   return (
     <div className="grid grid-cols-[10rem_1fr] gap-3 border-b border-ink-50 py-1.5 text-sm last:border-0">
       <span className="text-xs font-medium uppercase tracking-wide text-ink-400">{label}</span>
-      <span className="min-w-0 break-words text-ink-800">{children}</span>
+      <div className="min-w-0 break-words text-ink-800">{children}</div>
     </div>
   );
 }

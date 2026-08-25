@@ -42,7 +42,16 @@ export default function EventKindPicker({
   const [custom, setCustom] = useState("");
   const [customError, setCustomError] = useState<string | null>(null);
 
-  const everything = value.length === 0 || value.includes("*");
+  /*
+   * "Every kind" and "explicit list" are two intentions that an empty array
+   * cannot distinguish — the API reads [] as EVERY kind, not as none. So the
+   * intention is tracked here, and the one dangerous combination (explicit
+   * mode with nothing selected, which would silently save as "everything") is
+   * called out rather than papered over with a seeded default.
+   */
+  const [explicit, setExplicit] = useState(value.length > 0 && !value.includes("*"));
+  const everything = !explicit;
+  const explicitButEmpty = explicit && value.length === 0;
 
   const toggle = (entry: string) => {
     if (disabled) return;
@@ -85,7 +94,10 @@ export default function EventKindPicker({
           type="checkbox"
           checked={everything}
           disabled={disabled}
-          onChange={(e) => onChange(e.target.checked ? [] : ["*.create"])}
+          onChange={(e) => {
+            setExplicit(!e.target.checked);
+            onChange([]);
+          }}
           className="mt-0.5 h-4 w-4 rounded border-ink-300 text-brand-600 focus:ring-brand-500"
         />
         <span>
@@ -100,6 +112,15 @@ export default function EventKindPicker({
 
       {!everything ? (
         <>
+          {explicitButEmpty ? (
+            <Caveat tone="red">
+              <span className="font-semibold">Nothing is selected.</span> Saving now stores an empty{" "}
+              <code className="font-mono">eventKinds</code> list, and the API reads an empty list as{" "}
+              <strong>every kind</strong> — not as none. Pick at least one subscription below, or
+              tick &ldquo;Deliver every kind&rdquo; above so the intention is recorded deliberately.
+            </Caveat>
+          ) : null}
+
           {/* ----------------------------- selection ---------------------------- */}
           <div>
             <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-ink-500">
