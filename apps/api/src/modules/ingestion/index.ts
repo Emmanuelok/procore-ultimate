@@ -35,12 +35,13 @@ import {
 } from "@constructos/shared";
 import { hashPayload, sha256Hex } from "@constructos/ledger";
 import { newId } from "../../lib/ids.js";
+import { isExpired } from "../../lib/time.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
-import { AppError, badRequest, conflict, forbidden, notFound, unauthorized } from "../../lib/errors.js";
+import { badRequest, conflict, forbidden, notFound, unauthorized } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import type { Db } from "../../lib/db.js";
-import { ACONEX_REQUIREMENTS, PROCORE_REQUIREMENTS } from "./connectors.js";
+import { connectorPull } from "./connectors.js";
 import {
   coerceRow,
   datasetCatalog,
@@ -981,29 +982,19 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
   /* Connector pull — honest 501 scaffolding (see connectors.ts)       */
   /* ---------------------------------------------------------------- */
 
+  // The transport, OAuth2 exchange, pagination and mapping all live in
+  // connectors.ts; this route is the wiring. When credentials and a base URL
+  // are absent it still refuses with 501, now naming the exact env vars.
   app.post("/ingestion/sources/:sourceId/pull", { preHandler: adminGate }, async (req) => {
     const { sourceId } = req.params as { sourceId: string };
     const source = await fetchSource(sourceId, req.companyId!);
-    if (source.kind === "csv") {
-      throw badRequest("csv sources take file uploads — POST /ingestion/runs");
-    }
-    if (source.kind === "api_token") {
-      throw badRequest("api_token sources receive machine pushes — POST /ingestion/push/:dataset");
-    }
-    const requirements = source.kind === "procore" ? PROCORE_REQUIREMENTS : ACONEX_REQUIREMENTS;
-    // Not implemented and not pretended: this sandbox cannot reach either
-    // vendor and holds no credentials. The body names exactly what a real
-    // pull needs; the mapping layer is already written and fixture-tested.
-    throw new AppError(
-      501,
-      `${source.kind} pull is not implemented in this deployment: there is no network route ` +
-        "to the vendor and no credentials are configured. Nothing was fetched and nothing was staged.",
-      {
-        connector: requirements.connector,
-        required: { credentials: requirements.credentials, config: requirements.config },
-        note: requirements.note,
-      },
-    );
+    return connectorPull({
+      db: app.db,
+      source,
+      companyId: req.companyId!,
+      actorId: req.user!.id,
+      body: req.body,
+    });
   });
 
   /* ---------------------------------------------------------------- */
@@ -1398,7 +1389,7 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
     if (!token) throw unauthorized("Invalid API token");
     const nowIso = new Date().toISOString();
     if (token.revokedAt) throw unauthorized("API token has been revoked");
-    if (token.expiresAt && token.expiresAt <= nowIso) throw unauthorized("API token has expired");
+    if (isExpired(token.expiresAt)) throw unauthorized("API token has expired");
     if (!(token.scopes as string[]).includes(def.dataset)) {
       throw forbidden(`Token is not scoped for dataset ${def.dataset}`);
     }

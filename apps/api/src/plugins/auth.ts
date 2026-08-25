@@ -21,6 +21,17 @@ import {
   type ToolPermissionMap,
 } from "@constructos/shared";
 import { forbidden, unauthorized } from "../lib/errors.js";
+import { isExpired } from "../lib/time.js";
+// Vol I §0.7 #120 — machine callers. This gate needed four small additions,
+// all marked below: resolve an OAuth2 access token to a machine identity in
+// `authenticate`, branch to the machine equivalents in `requireCompany` and
+// `requireTool`, label each tool gate, and record which routes carry one. The
+// point of all of it is that a machine goes THROUGH these checks rather than
+// around them. See modules/integrations/machine-auth.ts for why it cannot
+// live outside this file: hooks and content-type parsers are
+// plugin-encapsulated, and the integrations module is registered last, so
+// nothing it adds can reach routes registered before it.
+import { machineAuth } from "../modules/integrations/machine-auth.js";
 
 const authPlugin: FastifyPluginAsync = async (app) => {
   const secret = new TextEncoder().encode(app.appConfig.AUTH_SECRET);
@@ -38,6 +49,7 @@ const authPlugin: FastifyPluginAsync = async (app) => {
   app.decorate("authenticate", async (req: FastifyRequest) => {
     const header = req.headers.authorization;
     if (!header?.startsWith("Bearer ")) throw unauthorized("Missing bearer token");
+    if (await machineAuth.resolve(app.db, req, header.slice(7))) return;
     let sub: string | undefined;
     try {
       const { payload } = await jwtVerify(header.slice(7), secret);
@@ -58,6 +70,7 @@ const authPlugin: FastifyPluginAsync = async (app) => {
 
   app.decorate("requireCompany", async (req: FastifyRequest) => {
     if (!req.user) throw unauthorized();
+    if (req.machineClient) return machineAuth.company(req);
     const companyId = req.headers["x-company-id"];
     if (typeof companyId !== "string" || !companyId) {
       throw unauthorized("Missing x-company-id header");
@@ -89,7 +102,7 @@ const authPlugin: FastifyPluginAsync = async (app) => {
   app.decorate("requireAssuranceRole", (roles: AssuranceRole[]) => {
     return async (req: FastifyRequest) => {
       if (!req.user || !req.companyId) throw unauthorized();
-      const now = new Date().toISOString();
+      const nowMs = Date.now();
       const grants = await app.db
         .select()
         .from(assuranceGrants)
@@ -101,7 +114,7 @@ const authPlugin: FastifyPluginAsync = async (app) => {
         );
       const grant = grants.find(
         (g) =>
-          roles.includes(g.role as AssuranceRole) && (!g.expiresAt || g.expiresAt > now),
+          roles.includes(g.role as AssuranceRole) && !isExpired(g.expiresAt, nowMs),
       );
       if (!grant) throw forbidden("Requires an assurance role");
       req.assuranceRole = grant.role as AssuranceRole;
@@ -109,8 +122,12 @@ const authPlugin: FastifyPluginAsync = async (app) => {
   });
 
   app.decorate("requireTool", (tool: ToolKey, level: PermissionLevel) => {
-    return async (req: FastifyRequest) => {
+    // machineAuth.markToolGate labels this closure so the onRoute hook below
+    // can tell which routes are tool-scoped — machine callers are admitted
+    // only to those. It changes nothing about how the gate behaves.
+    return machineAuth.markToolGate(async (req: FastifyRequest) => {
       if (!req.user || !req.companyId) throw unauthorized("Company context not resolved");
+      if (req.machineClient) return machineAuth.tool(app.db, req, tool, level);
       const params = req.params as Record<string, string | undefined>;
       const projectId = params["projectId"];
       if (!projectId) throw forbidden("Route is missing :projectId");
@@ -167,7 +184,7 @@ const authPlugin: FastifyPluginAsync = async (app) => {
 
       // Assurance roles grant read-only visibility over operational tools.
       if (level === "read") {
-        const now = new Date().toISOString();
+        const nowMs = Date.now();
         const grants = await app.db
           .select()
           .from(assuranceGrants)
@@ -178,7 +195,7 @@ const authPlugin: FastifyPluginAsync = async (app) => {
               or(isNull(assuranceGrants.projectId), eq(assuranceGrants.projectId, projectId)),
             ),
           );
-        const grant = grants.find((g) => !g.expiresAt || g.expiresAt > now);
+        const grant = grants.find((g) => !isExpired(g.expiresAt, nowMs));
         if (grant) {
           req.assuranceRole = grant.role as AssuranceRole;
           return;
@@ -186,8 +203,13 @@ const authPlugin: FastifyPluginAsync = async (app) => {
       }
 
       throw forbidden(`Requires ${level} access to ${tool}`);
-    };
+    }, tool, level);
   });
+
+  // Vol I §0.7 #120 — record which routes carry a tool gate. This plugin is
+  // non-encapsulated and loads before every module, so the hook sees every
+  // route in the API; machine callers are refused anywhere it does not fire.
+  app.addHook("onRoute", machineAuth.noteRoute);
 };
 
 export default fp(authPlugin, { name: "auth" });
