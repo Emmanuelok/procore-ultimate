@@ -1053,22 +1053,6 @@ export function Caveat({ children }: { children: ReactNode }) {
   );
 }
 
-/** The loudest thing on the page: a deadline that has already gone. */
-export function FatalBanner({
-  title,
-  children,
-}: {
-  title: string;
-  children?: ReactNode;
-}) {
-  return (
-    <div className="rounded-md border-l-4 border-red-700 bg-red-900 px-4 py-3 text-red-50 shadow-sm">
-      <div className="text-sm font-bold uppercase tracking-wide">{title}</div>
-      {children ? <div className="mt-1 text-xs leading-relaxed text-red-100">{children}</div> : null}
-    </div>
-  );
-}
-
 /**
  * Deadline countdown chip.
  *
@@ -1124,28 +1108,6 @@ export function DeadlineChip({
       {text}
       {suffix ? <span className="ml-1 font-normal opacity-80">{suffix}</span> : null}
     </span>
-  );
-}
-
-/** A per-currency money list. Currencies are never summed together. */
-export function CurrencyRows({
-  rows,
-  empty = "—",
-  dp = 2,
-}: {
-  rows: { currency: string; amount: number | null }[];
-  empty?: string;
-  dp?: number;
-}) {
-  if (rows.length === 0) return <span className="text-ink-400">{empty}</span>;
-  return (
-    <div className="space-y-0.5">
-      {rows.map((r) => (
-        <div key={r.currency} className="whitespace-nowrap tabular-nums">
-          {fmtMoney(r.amount, r.currency, dp)}
-        </div>
-      ))}
-    </div>
   );
 }
 
