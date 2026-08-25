@@ -131,3 +131,51 @@ in this document** — a limitation stated in an ADR nobody reads is a limitatio
 reach, and never let a verification path answer from data the party under examination
 supplied. Both would restore the self-attestation this ADR exists to end — the first by
 handing the attacker the signature, the second by handing them the verdict.
+
+## Amendment — the first implementation broke its own rule
+
+An adversarial pass against a real Postgres, mutating rows behind the running server,
+defeated the design as first built. The attack is worth recording in full because the flaw
+was in exactly the place this ADR claimed to be careful about.
+
+The private half of the signing key was outside the database, as designed. **The public half
+was not.** Signature checking merged every row of `signing_keys` into its trusted key set —
+a table inside the database the seal exists to police. So an attacker with database write
+access and nothing else could: rewrite the chain from genesis so it was internally perfect,
+generate their own Ed25519 key, `INSERT` its public half under a fresh key id, and re-sign
+every seal. The observed verdict was `intact`, `signaturesChecked: 3`, `unknownKeyIds: []`.
+
+It was worse than silent. Because the attacker chose their own key id and no rule reserved
+the environment-key prefix, the forged chain reported a *stronger* guarantee than the honest
+one — `weakening: null` where the legitimate derived key would have carried its warning.
+
+This is the second half of the forbidden shortcut above, committed by the ADR's own author:
+the verification path was answering from data the party under examination supplied. A
+signature is only as good as the verifier's prior knowledge of which public key to expect,
+and that knowledge was being fetched from the store under attack.
+
+**The fix is to move the trust anchor out of reach of the database.**
+`ANCHOR_TRUSTED_FINGERPRINTS` pins the acceptable public-key fingerprints in the
+environment. Pinned, a key registered in `signing_keys` is unusable unless the operator
+vouched for its fingerprint out of band, and a seal signed under anything else is reported
+as `seal_forged` rather than as merely uncheckable — because under a pin those are different
+claims. The process's own key is subject to the same pin, so an operator who pins and then
+runs with a key outside the set is refused at seal time rather than quietly minting seals no
+verifier will accept.
+
+**Unpinned behaviour is deliberately unchanged, and now says so.** From inside the database,
+an attacker-registered key and a legitimate rotation are indistinguishable — `retired_at` is
+attacker-controlled too — so treating an unknown key as a forgery without a pin would break
+the module's promise that rotation does not invalidate earlier seals. Instead every verdict
+carries a `trustAnchor` block, and when unpinned, a limitation naming this exact attack and
+its remedy.
+
+The claim this ADR may make is therefore bounded, and the bound is now the first thing a
+verdict states: **sealing defeats a database-only attacker who does not also register a key;
+pinning the fingerprints out of band removes that qualifier.** Three tests reproduce the
+exploit end to end — unpinned it verifies, pinned it is caught, and an honest chain still
+verifies under its own pin.
+
+The general lesson generalises past this module: *a cryptographic check inherits the
+trustworthiness of wherever its public parameters came from.* Signing was never the weak
+point; knowing whose signature to expect was.
