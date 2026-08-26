@@ -1,9 +1,29 @@
+/**
+ * App — routing and the provider stack.
+ *
+ * Provider order matters and is deliberate:
+ *
+ *   BrowserRouter        useNavigate must exist for everything below
+ *     AuthProvider       identity + the active company
+ *       ShortcutsProvider  one window listener + the "?" cheat sheet
+ *         ShellDataProvider live badge counts and the project cache
+ *           SearchProvider   the ⌘K palette (claims its own binding)
+ *             Routes
+ *
+ * ThemeProvider, <Toaster /> and the root <AppErrorBoundary> are mounted a
+ * level up, in main.tsx.
+ */
 import { lazy, Suspense, type ReactNode } from "react";
-import { BrowserRouter, Route, Routes } from "react-router-dom";
-import { AuthProvider, RequireAuth } from "./lib/auth";
+import { BrowserRouter, Route, Routes, useNavigate } from "react-router-dom";
+import { AuthProvider, RequireAuth, useAuth } from "./lib/auth";
+import { SearchProvider } from "./lib/search";
+import { ShortcutsProvider } from "./lib/shortcuts";
+import { ShellDataProvider } from "./layouts/shell/shell-data";
+import { RouteFallback } from "./layouts/shell/RouteFallback";
 import AppLayout from "./layouts/AppLayout";
 import ProjectLayout from "./layouts/ProjectLayout";
-import { Spinner } from "./ui";
+import { Button, EmptyState } from "./ui";
+import { IconEmpty } from "./ui/icons";
 
 const LoginPage = lazy(() => import("./pages/auth/LoginPage"));
 const RegisterPage = lazy(() => import("./pages/auth/RegisterPage"));
@@ -51,365 +71,104 @@ const LearningPage = lazy(() => import("./pages/learning/LearningPage"));
 const IntegrationsPage = lazy(() => import("./pages/integrations/IntegrationsPage"));
 const InsurancePage = lazy(() => import("./pages/insurance/InsurancePage"));
 
+/* --------------------------------------------------------------------------
+ * The financial suite (M2–M6). Five complete, project-scoped workspaces that
+ * shipped without routes; each exports a default component and reads
+ * `projectId` from useParams.
+ * ----------------------------------------------------------------------- */
+const BudgetPage = lazy(() => import("./pages/budget/BudgetPage"));
+const PrimeContractPage = lazy(() => import("./pages/primecontracts/PrimeContractPage"));
+const CommitmentsPage = lazy(() => import("./pages/commitments/CommitmentsPage"));
+const ChangesPage = lazy(() => import("./pages/changes/ChangesPage"));
+const InvoicingPage = lazy(() => import("./pages/invoicing/InvoicingPage"));
+
+/** Per-route suspense: only the page body swaps, never the surrounding chrome. */
 function S({ children }: { children: ReactNode }) {
-  return <Suspense fallback={<Spinner />}>{children}</Suspense>;
+  return <Suspense fallback={<RouteFallback />}>{children}</Suspense>;
+}
+
+function NotFound() {
+  const navigate = useNavigate();
+  return (
+    <div className="flex min-h-dvh items-center justify-center bg-surface p-6">
+      <EmptyState
+        size="lg"
+        icon={IconEmpty}
+        title="Page not found"
+        hint="That address does not match any route in ConstructOS. It may have moved, or the link may be incomplete."
+        action={
+          <Button size="sm" onClick={() => navigate("/")}>
+            Back to dashboard
+          </Button>
+        }
+      />
+    </div>
+  );
+}
+
+/** Keeps the keyboard layer quiet on the unauthenticated screens. */
+function Providers({ children }: { children: ReactNode }) {
+  const { user } = useAuth();
+  return (
+    <ShortcutsProvider disabled={!user}>
+      <ShellDataProvider>
+        <SearchProvider>{children}</SearchProvider>
+      </ShellDataProvider>
+    </ShortcutsProvider>
+  );
 }
 
 export default function App() {
   return (
     <BrowserRouter>
       <AuthProvider>
-        <Routes>
-          <Route
-            path="/login"
-            element={
-              <S>
-                <LoginPage />
-              </S>
-            }
-          />
-          <Route
-            path="/register"
-            element={
-              <S>
-                <RegisterPage />
-              </S>
-            }
-          />
-          <Route
-            path="/"
-            element={
-              <RequireAuth>
-                <AppLayout />
-              </RequireAuth>
-            }
-          >
+        <Providers>
+          <Routes>
             <Route
-              index
+              path="/login"
               element={
                 <S>
-                  <DashboardPage />
+                  <LoginPage />
                 </S>
               }
             />
             <Route
-              path="projects"
+              path="/register"
               element={
                 <S>
-                  <ProjectsPage />
+                  <RegisterPage />
                 </S>
               }
             />
             <Route
-              path="directory"
+              path="/"
               element={
-                <S>
-                  <DirectoryPage />
-                </S>
+                <RequireAuth>
+                  <AppLayout />
+                </RequireAuth>
               }
-            />
-            <Route
-              path="assurance"
-              element={
-                <S>
-                  <CompanyAssurancePage />
-                </S>
-              }
-            />
-            <Route
-              path="ingestion"
-              element={
-                <S>
-                  <IngestionPage />
-                </S>
-              }
-            />
-            <Route
-              path="benchmarks"
-              element={
-                <S>
-                  <BenchmarksPage />
-                </S>
-              }
-            />
-            <Route
-              path="ledger"
-              element={
-                <S>
-                  <LedgerPage />
-                </S>
-              }
-            />
-            <Route
-              path="learning"
-              element={
-                <S>
-                  <LearningPage />
-                </S>
-              }
-            />
-            <Route
-              path="integrations"
-              element={
-                <S>
-                  <IntegrationsPage />
-                </S>
-              }
-            />
-            <Route
-              path="notifications"
-              element={
-                <S>
-                  <NotificationsPage />
-                </S>
-              }
-            />
-            <Route
-              path="admin"
-              element={
-                <S>
-                  <AdminPage />
-                </S>
-              }
-            />
-            <Route path="projects/:projectId" element={<ProjectLayout />}>
+            >
               <Route
                 index
                 element={
                   <S>
-                    <ProjectOverviewPage />
+                    <DashboardPage />
                   </S>
                 }
               />
               <Route
-                path="documents"
+                path="projects"
                 element={
                   <S>
-                    <DocumentsPage />
+                    <ProjectsPage />
                   </S>
                 }
               />
               <Route
-                path="drawings"
+                path="directory"
                 element={
                   <S>
-                    <DrawingsPage />
-                  </S>
-                }
-              />
-              <Route
-                path="drawings/:sheetId"
-                element={
-                  <S>
-                    <SheetViewerPage />
-                  </S>
-                }
-              />
-              <Route
-                path="bim"
-                element={
-                  <S>
-                    <BimPage />
-                  </S>
-                }
-              />
-              <Route
-                path="bim/:modelId"
-                element={
-                  <S>
-                    <ModelViewerPage />
-                  </S>
-                }
-              />
-              <Route
-                path="twin"
-                element={
-                  <S>
-                    <TwinPage />
-                  </S>
-                }
-              />
-              <Route
-                path="rfis"
-                element={
-                  <S>
-                    <RfisPage />
-                  </S>
-                }
-              />
-              <Route
-                path="rfis/:rfiId"
-                element={
-                  <S>
-                    <RfiDetailPage />
-                  </S>
-                }
-              />
-              <Route
-                path="submittals"
-                element={
-                  <S>
-                    <SubmittalsPage />
-                  </S>
-                }
-              />
-              <Route
-                path="submittals/:submittalId"
-                element={
-                  <S>
-                    <SubmittalDetailPage />
-                  </S>
-                }
-              />
-              <Route
-                path="daily-logs"
-                element={
-                  <S>
-                    <DailyLogsPage />
-                  </S>
-                }
-              />
-              <Route
-                path="punch"
-                element={
-                  <S>
-                    <PunchPage />
-                  </S>
-                }
-              />
-              <Route
-                path="photos"
-                element={
-                  <S>
-                    <PhotosPage />
-                  </S>
-                }
-              />
-              <Route
-                path="schedule"
-                element={
-                  <S>
-                    <SchedulePage />
-                  </S>
-                }
-              />
-              <Route
-                path="risk"
-                element={
-                  <S>
-                    <RiskPage />
-                  </S>
-                }
-              />
-              <Route
-                path="land"
-                element={
-                  <S>
-                    <LandPage />
-                  </S>
-                }
-              />
-              <Route
-                path="workforce"
-                element={
-                  <S>
-                    <WorkforcePage />
-                  </S>
-                }
-              />
-              <Route
-                path="esg"
-                element={
-                  <S>
-                    <EsgPage />
-                  </S>
-                }
-              />
-              <Route
-                path="jurisdiction"
-                element={
-                  <S>
-                    <JurisdictionPage />
-                  </S>
-                }
-              />
-              <Route
-                path="insurance"
-                element={
-                  <S>
-                    <InsurancePage />
-                  </S>
-                }
-              />
-              <Route
-                path="analytics"
-                element={
-                  <S>
-                    <AnalyticsPage />
-                  </S>
-                }
-              />
-              <Route
-                path="governance"
-                element={
-                  <S>
-                    <GovernancePage />
-                  </S>
-                }
-              />
-              <Route
-                path="finance"
-                element={
-                  <S>
-                    <FinancePage />
-                  </S>
-                }
-              />
-              <Route
-                path="disputes"
-                element={
-                  <S>
-                    <DisputesPage />
-                  </S>
-                }
-              />
-              <Route
-                path="forensics"
-                element={
-                  <S>
-                    <ForensicsPage />
-                  </S>
-                }
-              />
-              <Route
-                path="payments"
-                element={
-                  <S>
-                    <PaymentsPage />
-                  </S>
-                }
-              />
-              <Route
-                path="commercial"
-                element={
-                  <S>
-                    <CommercialPage />
-                  </S>
-                }
-              />
-              <Route
-                path="contracts"
-                element={
-                  <S>
-                    <ContractsPage />
-                  </S>
-                }
-              />
-              <Route
-                path="contracts/:contractId"
-                element={
-                  <S>
-                    <ContractDetailPage />
+                    <DirectoryPage />
                   </S>
                 }
               />
@@ -417,29 +176,370 @@ export default function App() {
                 path="assurance"
                 element={
                   <S>
-                    <AssurancePage />
+                    <CompanyAssurancePage />
                   </S>
                 }
               />
               <Route
-                path="ai"
+                path="ingestion"
                 element={
                   <S>
-                    <AiPage />
+                    <IngestionPage />
                   </S>
                 }
               />
+              <Route
+                path="benchmarks"
+                element={
+                  <S>
+                    <BenchmarksPage />
+                  </S>
+                }
+              />
+              <Route
+                path="ledger"
+                element={
+                  <S>
+                    <LedgerPage />
+                  </S>
+                }
+              />
+              <Route
+                path="learning"
+                element={
+                  <S>
+                    <LearningPage />
+                  </S>
+                }
+              />
+              <Route
+                path="integrations"
+                element={
+                  <S>
+                    <IntegrationsPage />
+                  </S>
+                }
+              />
+              <Route
+                path="notifications"
+                element={
+                  <S>
+                    <NotificationsPage />
+                  </S>
+                }
+              />
+              <Route
+                path="admin"
+                element={
+                  <S>
+                    <AdminPage />
+                  </S>
+                }
+              />
+              <Route path="projects/:projectId" element={<ProjectLayout />}>
+                <Route
+                  index
+                  element={
+                    <S>
+                      <ProjectOverviewPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="documents"
+                  element={
+                    <S>
+                      <DocumentsPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="drawings"
+                  element={
+                    <S>
+                      <DrawingsPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="drawings/:sheetId"
+                  element={
+                    <S>
+                      <SheetViewerPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="bim"
+                  element={
+                    <S>
+                      <BimPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="bim/:modelId"
+                  element={
+                    <S>
+                      <ModelViewerPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="twin"
+                  element={
+                    <S>
+                      <TwinPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="rfis"
+                  element={
+                    <S>
+                      <RfisPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="rfis/:rfiId"
+                  element={
+                    <S>
+                      <RfiDetailPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="submittals"
+                  element={
+                    <S>
+                      <SubmittalsPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="submittals/:submittalId"
+                  element={
+                    <S>
+                      <SubmittalDetailPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="daily-logs"
+                  element={
+                    <S>
+                      <DailyLogsPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="punch"
+                  element={
+                    <S>
+                      <PunchPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="photos"
+                  element={
+                    <S>
+                      <PhotosPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="schedule"
+                  element={
+                    <S>
+                      <SchedulePage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="risk"
+                  element={
+                    <S>
+                      <RiskPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="land"
+                  element={
+                    <S>
+                      <LandPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="workforce"
+                  element={
+                    <S>
+                      <WorkforcePage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="esg"
+                  element={
+                    <S>
+                      <EsgPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="jurisdiction"
+                  element={
+                    <S>
+                      <JurisdictionPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="insurance"
+                  element={
+                    <S>
+                      <InsurancePage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="analytics"
+                  element={
+                    <S>
+                      <AnalyticsPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="governance"
+                  element={
+                    <S>
+                      <GovernancePage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="finance"
+                  element={
+                    <S>
+                      <FinancePage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="disputes"
+                  element={
+                    <S>
+                      <DisputesPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="forensics"
+                  element={
+                    <S>
+                      <ForensicsPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="payments"
+                  element={
+                    <S>
+                      <PaymentsPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="commercial"
+                  element={
+                    <S>
+                      <CommercialPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="contracts"
+                  element={
+                    <S>
+                      <ContractsPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="contracts/:contractId"
+                  element={
+                    <S>
+                      <ContractDetailPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="assurance"
+                  element={
+                    <S>
+                      <AssurancePage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="ai"
+                  element={
+                    <S>
+                      <AiPage />
+                    </S>
+                  }
+                />
+
+                {/* ---- financial suite ---- */}
+                <Route
+                  path="budget"
+                  element={
+                    <S>
+                      <BudgetPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="prime-contract"
+                  element={
+                    <S>
+                      <PrimeContractPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="commitments"
+                  element={
+                    <S>
+                      <CommitmentsPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="changes"
+                  element={
+                    <S>
+                      <ChangesPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="invoicing"
+                  element={
+                    <S>
+                      <InvoicingPage />
+                    </S>
+                  }
+                />
+              </Route>
             </Route>
-          </Route>
-          <Route
-            path="*"
-            element={
-              <div className="flex h-screen items-center justify-center text-ink-400">
-                Page not found
-              </div>
-            }
-          />
-        </Routes>
+            <Route path="*" element={<NotFound />} />
+          </Routes>
+        </Providers>
       </AuthProvider>
     </BrowserRouter>
   );
