@@ -47,6 +47,28 @@ Use S3. The local driver exists for development and as an escape hatch.
 
 ---
 
+## 1.9 Production image — verified, not assumed
+
+The image in this repo was built and booted before this release shipped, because a
+deployment that fails at boot costs more than the check does. What was verified, on
+2026-08-26, against the exact `Dockerfile` and `railway.json` here:
+
+| Check | Result |
+|---|---|
+| Image builds with the full dependency set (React 19, Tailwind v4, recharts, framer-motion, TanStack Table, pdf.js, three/web-ifc) | builds clean |
+| Container boots with only `AUTH_SECRET` set | `/api/v1/health` → 200, `db: pglite` |
+| Container boots against real PostgreSQL 16 via `DATABASE_URL` | `/api/v1/health` → 200, `db: postgres` |
+| Migrations 0000–0008 apply at boot on a virgin Postgres | **177 tables created**, including all 17 financial tables |
+| SPA served same-origin from the API container | `GET /` → 200 |
+| Financial API end to end inside the image | project → cost code → budget → budget line; `revisedBudget` = `originalBudget` + `approvedChanges` reconciled |
+| Hash-chained ledger inside the image | `/ledger/verify` → `{"valid": true}` |
+
+Two refusals fired correctly during that walkthrough and are worth knowing about, because
+both look like errors and are not: creating a project with an invalid `stage` returns a
+zod validation error naming the five permitted values, and creating a budget line without
+a cost code is refused outright — budget lines bind to the project's cost-code structure
+rather than inventing a parallel hierarchy.
+
 ## 2. Runbook
 
 > **Fast path — one command.** Everything in §2.1–§2.6 is scripted:
