@@ -58,10 +58,22 @@ export function renderIconLike(
   className?: string,
 ): ReactNode {
   if (icon === null || icon === undefined || icon === false) return null;
-  if (typeof icon === "function") {
+  // An already-built element passes straight through. Check this BEFORE the
+  // component test: an element is also an object carrying $$typeof.
+  if (isValidElement(icon)) return icon;
+  // A component may be a plain function OR an object — forwardRef and memo
+  // both produce `{$$typeof, render}`, which is what every lucide icon is.
+  // Testing only for `typeof === "function"` let those fall through to the
+  // raw return below, and React refuses to render an object as a child:
+  // "Objects are not valid as a React child (found: object with keys
+  // {$$typeof, render})". That crashed every Timeline, DataTable, toolbar and
+  // description list that was handed an icon component rather than an element.
+  if (
+    typeof icon === "function" ||
+    (typeof icon === "object" && icon !== null && "$$typeof" in (icon as object))
+  ) {
     return createElement(icon as IconComponent, { size, className });
   }
-  if (isValidElement(icon)) return icon;
   if (typeof icon === "string" || typeof icon === "number") return icon;
   return icon as ReactNode;
 }
