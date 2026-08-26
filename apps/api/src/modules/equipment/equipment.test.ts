@@ -165,7 +165,7 @@ beforeAll(async () => {
 
   const tokenRes = await post("/ingestion/tokens", {
     name: "OEM telematics feed",
-    scopes: ["evidence"],
+    scopes: ["telematics"],
   });
   expect(tokenRes.statusCode).toBe(201);
   pushToken = tokenRes.json().token as string;

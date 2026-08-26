@@ -47,15 +47,13 @@ export const TELEMATICS_DATASET = "telematics" as const;
 /**
  * API-token scopes accepted by the telematics inlet.
  *
- * `telematics` is the intended scope. `evidence` is accepted as well because
- * `POST /ingestion/tokens` validates requested scopes against
- * `INGESTION_DATASETS`, which does not yet carry a telematics member — so no
- * token can be MINTED with the intended scope until that shared enum gains
- * one. Accepting the generic machine-evidence scope keeps the inlet usable
- * without widening a token to every dataset on the platform, and the check
- * starts refusing `evidence` the day `telematics` becomes mintable.
+ * `telematics` is now a real member of INGESTION_DATASETS, so a machine token
+ * can be minted with exactly this scope and nothing broader. The `evidence`
+ * fallback that existed while the enum lacked the member has been removed: a
+ * telematics feed should not be able to write evidence, and an evidence feed
+ * should not be able to write plant hours.
  */
-export const TELEMATICS_PUSH_SCOPES: readonly string[] = [TELEMATICS_DATASET, "evidence"];
+export const TELEMATICS_PUSH_SCOPES: readonly string[] = [TELEMATICS_DATASET];
 
 export interface TelematicsFieldIssue {
   field: string | null;

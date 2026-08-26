@@ -421,6 +421,16 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
     const num = (p: Record<string, unknown>, k: string) => p[k] as number | undefined;
 
     switch (dataset) {
+      // Committed by the equipment module through its own inlet, never here.
+      // The dataset is a first-class member so tokens can carry its scope and
+      // its runs can be filtered; reaching this writer means a CSV run was
+      // started for it, which the wizard should have refused.
+      case "telematics":
+        throw badRequest(
+          "Telematics readings are committed by the equipment module through " +
+            "POST /api/v1/ingestion/push/telematics, not by a CSV run. Push them " +
+            "with a machine token scoped to `telematics`.",
+        );
       case "vendors": {
         const outcomes: RowOutcome[] = [];
         const values: (typeof vendors.$inferInsert)[] = rows.map((r) => {

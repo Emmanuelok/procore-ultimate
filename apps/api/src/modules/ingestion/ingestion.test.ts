@@ -345,7 +345,7 @@ describe("connector mappings", () => {
 /* ------------------------------------------------------------------ */
 
 describe("sources & dataset registry", () => {
-  it("GET /ingestion/datasets describes all 8 datasets with typed fields", async () => {
+  it("GET /ingestion/datasets describes all 9 datasets with typed fields", async () => {
     const res = await app.inject({
       method: "GET",
       url: url("/ingestion/datasets"),
@@ -363,6 +363,7 @@ describe("sources & dataset registry", () => {
       "rfis",
       "schedule_tasks",
       "site_access",
+      "telematics",
       "vendors",
     ]);
     const vendorsDef = body.datasets.find((d) => d.dataset === "vendors")!;

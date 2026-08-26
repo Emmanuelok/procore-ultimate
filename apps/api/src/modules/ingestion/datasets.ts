@@ -42,6 +42,13 @@ export interface DatasetDef {
   target: string;
   /** true = a run for this dataset must carry a projectId */
   requiresProject: boolean;
+  /**
+   * true = rows are committed by another module through its own inlet, not by
+   * this module's writers. The dataset is still a first-class member so tokens
+   * can be scoped to it and its runs filtered, but the CSV mapping wizard must
+   * not offer it.
+   */
+  committedElsewhere?: boolean;
   fields: DatasetField[];
   /**
    * Cross-field check run AFTER per-field coercion succeeded. Returns a
@@ -337,6 +344,39 @@ export const DATASET_REGISTRY: Record<IngestionDataset, DatasetDef> = {
       }
       return null;
     },
+  },
+
+  /**
+   * Plant telematics — the one dataset whose rows this module does NOT commit.
+   *
+   * Readings arrive at POST /ingestion/push/telematics, which the equipment
+   * module registers, and land in equipment_telematics_readings idempotent on
+   * (providerKey, deviceId, recordedAt). The entry exists here so the dataset
+   * behaves like every other one where it matters to an operator: a machine
+   * token can be minted with the `telematics` scope, and runs can be filtered
+   * to it. `committedElsewhere` marks it so the CSV wizard does not offer a
+   * mapping step for a dataset it cannot commit.
+   */
+  telematics: {
+    dataset: "telematics",
+    label: "Plant telematics readings",
+    target:
+      "Equipment telematics readings, committed by the equipment module " +
+      "(idempotent on provider + device + timestamp; an unmapped device is " +
+      "retained with a null equipmentId rather than dropped)",
+    requiresProject: false,
+    committedElsewhere: true,
+    fields: [
+      { key: "deviceId", label: "Device ID", required: true, type: "string" },
+      { key: "recordedAt", label: "Recorded at", required: true, type: "date" },
+      { key: "providerKey", label: "Provider", required: false, type: "string" },
+      { key: "engineHours", label: "Engine hours", required: false, type: "number" },
+      { key: "odometerKm", label: "Odometer (km)", required: false, type: "number" },
+      { key: "fuelUsedLitres", label: "Fuel used (litres)", required: false, type: "number" },
+      { key: "latitude", label: "Latitude", required: false, type: "number" },
+      { key: "longitude", label: "Longitude", required: false, type: "number" },
+      EXTERNAL_ID_FIELD,
+    ],
   },
 };
 

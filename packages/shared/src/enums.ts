@@ -841,6 +841,14 @@ export const INGESTION_DATASETS = [
   "schedule_tasks",
   "evidence",
   "fx_rates",
+  /**
+   * Plant telematics. Unlike the others this dataset is COMMITTED BY THE
+   * EQUIPMENT MODULE, not by the ingestion module's own writers: readings land
+   * in equipment_telematics_readings, idempotent on provider + device +
+   * timestamp. It is a member here so a machine token can actually be minted
+   * with the right scope and so its runs can be filtered like any other.
+   */
+  "telematics",
 ] as const;
 export type IngestionDataset = (typeof INGESTION_DATASETS)[number];
 
