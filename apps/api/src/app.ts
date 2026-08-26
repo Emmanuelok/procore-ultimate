@@ -56,6 +56,17 @@ import { primeContractsModule } from "./modules/primecontracts/index.js";
 import { commitmentsModule } from "./modules/commitments/index.js";
 import { changesModule } from "./modules/changes/index.js";
 import { invoicingModule } from "./modules/invoicing/index.js";
+// Procore-parity domains (M19-M25) — specifications, meetings, safety,
+// quality, equipment & materials, timecards, bidding. Schema lives in
+// packages/db/src/schema/{specifications,meetings,safety,quality,equipment,
+// timecards,bidding}.ts; routes land per module.
+import { specificationsModule } from "./modules/specifications/index.js";
+import { meetingsModule } from "./modules/meetings/index.js";
+import { safetyModule } from "./modules/safety/index.js";
+import { qualityModule } from "./modules/quality/index.js";
+import { equipmentModule } from "./modules/equipment/index.js";
+import { timecardsModule } from "./modules/timecards/index.js";
+import { biddingModule } from "./modules/bidding/index.js";
 
 export interface BuildAppOptions {
   config?: Config;
@@ -195,6 +206,13 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
   await app.register(commitmentsModule, { prefix });
   await app.register(changesModule, { prefix });
   await app.register(invoicingModule, { prefix });
+  await app.register(specificationsModule, { prefix });
+  await app.register(meetingsModule, { prefix });
+  await app.register(safetyModule, { prefix });
+  await app.register(qualityModule, { prefix });
+  await app.register(equipmentModule, { prefix });
+  await app.register(timecardsModule, { prefix });
+  await app.register(biddingModule, { prefix });
 
   // Same-origin SPA serving (production): the built web app is copied into
   // the container and served by the API, so the client's absolute

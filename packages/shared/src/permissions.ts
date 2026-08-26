@@ -62,6 +62,13 @@ export const TOOLS = [
   "assurance",
   "ai",
   "admin",
+  // Procore-parity domains (M19-M25). "specifications" and "meetings" above
+  // predate their modules and are filled in by the same work.
+  "safety",
+  "quality",
+  "equipment",
+  "timecards",
+  "bidding",
 ] as const;
 export type ToolKey = (typeof TOOLS)[number];
 
