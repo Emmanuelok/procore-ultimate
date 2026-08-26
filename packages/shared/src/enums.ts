@@ -1051,3 +1051,430 @@ export const NOTIFICATION_KINDS = [
   "system",
 ] as const;
 export type NotificationKind = (typeof NOTIFICATION_KINDS)[number];
+
+/* ------------------------------------------------------------------ */
+/* Financial suite — budget, prime contracts, commitments, change      */
+/* management, invoicing (spec Vol I §3 / modules M2-M6).              */
+/*                                                                     */
+/* This is the money spine: every dollar on a project enters through a */
+/* budget line, is obligated by a commitment, is moved by a change     */
+/* order and leaves through an invoice. The enums below are the        */
+/* lifecycle vocabulary those five tools share, so a status string     */
+/* means the same thing in the budget view, the change log and the     */
+/* billing period.                                                     */
+/* ------------------------------------------------------------------ */
+
+/** Budget header lifecycle. A `locked` budget is the baseline: its line
+ *  amounts may then only move through an approved `budget_changes` row, which
+ *  is what makes original-vs-revised a defensible number rather than an edit
+ *  history. `revised` means at least one change has landed since the lock. */
+export const BUDGET_STATUSES = ["draft", "locked", "revised", "closed"] as const;
+export type BudgetStatus = (typeof BUDGET_STATUSES)[number];
+
+/** Per-line state. `locked` freezes a single line while the rest of the
+ *  budget stays editable (used when one cost code is under audit). */
+export const BUDGET_LINE_STATUSES = [
+  "draft",
+  "active",
+  "locked",
+  "closed",
+  "void",
+] as const;
+export type BudgetLineStatus = (typeof BUDGET_LINE_STATUSES)[number];
+
+/** What a budget line *is*, which decides how forecasting treats it: a
+ *  contingency line is drawn down rather than spent, an allowance is
+ *  reconciled against actual scope, an alternate is not in the revised total
+ *  until it is accepted. */
+export const BUDGET_LINE_KINDS = [
+  "standard",
+  "allowance",
+  "contingency",
+  "alternate",
+  "owner_reserve",
+  "escalation",
+  "markup",
+] as const;
+export type BudgetLineKind = (typeof BUDGET_LINE_KINDS)[number];
+
+/** Budget change (transfer / draw) lifecycle. Approval is a distinct actor
+ *  from the requester — see `budget_changes.requestedBy` vs `approvedBy`. */
+export const BUDGET_CHANGE_STATUSES = [
+  "draft",
+  "pending_approval",
+  "approved",
+  "rejected",
+  "void",
+] as const;
+export type BudgetChangeStatus = (typeof BUDGET_CHANGE_STATUSES)[number];
+
+/** Why the budget moved. `transfer` must net to zero across its legs;
+ *  `contingency_draw` nets to zero but always sources a contingency line;
+ *  `owner_change` is the only kind that changes the budget total, and it
+ *  exists only as the downstream effect of an executed prime contract CO. */
+export const BUDGET_CHANGE_KINDS = [
+  "transfer",
+  "contingency_draw",
+  "owner_change",
+  "adjustment",
+  "reallocation",
+] as const;
+export type BudgetChangeKind = (typeof BUDGET_CHANGE_KINDS)[number];
+
+/** Why a snapshot was taken. Snapshots are immutable period captures: the
+ *  monthly close, a gate milestone, or a manual freeze before a big change. */
+export const BUDGET_SNAPSHOT_KINDS = [
+  "monthly_close",
+  "milestone",
+  "manual",
+  "forecast_lock",
+  "closeout",
+] as const;
+export type BudgetSnapshotKind = (typeof BUDGET_SNAPSHOT_KINDS)[number];
+
+/** How forecast-to-complete was derived. Persisted per forecast row so a
+ *  reviewer can see whether a number was typed or computed. */
+export const FORECAST_METHODS = [
+  "manual",
+  "remaining_budget",
+  "percent_complete",
+  "committed_plus_pending",
+  "unit_rate_trend",
+  "productivity_trend",
+] as const;
+export type ForecastMethod = (typeof FORECAST_METHODS)[number];
+
+export const BUDGET_FORECAST_STATUSES = [
+  "draft",
+  "submitted",
+  "approved",
+  "superseded",
+] as const;
+export type BudgetForecastStatus = (typeof BUDGET_FORECAST_STATUSES)[number];
+
+/** Prime contract lifecycle (owner-facing agreement). `approved` means
+ *  internally approved; `executed` (a flag, not a status) means signed by
+ *  both parties — only then may it be billed against. */
+export const PRIME_CONTRACT_STATUSES = [
+  "draft",
+  "out_for_bid",
+  "out_for_signature",
+  "approved",
+  "complete",
+  "terminated",
+  "void",
+] as const;
+export type PrimeContractStatus = (typeof PRIME_CONTRACT_STATUSES)[number];
+
+/** How the contract sum is priced. Drives which SOV billing methods are
+ *  legal on the schedule of values and how forecasts roll up. */
+export const CONTRACT_PRICING_TYPES = [
+  "lump_sum",
+  "cost_plus",
+  "cost_plus_gmp",
+  "unit_price",
+  "time_and_materials",
+  "design_build",
+] as const;
+export type ContractPricingType = (typeof CONTRACT_PRICING_TYPES)[number];
+
+/** How a schedule-of-values line earns value in a billing period. */
+export const SOV_BILLING_METHODS = [
+  "lump_sum",
+  "percent_complete",
+  "unit_price",
+  "milestone",
+  "stored_materials",
+  "cost_plus",
+  "allowance",
+] as const;
+export type SovBillingMethod = (typeof SOV_BILLING_METHODS)[number];
+
+/** A commitment is either a subcontract (labour + material, retainage,
+ *  lien waivers, change orders) or a purchase order (material, tax,
+ *  delivery). One table, one discriminator — they share 90% of their shape
+ *  and every rollup treats them identically. */
+export const COMMITMENT_KINDS = ["subcontract", "purchase_order"] as const;
+export type CommitmentKind = (typeof COMMITMENT_KINDS)[number];
+
+/**
+ * Commitment lifecycle. NAMED `FINANCIAL_` because `COMMITMENT_STATUSES`
+ * above is already taken by ESG social-value commitments (Domain M) and
+ * renaming a shipped enum is a data migration, not a refactor.
+ */
+export const FINANCIAL_COMMITMENT_STATUSES = [
+  "draft",
+  "out_for_bid",
+  "out_for_signature",
+  "approved",
+  "complete",
+  "terminated",
+  "void",
+] as const;
+export type FinancialCommitmentStatus = (typeof FINANCIAL_COMMITMENT_STATUSES)[number];
+
+/** Executed-change lifecycle, shared by prime contract changes (PCCO),
+ *  commitment changes (CCO) and the packages that produce them. */
+export const CHANGE_ORDER_STATUSES = [
+  "draft",
+  "pending_pricing",
+  "pending_in_house_review",
+  "pending_owner_approval",
+  "revise_and_resubmit",
+  "approved",
+  "executed",
+  "rejected",
+  "no_charge",
+  "void",
+] as const;
+export type ChangeOrderStatus = (typeof CHANGE_ORDER_STATUSES)[number];
+
+/** Change event lifecycle — the origin record for the whole change chain.
+ *  `open` = identified, not yet priced; `pending` = priced and moving
+ *  through PCO/COR; `closed` = resolved (executed, absorbed or dropped). */
+export const CHANGE_EVENT_STATUSES = ["open", "pending", "closed", "void"] as const;
+export type ChangeEventStatus = (typeof CHANGE_EVENT_STATUSES)[number];
+
+/** What kind of change this is, commercially. Drives entitlement: an
+ *  `errors_omissions` event is a candidate backcharge, a `design_change`
+ *  is owner-billable, a `scope_gap` usually is not. */
+export const CHANGE_EVENT_TYPES = [
+  "design_change",
+  "field_condition",
+  "owner_request",
+  "allowance_reconciliation",
+  "value_engineering",
+  "backcharge",
+  "weather",
+  "errors_omissions",
+  "regulatory",
+  "scope_gap",
+  "other",
+] as const;
+export type ChangeEventType = (typeof CHANGE_EVENT_TYPES)[number];
+
+/** Whether the work is inside the existing contract scope. `tbd` is the
+ *  honest default and is what keeps unpriced exposure visible. */
+export const CHANGE_EVENT_SCOPES = ["in_scope", "out_of_scope", "tbd"] as const;
+export type ChangeEventScope = (typeof CHANGE_EVENT_SCOPES)[number];
+
+/** The record type a change event was raised FROM — an answered RFI, an
+ *  observation, a drawing revision. This is the provenance link that lets a
+ *  claim be traced back to the document that caused it. */
+export const CHANGE_EVENT_ORIGIN_KINDS = [
+  "rfi",
+  "submittal",
+  "observation",
+  "daily_log",
+  "drawing_revision",
+  "specification",
+  "meeting",
+  "inspection",
+  "punch_item",
+  "contract_event",
+  "schedule_task",
+  "document",
+  "manual",
+] as const;
+export type ChangeEventOriginKind = (typeof CHANGE_EVENT_ORIGIN_KINDS)[number];
+
+/** Contractual reason cited on a change order. Reported on the change log
+ *  and is the first thing an owner's auditor filters by. */
+export const CHANGE_REASONS = [
+  "client_request",
+  "design_development",
+  "design_error",
+  "design_omission",
+  "unforeseen_condition",
+  "existing_condition",
+  "code_compliance",
+  "coordination_conflict",
+  "allowance_reconciliation",
+  "value_engineering",
+  "weather",
+  "owner_directed_acceleration",
+  "other",
+] as const;
+export type ChangeReason = (typeof CHANGE_REASONS)[number];
+
+/** Potential change order — the internal cost position, usually one per
+ *  affected commitment. */
+export const PCO_STATUSES = [
+  "draft",
+  "pending_quote",
+  "priced",
+  "submitted",
+  "approved",
+  "rejected",
+  "no_charge",
+  "void",
+] as const;
+export type PcoStatus = (typeof PCO_STATUSES)[number];
+
+/** Change order request — the priced ask sent to the owner. */
+export const COR_STATUSES = [
+  "draft",
+  "submitted",
+  "under_review",
+  "negotiating",
+  "approved",
+  "partially_approved",
+  "rejected",
+  "withdrawn",
+  "void",
+] as const;
+export type CorStatus = (typeof COR_STATUSES)[number];
+
+/** A change order package executes against exactly one side of the ledger:
+ *  the prime contract (PCCO — revenue up) or a commitment (CCO — cost up). */
+export const CHANGE_ORDER_PACKAGE_KINDS = ["prime_contract", "commitment"] as const;
+export type ChangeOrderPackageKind = (typeof CHANGE_ORDER_PACKAGE_KINDS)[number];
+
+/** RFQ to a subcontractor for change pricing. */
+export const QUOTE_REQUEST_STATUSES = [
+  "draft",
+  "sent",
+  "viewed",
+  "quoted",
+  "accepted",
+  "declined",
+  "expired",
+  "void",
+] as const;
+export type QuoteRequestStatus = (typeof QUOTE_REQUEST_STATUSES)[number];
+
+/** How a markup line (overhead, profit, bond, insurance) is computed. */
+export const MARKUP_KINDS = ["percent", "fixed_amount", "per_unit"] as const;
+export type MarkupKind = (typeof MARKUP_KINDS)[number];
+
+/** Procore-style change configuration: how many approval tiers stand
+ *  between a change event and an executed change order. Stored per project
+ *  in `projects.settings.changeManagementTier`. */
+export const CHANGE_MANAGEMENT_TIERS = ["one_tier", "two_tier", "three_tier"] as const;
+export type ChangeManagementTier = (typeof CHANGE_MANAGEMENT_TIERS)[number];
+
+/** Invoicing runs in both directions: we bill the owner (an AIA-style
+ *  application for payment) and our subs bill us. Same document shape,
+ *  opposite sign — one table, one discriminator. */
+export const INVOICE_KINDS = ["owner_billing", "subcontractor_invoice"] as const;
+export type InvoiceKind = (typeof INVOICE_KINDS)[number];
+
+/** Invoice lifecycle. `approved_as_noted` is deliberately distinct from
+ *  `approved`: it records that the reviewer cut the amount, which is the
+ *  number a later dispute turns on. */
+export const INVOICE_STATUSES = [
+  "draft",
+  "submitted",
+  "under_review",
+  "revise_and_resubmit",
+  "approved",
+  "approved_as_noted",
+  "rejected",
+  "paid",
+  "void",
+] as const;
+export type InvoiceStatus = (typeof INVOICE_STATUSES)[number];
+
+/** What an invoice line is billing, so the G703 can group correctly and the
+ *  budget knows which bucket the cost lands in. */
+export const INVOICE_LINE_SOURCES = [
+  "contract_sov",
+  "change_order",
+  "stored_materials",
+  "retainage_release",
+  "allowance",
+  "tax",
+  "credit",
+  "other",
+] as const;
+export type InvoiceLineSource = (typeof INVOICE_LINE_SOURCES)[number];
+
+/** Billing periods gate the whole month: subs submit inside the window,
+ *  the owner application is assembled from what was approved, and `locked`
+ *  means the period's numbers are frozen for reporting. */
+export const BILLING_PERIOD_STATUSES = ["open", "closed", "locked"] as const;
+export type BillingPeriodStatus = (typeof BILLING_PERIOD_STATUSES)[number];
+
+/** AIA G702 application lifecycle. `certified` is the architect's act and
+ *  is separate from our submission — the certified amount may be lower. */
+export const PAYMENT_APPLICATION_STATUSES = [
+  "draft",
+  "submitted",
+  "certified",
+  "partially_certified",
+  "rejected",
+  "paid",
+  "void",
+] as const;
+export type PaymentApplicationStatus = (typeof PAYMENT_APPLICATION_STATUSES)[number];
+
+export const PAYMENT_METHODS = [
+  "check",
+  "ach",
+  "wire",
+  "credit_card",
+  "cash",
+  "joint_check",
+  "other",
+] as const;
+export type PaymentMethod = (typeof PAYMENT_METHODS)[number];
+
+export const PAYMENT_STATUSES = [
+  "scheduled",
+  "on_hold",
+  "issued",
+  "cleared",
+  "failed",
+  "voided",
+] as const;
+export type PaymentStatus = (typeof PAYMENT_STATUSES)[number];
+
+/** The four statutory lien waiver forms. Conditional waivers take effect
+ *  only on payment clearing; unconditional waivers take effect on signature
+ *  — signing an unconditional waiver before the money lands is how
+ *  subcontractors lose their lien rights, so the type is never inferred. */
+export const LIEN_WAIVER_TYPES = [
+  "conditional_progress",
+  "unconditional_progress",
+  "conditional_final",
+  "unconditional_final",
+] as const;
+export type LienWaiverType = (typeof LIEN_WAIVER_TYPES)[number];
+
+export const LIEN_WAIVER_STATUSES = [
+  "draft",
+  "requested",
+  "sent",
+  "signed",
+  "received",
+  "verified",
+  "rejected",
+  "not_required",
+  "void",
+] as const;
+export type LienWaiverStatus = (typeof LIEN_WAIVER_STATUSES)[number];
+
+/** Which side of the ledger a retainage release sits on: the owner
+ *  releasing to us, or us releasing to a sub. */
+export const RETAINAGE_SCOPES = ["prime_contract", "commitment"] as const;
+export type RetainageScope = (typeof RETAINAGE_SCOPES)[number];
+
+/** How retainage was calculated on the amount being released. */
+export const RETAINAGE_BASES = [
+  "percent_work_completed",
+  "percent_stored_materials",
+  "fixed_amount",
+  "milestone_reduction",
+  "none",
+] as const;
+export type RetainageBasis = (typeof RETAINAGE_BASES)[number];
+
+export const RETAINAGE_RELEASE_STATUSES = [
+  "draft",
+  "pending_approval",
+  "approved",
+  "rejected",
+  "released",
+  "void",
+] as const;
+export type RetainageReleaseStatus = (typeof RETAINAGE_RELEASE_STATUSES)[number];

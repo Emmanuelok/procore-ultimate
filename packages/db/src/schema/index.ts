@@ -29,3 +29,4 @@ export * from "./anchoring.js";
 export * from "./insurance.js";
 export * from "./learning.js";
 export * from "./integrations.js";
+export * from "./financials.js";

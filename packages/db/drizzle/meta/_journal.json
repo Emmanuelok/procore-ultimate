@@ -57,6 +57,13 @@
       "when": 1787653222220,
       "tag": "0007_brave_red_hulk",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1787687837801,
+      "tag": "0008_motionless_black_tom",
+      "breakpoints": true
     }
   ]
 }

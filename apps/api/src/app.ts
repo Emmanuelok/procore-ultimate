@@ -49,6 +49,13 @@ import { anchoringModule } from "./modules/anchoring/index.js";
 import { insuranceModule } from "./modules/insurance/index.js";
 import { learningModule } from "./modules/learning/index.js";
 import { integrationsModule } from "./modules/integrations/index.js";
+// Financial suite — budget, prime contracts, commitments, change management,
+// invoicing (M2-M6). The money spine: see packages/db/src/schema/financials.ts.
+import { budgetModule } from "./modules/budget/index.js";
+import { primeContractsModule } from "./modules/primecontracts/index.js";
+import { commitmentsModule } from "./modules/commitments/index.js";
+import { changesModule } from "./modules/changes/index.js";
+import { invoicingModule } from "./modules/invoicing/index.js";
 
 export interface BuildAppOptions {
   config?: Config;
@@ -183,6 +190,11 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
   await app.register(insuranceModule, { prefix });
   await app.register(learningModule, { prefix });
   await app.register(integrationsModule, { prefix });
+  await app.register(budgetModule, { prefix });
+  await app.register(primeContractsModule, { prefix });
+  await app.register(commitmentsModule, { prefix });
+  await app.register(changesModule, { prefix });
+  await app.register(invoicingModule, { prefix });
 
   // Same-origin SPA serving (production): the built web app is copied into
   // the container and served by the API, so the client's absolute

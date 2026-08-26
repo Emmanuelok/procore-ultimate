@@ -2,11 +2,118 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+
     <title>ConstructOS</title>
+    <meta
+      name="description"
+      content="ConstructOS — AI-native construction delivery and assurance. Drawings, RFIs, submittals, commercial control and an evidence-first ledger in one system."
+    />
+    <meta name="application-name" content="ConstructOS" />
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="format-detection" content="telephone=no" />
+
+    <!-- Managed at runtime by the anti-flash script below and src/lib/theme.tsx.
+         Values must match THEME_COLOR in src/ui/tokens.ts. -->
+    <meta name="theme-color" content="#f6f7fa" />
+
+    <!-- Installable web app -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="ConstructOS" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="ConstructOS" />
+    <meta property="og:title" content="ConstructOS" />
+    <meta
+      property="og:description"
+      content="AI-native construction delivery and assurance."
+    />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&display=swap"
+    />
+
+    <!-- Paint the correct canvas colour even before the app stylesheet parses,
+         and before JS runs at all (no-JS / system preference). -->
+    <style>
+      html {
+        background-color: #f6f7fa;
+      }
+      html[data-theme="dark"] {
+        background-color: #0a0c11;
+      }
+      html[data-theme="light"] {
+        background-color: #f6f7fa;
+      }
+      @media (prefers-color-scheme: dark) {
+        html:not([data-theme="light"]) {
+          background-color: #0a0c11;
+        }
+      }
+    </style>
+
+    <!--
+      Anti-flash theme bootstrap. Runs synchronously before first paint so the
+      resolved theme and density are already on <html> when the stylesheet is
+      applied. Keys and attribute names mirror src/ui/tokens.ts:
+        constructos:theme    → "light" | "dark" | "system"
+        constructos:density  → "comfortable" | "compact"
+    -->
+    <script>
+      (function () {
+        var root = document.documentElement;
+        var theme = "system";
+        var density = "comfortable";
+        try {
+          var t = localStorage.getItem("constructos:theme");
+          if (t === "light" || t === "dark" || t === "system") theme = t;
+          var d = localStorage.getItem("constructos:density");
+          if (d === "comfortable" || d === "compact") density = d;
+        } catch (e) {
+          /* storage blocked — fall through to defaults */
+        }
+        var resolved = theme;
+        if (theme === "system") {
+          resolved =
+            window.matchMedia &&
+            window.matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "light";
+        }
+        root.setAttribute("data-theme", resolved);
+        root.setAttribute("data-density", density);
+        root.style.colorScheme = resolved;
+        var meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) {
+          meta.setAttribute("content", resolved === "dark" ? "#0a0c11" : "#f6f7fa");
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
+    <noscript>
+      <div
+        style="
+          font:
+            500 14px/1.5 Inter,
+            system-ui,
+            sans-serif;
+          padding: 48px;
+          text-align: center;
+        "
+      >
+        ConstructOS needs JavaScript enabled.
+      </div>
+    </noscript>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

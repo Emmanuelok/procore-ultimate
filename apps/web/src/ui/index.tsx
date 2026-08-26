@@ -1,292 +1,180 @@
 /**
- * Minimal UI kit. Every page should compose these instead of hand-rolling
- * Tailwind so the product stays visually coherent.
+ * ../ui — the single import surface for every page in ConstructOS.
+ *
+ *     import { Button, Card, DataTable, Modal } from "../../ui";
+ *
+ * This file is a barrel and nothing else: no component is defined here. The
+ * design system is split by concern and re-exported below.
+ *
+ *   ./primitives  buttons, inputs, badges, cards, tables, feedback, layout
+ *   ./overlays    modal, dialog, drawer, sheet, popover, tooltip, toast
+ *   ./inputs      rich entry: combobox, date, file, search, editors
+ *   ./data        data table, list views, board, filters, pagination
+ *   ./charts      recharts wrappers bound to the chart tokens
+ *
+ * Foundations are importable directly and are deliberately NOT star-exported
+ * here — they carry short, collision-prone names (`tone`, `text`, `surface`,
+ * `focus`) that do not belong in a barrel:
+ *
+ *   import { cx } from "../../ui/cx";
+ *   import { tone, statusToTone, Z } from "../../ui/tokens";
+ *   import { IconRfi, IconChevronDown } from "../../ui/icons";
+ *   import { motion, useMotionVariants } from "../../ui/motion";
+ *
+ * ---------------------------------------------------------------------------
+ * BACKWARD COMPATIBILITY CONTRACT
+ *
+ * ~89k lines across 35 page directories import from here. The 18 symbols this
+ * module has always exported — Button, Input, Textarea, Select, Field, Card,
+ * CardBody, PageHeader, Table, Th, Td, Badge, statusTone, EmptyState, Spinner,
+ * Modal, ErrorAlert — keep their exact call signatures. Props have only ever
+ * been *added* or *widened*; none was removed, renamed, or made required.
+ *
+ * Those names are re-exported EXPLICITLY (not via `export *`). An explicit
+ * re-export takes precedence over a star export, so if a sibling module ever
+ * exports a colliding name, the legacy symbol still resolves to exactly one
+ * implementation instead of silently becoming ambiguous and disappearing.
+ * ---------------------------------------------------------------------------
  */
-import {
-  forwardRef,
-  type ButtonHTMLAttributes,
-  type InputHTMLAttributes,
-  type ReactNode,
-  type SelectHTMLAttributes,
-  type TextareaHTMLAttributes,
-} from "react";
 
-function cx(...parts: Array<string | false | null | undefined>): string {
-  return parts.filter(Boolean).join(" ");
-}
+/* ===========================================================================
+   Module surfaces
+   =========================================================================== */
 
-/* ---------------------------------- Button --------------------------------- */
+export * from "./primitives";
+export * from "./overlays";
 
-type ButtonVariant = "primary" | "secondary" | "danger" | "ghost";
+/* ---------------------------------------------------------------------------
+ * PENDING MODULES — uncomment each line the moment its file exists.
+ *
+ * `./inputs`, `./data` and `./charts` had not landed when this barrel was
+ * written, and a static re-export of a missing module fails `tsc` and the
+ * production build for the whole app. Each line below is the complete wiring
+ * for its module: create the file, delete the leading `//`, done. Nothing else
+ * in this file needs to change — the pinned blocks further down already
+ * guarantee the legacy names resolve to one implementation even if one of
+ * these modules exports a colliding name.
+ * ------------------------------------------------------------------------- */
 
-const buttonStyles: Record<ButtonVariant, string> = {
-  primary:
-    "bg-brand-600 text-white hover:bg-brand-700 focus-visible:outline-brand-600 disabled:bg-brand-300",
-  secondary:
-    "bg-white text-ink-800 ring-1 ring-ink-200 hover:bg-ink-50 focus-visible:outline-brand-600",
-  danger: "bg-red-600 text-white hover:bg-red-700 focus-visible:outline-red-600",
-  ghost: "text-ink-600 hover:bg-ink-100 hover:text-ink-900",
-};
+// export * from "./inputs";
+// export * from "./data";
+// export * from "./charts";
 
-export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
-  variant?: ButtonVariant;
-  size?: "sm" | "md";
-}
+/* ===========================================================================
+   Pinned resolutions
 
-export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button(
-  { variant = "primary", size = "md", className, type, ...rest },
-  ref,
-) {
-  return (
-    <button
-      ref={ref}
-      type={type ?? "button"}
-      className={cx(
-        "inline-flex items-center justify-center gap-1.5 rounded-md font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 disabled:cursor-not-allowed disabled:opacity-60",
-        size === "sm" ? "px-2.5 py-1.5 text-xs" : "px-3.5 py-2 text-sm",
-        buttonStyles[variant],
-        className,
-      )}
-      {...rest}
-    />
-  );
-});
+   Names that exist in more than one module. Listing them here picks the
+   owner deterministically instead of leaving an ambiguous star export.
+   =========================================================================== */
 
-/* ---------------------------------- Inputs --------------------------------- */
+/** Overlays owns every portalled surface, including the legacy `Modal`. */
+export { Modal } from "./overlays";
+export type { ModalProps } from "./overlays";
 
-const fieldBase =
-  "block w-full rounded-md border-0 bg-white px-3 py-2 text-sm text-ink-900 shadow-sm ring-1 ring-inset ring-ink-200 placeholder:text-ink-300 focus:ring-2 focus:ring-inset focus:ring-brand-500";
+/** Primitives owns the broader `IconLike` (also accepts plain nodes/strings). */
+export type { IconLike } from "./primitives";
 
-export const Input = forwardRef<HTMLInputElement, InputHTMLAttributes<HTMLInputElement>>(
-  function Input({ className, ...rest }, ref) {
-    return <input ref={ref} className={cx(fieldBase, className)} {...rest} />;
-  },
-);
+/* ===========================================================================
+   Legacy contract — pinned so it can never become ambiguous.
+   Do not remove an entry from this block.
+   =========================================================================== */
 
-export const Textarea = forwardRef<
-  HTMLTextAreaElement,
-  TextareaHTMLAttributes<HTMLTextAreaElement>
->(function Textarea({ className, ...rest }, ref) {
-  return <textarea ref={ref} className={cx(fieldBase, "min-h-24", className)} {...rest} />;
-});
+export {
+  Badge,
+  Button,
+  Card,
+  CardBody,
+  EmptyState,
+  ErrorAlert,
+  Field,
+  Input,
+  PageHeader,
+  Select,
+  Spinner,
+  Table,
+  Td,
+  Textarea,
+  Th,
+  statusTone,
+} from "./primitives";
 
-export const Select = forwardRef<HTMLSelectElement, SelectHTMLAttributes<HTMLSelectElement>>(
-  function Select({ className, ...rest }, ref) {
-    return <select ref={ref} className={cx(fieldBase, "pr-8", className)} {...rest} />;
-  },
-);
+export type {
+  BadgeProps,
+  ButtonProps,
+  CardBodyProps,
+  CardProps,
+  EmptyStateProps,
+  ErrorAlertProps,
+  FieldProps,
+  InputProps,
+  PageHeaderProps,
+  SelectProps,
+  SpinnerProps,
+  TableProps,
+  TdProps,
+  TextareaProps,
+  ThProps,
+} from "./primitives";
 
-export function Field({
-  label,
-  children,
-  hint,
-}: {
-  label: string;
-  children: ReactNode;
-  hint?: string;
-}) {
-  return (
-    <label className="block">
-      <span className="mb-1 block text-xs font-medium text-ink-600">{label}</span>
-      {children}
-      {hint ? <span className="mt-1 block text-xs text-ink-400">{hint}</span> : null}
-    </label>
-  );
-}
+/* ===========================================================================
+   Convenience re-exports
 
-/* ---------------------------------- Layout --------------------------------- */
+   The handful of foundation symbols worth having on the barrel because pages
+   reach for them constantly. Everything else stays behind its own module.
+   =========================================================================== */
 
-export function Card({ className, children }: { className?: string; children: ReactNode }) {
-  return (
-    <div className={cx("rounded-lg bg-white shadow-sm ring-1 ring-ink-100", className)}>
-      {children}
-    </div>
-  );
-}
+export { cx, cn } from "./cx";
+export type { ClassValue } from "./cx";
 
-export function CardBody({ className, children }: { className?: string; children: ReactNode }) {
-  return <div className={cx("p-4", className)}>{children}</div>;
-}
+export {
+  TONES,
+  TONE_LABEL,
+  toneClass,
+  statusToTone,
+  statusToLegacyTone,
+  formatStatusLabel,
+  normalizeKey,
+  fromLegacyBadgeTone,
+  toLegacyBadgeTone,
+  SEVERITIES,
+  SEVERITY_LABEL,
+  SEVERITY_RANK,
+  asSeverity,
+  severityToTone,
+  STAGES,
+  STAGE_LABEL,
+  STAGE_ORDER,
+  asStage,
+  stageToTone,
+  PRIORITIES,
+  PRIORITY_LABEL,
+  PRIORITY_RANK,
+  asPriority,
+  priorityToTone,
+  RAG_STATES,
+  RAG_LABEL,
+  asRag,
+  ragToTone,
+  directionOf,
+  deltaToTone,
+  cssVar,
+  chartColor,
+  CHART_COLORS,
+  readToken,
+  Z,
+  Z_CLASS,
+} from "./tokens";
 
-export function PageHeader({
-  title,
-  subtitle,
-  actions,
-}: {
-  title: string;
-  subtitle?: string;
-  actions?: ReactNode;
-}) {
-  return (
-    <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
-      <div>
-        <h1 className="text-xl font-semibold text-ink-900">{title}</h1>
-        {subtitle ? <p className="mt-0.5 text-sm text-ink-500">{subtitle}</p> : null}
-      </div>
-      {actions ? <div className="flex items-center gap-2">{actions}</div> : null}
-    </div>
-  );
-}
-
-/* ---------------------------------- Table ---------------------------------- */
-
-export function Table({ children }: { children: ReactNode }) {
-  return (
-    <div className="overflow-x-auto rounded-lg bg-white shadow-sm ring-1 ring-ink-100">
-      <table className="min-w-full divide-y divide-ink-100 text-sm">{children}</table>
-    </div>
-  );
-}
-
-export function Th({ children, className }: { children?: ReactNode; className?: string }) {
-  return (
-    <th
-      className={cx(
-        "px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wide text-ink-500",
-        className,
-      )}
-    >
-      {children}
-    </th>
-  );
-}
-
-export function Td({
-  children,
-  className,
-  title,
-}: {
-  children?: ReactNode;
-  className?: string;
-  title?: string;
-}) {
-  return (
-    <td className={cx("px-4 py-2.5 text-ink-800", className)} title={title}>
-      {children}
-    </td>
-  );
-}
-
-/* ---------------------------------- Badge ---------------------------------- */
-
-const badgeTones: Record<string, string> = {
-  gray: "bg-ink-100 text-ink-700",
-  blue: "bg-brand-100 text-brand-800",
-  green: "bg-emerald-100 text-emerald-800",
-  amber: "bg-amber-100 text-amber-800",
-  red: "bg-red-100 text-red-800",
-  violet: "bg-violet-100 text-violet-800",
-};
-
-export function Badge({
-  tone = "gray",
-  children,
-}: {
-  tone?: keyof typeof badgeTones & string;
-  children: ReactNode;
-}) {
-  return (
-    <span
-      className={cx(
-        "inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium",
-        badgeTones[tone] ?? badgeTones["gray"],
-      )}
-    >
-      {children}
-    </span>
-  );
-}
-
-/** Map common lifecycle statuses to badge tones. */
-export function statusTone(status: string): string {
-  if (["open", "running", "in_review", "pending", "submitted"].includes(status)) return "blue";
-  if (["approved", "closed", "answered", "supported", "resolved", "ready", "operational"].includes(status))
-    return "green";
-  if (["overdue", "rejected", "breached", "contradicted", "failed", "critical"].includes(status))
-    return "red";
-  if (["draft", "void", "superseded", "archived"].includes(status)) return "gray";
-  if (["at_risk", "revise_and_resubmit", "partially_supported", "high"].includes(status))
-    return "amber";
-  return "gray";
-}
-
-/* ---------------------------------- Empty ---------------------------------- */
-
-export function EmptyState({
-  title,
-  hint,
-  action,
-}: {
-  title: string;
-  hint?: string;
-  action?: ReactNode;
-}) {
-  return (
-    <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-ink-200 bg-white/50 px-6 py-14 text-center">
-      <p className="text-sm font-medium text-ink-700">{title}</p>
-      {hint ? <p className="mt-1 max-w-sm text-xs text-ink-400">{hint}</p> : null}
-      {action ? <div className="mt-4">{action}</div> : null}
-    </div>
-  );
-}
-
-export function Spinner({ label }: { label?: string }) {
-  return (
-    <div className="flex items-center justify-center gap-2 py-10 text-sm text-ink-400">
-      <span className="h-4 w-4 animate-spin rounded-full border-2 border-ink-200 border-t-brand-600" />
-      {label ?? "Loading…"}
-    </div>
-  );
-}
-
-/* ---------------------------------- Modal ---------------------------------- */
-
-export function Modal({
-  open,
-  title,
-  onClose,
-  children,
-  wide,
-}: {
-  open: boolean;
-  title: string;
-  onClose: () => void;
-  children: ReactNode;
-  wide?: boolean;
-}) {
-  if (!open) return null;
-  return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-ink-950/40 p-4 pt-16">
-      <div
-        className={cx(
-          "w-full rounded-xl bg-white p-5 shadow-xl",
-          wide ? "max-w-3xl" : "max-w-lg",
-        )}
-      >
-        <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-base font-semibold text-ink-900">{title}</h2>
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded p-1 text-ink-400 hover:bg-ink-100 hover:text-ink-700"
-            aria-label="Close"
-          >
-            ✕
-          </button>
-        </div>
-        {children}
-      </div>
-    </div>
-  );
-}
-
-/* ---------------------------------- Alert ---------------------------------- */
-
-export function ErrorAlert({ message }: { message: string | null }) {
-  if (!message) return null;
-  return (
-    <div className="mb-3 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700 ring-1 ring-red-100">
-      {message}
-    </div>
-  );
-}
+export type {
+  Density,
+  Direction,
+  LegacyBadgeTone,
+  Priority,
+  RagState,
+  ResolvedTheme,
+  Severity,
+  Stage,
+  ThemePreference,
+  Tone,
+  ZLayer,
+} from "./tokens";
