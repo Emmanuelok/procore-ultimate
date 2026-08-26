@@ -281,12 +281,16 @@ export type {
 export { Sparkline } from "./charts/sparkline";
 export type { SparklineProps } from "./charts/sparkline";
 
-export { ChartProgressRing, Gauge, ProgressRing, describeArc } from "./charts/radial";
+// `ProgressRing` is deliberately NOT re-exported here: apps/web/src/ui/primitives.tsx
+// owns that name in the barrel (a compact inline indicator). The chart version is
+// already surfaced as ChartProgressRing, which is the one to use for dashboards.
+export { ChartProgressRing, Gauge, describeArc } from "./charts/radial";
 export type {
   ChartProgressRingProps,
   GaugeProps,
   GaugeThreshold,
-  ProgressRingProps,
+  // ProgressRingProps stays unexported here for the same reason as the value:
+  // the primitive of that name owns it in the barrel.
   ProgressRingSegment,
   ProgressRingSize,
 } from "./charts/radial";

@@ -45,20 +45,19 @@ export * from "./primitives";
 export * from "./overlays";
 
 /* ---------------------------------------------------------------------------
- * PENDING MODULES — uncomment each line the moment its file exists.
- *
- * `./inputs`, `./data` and `./charts` had not landed when this barrel was
- * written, and a static re-export of a missing module fails `tsc` and the
- * production build for the whole app. Each line below is the complete wiring
- * for its module: create the file, delete the leading `//`, done. Nothing else
- * in this file needs to change — the pinned blocks further down already
- * guarantee the legacy names resolve to one implementation even if one of
- * these modules exports a colliding name.
+ * The rest of the library. These three landed after this barrel was first
+ * written and are now wired. The pinned blocks further down still guarantee
+ * the legacy names resolve to one implementation even where a module here
+ * exports a colliding name.
  * ------------------------------------------------------------------------- */
 
-// export * from "./inputs";
-// export * from "./data";
-// export * from "./charts";
+export * from "./inputs";
+export * from "./data";
+// `ProgressRing` exists in both ./primitives (a compact inline indicator) and
+// ./charts (the full radial chart). The primitive owns the plain name because
+// existing pages reference it; the chart version is exported by ./charts as
+// ChartProgressRing.
+export * from "./charts";
 
 /* ===========================================================================
    Pinned resolutions
