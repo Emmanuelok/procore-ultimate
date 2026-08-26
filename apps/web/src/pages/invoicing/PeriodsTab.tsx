@@ -583,6 +583,14 @@ export default function PeriodsTab({
     `/api/v1/projects/${projectId}/billing-periods/current`,
   );
 
+  /**
+   * The stored period rollups are summed across every currency billed into the
+   * period, so they only carry a currency when the project bills in exactly
+   * one. Otherwise they are rendered with the currency named as unknown rather
+   * than labelled with a currency they are not actually in.
+   */
+  const rollupCurrency = context.currencies.length === 1 ? (context.currencies[0] ?? null) : null;
+
   const columns = useMemo<DataColumns<BillingPeriodRow>>(
     () => [
       {
@@ -651,11 +659,20 @@ export default function PeriodsTab({
         id: "ownerBilledAmount",
         header: "Owner billed",
         headerTooltip:
-          "A period rollup, stored per period. Where a project bills in more than one currency this column mixes them — the per-currency split is inside the period.",
+          "A period rollup, stored per period across every currency billed into it. It carries a currency only when the project bills in exactly one — otherwise the per-currency split inside the period is the figure to read.",
         accessor: "ownerBilledAmount",
         type: "currency",
         width: 140,
-        cell: (ctx) => money(ctx.row.ownerBilledAmount, context.currencies[0] ?? null),
+        cell: (ctx) => money(ctx.row.ownerBilledAmount, rollupCurrency),
+      },
+      {
+        id: "subcontractorBilledAmount",
+        header: "Sub billed",
+        accessor: "subcontractorBilledAmount",
+        type: "currency",
+        width: 140,
+        defaultHidden: true,
+        cell: (ctx) => money(ctx.row.subcontractorBilledAmount, rollupCurrency),
       },
       {
         id: "retainageHeldAmount",
@@ -663,10 +680,10 @@ export default function PeriodsTab({
         accessor: "retainageHeldAmount",
         type: "currency",
         width: 140,
-        cell: (ctx) => money(ctx.row.retainageHeldAmount, context.currencies[0] ?? null),
+        cell: (ctx) => money(ctx.row.retainageHeldAmount, rollupCurrency),
       },
     ],
-    [context.currencies],
+    [rollupCurrency],
   );
 
   return (
@@ -729,6 +746,7 @@ export default function PeriodsTab({
         columns={columns}
         getRowId={(row) => row.id}
         loading={context.loading}
+        error={context.error}
         onRetry={context.reload}
         height={520}
         stickyHeader

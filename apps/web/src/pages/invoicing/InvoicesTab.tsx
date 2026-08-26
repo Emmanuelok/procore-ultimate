@@ -620,6 +620,7 @@ export default function InvoicesTab({
         columns={columns}
         getRowId={(row) => row.id}
         loading={invoices.loading}
+        error={invoices.error}
         onRetry={invoices.reload}
         height={620}
         stickyHeader

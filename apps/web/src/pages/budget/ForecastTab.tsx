@@ -26,10 +26,7 @@ import {
   EmptyState,
   ErrorAlert,
   Select,
-  Table,
-  Td,
-  Th,
-  Tr,
+  Tooltip,
   cx,
   useConfirm,
 } from "../../ui";
@@ -46,7 +43,6 @@ import {
   FORECAST_STATUS_TONE,
   LoadError,
   MethodBadge,
-  ReasonList,
   RefusalNotice,
   SectionHeading,
   actorName,
@@ -151,6 +147,169 @@ export default function ForecastTab({
       setBusy(null);
     }
   }
+
+  /**
+   * The preview grid. A line whose inputs do not support the chosen method
+   * shows "Not available" and carries the platform's reasons in a column of
+   * their own — never a zero, and never a silently omitted row.
+   */
+  const previewColumns = useMemo<DataColumns<ForecastPreviewLine>>(
+    () => [
+      {
+        id: "costCode",
+        header: "Cost code",
+        accessor: "costCode",
+        type: "code",
+        width: 132,
+        sticky: "start",
+        mono: true,
+      },
+      { id: "description", header: "Description", accessor: "description", type: "text", width: 260 },
+      {
+        id: "revisedBudget",
+        header: "Revised budget",
+        accessor: "revisedBudget",
+        type: "currency",
+        currency,
+        precision: 2,
+        width: 150,
+        mono: true,
+        aggregate: "sum",
+      },
+      {
+        id: "jobToDateCosts",
+        header: "Spent (JTD)",
+        accessor: "jobToDateCosts",
+        type: "currency",
+        currency,
+        precision: 2,
+        width: 140,
+        mono: true,
+        aggregate: "sum",
+      },
+      {
+        id: "storedMethod",
+        header: "Stored method",
+        headerTooltip: "The method the line's stored forecast was derived by.",
+        accessor: "storedMethod",
+        type: "enum",
+        width: 160,
+        aggregate: "none",
+        options: FORECAST_METHODS.map<DataOption>((value) => ({
+          value,
+          text: FORECAST_METHOD_LABEL[value],
+          label: FORECAST_METHOD_LABEL[value],
+        })),
+        cell: (ctx) => <MethodBadge method={ctx.row.storedMethod} />,
+      },
+      {
+        id: "storedForecastFinal",
+        header: "Stored at completion",
+        accessor: "storedForecastFinal",
+        type: "currency",
+        currency,
+        precision: 2,
+        width: 160,
+        mono: true,
+        aggregate: "sum",
+      },
+      {
+        id: "proposedForecastToComplete",
+        header: "Proposed to complete",
+        accessor: "proposedForecastToComplete",
+        type: "currency",
+        currency,
+        precision: 2,
+        width: 168,
+        mono: true,
+        aggregate: "none",
+        cell: (ctx) => <ProposedCell row={ctx.row} value={ctx.row.proposedForecastToComplete} currency={currency} />,
+      },
+      {
+        id: "proposedForecastFinal",
+        header: "Proposed at completion",
+        accessor: "proposedForecastFinal",
+        type: "currency",
+        currency,
+        precision: 2,
+        width: 172,
+        mono: true,
+        aggregate: "none",
+        cell: (ctx) => <ProposedCell row={ctx.row} value={ctx.row.proposedForecastFinal} currency={currency} />,
+      },
+      {
+        id: "delta",
+        header: "Movement",
+        headerTooltip: "Proposed forecast at completion against the figure the line stores today.",
+        accessor: "delta",
+        type: "currency",
+        currency,
+        precision: 2,
+        width: 150,
+        mono: true,
+        aggregate: "none",
+        cell: (ctx) =>
+          ctx.row.delta === null ? (
+            <span className="text-content-disabled">{EM_DASH}</span>
+          ) : (
+            <span
+              className={cx(
+                "tabular-nums font-medium",
+                ctx.row.delta > 0
+                  ? "text-danger-fg"
+                  : ctx.row.delta < 0
+                    ? "text-success-fg"
+                    : "text-content-muted",
+              )}
+            >
+              {money(ctx.row.delta, currency, { signed: true })}
+            </span>
+          ),
+      },
+      {
+        id: "reasons",
+        header: "Why it cannot be computed",
+        accessor: (row: ForecastPreviewLine) => row.reasons.join(" "),
+        type: "text",
+        width: 340,
+        aggregate: "none",
+        cell: (ctx) =>
+          ctx.row.reasons.length === 0 ? (
+            <span className="text-content-disabled">{EM_DASH}</span>
+          ) : (
+            <Tooltip
+              content={
+                <span className="block max-w-xs space-y-1">
+                  {ctx.row.reasons.map((reason, index) => (
+                    <span key={index} className="block">
+                      {reason}
+                    </span>
+                  ))}
+                </span>
+              }
+            >
+              <span className="truncate text-warning-fg">{ctx.row.reasons[0]}</span>
+            </Tooltip>
+          ),
+      },
+    ],
+    [currency],
+  );
+
+  const previewActions = useCallback(
+    (row: ForecastPreviewLine): ReadonlyArray<DataRowAction<ForecastPreviewLine>> => [
+      {
+        id: "record",
+        label: "Record a forecast on this line",
+        disabled: budget.status === "closed",
+        onSelect: () => {
+          const line = lineById.get(row.lineItemId);
+          if (line) setForecastLine(line);
+        },
+      },
+    ],
+    [budget.status, lineById],
+  );
 
   const forecastColumns = useMemo<DataColumns<ForecastRecord>>(
     () => [
@@ -409,9 +568,7 @@ export default function ForecastTab({
           />
         </div>
 
-        {preview.loading && previewRows.length === 0 ? (
-          <div className="skeleton mt-3 h-64 rounded-lg" aria-hidden="true" />
-        ) : previewRows.length === 0 ? (
+        {previewRows.length === 0 && !preview.loading ? (
           <EmptyState
             className="mt-3"
             icon={IconInsight}
@@ -419,37 +576,28 @@ export default function ForecastTab({
             hint="This budget holds no lines, so there is nothing to compute a position for."
           />
         ) : (
-          <div className="mt-3 max-h-[32rem] overflow-auto">
-            <Table dense stickyHeader flush>
-              <thead>
-                <tr>
-                  <Th>Cost code</Th>
-                  <Th>Description</Th>
-                  <Th numeric>Revised</Th>
-                  <Th numeric>Spent</Th>
-                  <Th>Stored method</Th>
-                  <Th numeric>Stored at completion</Th>
-                  <Th numeric>Proposed to complete</Th>
-                  <Th numeric>Proposed at completion</Th>
-                  <Th numeric>Movement</Th>
-                  <Th />
-                </tr>
-              </thead>
-              <tbody>
-                {previewRows.map((row) => (
-                  <PreviewRow
-                    key={row.lineItemId}
-                    row={row}
-                    currency={currency}
-                    disabled={budget.status === "closed"}
-                    onRecord={() => {
-                      const line = lineById.get(row.lineItemId);
-                      if (line) setForecastLine(line);
-                    }}
-                  />
-                ))}
-              </tbody>
-            </Table>
+          <div className="mt-3">
+            <DataTable<ForecastPreviewLine>
+              tableId="budget-forecast-preview"
+              data={previewRows}
+              columns={previewColumns}
+              getRowId={(row) => row.lineItemId}
+              loading={preview.loading && previewRows.length === 0}
+              loadingRows={10}
+              density="compact"
+              stickyHeader
+              gridLines
+              height={460}
+              savedViews={false}
+              exportFileName={`${budget.reference}-forecast-${method}`}
+              searchPlaceholder="Search cost code, description…"
+              rowActions={previewActions}
+              empty={{
+                title: "No line to forecast",
+                description: "This budget holds no lines.",
+              }}
+              aria-label={`Forecast preview under ${FORECAST_METHOD_LABEL[method]}`}
+            />
           </div>
         )}
       </section>
@@ -536,66 +684,41 @@ export default function ForecastTab({
 }
 
 /* ========================================================================== */
-/* Preview row                                                                 */
+/* Cells                                                                       */
 /* ========================================================================== */
 
-function PreviewRow({
+/**
+ * A proposed figure, or the platform's refusal to invent one. A blank here
+ * would read as zero, so the cell says "Not available" and carries the reasons.
+ */
+function ProposedCell({
   row,
+  value,
   currency,
-  disabled,
-  onRecord,
 }: {
   row: ForecastPreviewLine;
+  value: number | null;
   currency: string;
-  disabled: boolean;
-  onRecord: () => void;
 }) {
-  const unavailable = row.proposedForecastFinal === null;
+  if (value !== null) return <span className="tabular-nums">{money(value, currency, { precision: 2 })}</span>;
   return (
-    <Tr>
-      <Td className="font-mono text-code">{row.costCode}</Td>
-      <Td truncate>{row.description}</Td>
-      <Td numeric muted>
-        {money(row.revisedBudget, currency)}
-      </Td>
-      <Td numeric muted>
-        {money(row.jobToDateCosts, currency)}
-      </Td>
-      <Td>
-        <MethodBadge method={row.storedMethod} />
-      </Td>
-      <Td numeric>{money(row.storedForecastFinal, currency)}</Td>
-      {unavailable ? (
-        <Td colSpan={3}>
-          <div className="flex items-start gap-2">
-            <Badge tone="warning" size="xs">
-              Not available
-            </Badge>
-            <ReasonList reasons={row.reasons} />
-          </div>
-        </Td>
-      ) : (
-        <>
-          <Td numeric>{money(row.proposedForecastToComplete, currency)}</Td>
-          <Td numeric>{money(row.proposedForecastFinal, currency)}</Td>
-          <Td numeric>
-            <span
-              className={cx(
-                "font-medium",
-                (row.delta ?? 0) > 0 ? "text-danger-fg" : (row.delta ?? 0) < 0 ? "text-success-fg" : undefined,
-              )}
-            >
-              {money(row.delta, currency, { signed: true })}
+    <Tooltip
+      content={
+        <span className="block max-w-xs space-y-1">
+          {row.reasons.map((reason, index) => (
+            <span key={index} className="block">
+              {reason}
             </span>
-          </Td>
-        </>
-      )}
-      <Td align="right">
-        <Button size="xs" variant="ghost" onClick={onRecord} disabled={disabled}>
-          Record
-        </Button>
-      </Td>
-    </Tr>
+          ))}
+        </span>
+      }
+    >
+      <span>
+        <Badge tone="warning" size="xs">
+          Not available
+        </Badge>
+      </span>
+    </Tooltip>
   );
 }
 

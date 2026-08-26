@@ -38,7 +38,7 @@ import {
   useConfirm,
 } from "../../ui";
 import type { MenuItemSpec } from "../../ui";
-import { IconBudget, IconMore, IconPlus, IconRefresh } from "../../ui/icons";
+import { IconBudget, IconEdit, IconMore, IconPlus, IconRefresh } from "../../ui/icons";
 import { api } from "../../lib/api";
 import ChangesTab from "./ChangesTab";
 import ForecastTab from "./ForecastTab";
@@ -54,6 +54,7 @@ import {
   count,
   dateTime,
   errorMessage,
+  errorReasons,
   groupByCurrency,
   labelize,
   money,
@@ -101,6 +102,7 @@ export default function BudgetPage() {
   );
   const [busy, setBusy] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
   const [recalcResult, setRecalcResult] = useState<RecalculateResult | null>(null);
 
   const budgets = useResource<ListResponse<BudgetRecord>>(
@@ -178,7 +180,7 @@ export default function BudgetPage() {
           setRefusal({
             title: refusalTitle,
             message: errorMessage(err, "The platform refused this action."),
-            reasons: [],
+            reasons: errorReasons(err),
           });
         } else {
           setActionError(errorMessage(err, "That action could not be completed"));
@@ -212,6 +214,13 @@ export default function BudgetPage() {
     if (!budget) return [];
     return [
       { type: "label", label: budget.reference },
+      {
+        id: "edit",
+        label: "Rename or re-describe",
+        icon: IconEdit,
+        disabled: budget.status === "closed",
+        onSelect: () => setEditOpen(true),
+      },
       {
         id: "recalculate",
         label: "Recalculate from source tools",
@@ -466,6 +475,7 @@ export default function BudgetPage() {
               budget={budget}
               currency={currency}
               users={users}
+              summary={summary.data}
               version={version}
               onChanged={refresh}
             />
@@ -498,6 +508,16 @@ export default function BudgetPage() {
           )}
         </>
       )}
+
+      <EditBudgetModal
+        open={editOpen && budget !== null}
+        budget={budget}
+        onClose={() => setEditOpen(false)}
+        onSaved={() => {
+          setEditOpen(false);
+          refresh();
+        }}
+      />
 
       <NewBudgetModal
         open={createOpen}
@@ -727,6 +747,114 @@ function NewBudgetModal({
           label="Make this the project's active budget"
           description="Exactly one budget per project is active, and it is the one every rollup reads."
         />
+      </div>
+    </Modal>
+  );
+}
+
+/* ========================================================================== */
+/* Edit budget                                                                 */
+/* ========================================================================== */
+
+function EditBudgetModal({
+  open,
+  budget,
+  onClose,
+  onSaved,
+}: {
+  open: boolean;
+  budget: BudgetDetail | null;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [currency, setCurrency] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open || !budget) return;
+    setName(budget.name);
+    setDescription(budget.description ?? "");
+    setCurrency(budget.currency);
+    setError(null);
+  }, [open, budget]);
+
+  if (!budget) return null;
+
+  const currencyLocked = budget.lineCount > 0;
+
+  async function submit() {
+    if (!budget) return;
+    if (name.trim() === "") {
+      setError("A budget needs a name.");
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      const body: Record<string, unknown> = {
+        name: name.trim(),
+        description: description.trim() === "" ? null : description.trim(),
+      };
+      if (!currencyLocked && currency.trim().toUpperCase() !== budget.currency) {
+        body["currency"] = currency.trim().toUpperCase();
+      }
+      await api.patch(`/api/v1/budgets/${budget.id}`, body);
+      onSaved();
+    } catch (err) {
+      setError(errorMessage(err, "The budget could not be updated"));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={`Edit ${budget.reference}`}
+      description="Naming only. Amounts move through the grid, a budget change, or a forecast — never here."
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button onClick={() => void submit()} loading={saving}>
+            Save
+          </Button>
+        </>
+      }
+    >
+      <ErrorAlert message={error} />
+      <div className="space-y-3">
+        <Field label="Name" required>
+          <Input value={name} onChange={(event) => setName(event.target.value)} autoFocus />
+        </Field>
+        <Field label="Description" optional>
+          <Textarea
+            value={description}
+            onChange={(event) => setDescription(event.target.value)}
+            rows={3}
+          />
+        </Field>
+        <Field
+          label="Currency"
+          hint={
+            currencyLocked
+              ? `Locked: this budget holds ${count(budget.lineCount)} lines, and the stored amounts are denominated in ${budget.currency}. They are never converted implicitly.`
+              : "Changeable only while the budget holds no lines."
+          }
+        >
+          <Input
+            value={currency}
+            onChange={(event) => setCurrency(event.target.value)}
+            disabled={currencyLocked}
+            maxLength={8}
+            className="max-w-32"
+          />
+        </Field>
       </div>
     </Modal>
   );

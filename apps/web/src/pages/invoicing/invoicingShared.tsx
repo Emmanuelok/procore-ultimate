@@ -1103,15 +1103,20 @@ export interface InvoicingContext {
 }
 
 export function useInvoicingContext(projectId: string): InvoicingContext {
+  // No project in the route means no request: an empty projectId would
+  // otherwise fire `/api/v1/projects//invoices` and read as an empty project.
+  const scope = projectId ? `/api/v1/projects/${projectId}` : null;
   const contracts = useResource<ListResponse<PrimeContractRow>>(
-    `/api/v1/projects/${projectId}/prime-contracts?page=1&pageSize=200`,
+    scope && `${scope}/prime-contracts?page=1&pageSize=200`,
   );
   const commitments = useResource<ListResponse<CommitmentRow>>(
-    `/api/v1/projects/${projectId}/commitments?page=1&pageSize=500`,
+    scope && `${scope}/commitments?page=1&pageSize=500`,
   );
-  const vendors = useResource<ListResponse<VendorRow>>(`/api/v1/vendors?page=1&pageSize=500`);
+  const vendors = useResource<ListResponse<VendorRow>>(
+    projectId ? "/api/v1/vendors?page=1&pageSize=500" : null,
+  );
   const periods = useResource<ListResponse<BillingPeriodRow>>(
-    `/api/v1/projects/${projectId}/billing-periods?page=1&pageSize=200`,
+    scope && `${scope}/billing-periods?page=1&pageSize=200`,
   );
 
   const contractRows = useMemo(() => contracts.data?.items ?? [], [contracts.data]);

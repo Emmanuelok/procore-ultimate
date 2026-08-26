@@ -676,6 +676,7 @@ export default function QuotesTab({
         columns={columns}
         getRowId={(row) => row.id}
         loading={chain.loading}
+        error={chain.error}
         onRetry={chain.reload}
         height={560}
         stickyHeader

@@ -32,6 +32,7 @@ import {
   Th,
   Tr,
   cx,
+  useConfirm,
 } from "../../ui";
 import { IconDownload, IconImport, IconWarning } from "../../ui/icons";
 import { FileDropzone } from "../../ui/inputs";
@@ -80,6 +81,7 @@ export interface ImportTabProps {
 }
 
 export default function ImportTab({ budget, currency, onChanged }: ImportTabProps) {
+  const { confirm, dialog } = useConfirm();
   const dropzone = useRef<FileDropzoneHandle>(null);
   const [fileName, setFileName] = useState<string | null>(null);
   const [csv, setCsv] = useState<string | null>(null);
@@ -139,6 +141,19 @@ export default function ImportTab({ budget, currency, onChanged }: ImportTabProp
 
   async function commit() {
     if (!csv) return;
+    if (mode === "upsert") {
+      // Upsert overwrites the amounts on lines that already exist. That is a
+      // destructive write to figures somebody may already have reported on, so
+      // it is named before it happens.
+      const ok = await confirm({
+        title: "Overwrite existing lines?",
+        description:
+          "Upsert mode replaces the amounts, description and unit basis on any line whose cost code and cost type already exist on this budget. Those figures may already have been reported against.",
+        confirmLabel: "Overwrite and import",
+        destructive: true,
+      });
+      if (!ok) return;
+    }
     setCommitting(true);
     setError(null);
     setIssues([]);
@@ -411,6 +426,8 @@ export default function ImportTab({ budget, currency, onChanged }: ImportTabProp
           hint="Drop a CSV above and every row is checked against this project's cost-code list before anything is written."
         />
       ) : null}
+
+      {dialog}
     </div>
   );
 }

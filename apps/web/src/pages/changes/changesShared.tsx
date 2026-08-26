@@ -1048,7 +1048,7 @@ export interface Resource<T> {
 }
 
 /** GET once, re-fetch on demand. Failures are named, never rendered as empty. */
-export function useResource<T>(path: string | null, deps: unknown[] = []): Resource<T> {
+export function useResource<T>(path: string | null): Resource<T> {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(path !== null);
@@ -1077,8 +1077,7 @@ export function useResource<T>(path: string | null, deps: unknown[] = []): Resou
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [path, nonce, ...deps]);
+  }, [path, nonce]);
 
   const reload = useCallback(() => setNonce((n) => n + 1), []);
   return { data, error, loading, reload };
@@ -1107,13 +1106,16 @@ export interface ChangeContext {
  * contract that owns the money — never assumed from the project.
  */
 export function useChangeContext(projectId: string): ChangeContext {
+  const scope = projectId ? `/api/v1/projects/${projectId}` : null;
   const contracts = useResource<ListResponse<PrimeContractRow>>(
-    `/api/v1/projects/${projectId}/prime-contracts?page=1&pageSize=200`,
+    scope && `${scope}/prime-contracts?page=1&pageSize=200`,
   );
   const commitments = useResource<ListResponse<CommitmentRow>>(
-    `/api/v1/projects/${projectId}/commitments?page=1&pageSize=500`,
+    scope && `${scope}/commitments?page=1&pageSize=500`,
   );
-  const vendors = useResource<ListResponse<VendorRow>>(`/api/v1/vendors?page=1&pageSize=500`);
+  const vendors = useResource<ListResponse<VendorRow>>(
+    projectId ? "/api/v1/vendors?page=1&pageSize=500" : null,
+  );
 
   const contractRows = useMemo(() => contracts.data?.items ?? [], [contracts.data]);
   const commitmentRows = useMemo(() => commitments.data?.items ?? [], [commitments.data]);
@@ -1186,20 +1188,21 @@ export interface ChangeChain {
  * quoted, submitted or executed, never by somebody setting a field.
  */
 export function useChangeChain(projectId: string): ChangeChain {
+  const scope = projectId ? `/api/v1/projects/${projectId}` : null;
   const events = useResource<ListResponse<ChangeEventRow>>(
-    `/api/v1/projects/${projectId}/change-events?page=1&pageSize=500`,
+    scope && `${scope}/change-events?page=1&pageSize=500`,
   );
   const pcos = useResource<ListResponse<PcoRow>>(
-    `/api/v1/projects/${projectId}/potential-change-orders?page=1&pageSize=500`,
+    scope && `${scope}/potential-change-orders?page=1&pageSize=500`,
   );
   const quotes = useResource<ListResponse<QuoteRow>>(
-    `/api/v1/projects/${projectId}/quote-requests?page=1&pageSize=500`,
+    scope && `${scope}/quote-requests?page=1&pageSize=500`,
   );
   const cors = useResource<ListResponse<CorRow>>(
-    `/api/v1/projects/${projectId}/change-order-requests?page=1&pageSize=500`,
+    scope && `${scope}/change-order-requests?page=1&pageSize=500`,
   );
   const packages = useResource<ListResponse<PackageRow>>(
-    `/api/v1/projects/${projectId}/change-order-packages?page=1&pageSize=500`,
+    scope && `${scope}/change-order-packages?page=1&pageSize=500`,
   );
 
   const reload = useCallback(() => {

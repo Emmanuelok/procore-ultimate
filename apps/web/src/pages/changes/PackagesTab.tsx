@@ -1165,6 +1165,7 @@ export default function PackagesTab({
         columns={columns}
         getRowId={(row) => row.id}
         loading={chain.loading}
+        error={chain.error}
         onRetry={chain.reload}
         height={560}
         stickyHeader

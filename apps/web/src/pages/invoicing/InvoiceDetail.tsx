@@ -746,6 +746,14 @@ function PaymentsPanel({
               </li>
             ))}
           </ul>
+        ) : invoice.kind === "owner_billing" && invoice.amountPaid > 0 ? (
+          <Alert tone="info" variant="subtle" size="sm" title="Owner receipts are not in the payment register">
+            {money(invoice.amountPaid, invoice.currency)} has been received against this
+            application — the paid figure above is the record of it. Money coming IN is booked as a
+            receipt against the payment application and the prime contract, not as a row in the
+            commitment payment register, which only holds money going OUT to subcontractors. The
+            empty list below is that distinction, not a missing payment.
+          </Alert>
         ) : (
           <p className="text-meta text-content-muted">
             Nothing has been paid against this invoice.

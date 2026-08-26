@@ -755,6 +755,7 @@ export default function PcoTab({
         columns={columns}
         getRowId={(row) => row.id}
         loading={chain.loading}
+        error={chain.error}
         onRetry={chain.reload}
         height={620}
         stickyHeader

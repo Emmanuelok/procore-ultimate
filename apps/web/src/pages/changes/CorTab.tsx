@@ -44,13 +44,11 @@ import {
   ComponentValue,
   IdentityList,
   PanelSkeleton,
-  PanelSkeleton as Skel,
   Reasons,
   corTone,
   days,
   errorMessage,
   isoDate,
-  isoDateTime,
   label,
   money,
   pcoTone,
@@ -430,7 +428,7 @@ function CorDrawer({
     >
       <DrawerBody>
         {detail.loading && !detail.data ? (
-          <Skel rows={6} />
+          <PanelSkeleton rows={6} />
         ) : detail.error ? (
           <ErrorAlert message={detail.error} />
         ) : detail.data && cor ? (
@@ -1005,6 +1003,7 @@ export default function CorTab({
         columns={columns}
         getRowId={(row) => row.id}
         loading={chain.loading}
+        error={chain.error}
         onRetry={chain.reload}
         height={620}
         stickyHeader

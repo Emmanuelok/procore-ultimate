@@ -85,7 +85,9 @@ import {
   varianceBand,
   type BudgetDetail,
   type BudgetLine,
+  type BudgetSummary,
   type CostCodeOption,
+  type Figure,
 } from "./budgetShared";
 
 /* ========================================================================== */
@@ -223,11 +225,20 @@ export interface GridTabProps {
   budget: BudgetDetail;
   currency: string;
   users: Map<string, string>;
+  /** The live cost-side read, so the grid can disclose what it cannot corroborate. */
+  summary: BudgetSummary | null;
   version: number;
   onChanged: () => void;
 }
 
-export default function GridTab({ budget, currency, users, version, onChanged }: GridTabProps) {
+export default function GridTab({
+  budget,
+  currency,
+  users,
+  summary,
+  version,
+  onChanged,
+}: GridTabProps) {
   const { confirm, dialog } = useConfirm();
   const [groupMode, setGroupMode] = useState<GroupMode>(() => {
     try {
@@ -280,6 +291,19 @@ export default function GridTab({ budget, currency, users, version, onChanged }:
   const columns = useMemo<DataColumns<BudgetLine>>(
     () => [
       {
+        id: "division",
+        header: "Division",
+        headerTooltip:
+          "The first segment of the line's materialized WBS path. Grouping by it gives the classic division subtotal.",
+        accessor: (line: BudgetLine) => divisionOf(line),
+        type: "text",
+        width: 108,
+        sticky: "start",
+        mono: true,
+        groupable: true,
+        aggregate: "none",
+      },
+      {
         id: "costCode",
         header: "Cost code",
         accessor: "costCode",
@@ -299,16 +323,6 @@ export default function GridTab({ budget, currency, users, version, onChanged }:
         editable: (line) => lineEditable(line),
         validate: (value) =>
           typeof value === "string" && value.trim() !== "" ? null : "A line needs a description.",
-      },
-      {
-        id: "division",
-        header: "Division",
-        headerTooltip: "The first segment of the line's materialized WBS path.",
-        accessor: (line: BudgetLine) => divisionOf(line),
-        type: "text",
-        width: 110,
-        groupable: true,
-        aggregate: "none",
       },
       {
         id: "costType",
@@ -654,6 +668,49 @@ export default function GridTab({ budget, currency, users, version, onChanged }:
 
   const grouping = GROUPING[groupMode];
 
+  /**
+   * The grid sums the stored columns itself. The API also sends the totals it
+   * derived from exactly the same rows, so the two are compared out loud: if a
+   * client-side rollup ever disagrees with the server's, the grid says so
+   * rather than presenting whichever figure happened to be summed last.
+   */
+  const totalsCheck = useMemo(() => {
+    const serverTotals = lines.data?.totals;
+    if (!serverTotals || allLines.length === 0) return null;
+    const clientRevised =
+      Math.round(allLines.reduce((sum, line) => sum + line.revisedBudget, 0) * 100) / 100;
+    const clientForecast =
+      Math.round(allLines.reduce((sum, line) => sum + line.forecastFinal, 0) * 100) / 100;
+    return {
+      agrees:
+        Math.abs(clientRevised - serverTotals.revisedBudgetTotal) <= 0.01 &&
+        Math.abs(clientForecast - serverTotals.forecastFinalTotal) <= 0.01,
+      clientRevised,
+      serverRevised: serverTotals.revisedBudgetTotal,
+    };
+  }, [lines.data, allLines]);
+
+  /** Lines the client cap left behind — disclosed, never silently dropped. */
+  const truncated = lines.data ? lines.data.total - allLines.length : 0;
+
+  /**
+   * Stored cost columns the source tools cannot currently corroborate. The
+   * budget holds a number for every line; when the commitments or invoices
+   * tool holds nothing at all, that stored number is not evidence of zero cost
+   * and the grid says so rather than letting the column read as fact.
+   */
+  const uncorroborated = useMemo<Array<{ column: string; reasons: string[] }>>(() => {
+    if (!summary) return [];
+    const entries: Array<[string, Figure]> = [
+      ["Committed", summary.components.committed],
+      ["Pending commitments", summary.components.pendingCommitments],
+      ["Spent (JTD)", summary.components.jobToDateCosts],
+    ];
+    return entries
+      .filter(([, figure]) => figure.value === null)
+      .map(([column, figure]) => ({ column, reasons: figure.reasons }));
+  }, [summary]);
+
   return (
     <div className="space-y-3">
       {lines.error ? (
@@ -675,6 +732,28 @@ export default function GridTab({ budget, currency, users, version, onChanged }:
       {closed ? (
         <Alert tone="warning" size="sm" title="This budget is closed">
           Nothing on the grid can be edited.
+        </Alert>
+      ) : null}
+
+      {uncorroborated.length > 0 ? (
+        <Alert
+          tone="warning"
+          size="sm"
+          title={`${uncorroborated.length} cost column${
+            uncorroborated.length === 1 ? "" : "s"
+          } cannot be corroborated from the source tools`}
+        >
+          <p>
+            The figures below are what this budget has stored. The tools they come from hold
+            nothing to check them against right now, so read them as stored values rather than as
+            evidence of spend:
+          </p>
+          {uncorroborated.map((entry) => (
+            <div key={entry.column} className="mt-2">
+              <p className="text-meta font-semibold text-content">{entry.column}</p>
+              <ReasonList reasons={entry.reasons} />
+            </div>
+          ))}
         </Alert>
       ) : null}
 
@@ -799,11 +878,45 @@ export default function GridTab({ budget, currency, users, version, onChanged }:
           {allLines.length === 1 ? "" : "s"} · all figures in {currency}
           {saving ? " · saving…" : ""}
         </span>
-        <span>
-          Subtotals and the footer are summed over the rows actually on screen — never a
-          pre-aggregated figure from somewhere else.
+        <span className="flex items-center gap-2">
+          {totalsCheck ? (
+            <Tooltip
+              content={
+                totalsCheck.agrees
+                  ? `The grid's own sum of the revised budget column (${money(
+                      totalsCheck.clientRevised,
+                      currency,
+                    )}) matches the total the API derived from the same rows.`
+                  : `The grid sums the revised budget column to ${money(
+                      totalsCheck.clientRevised,
+                      currency,
+                    )}; the API derived ${money(
+                      totalsCheck.serverRevised,
+                      currency,
+                    )} from the same rows. Reload before relying on either figure.`
+              }
+            >
+              <span>
+                <Badge tone={totalsCheck.agrees ? "success" : "danger"} size="xs" dot>
+                  {totalsCheck.agrees ? "Totals agree with the API" : "Totals disagree with the API"}
+                </Badge>
+              </span>
+            </Tooltip>
+          ) : null}
+          <span>
+            Subtotals and the footer are summed over the rows actually on screen — never a
+            pre-aggregated figure from somewhere else.
+          </span>
         </span>
       </div>
+
+      {truncated > 0 ? (
+        <Alert tone="warning" size="sm" title="This budget is larger than the grid loaded">
+          {count(allLines.length)} of {count(lines.data?.total ?? 0)} lines were loaded. The
+          remaining {count(truncated)} are not on screen and are NOT in the subtotals or the footer
+          — filter the budget down rather than reading these totals as the whole cost report.
+        </Alert>
+      ) : null}
 
       <LineDrawer
         lineId={openLineId}

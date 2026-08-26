@@ -972,6 +972,7 @@ export default function EventsTab({
         columns={columns}
         getRowId={(row) => row.id}
         loading={loading}
+        error={error}
         onRetry={reload}
         height={620}
         stickyHeader
