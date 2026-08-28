@@ -136,7 +136,6 @@
 
 .witness-button--copper {
   background: var(--copper);
-  color: var(--void);
   box-shadow: 0 18px 70px rgb(255 101 52 / 0.2);
 }
 
@@ -152,6 +151,11 @@
 
 .witness-button--chalk {
   background: var(--chalk);
+}
+
+.witness-page .witness-button--copper,
+.witness-page .witness-button--chalk,
+.witness-page .witness-header-cta {
   color: var(--void);
 }
 
