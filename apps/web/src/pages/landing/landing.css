@@ -948,7 +948,7 @@
 
 .witness-network-nodes {
   position: absolute;
-  z-index: 3;
+  z-index: 7;
   top: 16px;
   right: 3%;
   left: 3%;
@@ -973,7 +973,7 @@
 }
 
 .witness-network-node:nth-child(even) {
-  top: 46%;
+  top: 34%;
 }
 
 .witness-network-node span {
