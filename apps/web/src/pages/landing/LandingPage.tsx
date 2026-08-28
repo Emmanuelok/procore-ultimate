@@ -13,6 +13,11 @@ const FILM_DESKTOP =
 const FILM_MOBILE =
   "https://d2ol7oe51mr4n9.cloudfront.net/user_3ChJ2tLVG7i2Ag6ynWBf8Xmyz6a/cd8da2e8-50fa-438b-84af-47988d92d692.mp4";
 const FILM_POSTER = "/assets/landing/constructos-proof-line-poster-v1.webp";
+const EVIDENCE_ORIGIN = "/assets/landing/constructos-evidence-origin-v1.webp";
+const EVIDENCE_ORIGIN_MOBILE = "/assets/landing/constructos-evidence-origin-mobile-v1.webp";
+const EVIDENCE_MEASURE = "/assets/landing/constructos-evidence-measure-v1.webp";
+const EVIDENCE_CUSTODY = "/assets/landing/constructos-evidence-custody-v1.webp";
+const EVIDENCE_CUSTODY_MOBILE = "/assets/landing/constructos-evidence-custody-mobile-v1.webp";
 
 type MotionConnection = {
   saveData?: boolean;
@@ -505,7 +510,7 @@ function ConsequenceEngine({ staticVisual }: { staticVisual: boolean }) {
   const active = TRACE_STEPS[activeStep] ?? TRACE_STEPS[0];
 
   return (
-    <section ref={sectionRef} id="trace" className="witness-consequence" data-step="0" aria-labelledby="trace-title">
+    <section ref={sectionRef} id="trace" className="witness-consequence" data-step={activeStep} aria-labelledby="trace-title">
       <div className="witness-consequence-sticky">
         <div className="witness-section-rail" aria-hidden="true"><span>01</span><i /><b>THE CASCADE</b></div>
         <div className="witness-consequence-copy">
@@ -518,6 +523,20 @@ function ConsequenceEngine({ staticVisual }: { staticVisual: boolean }) {
         </div>
 
         <div className="witness-consequence-stage">
+          <figure className="witness-origin-plate">
+            <picture>
+              <source media="(max-width: 680px)" srcSet={EVIDENCE_ORIGIN_MOBILE} />
+              <img
+                src={EVIDENCE_ORIGIN}
+                alt="Illustrative scene of a site inspector documenting incomplete fire stopping before enclosure."
+                width="1600"
+                height="1000"
+                loading="lazy"
+                decoding="async"
+              />
+            </picture>
+            <figcaption><span>ORIGIN CAPTURE</span><strong>FIELD REALITY / PRESERVED AT SOURCE</strong></figcaption>
+          </figure>
           <svg className="witness-network-lines" viewBox="0 0 720 520" preserveAspectRatio="none" aria-hidden="true">
             {TRACE_STEPS.slice(0, -1).map((_, index) => (
               <path key={index} pathLength="1" d={`M ${90 + index * 108} ${index % 2 === 0 ? 160 : 350} C ${142 + index * 108} ${index % 2 === 0 ? 160 : 350}, ${145 + index * 108} ${index % 2 === 0 ? 350 : 160}, ${198 + index * 108} ${index % 2 === 0 ? 350 : 160}`} style={{ "--edge": index } as LandingStyle} />
@@ -656,7 +675,7 @@ function ReconciliationLab() {
       <div className="witness-lab-stage" key={activeCase.label}>
         <div className="witness-claim-column"><span>CONTRACTOR ASSERTION</span><strong>{activeCase.claim}</strong><p>Claim / programme / submitted record</p><div className="witness-claim-sheet"><i /><b>PAY-007</b><span>AUTHORED SOURCE</span></div></div>
         <div className="witness-lab-core"><span className="witness-scan-label">RECONCILING</span><div className="witness-scanner"><i /><b /></div><div className="witness-variance"><span>SIGNAL</span><strong>{activeCase.signal}</strong></div><div className="witness-obligation"><i />{activeCase.obligation}<span>REVIEW REQUIRED</span></div></div>
-        <div className="witness-evidence-column"><span>INDEPENDENT STREAM</span><strong>{activeCase.verified}</strong><p>Measurement / imagery / approved state</p><div className="witness-evidence-stack"><i>MEAS</i><i>PHOTO</i><i>PROG</i></div></div>
+        <div className="witness-evidence-column"><span>INDEPENDENT STREAM</span><strong>{activeCase.verified}</strong><p>Measurement / imagery / approved state</p><figure className="witness-measure-plate"><img src={EVIDENCE_MEASURE} alt="Illustrative independent measurement of installed work used to compare claimed and verified progress." width="1200" height="675" loading="lazy" decoding="async" /><figcaption><span>MEAS</span><span>PHOTO</span><span>PROG</span></figcaption></figure></div>
       </div>
       <div className="witness-proof-verdict" aria-label="Assurance sequence"><span>ASSERTION</span><i>→</i><span>EVIDENCE</span><i>→</i><span>RECONCILIATION</span><i>→</i><span>SIGNAL</span><i>→</i><strong>AUTHORISED RECORD</strong></div>
     </section>
@@ -729,6 +748,10 @@ function EvidenceVault({ staticVisual }: { staticVisual: boolean }) {
 
   return (
     <section ref={sectionRef} id="verify" className="witness-vault" aria-labelledby="vault-title">
+      <picture className="witness-vault-backdrop" aria-hidden="true">
+        <source media="(max-width: 680px)" srcSet={EVIDENCE_CUSTODY_MOBILE} />
+        <img src={EVIDENCE_CUSTODY} alt="" width="1600" height="1000" loading="lazy" decoding="async" />
+      </picture>
       <div className="witness-section-rail" aria-hidden="true"><span>05</span><i /><b>PORTABLE PROOF</b></div>
       <div className="witness-vault-copy"><p className="witness-kicker witness-kicker--copper"><span /> Verify, don’t trust</p><h2 id="vault-title">Even ConstructOS should not have to vouch for <em>its own record.</em></h2><p>Export a signed manifest and test its sequence outside the platform. The seal proves record integrity; it does not, by itself, prove the underlying real-world event was true.</p><button className="witness-button witness-button--copper" type="button" onClick={runVerification} disabled={verifying}>{verifying ? "Verification running" : verificationStage === VERIFICATION_CHECKS.length ? "Verify again" : "Verify sample receipt"}<ArrowIcon /></button><span className="witness-simulation-note">Illustrative local verification · no upload</span></div>
       <div className="witness-vault-stage">

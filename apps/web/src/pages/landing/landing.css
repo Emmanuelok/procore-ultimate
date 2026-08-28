@@ -830,6 +830,64 @@
   overflow: hidden;
 }
 
+.witness-origin-plate {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  margin: 0;
+  overflow: hidden;
+}
+
+.witness-origin-plate::after {
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(to bottom, rgb(5 6 7 / 0.18), rgb(5 6 7 / 0.34) 48%, rgb(5 6 7 / 0.9) 100%),
+    linear-gradient(90deg, rgb(5 6 7 / 0.5), transparent 45%, rgb(5 6 7 / 0.12));
+  content: "";
+}
+
+.witness-origin-plate picture,
+.witness-origin-plate img {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.witness-origin-plate img {
+  object-fit: cover;
+  object-position: 54% center;
+  filter: saturate(0.86) contrast(1.08) brightness(0.76);
+  transform: scale(1.025);
+  transition: transform 1.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.witness-consequence[data-step="5"] .witness-origin-plate img {
+  transform: scale(1);
+}
+
+.witness-origin-plate figcaption {
+  position: absolute;
+  z-index: 2;
+  bottom: 22px;
+  left: 24px;
+  display: grid;
+  gap: 4px;
+  color: rgb(247 243 233 / 0.72);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.52rem;
+  letter-spacing: 0.1em;
+}
+
+.witness-origin-plate figcaption span {
+  color: var(--copper);
+}
+
+.witness-origin-plate figcaption strong {
+  font-size: 0.5rem;
+  font-weight: 500;
+}
+
 .witness-network-grid {
   position: absolute;
   inset: 0;
@@ -1970,6 +2028,54 @@
 .witness-evidence-stack i:nth-child(1) { right: 18%; bottom: 34px; }
 .witness-evidence-stack i:nth-child(2) { right: 9%; bottom: 17px; }
 
+.witness-measure-plate {
+  position: absolute;
+  right: 40px;
+  bottom: 55px;
+  left: 40px;
+  height: 165px;
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid rgb(88 224 161 / 0.42);
+  background: var(--void);
+}
+
+.witness-measure-plate::after {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to top, rgb(5 6 7 / 0.76), transparent 65%), linear-gradient(90deg, transparent 42%, rgb(5 6 7 / 0.2));
+  content: "";
+}
+
+.witness-measure-plate img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: 45% 54%;
+  filter: saturate(0.84) contrast(1.08) brightness(0.82);
+  transform: scale(1.035);
+}
+
+.witness-measure-plate figcaption {
+  position: absolute;
+  z-index: 2;
+  right: 12px;
+  bottom: 11px;
+  display: flex;
+  gap: 5px;
+}
+
+.witness-measure-plate figcaption span {
+  padding: 5px 7px;
+  border: 1px solid rgb(88 224 161 / 0.54);
+  background: rgb(5 6 7 / 0.68);
+  color: var(--valid);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.5rem;
+  letter-spacing: 0.08em;
+}
+
 .witness-lab-core {
   position: relative;
   display: flex;
@@ -2540,6 +2646,34 @@
     var(--void);
 }
 
+.witness-vault-backdrop {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  display: block;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.witness-vault-backdrop::after {
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(90deg, var(--void) 0%, rgb(5 6 7 / 0.96) 24%, rgb(5 6 7 / 0.7) 50%, rgb(5 6 7 / 0.58) 100%),
+    linear-gradient(to bottom, rgb(5 6 7 / 0.35), transparent 38%, rgb(5 6 7 / 0.72));
+  content: "";
+}
+
+.witness-vault-backdrop img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+  filter: saturate(0.68) contrast(1.05) brightness(0.66);
+  transform: scale(1.02);
+}
+
 .witness-vault-copy {
   position: relative;
   z-index: 4;
@@ -2574,6 +2708,7 @@
 
 .witness-vault-stage {
   position: relative;
+  z-index: 2;
   min-height: 700px;
   perspective: 1200px;
   opacity: 0;
@@ -3164,6 +3299,10 @@
   .witness-consequence-tally span { font-size: 0.51rem; }
   .witness-consequence-stage { height: auto; min-height: 0; margin-top: 45px; padding: 22px 14px; }
   .witness-network-lines, .witness-network-grid, .witness-network-pulse { display: none; }
+  .witness-origin-plate { position: relative; inset: auto; height: 230px; margin-bottom: 18px; border: 1px solid rgb(247 243 233 / 0.14); }
+  .witness-origin-plate::after { background: linear-gradient(to top, rgb(5 6 7 / 0.78), transparent 68%); }
+  .witness-origin-plate img { object-position: 68% center; transform: none; }
+  .witness-origin-plate figcaption { bottom: 13px; left: 14px; }
   .witness-network-nodes { position: relative; top: auto; right: auto; left: auto; display: flex; height: auto; gap: 6px; overflow-x: auto; padding-bottom: 15px; scroll-snap-type: x mandatory; }
   .witness-network-node, .witness-network-node:nth-child(even) { position: relative; top: auto; left: auto; width: 94px; min-width: 94px; min-height: 82px; flex: none; border: 1px solid var(--line); transform: none; scroll-snap-align: start; }
   .witness-network-node[data-active] { border-color: var(--copper); transform: none; }
@@ -3208,7 +3347,9 @@
   .witness-lab-stage { display: block; }
   .witness-claim-column, .witness-evidence-column { min-height: 380px; padding: 34px 22px; border: 0; border-bottom: 1px solid var(--line); text-align: left; }
   .witness-claim-column > strong, .witness-evidence-column > strong { font-size: 5.2rem; }
-  .witness-claim-sheet, .witness-evidence-stack { right: 22px; bottom: 32px; left: 22px; }
+  .witness-claim-sheet, .witness-evidence-stack, .witness-measure-plate { right: 22px; bottom: 32px; left: 22px; }
+  .witness-measure-plate { height: 170px; }
+  .witness-measure-plate img { object-position: 45% center; }
   .witness-evidence-stack i { right: auto; left: 0; align-items: flex-end; justify-content: flex-start; }
   .witness-evidence-stack i:nth-child(1) { right: auto; left: 18%; }
   .witness-evidence-stack i:nth-child(2) { right: auto; left: 9%; }
@@ -3235,6 +3376,8 @@
   .witness-claim-chain { justify-content: flex-start; }
 
   .witness-vault-copy > p:nth-of-type(2) { font-size: 0.96rem; }
+  .witness-vault-backdrop::after { background: linear-gradient(to bottom, rgb(5 6 7 / 0.48), rgb(5 6 7 / 0.72) 54%, rgb(5 6 7 / 0.92)); }
+  .witness-vault-backdrop img { object-position: 68% center; filter: saturate(0.62) contrast(1.04) brightness(0.5); }
   .witness-vault-stage { min-height: 880px; margin-top: 55px; }
   .witness-hash-chain { justify-content: flex-start; gap: 8px; overflow-x: auto; }
   .witness-hash-chain i { width: 70px; min-width: 70px; height: 70px; }
