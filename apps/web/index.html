@@ -4,15 +4,16 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 
-    <title>ConstructOS</title>
+    <title>ConstructOS — Run the project. Preserve the proof.</title>
     <meta
       name="description"
-      content="ConstructOS — AI-native construction delivery and assurance. Drawings, RFIs, submittals, commercial control and an evidence-first ledger in one system."
+      content="ConstructOS connects construction delivery, commercial control and project intelligence to independent evidence—so every consequential decision can be traced, tested and defended."
     />
     <meta name="application-name" content="ConstructOS" />
-    <meta name="robots" content="noindex, nofollow" />
+    <meta name="robots" content="index, follow" />
     <meta name="color-scheme" content="light dark" />
     <meta name="format-detection" content="telephone=no" />
+    <link rel="canonical" href="https://constructos-production-7d87.up.railway.app/" />
 
     <!-- Managed at runtime by the anti-flash script below and src/lib/theme.tsx.
          Values must match THEME_COLOR in src/ui/tokens.ts. -->
@@ -28,12 +29,31 @@
 
     <meta property="og:type" content="website" />
     <meta property="og:site_name" content="ConstructOS" />
-    <meta property="og:title" content="ConstructOS" />
+    <meta property="og:url" content="https://constructos-production-7d87.up.railway.app/" />
+    <meta property="og:title" content="ConstructOS — Run the project. Preserve the proof." />
     <meta
       property="og:description"
-      content="AI-native construction delivery and assurance."
+      content="AI-native construction delivery and independent assurance in one connected operating system."
+    />
+    <meta
+      property="og:image"
+      content="https://constructos-production-7d87.up.railway.app/assets/landing/constructos-og-v1.jpg"
+    />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="ConstructOS — construction delivery connected to verifiable proof" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="ConstructOS — Run the project. Preserve the proof." />
+    <meta
+      name="twitter:description"
+      content="AI-native construction delivery and independent assurance in one connected operating system."
+    />
+    <meta
+      name="twitter:image"
+      content="https://constructos-production-7d87.up.railway.app/assets/landing/constructos-og-v1.jpg"
     />
 
+    <link rel="preconnect" href="https://d2ol7oe51mr4n9.cloudfront.net" crossorigin />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -67,36 +87,7 @@
         constructos:theme    → "light" | "dark" | "system"
         constructos:density  → "comfortable" | "compact"
     -->
-    <script>
-      (function () {
-        var root = document.documentElement;
-        var theme = "system";
-        var density = "comfortable";
-        try {
-          var t = localStorage.getItem("constructos:theme");
-          if (t === "light" || t === "dark" || t === "system") theme = t;
-          var d = localStorage.getItem("constructos:density");
-          if (d === "comfortable" || d === "compact") density = d;
-        } catch (e) {
-          /* storage blocked — fall through to defaults */
-        }
-        var resolved = theme;
-        if (theme === "system") {
-          resolved =
-            window.matchMedia &&
-            window.matchMedia("(prefers-color-scheme: dark)").matches
-              ? "dark"
-              : "light";
-        }
-        root.setAttribute("data-theme", resolved);
-        root.setAttribute("data-density", density);
-        root.style.colorScheme = resolved;
-        var meta = document.querySelector('meta[name="theme-color"]');
-        if (meta) {
-          meta.setAttribute("content", resolved === "dark" ? "#0a0c11" : "#f6f7fa");
-        }
-      })();
-    </script>
+    <script src="/theme-bootstrap.js"></script>
   </head>
   <body>
     <div id="root"></div>
