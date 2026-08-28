@@ -509,6 +509,19 @@ function ConsequenceEngine({ staticVisual }: { staticVisual: boolean }) {
   const [activeStep, setActiveStep] = useNarrativeProgress(sectionRef, TRACE_STEPS.length, staticVisual);
   const active = TRACE_STEPS[activeStep] ?? TRACE_STEPS[0];
 
+  const selectStep = (index: number) => {
+    const section = sectionRef.current;
+    if (!section || staticVisual) {
+      setActiveStep(index);
+      return;
+    }
+
+    const travel = Math.max(1, section.offsetHeight - window.innerHeight);
+    const sectionTop = window.scrollY + section.getBoundingClientRect().top;
+    const progress = (index + 0.5) / TRACE_STEPS.length;
+    window.scrollTo({ top: sectionTop + travel * progress, behavior: "auto" });
+  };
+
   return (
     <section ref={sectionRef} id="trace" className="witness-consequence" data-step={activeStep} aria-labelledby="trace-title">
       <div className="witness-consequence-sticky">
@@ -546,7 +559,7 @@ function ConsequenceEngine({ staticVisual }: { staticVisual: boolean }) {
           <div className="witness-network-pulse" aria-hidden="true" />
           <div className="witness-network-nodes" role="list" aria-label="Trace steps">
             {TRACE_STEPS.map((step, index) => (
-              <button key={step.code} type="button" className="witness-network-node" data-active={index === activeStep ? "" : undefined} data-passed={index < activeStep ? "" : undefined} style={{ "--node": index } as LandingStyle} onClick={() => setActiveStep(index)} aria-current={index === activeStep ? "step" : undefined}>
+              <button key={step.code} type="button" className="witness-network-node" data-active={index === activeStep ? "" : undefined} data-passed={index < activeStep ? "" : undefined} style={{ "--node": index } as LandingStyle} onClick={() => selectStep(index)} aria-current={index === activeStep ? "step" : undefined}>
                 <span>{step.number}</span><i /><strong>{step.kind}</strong>
               </button>
             ))}
