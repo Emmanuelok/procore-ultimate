@@ -71,6 +71,13 @@
       "when": 1787707479167,
       "tag": "0009_mean_magus",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1788193139146,
+      "tag": "0010_third_the_anarchist",
+      "breakpoints": true
     }
   ]
 }

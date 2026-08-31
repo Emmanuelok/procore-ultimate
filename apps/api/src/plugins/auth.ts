@@ -22,6 +22,7 @@ import {
 } from "@constructos/shared";
 import { forbidden, unauthorized } from "../lib/errors.js";
 import { isExpired } from "../lib/time.js";
+import { loadSession } from "../modules/account/sessions.js";
 // Vol I §0.7 #120 — machine callers. This gate needed four small additions,
 // all marked below: resolve an OAuth2 access token to a machine identity in
 // `authenticate`, branch to the machine equivalents in `requireCompany` and
@@ -58,9 +59,11 @@ const authPlugin: FastifyPluginAsync = async (app) => {
       return;
     }
     let sub: string | undefined;
+    let payload: Record<string, unknown> = {};
     try {
-      const { payload } = await jwtVerify(header.slice(7), secret);
-      sub = payload.sub;
+      const verified = await jwtVerify(header.slice(7), secret);
+      payload = verified.payload as Record<string, unknown>;
+      sub = verified.payload.sub;
     } catch {
       throw unauthorized("Invalid or expired token");
     }
@@ -73,6 +76,41 @@ const authPlugin: FastifyPluginAsync = async (app) => {
     const user = row[0];
     if (!user || !user.isActive) throw unauthorized("Unknown or deactivated user");
     req.user = { id: user.id, email: user.email, name: user.name };
+
+    // Phase 8 — REVOCATION ON THE ACCESS PATH.
+    //
+    // An access token is a one-hour stateless JWT, so revoking the refresh
+    // token alone leaves the bearer working for the rest of that hour: the
+    // exact hour that matters after a laptop is stolen. modules/account mints
+    // every token with a `sid` naming its `auth_sessions` row and enforced
+    // that row on its own routes; enforcing it only there made "sign out this
+    // device" cosmetic everywhere else — a revoked token was measured
+    // reading GET /me and CREATING A PROJECT. The check belongs here, where
+    // it reaches every authenticated route, because Fastify binds a route's
+    // hooks from the encapsulation context it was registered in and no module
+    // hook can reach routes registered before it.
+    //
+    // A token with NO `sid` is not refused: `signAccessToken` (and every test
+    // helper) mints one, and there is no session behind it to check. That is
+    // stated rather than assumed.
+    const sid = (payload as { sid?: unknown }).sid;
+    if (typeof sid === "string" && sid.length > 0) {
+      const session = await loadSession(app.db, sid);
+      if (!session || session.userId !== user.id) {
+        throw unauthorized("Session is no longer valid");
+      }
+      if (session.revokedAt) {
+        throw unauthorized(
+          session.revokedReason === "password_changed" || session.revokedReason === "mfa_reset"
+            ? "Session ended because the account credentials changed"
+            : "Session has been signed out",
+        );
+      }
+      if (isExpired(session.expiresAt, Date.now())) {
+        throw unauthorized("Session has expired");
+      }
+      req.accountSessionId = session.id;
+    }
   });
 
   app.decorate("requireCompany", async (req: FastifyRequest) => {

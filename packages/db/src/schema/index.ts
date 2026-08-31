@@ -37,3 +37,4 @@ export * from "./quality.js";
 export * from "./equipment.js";
 export * from "./timecards.js";
 export * from "./bidding.js";
+export * from "./auth.js";

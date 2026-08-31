@@ -82,6 +82,30 @@ const CommitmentsPage = lazy(() => import("./pages/commitments/CommitmentsPage")
 const ChangesPage = lazy(() => import("./pages/changes/ChangesPage"));
 const InvoicingPage = lazy(() => import("./pages/invoicing/InvoicingPage"));
 
+/* --------------------------------------------------------------------------
+ * Procore-parity workspaces (M19–M25) and the Phase 8 authentication screens.
+ * Every one of them shipped complete and UNREACHABLE: nothing imported them,
+ * so vite emitted no chunk and `pnpm build` passing said nothing about them.
+ * Two of these paths are load-bearing rather than cosmetic — the SSO callback
+ * redirects the browser to /auth/sso/complete, and the links inside every
+ * verification, reset and invitation message point at /verify-email,
+ * /reset-password and /invitations/accept.
+ * ----------------------------------------------------------------------- */
+const SafetyPage = lazy(() => import("./pages/safety/SafetyPage"));
+const QualityPage = lazy(() => import("./pages/quality/QualityPage"));
+const SpecificationsPage = lazy(() => import("./pages/specifications/SpecificationsPage"));
+const MeetingsPage = lazy(() => import("./pages/meetings/MeetingsPage"));
+const EquipmentPage = lazy(() => import("./pages/equipment/EquipmentPage"));
+const TimecardsPage = lazy(() => import("./pages/timecards/TimecardsPage"));
+const BiddingPage = lazy(() => import("./pages/bidding/BiddingPage"));
+
+const ForgotPasswordPage = lazy(() => import("./pages/auth/ForgotPasswordPage"));
+const ResetPasswordPage = lazy(() => import("./pages/auth/ResetPasswordPage"));
+const VerifyEmailPage = lazy(() => import("./pages/auth/VerifyEmailPage"));
+const AcceptInvitationPage = lazy(() => import("./pages/auth/AcceptInvitationPage"));
+const SsoCompletePage = lazy(() => import("./pages/auth/SsoCompletePage"));
+const AccountSecurityPage = lazy(() => import("./pages/auth/AccountSecurityPage"));
+
 /** Per-route suspense: only the page body swaps, never the surrounding chrome. */
 function S({ children }: { children: ReactNode }) {
   return <Suspense fallback={<RouteFallback />}>{children}</Suspense>;
@@ -140,6 +164,49 @@ export default function App() {
                 </S>
               }
             />
+            {/* Public, because the person holding the link is not signed in yet. */}
+            <Route
+              path="/forgot-password"
+              element={
+                <S>
+                  <ForgotPasswordPage />
+                </S>
+              }
+            />
+            <Route
+              path="/reset-password"
+              element={
+                <S>
+                  <ResetPasswordPage />
+                </S>
+              }
+            />
+            <Route
+              path="/verify-email"
+              element={
+                <S>
+                  <VerifyEmailPage />
+                </S>
+              }
+            />
+            <Route
+              path="/invitations/accept"
+              element={
+                <S>
+                  <AcceptInvitationPage />
+                </S>
+              }
+            />
+            {/* The SSO callback redirects the browser here with a single-use
+                ticket; it must be reachable without a session. */}
+            <Route
+              path="/auth/sso/complete"
+              element={
+                <S>
+                  <SsoCompletePage />
+                </S>
+              }
+            />
             <Route
               path="/"
               element={
@@ -169,6 +236,14 @@ export default function App() {
                 element={
                   <S>
                     <DirectoryPage />
+                  </S>
+                }
+              />
+              <Route
+                path="account/security"
+                element={
+                  <S>
+                    <AccountSecurityPage />
                   </S>
                 }
               />
@@ -532,6 +607,64 @@ export default function App() {
                   element={
                     <S>
                       <InvoicingPage />
+                    </S>
+                  }
+                />
+
+                {/* ---- Procore-parity workspaces (M19–M25) ---- */}
+                <Route
+                  path="specifications"
+                  element={
+                    <S>
+                      <SpecificationsPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="meetings"
+                  element={
+                    <S>
+                      <MeetingsPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="safety"
+                  element={
+                    <S>
+                      <SafetyPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="quality"
+                  element={
+                    <S>
+                      <QualityPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="equipment"
+                  element={
+                    <S>
+                      <EquipmentPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="timecards"
+                  element={
+                    <S>
+                      <TimecardsPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="bidding"
+                  element={
+                    <S>
+                      <BiddingPage />
                     </S>
                   }
                 />

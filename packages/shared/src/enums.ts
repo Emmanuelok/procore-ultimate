@@ -3184,3 +3184,214 @@ export const FINANCIAL_DATA_SOURCES = [
   "bank_reference",
 ] as const;
 export type FinancialDataSource = (typeof FINANCIAL_DATA_SOURCES)[number];
+
+/* ------------------------------------------------------------------ */
+/* Authentication, SSO, MFA and account security (Phase 8)             */
+/*                                                                     */
+/* These back packages/db/src/schema/auth.ts. Read that file's header  */
+/* for the two decisions that shape them: a secret an identity         */
+/* provider must REPLAY (an OIDC client secret, a TOTP seed) cannot be */
+/* hashed, so it is envelope-encrypted with a key held outside the     */
+/* database; a secret the platform only ever CHECKS (a reset token, a  */
+/* recovery code) is stored as a hash and never in usable form.        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The shape of a company's SSO connection. `google` and `microsoft` are OIDC
+ * with a fixed, known issuer — the operator supplies only a client id and
+ * secret; `oidc` is any other compliant provider (Okta, Auth0, Keycloak,
+ * PingFederate) where the issuer or discovery URL is supplied too; `saml` is
+ * the assertion-based protocol still mandated by many public-sector and
+ * enterprise IT departments, and shares no code path with the OIDC three.
+ *
+ * NOT to be confused with OAUTH_GRANT_TYPES above: that is a MACHINE caller
+ * authenticating as itself with a client-credentials grant. This is a PERSON
+ * authenticating at their own employer's identity provider and arriving here
+ * with an assertion about who they are.
+ */
+export const IDENTITY_PROVIDER_KINDS = ["google", "microsoft", "oidc", "saml"] as const;
+export type IdentityProviderKind = (typeof IDENTITY_PROVIDER_KINDS)[number];
+
+/**
+ * How an identity provider's client secret is held. The platform must be able
+ * to present that secret to the IdP's token endpoint, so — unlike every other
+ * credential on this platform — it cannot be a one-way hash.
+ *
+ * `encrypted`  AES-256-GCM ciphertext in `client_secret_ciphertext`, the key
+ *              derived from SSO_ENCRYPTION_KEY (or AUTH_SECRET as a documented
+ *              fallback). A database dump alone does not yield the secret.
+ * `reference`  Nothing secret is stored at all: `client_secret_ref` names an
+ *              external holder (`env:OKTA_CLIENT_SECRET`, `aws-sm:<arn>`,
+ *              `vault:<path>`) resolved at request time. The strongest option
+ *              and the one large deployments should take.
+ * `none`       A public client using PKCE, which has no secret to hold. Only
+ *              legitimate where the IdP supports it; recorded explicitly so
+ *              "no secret" is never confused with "secret not yet configured".
+ */
+export const SSO_SECRET_STORAGE_MODES = ["encrypted", "reference", "none"] as const;
+export type SsoSecretStorageMode = (typeof SSO_SECRET_STORAGE_MODES)[number];
+
+/** SAML binding used to reach the IdP's SSO endpoint. */
+export const SAML_BINDINGS = ["http_post", "http_redirect"] as const;
+export type SamlBinding = (typeof SAML_BINDINGS)[number];
+
+/**
+ * How the credential presented at the start of a session was verified. Stored
+ * on the session so a device list can say "signed in with Microsoft" rather
+ * than implying everyone typed a password, and so revoking password login for
+ * a company can be checked against sessions already in flight.
+ */
+export const AUTH_METHODS = ["password", "sso", "invitation", "recovery_code"] as const;
+export type AuthMethod = (typeof AUTH_METHODS)[number];
+
+/**
+ * Why a session stopped being usable. An auditor's first question after an
+ * incident is "who ended that session and on what basis" — a bare revoked_at
+ * cannot answer it. `token_reuse_detected` is the serious one: a refresh token
+ * presented twice means a copy exists somewhere it should not, and the whole
+ * session family is destroyed rather than rotated.
+ */
+export const SESSION_REVOKE_REASONS = [
+  "user_signed_out",
+  "user_signed_out_everywhere",
+  "admin_revoked",
+  "password_changed",
+  "mfa_reset",
+  "token_reuse_detected",
+  "membership_removed",
+  "account_deactivated",
+  "sso_policy_changed",
+  "expired",
+] as const;
+export type SessionRevokeReason = (typeof SESSION_REVOKE_REASONS)[number];
+
+/**
+ * Second factors the platform can actually verify today. WebAuthn/passkeys and
+ * SMS are deliberately ABSENT: a value here is a promise that enrolment and
+ * challenge both work, and offering a factor the platform cannot check is the
+ * security equivalent of fabricating a figure. Add the value with the code.
+ */
+export const MFA_METHODS = ["totp", "recovery_code"] as const;
+export type MfaMethod = (typeof MFA_METHODS)[number];
+
+/**
+ * Enrolment lifecycle. `pending` matters: a TOTP secret exists and has been
+ * shown as a QR code, but no code has been verified against it yet — that
+ * enrolment must NOT be treated as a second factor, or a user who scanned
+ * nothing gets locked out of their own account.
+ */
+export const MFA_STATUSES = ["pending", "active", "disabled"] as const;
+export type MfaStatus = (typeof MFA_STATUSES)[number];
+
+/** Why a single-use token was issued, so consuming one cannot serve another purpose. */
+export const EMAIL_VERIFICATION_PURPOSES = ["signup", "email_change", "reverify"] as const;
+export type EmailVerificationPurpose = (typeof EMAIL_VERIFICATION_PURPOSES)[number];
+
+/** Invitation lifecycle. `expired` is derived on read (a lazy, idempotent
+ *  sweep on list — never a cron) and then written back, so the register and
+ *  the reader never disagree. */
+export const INVITATION_STATUSES = ["pending", "accepted", "revoked", "expired"] as const;
+export type InvitationStatus = (typeof INVITATION_STATUSES)[number];
+
+/**
+ * The messages the platform sends. Every one is a security-relevant event in
+ * its own right, which is why they are enumerated rather than free text: an
+ * auditor asks "was this user told their MFA changed", and the answer has to
+ * be a row, not a grep of application logs.
+ */
+export const EMAIL_TEMPLATE_KEYS = [
+  "verify_email",
+  "password_reset",
+  "invitation",
+  "mfa_enrolled",
+  "new_device_sign_in",
+] as const;
+export type EmailTemplateKey = (typeof EMAIL_TEMPLATE_KEYS)[number];
+
+/**
+ * What became of a message. `recorded` is the honest state this platform needs
+ * most: no transport is configured, so the message was composed and written
+ * down and NOT delivered. Reporting that as `sent` would make an invitation
+ * that nobody receives look successful — which is exactly the failure this
+ * whole subsystem exists to end.
+ */
+export const EMAIL_DISPATCH_STATUSES = ["recorded", "sent", "failed", "suppressed"] as const;
+export type EmailDispatchStatus = (typeof EMAIL_DISPATCH_STATUSES)[number];
+
+/**
+ * Which transport handled (or declined) a message. `noop` records and does not
+ * send; `http` is a provider REST API (Resend/Postmark shape) reached with
+ * fetch and no npm dependency; `smtp` is the documented adapter slot — it is
+ * accepted as configuration and reports itself unavailable rather than
+ * pretending, because implementing SMTP requires a dependency this repo has
+ * not taken.
+ */
+export const EMAIL_TRANSPORT_KINDS = ["noop", "http", "smtp"] as const;
+export type EmailTransportKind = (typeof EMAIL_TRANSPORT_KINDS)[number];
+
+/** The HTTP email providers with an adapter in apps/api/src/lib/email.ts. */
+export const EMAIL_PROVIDERS = ["none", "resend", "postmark", "smtp"] as const;
+export type EmailProvider = (typeof EMAIL_PROVIDERS)[number];
+
+/**
+ * The account-security trail (`auth_security_events`). This is deliberately
+ * separate from the assurance ledger: the ledger records what was done to
+ * PROJECT records and is anchored for dispute use; this records what happened
+ * to ACCOUNTS and is what an ISO 27001 or SOC 2 auditor asks to see. A failed
+ * login against an address that does not exist has no company and no user, so
+ * it could never be a ledger entry, yet it is precisely the row an intrusion
+ * investigation needs.
+ */
+export const AUTH_EVENT_KINDS = [
+  "register",
+  "login_success",
+  "login_failure",
+  "login_blocked_locked",
+  "login_blocked_password_disabled",
+  "login_blocked_inactive",
+  "logout",
+  "refresh_success",
+  "refresh_reuse_detected",
+  "session_revoked",
+  "sessions_revoked_all",
+  "account_locked",
+  "account_unlocked",
+  "password_changed",
+  "password_reset_requested",
+  "password_reset_completed",
+  "email_verification_sent",
+  "email_verified",
+  "email_change_requested",
+  "mfa_enrol_started",
+  "mfa_enrolled",
+  "mfa_challenge_success",
+  "mfa_challenge_failure",
+  "mfa_disabled",
+  "mfa_recovery_code_used",
+  "mfa_recovery_codes_regenerated",
+  "sso_login_success",
+  "sso_login_failure",
+  "sso_identity_linked",
+  "sso_identity_unlinked",
+  "sso_user_provisioned",
+  "identity_provider_created",
+  "identity_provider_updated",
+  "identity_provider_disabled",
+  "invitation_sent",
+  "invitation_accepted",
+  "invitation_revoked",
+  "new_device_sign_in",
+  "email_dispatch_recorded",
+  "email_dispatch_failed",
+] as const;
+export type AuthEventKind = (typeof AUTH_EVENT_KINDS)[number];
+
+/**
+ * The outcome of a security event, kept separate from its kind so a query can
+ * ask "every failure in the last hour" across every kind. `blocked` is not
+ * `failure`: the credential may have been correct and the attempt refused by
+ * policy (lockout, password login disabled for the tenant), and conflating the
+ * two turns a policy report into a false brute-force alarm.
+ */
+export const AUTH_EVENT_OUTCOMES = ["success", "failure", "blocked", "pending"] as const;
+export type AuthEventOutcome = (typeof AUTH_EVENT_OUTCOMES)[number];

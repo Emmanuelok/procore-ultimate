@@ -1,26 +1,61 @@
-import type { FastifyPluginAsync } from "fastify";
+import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import { and, eq } from "drizzle-orm";
-import bcrypt from "bcryptjs";
 import { z } from "zod";
 import {
-  authEvents,
   companies,
   companyMemberships,
   permissionTemplates,
   refreshTokens,
   users,
 } from "@constructos/db";
-import { BUILTIN_PERMISSION_TEMPLATES } from "@constructos/shared";
+import { BUILTIN_PERMISSION_TEMPLATES, type AuthMethod } from "@constructos/shared";
 import { sha256Hex } from "@constructos/ledger";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, conflict, unauthorized } from "../../lib/errors.js";
 import { isExpired } from "../../lib/time.js";
 import type { Db } from "../../lib/db.js";
+// Phase 8 — account lifecycle and session security. These four imports are the
+// whole of what this module borrows from `modules/account`: the password
+// policy and hashing, the lockout guard, the session-bearing token mint, and
+// the verification message a registration now sends. The logic lives there so
+// that this file — the platform's front door — changes as little as possible.
+// See modules/account/index.ts for the routes that complete each flow.
+import {
+  assessPassword,
+  hashPassword,
+  equalizeVerifyTiming,
+  verifyPassword,
+} from "../account/password.js";
+import {
+  completeLogin,
+  guardLoginAttempt,
+  noteLoginFailure,
+} from "../account/login.js";
+import {
+  issueUserSession,
+  requestContext,
+  revokeSessions,
+  sessionIdForRefreshToken,
+} from "../account/sessions.js";
+import { recordAuthEvent, recordLegacyAuthEvent } from "../account/events.js";
+import { startEmailVerification } from "../account/verification.js";
+// Phase 8 — the second factor. `POST /auth/login` used to hand out a full
+// session to an account with a confirmed factor, so any client that kept
+// calling this route bypassed MFA completely while POST /auth/mfa/login (the
+// identical request body) challenged correctly. Both routes now speak one
+// protocol and redeem at the same POST /auth/mfa/challenge.
+import { activeFactor, companiesRequiringMfa } from "../mfa/service.js";
+import { challengeEnvelope, mintChallengeToken } from "../mfa/challenge.js";
 
+// The length floor lives in the password policy (modules/account/password.ts),
+// not in this schema: a bare `.min(8)` here was the whole of the platform's
+// password policy, and a zod message cannot explain WHY a password was
+// refused. `assessPassword` returns every reason at once and the route answers
+// with all of them.
 const registerSchema = z.object({
   email: z.string().email().toLowerCase(),
-  password: z.string().min(8).max(128),
+  password: z.string().min(1).max(128),
   name: z.string().min(1).max(200),
   companyName: z.string().min(1).max(200).optional(),
 });
@@ -71,22 +106,33 @@ export const identityModule: FastifyPluginAsync = async (app) => {
         }
       : {};
 
-  async function issueTokens(user: { id: string; email: string }) {
-    const accessToken = await app.signAccessToken(user);
-    const refreshToken = newId("rt") + newId();
-    const expiresAt = new Date(
-      Date.now() + app.appConfig.REFRESH_TOKEN_TTL_DAYS * 24 * 3600 * 1000,
-    ).toISOString();
-    await app.db.insert(refreshTokens).values({
-      id: newId("rtk"),
-      userId: user.id,
-      tokenHash: sha256Hex(refreshToken),
-      expiresAt,
+  /**
+   * Issue the token pair AND the `auth_sessions` row behind it.
+   *
+   * Previously this minted a refresh token and nothing else, so a sign-in was
+   * an anonymous credential: "which devices are signed in to my account?" had
+   * no answer, and "sign this one out" had nothing to act on. The session row
+   * is that answer, and the access token now names it (`sid`) so a revoked
+   * session is refused on its next request rather than an hour later.
+   *
+   * `sessionId` is passed on refresh so rotation REPOINTS the existing session
+   * instead of opening a second device for the same browser.
+   */
+  async function issueTokens(
+    user: { id: string; email: string; name?: string | null },
+    req: FastifyRequest,
+    options: { authMethod?: AuthMethod; sessionId?: string | null } = {},
+  ) {
+    const issued = await issueUserSession(app, requestContext(req), {
+      user,
+      authMethod: options.authMethod ?? "password",
+      sessionId: options.sessionId ?? null,
     });
     return {
-      accessToken,
-      refreshToken,
-      expiresIn: app.appConfig.ACCESS_TOKEN_TTL_SECONDS,
+      accessToken: issued.accessToken,
+      refreshToken: issued.refreshToken,
+      expiresIn: issued.expiresIn,
+      session: issued.session,
     };
   }
 
@@ -121,6 +167,13 @@ export const identityModule: FastifyPluginAsync = async (app) => {
 
   app.post("/auth/register", authLimited, async (req, reply) => {
     const body = registerSchema.parse(req.body);
+    // Policy first, before an account exists to half-create.
+    const assessment = assessPassword(body.password, { email: body.email, name: body.name });
+    if (!assessment.ok) {
+      throw badRequest("Password does not meet the password policy.", {
+        reasons: assessment.reasons,
+      });
+    }
     const existing = await app.db
       .select({ id: users.id })
       .from(users)
@@ -129,7 +182,7 @@ export const identityModule: FastifyPluginAsync = async (app) => {
     if (existing[0]) throw conflict("An account with this email already exists");
 
     const userId = newId("u");
-    const passwordHash = await bcrypt.hash(body.password, 10);
+    const passwordHash = await hashPassword(app.appConfig, body.password);
     await app.db.insert(users).values({
       id: userId,
       email: body.email,
@@ -142,43 +195,152 @@ export const identityModule: FastifyPluginAsync = async (app) => {
       company = await createCompany(body.companyName, userId);
     }
 
-    await app.db.insert(authEvents).values({
-      id: newId("ae"),
+    const ctx = requestContext(req);
+    await recordLegacyAuthEvent(app.db, {
       userId,
       email: body.email,
       kind: "register",
-      ip: req.ip,
-      userAgent: req.headers["user-agent"] ?? null,
+      ip: ctx.ip,
+      userAgent: ctx.userAgent,
+    });
+    await recordAuthEvent(app.db, {
+      kind: "register",
+      userId,
+      companyId: company?.id ?? null,
+      email: body.email,
+      ip: ctx.ip,
+      userAgent: ctx.userAgent,
     });
 
-    const tokens = await issueTokens({ id: userId, email: body.email });
+    // Prove the address. The message is composed and RECORDED whether or not a
+    // transport is configured; when there is none the link comes back in this
+    // response (to the person who just typed the address, and nobody else) so
+    // that a development deployment can still complete the flow.
+    const verification = await startEmailVerification(app, ctx, {
+      userId,
+      email: body.email,
+      name: body.name,
+      purpose: "signup",
+      companyId: company?.id ?? null,
+    });
+
+    const tokens = await issueTokens({ id: userId, email: body.email, name: body.name }, req);
     return reply.status(201).send({
       user: { id: userId, email: body.email, name: body.name },
       company,
       ...tokens,
+      verification: {
+        status: verification.status,
+        expiresAt: verification.expiresAt,
+        delivery: verification.delivery,
+        verifyUrl: verification.verifyUrl,
+      },
     });
   });
 
+  /**
+   * Sign in.
+   *
+   * The shape to keep: every refusal answers the same way. An address with no
+   * account, a wrong password, a deactivated account and a locked account are
+   * indistinguishable from outside — same status, same message — and an
+   * address with no account still spends a bcrypt comparison
+   * (`equalizeVerifyTiming`) so the CLOCK does not answer the question the body
+   * refuses to. The lockout guard runs before the password is looked at, and
+   * everything after a correct password (rehash to the current work factor,
+   * the session row, the trail, the new-device message) lives in
+   * modules/account/login.ts.
+   */
   app.post("/auth/login", authLimited, async (req) => {
     const body = loginSchema.parse(req.body);
+    await guardLoginAttempt(app, req, body.email);
+
     const rows = await app.db.select().from(users).where(eq(users.email, body.email)).limit(1);
     const user = rows[0];
-    const ok = user ? await bcrypt.compare(body.password, user.passwordHash) : false;
-    await app.db.insert(authEvents).values({
-      id: newId("ae"),
+    const ok = user
+      ? await verifyPassword(body.password, user.passwordHash)
+      : await equalizeVerifyTiming(body.password, app.appConfig);
+
+    const ctx = requestContext(req);
+    await recordLegacyAuthEvent(app.db, {
       userId: user?.id ?? null,
       email: body.email,
       kind: ok ? "login_success" : "login_failure",
-      ip: req.ip,
-      userAgent: req.headers["user-agent"] ?? null,
+      ip: ctx.ip,
+      userAgent: ctx.userAgent,
     });
-    if (!user || !ok || !user.isActive) throw unauthorized("Invalid credentials");
+
+    if (!user || !ok || !user.isActive) {
+      await noteLoginFailure(app, req, {
+        email: body.email,
+        userId: user?.id ?? null,
+        reason: !user ? "unknown_address" : !ok ? "invalid_password" : "account_inactive",
+      });
+      throw unauthorized("Invalid credentials");
+    }
+
+    // THE SECOND FACTOR, before any token is minted. A confirmed factor — or a
+    // tenant policy that demands one from a member who has not enrolled — turns
+    // this into a challenge: no access token, no refresh token, no session row,
+    // and no identity beyond the fact that a challenge is outstanding. The
+    // caller redeems it at POST /auth/mfa/challenge exactly as it would a
+    // challenge from POST /auth/mfa/login.
+    const factor = await activeFactor(app.db, user.id);
+    const requiredBy = await companiesRequiringMfa(app.db, user.id);
+    if (factor || requiredBy.length > 0) {
+      const minted = mintChallengeToken(app.appConfig, {
+        userId: user.id,
+        scope: factor ? "verify" : "enrol",
+        ttlMinutes: app.appConfig.MFA_CHALLENGE_TTL_MINUTES,
+      });
+      // The same trail POST /auth/mfa/login writes for the same event: the
+      // password WAS correct, and the sign-in is pending a second factor.
+      await recordAuthEvent(app.db, {
+        kind: "login_success",
+        outcome: "pending",
+        userId: user.id,
+        email: user.email,
+        ip: ctx.ip,
+        userAgent: ctx.userAgent,
+        reason: factor
+          ? "Password accepted; awaiting second factor"
+          : "Password accepted; tenant policy requires enrolling a second factor",
+        metadata: { challengeId: minted.claims.jti, scope: minted.claims.scope },
+      });
+      // 200, not 401 — the password was right. The absence of any token in
+      // this body is the answer: there is no session yet, and no user id,
+      // email or name either, because the caller has not finished proving who
+      // they are.
+      return {
+        mfaRequired: true,
+        ...challengeEnvelope(minted),
+        policy:
+          requiredBy.length > 0
+            ? {
+                required: true,
+                companies: requiredBy.map((r) => ({ companyId: r.companyId, name: r.name })),
+              }
+            : { required: false, companies: [] },
+        reasons: [
+          factor
+            ? "This account has a confirmed second factor."
+            : "A company this account belongs to requires multi-factor authentication.",
+        ],
+      };
+    }
+
     await app.db
       .update(users)
       .set({ lastLoginAt: new Date().toISOString() })
       .where(eq(users.id, user.id));
-    const tokens = await issueTokens(user);
-    return { user: { id: user.id, email: user.email, name: user.name }, ...tokens };
+    const completed = await completeLogin(app, req, { user, password: body.password });
+    return {
+      user: { id: user.id, email: user.email, name: user.name },
+      accessToken: completed.accessToken,
+      refreshToken: completed.refreshToken,
+      expiresIn: completed.expiresIn,
+      session: completed.session,
+    };
   });
 
   app.post("/auth/refresh", authLimited, async (req) => {
@@ -210,16 +372,59 @@ export const identityModule: FastifyPluginAsync = async (app) => {
       .limit(1);
     const user = userRows[0];
     if (!user || !user.isActive) throw unauthorized("Unknown or deactivated user");
-    const tokens = await issueTokens(user);
+    // Repoint the session this token belonged to rather than opening a second
+    // one: rotation replaces the credential, not the device. A revoked session
+    // never reaches here — revoking one revokes its refresh token, which the
+    // check above already refused.
+    const sessionId = await sessionIdForRefreshToken(app.db, token.id);
+    const tokens = await issueTokens(user, req, { sessionId });
+    await recordAuthEvent(app.db, {
+      kind: "refresh_success",
+      userId: user.id,
+      email: user.email,
+      sessionId: tokens.session.id,
+      ...requestContext(req),
+    });
     return { user: { id: user.id, email: user.email, name: user.name }, ...tokens };
   });
 
   app.post("/auth/logout", async (req) => {
     const body = refreshSchema.parse(req.body);
+    const hash = sha256Hex(body.refreshToken);
+    const [token] = await app.db
+      .select({ id: refreshTokens.id, userId: refreshTokens.userId })
+      .from(refreshTokens)
+      .where(eq(refreshTokens.tokenHash, hash))
+      .limit(1);
     await app.db
       .update(refreshTokens)
       .set({ revokedAt: new Date().toISOString() })
-      .where(eq(refreshTokens.tokenHash, sha256Hex(body.refreshToken)));
+      .where(eq(refreshTokens.tokenHash, hash));
+    // Sign the DEVICE out, not just the token: leaving the session row live
+    // would keep the access token working until it expired, and would leave a
+    // signed-out device sitting in the account's device list.
+    if (token) {
+      const sessionId = await sessionIdForRefreshToken(app.db, token.id);
+      if (sessionId) {
+        await revokeSessions(app.db, [sessionId], {
+          reason: "user_signed_out",
+          byUser: true,
+          actorId: token.userId,
+        });
+        await recordAuthEvent(app.db, {
+          kind: "logout",
+          userId: token.userId,
+          sessionId,
+          ...requestContext(req),
+        });
+      }
+    }
+    await recordLegacyAuthEvent(app.db, {
+      userId: token?.userId ?? null,
+      kind: "logout",
+      ip: req.ip,
+      userAgent: typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"] : null,
+    });
     return { ok: true };
   });
 

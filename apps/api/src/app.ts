@@ -1,4 +1,5 @@
-import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import Fastify, { type FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
@@ -67,6 +68,39 @@ import { qualityModule } from "./modules/quality/index.js";
 import { equipmentModule } from "./modules/equipment/index.js";
 import { timecardsModule } from "./modules/timecards/index.js";
 import { biddingModule } from "./modules/bidding/index.js";
+// Authentication foundation (Phase 8) — user SSO, MFA and account
+// self-service. Schema in packages/db/src/schema/auth.ts, email transport in
+// lib/email.ts. These carry REAL ROUTES: OIDC sign-in and provider CRUD, TOTP
+// enrolment and the MFA challenge, and email verification / password reset /
+// device sessions / invitations. See each module's index.ts.
+import { ssoModule } from "./modules/sso/index.js";
+import { mfaModule } from "./modules/mfa/index.js";
+import { accountModule } from "./modules/account/index.js";
+
+/**
+ * sha256 CSP hashes for every inline <script> in the index.html this process
+ * serves, or [] when it serves no SPA. Read once at boot: the file cannot
+ * change under a running container, and re-reading it per request would put a
+ * disk hit on the hot path.
+ */
+function webRootIndexScriptHashes(config: Config): string[] {
+  if (!config.WEB_DIST_DIR) return [];
+  const indexPath = path.join(path.resolve(config.WEB_DIST_DIR), "index.html");
+  if (!existsSync(indexPath)) return [];
+  let html = "";
+  try {
+    html = readFileSync(indexPath, "utf8");
+  } catch {
+    return [];
+  }
+  const hashes = new Set<string>();
+  for (const m of html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)) {
+    const body = m[1];
+    if (body === undefined || body.trim() === "") continue;
+    hashes.add(`'sha256-${createHash("sha256").update(body, "utf8").digest("base64")}'`);
+  }
+  return [...hashes];
+}
 
 export interface BuildAppOptions {
   config?: Config;
@@ -92,16 +126,33 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
   // Security headers. CSP is tuned for the SPA the API serves same-origin:
   // pdf.js needs blob: workers and blob: fetches, web-ifc needs WebAssembly
   // compilation ('wasm-unsafe-eval'), and viewers render into blob: images.
+  //
+  // The two additions below were found by driving the built SPA through this
+  // server in a real browser, which is the only place they show up — `vite
+  // preview` and the dev server send no CSP at all:
+  //
+  //   * index.html carries ONE inline script, the anti-flash theme bootstrap
+  //     that sets data-theme before first paint. `script-src 'self'` blocked
+  //     it, so the production build painted the wrong canvas colour on every
+  //     load and ignored a stored dark-mode preference until React mounted.
+  //     Rather than pasting a hash that silently rots the next time that
+  //     script is edited, the hashes are COMPUTED from the index.html this
+  //     process is actually serving. A CSP that can drift from the file it
+  //     protects is a CSP nobody will keep correct.
+  //   * the Inter webfont is loaded from fonts.googleapis.com/gstatic.com, so
+  //     `style-src 'self'` blocked the stylesheet and the whole app rendered
+  //     in the fallback system font.
+  const inlineScriptHashes = webRootIndexScriptHashes(config);
   await app.register(helmet, {
     contentSecurityPolicy: {
       directives: {
         defaultSrc: ["'self'"],
-        scriptSrc: ["'self'", "'wasm-unsafe-eval'"],
+        scriptSrc: ["'self'", "'wasm-unsafe-eval'", ...inlineScriptHashes],
         workerSrc: ["'self'", "blob:"],
-        styleSrc: ["'self'", "'unsafe-inline'"],
+        styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
         imgSrc: ["'self'", "data:", "blob:"],
         connectSrc: ["'self'", "blob:"],
-        fontSrc: ["'self'", "data:"],
+        fontSrc: ["'self'", "data:", "https://fonts.gstatic.com"],
         objectSrc: ["'none'"],
         frameAncestors: ["'self'"],
       },
@@ -169,6 +220,12 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
 
   const prefix = "/api/v1";
   await app.register(identityModule, { prefix });
+  // Registered next to identity because they extend the same surface: SSO and
+  // MFA sit in front of the login it already owns, and account self-service
+  // (verification, reset, device list) sits behind it.
+  await app.register(ssoModule, { prefix });
+  await app.register(mfaModule, { prefix });
+  await app.register(accountModule, { prefix });
   await app.register(directoryModule, { prefix });
   await app.register(adminModule, { prefix });
   await app.register(projectsModule, { prefix });

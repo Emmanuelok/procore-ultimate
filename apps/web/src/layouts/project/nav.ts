@@ -18,11 +18,12 @@
  * EVERY ENTRY HERE MUST RESOLVE TO A ROUTE THAT EXISTS. A nav link to a 404 is
  * worse than an absent link: it teaches people the product is broken.
  *
- * The API has modules with no web page yet — specifications, meetings, safety,
- * quality, equipment, timecards, bidding. They are deliberately NOT listed
- * here, and this comment is the record of that decision so the next person
- * does not "fix" the omission. Add the entry in the same change that adds the
- * page and its route, not before.
+ * Specifications, meetings, safety, quality, equipment, timecards and bidding
+ * were listed here as deliberately absent, "add the entry in the same change
+ * that adds the page and its route, not before". Those seven workspaces
+ * shipped complete and then sat unreachable: no import in App.tsx, no route,
+ * no chunk in the bundle. This is that change — routes first (App.tsx), then
+ * these entries. The rule stands for whatever comes next.
  *
  * `to` is relative to /projects/:projectId.
  */
@@ -58,6 +59,13 @@ import {
   IconPunch,
   IconRfi,
   IconRisk,
+  IconSafety,
+  IconQuality,
+  IconEquipment,
+  IconMeeting,
+  IconSpec,
+  IconClock,
+  IconProcurement,
   IconSchedule,
   IconSite,
   IconSpreadsheet,
@@ -105,6 +113,12 @@ export const PROJECT_NAV_GROUPS: readonly ProjectNavGroup[] = [
       { to: "documents", label: "Documents", icon: IconDocument, keywords: "files folders" },
       { to: "bim", label: "BIM", icon: IconBim, keywords: "models ifc clash" },
       { to: "twin", label: "Digital Twin", icon: IconTwin, keywords: "assets handover" },
+      {
+        to: "specifications",
+        label: "Specifications",
+        icon: IconSpec,
+        keywords: "spec book sections requirements divisions csi uniclass",
+      },
     ],
   },
   {
@@ -117,6 +131,36 @@ export const PROJECT_NAV_GROUPS: readonly ProjectNavGroup[] = [
       { to: "daily-logs", label: "Daily Logs", icon: IconDailyLog, keywords: "diary weather" },
       { to: "punch", label: "Punch", icon: IconPunch, keywords: "snagging defects" },
       { to: "photos", label: "Photos", icon: IconPhoto, keywords: "images site record" },
+      {
+        to: "safety",
+        label: "Safety",
+        icon: IconSafety,
+        keywords: "incidents observations riddor toolbox talks corrective actions",
+      },
+      {
+        to: "quality",
+        label: "Quality",
+        icon: IconQuality,
+        keywords: "itp hold points checklists ncr commissioning turnover",
+      },
+      {
+        to: "meetings",
+        label: "Meetings",
+        icon: IconMeeting,
+        keywords: "minutes agenda decisions actions quorum",
+      },
+      {
+        to: "equipment",
+        label: "Equipment",
+        icon: IconEquipment,
+        keywords: "plant hire certificates maintenance telematics materials",
+      },
+      {
+        to: "timecards",
+        label: "Timecards",
+        icon: IconClock,
+        keywords: "labour hours crews overtime t&m tickets",
+      },
     ],
   },
   {
@@ -169,6 +213,12 @@ export const PROJECT_NAV_GROUPS: readonly ProjectNavGroup[] = [
         keywords: "boq valuations certificates",
       },
       { to: "payments", label: "Payments", icon: IconPayment, keywords: "cash remittance" },
+      {
+        to: "bidding",
+        label: "Bidding",
+        icon: IconProcurement,
+        keywords: "tender packages invitations sealed bids levelling award prequalification",
+      },
     ],
   },
   {

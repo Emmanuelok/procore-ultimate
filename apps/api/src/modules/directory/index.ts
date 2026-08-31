@@ -1,9 +1,9 @@
 import type { FastifyPluginAsync } from "fastify";
 import { randomBytes } from "node:crypto";
-import bcrypt from "bcryptjs";
 import { z } from "zod";
 import { and, asc, count, eq, ilike, inArray, ne, or, sql } from "drizzle-orm";
 import {
+  companies,
   companyMemberships,
   contacts,
   distributionGroupMembers,
@@ -18,6 +18,13 @@ import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, conflict, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
+// Phase 8 — an invitation now produces a record and a message instead of a
+// temporary password and silence. Everything about tokens, dispatch and
+// acceptance lives in modules/account; this module keeps the route.
+import { createInvitation } from "../account/invitations.js";
+import { hashPassword } from "../account/password.js";
+import { requestContext } from "../account/sessions.js";
+import { requireVerifiedEmail } from "../account/verification.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -77,6 +84,11 @@ const inviteSchema = z.object({
   email: z.string().email().toLowerCase(),
   name: z.string().min(1).max(200),
   role: z.enum(COMPANY_ROLES),
+  /** permission template applied to the projects below, on acceptance */
+  templateKey: z.string().min(1).max(80).optional(),
+  projectIds: z.array(z.string().min(1).max(100)).max(100).default([]),
+  /** a note from the inviter, rendered escaped in the message */
+  message: z.string().max(2000).optional(),
 });
 
 /* ------------------------------------------------------------------ */
@@ -603,7 +615,35 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
     return paginate(items, Number(row?.n ?? 0), q);
   });
 
-  app.post("/company/users/invite", { preHandler: adminOnly }, async (req, reply) => {
+  /**
+   * Invite someone into the company.
+   *
+   * WHAT CHANGED (Phase 8) and what deliberately did not.
+   *
+   * Unchanged, because existing callers depend on it: an unknown address still
+   * gets an account and a one-time temporary password in the response, and a
+   * known address is still added to the company immediately.
+   *
+   * Added: a real `user_invitations` record with a hashed single-use token and
+   * an expiry, a message composed and DISPATCHED through the email transport,
+   * and an honest `delivery` block in the response. When no transport is
+   * configured the answer says so — `dispatched: false`, with the reason
+   * naming EMAIL_PROVIDER — and returns `acceptUrl` so an administrator can
+   * pass the link on by hand. Silently pretending to send was the previous
+   * behaviour and it is the one thing this must never do again.
+   *
+   * `acceptUrl` is returned ONLY for an account this invitation created. For
+   * an address that already had one, handing the inviter a link that can set a
+   * password would be a takeover of somebody else's account.
+   *
+   * The route is gated on the inviter having proved their own address (when
+   * the deployment can send mail at all) — this is the outbound action an
+   * unverified account must not have.
+   */
+  app.post(
+    "/company/users/invite",
+    { preHandler: [...adminOnly, requireVerifiedEmail(app, "invite people")] },
+    async (req, reply) => {
     const body = inviteSchema.parse(req.body);
     const [existing] = await app.db
       .select()
@@ -629,7 +669,7 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
     } else {
       userId = newId("u");
       tempPassword = randomBytes(12).toString("base64url");
-      const passwordHash = await bcrypt.hash(tempPassword, 10);
+      const passwordHash = await hashPassword(app.appConfig, tempPassword);
       await app.db.insert(users).values({
         id: userId,
         email: body.email,
@@ -662,14 +702,44 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
       payload: { userId, role: body.role },
     });
 
+    const [company] = await app.db
+      .select({ name: companies.name })
+      .from(companies)
+      .where(eq(companies.id, req.companyId!))
+      .limit(1);
+    const invited = await createInvitation(app, requestContext(req), {
+      companyId: req.companyId!,
+      companyName: company?.name ?? "your company",
+      invitedBy: req.user!.id,
+      inviterName: req.user!.name,
+      email: body.email,
+      name: body.name,
+      role: body.role,
+      templateKey: body.templateKey ?? null,
+      projectIds: body.projectIds,
+      message: body.message ?? null,
+      createdAccount: !existing,
+    });
+
     return reply.status(201).send({
       user: { id: userId, email: body.email, name: existing?.name ?? body.name },
       role: body.role,
       existingUser: Boolean(existing),
       // Returned exactly once, only when a brand-new account was created.
       ...(tempPassword ? { tempPassword } : {}),
+      invitation: {
+        id: invited.invitation.id,
+        status: invited.invitation.status,
+        expiresAt: invited.invitation.expiresAt,
+        tokenPrefix: invited.invitation.tokenPrefix,
+      },
+      // Never absent: the caller must always be able to tell an invitation
+      // that is on its way from one that will never arrive.
+      delivery: invited.delivery,
+      acceptUrl: !invited.delivery.dispatched && !existing ? invited.acceptUrl : null,
     });
-  });
+  },
+  );
 
   async function getMembershipOr404(companyId: string, userId: string) {
     const [membership] = await app.db
