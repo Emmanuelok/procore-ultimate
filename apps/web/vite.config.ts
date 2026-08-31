@@ -13,7 +13,7 @@ import tailwindcss from "@tailwindcss/vite";
 const BRAND = {
   name: "ConstructOS",
   shortName: "ConstructOS",
-  description: "AI-native construction delivery and assurance.",
+  description: "AI-native construction delivery and independent assurance.",
   /** Must match THEME_COLOR.light in src/ui/tokens.ts. */
   backgroundColor: "#f6f7fa",
   themeColor: "#f6f7fa",
@@ -30,7 +30,9 @@ const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" 
     </linearGradient>
   </defs>
   <rect width="512" height="512" rx="116" fill="url(#c)"/>
-  <path d="M338 174A116 116 0 1 0 338 338" fill="none" stroke="#fff" stroke-width="58" stroke-linecap="round"/>
+  <path d="M354 112H206l-72 72v144l72 72h148" fill="none" stroke="#fff" stroke-width="38" stroke-linecap="square" stroke-linejoin="miter"/>
+  <path d="M218 184h136M218 328h136" fill="none" stroke="#fff" stroke-width="18" opacity=".7"/>
+  <circle cx="354" cy="256" r="29" fill="#fff"/>
 </svg>
 `;
 

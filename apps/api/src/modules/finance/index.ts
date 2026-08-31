@@ -1127,7 +1127,9 @@ export const financeModule: FastifyPluginAsync = async (app) => {
     const catName = new Map(parseCategories(facility).map((c) => [c.id, c.name]));
     const items = rows.map((d) => ({
       number: d.number,
-      date: (d.disbursedAt ?? d.submittedAt ?? d.createdAt).slice(0, 10),
+      date: new Date(d.disbursedAt ?? d.submittedAt ?? d.createdAt)
+        .toISOString()
+        .slice(0, 10),
       amount: d.amount,
       category: d.categoryId ? (catName.get(d.categoryId) ?? "") : "",
       purpose: d.purpose,

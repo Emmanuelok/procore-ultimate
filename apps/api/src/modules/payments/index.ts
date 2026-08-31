@@ -852,13 +852,14 @@ export const paymentsModule: FastifyPluginAsync = async (app) => {
       }
       let daysLate = 0;
       if (claim.status === "paid" && claim.paidAt) {
+        const paidDate = new Date(claim.paidAt).toISOString().slice(0, 10);
         daysLate = Math.max(
           0,
-          wholeDaysBetween(claim.finalPaymentDate, claim.paidAt.slice(0, 10)),
+          wholeDaysBetween(claim.finalPaymentDate, paidDate),
         );
         if (daysLate === 0) {
           return zero(
-            `Paid on ${claim.paidAt.slice(0, 10)}, on or before the final payment date ${claim.finalPaymentDate}.`,
+            `Paid on ${paidDate}, on or before the final payment date ${claim.finalPaymentDate}.`,
           );
         }
       } else if (claim.status !== "paid") {

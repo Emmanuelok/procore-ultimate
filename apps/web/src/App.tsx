@@ -14,7 +14,7 @@
  * level up, in main.tsx.
  */
 import { lazy, Suspense, type ReactNode } from "react";
-import { BrowserRouter, Route, Routes, useNavigate } from "react-router-dom";
+import { BrowserRouter, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { AuthProvider, RequireAuth, useAuth } from "./lib/auth";
 import { SearchProvider } from "./lib/search";
 import { ShortcutsProvider } from "./lib/shortcuts";
@@ -27,6 +27,7 @@ import { IconEmpty } from "./ui/icons";
 
 const LoginPage = lazy(() => import("./pages/auth/LoginPage"));
 const RegisterPage = lazy(() => import("./pages/auth/RegisterPage"));
+const LandingPage = lazy(() => import("./pages/landing/LandingPage"));
 const DashboardPage = lazy(() => import("./pages/DashboardPage"));
 const ProjectsPage = lazy(() => import("./pages/projects/ProjectsPage"));
 const ProjectOverviewPage = lazy(() => import("./pages/projects/ProjectOverviewPage"));
@@ -109,6 +110,39 @@ const AccountSecurityPage = lazy(() => import("./pages/auth/AccountSecurityPage"
 /** Per-route suspense: only the page body swaps, never the surrounding chrome. */
 function S({ children }: { children: ReactNode }) {
   return <Suspense fallback={<RouteFallback />}>{children}</Suspense>;
+}
+
+/**
+ * The public root is a cinematic product page. Authenticated users keep the
+ * existing dashboard at the same URL, and every deep application route stays
+ * protected without a migration or broken bookmark.
+ */
+function AppEntry() {
+  const { user, loading } = useAuth();
+  const location = useLocation();
+
+  if (location.pathname === "/") {
+    if (loading) {
+      return (
+        <div className="grid min-h-dvh place-items-center bg-ink-950 text-sm text-ink-300">
+          Loading ConstructOS…
+        </div>
+      );
+    }
+    if (!user) {
+      return (
+        <S>
+          <LandingPage />
+        </S>
+      );
+    }
+  }
+
+  return (
+    <RequireAuth>
+      <AppLayout />
+    </RequireAuth>
+  );
 }
 
 function NotFound() {
@@ -209,11 +243,7 @@ export default function App() {
             />
             <Route
               path="/"
-              element={
-                <RequireAuth>
-                  <AppLayout />
-                </RequireAuth>
-              }
+              element={<AppEntry />}
             >
               <Route
                 index

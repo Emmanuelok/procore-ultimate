@@ -151,7 +151,11 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
         workerSrc: ["'self'", "blob:"],
         styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
         imgSrc: ["'self'", "data:", "blob:"],
-        connectSrc: ["'self'", "blob:"],
+        // The landing page streams its poster media from CloudFront, so that
+        // origin is allowed for media and fetch. `blob:` stays on connectSrc
+        // for the PDF and IFC viewers, which build object URLs client-side.
+        mediaSrc: ["'self'", "https://d2ol7oe51mr4n9.cloudfront.net"],
+        connectSrc: ["'self'", "blob:", "https://d2ol7oe51mr4n9.cloudfront.net"],
         fontSrc: ["'self'", "data:", "https://fonts.gstatic.com"],
         objectSrc: ["'none'"],
         frameAncestors: ["'self'"],
@@ -293,6 +297,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
     app.setNotFoundHandler((req, reply) => {
       const wantsApi = req.raw.url?.startsWith("/api/");
       if (!wantsApi && (req.method === "GET" || req.method === "HEAD")) {
+        const pathname = req.url.split("?", 1)[0];
+        if (pathname !== "/") reply.header("x-robots-tag", "noindex, nofollow");
         return reply.header("cache-control", "no-cache").sendFile("index.html");
       }
       return reply.status(404).send({
