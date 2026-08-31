@@ -225,6 +225,15 @@ export const SEGMENT_LABELS: Readonly<Record<string, string>> = {
   commitments: "Commitments",
   changes: "Change Management",
   invoicing: "Invoicing",
+
+  /* Procore-parity workspaces (M19–M25) */
+  specifications: "Specifications",
+  meetings: "Meetings",
+  safety: "Safety",
+  quality: "Quality",
+  equipment: "Equipment",
+  timecards: "Timecards",
+  bidding: "Bidding",
 };
 
 /** Every project-scoped destination the palette can jump straight into. */
@@ -246,6 +255,13 @@ export const PROJECT_DESTINATIONS: readonly ProjectDestination[] = [
   { segment: "schedule", label: "Schedule" },
   { segment: "documents", label: "Documents" },
   { segment: "assurance", label: "Assurance" },
+  { segment: "specifications", label: "Specifications" },
+  { segment: "meetings", label: "Meetings" },
+  { segment: "safety", label: "Safety" },
+  { segment: "quality", label: "Quality" },
+  { segment: "equipment", label: "Equipment" },
+  { segment: "timecards", label: "Timecards" },
+  { segment: "bidding", label: "Bidding" },
 ];
 
 /** Title Case fallback for a segment with no explicit label. */

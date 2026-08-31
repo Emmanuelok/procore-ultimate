@@ -30,6 +30,7 @@ import {
   IconChevronsUpDown,
   IconCompany,
   IconKeyboard,
+  IconLock,
   IconLogout,
 } from "../../ui/icons";
 import { useAuth } from "../../lib/auth";
@@ -134,6 +135,17 @@ export function UserMenu() {
           </>
         ) : null}
 
+        {/* The only route into /account/security, which owns sessions and
+            devices, the second factor, linked identities and the account's
+            own security trail. Without a link it was reachable by typing the
+            URL and nothing else. */}
+        <MenuItem
+          icon={IconLock}
+          description="Devices, two-factor, sign-in methods"
+          onSelect={() => navigate("/account/security")}
+        >
+          Account security
+        </MenuItem>
         <MenuItem icon={IconKeyboard} shortcut="?" onSelect={openHelp}>
           Keyboard shortcuts
         </MenuItem>
