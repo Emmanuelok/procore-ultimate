@@ -19,8 +19,16 @@ const envSchema = z.object({
   PORT: z.coerce.number().default(4000),
   HOST: z.string().default("0.0.0.0"),
   DATABASE_URL: z.string().optional(),
+  DATABASE_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),
   /** directory for the embedded PGlite database when DATABASE_URL is unset */
   PGLITE_DIR: z.string().default("./.pglite"),
+  /** Production refuses to boot on the embedded database unless this is set:
+   *  an in-container PGlite is wiped on every redeploy, and a platform whose
+   *  product is the durability of its record must not report healthy on it. */
+  ALLOW_EMBEDDED_DB: envBool(false),
+  /** Same guard for the local-disk storage driver in production — it needs a
+   *  mounted volume and a single replica, which is a deliberate choice. */
+  ALLOW_LOCAL_STORAGE: envBool(false),
   AUTH_SECRET: z.string().min(16).default("dev-only-secret-change-me-in-prod"),
   ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().default(60 * 60), // 1h
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().default(30),
@@ -41,6 +49,21 @@ const envSchema = z.object({
   MIGRATIONS_DIR: z.string().optional(),
   /** honor x-forwarded-* from the platform proxy (Railway, ALB, …) */
   TRUST_PROXY: envBool(false),
+  /** How many proxy hops to trust. `1` (the default) trusts only the platform
+   *  edge, so a client cannot prepend a fake X-Forwarded-For and dodge the
+   *  per-IP auth rate limit; raise it only behind a CDN in front of the edge. */
+  TRUST_PROXY_HOPS: z.coerce.number().int().min(1).max(10).default(1),
+  /** Comma-separated browser origins allowed to call the API cross-origin
+   *  with credentials. The SPA is served same-origin in production, so this
+   *  is normally empty; APP_BASE_URL's origin is always allowed. */
+  CORS_ORIGINS: z.string().default(""),
+  /** Per-file multipart ceiling. Uploads are buffered per request, so this
+   *  bounds memory per in-flight upload. */
+  UPLOAD_MAX_BYTES: z.coerce.number().int().min(1024 * 1024).default(256 * 1024 * 1024),
+  UPLOAD_MAX_FILES: z.coerce.number().int().min(1).max(100).default(25),
+  /** The platform job scheduler (lib/scheduler.ts). Off in tests. */
+  SCHEDULER_ENABLED: envBool(true),
+  SCHEDULER_TICK_MS: z.coerce.number().int().min(1000).default(60_000),
   RATE_LIMIT_ENABLED: envBool(true),
   RATE_LIMIT_MAX_PER_MINUTE: z.coerce.number().default(300),
   AUTH_RATE_LIMIT_MAX_PER_MINUTE: z.coerce.number().default(10),
@@ -105,6 +128,14 @@ const envSchema = z.object({
   /** bcrypt work factor. Raising it re-hashes on next successful login, it
    *  does not invalidate existing hashes (the cost is encoded in each one). */
   BCRYPT_COST: z.coerce.number().min(4).max(15).default(10),
+  /* --- Ledger anchoring, webhooks (read by their modules; declared here so
+   *     production boot can validate them and .env.example stays honest) --- */
+  ANCHOR_SIGNING_KEY: z.string().optional(),
+  ANCHOR_TRUSTED_FINGERPRINTS: z.string().optional(),
+  ANCHOR_TSA_URL: z.string().optional(),
+  ANCHOR_OTS_CALENDAR_URL: z.string().optional(),
+  ANCHOR_HEARTBEAT_HOURS: z.coerce.number().optional(),
+  WEBHOOK_SIGNING_KEY: z.string().optional(),
   /** Key that encrypts the two secrets which cannot be hashed: an identity
    *  provider's client secret and a TOTP seed (see packages/db/src/schema/
    *  auth.ts). Unset, it is derived from AUTH_SECRET — still safe against a
@@ -119,11 +150,42 @@ export type Config = z.infer<typeof envSchema>;
 export function loadConfig(overrides: Partial<Record<string, string>> = {}): Config {
   const cfg = envSchema.parse({ ...process.env, ...overrides });
   if (cfg.NODE_ENV === "production") {
-    if (cfg.AUTH_SECRET === "dev-only-secret-change-me-in-prod") {
-      throw new Error(
-        "Refusing to start: AUTH_SECRET is the development default. " +
-          "Set a strong secret (openssl rand -hex 32) in the environment.",
+    const problems: string[] = [];
+    const placeholderSecrets = [
+      "dev-only-secret-change-me-in-prod",
+      "change-me-to-a-long-random-string",
+      "changeme",
+      "secret",
+    ];
+    if (placeholderSecrets.includes(cfg.AUTH_SECRET.trim().toLowerCase())) {
+      problems.push(
+        "AUTH_SECRET is a placeholder. Set a strong secret (openssl rand -hex 32).",
       );
+    } else if (cfg.AUTH_SECRET.length < 32 || new Set(cfg.AUTH_SECRET).size < 8) {
+      problems.push(
+        "AUTH_SECRET is too weak for production (need >= 32 characters of real entropy; openssl rand -hex 32).",
+      );
+    }
+    if (!cfg.DATABASE_URL && !cfg.ALLOW_EMBEDDED_DB) {
+      problems.push(
+        "DATABASE_URL is not set. Production would run on an embedded in-container database that is " +
+          "wiped on redeploy. Set DATABASE_URL, or set ALLOW_EMBEDDED_DB=true to accept that explicitly.",
+      );
+    }
+    if (cfg.STORAGE_DRIVER === "local" && !cfg.ALLOW_LOCAL_STORAGE) {
+      problems.push(
+        "STORAGE_DRIVER=local in production needs a mounted volume and a single replica. Use STORAGE_DRIVER=s3, " +
+          "or set ALLOW_LOCAL_STORAGE=true to accept that explicitly.",
+      );
+    }
+    if (/^https?:\/\/(localhost|127\.0\.0\.1)/i.test(cfg.APP_BASE_URL)) {
+      problems.push(
+        "APP_BASE_URL points at localhost, so every link in every email (verification, reset, invitation) would too. " +
+          "Set it to the public origin of the web app.",
+      );
+    }
+    if (problems.length > 0) {
+      throw new Error(`Refusing to start in production:\n - ${problems.join("\n - ")}`);
     }
     if (cfg.STORAGE_DRIVER === "s3") {
       const missing = (

@@ -79,8 +79,11 @@ describe("identity", () => {
     const { refreshToken } = reg.json() as { refreshToken: string };
     const hash = sha256Hex(refreshToken);
 
-    const laterToday = new Date();
-    laterToday.setUTCHours(23, 0, 0, 0);
+    // One minute from now — still on the expiry DAY, so the string-comparison
+    // regression above still trips ("YYYY-MM-DD hh:mm:ss+00" sorts before
+    // "YYYY-MM-DDThh…"), but unlike a fixed 23:00 it cannot be in the past
+    // when the suite happens to run late in the UTC day.
+    const laterToday = new Date(Date.now() + 60_000);
     await built.app.db
       .update(refreshTokens)
       .set({ expiresAt: laterToday.toISOString() })

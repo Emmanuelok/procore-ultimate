@@ -17,6 +17,15 @@ BASELINE_IDX=10
 exec 9>"/tmp/constructos-migrate.lock"
 flock 9
 
+# Once 0011 has been applied to any database that matters, regenerating it
+# would produce a migration with a new hash that drizzle re-applies at boot
+# and fails on the existing tables. Drop a marker to freeze it; from then on
+# use plain `pnpm --filter @constructos/db generate` to append 0012+.
+if [ -f "$DRIZZLE/.frozen" ]; then
+  echo "refusing: $DRIZZLE/.frozen exists — 0011_platform_upgrade has shipped; append a new migration with drizzle-kit generate instead" >&2
+  exit 1
+fi
+
 node - "$DRIZZLE" "$BASELINE_IDX" <<'JS'
 const fs = require("node:fs");
 const path = require("node:path");

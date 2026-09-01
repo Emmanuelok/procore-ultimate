@@ -1,4 +1,4 @@
-import { desc, eq } from "drizzle-orm";
+import { desc, eq, sql } from "drizzle-orm";
 import { ledgerEntries } from "@constructos/db";
 import { appendEntry, hashPayload, verifyChain, type ChainedEntry } from "@constructos/ledger";
 import type { LedgerAction } from "@constructos/shared";
@@ -111,6 +111,13 @@ export async function appendLedger(db: Db, write: LedgerWrite): Promise<void> {
   const at = new Date().toISOString();
   const payloadHash = hashPayload(write.payload ?? null);
   const emitted = await db.transaction(async (tx): Promise<LedgerEvent> => {
+    // Serialise appends per company chain. Without this, two concurrent
+    // writers on Postgres both read the same head and both insert an entry
+    // whose prevHash is that head — the chain forks, and the second entry is
+    // reported as a break by every verifier from then on. A transaction-scoped
+    // advisory lock keyed on the company makes the head read-then-insert
+    // atomic across connections and replicas; it is released at commit.
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`ledger:${write.companyId}`}))`);
     const head = await tx
       .select({ entryHash: ledgerEntries.entryHash })
       .from(ledgerEntries)
