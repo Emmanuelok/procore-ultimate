@@ -1057,6 +1057,25 @@ export const NOTIFICATION_KINDS = [
   "ai_review",
   "signal",
   "system",
+  // Platform upgrade wave: kinds raised by the coherence layer and the new
+  // modules, so each surfaces distinctly in the notification centre.
+  "attention",
+  "automation",
+  "agent_proposal",
+  "agent_action",
+  "escalation",
+  "reminder",
+  "digest",
+  "tax",
+  "supply_chain",
+  "design",
+  "correspondence",
+  "commissioning",
+  "site",
+  "portfolio",
+  "estimate",
+  "resource",
+  "compliance",
 ] as const;
 export type NotificationKind = (typeof NOTIFICATION_KINDS)[number];
 

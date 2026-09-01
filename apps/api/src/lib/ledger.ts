@@ -1,4 +1,4 @@
-import { desc, eq } from "drizzle-orm";
+import { desc, eq, sql } from "drizzle-orm";
 import { ledgerEntries } from "@constructos/db";
 import { appendEntry, hashPayload, verifyChain, type ChainedEntry } from "@constructos/ledger";
 import type { LedgerAction } from "@constructos/shared";
@@ -52,10 +52,37 @@ export type LedgerEmitHook = (event: LedgerEvent) => void | Promise<void>;
  */
 const emitHooks = new WeakMap<object, LedgerEmitHook>();
 
+/**
+ * Additional subscribers on the same append path (platform upgrade wave):
+ * the automation rules engine and the intelligence layer both react to
+ * ledger events. They are held separately from the webhook emitter so
+ * `setLedgerEmitHook` keeps its exact contract, and each subscriber is
+ * isolated the same way — a throwing subscriber never fails the caller and
+ * never starves the others.
+ */
+const extraHooks = new WeakMap<object, Set<LedgerEmitHook>>();
+
 /** Register the webhook emitter for one database handle (Vol I §0.7 #121). */
 export function setLedgerEmitHook(db: Db, hook: LedgerEmitHook | null): void {
   if (hook) emitHooks.set(db as object, hook);
   else emitHooks.delete(db as object);
+}
+
+/**
+ * Subscribe an additional listener to every committed ledger entry on this
+ * database handle. Returns an unsubscribe function. Listeners run after the
+ * webhook emitter, in registration order, each guarded independently.
+ */
+export function addLedgerEmitHook(db: Db, hook: LedgerEmitHook): () => void {
+  let set = extraHooks.get(db as object);
+  if (!set) {
+    set = new Set();
+    extraHooks.set(db as object, set);
+  }
+  set.add(hook);
+  return () => {
+    set?.delete(hook);
+  };
 }
 
 function eventProjectId(write: LedgerWrite): string | null {
@@ -84,6 +111,13 @@ export async function appendLedger(db: Db, write: LedgerWrite): Promise<void> {
   const at = new Date().toISOString();
   const payloadHash = hashPayload(write.payload ?? null);
   const emitted = await db.transaction(async (tx): Promise<LedgerEvent> => {
+    // Serialise appends per company chain. Without this, two concurrent
+    // writers on Postgres both read the same head and both insert an entry
+    // whose prevHash is that head — the chain forks, and the second entry is
+    // reported as a break by every verifier from then on. A transaction-scoped
+    // advisory lock keyed on the company makes the head read-then-insert
+    // atomic across connections and replicas; it is released at commit.
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`ledger:${write.companyId}`}))`);
     const head = await tx
       .select({ entryHash: ledgerEntries.entryHash })
       .from(ledgerEntries)
@@ -162,6 +196,16 @@ export async function appendLedger(db: Db, write: LedgerWrite): Promise<void> {
       await hook(emitted);
     } catch {
       /* deliberately swallowed — see rule 2 above */
+    }
+  }
+  const extras = extraHooks.get(db as object);
+  if (extras) {
+    for (const extra of extras) {
+      try {
+        await extra(emitted);
+      } catch {
+        /* same rule: a subscriber's failure is the subscriber's to record */
+      }
     }
   }
 }

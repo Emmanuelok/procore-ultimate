@@ -8,16 +8,19 @@ import multipart from "@fastify/multipart";
 import rateLimit from "@fastify/rate-limit";
 import fastifyStatic from "@fastify/static";
 import { ZodError } from "zod";
+import { sql } from "drizzle-orm";
 import "./types.js";
 import { loadConfig, type Config } from "./config.js";
 import { createDb, type DbHandle } from "./lib/db.js";
 import { createLocalStorage } from "./lib/storage.js";
 import { createS3Storage } from "./lib/storage-s3.js";
+import { PlatformScheduler } from "./lib/scheduler.js";
 import { AppError } from "./lib/errors.js";
 import authPlugin from "./plugins/auth.js";
 
 // Module plugins — each owns its routes under /api/v1.
 import { identityModule } from "./modules/identity/index.js";
+import { platformModule } from "./modules/platform/index.js";
 import { directoryModule } from "./modules/directory/index.js";
 import { adminModule } from "./modules/admin/index.js";
 import { projectsModule } from "./modules/projects/index.js";
@@ -120,7 +123,14 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
         ? false
         : { level: config.LOG_LEVEL },
     bodyLimit: 32 * 1024 * 1024,
-    trustProxy: config.TRUST_PROXY,
+    // A hop COUNT rather than `true`: with `true`, Fastify takes the LEFTMOST
+    // X-Forwarded-For entry as the client address, and a client can prepend
+    // any value it likes — which is exactly how the per-IP auth rate limit
+    // was bypassable. Trusting only the platform edge uses the address the
+    // edge itself appended.
+    trustProxy: config.TRUST_PROXY
+      ? (_address: string, hop: number) => hop < config.TRUST_PROXY_HOPS
+      : false,
   });
 
   // Security headers. CSP is tuned for the SPA the API serves same-origin:
@@ -171,9 +181,30 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
     });
   }
 
-  await app.register(cors, { origin: true, credentials: true });
+  // CORS. In production the SPA is served same-origin, so the only
+  // cross-origin callers are the ones an operator lists in CORS_ORIGINS (plus
+  // APP_BASE_URL's origin). Reflecting every origin WITH credentials — the
+  // previous behaviour — is the textbook misconfiguration: any site could
+  // make credentialed calls with a victim's cookies. Bearer tokens make the
+  // exposure smaller than it looks, but the header is wrong regardless.
+  // Development and test keep the permissive origin for the Vite proxy.
+  const corsOrigins = new Set<string>(
+    config.CORS_ORIGINS.split(",").map((o) => o.trim()).filter(Boolean),
+  );
+  try {
+    corsOrigins.add(new URL(config.APP_BASE_URL).origin);
+  } catch {
+    /* an unparseable APP_BASE_URL is already refused by loadConfig in production */
+  }
+  await app.register(cors, {
+    origin:
+      config.NODE_ENV === "production"
+        ? (origin, cb) => cb(null, !origin || corsOrigins.has(origin))
+        : true,
+    credentials: true,
+  });
   await app.register(multipart, {
-    limits: { fileSize: 1024 * 1024 * 1024, files: 25 },
+    limits: { fileSize: config.UPLOAD_MAX_BYTES, files: config.UPLOAD_MAX_FILES },
   });
 
   const dbHandle: DbHandle = await createDb(config);
@@ -183,6 +214,19 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
     config.STORAGE_DRIVER === "s3" ? createS3Storage(config) : createLocalStorage(config.STORAGE_DIR),
   );
   app.decorate("appConfig", config);
+
+  // The platform job scheduler. Modules register their sweeps during their
+  // own registration; the ticker starts once every module is in place (below)
+  // and is stopped on close. Off under test — suites call runNow() instead.
+  const scheduler = new PlatformScheduler(dbHandle.db, app.log, {
+    enabled: config.SCHEDULER_ENABLED && config.NODE_ENV !== "test",
+    tickMs: config.SCHEDULER_TICK_MS,
+    postgres: Boolean(config.DATABASE_URL),
+  });
+  app.decorate("scheduler", scheduler);
+  app.addHook("onClose", async () => {
+    scheduler.stop();
+  });
 
   await app.register(authPlugin);
 
@@ -222,8 +266,34 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
     time: new Date().toISOString(),
   }));
 
+  // Readiness is a different question from liveness: "is the process up"
+  // versus "can it serve a request that touches the database". Orchestrators
+  // route traffic on this one.
+  app.get("/api/v1/health/ready", async (_req, reply) => {
+    const checks: Record<string, { ok: boolean; detail?: string }> = {};
+    try {
+      await dbHandle.db.execute(sql`select 1`);
+      checks["database"] = { ok: true };
+    } catch (err) {
+      checks["database"] = { ok: false, detail: err instanceof Error ? err.message : String(err) };
+    }
+    checks["storage"] = { ok: true, detail: config.STORAGE_DRIVER };
+    checks["scheduler"] = {
+      ok: true,
+      detail: scheduler.enabled ? `enabled, ${scheduler.list().length} jobs` : "disabled",
+    };
+    const ok = Object.values(checks).every((c) => c.ok);
+    return reply.status(ok ? 200 : 503).send({
+      ok,
+      db: config.DATABASE_URL ? "postgres" : "pglite",
+      checks,
+      time: new Date().toISOString(),
+    });
+  });
+
   const prefix = "/api/v1";
   await app.register(identityModule, { prefix });
+  await app.register(platformModule, { prefix });
   // Registered next to identity because they extend the same surface: SSO and
   // MFA sit in front of the login it already owns, and account self-service
   // (verification, reset, device list) sits behind it.
@@ -274,6 +344,9 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
   await app.register(equipmentModule, { prefix });
   await app.register(timecardsModule, { prefix });
   await app.register(biddingModule, { prefix });
+
+  // Every module has registered its jobs; start the ticker.
+  scheduler.start();
 
   // Same-origin SPA serving (production): the built web app is copied into
   // the container and served by the API, so the client's absolute
