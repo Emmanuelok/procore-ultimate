@@ -925,7 +925,9 @@ function ChangeComposer({
   const packages = useResource<ListResponse<ChangeOrderPackageRef>>(
     (signal) =>
       api.get<ListResponse<ChangeOrderPackageRef>>(
-        `/api/v1/projects/${budget.projectId}/change-order-packages?page=1&pageSize=100`,
+        // Only an EXECUTED prime-contract package can fund an owner change; the
+        // list is filtered to exactly what the API will accept.
+        `/api/v1/projects/${budget.projectId}/change-order-packages?page=1&pageSize=100&kind=prime_contract&status=executed`,
         { signal },
       ),
     [budget.projectId],
@@ -1095,7 +1097,7 @@ function ChangeComposer({
       (packages.data?.items ?? []).map((pkg) => ({
         value: pkg.id,
         label: `${pkg.reference} · ${pkg.title}`,
-        description: `${labelize(pkg.status)} · ${money(pkg.amount, currency)}`,
+        description: `${labelize(pkg.status)} PCCO · ${money(pkg.amount, currency)}`,
       })),
     [packages.data, currency],
   );
@@ -1163,8 +1165,8 @@ function ChangeComposer({
               value={sourceId}
               onChange={(next) => setSourceId(next)}
               options={packageOptions}
-              placeholder={packages.loading ? "Loading packages…" : "Search change order packages…"}
-              emptyMessage="No change order package on this project."
+              placeholder={packages.loading ? "Loading packages…" : "Search executed prime-contract packages…"}
+              emptyMessage="No executed prime-contract package on this project. Execute the change order first; a draft or commitment package cannot fund the budget."
             />
           </Field>
         ) : null}

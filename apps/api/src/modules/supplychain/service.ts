@@ -4,19 +4,28 @@
  *
  *  - long-lead: refresh required-on-site from the programme, re-assess, keep
  *    the order-by OBLIGATION in step, raise late/at-risk SIGNALS idempotently
+ *    and tell the expediting owner
  *  - JIT: detect delivery-vs-task conflicts and raise signals
  *  - supplier risk: assemble what the platform holds about every node, run
- *    the engine, snapshot the result, raise signals
+ *    the engine, snapshot the result (only when it changed), raise signals
+ *  - deliveries: mark bookings that never arrived, write the transport carbon
+ *    entry when a movement completes
+ *  - offsite: materialise a unit's rollup from its stages and inspections
+ *  - traceability: persist the chain-completeness verdict on the record
  *
  * Nothing here computes: the engines do. Nothing here decides who may call
  * it: the routes and the scheduler do.
  */
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, lt } from "drizzle-orm";
 import {
+  carbonEntries,
   deliverySlots,
   entities,
+  factoryInspections,
   longLeadItems,
+  materialTraceRecords,
   obligations,
+  offsiteProductionStages,
   offsiteUnits,
   prequalificationFinancials,
   prequalificationSubmissions,
@@ -28,17 +37,45 @@ import {
 import type { SignalSeverity } from "@constructos/shared";
 import type { Db } from "../../lib/db.js";
 import { newId } from "../../lib/ids.js";
+import { pushNotifications } from "../notifications/service.js";
 import { detectJitConflicts, type JitConflict } from "./engines/jit.js";
+import { estimateTransportCarbon } from "./engines/logistics.js";
 import {
   assessLongLead,
   isExpeditingStale,
   type LongLeadAssessment,
 } from "./engines/longLead.js";
+import { derivedProductionStatus, rollupStages, verifiedForPayment, type UnitRollup } from "./engines/offsite.js";
 import { assessSupplyChain, type RiskFlagRecord, type SupplyChainRiskResult } from "./engines/supplierRisk.js";
+import { chainCompleteness, type ChainCompleteness, type TraceCertificate } from "./engines/traceability.js";
 import { SYSTEM_ACTOR, alreadySignalled, ledger, nowISO, raiseSignal } from "./shared.js";
 
 export type LongLeadRow = typeof longLeadItems.$inferSelect;
 export type NodeRow = typeof supplyChainNodes.$inferSelect;
+export type SlotRow = typeof deliverySlots.$inferSelect;
+export type UnitRow = typeof offsiteUnits.$inferSelect;
+export type StageRowDb = typeof offsiteProductionStages.$inferSelect;
+export type InspectionRow = typeof factoryInspections.$inferSelect;
+export type TraceRow = typeof materialTraceRecords.$inferSelect;
+
+/** Timestamps come back from the driver in its own dialect; engines want ISO. */
+export function isoTs(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const t = Date.parse(value);
+  return Number.isNaN(t) ? value : new Date(t).toISOString();
+}
+
+const SLOT_TS_FIELDS = ["startsAt", "endsAt", "arrivedAt", "unloadingStartedAt", "completedAt", "createdAt", "updatedAt"] as const;
+
+/** A slot as the wire sees it: every timestamp in ISO form, whatever the driver's dialect. */
+export function wireSlot<T extends { startsAt: string; endsAt: string }>(row: T): T {
+  const out: Record<string, unknown> = { ...row };
+  for (const field of SLOT_TS_FIELDS) {
+    const v = out[field];
+    if (typeof v === "string") out[field] = isoTs(v);
+  }
+  return out as T;
+}
 
 export interface TaskLite {
   id: string;
@@ -126,7 +163,7 @@ export function assessItem(row: LongLeadRow, ctx: LongLeadContext, today: string
       actualArrivalDate: row.actualArrivalDate,
       customsRequired: row.customsRequired === 1,
       customsClearedAt: row.customsClearedAt,
-      lastExpeditedAt: row.lastExpeditedAt,
+      lastExpeditedAt: isoTs(row.lastExpeditedAt),
       supplierCriticality: node?.criticality ?? null,
       taskIsCritical: task?.isCritical ?? false,
     },
@@ -220,12 +257,18 @@ export async function persistAssessment(
   return { row: updated ?? row, assessed };
 }
 
-const OPEN_ITEM_STATUSES = ["identified", "requisitioned", "ordered", "in_production", "shipped", "in_customs"] as const;
+export const OPEN_ITEM_STATUSES = ["identified", "requisitioned", "ordered", "in_production", "shipped", "in_customs"] as const;
 
 export interface LongLeadSweepResult {
   assessed: number;
   signalsRaised: number;
   byRisk: Record<string, number>;
+}
+
+/** Who should hear about an item: its expediting owner, else whoever registered it. */
+function itemOwner(row: LongLeadRow): string | null {
+  const owner = row.expeditingOwnerId ?? row.createdBy;
+  return owner && owner !== SYSTEM_ACTOR ? owner : null;
 }
 
 /** Re-assess every open item on a project and raise late / at-risk signals once each. */
@@ -260,11 +303,12 @@ export async function sweepLongLead(
     if (seen.has(key)) continue;
     const severity: SignalSeverity =
       level === "late" ? (assessed.taskIsCritical ? "critical" : "high") : assessed.taskIsCritical ? "high" : "medium";
+    const title = `${stored.reference} ${stored.name} is ${level.replace("_", " ")}${assessed.taskIsCritical ? " on a critical-path task" : ""}`;
     const signalId = await raiseSignal(db, companyId, projectId, actorId, {
       detector,
       severity,
       confidence: 0.85,
-      title: `${stored.reference} ${stored.name} is ${level.replace("_", " ")}${assessed.taskIsCritical ? " on a critical-path task" : ""}`,
+      title,
       explanation: assessed.assessment.reasons.join(" "),
       key,
       evidence: {
@@ -280,6 +324,21 @@ export async function sweepLongLead(
     seen.add(key);
     signalsRaised += 1;
     await db.update(longLeadItems).set({ signalId }).where(eq(longLeadItems.id, row.id));
+    const owner = itemOwner(stored);
+    if (owner) {
+      await pushNotifications(db, [
+        {
+          companyId,
+          userId: owner,
+          projectId,
+          kind: "supply_chain",
+          title,
+          body: assessed.assessment.reasons[0] ?? null,
+          recordType: "long_lead_item",
+          recordId: stored.id,
+        },
+      ]);
+    }
   }
   return { assessed: rows.length, signalsRaised, byRisk };
 }
@@ -339,7 +398,7 @@ export async function computeJitConflicts(db: Db, companyId: string, projectId: 
   const ctx = await loadLongLeadContext(db, projectId, items);
   return detectJitConflicts({
     tasks: tasks.map((t) => ({ ...t, isCritical: t.isCritical === 1 })),
-    slots: slots.map((s) => ({ ...s, startsAt: new Date(s.startsAt).toISOString() })),
+    slots: slots.map((s) => ({ ...s, startsAt: isoTs(s.startsAt) ?? s.startsAt })),
     items: items.map((i) => ({
       id: i.id,
       reference: i.reference,
@@ -388,7 +447,26 @@ export interface SupplierRiskRun {
   result: SupplyChainRiskResult;
   nodes: NodeRow[];
   raised: number;
+  snapshotsWritten: number;
+  unchanged: number;
   assessedAt: string;
+}
+
+/** Two assessments say the same thing when level, score and the flag set match. */
+function sameVerdict(
+  a: { level: string; score: number | null; flags: unknown[] },
+  b: { level: string; score: number | null; flags: RiskFlagRecord[] },
+): boolean {
+  if (a.level !== b.level || a.score !== b.score) return false;
+  const codes = (flags: unknown[]) =>
+    flags
+      .map((f) => {
+        const r = f as { code?: unknown; severity?: unknown };
+        return `${String(r.code)}:${String(r.severity)}`;
+      })
+      .sort()
+      .join("|");
+  return codes(a.flags) === codes(b.flags);
 }
 
 export async function runSupplierRisk(
@@ -408,7 +486,7 @@ export async function runSupplierRisk(
     .where(and(eq(supplyChainLinks.companyId, companyId), eq(supplyChainLinks.projectId, projectId)));
   const vendorIds = [...new Set(nodes.map((n) => n.vendorId).filter((x): x is string => Boolean(x)))];
   const entityIds = [...new Set(nodes.map((n) => n.entityId).filter((x): x is string => Boolean(x)))];
-  const [financials, prequals, ents, items] = await Promise.all([
+  const [financials, prequals, ents, items, latest] = await Promise.all([
     vendorIds.length > 0
       ? db
           .select({
@@ -445,6 +523,7 @@ export async function runSupplierRisk(
       .select()
       .from(longLeadItems)
       .where(and(eq(longLeadItems.companyId, companyId), eq(longLeadItems.projectId, projectId), inArray(longLeadItems.status, [...OPEN_ITEM_STATUSES]))),
+    latestAssessments(db, companyId, projectId),
   ]);
   const ctx = await loadLongLeadContext(db, projectId, items);
 
@@ -472,13 +551,13 @@ export async function runSupplierRisk(
       isGoingConcernQualified: f.isGoingConcernQualified === 1,
       insolvencyEvents: Array.isArray(f.insolvencyEvents) ? f.insolvencyEvents.length : 0,
     })),
-    prequals,
+    prequals: prequals.map((p) => ({ vendorId: p.vendorId, outcome: p.outcome ?? "pending", expiresAt: p.expiresAt })),
     entities: ents,
     items: items.map((i) => ({
       supplierNodeId: i.supplierNodeId,
       taskIsCritical: i.scheduleTaskId ? (ctx.tasks.get(i.scheduleTaskId)?.isCritical ?? false) : false,
       riskLevel: i.riskLevel,
-      expeditingStale: isExpeditingStale(i, today),
+      expeditingStale: isExpeditingStale({ status: i.status, lastExpeditedAt: isoTs(i.lastExpeditedAt), actualArrivalDate: i.actualArrivalDate }, today),
       status: i.status,
     })),
     today,
@@ -492,6 +571,8 @@ export async function runSupplierRisk(
     "supply_sanctions",
   ]);
   let raised = 0;
+  let snapshotsWritten = 0;
+  let unchanged = 0;
   const nodeById = new Map(nodes.map((n) => [n.id, n]));
 
   for (const a of result.assessments) {
@@ -528,6 +609,17 @@ export async function runSupplierRisk(
         await raiseFor("supply_sanctions", `risk:${node.id}:sanctions`, "critical", `${node.name}: screening hit on the linked entity`, f);
       }
     }
+    // A snapshot is written only when the verdict moved: a run that finds
+    // the same thing as the last one is a confirmation, not a new fact.
+    const previous = latest.get(node.id);
+    if (previous && signalIds.length === 0 && sameVerdict(previous, a)) {
+      unchanged += 1;
+      await db
+        .update(supplyChainNodes)
+        .set({ riskLevel: a.level, riskScore: a.score, riskAssessedAt: assessedAt, updatedAt: assessedAt })
+        .where(eq(supplyChainNodes.id, node.id));
+      continue;
+    }
     const id = newId("sra");
     await db.insert(supplierRiskAssessments).values({
       id,
@@ -543,6 +635,7 @@ export async function runSupplierRisk(
       basis: a.basis,
       signalIds,
     });
+    snapshotsWritten += 1;
     await db
       .update(supplyChainNodes)
       .set({ riskLevel: a.level, riskScore: a.score, riskAssessedAt: assessedAt, updatedAt: assessedAt })
@@ -554,7 +647,7 @@ export async function runSupplierRisk(
       action: "create",
       objectType: "supplier_risk_assessment",
       objectId: id,
-      payload: { nodeId: node.id, level: a.level, score: a.score, flags: a.flags.map((f) => f.code) },
+      payload: { nodeId: node.id, level: a.level, score: a.score, flags: a.flags.map((f) => f.code), previousLevel: previous?.level ?? null },
     });
   }
 
@@ -578,7 +671,7 @@ export async function runSupplierRisk(
     .select()
     .from(supplyChainNodes)
     .where(and(eq(supplyChainNodes.companyId, companyId), eq(supplyChainNodes.projectId, projectId)));
-  return { result, nodes: refreshed, raised, assessedAt };
+  return { result, nodes: refreshed, raised, snapshotsWritten, unchanged, assessedAt };
 }
 
 /** Latest snapshot per node for a project (one query, newest first, first-seen wins). */
@@ -587,9 +680,292 @@ export async function latestAssessments(db: Db, companyId: string, projectId: st
     .select()
     .from(supplierRiskAssessments)
     .where(and(eq(supplierRiskAssessments.companyId, companyId), eq(supplierRiskAssessments.projectId, projectId)))
-    .orderBy(desc(supplierRiskAssessments.assessedAt))
+    .orderBy(desc(supplierRiskAssessments.assessedAt), desc(supplierRiskAssessments.createdAt))
     .limit(2000);
   const latest = new Map<string, (typeof rows)[number]>();
   for (const r of rows) if (!latest.has(r.nodeId)) latest.set(r.nodeId, r);
   return latest;
+}
+
+/* ------------------------------------------------------------------ */
+/* Deliveries: no-shows and the transport carbon hook                  */
+/* ------------------------------------------------------------------ */
+
+/** A booking is a no-show once its window has been closed this long. */
+export const NO_SHOW_GRACE_MS = 24 * 60 * 60_000;
+
+export interface NoShowSweepResult {
+  marked: number;
+  raised: number;
+}
+
+/**
+ * Bookings still `requested`/`confirmed` a full day after their window
+ * closed never happened. Mark them, raise one signal each, tell the booker.
+ * Idempotent: a marked slot is no longer a candidate, and the signal is keyed.
+ */
+export async function sweepDeliveryNoShows(
+  db: Db,
+  companyId: string,
+  now: Date,
+  projectId?: string,
+): Promise<NoShowSweepResult> {
+  const cutoff = new Date(now.getTime() - NO_SHOW_GRACE_MS).toISOString();
+  const rows = await db
+    .select()
+    .from(deliverySlots)
+    .where(
+      and(
+        eq(deliverySlots.companyId, companyId),
+        projectId ? eq(deliverySlots.projectId, projectId) : undefined,
+        inArray(deliverySlots.status, ["requested", "confirmed"]),
+        lt(deliverySlots.endsAt, cutoff),
+      ),
+    )
+    .limit(500);
+  const seen = await alreadySignalled(db, companyId, ["supply_delivery_no_show"]);
+  let marked = 0;
+  let raised = 0;
+  for (const slot of rows) {
+    const at = nowISO();
+    await db
+      .update(deliverySlots)
+      .set({ status: "no_show", issueKind: slot.issueKind === "none" ? "late" : slot.issueKind, updatedAt: at })
+      .where(eq(deliverySlots.id, slot.id));
+    marked += 1;
+    await ledger(db, {
+      companyId,
+      projectId: slot.projectId,
+      actorId: null,
+      action: "state_change",
+      objectType: "delivery_slot",
+      objectId: slot.id,
+      payload: { from: slot.status, to: "no_show", reason: "no arrival recorded 24h after the booked window closed" },
+    });
+    const key = `slot:${slot.id}:noshow`;
+    if (!seen.has(key)) {
+      await raiseSignal(db, companyId, slot.projectId, null, {
+        detector: "supply_delivery_no_show",
+        severity: slot.longLeadItemId || slot.offsiteUnitId ? "medium" : "low",
+        confidence: 0.7,
+        title: `${slot.reference} never arrived`,
+        explanation: `Delivery ${slot.reference} (${slot.description}) was booked ${isoTs(slot.startsAt) ?? slot.startsAt} – ${isoTs(slot.endsAt) ?? slot.endsAt} and no arrival was recorded within 24 hours of the window closing.${slot.longLeadItemId ? " It carries a long-lead item; check the item's forecast." : ""}`,
+        key,
+        evidence: { slotId: slot.id, gateId: slot.gateId, longLeadItemId: slot.longLeadItemId, offsiteUnitId: slot.offsiteUnitId, scheduleTaskId: slot.scheduleTaskId },
+      });
+      seen.add(key);
+      raised += 1;
+    }
+    if (slot.bookedBy && slot.bookedBy !== SYSTEM_ACTOR) {
+      await pushNotifications(db, [
+        {
+          companyId,
+          userId: slot.bookedBy,
+          projectId: slot.projectId,
+          kind: "supply_chain",
+          title: `${slot.reference} marked as a no-show`,
+          body: "No arrival was recorded within 24 hours of the booked window. Record the arrival if it did come, or rebook.",
+          recordType: "delivery_slot",
+          recordId: slot.id,
+        },
+      ]);
+    }
+  }
+  return { marked, raised };
+}
+
+export interface CarbonSync {
+  kgCo2e: number | null;
+  basis: string | null;
+  carbonEntryId: string | null;
+  reasons: string[];
+}
+
+/**
+ * The transport carbon hook (#945, ESG module A4). Runs when a delivery
+ * completes (and again if its km/load change afterwards): the estimate is
+ * written to esg.carbon_entries so the project's whole-life assessment sees
+ * it, and the slot keeps the figure, its basis and the entry id. No distance
+ * → no entry, and the reason is kept on the slot.
+ */
+export async function syncSlotCarbon(db: Db, slot: SlotRow, actorId: string | null): Promise<CarbonSync> {
+  const estimate = estimateTransportCarbon({
+    transportMode: slot.transportMode,
+    vehicleType: slot.vehicleType,
+    transportKm: slot.transportKm,
+    loadTonnes: slot.loadTonnes,
+  });
+  const entryDate = (isoTs(slot.completedAt) ?? isoTs(slot.startsAt) ?? nowISO()).slice(0, 10);
+  const isTonneKm = slot.transportMode !== "road" && slot.transportMode !== "multimodal";
+  let carbonEntryId = slot.carbonEntryId;
+
+  if (estimate.kgCo2e === null) {
+    if (carbonEntryId) {
+      await db.delete(carbonEntries).where(and(eq(carbonEntries.id, carbonEntryId), eq(carbonEntries.companyId, slot.companyId)));
+      await ledger(db, { companyId: slot.companyId, projectId: slot.projectId, actorId, action: "delete", objectType: "carbon_entry", objectId: carbonEntryId, payload: { slotId: slot.id, reason: estimate.reasons } });
+      carbonEntryId = null;
+    }
+    await db
+      .update(deliverySlots)
+      .set({ carbonKgCo2e: null, carbonBasis: estimate.reasons.join(" "), carbonEntryId: null, updatedAt: nowISO() })
+      .where(eq(deliverySlots.id, slot.id));
+    return { kgCo2e: null, basis: null, carbonEntryId: null, reasons: estimate.reasons };
+  }
+
+  const quantity = isTonneKm ? (slot.transportKm ?? 0) * (slot.loadTonnes ?? 0) : (slot.transportKm ?? 0);
+  const values = {
+    description: `Transport to site — ${slot.reference} ${slot.description}`.slice(0, 500),
+    lifecycleModule: "A4",
+    scope: "scope_3",
+    factorId: null,
+    quantity,
+    unit: isTonneKm ? "tonne-km" : "vehicle-km",
+    tco2e: Math.round((estimate.kgCo2e / 1000) * 1_000_000) / 1_000_000,
+    sourceNote: `Delivery slot ${slot.reference}: ${estimate.basis}`,
+    entryDate,
+  };
+  if (carbonEntryId) {
+    const [existing] = await db
+      .update(carbonEntries)
+      .set(values)
+      .where(and(eq(carbonEntries.id, carbonEntryId), eq(carbonEntries.companyId, slot.companyId)))
+      .returning({ id: carbonEntries.id });
+    if (!existing) carbonEntryId = null;
+    else {
+      await ledger(db, { companyId: slot.companyId, projectId: slot.projectId, actorId, action: "update", objectType: "carbon_entry", objectId: carbonEntryId, payload: { slotId: slot.id, kgCo2e: estimate.kgCo2e, basis: estimate.basis } });
+    }
+  }
+  if (!carbonEntryId) {
+    carbonEntryId = newId("cen");
+    await db.insert(carbonEntries).values({
+      id: carbonEntryId,
+      companyId: slot.companyId,
+      projectId: slot.projectId,
+      budgetId: null,
+      boqItemId: null,
+      createdBy: actorId ?? slot.bookedBy,
+      ...values,
+    });
+    await ledger(db, { companyId: slot.companyId, projectId: slot.projectId, actorId, action: "create", objectType: "carbon_entry", objectId: carbonEntryId, payload: { slotId: slot.id, kgCo2e: estimate.kgCo2e, basis: estimate.basis, module: "A4" } });
+  }
+  await db
+    .update(deliverySlots)
+    .set({ carbonKgCo2e: estimate.kgCo2e, carbonBasis: estimate.basis, carbonEntryId, updatedAt: nowISO() })
+    .where(eq(deliverySlots.id, slot.id));
+  return { kgCo2e: estimate.kgCo2e, basis: estimate.basis, carbonEntryId, reasons: [] };
+}
+
+/* ------------------------------------------------------------------ */
+/* Offsite units                                                       */
+/* ------------------------------------------------------------------ */
+
+export interface UnitRecompute {
+  unit: UnitRow;
+  stages: StageRowDb[];
+  inspections: InspectionRow[];
+  rollup: UnitRollup;
+  verified: ReturnType<typeof verifiedForPayment>;
+}
+
+/**
+ * Materialise what the stages and inspections say onto the unit row: counts,
+ * percent complete, QA gate tallies, the production status (never regressing
+ * a shipped unit) and the independently verified percent for payment.
+ */
+export async function recomputeUnit(db: Db, unit: UnitRow): Promise<UnitRecompute> {
+  const [stages, inspections] = await Promise.all([
+    db
+      .select()
+      .from(offsiteProductionStages)
+      .where(eq(offsiteProductionStages.unitId, unit.id))
+      .orderBy(offsiteProductionStages.position, offsiteProductionStages.createdAt),
+    db
+      .select()
+      .from(factoryInspections)
+      .where(eq(factoryInspections.unitId, unit.id))
+      .orderBy(desc(factoryInspections.performedAt), desc(factoryInspections.createdAt)),
+  ]);
+  const rollup = rollupStages(
+    stages.map((s) => ({
+      id: s.id,
+      position: s.position,
+      status: s.status,
+      isQaGate: s.isQaGate === 1,
+      qaResult: s.qaResult,
+      completedBy: s.completedBy,
+    })),
+  );
+  const verified = verifiedForPayment(
+    inspections.map((i) => ({ result: i.result, percentVerified: i.percentVerified, performedAt: i.performedAt, inspectorId: i.inspectorId })),
+  );
+  const status = derivedProductionStatus(unit.status, rollup);
+  const best = verified.percent !== null
+    ? inspections
+        .filter((i) => (i.result === "passed" || i.result === "conditional") && i.percentVerified === verified.percent)
+        .sort((a, b) => (b.performedAt ?? "").localeCompare(a.performedAt ?? ""))[0]
+    : undefined;
+  const [updated] = await db
+    .update(offsiteUnits)
+    .set({
+      stagesTotal: rollup.stagesTotal,
+      stagesComplete: rollup.stagesComplete,
+      percentComplete: rollup.percentComplete,
+      qaGatesTotal: rollup.qaGatesTotal,
+      qaGatesPassed: rollup.qaGatesPassed,
+      qaGatesFailed: rollup.qaGatesFailed,
+      status,
+      percentVerifiedForPayment: verified.percent,
+      verifiedForPaymentBy: best?.inspectorId ?? null,
+      verifiedForPaymentAt: best ? (isoTs(best.updatedAt) ?? nowISO()) : null,
+      updatedAt: nowISO(),
+    })
+    .where(eq(offsiteUnits.id, unit.id))
+    .returning();
+  return { unit: updated ?? unit, stages, inspections, rollup, verified };
+}
+
+/* ------------------------------------------------------------------ */
+/* Traceability                                                        */
+/* ------------------------------------------------------------------ */
+
+export function certificatesOf(row: Pick<TraceRow, "certificates">): TraceCertificate[] {
+  return (Array.isArray(row.certificates) ? row.certificates : []).filter(
+    (c): c is TraceCertificate => typeof c === "object" && c !== null && typeof (c as { id?: unknown }).id === "string",
+  );
+}
+
+export function traceInput(row: TraceRow) {
+  const detail = (row.detail ?? {}) as Record<string, unknown>;
+  return {
+    heatNumber: row.heatNumber,
+    batchNumber: row.batchNumber,
+    lotNumber: row.lotNumber,
+    serialNumber: row.serialNumber,
+    certificates: certificatesOf(row),
+    status: row.status,
+    installedLocationId: row.installedLocationId,
+    installedAt: row.installedAt,
+    supplierNodeId: row.supplierNodeId,
+    vendorId: row.vendorId,
+    manufacturer: row.manufacturer,
+    originCountry: row.originCountry,
+    conformityMarking: row.conformityMarking,
+    requiresConformityMarking: detail["requiresConformityMarking"] === true,
+  };
+}
+
+/** Persist the engine's verdict on the row. Returns the stored row and the verdict. */
+export async function persistChain(db: Db, row: TraceRow): Promise<{ row: TraceRow; chain: ChainCompleteness }> {
+  const chain = chainCompleteness(traceInput(row));
+  const [updated] = await db
+    .update(materialTraceRecords)
+    .set({
+      chainComplete: chain.complete ? 1 : 0,
+      chainGaps: chain.gaps,
+      certificateCount: certificatesOf(row).length,
+      updatedAt: nowISO(),
+    })
+    .where(eq(materialTraceRecords.id, row.id))
+    .returning();
+  return { row: updated ?? row, chain };
 }

@@ -22,7 +22,6 @@ import type {
 import type { Db } from "../../lib/db.js";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
-import { addDaysISO } from "../field/dates.js";
 import {
   determine,
   positionFromRegistrations,
@@ -243,6 +242,7 @@ export async function persistDetermination(db: Db, a: PersistArgs): Promise<Dete
     contractType: a.input.contractType,
     amount: a.input.amount,
     currency: a.input.currency,
+    taxPointDate: a.input.asOf,
     inputs: a.input as unknown as Record<string, unknown>,
     vatTreatment: o.vatTreatment,
     vatRate: o.vatRate,
@@ -420,8 +420,6 @@ const SCHEME_FOR_KIND: Record<string, string[]> = {
  * excluded and named in the basis — never converted, never summed across.
  */
 export async function computePeriodAggregates(db: Db, period: PeriodRow): Promise<PeriodAggregates> {
-  const startTs = `${period.periodStart}T00:00:00.000Z`;
-  const endTs = `${addDaysISO(period.periodEnd, 1)}T00:00:00.000Z`;
   const kind = period.returnKind as TaxReturnKind;
   const basis: Record<string, unknown> = {
     window: { from: period.periodStart, to: period.periodEnd },
@@ -445,8 +443,8 @@ export async function computePeriodAggregates(db: Db, period: PeriodRow): Promis
           eq(taxDeterminations.status, "determined"),
           eq(taxDeterminations.regime, period.regime),
           ne(taxDeterminations.sourceType, "manual"),
-          gte(taxDeterminations.createdAt, startTs),
-          lte(taxDeterminations.createdAt, endTs),
+          gte(taxDeterminations.taxPointDate, period.periodStart),
+          lte(taxDeterminations.taxPointDate, period.periodEnd),
         ),
       );
     let excluded = 0;
@@ -492,7 +490,7 @@ export async function computePeriodAggregates(db: Db, period: PeriodRow): Promis
     basis["ownerBillings"] = salesCount;
     basis["inputTaxAssumesFullRecovery"] = true;
     basis["note"] =
-      "Input tax = supplier VAT charged + self-accounted reverse-charge VAT (full recovery assumed); output tax = VAT on owner billings dated in the window + self-accounted reverse-charge VAT. Manual what-if determinations are excluded.";
+      "Input tax = supplier VAT charged + self-accounted reverse-charge VAT on determinations whose tax point falls in the window (full recovery assumed); output tax = VAT on owner billings dated in the window + self-accounted reverse-charge VAT. Manual what-if determinations are excluded.";
     return {
       outputTax,
       inputTax,

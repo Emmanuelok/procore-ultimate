@@ -44,8 +44,11 @@ export interface SpecCitation {
 
 const SHEET = String.raw`([A-Z]{1,3}[-–]?\d{1,4}(?:\.\d{1,2})?[A-Z]?)`;
 const CALLOUT_RE = new RegExp(String.raw`\b(\d{1,2}|[A-Z])\s*/\s*${SHEET}\b`, "g");
+// The optional detail id ("4" in "SEE DETAIL 4/A-501") must be followed by a
+// separator — a slash, " ON " or whitespace — so it can never swallow the
+// first letter of the sheet number itself ("SEE REV-2" is not "EV-2").
 const SEE_RE = new RegExp(
-  String.raw`\b(?:SEE|REFER(?:\s+TO)?)\s+(?:(DETAIL|SECTION|ELEV(?:ATION)?|SHEET|DWG\.?|PLAN)\s*)?(?:(\d{1,2}|[A-Z])\s*)?(?:ON\s+|/\s*)?(?:SHEET\s+|DWG\.?\s+)?${SHEET}\b`,
+  String.raw`\b(?:SEE|REFER(?:\s+TO)?)\s+(?:(DETAIL|SECTION|ELEV(?:ATION)?|SHEET|DWG\.?|PLAN)\s*)?(?:(\d{1,2}|[A-Z])(?:\s*/\s*|\s+ON\s+|\s+))?(?:SHEET\s+|DWG\.?\s+)?${SHEET}\b`,
   "g",
 );
 const TYP_RE = /\b(TYP\.?|TYPICAL|SIM\.?|SIMILAR)\b/i;

@@ -1,7 +1,12 @@
 /**
- * pdf.js (v6) plumbing for the sheet viewer: document loading via the
- * authenticated blob fetch, page rendering into canvases with cancellation,
- * and a hook that manages document lifecycle per fileId.
+ * pdf.js (v6) plumbing for the sheet viewer.
+ *
+ * Documents are opened straight from the authenticated revision URL with
+ * RANGE REQUESTS (spec #278): the API advertises `Accept-Ranges: bytes`, so
+ * pdf.js fetches the xref and only the objects of the page being shown
+ * instead of the whole set. `disableAutoFetch` stops it from quietly pulling
+ * the rest of a 400 MB set in the background. The bearer token and tenant
+ * header ride on every request through `httpHeaders`.
  */
 import { useEffect, useRef, useState } from "react";
 // Legacy build: the modern build relies on bleeding-edge JS APIs (e.g.
@@ -10,33 +15,54 @@ import { useEffect, useRef, useState } from "react";
 import * as pdfjs from "pdfjs-dist/legacy/build/pdf.mjs";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
-import { fetchBlobUrl } from "../../lib/api";
+import { tokenStore } from "../../lib/api";
 import type { PageSize } from "./types";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
 export interface LoadedPdf {
   doc: PDFDocumentProxy;
-  blobUrl: string;
   destroy: () => void;
 }
 
-/** Fetch a drawing file (auth headers attached) and open it with pdf.js. */
-export async function loadPdf(fileId: string): Promise<LoadedPdf> {
-  const blobUrl = await fetchBlobUrl(`/api/v1/drawing-files/${fileId}/pdf`);
+/** The revision's PDF endpoint (range-served, access-logged on first open). */
+export function revisionPdfUrl(projectId: string, revisionId: string): string {
+  return `/api/v1/projects/${projectId}/revisions/${revisionId}/pdf`;
+}
+
+function authHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {};
+  const access = tokenStore.access;
+  if (access) headers["authorization"] = `Bearer ${access}`;
+  const companyId = tokenStore.companyId;
+  if (companyId) headers["x-company-id"] = companyId;
+  return headers;
+}
+
+/** Open a PDF by URL with range requests and the platform's auth headers. */
+export async function loadPdf(url: string): Promise<LoadedPdf> {
+  const task = pdfjs.getDocument({
+    url,
+    httpHeaders: authHeaders(),
+    withCredentials: false,
+    rangeChunkSize: 256 * 1024,
+    disableAutoFetch: true,
+    disableStream: false,
+  });
   try {
-    const doc = await pdfjs.getDocument({ url: blobUrl }).promise;
+    const doc = await task.promise;
     return {
       doc,
-      blobUrl,
       destroy: () => {
-        void doc.loadingTask.destroy().catch(() => undefined);
-        URL.revokeObjectURL(blobUrl);
+        void task.destroy().catch(() => undefined);
       },
     };
   } catch (err) {
-    URL.revokeObjectURL(blobUrl);
-    throw err;
+    void task.destroy().catch(() => undefined);
+    const status = (err as { status?: number })?.status;
+    if (status === 404) throw new Error("The sheet's PDF was not found, or you do not have access to it.");
+    if (status === 403) throw new Error("You do not have permission to open this sheet.");
+    throw err instanceof Error ? err : new Error("Failed to load PDF");
   }
 }
 
@@ -116,28 +142,28 @@ export interface UsePdfResult {
 }
 
 /**
- * Load the PDF document for a fileId and expose the page's scale-1 size.
- * Handles cleanup + fileId/pageIndex changes; stale loads are discarded.
+ * Load the PDF at `url` and expose the page's scale-1 size. Handles cleanup
+ * and url/pageIndex changes; stale loads are discarded.
  */
-export function usePdfPage(fileId: string | null, pageIndex: number): UsePdfResult {
+export function usePdfPage(url: string | null, pageIndex: number): UsePdfResult {
   const [state, setState] = useState<UsePdfResult>({
     doc: null,
     pageSize: null,
-    loading: Boolean(fileId),
+    loading: Boolean(url),
     error: null,
   });
   const generation = useRef(0);
 
   useEffect(() => {
     const gen = ++generation.current;
-    if (!fileId) {
+    if (!url) {
       setState({ doc: null, pageSize: null, loading: false, error: null });
       return;
     }
     let loaded: LoadedPdf | null = null;
     setState({ doc: null, pageSize: null, loading: true, error: null });
     (async () => {
-      loaded = await loadPdf(fileId);
+      loaded = await loadPdf(url);
       if (generation.current !== gen) {
         loaded.destroy();
         return;
@@ -161,7 +187,7 @@ export function usePdfPage(fileId: string | null, pageIndex: number): UsePdfResu
       generation.current++;
       if (loaded) loaded.destroy();
     };
-  }, [fileId, pageIndex]);
+  }, [url, pageIndex]);
 
   return state;
 }

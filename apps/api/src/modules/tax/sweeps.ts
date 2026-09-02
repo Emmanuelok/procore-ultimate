@@ -3,6 +3,7 @@ import { and, desc, eq, gte, inArray, isNotNull, lt, ne } from "drizzle-orm";
 import {
   commitmentPayments,
   commitments,
+  invoices,
   peExposures,
   taxDeterminations,
   taxPeriods,
@@ -42,6 +43,7 @@ export interface SweepCounts {
   missingRegistrations: number;
   missingRegistrationsCleared: number;
   whtNotDeducted: number;
+  reverseChargeMisapplied: number;
   signalsRaised: number;
 }
 
@@ -275,6 +277,10 @@ export async function sweepWhtNotDeducted(db: Db, companyId: string, now: Date):
       );
     for (const pay of payments) {
       if (!pay.vendorId) continue;
+      // The vendor's CURRENT position on the project is its most recent live
+      // determination — whatever that says. An older determination that
+      // required a deduction must not outrank a newer one that found none
+      // (a subcontractor verified for gross payment since).
       const [det] = await db
         .select({
           id: taxDeterminations.id,
@@ -289,12 +295,12 @@ export async function sweepWhtNotDeducted(db: Db, companyId: string, now: Date):
             eq(taxDeterminations.projectId, p.projectId),
             eq(taxDeterminations.vendorId, pay.vendorId),
             eq(taxDeterminations.status, "determined"),
-            ne(taxDeterminations.withholdingScheme, "none"),
+            ne(taxDeterminations.sourceType, "manual"),
           ),
         )
         .orderBy(desc(taxDeterminations.createdAt))
         .limit(1);
-      if (!det || det.withholdingAmount <= 0) continue;
+      if (!det || det.withholdingScheme === "none" || det.withholdingAmount <= 0) continue;
       const [cert] = await db
         .select({ id: withholdingCertificates.id })
         .from(withholdingCertificates)
@@ -318,6 +324,102 @@ export async function sweepWhtNotDeducted(db: Db, companyId: string, now: Date):
           `Payment ${pay.reference} (${pay.currency} ${pay.amount.toFixed(2)}${pay.paymentDate ? `, ${pay.paymentDate}` : ""}) was issued to a vendor whose current determination on this project requires a ${det.withholdingRate}% ${det.withholdingScheme.toUpperCase()} deduction, ` +
           `but no withholding certificate is recorded against the payment. If the deduction was not made, the paying party is liable for it (#802, #804).`,
         evidenceRefs: { paymentId: pay.id, determinationId: det.id, vendorId: pay.vendorId },
+      });
+      if (res.raised) raised += 1;
+    }
+  }
+  return { raised };
+}
+
+/**
+ * A subcontractor invoice that still shows tax although its current
+ * line determinations say the supply is reverse-charged (#799, #818). The
+ * invoice-level determination route raises the same key on demand; this
+ * sweep catches invoices whose figures changed after the determination
+ * ran. Bounded to invoices billed in the last 180 days.
+ */
+export async function sweepReverseChargeMisapplied(
+  db: Db,
+  companyId: string,
+  now: Date,
+): Promise<{ raised: number }> {
+  const profiles = await db
+    .select({ projectId: taxProjectProfiles.projectId, regime: taxProjectProfiles.regime })
+    .from(taxProjectProfiles)
+    .where(eq(taxProjectProfiles.companyId, companyId));
+  let raised = 0;
+  const since = addDaysISO(today(now), -180);
+  for (const p of profiles) {
+    const def = findTaxRegime(p.regime);
+    if (!def) continue;
+    // Every current line determination on recent invoices: an invoice is a
+    // candidate when at least one line is reverse-charged, and it is wrong
+    // only when its tax exceeds what the OTHER (standard-rated) lines may
+    // legitimately carry — a mixed works + materials invoice is not a
+    // misapplication just because it shows some VAT.
+    const lines = await db
+      .select({
+        sourceId: taxDeterminations.sourceId,
+        vatAmount: taxDeterminations.vatAmount,
+        selfAccountedVat: taxDeterminations.selfAccountedVat,
+        reverseCharge: taxDeterminations.reverseCharge,
+        vendorName: taxDeterminations.vendorName,
+      })
+      .from(taxDeterminations)
+      .where(
+        and(
+          eq(taxDeterminations.companyId, companyId),
+          eq(taxDeterminations.projectId, p.projectId),
+          eq(taxDeterminations.status, "determined"),
+          eq(taxDeterminations.sourceType, "invoice_line"),
+          gte(taxDeterminations.taxPointDate, since),
+        ),
+      );
+    const byInvoice = new Map<string, { selfAccounted: number; allowedVat: number; anyReverseCharge: boolean; vendorName: string | null }>();
+    for (const d of lines) {
+      if (!d.sourceId) continue;
+      const cur = byInvoice.get(d.sourceId) ?? { selfAccounted: 0, allowedVat: 0, anyReverseCharge: false, vendorName: d.vendorName };
+      cur.selfAccounted += d.selfAccountedVat;
+      cur.allowedVat += d.vatAmount;
+      if (d.reverseCharge === 1) cur.anyReverseCharge = true;
+      byInvoice.set(d.sourceId, cur);
+    }
+    for (const [id, v] of byInvoice) if (!v.anyReverseCharge) byInvoice.delete(id);
+    if (byInvoice.size === 0) continue;
+    const invs = await db
+      .select({
+        id: invoices.id,
+        reference: invoices.reference,
+        currency: invoices.currency,
+        taxAmount: invoices.taxAmount,
+        status: invoices.status,
+        vendorId: invoices.vendorId,
+      })
+      .from(invoices)
+      .where(
+        and(
+          eq(invoices.companyId, companyId),
+          eq(invoices.projectId, p.projectId),
+          inArray(invoices.id, [...byInvoice.keys()]),
+        ),
+      );
+    for (const inv of invs) {
+      if (inv.status === "void" || inv.status === "rejected") continue;
+      const det = byInvoice.get(inv.id)!;
+      if (!(inv.taxAmount > det.allowedVat + 0.005)) continue;
+      const res = await raiseSignalOnce(db, {
+        companyId,
+        projectId: p.projectId,
+        detector: "tax_reverse_charge_misapplied",
+        key: `rc_misapplied:${inv.id}`,
+        severity: "high",
+        confidence: 0.9,
+        title: `Reverse charge misapplied — invoice ${inv.reference} charges VAT on a reverse-charge supply`,
+        explanation:
+          `The current determinations for invoice ${inv.reference}${det.vendorName ? ` from ${det.vendorName}` : ""} conclude the supply is subject to the domestic reverse charge under ${def.name}, ` +
+          `so the supplier must not charge VAT and the customer self-accounts ${inv.currency} ${det.selfAccounted.toFixed(2)}; the invoice nevertheless shows ${inv.currency} ${inv.taxAmount.toFixed(2)} of tax against ${inv.currency} ${det.allowedVat.toFixed(2)} allowable on its standard-rated lines. ` +
+          `Paying that VAT loses input-tax recovery and leaves the customer still liable to self-account. Reject the invoice for re-issue (#799, #818).`,
+        evidenceRefs: { invoiceId: inv.id, invoiceTax: inv.taxAmount, allowedVat: det.allowedVat, vendorId: inv.vendorId, selfAccountedVat: det.selfAccounted },
       });
       if (res.raised) raised += 1;
     }
@@ -354,13 +456,15 @@ export async function runTaxRiskSweep(db: Db, companyId: string, now: Date): Pro
   const ver = await sweepVerificationExpiry(db, companyId, now);
   const missing = await sweepMissingRegistrations(db, companyId, now);
   const wht = await sweepWhtNotDeducted(db, companyId, now);
+  const rc = await sweepReverseChargeMisapplied(db, companyId, now);
   return {
     overduePeriods: periods.overdue,
     verificationsExpired: ver.expired,
     missingRegistrations: missing.raised,
     missingRegistrationsCleared: missing.cleared,
     whtNotDeducted: wht.raised,
-    signalsRaised: periods.raised + ver.expired + missing.raised + wht.raised,
+    reverseChargeMisapplied: rc.raised,
+    signalsRaised: periods.raised + ver.expired + missing.raised + wht.raised + rc.raised,
   };
 }
 
@@ -368,7 +472,7 @@ export function registerTaxJobs(app: FastifyInstance): void {
   app.scheduler.register({
     name: "tax.risk-sweep",
     description:
-      "Overdue tax returns, lapsed verifications, unregistered paying vendors and payments issued without a deduction certificate",
+      "Overdue tax returns, lapsed verifications, unregistered paying vendors, payments issued without a deduction certificate and invoices charging VAT on reverse-charge supplies",
     everyMs: 60 * 60_000,
     runOnBoot: true,
     run: async ({ db, now }) => forEachCompany(db, (companyId) => runTaxRiskSweep(db, companyId, now)),

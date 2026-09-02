@@ -1349,7 +1349,13 @@ describe("access control and the record", () => {
     await inject("POST", `/api/v1/commitment-changes/${open.json().id}/void`, approverH, {
       reason: "not proceeding",
     });
-    const ok = await inject("POST", `/api/v1/commitments/${subA}/complete`, approverH, {});
+    /* the closeout checklist (#539) gates completion: refused without evidence or an override */
+    const gated = await inject("POST", `/api/v1/commitments/${subA}/complete`, approverH, {});
+    expect(gated.statusCode).toBe(409);
+    expect(gated.json().details.control).toBe("closeout_checklist");
+    const ok = await inject("POST", `/api/v1/commitments/${subA}/complete`, approverH, {
+      overrideReason: "Closeout documents held off-platform; completing on the PM's instruction",
+    });
     expect(ok.statusCode).toBe(200);
     expect(ok.json().commitment.status).toBe("complete");
   });

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  addMonthsISO,
   classifyExposure,
   daysInclusive,
   mergeRanges,
@@ -30,10 +31,14 @@ describe("PE day-count engine", () => {
     ]);
   });
 
-  it("subtracts months with end-of-month clamping", () => {
+  it("adds and subtracts months with end-of-month clamping", () => {
     expect(subtractMonthsISO("2026-03-31", 1)).toBe("2026-02-28");
     expect(subtractMonthsISO("2026-09-01", 12)).toBe("2025-09-01");
     expect(subtractMonthsISO("2026-01-15", 2)).toBe("2025-11-15");
+    expect(addMonthsISO("2026-01-31", 1)).toBe("2026-02-28");
+    expect(addMonthsISO("2024-01-31", 1)).toBe("2024-02-29");
+    expect(addMonthsISO("2026-04-06", 1)).toBe("2026-05-06"); // a UK tax month
+    expect(addMonthsISO("2026-11-15", 3)).toBe("2027-02-15");
   });
 
   it("counts only the days inside a rolling window, and everything when the window is 0", () => {

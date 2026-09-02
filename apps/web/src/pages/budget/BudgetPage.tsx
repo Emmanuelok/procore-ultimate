@@ -40,12 +40,18 @@ import {
 import type { MenuItemSpec } from "../../ui";
 import { IconBudget, IconEdit, IconMore, IconPlus, IconRefresh } from "../../ui/icons";
 import { api } from "../../lib/api";
+import CashflowTab from "./CashflowTab";
 import ChangesTab from "./ChangesTab";
+import ContingencyTab from "./ContingencyTab";
 import ForecastTab from "./ForecastTab";
 import GridTab from "./GridTab";
 import ImportTab from "./ImportTab";
+import InsightsTab from "./InsightsTab";
+import LineDrawer from "./LineDrawer";
 import SnapshotsTab from "./SnapshotsTab";
 import SummaryHeader from "./SummaryHeader";
+import VarianceTab from "./VarianceTab";
+import ViewsTab from "./ViewsTab";
 import {
   BUDGET_STATUS_TONE,
   LoadError,
@@ -67,13 +73,28 @@ import {
   type RecalculateResult,
 } from "./budgetShared";
 
-type TabKey = "grid" | "changes" | "snapshots" | "forecast" | "import";
+type TabKey =
+  | "grid"
+  | "changes"
+  | "snapshots"
+  | "forecast"
+  | "insights"
+  | "variance"
+  | "cashflow"
+  | "views"
+  | "contingency"
+  | "import";
 
 const TABS: Array<{ value: TabKey; label: string }> = [
   { value: "grid", label: "Budget grid" },
   { value: "changes", label: "Changes & transfers" },
   { value: "snapshots", label: "Snapshots" },
   { value: "forecast", label: "Forecasting" },
+  { value: "insights", label: "Insights" },
+  { value: "variance", label: "Budget vs actual" },
+  { value: "cashflow", label: "Cash flow" },
+  { value: "views", label: "Views" },
+  { value: "contingency", label: "Contingency" },
   { value: "import", label: "Import" },
 ];
 
@@ -104,6 +125,8 @@ export default function BudgetPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
   const [recalcResult, setRecalcResult] = useState<RecalculateResult | null>(null);
+  /** a line opened from the insights / variance tabs — the grid has its own drawer */
+  const [openLine, setOpenLine] = useState<string | null>(null);
 
   const budgets = useResource<ListResponse<BudgetRecord>>(
     (signal) =>
@@ -378,6 +401,11 @@ export default function BudgetPage() {
                   Dismiss
                 </Button>
               </div>
+              {recalcResult.driftCount !== undefined && recalcResult.driftCount > 0 ? (
+                <p className="mt-1 text-meta text-warning-fg">
+                  {count(recalcResult.driftCount)} stored figure{recalcResult.driftCount === 1 ? "" : "s"} disagreed with the source tables and were corrected ({recalcResult.reference ?? "reconciliation"} — see the Insights tab for the rows).
+                </p>
+              ) : null}
               {recalcResult.skipped.length > 0 ? (
                 <div className="mt-2">
                   <p className="text-meta font-semibold text-content">
@@ -503,11 +531,30 @@ export default function BudgetPage() {
               version={version}
               onChanged={refresh}
             />
+          ) : tab === "insights" ? (
+            <InsightsTab
+              budget={budget}
+              currency={currency}
+              users={users}
+              version={version}
+              onChanged={refresh}
+              onOpenLine={setOpenLine}
+            />
+          ) : tab === "variance" ? (
+            <VarianceTab budget={budget} currency={currency} version={version} onOpenLine={setOpenLine} />
+          ) : tab === "cashflow" ? (
+            <CashflowTab budget={budget} currency={currency} version={version} />
+          ) : tab === "views" ? (
+            <ViewsTab budget={budget} currency={currency} users={users} version={version} onChanged={refresh} />
+          ) : tab === "contingency" ? (
+            <ContingencyTab budget={budget} currency={currency} version={version} onChanged={refresh} />
           ) : (
             <ImportTab budget={budget} currency={currency} onChanged={refresh} />
           )}
         </>
       )}
+
+      <LineDrawer lineId={openLine} currency={currency} users={users} onClose={() => setOpenLine(null)} />
 
       <EditBudgetModal
         open={editOpen && budget !== null}

@@ -122,6 +122,8 @@ export const taxDeterminations = pgTable(
     contractType: text("contract_type").notNull(),
     amount: doublePrecision("amount").notNull(),
     currency: text("currency").notNull(),
+    /** tax point (ISO date): the invoice/billing date the determination was run as of — what a period aggregates on */
+    taxPointDate: text("tax_point_date"),
     /** the full engine input, as run */
     inputs: jsonb("inputs").$type<Record<string, unknown>>().default({}).notNull(),
     /* headline outputs, denormalised for the register */
@@ -161,6 +163,7 @@ export const taxDeterminations = pgTable(
     index("tax_determinations_source_idx").on(t.sourceType, t.sourceId, t.sourceLineId),
     index("tax_determinations_vendor_idx").on(t.vendorId),
     index("tax_determinations_company_idx").on(t.companyId, t.createdAt),
+    index("tax_determinations_tax_point_idx").on(t.projectId, t.taxPointDate),
   ],
 );
 

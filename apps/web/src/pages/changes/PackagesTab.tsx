@@ -765,12 +765,12 @@ function PackageDrawer({
                 Submit
               </Button>
             ) : null}
-            {pkg && ["pending_in_house_review", "pending_owner_approval", "draft"].includes(pkg.status) ? (
+            {pkg && ["pending_in_house_review", "pending_owner_approval"].includes(pkg.status) ? (
               <Button size="sm" onClick={() => void act("approve", {}, "Approved for execution.")}>
                 Approve
               </Button>
             ) : null}
-            {pkg && pkg.status !== "executed" && pkg.status !== "void" ? (
+            {pkg && ["pending_in_house_review", "pending_owner_approval", "approved"].includes(pkg.status) ? (
               <Button size="sm" variant="danger" onClick={() => setRejecting(true)}>
                 Reject
               </Button>

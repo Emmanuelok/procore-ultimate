@@ -313,3 +313,52 @@ export function estimateTransportCarbon(input: {
     reasons,
   };
 }
+
+/* ------------------------------------------------------------------ */
+/* Availability: the free windows on a gate for one day (#931–932)     */
+/* ------------------------------------------------------------------ */
+
+export interface FreeWindow {
+  startsAt: string;
+  endsAt: string;
+  /** bays free for the whole window */
+  freeBays: number;
+  craneFree: boolean;
+}
+
+/**
+ * Walk the gate's operating window on `date` in `slotMinutes` steps and
+ * report each step's free bays and whether the crane is uncommitted. Steps
+ * with no free bay are omitted; adjacent identical steps are merged.
+ */
+export function freeWindows(
+  gate: GateRules & { slotMinutes: number },
+  existing: SlotWindow[],
+  date: string,
+): FreeWindow[] {
+  const opens = hhmmToMinutes(gate.opensAt);
+  const closes = hhmmToMinutes(gate.closesAt);
+  if (opens === null || closes === null || closes <= opens || gate.status !== "open") return [];
+  const step = Math.max(5, Math.floor(gate.slotMinutes || 30));
+  const bays = Math.max(1, gate.concurrentSlots);
+  const live = existing.filter((s) => ACTIVE_SLOT_STATUSES.has(s.status));
+  const dayStart = Date.parse(`${date}T00:00:00.000Z`);
+  if (Number.isNaN(dayStart)) return [];
+  const out: FreeWindow[] = [];
+  for (let m = opens; m + step <= closes; m += step) {
+    const from = new Date(dayStart + m * 60_000).toISOString();
+    const to = new Date(dayStart + (m + step) * 60_000).toISOString();
+    const clashing = live.filter((s) => overlaps(s.startsAt, s.endsAt, from, to));
+    const used = peakConcurrency(clashing, from, to);
+    const freeBays = Math.max(0, bays - used);
+    if (freeBays === 0) continue;
+    const craneFree = gate.craneAvailable && !clashing.some((s) => s.craneRequired);
+    const last = out[out.length - 1];
+    if (last && last.endsAt === from && last.freeBays === freeBays && last.craneFree === craneFree) {
+      last.endsAt = to;
+    } else {
+      out.push({ startsAt: from, endsAt: to, freeBays, craneFree });
+    }
+  }
+  return out;
+}

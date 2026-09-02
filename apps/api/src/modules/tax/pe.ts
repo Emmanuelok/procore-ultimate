@@ -62,15 +62,20 @@ export function mergeRanges(ranges: PresenceRange[]): PresenceRange[] {
   return out;
 }
 
-/** Months back from an ISO date, clamped to the month's last day. */
-export function subtractMonthsISO(iso: string, months: number): string {
+/** Months forward (negative = back) from an ISO date, clamped to the month's last day. */
+export function addMonthsISO(iso: string, months: number): string {
   const d = new Date(`${iso}T00:00:00Z`);
   const day = d.getUTCDate();
   d.setUTCDate(1);
-  d.setUTCMonth(d.getUTCMonth() - months);
+  d.setUTCMonth(d.getUTCMonth() + months);
   const lastDay = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
   d.setUTCDate(Math.min(day, lastDay));
   return d.toISOString().slice(0, 10);
+}
+
+/** Months back from an ISO date, clamped to the month's last day. */
+export function subtractMonthsISO(iso: string, months: number): string {
+  return addMonthsISO(iso, -months);
 }
 
 /**

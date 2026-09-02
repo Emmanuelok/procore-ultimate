@@ -8,6 +8,7 @@ import {
   potentialChangeOrders,
   primeContracts,
   vendors,
+  changeOrderRequests,
 } from "@constructos/db";
 import { CHANGE_EVENT_SCOPES, CHANGE_REASONS, PCO_STATUSES } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
@@ -558,6 +559,22 @@ export const pcoRoutes: FastifyPluginAsync = async (app) => {
           `${pco.reference} is inside change order package and cannot be voided. Void the package ` +
             "instead, or raise a reversing change.",
         );
+      }
+      if (pco.changeOrderRequestId) {
+        const cor = (
+          await app.db
+            .select({ reference: changeOrderRequests.reference, status: changeOrderRequests.status })
+            .from(changeOrderRequests)
+            .where(eq(changeOrderRequests.id, pco.changeOrderRequestId))
+            .limit(1)
+        )[0];
+        if (cor && !["withdrawn", "rejected", "void"].includes(cor.status)) {
+          throw conflict(
+            `${pco.reference} is inside owner change order request ${cor.reference} (${cor.status}); voiding it ` +
+              "would leave the owner asked for money on a position that no longer exists. Withdraw the request " +
+              "or remove the PCO from it first.",
+          );
+        }
       }
       assertTransition(
         pco.status,

@@ -6,7 +6,7 @@ import { assessProjectCommitments } from "./compliance.js";
 import {
   buyoutLog,
   committedByCostCode,
-  reconcile,
+  reconcileProject,
   recomputeCommitmentTotals,
   syncBudgetCommitted,
 } from "./rollups.js";
@@ -104,35 +104,17 @@ export const reportRoutes: FastifyPluginAsync = async (app) => {
     "/projects/:projectId/commitments/rollups/reconcile",
     { preHandler: readGate },
     async (req) => {
-      const rows = await app.db
-        .select({
-          id: commitments.id,
-          reference: commitments.reference,
-          title: commitments.title,
-          status: commitments.status,
-          currency: commitments.currency,
-        })
-        .from(commitments)
-        .where(
-          and(
-            eq(commitments.companyId, req.companyId!),
-            eq(commitments.projectId, req.projectId!),
-          ),
-        );
-      const results = [];
-      for (const row of rows) {
-        const r = await reconcile(app.db, row.id);
-        results.push({
-          commitmentId: row.id,
-          reference: row.reference,
-          title: row.title,
-          status: row.status,
-          currency: row.currency,
-          reconciles: r.reconciles,
-          failing: r.checks.filter((c) => !c.reconciles),
-          checks: r.checks,
-        });
-      }
+      /* three queries for the whole project, not three per commitment */
+      const results = (await reconcileProject(app.db, req.companyId!, req.projectId!)).map((r) => ({
+        commitmentId: r.commitment.id,
+        reference: r.commitment.reference,
+        title: r.commitment.title,
+        status: r.commitment.status,
+        currency: r.commitment.currency,
+        reconciles: r.reconciles,
+        failing: r.checks.filter((c) => !c.reconciles),
+        checks: r.checks,
+      }));
       const failing = results.filter((r) => !r.reconciles);
       return {
         projectId: req.projectId!,

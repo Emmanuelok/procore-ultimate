@@ -67,6 +67,14 @@ const inject = (
   payload?: unknown,
 ) => built.app.inject({ method, url, headers, ...(payload !== undefined ? { payload } : {}) });
 
+/** ISO date n days before today — a capture may never be dated in the future. */
+const daysAgo = (n: number): string => new Date(Date.now() - n * 86_400_000).toISOString().slice(0, 10);
+const CAPTURE_1 = daysAgo(40);
+const BACKDATED = daysAgo(50);
+const TRANSFER_2 = daysAgo(20);
+const CAPTURE_2 = daysAgo(10);
+const LATE_CAPTURE = daysAgo(45);
+
 beforeAll(async () => {
   built = await buildTestApp();
   u1 = await registerActor(built.app);
@@ -1151,9 +1159,9 @@ describe("Budget snapshots: immutable period captures", () => {
     const res = await inject("POST", `/api/v1/budgets/${budgetSnap}/snapshots`, u1.headers, {
       name: "August close",
       kind: "monthly_close",
-      asOfDate: "2026-08-31",
-      periodStart: "2026-08-01",
-      periodEnd: "2026-08-31",
+      asOfDate: CAPTURE_1,
+      periodStart: daysAgo(70),
+      periodEnd: CAPTURE_1,
     });
     expect(res.statusCode).toBe(201);
     const body = res.json();
@@ -1189,7 +1197,7 @@ describe("Budget snapshots: immutable period captures", () => {
       originalBudget: 250_000,
     });
     expect(res.statusCode).toBe(409);
-    expect(res.json().message).toMatch(/captured as at 2026-08-31/i);
+    expect(res.json().message).toMatch(new RegExp(`captured as at ${CAPTURE_1}`, "i"));
 
     const added = await inject("POST", `/api/v1/budgets/${budgetSnap}/lines`, u1.headers, {
       costCodeId: ccElecSub,
@@ -1202,7 +1210,7 @@ describe("Budget snapshots: immutable period captures", () => {
   it("refuses a movement back-dated into a captured period", async () => {
     const res = await inject("POST", `/api/v1/budgets/${budgetSnap}/changes`, u1.headers, {
       title: "Back-dated transfer",
-      effectiveDate: "2026-08-15",
+      effectiveDate: BACKDATED,
       fromLineItemId: snapLineA,
       toLineItemId: snapLineB,
       amount: 5_000,
@@ -1214,7 +1222,7 @@ describe("Budget snapshots: immutable period captures", () => {
   it("accepts the same movement dated after the capture, and captures again", async () => {
     const created = await inject("POST", `/api/v1/budgets/${budgetSnap}/changes`, u1.headers, {
       title: "September transfer",
-      effectiveDate: "2026-09-10",
+      effectiveDate: TRANSFER_2,
       fromLineItemId: snapLineA,
       toLineItemId: snapLineB,
       amount: 20_000,
@@ -1227,7 +1235,7 @@ describe("Budget snapshots: immutable period captures", () => {
 
     const res = await inject("POST", `/api/v1/budgets/${budgetSnap}/snapshots`, u1.headers, {
       name: "September close",
-      asOfDate: "2026-09-30",
+      asOfDate: CAPTURE_2,
     });
     expect(res.statusCode).toBe(201);
     snap2 = res.json().id;
@@ -1238,7 +1246,7 @@ describe("Budget snapshots: immutable period captures", () => {
   it("refuses a capture back-dated behind one already taken", async () => {
     const res = await inject("POST", `/api/v1/budgets/${budgetSnap}/snapshots`, u1.headers, {
       name: "July close, late",
-      asOfDate: "2026-07-31",
+      asOfDate: LATE_CAPTURE,
     });
     expect(res.statusCode).toBe(409);
     expect(res.json().message).toMatch(/cannot be back-dated/i);
@@ -1567,10 +1575,13 @@ describe("Rollups and budget vs actual", () => {
       committedCost: false,
       pendingCommitments: false,
       jobToDateCosts: false,
+      paidToDate: false,
     });
     expect(body.skipped.map((s: { component: string }) => s.component)).toEqual([
       "committedCost",
       "pendingCommitments",
+      "invoicedToDate",
+      "paidToDate",
       "jobToDateCosts",
     ]);
     for (const skipped of body.skipped) expect(skipped.reasons.length).toBeGreaterThan(0);
@@ -1675,8 +1686,10 @@ describe("Rollups and budget vs actual", () => {
       committedCost: true,
       pendingCommitments: true,
       jobToDateCosts: true,
+      // no commitment payment has been posted on this project yet
+      paidToDate: false,
     });
-    expect(body.skipped).toHaveLength(0);
+    expect(body.skipped.map((s: { component: string }) => s.component)).toEqual(["paidToDate"]);
     expect(body.totals.committedTotal).toBe(180_000);
     expect(body.totals.pendingCommitmentsTotal).toBe(60_000);
     expect(body.totals.jobToDateCostsTotal).toBe(90_000);

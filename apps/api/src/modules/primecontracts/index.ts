@@ -1,15 +1,19 @@
 import type { FastifyInstance, FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
-import { and, asc, count, desc, eq, inArray, ne } from "drizzle-orm";
+import { and, asc, count, desc, eq, ilike, inArray, ne, or } from "drizzle-orm";
 import { z } from "zod";
 import {
   billingPeriods,
+  budgetChanges,
   budgetLineItems,
+  budgets,
   changeOrderPackages,
+  contacts,
   contracts,
   invoiceLineItems,
   invoices,
   paymentApplications,
   primeContractChanges,
+  primeContractComplianceDocuments,
   primeContractSovLines,
   primeContracts,
   vendors,
@@ -27,8 +31,32 @@ import {
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
-import { AppError, badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
+import { AppError, badRequest, conflict, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
+import { rollUpTotals as rollUpBudgetTotals } from "../budget/calc.js";
+import { derivedColumns as deriveBudgetColumns } from "../budget/derive.js";
+import { complianceGate } from "./analytics.js";
+import { primeLifecycleRoutes } from "./lifecycle.js";
+import {
+  CERTIFIED_APP_STATUSES,
+  OPEN_APP_STATUSES,
+  certifiedBilledOf,
+  fetchBilling as fetchBillingRow,
+  fetchContract as fetchContractRow,
+  loadChanges as loadChangeRows,
+  loadSov as loadSovRows,
+  nowIso,
+  recalcContract as recalcContractRow,
+  recordReceipt,
+  requireContractsLevel,
+  today,
+  type AppRow,
+  type Billing,
+  type ChangeRow,
+  type ContractRow,
+  type InvoiceRow,
+  type SovRow,
+} from "./shared.js";
 import {
   changeOrderLineNumber,
   changeSums,
@@ -45,6 +73,7 @@ import {
   revisedScheduledValueOf,
   rollForward,
   round2,
+  round4,
   sovTotals,
   unavailable,
   validatePeriodValues,
@@ -123,6 +152,19 @@ const contractListQuery = pageQuerySchema.extend({
 const executeSchema = z.object({
   executionDate: isoDate,
   signedContractReceivedDate: isoDate.nullable().optional(),
+});
+
+/**
+ * The owner's (or architect's) identity on an approval or a certification —
+ * the owner modelled as an actor (#511). Recorded on the record and in the
+ * ledger; a document hash ties the act to the signed instrument.
+ */
+const externalSignatorySchema = z.object({
+  contactId: idRef.nullable().optional(),
+  name: z.string().min(1).max(200),
+  signedAt: isoDate.optional(),
+  documentHash: z.string().max(128).nullable().optional(),
+  notes: z.string().max(2000).nullable().optional(),
 });
 
 const statusSchema = z.object({
@@ -208,6 +250,11 @@ const changeListQuery = pageQuerySchema.extend({
 });
 
 const rejectSchema = z.object({ reason: z.string().min(1).max(2000) });
+const voidSchema = z.object({ reason: z.string().min(1).max(2000) });
+
+const changeApproveSchema = z.object({
+  ownerApproval: externalSignatorySchema.optional(),
+});
 
 const billingCreateSchema = z.object({
   billingDate: isoDate,
@@ -245,12 +292,17 @@ const certifySchema = z.object({
   certifiedAmount: money.optional(),
   certificationNotes: z.string().max(5000).nullable().optional(),
   architectVendorId: idRef.nullable().optional(),
+  /** who signed the certificate on the owner/architect side */
+  certifier: externalSignatorySchema.optional(),
 });
 
 const paySchema = z.object({
   paidAmount: money.optional(),
   paidAt: isoDate.optional(),
   paymentReference: z.string().max(200).nullable().optional(),
+  method: z.enum(["ach", "wire", "check", "card", "other"]).optional(),
+  bankReference: z.string().max(200).nullable().optional(),
+  notes: z.string().max(2000).nullable().optional(),
 });
 
 const billingListQuery = pageQuerySchema.extend({
@@ -261,19 +313,9 @@ const billingListQuery = pageQuerySchema.extend({
 /* Row types and small helpers                                         */
 /* ------------------------------------------------------------------ */
 
-type ContractRow = typeof primeContracts.$inferSelect;
-type SovRow = typeof primeContractSovLines.$inferSelect;
-type ChangeRow = typeof primeContractChanges.$inferSelect;
-type InvoiceRow = typeof invoices.$inferSelect;
-type AppRow = typeof paymentApplications.$inferSelect;
-
-const nowIso = (): string => new Date().toISOString();
-const today = (): string => new Date().toISOString().slice(0, 10);
-
-/** Statuses in which a payment application has left the contractor's hands. */
-const CERTIFIED_APP_STATUSES = ["certified", "partially_certified", "paid"] as const;
-/** Statuses in which an application is still ours to edit or withdraw. */
-const OPEN_APP_STATUSES = ["draft", "submitted", "rejected"] as const;
+/** The one SoD control this module applies; the web renders it as "the control did its job". */
+const segregation = (message: string): AppError =>
+  new AppError(403, message, { control: "no_self_certification" });
 
 /**
  * The prime contract lifecycle. `approved` is reachable only through
@@ -391,45 +433,22 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
    * put through the standard gate — so `/prime-contracts/:id/...` enforces
    * exactly the levels `/projects/:projectId/prime-contracts` does.
    */
-  async function requireLevel(
+  const requireLevel = (
     req: FastifyRequest,
     reply: FastifyReply,
     projectId: string,
     level: PermissionLevel,
-  ): Promise<void> {
-    (req.params as Record<string, string | undefined>)["projectId"] = projectId;
-    await (app as FastifyInstance).requireTool("contracts", level)(req, reply);
-  }
+  ): Promise<void> => requireContractsLevel(app as FastifyInstance, req, reply, projectId, level);
 
   /* ---------------------------------------------------------------- */
   /* Fetchers                                                          */
   /* ---------------------------------------------------------------- */
 
-  async function fetchContract(id: string, companyId: string): Promise<ContractRow> {
-    const rows = await app.db
-      .select()
-      .from(primeContracts)
-      .where(and(eq(primeContracts.id, id), eq(primeContracts.companyId, companyId)))
-      .limit(1);
-    if (!rows[0]) throw notFound("Prime contract not found");
-    return rows[0];
-  }
-
-  async function loadSov(primeContractId: string): Promise<SovRow[]> {
-    return app.db
-      .select()
-      .from(primeContractSovLines)
-      .where(eq(primeContractSovLines.primeContractId, primeContractId))
-      .orderBy(asc(primeContractSovLines.sortOrder), asc(primeContractSovLines.lineNumber));
-  }
-
-  async function loadChanges(primeContractId: string): Promise<ChangeRow[]> {
-    return app.db
-      .select()
-      .from(primeContractChanges)
-      .where(eq(primeContractChanges.primeContractId, primeContractId))
-      .orderBy(asc(primeContractChanges.number));
-  }
+  const fetchContract = (id: string, companyId: string): Promise<ContractRow> =>
+    fetchContractRow(app.db, id, companyId);
+  const loadSov = (primeContractId: string): Promise<SovRow[]> => loadSovRows(app.db, primeContractId);
+  const loadChanges = (primeContractId: string): Promise<ChangeRow[]> =>
+    loadChangeRows(app.db, primeContractId);
 
   async function fetchChange(
     contract: ContractRow,
@@ -450,35 +469,8 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
   }
 
   /** A billing = the owner invoice (G703) plus the payment application (G702). */
-  interface Billing {
-    application: AppRow;
-    invoice: InvoiceRow;
-  }
-
-  async function fetchBilling(contract: ContractRow, billingId: string): Promise<Billing> {
-    const rows = await app.db
-      .select()
-      .from(paymentApplications)
-      .where(
-        and(
-          eq(paymentApplications.id, billingId),
-          eq(paymentApplications.primeContractId, contract.id),
-        ),
-      )
-      .limit(1);
-    const application = rows[0];
-    if (!application) throw notFound("Payment application not found");
-    if (!application.invoiceId) {
-      throw new AppError(500, "Payment application has no owner invoice attached");
-    }
-    const inv = await app.db
-      .select()
-      .from(invoices)
-      .where(eq(invoices.id, application.invoiceId))
-      .limit(1);
-    if (!inv[0]) throw new AppError(500, "Owner invoice for this application is missing");
-    return { application, invoice: inv[0] };
-  }
+  const fetchBilling = (contract: ContractRow, billingId: string): Promise<Billing> =>
+    fetchBillingRow(app.db, contract, billingId);
 
   /** Refuse to touch money inside a period someone has closed or locked. */
   async function assertPeriodWritable(
@@ -511,50 +503,10 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
 
   /**
    * Re-derive every rollup column on the contract from the rows underneath
-   * it. Nothing here is incremented in place: a total that is only ever
-   * added to drifts, and a drifted contract sum is a dispute.
+   * it (shared.ts). `totalBilled` is the CERTIFIED position.
    */
-  async function recalcContract(contractId: string, companyId: string): Promise<ContractRow> {
-    const contract = await fetchContract(contractId, companyId);
-    const [lines, changes] = await Promise.all([
-      loadSov(contractId),
-      loadChanges(contractId),
-    ]);
-    const sums = changeSums(contract.originalContractSum, changes);
-    let totalBilled = 0;
-    let retainageHeld = 0;
-    let retainageReleased = 0;
-    for (const l of lines) {
-      totalBilled += l.totalCompletedAndStored;
-      retainageHeld += l.retainageHeld;
-      retainageReleased += l.retainageReleased;
-    }
-    const apps = await app.db
-      .select({ paidAmount: paymentApplications.paidAmount })
-      .from(paymentApplications)
-      .where(
-        and(
-          eq(paymentApplications.primeContractId, contractId),
-          ne(paymentApplications.status, "void"),
-        ),
-      );
-    const totalPaid = round2(apps.reduce((s, a) => s + a.paidAmount, 0));
-    const patch = {
-      approvedChangeSum: sums.approvedChangeSum,
-      pendingChangeSum: sums.pendingChangeSum,
-      draftChangeSum: sums.draftChangeSum,
-      revisedContractSum: sums.revisedContractSum,
-      totalBilled: round2(totalBilled),
-      totalPaid,
-      retainageHeld: round2(retainageHeld),
-      retainageReleased: round2(retainageReleased),
-      balanceToFinish: round2(sums.revisedContractSum - totalBilled),
-      totalsCalculatedAt: nowIso(),
-      updatedAt: nowIso(),
-    };
-    await app.db.update(primeContracts).set(patch).where(eq(primeContracts.id, contractId));
-    return { ...contract, ...patch };
-  }
+  const recalcContract = (contractId: string, companyId: string): Promise<ContractRow> =>
+    recalcContractRow(app.db, contractId, companyId);
 
   /** Contract + SOV identity + reconciliation, the shape every read returns. */
   async function contractView(contract: ContractRow) {
@@ -565,8 +517,13 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
       currency: contract.currency,
     });
     const totals = sovTotals(lines.map(billable));
-    const lineBilledToDate = round2(
-      lines.reduce((s, l) => s + l.totalCompletedAndStored, 0),
+    // The identity compares like with like: the CERTIFIED billed position on
+    // the lines against the certified total stored on the contract. Work on
+    // a draft application is mirrored onto the lines for the G703 and is
+    // reported separately as `draftBilled`, never as a failed identity.
+    const lineBilledToDate = round2(lines.reduce((s, l) => s + certifiedBilledOf(l), 0));
+    const draftBilled = round2(
+      lines.reduce((s, l) => s + l.totalCompletedAndStored, 0) - lineBilledToDate,
     );
     const lineRetainageHeld = round2(lines.reduce((s, l) => s + l.retainageHeld, 0));
     const identities = reconcileContract({
@@ -590,6 +547,8 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
       retainageTerms: retainageTermsOf(contract),
       sov: { totals, identity },
       percentComplete,
+      /** this-period work on an open (uncertified) application, outside totalBilled */
+      draftBilled,
       identities,
       reconciled: identities.every((i) => i.ok) && identity.ok,
     };
@@ -629,22 +588,8 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
       const companyId = req.companyId!;
       const projectId = req.projectId!;
       await assertVendors(body, companyId);
-      if (body.contractId) {
-        const rows = await app.db
-          .select({ id: contracts.id })
-          .from(contracts)
-          .where(
-            and(
-              eq(contracts.id, body.contractId),
-              eq(contracts.companyId, companyId),
-              eq(contracts.projectId, projectId),
-            ),
-          )
-          .limit(1);
-        if (!rows[0]) {
-          throw badRequest("contractId does not reference a contract on this project");
-        }
-      }
+      await assertContractLink(body.contractId, companyId, projectId);
+      await assertOwnerContact(body.ownerContactId, companyId);
       const number = await nextRecordNumber(app.db, projectId, "prime_contract");
       const id = newId("pct");
       const original = round2(body.originalContractSum ?? 0);
@@ -700,6 +645,41 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
     },
   );
 
+  /** `contractId` must be a standard-form contract record on THIS project and company. */
+  async function assertContractLink(
+    contractId: string | null | undefined,
+    companyId: string,
+    projectId: string,
+  ): Promise<void> {
+    if (!contractId) return;
+    const rows = await app.db
+      .select({ id: contracts.id })
+      .from(contracts)
+      .where(
+        and(
+          eq(contracts.id, contractId),
+          eq(contracts.companyId, companyId),
+          eq(contracts.projectId, projectId),
+        ),
+      )
+      .limit(1);
+    if (!rows[0]) throw badRequest("contractId does not reference a contract on this project");
+  }
+
+  /** `ownerContactId` must be a directory contact of this company. */
+  async function assertOwnerContact(
+    contactId: string | null | undefined,
+    companyId: string,
+  ): Promise<void> {
+    if (!contactId) return;
+    const rows = await app.db
+      .select({ id: contacts.id })
+      .from(contacts)
+      .where(and(eq(contacts.id, contactId), eq(contacts.companyId, companyId)))
+      .limit(1);
+    if (!rows[0]) throw badRequest("ownerContactId is not a contact in this company's directory");
+  }
+
   async function assertVendors(
     body: Partial<z.infer<typeof contractCreateSchema>>,
     companyId: string,
@@ -726,23 +706,23 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
     ];
     if (q.status) clauses.push(eq(primeContracts.status, q.status));
     if (q.executed) clauses.push(eq(primeContracts.executed, q.executed === "true" ? 1 : 0));
+    // The text search is part of the WHERE, so the count and every page
+    // reflect the same filtered set — a match on page 2 is not invisible
+    // from page 1.
+    if (q.q && q.q.trim() !== "") {
+      const needle = `%${q.q.trim().replace(/[%_\\]/g, (m) => `\\${m}`)}%`;
+      const textMatch = or(ilike(primeContracts.title, needle), ilike(primeContracts.reference, needle));
+      if (textMatch) clauses.push(textMatch);
+    }
     const where = and(...clauses);
     const [totalRow] = await app.db.select({ n: count() }).from(primeContracts).where(where);
-    const rows = await app.db
+    const items = await app.db
       .select()
       .from(primeContracts)
       .where(where)
       .orderBy(desc(primeContracts.number))
       .limit(q.pageSize)
       .offset(pageOffset(q));
-    const needle = q.q?.toLowerCase();
-    const items = needle
-      ? rows.filter(
-          (r) =>
-            r.title.toLowerCase().includes(needle) ||
-            r.reference.toLowerCase().includes(needle),
-        )
-      : rows;
     return paginate(items, Number(totalRow?.n ?? 0), q);
   });
 
@@ -831,6 +811,8 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
       throw conflict(`A ${contract.status} prime contract cannot be edited`);
     }
     await assertVendors(body, req.companyId!);
+    await assertContractLink(body.contractId, req.companyId!, contract.projectId);
+    await assertOwnerContact(body.ownerContactId, req.companyId!);
 
     // The contract sum is one half of an identity. Moving it without moving
     // the schedule of values breaks the G703, so it is checked here and not
@@ -977,7 +959,7 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
         throw conflict(`A ${contract.status} prime contract cannot be approved`);
       }
       if (contract.createdBy === req.user!.id) {
-        throw forbidden(
+        throw segregation(
           "The approver of a prime contract may not be the person who raised it (segregation " +
             "of duties, ADR 0004).",
         );
@@ -1125,6 +1107,44 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
             "This prime contract still has an open payment application — certify, reject or " +
               "void it before closing the contract.",
           );
+        }
+      }
+      if (body.status === "void") {
+        // An executed contract with money moved under it is a signed
+        // instrument with a billing history; it is terminated, not voided.
+        if (!body.reason || body.reason.trim() === "") {
+          throw badRequest("Voiding a prime contract requires a reason.");
+        }
+        if (contract.executed === 1) {
+          const [apps, executedChanges] = await Promise.all([
+            app.db
+              .select({ n: count() })
+              .from(paymentApplications)
+              .where(
+                and(
+                  eq(paymentApplications.primeContractId, contract.id),
+                  ne(paymentApplications.status, "void"),
+                ),
+              ),
+            app.db
+              .select({ n: count() })
+              .from(primeContractChanges)
+              .where(
+                and(
+                  eq(primeContractChanges.primeContractId, contract.id),
+                  eq(primeContractChanges.status, "executed"),
+                ),
+              ),
+          ]);
+          const appCount = Number(apps[0]?.n ?? 0);
+          const changeCount = Number(executedChanges[0]?.n ?? 0);
+          if (appCount > 0 || changeCount > 0) {
+            throw conflict(
+              `Prime contract ${contract.reference} is executed and carries ${appCount} live ` +
+                `application(s) and ${changeCount} executed change order(s). A signed instrument ` +
+                "with a billing history is terminated, never voided.",
+            );
+          }
         }
       }
       const now = nowIso();
@@ -1487,33 +1507,40 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
         currency: contract.currency,
       });
       const id = newId("sov");
-      await app.db.insert(primeContractSovLines).values({
-        id,
-        companyId: contract.companyId,
-        projectId: contract.projectId,
-        primeContractId: contract.id,
-        lineNumber: body.lineNumber,
-        sortOrder: body.sortOrder ?? existing.length,
-        costCodeId: body.costCodeId ?? null,
-        costCode: body.costCode ?? null,
-        costType: body.costType ?? null,
-        budgetLineItemId: body.budgetLineItemId ?? null,
-        description: body.description,
-        billingMethod: body.billingMethod ?? "percent_complete",
-        unit: body.unit ?? null,
-        quantity: body.quantity ?? null,
-        unitRate: body.unitRate ?? null,
-        scheduledValue,
-        revisedScheduledValue: scheduledValue,
-        balanceToFinish: scheduledValue,
-        retainagePercent: body.retainagePercent ?? contract.defaultRetainagePercent,
-        notes: body.notes ?? null,
+      // The line and the contract sum move together, or not at all: a
+      // failure between the two would leave the sheet out of balance, which
+      // every later write then refuses.
+      await app.db.transaction(async (tx) => {
+        await tx.insert(primeContractSovLines).values({
+          id,
+          companyId: contract.companyId,
+          projectId: contract.projectId,
+          primeContractId: contract.id,
+          lineNumber: body.lineNumber,
+          sortOrder: body.sortOrder ?? existing.length,
+          costCodeId: body.costCodeId ?? null,
+          costCode: body.costCode ?? null,
+          costType: body.costType ?? null,
+          budgetLineItemId: body.budgetLineItemId ?? null,
+          description: body.description,
+          billingMethod: body.billingMethod ?? "percent_complete",
+          unit: body.unit ?? null,
+          quantity: body.quantity ?? null,
+          unitRate: body.unitRate ?? null,
+          scheduledValue,
+          revisedScheduledValue: scheduledValue,
+          balanceToFinish: scheduledValue,
+          retainagePercent: body.retainagePercent ?? contract.defaultRetainagePercent,
+          notes: body.notes ?? null,
+        });
+        if (body.raiseContractSum === true) {
+          await tx
+            .update(primeContracts)
+            .set({ originalContractSum, updatedAt: nowIso() })
+            .where(eq(primeContracts.id, contract.id));
+        }
       });
       if (body.raiseContractSum === true) {
-        await app.db
-          .update(primeContracts)
-          .set({ originalContractSum, updatedAt: nowIso() })
-          .where(eq(primeContracts.id, contract.id));
         await recalcContract(contract.id, req.companyId!);
       }
       await appendLedger(app.db, {
@@ -1721,6 +1748,12 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
         absorb = existing.find((l) => l.id === body.absorbIntoLineId);
         if (!absorb) throw badRequest("absorbIntoLineId is not a line on this contract");
         if (absorb.id === line.id) throw badRequest("absorbIntoLineId must name a different line");
+        if (absorb.isChangeOrderLine === 1) {
+          throw badRequest(
+            `Line ${absorb.lineNumber} was appended by a change order — base scope cannot be ` +
+              "moved into it.",
+          );
+        }
         absorbValue = round2(absorb.scheduledValue + line.scheduledValue);
       }
       const proposed = existing
@@ -1908,10 +1941,16 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
       const contract = await fetchContract(primeContractId, req.companyId!);
       await requireLevel(req, reply, contract.projectId, "standard");
       const change = await fetchChange(contract, changeId);
-      if (change.status === "executed") {
+      // Only a change order nobody has yet signed off may be edited. An
+      // approved number is the number that was approved; changing it and
+      // executing on the old approval would defeat the second pair of eyes.
+      if (!["draft", "revise_and_resubmit"].includes(change.status)) {
         throw conflict(
-          `${change.reference} is executed — an executed change order is part of the contract ` +
-            "sum and cannot be edited.",
+          `${change.reference} is ${change.status} — ` +
+            (change.status === "executed"
+              ? "an executed change order is part of the contract sum and cannot be edited."
+              : "a change order under review or already approved cannot be edited. Reject it " +
+                "back to revise_and_resubmit (or void it) and raise the corrected figure."),
         );
       }
       const lines = (body.lines ?? (change.lines as Array<{ amount: number }>)) as Array<{
@@ -2006,6 +2045,7 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
         primeContractId: string;
         changeId: string;
       };
+      const body = changeApproveSchema.parse(req.body ?? {});
       const contract = await fetchContract(primeContractId, req.companyId!);
       await requireLevel(req, reply, contract.projectId, "admin");
       const change = await fetchChange(contract, changeId);
@@ -2016,15 +2056,37 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
       }
       const actor = req.user!.id;
       if (actor === change.createdBy || actor === change.submittedBy) {
-        throw forbidden(
+        throw segregation(
           "The approver of a change order may be neither the person who raised it nor the " +
             "person who submitted it (segregation of duties, ADR 0004).",
         );
       }
+      if (body.ownerApproval?.contactId) {
+        await assertOwnerContact(body.ownerApproval.contactId, req.companyId!);
+      }
       const now = nowIso();
+      const ownerApproval = body.ownerApproval
+        ? {
+            contactId: body.ownerApproval.contactId ?? contract.ownerContactId ?? null,
+            name: body.ownerApproval.name,
+            signedAt: body.ownerApproval.signedAt ?? today(),
+            documentHash: body.ownerApproval.documentHash ?? null,
+            notes: body.ownerApproval.notes ?? null,
+            recordedBy: actor,
+            recordedAt: now,
+          }
+        : null;
       await app.db
         .update(primeContractChanges)
-        .set({ status: "approved", approvedBy: actor, approvedAt: now, updatedAt: now })
+        .set({
+          status: "approved",
+          approvedBy: actor,
+          approvedAt: now,
+          updatedAt: now,
+          ...(ownerApproval
+            ? { detail: { ...((change.detail as Record<string, unknown> | null) ?? {}), ownerApproval } }
+            : {}),
+        })
         .where(eq(primeContractChanges.id, change.id));
       await recalcContract(contract.id, req.companyId!);
       await appendLedger(app.db, {
@@ -2034,7 +2096,7 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
         action: "state_change",
         objectType: "prime_contract_change",
         objectId: change.id,
-        payload: { from: change.status, to: "approved", amount: change.amount },
+        payload: { from: change.status, to: "approved", amount: change.amount, ownerApproval },
         storePayload: true,
       });
       return fetchChange(contract, change.id);
@@ -2058,7 +2120,7 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
       }
       const actor = req.user!.id;
       if (actor === change.createdBy || actor === change.submittedBy) {
-        throw forbidden(
+        throw segregation(
           "The reviewer of a change order may be neither its author nor its submitter " +
             "(segregation of duties, ADR 0004).",
         );
@@ -2088,13 +2150,128 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
     },
   );
 
+  interface OwnerChangePlan {
+    budgetId: string;
+    budgetStatus: string;
+    legs: Array<{ lineItemId: string; costCode: string; costType: string; amount: number }>;
+    rows: Map<string, typeof budgetLineItems.$inferSelect>;
+  }
+
+  /** Why the last plan produced nothing — set by planOwnerChange, read by the ledger. */
+  let planReasons: string[] = [];
+
+  /**
+   * Resolve a change order's allocation onto the lines of the ACTIVE budget,
+   * or refuse. A leg resolves by the budget line its source SOV line is
+   * bound to, else by cost code × cost type on the budget. Nothing is
+   * invented: with an active budget every leg must land, and the refusal
+   * names the ones that do not. Without an active budget the contract side
+   * executes alone and the reasons are recorded on the change.
+   */
+  async function planOwnerChange(
+    contract: ContractRow,
+    change: ChangeRow,
+    legs: ReadonlyArray<{ sovLineId?: string | null; costCode?: string | null; costType?: string | null; description?: string; amount: number }>,
+    appended: ReadonlyArray<typeof primeContractSovLines.$inferInsert>,
+  ): Promise<OwnerChangePlan | null> {
+    planReasons = [];
+    const active = await app.db
+      .select()
+      .from(budgets)
+      .where(and(eq(budgets.companyId, contract.companyId), eq(budgets.projectId, contract.projectId), eq(budgets.isActive, 1)))
+      .limit(1);
+    const budget = active[0];
+    if (!budget) {
+      planReasons = ["This project has no active budget, so there is no budget column for this change to fund. The contract side executed on its own."];
+      return null;
+    }
+    if (budget.currency.toUpperCase() !== contract.currency.toUpperCase()) {
+      throw conflict(
+        `Budget ${budget.reference} is kept in ${budget.currency} and this change is in ` +
+          `${contract.currency}. Money is never converted silently — align the budget currency first.`,
+      );
+    }
+    if (budget.status === "closed") {
+      throw conflict(`Budget ${budget.reference} is closed and cannot take an owner change.`);
+    }
+    const rows = await app.db.select().from(budgetLineItems).where(eq(budgetLineItems.budgetId, budget.id));
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    const byCode = new Map(rows.map((r) => [`${r.costCode}::${r.costType}`, r]));
+    const merged = new Map<string, OwnerChangePlan["legs"][number]>();
+    const unresolved: string[] = [];
+    legs.forEach((leg, i) => {
+      const source = appended[i];
+      let row = source?.budgetLineItemId ? byId.get(source.budgetLineItemId) : undefined;
+      if (!row && leg.costCode) row = byCode.get(`${leg.costCode}::${leg.costType ?? "other"}`);
+      if (!row) {
+        unresolved.push(`"${leg.description ?? change.title}" (${leg.costCode ?? "no cost code"} / ${leg.costType ?? "no cost type"}, ${formatMoney(leg.amount)})`);
+        return;
+      }
+      if (row.status === "void") {
+        throw conflict(`Budget line ${row.costCode} / ${row.costType} is void and cannot take an owner-funded increase.`);
+      }
+      const existing = merged.get(row.id);
+      if (existing) existing.amount = round2(existing.amount + leg.amount);
+      else merged.set(row.id, { lineItemId: row.id, costCode: row.costCode, costType: row.costType, amount: round2(leg.amount) });
+    });
+    if (unresolved.length > 0) {
+      throw badRequest(
+        `These change order lines do not resolve to a line of budget ${budget.reference}: ` +
+          `${unresolved.join("; ")}. Point each line at a schedule-of-values line bound to a ` +
+          "budget line, or give it a cost code and cost type the budget carries — an owner-funded " +
+          "increase has to land somewhere a cost report can find it.",
+        { unresolved },
+      );
+    }
+    for (const leg of merged.values()) {
+      const row = byId.get(leg.lineItemId)!;
+      const next = round2(row.originalBudget + row.budgetModifications + row.approvedChanges + leg.amount);
+      if (next < 0) {
+        throw conflict(
+          `Executing this change would take budget line ${row.costCode} / ${row.costType} to ` +
+            `${formatMoney(next)}. A budget line cannot hold a negative revised budget.`,
+        );
+      }
+    }
+    return { budgetId: budget.id, budgetStatus: budget.status, legs: [...merged.values()], rows: byId };
+  }
+
+  /** Re-derive the budget's materialized rollups after an owner change lands. */
+  async function recomputeBudgetTotals(budgetId: string): Promise<void> {
+    const rows = await app.db.select().from(budgetLineItems).where(eq(budgetLineItems.budgetId, budgetId));
+    const totals = rollUpBudgetTotals(
+      rows.map((l) => ({
+        originalBudget: l.originalBudget,
+        budgetModifications: l.budgetModifications,
+        approvedChanges: l.approvedChanges,
+        pendingBudgetChanges: l.pendingBudgetChanges,
+        committedCost: l.committedCost,
+        pendingCommitments: l.pendingCommitments,
+        directCosts: l.directCosts,
+        jobToDateCosts: l.jobToDateCosts,
+        percentComplete: l.percentComplete,
+        quantity: l.quantity,
+        unitRate: l.unitRate,
+        revisedBudget: l.revisedBudget,
+        forecastToComplete: l.forecastToComplete,
+        forecastFinal: l.forecastFinal,
+        projectedOverUnder: l.projectedOverUnder,
+      })),
+    );
+    await app.db
+      .update(budgets)
+      .set({ ...totals, totalsCalculatedAt: nowIso(), updatedAt: nowIso() })
+      .where(eq(budgets.id, budgetId));
+  }
+
   /**
    * Execution — the moment a change order becomes money. It APPENDS SOV
    * lines rather than editing the originals, so the continuation sheet keeps
    * reconciling to the signed contract, and it raises the contract sum by
    * exactly what it appends. The two happen in one transaction because a
    * contract sum that moved without its schedule of values is precisely the
-   * failure this module exists to prevent.
+   * failure this module exists to prevent — and the owner-funded budget
+   * increase lands in the same transaction, for the same reason.
    */
   app.post(
     "/prime-contracts/:primeContractId/changes/:changeId/execute",
@@ -2192,6 +2369,24 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
         });
       }
 
+      // The package this change came from (when the chain started in change
+      // management) must not have executed its own PCCO already — that would
+      // be the same instrument entering the contract sum twice.
+      if (change.changeOrderPackageId) {
+        const pkg = await app.db
+          .select({ id: changeOrderPackages.id, reference: changeOrderPackages.reference, primeContractChangeId: changeOrderPackages.primeContractChangeId, status: changeOrderPackages.status })
+          .from(changeOrderPackages)
+          .where(eq(changeOrderPackages.id, change.changeOrderPackageId))
+          .limit(1);
+        if (pkg[0]?.primeContractChangeId && pkg[0].primeContractChangeId !== change.id) {
+          throw conflict(
+            `${pkg[0].reference} was already executed through change management as ` +
+              `${pkg[0].primeContractChangeId}; executing ${change.reference} would carry the ` +
+              "same instrument into the contract sum twice.",
+          );
+        }
+      }
+
       const newApprovedChangeSum = round2(contract.approvedChangeSum + change.amount);
       const proposed: BillableLine[] = [
         ...existing.map(billable),
@@ -2230,7 +2425,16 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
         currency: contract.currency,
       });
 
+      // The budget side. Revenue and budget rise together or the chain the
+      // schema promises (PCCO -> owner_change -> approvedChanges) is broken
+      // for every UI-raised change order. Planned before the transaction so
+      // a refusal names the uncoded lines and writes nothing.
+      const plan = await planOwnerChange(contract, change, legs, appended);
+      const budgetChangeNumber = plan ? await nextRecordNumber(app.db, plan.budgetId, "budget_change") : null;
+      const budgetChangeId = plan ? newId("bch") : null;
+
       const now = nowIso();
+      let budgetLinesMoved = 0;
       await app.db.transaction(async (tx) => {
         for (const row of appended) await tx.insert(primeContractSovLines).values(row);
         await tx
@@ -2242,10 +2446,93 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
             signedChangeOrderReceivedDate:
               body.signedChangeOrderReceivedDate ?? change.signedChangeOrderReceivedDate,
             revisedContractSum: round2(contract.originalContractSum + newApprovedChangeSum),
+            detail: {
+              ...((change.detail as Record<string, unknown> | null) ?? {}),
+              budgetChangeId,
+              budgetReasons: plan ? [] : planReasons,
+            },
             updatedAt: now,
           })
           .where(eq(primeContractChanges.id, change.id));
+        if (plan && budgetChangeId && budgetChangeNumber !== null) {
+          const requestedBy = change.submittedBy ?? change.createdBy;
+          const approvedBy = change.approvedBy ?? req.user!.id;
+          if (approvedBy === requestedBy) {
+            throw new AppError(
+              403,
+              "Segregation of duties: the budget movement this change order funds would be " +
+                "requested and approved by the same person.",
+              { control: "no_self_certification" },
+            );
+          }
+          await tx.insert(budgetChanges).values({
+            id: budgetChangeId,
+            companyId: contract.companyId,
+            projectId: contract.projectId,
+            budgetId: plan.budgetId,
+            number: budgetChangeNumber,
+            reference: `BC-${pad3(budgetChangeNumber)}`,
+            kind: "owner_change",
+            title: `${change.reference} — ${change.title}`,
+            description: change.description,
+            reason: "Owner-funded change order",
+            status: "approved",
+            lines: plan.legs.map((leg) => ({
+              lineItemId: leg.lineItemId,
+              costCode: leg.costCode,
+              costType: leg.costType,
+              amount: leg.amount,
+            })),
+            fromLineItemId: null,
+            toLineItemId: plan.legs[0]?.lineItemId ?? null,
+            amount: round2(plan.legs.reduce((sum, l) => sum + Math.abs(l.amount), 0)),
+            netEffect: round2(change.amount),
+            effectiveDate: executedDate,
+            sourceType: "prime_contract_change",
+            sourceId: change.id,
+            requestedBy,
+            requestedAt: change.submittedAt ?? now,
+            approvedBy,
+            approvedAt: change.approvedAt ?? now,
+            detail: { primeContractChangeId: change.id, changeOrderPackageId: change.changeOrderPackageId },
+            createdBy: change.createdBy,
+          });
+          for (const leg of plan.legs) {
+            const row = plan.rows.get(leg.lineItemId)!;
+            const approvedChanges = round2(row.approvedChanges + leg.amount);
+            const derived = deriveBudgetColumns({
+              originalBudget: row.originalBudget,
+              budgetModifications: row.budgetModifications,
+              approvedChanges,
+              pendingBudgetChanges: row.pendingBudgetChanges,
+              committedCost: row.committedCost,
+              pendingCommitments: row.pendingCommitments,
+              directCosts: row.directCosts,
+              jobToDateCosts: row.jobToDateCosts,
+              percentComplete: row.percentComplete,
+              quantity: row.quantity,
+              unitRate: row.unitRate,
+              forecastMethod: row.forecastMethod,
+              forecastToComplete: row.forecastToComplete,
+            });
+            await tx
+              .update(budgetLineItems)
+              .set({ approvedChanges, updatedAt: now, ...derived.set })
+              .where(eq(budgetLineItems.id, leg.lineItemId));
+            budgetLinesMoved += 1;
+          }
+          if (plan.budgetStatus === "locked") {
+            await tx.update(budgets).set({ status: "revised", updatedAt: now }).where(eq(budgets.id, plan.budgetId));
+          }
+        }
+        if (change.changeOrderPackageId) {
+          await tx
+            .update(changeOrderPackages)
+            .set({ primeContractChangeId: change.id, budgetChangeId, updatedAt: now })
+            .where(eq(changeOrderPackages.id, change.changeOrderPackageId));
+        }
       });
+      if (plan) await recomputeBudgetTotals(plan.budgetId);
       const recalculated = await recalcContract(contract.id, req.companyId!);
       await appendLedger(app.db, {
         companyId: req.companyId!,
@@ -2260,9 +2547,22 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
           amount: change.amount,
           appendedSovLines: appended.map((a) => a.lineNumber),
           revisedContractSum: recalculated.revisedContractSum,
+          budget: { applied: plan !== null, budgetId: plan?.budgetId ?? null, budgetChangeId, linesMoved: budgetLinesMoved, reasons: plan ? [] : planReasons },
         },
         storePayload: true,
       });
+      if (plan && budgetChangeId) {
+        await appendLedger(app.db, {
+          companyId: req.companyId!,
+          projectId: contract.projectId,
+          actorId: req.user!.id,
+          action: "create",
+          objectType: "budget_change",
+          objectId: budgetChangeId,
+          payload: { budgetId: plan.budgetId, kind: "owner_change", status: "approved", sourceType: "prime_contract_change", sourceId: change.id, netEffect: round2(change.amount), legs: plan.legs },
+          storePayload: true,
+        });
+      }
       return {
         change: await fetchChange(contract, change.id),
         appendedLines: appended.map((a) => ({
@@ -2270,6 +2570,14 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
           lineNumber: a.lineNumber,
           scheduledValue: a.scheduledValue,
         })),
+        budget: {
+          applied: plan !== null,
+          budgetId: plan?.budgetId ?? null,
+          budgetChangeId,
+          linesMoved: budgetLinesMoved,
+          amount: plan ? round2(plan.legs.reduce((sum, l) => sum + l.amount, 0)) : 0,
+          reasons: plan ? [] : planReasons,
+        },
         contract: await contractView(recalculated),
       };
     },
@@ -2558,19 +2866,20 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
         currency: contract.currency,
       });
       const open = await app.db
-        .select({ id: paymentApplications.id, reference: paymentApplications.reference })
+        .select({ id: paymentApplications.id, reference: paymentApplications.reference, status: paymentApplications.status })
         .from(paymentApplications)
         .where(
           and(
             eq(paymentApplications.primeContractId, contract.id),
-            inArray(paymentApplications.status, ["draft", "submitted"]),
+            inArray(paymentApplications.status, [...OPEN_APP_STATUSES]),
           ),
         )
         .limit(1);
       if (open[0]) {
         throw conflict(
-          `Application ${open[0].reference} is still open on this contract — certify, reject or ` +
-            "void it before starting the next one.",
+          `Application ${open[0].reference} is still open (${open[0].status}) on this contract — ` +
+            "certify, reopen or void it before starting the next one. Two open applications " +
+            "would each carry this period's figures for the same work.",
         );
       }
       await assertPeriodWritable(
@@ -2901,6 +3210,22 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
         contract.projectId,
         "submitting an application",
       );
+      // The owner-side mirror of commitments.paymentHold: an application
+      // cannot go out while a required compliance document is missing or
+      // expired. The refusal names the documents.
+      const docs = await app.db
+        .select()
+        .from(primeContractComplianceDocuments)
+        .where(eq(primeContractComplianceDocuments.primeContractId, contract.id));
+      const gate = complianceGate(docs, today());
+      if (!gate.ok) {
+        throw new AppError(
+          409,
+          `Application ${billing.application.reference} cannot be submitted: ${gate.blocking.length} ` +
+            `required compliance document(s) block it — ${gate.blocking.map((b) => b.problem).join(" ")}`,
+          { control: "compliance_gate", blocking: gate.blocking },
+        );
+      }
       // recompute once more so what is sworn to is what the SOV says now
       const result = await recomputeBilling(contract, billing, new Map());
       if (result.application.currentPaymentDue < -0.005) {
@@ -2980,12 +3305,26 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
       }
       const actor = req.user!.id;
       if (actor === a.createdBy || actor === a.submittedBy) {
-        throw forbidden(
+        throw segregation(
           "The certifier of a payment application may be neither the person who prepared it nor " +
             "the person who submitted it (segregation of duties, ADR 0004).",
         );
       }
+      if (body.certifier?.contactId) await assertOwnerContact(body.certifier.contactId, req.companyId!);
       await assertPeriodWritable(a.billingPeriodId, contract.projectId, "certifying an application");
+      const certifier = body.certifier
+        ? {
+            contactId: body.certifier.contactId ?? contract.ownerContactId ?? null,
+            name: body.certifier.name,
+            signedAt: body.certifier.signedAt ?? today(),
+            documentHash: body.certifier.documentHash ?? null,
+            notes: body.certifier.notes ?? null,
+            recordedBy: actor,
+          }
+        : null;
+      const stepDown = (a.detail as Record<string, unknown> | null)?.["retainage"] as
+        | { stepDownApplied?: boolean; percentCompleteAtCalc?: number | null; note?: string | null; workPercent?: number; reducedPercent?: number | null; thresholdPercent?: number | null }
+        | undefined;
       const certifiedAmount = round2(body.certifiedAmount ?? a.currentPaymentDue);
       if (certifiedAmount - a.currentPaymentDue > 0.005) {
         throw badRequest(
@@ -3061,6 +3400,9 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
             certifiedBy: actor,
             certifiedAt: now,
             architectVendorId: body.architectVendorId ?? a.architectVendorId,
+            ...(certifier
+              ? { detail: { ...((a.detail as Record<string, unknown> | null) ?? {}), certifier } }
+              : {}),
             updatedAt: now,
           })
           .where(eq(paymentApplications.id, a.id));
@@ -3093,9 +3435,34 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
           shortfall: round2(a.currentPaymentDue - certifiedAmount),
           totalBilled: recalculated.totalBilled,
           retainageHeld: recalculated.retainageHeld,
+          certifier,
         },
         storePayload: true,
       });
+      // The contractual step-down is a decision with money attached; it is
+      // ledgered as its own event, not left inside the application's detail.
+      if (stepDown?.stepDownApplied) {
+        await appendLedger(app.db, {
+          companyId: req.companyId!,
+          projectId: contract.projectId,
+          actorId: actor,
+          action: "state_change",
+          objectType: "prime_retainage_step_down",
+          objectId: a.id,
+          payload: {
+            primeContractId: contract.id,
+            applicationId: a.id,
+            applicationReference: a.reference,
+            percentCompleteAtCalc: stepDown.percentCompleteAtCalc ?? null,
+            thresholdPercent: stepDown.thresholdPercent ?? null,
+            fromPercent: contract.defaultRetainagePercent,
+            toPercent: stepDown.reducedPercent ?? stepDown.workPercent ?? null,
+            retainageHeldAfter: recalculated.retainageHeld,
+            note: stepDown.note ?? null,
+          },
+          storePayload: true,
+        });
+      }
       return billingView(recalculated, a.id);
     },
   );
@@ -3118,7 +3485,7 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
       }
       const actor = req.user!.id;
       if (actor === a.createdBy || actor === a.submittedBy) {
-        throw forbidden(
+        throw segregation(
           "The reviewer of a payment application may be neither its author nor its submitter " +
             "(segregation of duties, ADR 0004).",
         );
@@ -3227,7 +3594,101 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
     },
   );
 
-  /** Settlement: the owner has paid a certified application. */
+  /**
+   * Void an application that has not been certified. The mirror this
+   * application left on the schedule of values is reset to the rolled-
+   * forward (certified) position so the next application starts from what
+   * was actually certified, not from figures a rejected draft carried.
+   * Admin, reason required, ledgered with the payload.
+   */
+  app.post(
+    "/prime-contracts/:primeContractId/billings/:billingId/void",
+    { preHandler: companyGate },
+    async (req, reply) => {
+      const { primeContractId, billingId } = req.params as {
+        primeContractId: string;
+        billingId: string;
+      };
+      const body = voidSchema.parse(req.body);
+      const contract = await fetchContract(primeContractId, req.companyId!);
+      await requireLevel(req, reply, contract.projectId, "admin");
+      const billing = await fetchBilling(contract, billingId);
+      const a = billing.application;
+      if ((CERTIFIED_APP_STATUSES as readonly string[]).includes(a.status)) {
+        throw conflict(
+          `Application ${a.reference} was certified on ${a.certifiedAt ?? "record"} — a certified ` +
+            "application is a third party's determination and cannot be voided. Correct it on the " +
+            "next application.",
+        );
+      }
+      if (a.status === "void") throw conflict(`Application ${a.reference} is already void.`);
+      const sov = await loadSov(contract.id);
+      const now = nowIso();
+      await app.db.transaction(async (tx) => {
+        for (const line of sov) {
+          const certified = certifiedBilledOf(line);
+          const revised = revisedScheduledValueOf(line);
+          await tx
+            .update(primeContractSovLines)
+            .set({
+              thisPeriodWork: 0,
+              thisPeriodStoredMaterials: 0,
+              materialsPresentlyStored: line.previousStoredMaterials,
+              totalCompletedAndStored: certified,
+              percentComplete: revised > 0 ? round4((certified / revised) * 100) : 0,
+              balanceToFinish: round2(revised - certified),
+              updatedAt: now,
+            })
+            .where(eq(primeContractSovLines.id, line.id));
+        }
+        await tx
+          .update(paymentApplications)
+          .set({
+            status: "void",
+            detail: {
+              ...((a.detail as Record<string, unknown> | null) ?? {}),
+              voidedAt: now,
+              voidedBy: req.user!.id,
+              voidReason: body.reason,
+              statusBeforeVoid: a.status,
+            },
+            updatedAt: now,
+          })
+          .where(eq(paymentApplications.id, a.id));
+        await tx
+          .update(invoices)
+          .set({ status: "void", updatedAt: now })
+          .where(eq(invoices.id, billing.invoice.id));
+      });
+      const recalculated = await recalcContract(contract.id, req.companyId!);
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        projectId: contract.projectId,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "payment_application",
+        objectId: a.id,
+        payload: {
+          from: a.status,
+          to: "void",
+          reason: body.reason,
+          currentPaymentDue: a.currentPaymentDue,
+          totalCompletedAndStored: a.totalCompletedAndStored,
+          totalBilled: recalculated.totalBilled,
+        },
+        storePayload: true,
+      });
+      return billingView(recalculated, a.id);
+    },
+  );
+
+  /**
+   * Settlement: the owner has paid (some of) a certified application. Each
+   * call records ONE receipt; the application's paid amount and status are
+   * derived from the receipts, so a partial payment leaves the application
+   * certified with the balance outstanding and a later receipt can settle
+   * it. Σ receipts may never exceed the certified amount.
+   */
   app.post(
     "/prime-contracts/:primeContractId/billings/:billingId/pay",
     { preHandler: companyGate },
@@ -3246,54 +3707,71 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
           `Application ${a.reference} is ${a.status} — only a certified application is payable.`,
         );
       }
-      const certified = a.certifiedAmount ?? a.currentPaymentDue;
-      const paidAmount = round2(body.paidAmount ?? certified);
-      if (paidAmount - certified > 0.005) {
-        throw badRequest(
-          `Payment of ${formatMoney(paidAmount)} ${a.currency} exceeds the certified ` +
-            `${formatMoney(certified)} ${a.currency}.`,
-        );
-      }
-      const now = nowIso();
-      await app.db.transaction(async (tx) => {
-        await tx
-          .update(paymentApplications)
-          .set({
-            status: "paid",
-            paidAmount,
-            paidAt: body.paidAt ? `${body.paidAt}T00:00:00.000Z` : now,
-            paymentReference: body.paymentReference ?? null,
-            updatedAt: now,
-          })
-          .where(eq(paymentApplications.id, a.id));
-        await tx
-          .update(invoices)
-          .set({
-            status: "paid",
-            amountPaid: paidAmount,
-            paidDate: body.paidAt ?? today(),
-            updatedAt: now,
-          })
-          .where(eq(invoices.id, billing.invoice.id));
-      });
-      const recalculated = await recalcContract(contract.id, req.companyId!);
+      const result = await recordReceipt(
+        app.db,
+        contract,
+        billing,
+        req.user!.id,
+        {
+          amount: body.paidAmount,
+          receivedDate: body.paidAt,
+          method: body.method,
+          paymentReference: body.paymentReference,
+          bankReference: body.bankReference,
+          notes: body.notes,
+        },
+        () => nextRecordNumber(app.db, contract.id, "owner_payment_receipt"),
+      );
       await appendLedger(app.db, {
         companyId: req.companyId!,
         projectId: contract.projectId,
         actorId: req.user!.id,
-        action: "state_change",
-        objectType: "payment_application",
-        objectId: a.id,
+        action: "create",
+        objectType: "owner_payment_receipt",
+        objectId: result.receipt.id,
         payload: {
-          from: a.status,
-          to: "paid",
-          paidAmount,
-          certifiedAmount: certified,
-          totalPaid: recalculated.totalPaid,
+          applicationId: a.id,
+          applicationReference: a.reference,
+          amount: result.receipt.amount,
+          currency: result.receipt.currency,
+          receivedDate: result.receipt.receivedDate,
+          method: result.receipt.method,
+          paymentReference: result.receipt.paymentReference,
+          certifiedAmount: round2(a.certifiedAmount ?? a.currentPaymentDue),
+          paid: result.settlement.paid,
+          outstanding: result.settlement.outstanding,
+          settlement: result.settlement.state,
+          totalPaid: result.contract.totalPaid,
         },
         storePayload: true,
       });
-      return billingView(recalculated, a.id);
+      if (result.settlement.state === "paid") {
+        await appendLedger(app.db, {
+          companyId: req.companyId!,
+          projectId: contract.projectId,
+          actorId: req.user!.id,
+          action: "state_change",
+          objectType: "payment_application",
+          objectId: a.id,
+          payload: { from: a.status, to: "paid", paidAmount: result.settlement.paid, receipts: true },
+          storePayload: true,
+        });
+      }
+      return {
+        ...(await billingView(result.contract, a.id)),
+        receipt: result.receipt,
+        settlement: {
+          paid: result.settlement.paid,
+          outstanding: result.settlement.outstanding,
+          state: result.settlement.state,
+        },
+      };
     },
   );
+
+  /* ---------------------------------------------------------------- */
+  /* Lifecycle layer: compliance, stored materials, receipts, ageing,  */
+  /* retainage, change analytics, AIA export, health inputs           */
+  /* ---------------------------------------------------------------- */
+  await app.register(primeLifecycleRoutes);
 };

@@ -17,21 +17,7 @@
  * unwaived work, because that exposure cannot be withdrawn — only chased.
  */
 import { useMemo, useState } from "react";
-import {
-  Alert,
-  Badge,
-  Button,
-  Card,
-  CardBody,
-  CardHeader,
-  EmptyState,
-  ErrorAlert,
-  Field,
-  Input,
-  Select,
-  Stat,
-  Textarea,
-} from "../../ui";
+import { Alert, Badge, Button, Card, CardBody, CardHeader, EmptyState, ErrorAlert, Field, Input, Modal, Select, Stat, Textarea } from "../../ui";
 import { Modal, toast } from "../../ui/overlays";
 import { DataTable, type DataColumns } from "../../ui/data";
 import { NumberInput } from "../../ui/inputs";
@@ -50,6 +36,7 @@ import {
   label,
   money,
   refusalFrom,
+  useAllPages,
   useResource,
   waiverTone,
   type InvoicingContext,
@@ -244,10 +231,9 @@ export default function WaiversTab({
   const report = useResource<OutstandingWaiverReport>(
     `/api/v1/projects/${projectId}/lien-waivers/outstanding`,
   );
-  const waivers = useResource<ListResponse<LienWaiverRow>>(
-    `/api/v1/projects/${projectId}/lien-waivers?page=1&pageSize=300`,
-  );
+  const waivers = useAllPages<LienWaiverRow>(`/api/v1/projects/${projectId}/lien-waivers`);
   const [raising, setRaising] = useState(false);
+  const [signing, setSigning] = useState<LienWaiverRow | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   async function transition(waiver: LienWaiverRow, path: string, body?: unknown) {
@@ -609,6 +595,12 @@ export default function WaiversTab({
             onSelect: () => void transition(row, "send"),
           },
           {
+            id: "sign",
+            label: "Record the signature…",
+            disabled: !["requested", "sent"].includes(row.status),
+            onSelect: () => setSigning(row),
+          },
+          {
             id: "receive",
             label: "Mark as received",
             disabled: row.status !== "signed",
@@ -621,10 +613,31 @@ export default function WaiversTab({
             onSelect: () => void transition(row, "verify"),
           },
           {
+            id: "reject",
+            label: "Reject the document…",
+            disabled: !["requested", "sent", "signed", "received", "verified"].includes(row.status),
+            onSelect: () => {
+              const reason = window.prompt(`Why is ${row.reference} rejected?`);
+              if (reason && reason.trim()) void transition(row, "reject", { reason: reason.trim() });
+            },
+          },
+          {
             id: "not-required",
-            label: "Record as not required",
-            disabled: (SATISFYING_WAIVER_STATUSES as readonly string[]).includes(row.status),
-            onSelect: () => void transition(row, "not-required"),
+            label: "Record as not required (admin)…",
+            disabled: !["draft", "requested", "sent"].includes(row.status),
+            onSelect: () => {
+              const reason = window.prompt(`Why is a waiver not required on ${row.reference}? This satisfies the payment gate and is an admin act.`);
+              if (reason && reason.trim()) void transition(row, "not-required", { reason: reason.trim() });
+            },
+          },
+          {
+            id: "void",
+            label: "Void…",
+            disabled: row.status === "verified" || row.status === "void",
+            onSelect: () => {
+              const reason = window.prompt(`Why is ${row.reference} voided?`);
+              if (reason && reason.trim()) void transition(row, "void", { reason: reason.trim() });
+            },
           },
         ]}
         empty={{
@@ -656,6 +669,89 @@ export default function WaiversTab({
           report.reload();
         }}
       />
+
+      <SignWaiverModal
+        waiver={signing}
+        onClose={() => setSigning(null)}
+        onSign={async (body) => {
+          if (!signing) return;
+          await transition(signing, "sign", body);
+          setSigning(null);
+        }}
+      />
     </div>
+  );
+}
+
+/** The signature is a fact with a name, a method and a reference — never a bare tick. */
+function SignWaiverModal({
+  waiver,
+  onClose,
+  onSign,
+}: {
+  waiver: LienWaiverRow | null;
+  onClose: () => void;
+  onSign: (body: { signedByName: string; signatureMethod: string; signatureReference: string | null; signedAt?: string }) => Promise<void>;
+}) {
+  const [name, setName] = useState("");
+  const [method, setMethod] = useState("wet_ink");
+  const [reference, setReference] = useState("");
+  const [signedAt, setSignedAt] = useState("");
+  const [busy, setBusy] = useState(false);
+  return (
+    <Modal
+      open={waiver !== null}
+      onClose={onClose}
+      title={waiver ? `Record the signature on ${waiver.reference}` : "Record signature"}
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            disabled={!name.trim() || busy}
+            onClick={async () => {
+              setBusy(true);
+              try {
+                await onSign({
+                  signedByName: name.trim(),
+                  signatureMethod: method,
+                  signatureReference: reference.trim() || null,
+                  ...(signedAt ? { signedAt: new Date(signedAt).toISOString() } : {}),
+                });
+              } finally {
+                setBusy(false);
+              }
+            }}
+          >
+            Record signature
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        <Field label="Signed by (name)" required>
+          <Input value={name} onChange={(e) => setName(e.target.value)} />
+        </Field>
+        <div className="grid gap-3 sm:grid-cols-3">
+          <Field label="Method">
+            <Select value={method} onChange={(e) => setMethod(e.target.value)}>
+              <option value="wet_ink">Wet ink</option>
+              <option value="e_signature">E-signature</option>
+              <option value="notarized">Notarized</option>
+            </Select>
+          </Field>
+          <Field label="Reference" optional hint="Envelope id, notary seal number">
+            <Input value={reference} onChange={(e) => setReference(e.target.value)} />
+          </Field>
+          <Field label="Signed on" optional>
+            <Input type="date" value={signedAt} onChange={(e) => setSignedAt(e.target.value)} />
+          </Field>
+        </div>
+        <p className="text-2xs text-content-subtle">
+          Signed is not on file: the document still has to be received and verified by somebody other than the receiver.
+        </p>
+      </div>
+    </Modal>
   );
 }

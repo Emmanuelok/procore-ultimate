@@ -2,11 +2,8 @@ import type { FastifyPluginAsync } from "fastify";
 import { and, asc, count, desc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import {
-  budgetLineItems,
-  budgets,
   commitmentPayments,
   commitments,
-  invoiceLineItems,
   invoices,
   paymentApplications,
   primeContracts,
@@ -17,8 +14,17 @@ import { nextRecordNumber } from "../../lib/numbering.js";
 import { AppError, badRequest, conflict, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import type { Db } from "../../lib/db.js";
+import { assessCommitment } from "../commitments/compliance.js";
+import { assertCompliancePermits } from "../commitments/payments.js";
 import { fetchInvoice, type InvoiceRow } from "./invoices.js";
-import { waiverGateFor } from "./waivers.js";
+import {
+  allocateToBudgetLines,
+  payableOf as payableOfInvoice,
+  postDirectCosts,
+  settleAfterTransition,
+  type DirectCostAllocation,
+} from "./register.js";
+import { requestWaiverForPayment, waiverGateFor } from "./waivers.js";
 import {
   CENT,
   assertSegregation,
@@ -71,195 +77,10 @@ const paymentListQuery = pageQuerySchema.extend({
 });
 
 /* ------------------------------------------------------------------ */
-/* Direct-cost posting                                                 */
+/* Direct-cost posting — owned by register.ts, re-exported for callers  */
 /* ------------------------------------------------------------------ */
 
-export interface DirectCostAllocation {
-  budgetLineItemId: string;
-  costCode: string | null;
-  costType: string | null;
-  amount: number;
-}
-
-/**
- * Split a payment across the budget lines it actually landed on.
- *
- * The allocation follows the invoice's continuation sheet, pro-rata by the
- * net amount each line billed, because that is the only evidence on the
- * record of what the money bought. A payment with no invoice behind it (an
- * advance) falls back to the commitment's schedule of values by scheduled
- * value. The last line absorbs the rounding so the allocation sums to the
- * payment exactly — an allocation that loses a cent never reconciles.
- */
-export async function allocateToBudgetLines(
-  db: Db,
-  payment: { amount: number; invoiceId: string | null; commitmentId: string },
-): Promise<{ allocations: DirectCostAllocation[]; unallocated: number; reasons: string[] }> {
-  const reasons: string[] = [];
-  let rows: Array<{ budgetLineItemId: string | null; costCode: string | null; costType: string | null; weight: number }> = [];
-
-  if (payment.invoiceId) {
-    const lines = await db
-      .select({
-        budgetLineItemId: invoiceLineItems.budgetLineItemId,
-        costCode: invoiceLineItems.costCode,
-        costType: invoiceLineItems.costType,
-        weight: invoiceLineItems.amount,
-      })
-      .from(invoiceLineItems)
-      .where(eq(invoiceLineItems.invoiceId, payment.invoiceId));
-    rows = lines;
-  }
-  if (rows.length === 0) {
-    reasons.push(
-      "No invoice continuation sheet behind this payment — it was allocated across the " +
-        "commitment's schedule of values instead.",
-    );
-    const { commitmentSovLines } = await import("@constructos/db");
-    rows = await db
-      .select({
-        budgetLineItemId: commitmentSovLines.budgetLineItemId,
-        costCode: commitmentSovLines.costCode,
-        costType: commitmentSovLines.costType,
-        weight: commitmentSovLines.revisedScheduledValue,
-      })
-      .from(commitmentSovLines)
-      .where(eq(commitmentSovLines.commitmentId, payment.commitmentId));
-  }
-
-  const linked = rows.filter((r) => r.budgetLineItemId && r.weight > CENT);
-  const totalWeight = round2(linked.reduce((s, r) => s + r.weight, 0));
-  if (linked.length === 0 || totalWeight <= CENT) {
-    return {
-      allocations: [],
-      unallocated: round2(payment.amount),
-      reasons: [
-        ...reasons,
-        "None of the billed lines carry a budgetLineItemId, so this payment cannot be posted " +
-          "to a budget cost code. Link the schedule of values to the budget first.",
-      ],
-    };
-  }
-
-  const allocations: DirectCostAllocation[] = [];
-  let allocated = 0;
-  for (const [i, r] of linked.entries()) {
-    const share =
-      i === linked.length - 1
-        ? round2(payment.amount - allocated)
-        : round2((r.weight / totalWeight) * payment.amount);
-    allocated = round2(allocated + share);
-    allocations.push({
-      budgetLineItemId: r.budgetLineItemId!,
-      costCode: r.costCode,
-      costType: r.costType,
-      amount: share,
-    });
-  }
-  const unlinked = rows.length - linked.length;
-  if (unlinked > 0) {
-    reasons.push(
-      `${unlinked} billed line(s) carry no budgetLineItemId and were excluded from the ` +
-        "allocation; the payment was spread across the lines that are linked.",
-    );
-  }
-  return { allocations, unallocated: 0, reasons };
-}
-
-/**
- * Post a payment's allocation into `budget_line_items.direct_costs` and
- * `job_to_date_costs`, and re-derive the forecast columns that depend on
- * them. This is the invoicing module's one write into the budget: paid-to-
- * date IS the direct-cost column, and a budget that shows committed cost
- * without actual cost cannot forecast anything.
- *
- * Additive rather than recomputed, because direct costs also arrive from
- * sources this module cannot see (payroll, equipment, expenses). Idempotent
- * by stamp: `detail.budgetPostedAt` on the payment means it has already
- * landed, and a second call is a no-op rather than a double count.
- */
-export async function postDirectCosts(
-  db: Db,
-  paymentId: string,
-): Promise<{ posted: boolean; allocations: DirectCostAllocation[]; reasons: string[] }> {
-  const rows = await db
-    .select()
-    .from(commitmentPayments)
-    .where(eq(commitmentPayments.id, paymentId))
-    .limit(1);
-  const payment = rows[0];
-  if (!payment) throw notFound("Payment not found");
-  const detail = (payment.detail ?? {}) as Record<string, unknown>;
-  if (typeof detail["budgetPostedAt"] === "string") {
-    return {
-      posted: false,
-      allocations: (detail["budgetAllocation"] as DirectCostAllocation[]) ?? [],
-      reasons: ["Already posted to the budget."],
-    };
-  }
-
-  const { allocations, reasons } = await allocateToBudgetLines(db, {
-    amount: payment.amount,
-    invoiceId: payment.invoiceId,
-    commitmentId: payment.commitmentId,
-  });
-  const applied: DirectCostAllocation[] = [];
-  const now = nowIso();
-  for (const alloc of allocations) {
-    const lineRows = await db
-      .select()
-      .from(budgetLineItems)
-      .where(eq(budgetLineItems.id, alloc.budgetLineItemId))
-      .limit(1);
-    const line = lineRows[0];
-    if (!line) continue;
-    // Never post across currencies. A USD payment must not land on a budget
-    // kept in EUR — there is no rate on the record and inventing one would
-    // corrupt the one column a cost report is judged on.
-    const budgetRows = await db
-      .select({ currency: budgets.currency })
-      .from(budgets)
-      .where(eq(budgets.id, line.budgetId))
-      .limit(1);
-    const budgetCurrency = budgetRows[0]?.currency ?? payment.currency;
-    if (budgetCurrency.toUpperCase() !== payment.currency.toUpperCase()) {
-      reasons.push(
-        `Budget line ${line.costCode} is kept in ${budgetCurrency} but the payment is in ` +
-          `${payment.currency}; it was not posted. Figures in different currencies are never ` +
-          "summed on this platform.",
-      );
-      continue;
-    }
-    const directCosts = round2(line.directCosts + alloc.amount);
-    const jobToDateCosts = round2(line.jobToDateCosts + alloc.amount);
-    const forecastFinal = round2(jobToDateCosts + line.forecastToComplete);
-    await db
-      .update(budgetLineItems)
-      .set({
-        directCosts,
-        jobToDateCosts,
-        forecastFinal,
-        projectedOverUnder: round2(line.revisedBudget - forecastFinal),
-        updatedAt: now,
-      })
-      .where(eq(budgetLineItems.id, line.id));
-    applied.push(alloc);
-  }
-
-  await db
-    .update(commitmentPayments)
-    .set({
-      detail: {
-        ...detail,
-        budgetPostedAt: now,
-        budgetAllocation: applied,
-        budgetPostingReasons: reasons,
-      },
-      updatedAt: now,
-    })
-    .where(eq(commitmentPayments.id, paymentId));
-  return { posted: applied.length > 0, allocations: applied, reasons };
-}
+export { allocateToBudgetLines, postDirectCosts, type DirectCostAllocation } from "./register.js";
 
 /* ------------------------------------------------------------------ */
 /* Routes                                                              */
@@ -287,13 +108,7 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
   const readGate = [...companyGate, app.requireTool("invoicing", "read")];
 
   /** What is still payable on this invoice, honouring an "as noted" cut. */
-  function payableOf(inv: InvoiceRow): number {
-    const detail = (inv.detail ?? {}) as Record<string, unknown>;
-    const approved = detail["approvedAmount"];
-    const ceiling =
-      typeof approved === "number" ? Math.min(approved, inv.currentPaymentDue) : inv.currentPaymentDue;
-    return round2(ceiling - inv.amountPaid);
-  }
+  const payableOf = (inv: InvoiceRow): number => payableOfInvoice(inv);
 
   app.post("/invoices/:invoiceId/payments", { preHandler: companyGate }, async (req, reply) => {
     const { invoiceId } = req.params as { invoiceId: string };
@@ -307,8 +122,21 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
           "invoice — approve it first, by someone who neither raised nor submitted it.",
       );
     }
-    // The person who approved the invoice does not also get to pay it.
-    assertSegregation(req.user!.id, { submittedBy: inv.submittedBy }, "invoice");
+    // Neither the author, the submitter NOR THE APPROVER of the invoice gets to
+    // pay it: certifying and disbursing are the two acts the separate
+    // approvedBy / issuedBy columns exist to keep apart.
+    assertSegregation(
+      req.user!.id,
+      { createdBy: inv.createdBy, submittedBy: inv.submittedBy },
+      "invoice",
+    );
+    if (inv.approvedBy && inv.approvedBy === req.user!.id) {
+      throw new AppError(
+        403,
+        "Segregation of duties: the person who approved this invoice may not also pay it.",
+        { control: "no_self_issue", role: "approved_by" },
+      );
+    }
 
     const payable = payableOf(inv);
     const amount = round2(body.amount);
@@ -433,7 +261,20 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
       throw badRequest("A joint cheque needs at least one joint payee");
     }
 
-    const held = waiverBlocked;
+    /*
+     * THE COMPLIANCE GATE (spec #575/#590) — the same one the commitments
+     * register runs. An expired certificate or bond with strictness `block`
+     * refuses to issue; the payment is recorded ON HOLD with the findings on
+     * it, so the exposure is a record rather than a cheque. A warning-level
+     * finding is stamped on the payment and returned.
+     */
+    const compliance = await assessCommitment(app.db, commitment);
+    const complianceBlocked = compliance.blocking.length > 0;
+    if (complianceBlocked && (body.status ?? "issued") === "issued" && body.overrideMissingWaiver !== true) {
+      assertCompliancePermits(commitment, compliance, `Paying ${inv.reference}`);
+    }
+
+    const held = waiverBlocked || complianceBlocked;
     const status = held ? "on_hold" : (body.status ?? "issued");
     const number = await nextRecordNumber(
       app.db,
@@ -442,62 +283,85 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
     );
     const id = newId("cpy");
     const now = nowIso();
-    await app.db.insert(commitmentPayments).values({
-      id,
-      companyId: req.companyId!,
-      projectId: inv.projectId,
-      commitmentId: inv.commitmentId,
-      invoiceId,
-      vendorId: inv.vendorId ?? commitment.vendorId,
-      number,
-      reference: `${commitment.reference}-PAY-${pad3(number)}`,
-      method: body.method ?? "check",
-      status,
-      amount,
-      retainageReleasedAmount: round2(body.retainageReleasedAmount ?? 0),
-      discountTaken: round2(body.discountTaken ?? 0),
-      currency: inv.currency,
-      paymentDate: body.paymentDate ?? todayIso(),
-      checkNumber: body.checkNumber ?? null,
-      transactionReference: body.transactionReference ?? null,
-      bankAccountRef: body.bankAccountRef ?? null,
-      jointPayees: body.jointPayees ?? [],
-      holdReason: held
-        ? `Lien waiver not on file. Override: ${body.overrideReason}`
-        : null,
-      lienWaiverId: body.lienWaiverId ?? null,
-      notes: body.notes ?? null,
-      detail: {
-        ...(body.detail ?? {}),
-        ...(held
-          ? {
-              waiverOverriddenBy: req.user!.id,
-              waiverOverriddenAt: now,
-              waiverOverrideReason: body.overrideReason,
-              waiversAtOverride: gate.waivers,
-            }
-          : {}),
-      },
-      createdBy: req.user!.id,
-      ...(status === "issued" ? { issuedBy: req.user!.id, issuedAt: now } : {}),
-      updatedAt: now,
-    });
+    const holdReasons: string[] = [];
+    if (waiverBlocked) holdReasons.push(`Lien waiver not on file. Override: ${body.overrideReason}`);
+    if (complianceBlocked) holdReasons.push(compliance.blocking.map((f) => f.message).join(" "));
 
-    let budgetPosting: Awaited<ReturnType<typeof postDirectCosts>> | null = null;
-    if (status === "issued") {
-      const amountPaid = round2(inv.amountPaid + amount);
-      await app.db
-        .update(invoices)
-        .set({
-          amountPaid,
-          paidDate: body.paymentDate ?? todayIso(),
-          status: payable - amount <= CENT ? "paid" : inv.status,
-          updatedAt: now,
-        })
-        .where(eq(invoices.id, invoiceId));
-      await recomputeCommitmentPaid(app.db, inv.commitmentId);
-      budgetPosting = await postDirectCosts(app.db, id);
-    }
+    /*
+     * One transaction with the INVOICE ROW LOCKED: the payable check, the
+     * register row and the settlement land together, and a second concurrent
+     * post for the same payable waits, re-reads, and is refused.
+     */
+    let settled: Awaited<ReturnType<typeof settleAfterTransition>> | null = null;
+    await app.db.transaction(async (tx) => {
+      const locked = await tx
+        .select({ amountPaid: invoices.amountPaid, status: invoices.status, detail: invoices.detail, currentPaymentDue: invoices.currentPaymentDue })
+        .from(invoices)
+        .where(eq(invoices.id, invoiceId))
+        .for("update");
+      const live = locked[0];
+      if (!live || !isApprovedInvoice(live.status)) {
+        throw conflict(`Invoice ${inv.reference} is no longer payable (${live?.status ?? "gone"}).`);
+      }
+      const livePayable = payableOfInvoice({ detail: live.detail, currentPaymentDue: live.currentPaymentDue, amountPaid: live.amountPaid });
+      if (status !== "on_hold" && amount - livePayable > CENT) {
+        throw badRequest(
+          `Payment of ${formatMoney(amount)} ${inv.currency} exceeds the ${formatMoney(livePayable)} ` +
+            `${inv.currency} still payable on ${inv.reference} — another payment landed first.`,
+          { payable: livePayable, requested: amount, currency: inv.currency },
+        );
+      }
+      await tx.insert(commitmentPayments).values({
+        id,
+        companyId: req.companyId!,
+        projectId: inv.projectId,
+        commitmentId: inv.commitmentId!,
+        invoiceId,
+        vendorId: inv.vendorId ?? commitment.vendorId,
+        number,
+        reference: `${commitment.reference}-PAY-${pad3(number)}`,
+        method: body.method ?? "check",
+        status,
+        amount,
+        retainageReleasedAmount: round2(body.retainageReleasedAmount ?? 0),
+        discountTaken: round2(body.discountTaken ?? 0),
+        currency: inv.currency,
+        paymentDate: body.paymentDate ?? todayIso(),
+        checkNumber: body.checkNumber ?? null,
+        transactionReference: body.transactionReference ?? null,
+        bankAccountRef: body.bankAccountRef ?? null,
+        jointPayees: body.jointPayees ?? [],
+        holdReason: held ? holdReasons.join(" ") : null,
+        lienWaiverId: body.lienWaiverId ?? null,
+        notes: body.notes ?? null,
+        detail: {
+          ...(body.detail ?? {}),
+          ...(waiverBlocked
+            ? {
+                waiverOverriddenBy: req.user!.id,
+                waiverOverriddenAt: now,
+                waiverOverrideReason: body.overrideReason,
+                waiversAtOverride: gate.waivers,
+              }
+            : {}),
+          complianceAtIssue: {
+            status: compliance.status,
+            strictness: compliance.strictness,
+            blocking: compliance.blocking.map((f) => f.code),
+            warnings: compliance.warnings.map((f) => f.code),
+            asOf: compliance.asOf,
+          },
+        },
+        createdBy: req.user!.id,
+        ...(status === "issued" ? { issuedBy: req.user!.id, issuedAt: now } : {}),
+        ...(status === "issued" ? { approvedBy: inv.approvedBy, approvedAt: inv.approvedAt } : {}),
+        updatedAt: now,
+      });
+      /* the register service re-derives amountPaid, status, commitment totals and direct costs */
+      settled = await settleAfterTransition(tx, id);
+    });
+    const waiverRequested = status === "issued" ? await requestWaiverForPayment(app.db, id, req.user!.id) : null;
+    const budgetPosting = status === "issued" ? await postDirectCosts(app.db, id) : null;
 
     await ledger(app.db, req, "create", "commitment_payment", id, {
       invoiceId,
@@ -508,8 +372,11 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
       status,
       method: body.method ?? "check",
       lienWaiverSatisfied: gate.satisfied,
-      waiverOverridden: held,
+      waiverOverridden: waiverBlocked,
+      complianceStatus: compliance.status,
+      complianceBlocking: compliance.blocking.map((f) => f.code),
       budgetAllocation: budgetPosting?.allocations ?? [],
+      waiverRequested: waiverRequested?.id ?? null,
     }, inv.projectId, true);
 
     const payment = await app.db
@@ -517,34 +384,32 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
       .from(commitmentPayments)
       .where(eq(commitmentPayments.id, id))
       .limit(1);
+    const settledInvoice = settled as Awaited<ReturnType<typeof settleAfterTransition>> | null;
+    const warnings: string[] = [];
+    if (waiverBlocked) {
+      warnings.push(
+        `Recorded ON HOLD, not paid: ${inv.reference} still has no lien waiver on file. ` +
+          "The money has not moved and the exposure remains on the outstanding-waiver report.",
+      );
+    }
+    if (complianceBlocked) {
+      warnings.push(
+        `Recorded ON HOLD, not paid: ${commitment.reference} is payment-blocked — ` +
+          compliance.blocking.map((f) => f.message).join(" "),
+      );
+    }
+    for (const w of compliance.warnings) warnings.push(w.message);
     return reply.status(201).send({
       payment: payment[0],
       invoice: await fetchInvoice(app.db, invoiceId, req.companyId!),
       lienWaiver: gate,
+      compliance,
       budgetPosting,
-      warnings: held
-        ? [
-            `Recorded ON HOLD, not paid: ${inv.reference} still has no lien waiver on file. ` +
-              "The money has not moved and the exposure remains on the outstanding-waiver report.",
-          ]
-        : [],
+      settlement: settledInvoice?.invoice ?? null,
+      waiverRequested,
+      warnings,
     });
   });
-
-  /** `commitments.total_paid`, derived from the register rather than incremented. */
-  async function recomputeCommitmentPaid(db: Db, commitmentId: string): Promise<void> {
-    const rows = await db
-      .select({ status: commitmentPayments.status, amount: commitmentPayments.amount })
-      .from(commitmentPayments)
-      .where(eq(commitmentPayments.commitmentId, commitmentId));
-    const totalPaid = round2(
-      rows.filter((p) => p.status === "issued" || p.status === "cleared").reduce((s, p) => s + p.amount, 0),
-    );
-    await db
-      .update(commitments)
-      .set({ totalPaid, updatedAt: nowIso() })
-      .where(eq(commitments.id, commitmentId));
-  }
 
   app.get("/invoices/:invoiceId/payments", { preHandler: companyGate }, async (req, reply) => {
     const { invoiceId } = req.params as { invoiceId: string };

@@ -1,4 +1,6 @@
 import type { FastifyPluginAsync } from "fastify";
+import type { Db } from "../../lib/db.js";
+import { forEachCompany } from "../../lib/scheduler.js";
 import { and, asc, count, desc, eq, inArray, isNotNull, lt, lte } from "drizzle-orm";
 import { z } from "zod";
 import {
@@ -23,6 +25,10 @@ import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { addDaysISO, isoDateSchema, todayISO } from "../field/dates.js";
 import { pushNotifications } from "../notifications/service.js";
 import { computeTimeline, findRegime, REGIME_LIBRARY } from "./regimes.js";
+import { lienRoutes } from "./liens.js";
+import { securityAccountRoutes } from "./security.js";
+import { adjudicationRoutes } from "./adjudication.js";
+import { supplyChainRoutes } from "./supplychain.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -86,6 +92,93 @@ function wholeDaysBetween(a: string, b: string): number {
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
+
+/**
+ * DEEMED-LIABILITY SWEEP (#361). A served claim whose response deadline
+ * (end of day) has passed with no ON-TIME response flips to `deemed`, its
+ * response obligation is breached and a critical signal is raised — exactly
+ * once: the status flip is a conditional UPDATE ... RETURNING and the signal
+ * is inserted only for the row that flipped, so two concurrent sweeps cannot
+ * raise it twice. A LATE response does not rescue a claim: statutes make a
+ * late pay-less notice ineffective, so the claim is deemed regardless.
+ *
+ * Runs from the scheduler (`payments.deemed-liability`, hourly) and from the
+ * read paths, so a project nobody opens is still deemed on time.
+ */
+export async function sweepDeemedClaims(
+  db: Db,
+  companyId: string,
+  projectId: string | null,
+  actorId: string | null,
+  today: string = todayISO(),
+): Promise<{ deemed: number }> {
+  const clauses = [
+    eq(paymentClaims.companyId, companyId),
+    eq(paymentClaims.status, "served"),
+    isNotNull(paymentClaims.responseDeadline),
+    lt(paymentClaims.responseDeadline, today),
+  ];
+  if (projectId) clauses.push(eq(paymentClaims.projectId, projectId));
+  const overdue = await db.select().from(paymentClaims).where(and(...clauses));
+  let deemed = 0;
+  for (const claim of overdue) {
+    const [onTime] = await db
+      .select({ n: count() })
+      .from(paymentResponses)
+      .where(and(eq(paymentResponses.paymentClaimId, claim.id), eq(paymentResponses.late, 0)));
+    if (Number(onTime?.n ?? 0) > 0) continue; // an on-time response exists — not deemed
+    const flipped = await db
+      .update(paymentClaims)
+      .set({ status: "deemed", updatedAt: new Date().toISOString() })
+      .where(and(eq(paymentClaims.id, claim.id), eq(paymentClaims.status, "served")))
+      .returning({ id: paymentClaims.id });
+    if (flipped.length === 0) continue; // somebody else flipped it a moment ago
+    deemed += 1;
+    if (claim.obligationId) {
+      await db
+        .update(obligations)
+        .set({ status: "breached" })
+        .where(and(eq(obligations.id, claim.obligationId), eq(obligations.status, "open")));
+    }
+    const def = findRegime(claim.regime);
+    await db.insert(signals).values({
+      id: newId("sig"),
+      companyId,
+      projectId: claim.projectId,
+      detector: "payment_deemed_liability",
+      severity: "critical",
+      confidence: 1,
+      title: `No payment response served in time — deemed liability for ${claim.currency} ${claim.claimedAmount}`,
+      explanation:
+        `Payment claim #${claim.number} (${claim.currency} ${claim.claimedAmount}, ${def?.name ?? claim.regime}) ` +
+        `was served on ${claim.servedAt?.slice(0, 10)} with a statutory response deadline of ${claim.responseDeadline}. ` +
+        `No on-time payment response or pay-less notice was recorded before the deadline elapsed. ` +
+        `${def?.deemedRule ?? "The claimed amount may now be payable in full."} ${INDICATIVE_DISCLAIMER}`,
+    });
+    await appendLedger(db, {
+      companyId,
+      actorId,
+      action: "state_change",
+      objectType: "payment_claim",
+      objectId: claim.id,
+      projectId: claim.projectId,
+      payload: { from: "served", to: "deemed", responseDeadline: claim.responseDeadline },
+    });
+  }
+  return { deemed };
+}
+
+/**
+ * The regime library is a MODEL of each statute (see regimes.ts for the
+ * documented simplifications: no public-holiday calendars, one response
+ * clock per regime, pinned interest rates). Every computed deadline carries
+ * this so a user never mistakes the radar for legal advice.
+ */
+export const INDICATIVE_DISCLAIMER =
+  "Deadlines are indicative: computed from a simplified model of the statute (weekend-only " +
+  "business days, one response clock, pinned interest rate). Confirm against the contract and " +
+  "the statute before relying on them.";
+
 /**
  * Statutory payment security — spec Vol II Domain F / M10 (#358-393
  * foundation subset): code-resident regime library (#364-369), payment
@@ -97,6 +190,10 @@ const round2 = (n: number): number => Math.round(n * 100) / 100;
  * assurance layer see the same date.
  */
 export const paymentsModule: FastifyPluginAsync = async (app) => {
+  await app.register(lienRoutes);
+  await app.register(securityAccountRoutes);
+  await app.register(adjudicationRoutes);
+  await app.register(supplyChainRoutes);
   const readGate = [app.authenticate, app.requireCompany, app.requireTool("payments", "read")];
   const standardGate = [
     app.authenticate,
@@ -120,68 +217,9 @@ export const paymentsModule: FastifyPluginAsync = async (app) => {
     return rows[0];
   }
 
-  /**
-   * Lazy deemed-liability sweep (#361, same pattern as the contract
-   * time-bar sweep): a served claim whose response deadline (end of day)
-   * has passed with NO response on file flips to `deemed`, its response
-   * obligation is breached and a critical signal is raised — exactly once,
-   * guarded on the claim still being `served` at update time and on the
-   * status flip itself (a deemed claim never re-enters the sweep).
-   */
-  async function sweepDeemed(companyId: string, projectId: string, actorId: string): Promise<void> {
-    const today = todayISO();
-    const overdue = await app.db
-      .select()
-      .from(paymentClaims)
-      .where(
-        and(
-          eq(paymentClaims.companyId, companyId),
-          eq(paymentClaims.projectId, projectId),
-          eq(paymentClaims.status, "served"),
-          isNotNull(paymentClaims.responseDeadline),
-          lt(paymentClaims.responseDeadline, today),
-        ),
-      );
-    for (const claim of overdue) {
-      const [respRow] = await app.db
-        .select({ n: count() })
-        .from(paymentResponses)
-        .where(eq(paymentResponses.paymentClaimId, claim.id));
-      if (Number(respRow?.n ?? 0) > 0) continue; // a (late) response exists — not deemed
-      await app.db
-        .update(paymentClaims)
-        .set({ status: "deemed", updatedAt: new Date().toISOString() })
-        .where(and(eq(paymentClaims.id, claim.id), eq(paymentClaims.status, "served")));
-      if (claim.obligationId) {
-        await app.db
-          .update(obligations)
-          .set({ status: "breached" })
-          .where(and(eq(obligations.id, claim.obligationId), eq(obligations.status, "open")));
-      }
-      const def = findRegime(claim.regime);
-      await app.db.insert(signals).values({
-        id: newId("sig"),
-        companyId,
-        projectId,
-        detector: "payment_deemed_liability",
-        severity: "critical",
-        confidence: 1,
-        title: `No payment response served in time — deemed liability for ${claim.currency} ${claim.claimedAmount}`,
-        explanation:
-          `Payment claim #${claim.number} (${claim.currency} ${claim.claimedAmount}, ${def?.name ?? claim.regime}) ` +
-          `was served on ${claim.servedAt?.slice(0, 10)} with a statutory response deadline of ${claim.responseDeadline}. ` +
-          `No payment response or pay-less notice was recorded before the deadline elapsed. ` +
-          `${def?.deemedRule ?? "The claimed amount may now be payable in full."}`,
-      });
-      await appendLedger(app.db, {
-        companyId,
-        actorId,
-        action: "state_change",
-        objectType: "payment_claim",
-        objectId: claim.id,
-        payload: { from: "served", to: "deemed", responseDeadline: claim.responseDeadline },
-      });
-    }
+  /** Route-side sweep: the scheduled job runs the same function for every company. */
+  async function sweepDeemed(companyId: string, projectId: string, actorId: string | null): Promise<void> {
+    await sweepDeemedClaims(app.db, companyId, projectId, actorId);
   }
 
   /* ---------------------------------------------------------------- */
@@ -189,15 +227,36 @@ export const paymentsModule: FastifyPluginAsync = async (app) => {
   /* ---------------------------------------------------------------- */
 
   app.get("/payment-regimes", { preHandler: [app.authenticate] }, async () => ({
-    items: REGIME_LIBRARY,
+    items: REGIME_LIBRARY.map((r) => ({ ...r, indicative: true })),
     total: REGIME_LIBRARY.length,
+    indicative: true,
+    disclaimer: INDICATIVE_DISCLAIMER,
   }));
 
   app.get("/payment-regimes/:regime", { preHandler: [app.authenticate] }, async (req) => {
     const { regime } = req.params as { regime: string };
     const def = findRegime(regime);
     if (!def) throw notFound("Unknown payment regime");
-    return def;
+    return { ...def, indicative: true, disclaimer: INDICATIVE_DISCLAIMER };
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Scheduled sweeps — a project nobody opens is still deemed on time  */
+  /* ---------------------------------------------------------------- */
+
+  app.scheduler.register({
+    name: "payments.deemed-liability",
+    description: "Flip served payment claims past their statutory response deadline to deemed; breach the obligation and raise the signal",
+    everyMs: 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db, now }) => {
+      let deemed = 0;
+      const result = await forEachCompany(db, async (companyId) => {
+        const r = await sweepDeemedClaims(db, companyId, null, null, now.toISOString().slice(0, 10));
+        deemed += r.deemed;
+      });
+      return { deemed, companies: result.companies, failed: result.failed };
+    },
   });
 
   /* ---------------------------------------------------------------- */
@@ -436,6 +495,8 @@ export const paymentsModule: FastifyPluginAsync = async (app) => {
       responses,
       suspensionNotices: notices,
       regimeDef: findRegime(claim.regime) ?? null,
+      indicative: true,
+      disclaimer: INDICATIVE_DISCLAIMER,
     };
   });
 
@@ -551,6 +612,9 @@ export const paymentsModule: FastifyPluginAsync = async (app) => {
     async (req, reply) => {
       const { claimId } = req.params as { claimId: string };
       const body = respondSchema.parse(req.body);
+      await fetchClaim(claimId, req.companyId!, req.projectId!); // 404 before sweeping
+      /* a late response must not rescue an un-swept claim: deem first, then record */
+      await sweepDeemed(req.companyId!, req.projectId!, req.user!.id);
       const claim = await fetchClaim(claimId, req.companyId!, req.projectId!);
       if (claim.status !== "served" && claim.status !== "deemed") {
         throw badRequest(`A payment response cannot be served on a ${claim.status} claim`);
@@ -779,6 +843,8 @@ export const paymentsModule: FastifyPluginAsync = async (app) => {
     async (req) => {
       const { claimId } = req.params as { claimId: string };
       const body = markPaidSchema.parse(req.body);
+      await fetchClaim(claimId, req.companyId!, req.projectId!); // 404 before sweeping
+      await sweepDeemed(req.companyId!, req.projectId!, req.user!.id);
       const claim = await fetchClaim(claimId, req.companyId!, req.projectId!);
       if (!["served", "responded", "deemed", "suspended"].includes(claim.status)) {
         throw badRequest(`A ${claim.status} payment claim cannot be marked paid`);

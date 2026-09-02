@@ -208,6 +208,116 @@ export function assertCompliancePermits(
   );
 }
 
+/** Refuse a retainage release larger than the retainage actually held. */
+export async function assertRetainageAvailable(
+  db: Db,
+  commitment: CommitmentRow,
+  release: number,
+  excludePaymentId?: string,
+): Promise<void> {
+  if (release === 0) return;
+  const rows = await db
+    .select({
+      id: commitmentPayments.id,
+      released: commitmentPayments.retainageReleasedAmount,
+      status: commitmentPayments.status,
+    })
+    .from(commitmentPayments)
+    .where(eq(commitmentPayments.commitmentId, commitment.id));
+  /*
+   * Only payments that have NOT yet been issued are counted as reservations.
+   * An issued payment has already reduced `retainageHeld` on the schedule of
+   * values, so counting it here as well would reserve the same money twice.
+   */
+  const alreadyScheduled = round2(
+    rows
+      .filter(
+        (p) =>
+          p.id !== excludePaymentId && (p.status === "scheduled" || p.status === "on_hold"),
+      )
+      .reduce((s, p) => s + p.released, 0),
+  );
+  const available = round2(commitment.retainageHeld - alreadyScheduled);
+  if (commitment.retainageHeld <= 0) {
+    throw badRequest(
+      "No retainage is held on this commitment, so none can be released. Retainage is held " +
+        "as the sub bills; check the schedule of values before releasing.",
+    );
+  }
+  if (release - available > 0.005) {
+    throw badRequest(
+      `Releasing ${release} ${commitment.currency} would exceed the ${available} ` +
+        `${commitment.currency} of retainage still available (held ` +
+        `${commitment.retainageHeld}, already scheduled for release ${alreadyScheduled}).`,
+    );
+  }
+}
+
+
+/**
+ * THE ISSUE CORE — shared by the single-payment route and payment runs
+ * (#586–594). Runs in one transaction with the payment row locked: the
+ * retainage allocation, the status flip, the register settlement (invoice
+ * paid position, budget direct costs, commitment totals) land together or
+ * not at all, and a concurrent second issue finds the row already moved.
+ */
+export async function performIssue(
+  db: Db,
+  payment: typeof commitmentPayments.$inferSelect,
+  commitment: CommitmentRow,
+  compliance: ComplianceResult,
+  input: {
+    actorId: string;
+    paymentDate?: string | undefined;
+    checkNumber?: string | null | undefined;
+    transactionReference?: string | null | undefined;
+    acknowledgeWarnings: boolean;
+    paymentRunId?: string | null;
+  },
+): Promise<void> {
+  const now = new Date().toISOString();
+  await db.transaction(async (tx) => {
+    const locked = await tx
+      .select({ status: commitmentPayments.status, approvedBy: commitmentPayments.approvedBy })
+      .from(commitmentPayments)
+      .where(eq(commitmentPayments.id, payment.id))
+      .for("update");
+    if (locked[0]?.status !== "scheduled" || !locked[0].approvedBy) {
+      throw conflict("This payment moved before it could be issued. Nothing was issued twice.");
+    }
+    await assertRetainageAvailable(tx, commitment, payment.retainageReleasedAmount, payment.id);
+    await allocateRetainageRelease(tx, commitment, payment.retainageReleasedAmount);
+    await tx
+      .update(commitmentPayments)
+      .set({
+        status: "issued",
+        issuedBy: input.actorId,
+        issuedAt: now,
+        paymentDate: input.paymentDate ?? payment.paymentDate ?? todayIso(),
+        ...(input.checkNumber !== undefined ? { checkNumber: input.checkNumber } : {}),
+        ...(input.transactionReference !== undefined
+          ? { transactionReference: input.transactionReference }
+          : {}),
+        holdReason: null,
+        detail: {
+          ...(payment.detail ?? {}),
+          ...(payment.retainageReleasedAmount !== 0 ? { retainageAppliedAt: now } : {}),
+          ...(input.paymentRunId ? { paymentRunId: input.paymentRunId } : {}),
+          complianceAtIssue: {
+            status: compliance.status,
+            strictness: compliance.strictness,
+            warnings: compliance.warnings.map((f) => f.code),
+            acknowledgedWarnings: input.acknowledgeWarnings,
+            asOf: compliance.asOf,
+          },
+        },
+        updatedAt: now,
+      })
+      .where(eq(commitmentPayments.id, payment.id));
+    await settleAfterTransition(tx, payment.id);
+  });
+}
+
 /* ------------------------------------------------------------------ */
 /* Routes                                                              */
 /* ------------------------------------------------------------------ */
@@ -313,51 +423,6 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
       );
     }
     return { warnings, reservedForBackcharges: reserved };
-  }
-
-  /** Refuse a retainage release larger than the retainage actually held. */
-  async function assertRetainageAvailable(
-    db: Db,
-    commitment: CommitmentRow,
-    release: number,
-    excludePaymentId?: string,
-  ): Promise<void> {
-    if (release === 0) return;
-    const rows = await db
-      .select({
-        id: commitmentPayments.id,
-        released: commitmentPayments.retainageReleasedAmount,
-        status: commitmentPayments.status,
-      })
-      .from(commitmentPayments)
-      .where(eq(commitmentPayments.commitmentId, commitment.id));
-    /*
-     * Only payments that have NOT yet been issued are counted as reservations.
-     * An issued payment has already reduced `retainageHeld` on the schedule of
-     * values, so counting it here as well would reserve the same money twice.
-     */
-    const alreadyScheduled = round2(
-      rows
-        .filter(
-          (p) =>
-            p.id !== excludePaymentId && (p.status === "scheduled" || p.status === "on_hold"),
-        )
-        .reduce((s, p) => s + p.released, 0),
-    );
-    const available = round2(commitment.retainageHeld - alreadyScheduled);
-    if (commitment.retainageHeld <= 0) {
-      throw badRequest(
-        "No retainage is held on this commitment, so none can be released. Retainage is held " +
-          "as the sub bills; check the schedule of values before releasing.",
-      );
-    }
-    if (release - available > 0.005) {
-      throw badRequest(
-        `Releasing ${release} ${commitment.currency} would exceed the ${available} ` +
-          `${commitment.currency} of retainage still available (held ` +
-          `${commitment.retainageHeld}, already scheduled for release ${alreadyScheduled}).`,
-      );
-    }
   }
 
   /* ---------------------------------------------------------------- */
@@ -707,45 +772,12 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
           );
         }
 
-        const now = new Date().toISOString();
-        await app.db.transaction(async (tx) => {
-          const locked = await tx
-            .select({ status: commitmentPayments.status, approvedBy: commitmentPayments.approvedBy })
-            .from(commitmentPayments)
-            .where(eq(commitmentPayments.id, paymentId))
-            .for("update");
-          if (locked[0]?.status !== "scheduled" || !locked[0].approvedBy) {
-            throw conflict("This payment moved before it could be issued. Nothing was issued twice.");
-          }
-          await assertRetainageAvailable(tx, commitment, payment.retainageReleasedAmount, paymentId);
-          await allocateRetainageRelease(tx, commitment, payment.retainageReleasedAmount);
-          await tx
-            .update(commitmentPayments)
-            .set({
-              status: "issued",
-              issuedBy: req.user!.id,
-              issuedAt: now,
-              paymentDate: body.paymentDate ?? payment.paymentDate ?? todayIso(),
-              ...(body.checkNumber !== undefined ? { checkNumber: body.checkNumber } : {}),
-              ...(body.transactionReference !== undefined
-                ? { transactionReference: body.transactionReference }
-                : {}),
-              holdReason: null,
-              detail: {
-                ...(payment.detail ?? {}),
-                ...(payment.retainageReleasedAmount !== 0 ? { retainageAppliedAt: now } : {}),
-                complianceAtIssue: {
-                  status: compliance.status,
-                  strictness: compliance.strictness,
-                  warnings: compliance.warnings.map((f) => f.code),
-                  acknowledgedWarnings: body.acknowledgeWarnings === true,
-                  asOf: compliance.asOf,
-                },
-              },
-              updatedAt: now,
-            })
-            .where(eq(commitmentPayments.id, paymentId));
-          await settleAfterTransition(tx, paymentId);
+        await performIssue(app.db, payment, commitment, compliance, {
+          actorId: req.user!.id,
+          paymentDate: body.paymentDate,
+          checkNumber: body.checkNumber,
+          transactionReference: body.transactionReference,
+          acknowledgeWarnings: body.acknowledgeWarnings === true,
         });
         /* lien-waiver automation (#576–578): a paid invoice that still needs its waiver asks for it now */
         const waiver = await requestWaiverForPayment(app.db, paymentId, req.user!.id);

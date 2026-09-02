@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, ilike, inArray, isNull, ne, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, ilike, inArray, isNull, lte, ne, or } from "drizzle-orm";
 import { z } from "zod";
 import {
   commitments,
@@ -37,6 +37,7 @@ import {
   TAX_WITHHOLDING_BASES,
   TAX_WITHHOLDING_SCHEMES,
   type TaxRegime,
+  type TaxReturnKind,
   type TaxSupplyType,
   type TaxWithholdingBase,
 } from "@constructos/shared";
@@ -48,7 +49,7 @@ import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { addDaysISO, isoDateSchema, todayISO } from "../field/dates.js";
 import { pushNotifications } from "../notifications/service.js";
 import { determine, DeterminationError, type DeterminationInput, type DeterminationOutput } from "./determine.js";
-import { daysInclusive } from "./pe.js";
+import { addMonthsISO, daysInclusive } from "./pe.js";
 import {
   findReturnDef,
   findTaxRegime,
@@ -197,6 +198,8 @@ const determinationListQuery = pageQuerySchema.extend({
   sourceType: z.enum(TAX_DETERMINATION_SOURCES).optional(),
   sourceId: z.string().min(1).optional(),
   regime: z.enum(TAX_REGIMES).optional(),
+  from: isoDateSchema.optional(),
+  to: isoDateSchema.optional(),
   includeSuperseded: z.enum(["true", "false"]).optional(),
 });
 
@@ -863,7 +866,9 @@ export const taxModule: FastifyPluginAsync = async (app) => {
       // Risk checks against what the invoice itself claims.
       const risks: Array<{ detector: string; severity: string; title: string; signalId: string; raised: boolean }> = [];
       const invoiceTax = round2(inv.taxAmount);
-      if (anyReverseCharge && invoiceTax > 0) {
+      // Tax on a reverse-charged invoice is only wrong when it exceeds what
+      // the standard-rated lines (materials, say) may legitimately carry.
+      if (anyReverseCharge && invoiceTax > totals.vatAmount + 0.005) {
         const r = await raiseSignalOnce(app.db, {
           companyId: req.companyId!,
           projectId: req.projectId!,
@@ -874,9 +879,9 @@ export const taxModule: FastifyPluginAsync = async (app) => {
           title: `Reverse charge misapplied — invoice ${inv.reference} charges VAT on a reverse-charge supply`,
           explanation:
             `The determination for invoice ${inv.reference}${vendorName ? ` from ${vendorName}` : ""} concludes the supply is subject to the domestic reverse charge under ${def.name}, ` +
-            `so the supplier must not charge VAT and the customer self-accounts; the invoice nevertheless shows ${inv.currency} ${invoiceTax.toFixed(2)} of tax. ` +
+            `so the supplier must not charge VAT and the customer self-accounts; the invoice nevertheless shows ${inv.currency} ${invoiceTax.toFixed(2)} of tax against ${inv.currency} ${totals.vatAmount.toFixed(2)} allowable on its standard-rated lines. ` +
             `Paying that VAT loses input-tax recovery and leaves the customer still liable to self-account. Reject the invoice for re-issue (#799, #818).`,
-          evidenceRefs: { invoiceId, invoiceTax, vendorId, selfAccountedVat: totals.selfAccountedVat },
+          evidenceRefs: { invoiceId, invoiceTax, allowedVat: totals.vatAmount, vendorId, selfAccountedVat: totals.selfAccountedVat },
         });
         risks.push({ detector: "tax_reverse_charge_misapplied", severity: "high", title: "Reverse charge misapplied", ...r });
       }
@@ -960,6 +965,8 @@ export const taxModule: FastifyPluginAsync = async (app) => {
     if (q.sourceType) clauses.push(eq(taxDeterminations.sourceType, q.sourceType));
     if (q.sourceId) clauses.push(eq(taxDeterminations.sourceId, q.sourceId));
     if (q.regime) clauses.push(eq(taxDeterminations.regime, q.regime));
+    if (q.from) clauses.push(gte(taxDeterminations.taxPointDate, q.from));
+    if (q.to) clauses.push(lte(taxDeterminations.taxPointDate, q.to));
     const where = and(...clauses);
     const [totalRow] = await app.db.select({ n: count() }).from(taxDeterminations).where(where);
     const rows = await app.db
@@ -1127,6 +1134,8 @@ export const taxModule: FastifyPluginAsync = async (app) => {
     ];
     if (q.status) clauses.push(eq(withholdingCertificates.status, q.status));
     if (q.vendorId) clauses.push(eq(withholdingCertificates.vendorId, q.vendorId));
+    if (q.from) clauses.push(gte(withholdingCertificates.paymentDate, q.from));
+    if (q.to) clauses.push(lte(withholdingCertificates.paymentDate, q.to));
     const where = and(...clauses);
     const [totalRow] = await app.db.select({ n: count() }).from(withholdingCertificates).where(where);
     const rows = await app.db
@@ -1136,8 +1145,7 @@ export const taxModule: FastifyPluginAsync = async (app) => {
       .orderBy(desc(withholdingCertificates.number))
       .limit(q.pageSize)
       .offset(pageOffset(q));
-    const items = rows.filter((r) => (!q.from || r.paymentDate >= q.from) && (!q.to || r.paymentDate <= q.to));
-    return paginate(items, Number(totalRow?.n ?? 0), q);
+    return paginate(rows, Number(totalRow?.n ?? 0), q);
   });
 
   app.post("/projects/:projectId/tax/withholding-certificates", { preHandler: standardGate }, async (req, reply) => {
@@ -1299,16 +1307,6 @@ export const taxModule: FastifyPluginAsync = async (app) => {
     return row;
   }
 
-  function addMonthsISO(iso: string, months: number): string {
-    const d = new Date(`${iso}T00:00:00Z`);
-    const day = d.getUTCDate();
-    d.setUTCDate(1);
-    d.setUTCMonth(d.getUTCMonth() + months);
-    const last = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
-    d.setUTCDate(Math.min(day, last));
-    return d.toISOString().slice(0, 10);
-  }
-
   app.get("/projects/:projectId/tax/periods", { preHandler: readGate }, async (req) => {
     const q = periodListQuery.parse(req.query);
     const clauses = [eq(taxPeriods.companyId, req.companyId!), eq(taxPeriods.projectId, req.projectId!)];
@@ -1415,7 +1413,7 @@ export const taxModule: FastifyPluginAsync = async (app) => {
     const [obl] = row.obligationId
       ? await app.db.select().from(obligations).where(eq(obligations.id, row.obligationId)).limit(1)
       : [undefined];
-    return { ...row, live, obligation: obl ?? null, returnDef: findReturnDef(row.regime, row.returnKind as never) ?? null };
+    return { ...row, live, obligation: obl ?? null, returnDef: findReturnDef(row.regime, row.returnKind as TaxReturnKind) ?? null };
   });
 
   app.post("/projects/:projectId/tax/periods/:periodId/compute", { preHandler: standardGate }, async (req) => {

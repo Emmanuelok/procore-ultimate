@@ -4,7 +4,7 @@ import { z } from "zod";
 import { budgetLineItems, commitmentChanges, commitmentSovLines } from "@constructos/db";
 import { COST_TYPES, SOV_BILLING_METHODS } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
-import { badRequest, conflict, notFound } from "../../lib/errors.js";
+import { AppError, badRequest, conflict, notFound } from "../../lib/errors.js";
 import type { Db } from "../../lib/db.js";
 import { deriveSovLine, resolveScheduledValue } from "./arithmetic.js";
 import {
@@ -571,7 +571,8 @@ export const sovRoutes: FastifyPluginAsync = async (app) => {
       (c.lines as Array<Record<string, unknown>>).some((l) => l["sovLineId"] === lineId),
     );
     if (referencing.length > 0) {
-      throw conflict(
+      throw new AppError(
+        409,
         `Change order(s) ${referencing.map((c) => c.reference).join(", ")} allocate value to this ` +
           "line. Re-allocate or void them before deleting the line, or their share would never " +
           "reach the schedule of values.",

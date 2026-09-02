@@ -18,6 +18,7 @@ import {
   locations,
   permissionTemplates,
   projectMemberships,
+  vendors,
 } from "@constructos/db";
 import {
   BUILTIN_PERMISSION_TEMPLATES,
@@ -135,6 +136,23 @@ export async function assertProjectLocation(
       .limit(1)
   )[0];
   if (!row) throw badRequest(`Unknown location id "${locationId}" for this project`);
+}
+
+/** The vendor must belong to this company; returns silently for null. */
+export async function assertVendor(
+  db: Db,
+  companyId: string,
+  vendorId: string | null | undefined,
+): Promise<void> {
+  if (!vendorId) return;
+  const row = (
+    await db
+      .select({ id: vendors.id })
+      .from(vendors)
+      .where(and(eq(vendors.id, vendorId), eq(vendors.companyId, companyId)))
+      .limit(1)
+  )[0];
+  if (!row) throw badRequest(`Unknown vendor id "${vendorId}" for this company`);
 }
 
 /** Template keys the escalation ladder treats as project management. */

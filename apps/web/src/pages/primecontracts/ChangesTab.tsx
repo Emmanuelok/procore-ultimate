@@ -30,9 +30,11 @@ import {
   RefusalPanel,
   isoDate,
   money,
+  pct,
   statusToneOf,
   titleCase,
   useAction,
+  useChangeAnalytics,
   useReason,
   type Loadable,
 } from "./shared";
@@ -85,6 +87,7 @@ export default function ChangesTab({
 
   const cur = contract.currency;
   const rows = changes.data?.items ?? [];
+  const analytics = useChangeAnalytics(contract.id);
 
   async function act(change: PrimeChange, verb: string, path: string, body?: unknown) {
     const result = await run(`${verb}:${change.id}`, () =>
@@ -97,6 +100,7 @@ export default function ChangesTab({
       if (verb === "execute" && result && "appendedLines" in result) {
         setLastExecution(result as ChangeExecution);
       }
+      analytics.reload();
       changes.reload();
       onChanged();
     }
@@ -250,6 +254,31 @@ export default function ChangesTab({
       {reasonDialog}
       <RefusalPanel refusal={refusal} onDismiss={clear} />
 
+      {analytics.data ? (
+        <Card>
+          <CardBody>
+            <div className="mb-1 flex flex-wrap items-baseline justify-between gap-2">
+              <h3 className="text-sm font-semibold">Change order register</h3>
+              <span className="text-2xs text-content-subtle">as at {analytics.data.asOf}</span>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-6 text-meta">
+              <Bucket label="Executed" value={money(analytics.data.executed.amount, cur)} hint={`${analytics.data.executed.count} change order${analytics.data.executed.count === 1 ? "" : "s"}${analytics.data.executed.shareOfOriginal === null ? "" : ` · ${pct(analytics.data.executed.shareOfOriginal * 100, 1)} of the original sum`}`} />
+              <Bucket label="Pending" value={money(analytics.data.pending.amount, cur)} hint={analytics.data.pending.oldestDays === null ? `${analytics.data.pending.count} pending` : `${analytics.data.pending.count} pending · oldest ${analytics.data.pending.oldestDays} days`} />
+              <Bucket label="Schedule impact" value={`${analytics.data.executed.scheduleImpactDays} days`} hint="Σ executed schedule impact" />
+              <Bucket label="Raise → submit" value={analytics.data.cycleTimeDays.createdToSubmitted === null ? "—" : `${analytics.data.cycleTimeDays.createdToSubmitted} days`} hint="mean cycle time" />
+              <Bucket label="Submit → approve" value={analytics.data.cycleTimeDays.submittedToApproved === null ? "—" : `${analytics.data.cycleTimeDays.submittedToApproved} days`} hint="mean cycle time" />
+              <Bucket label="Approve → execute" value={analytics.data.cycleTimeDays.approvedToExecuted === null ? "—" : `${analytics.data.cycleTimeDays.approvedToExecuted} days`} hint="mean cycle time" />
+            </div>
+            {analytics.data.byReason.length > 0 ? (
+              <p className="mt-2 text-2xs text-content-subtle">
+                By reason: {analytics.data.byReason.map((r) => `${titleCase(r.reason)} ${money(r.amount, cur)} (${r.count})`).join(" · ")}
+              </p>
+            ) : null}
+            {analytics.data.reasons.length > 0 ? <p className="mt-1 text-2xs text-content-subtle">{analytics.data.reasons.join(" ")}</p> : null}
+          </CardBody>
+        </Card>
+      ) : null}
+
       {lastExecution ? (
         <Alert
           tone="success"
@@ -272,6 +301,13 @@ export default function ChangesTab({
             ))}
           </ul>
           <p className="mt-1 text-2xs">
+            {lastExecution.budget.applied ? (
+              <span className="block">
+                The budget rose with it: {money(lastExecution.budget.amount, cur)} of owner-funded increase landed on {lastExecution.budget.linesMoved} budget line{lastExecution.budget.linesMoved === 1 ? "" : "s"} as an approved owner change ({lastExecution.budget.budgetChangeId}).
+              </span>
+            ) : (
+              <span className="block">The budget was NOT funded: {lastExecution.budget.reasons.join(" ")}</span>
+            )}{" "}
             Σ SOV is now {money(lastExecution.contract.sov.identity.sovTotal, cur)} against a
             contract sum of {money(lastExecution.contract.sov.identity.contractSum, cur)} —{" "}
             {lastExecution.contract.sov.identity.ok ? "balanced" : "NOT balanced"}.

@@ -43,6 +43,7 @@ import {
   todayIso,
   type CommitmentRow,
 } from "./shared.js";
+import { assertCloseoutPermitsCompletion } from "./closeout.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -678,7 +679,11 @@ export const commitmentRoutes: FastifyPluginAsync = async (app) => {
   app.post("/commitments/:commitmentId/complete", { preHandler: companyGate }, async (req, reply) => {
     const { commitmentId } = req.params as { commitmentId: string };
     const body = z
-      .object({ actualCompletionDate: isoDateSchema.optional() })
+      .object({
+        actualCompletionDate: isoDateSchema.optional(),
+        /** complete despite an unpassed closeout checklist — recorded, never silent (#539) */
+        overrideReason: z.string().min(1).max(4000).optional(),
+      })
       .parse(req.body ?? {});
     const commitment = await fetchCommitment(app.db, commitmentId, req.companyId!);
     await requireCommitmentsLevel(app, req, reply, commitment.projectId, "standard");
@@ -705,6 +710,13 @@ export const commitmentRoutes: FastifyPluginAsync = async (app) => {
           "is unpriced exposure that nothing will ever surface again.",
       );
     }
+    /* the closeout checklist gates completion (#539): pass it, or override on the record */
+    const closeout = await assertCloseoutPermitsCompletion(
+      app.db,
+      commitment,
+      req.user!.id,
+      body.overrideReason ?? null,
+    );
     const now = new Date().toISOString();
     await app.db
       .update(commitments)
@@ -716,6 +728,8 @@ export const commitmentRoutes: FastifyPluginAsync = async (app) => {
       .where(eq(commitments.id, commitmentId));
     await ledger(app.db, req, "state_change", "commitment", commitmentId, {
       status: "complete",
+      closeoutStatus: closeout.status,
+      closeoutOverrideReason: body.overrideReason ?? null,
     }, commitment.projectId);
     return detail(commitmentId, req.companyId!);
   });

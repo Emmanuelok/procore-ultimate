@@ -121,9 +121,12 @@ export function sendRanged(
   const rangeHeader = req.headers.range;
   const parsed = parseRange(Array.isArray(rangeHeader) ? rangeHeader[0] : rangeHeader, obj.sizeBytes);
   if (parsed === "invalid") {
+    // The error body is JSON: override the media headers set above.
     return reply
       .status(416)
       .header("content-range", `bytes */${obj.sizeBytes}`)
+      .header("content-type", "application/json; charset=utf-8")
+      .removeHeader("content-disposition")
       .send({ statusCode: 416, error: "RangeNotSatisfiable", message: "Requested range is not satisfiable" });
   }
   if (parsed) {

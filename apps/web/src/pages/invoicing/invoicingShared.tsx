@@ -1085,6 +1085,82 @@ export function useResource<T>(path: string | null): Resource<T> {
   return { data, error, loading, reload };
 }
 
+
+/**
+ * Every page of a list endpoint, fetched sequentially at the API's page cap
+ * and concatenated — so a register with more rows than one page still loads
+ * in full, and one that fits in a page costs one request. Bounded at 25 pages
+ * (12,500 rows); beyond that `truncated` says so rather than pretending.
+ */
+export function useAllPages<T>(path: string | null, pageSize = 200): Resource<ListResponse<T>> & { truncated: boolean } {
+  const [data, setData] = useState<ListResponse<T> | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState<boolean>(path !== null);
+  const [truncated, setTruncated] = useState(false);
+  const [nonce, setNonce] = useState(0);
+
+  useEffect(() => {
+    if (!path) {
+      setData(null);
+      setLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    (async () => {
+      const items: T[] = [];
+      let total = 0;
+      let page = 1;
+      let more = true;
+      let cut = false;
+      while (more) {
+        const sep = path.includes("?") ? "&" : "?";
+        const body = await api.get<ListResponse<T>>(`${path}${sep}page=${page}&pageSize=${pageSize}`);
+        items.push(...body.items);
+        total = body.total;
+        more = body.items.length === pageSize && items.length < total;
+        page += 1;
+        if (more && page > 25) {
+          cut = true;
+          more = false;
+        }
+      }
+      if (!cancelled) {
+        setData({ items, total, page: 1, pageSize: items.length });
+        setTruncated(cut);
+      }
+    })()
+      .catch((err: unknown) => {
+        if (!cancelled) setError(errorMessage(err, `Failed to load ${path}`));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [path, nonce, pageSize]);
+
+  const reload = useCallback(() => setNonce((n) => n + 1), []);
+  return { data, error, loading, reload, truncated };
+}
+
+
+/** What an invoice is CERTIFIED for — an approved-as-noted reduction honoured. Mirrors the API. */
+export function certifiedOf(inv: { detail: Record<string, unknown>; currentPaymentDue: number }): number {
+  const approved = inv.detail["approvedAmount"];
+  if (typeof approved === "number" && Number.isFinite(approved)) {
+    return Math.round(Math.min(approved, inv.currentPaymentDue) * 100) / 100;
+  }
+  return Math.round(inv.currentPaymentDue * 100) / 100;
+}
+
+/** Certified less paid, never below zero — the one reading of "outstanding". */
+export function outstandingOf(inv: { detail: Record<string, unknown>; currentPaymentDue: number; amountPaid: number }): number {
+  return Math.round(Math.max(0, certifiedOf(inv) - inv.amountPaid) * 100) / 100;
+}
+
 export interface InvoicingContext {
   contracts: PrimeContractRow[];
   commitments: CommitmentRow[];
@@ -1106,18 +1182,10 @@ export function useInvoicingContext(projectId: string): InvoicingContext {
   // No project in the route means no request: an empty projectId would
   // otherwise fire `/api/v1/projects//invoices` and read as an empty project.
   const scope = projectId ? `/api/v1/projects/${projectId}` : null;
-  const contracts = useResource<ListResponse<PrimeContractRow>>(
-    scope && `${scope}/prime-contracts?page=1&pageSize=200`,
-  );
-  const commitments = useResource<ListResponse<CommitmentRow>>(
-    scope && `${scope}/commitments?page=1&pageSize=500`,
-  );
-  const vendors = useResource<ListResponse<VendorRow>>(
-    projectId ? "/api/v1/vendors?page=1&pageSize=500" : null,
-  );
-  const periods = useResource<ListResponse<BillingPeriodRow>>(
-    scope && `${scope}/billing-periods?page=1&pageSize=200`,
-  );
+  const contracts = useAllPages<PrimeContractRow>(scope && `${scope}/prime-contracts`);
+  const commitments = useAllPages<CommitmentRow>(scope && `${scope}/commitments`);
+  const vendors = useAllPages<VendorRow>(projectId ? "/api/v1/vendors" : null);
+  const periods = useAllPages<BillingPeriodRow>(scope && `${scope}/billing-periods`);
 
   const contractRows = useMemo(() => contracts.data?.items ?? [], [contracts.data]);
   const commitmentRows = useMemo(() => commitments.data?.items ?? [], [commitments.data]);

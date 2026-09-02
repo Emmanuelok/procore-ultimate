@@ -158,11 +158,22 @@ const PARAM_SCHEMAS: Record<(typeof AUTOMATION_ACTION_TYPES)[number], z.ZodTypeA
   create_task: taskParams,
 };
 
-/** Validate one action's params against its type. Returns the parsed params. */
-export function parseActionParams(type: string, params: unknown): Record<string, unknown> {
+/**
+ * Validate one action's params against its type. Returns the parsed params
+ * or the list of problems — never throws, so the caller (a zod transform)
+ * can attach the problems to the request's own issue list at the right path.
+ */
+export function parseActionParams(
+  type: string,
+  params: unknown,
+): { ok: true; params: Record<string, unknown> } | { ok: false; issues: Array<{ path: PropertyKey[]; message: string }> } {
   const schema = PARAM_SCHEMAS[type as (typeof AUTOMATION_ACTION_TYPES)[number]];
-  if (!schema) throw new z.ZodError([{ code: "custom", message: `unknown action type "${type}"`, path: ["type"] }]);
-  return schema.parse(params ?? {}) as Record<string, unknown>;
+  if (!schema) return { ok: false, issues: [{ path: ["type"], message: `unknown action type "${type}"` }] };
+  const parsed = schema.safeParse(params ?? {});
+  if (!parsed.success) {
+    return { ok: false, issues: parsed.error.issues.map((i) => ({ path: ["params", ...i.path], message: i.message })) };
+  }
+  return { ok: true, params: parsed.data as Record<string, unknown> };
 }
 
 export const actionSchema = z
@@ -170,7 +181,14 @@ export const actionSchema = z
     type: z.enum(AUTOMATION_ACTION_TYPES),
     params: z.record(z.string(), z.unknown()).default({}),
   })
-  .transform((a) => ({ type: a.type, params: parseActionParams(a.type, a.params) }));
+  .transform((a, ctx) => {
+    const result = parseActionParams(a.type, a.params);
+    if (!result.ok) {
+      for (const issue of result.issues) ctx.addIssue({ code: "custom", message: issue.message, path: issue.path });
+      return z.NEVER;
+    }
+    return { type: a.type, params: result.params };
+  });
 
 export const ruleBodySchema = z.object({
   name: z.string().min(1).max(200),

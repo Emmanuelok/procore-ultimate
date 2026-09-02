@@ -1,5 +1,5 @@
 {
-  "id": "6c1de2f5-12fc-43ac-a716-73424fbac487",
+  "id": "5678630b-a76a-42a6-a3c1-3093b6d2b169",
   "prevId": "340cf323-a4ed-4b81-8d6c-8f3e94b698e3",
   "version": "7",
   "dialect": "postgresql",
@@ -6928,6 +6928,57 @@
           "isUnique": false,
           "concurrently": false,
           "method": "btree",
+          "with": {}
+        },
+        "photos_uploader_idx": {
+          "name": "photos_uploader_idx",
+          "columns": [
+            {
+              "expression": "project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "uploaded_by",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "photos_tags_gin_idx": {
+          "name": "photos_tags_gin_idx",
+          "columns": [
+            {
+              "expression": "tags",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "gin",
+          "with": {}
+        },
+        "photos_ai_tags_gin_idx": {
+          "name": "photos_ai_tags_gin_idx",
+          "columns": [
+            {
+              "expression": "ai_tags",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "gin",
           "with": {}
         }
       },
@@ -56241,6 +56292,12 @@
           "primaryKey": false,
           "notNull": true
         },
+        "tax_point_date": {
+          "name": "tax_point_date",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "inputs": {
           "name": "inputs",
           "type": "jsonb",
@@ -56506,6 +56563,27 @@
             },
             {
               "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "tax_determinations_tax_point_idx": {
+          "name": "tax_determinations_tax_point_idx",
+          "columns": [
+            {
+              "expression": "project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "tax_point_date",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -57846,6 +57924,33 @@
           "method": "btree",
           "with": {}
         },
+        "delivery_slots_company_status_idx": {
+          "name": "delivery_slots_company_status_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "ends_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "delivery_slots_task_idx": {
           "name": "delivery_slots_task_idx",
           "columns": [
@@ -58870,6 +58975,27 @@
           "method": "btree",
           "with": {}
         },
+        "material_trace_company_idx": {
+          "name": "material_trace_company_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "material_trace_heat_idx": {
           "name": "material_trace_heat_idx",
           "columns": [
@@ -59432,6 +59558,27 @@
           "columns": [
             {
               "expression": "project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "offsite_units_company_idx": {
+          "name": "offsite_units_company_idx",
+          "columns": [
+            {
+              "expression": "company_id",
               "isExpression": false,
               "asc": true,
               "nulls": "last"

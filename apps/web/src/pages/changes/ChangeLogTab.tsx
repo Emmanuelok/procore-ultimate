@@ -30,6 +30,7 @@ import {
   type WaterfallStep,
 } from "../../ui/charts";
 import { IconLedger } from "../../ui/icons";
+import ChangeAnalytics from "./ChangeAnalytics";
 import {
   ComponentValue,
   IdentityList,
@@ -521,6 +522,8 @@ export default function ChangeLogTab({
         percentages are computed inside it.
         {changeLog ? ` Currencies on this project: ${changeLog.currencies.join(", ") || "none"}.` : ""}
       </Alert>
+
+      <ChangeAnalytics projectId={projectId} />
     </div>
   );
 }

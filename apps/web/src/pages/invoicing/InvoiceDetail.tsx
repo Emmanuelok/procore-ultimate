@@ -988,7 +988,9 @@ export default function InvoiceDrawer({
                 </Button>
               </>
             ) : null}
-            {invoice && !["paid", "void"].includes(invoice.status) && invoice.amountPaid === 0 ? (
+            {invoice &&
+            ["draft", "submitted", "under_review", "revise_and_resubmit", "rejected"].includes(invoice.status) &&
+            invoice.amountPaid === 0 ? (
               <Button size="sm" variant="ghost" onClick={() => setVoiding(true)}>
                 Void
               </Button>
@@ -1156,10 +1158,21 @@ export default function InvoiceDrawer({
             <WaiverPanel
               invoiceId={invoice.id}
               currency={invoice.currency}
-              onChanged={onChanged}
+              onChanged={() => {
+                detail.reload();
+                onChanged();
+              }}
             />
 
-            <PaymentsPanel invoice={invoice} onChanged={onChanged} />
+            <PaymentsPanel
+              invoice={invoice}
+              onChanged={() => {
+                detail.reload();
+                onChanged();
+              }}
+            />
+
+            <LineApprovalsPanel invoice={invoice} onChanged={() => { detail.reload(); onChanged(); }} />
 
             <Card>
               <CardHeader
@@ -1330,5 +1343,195 @@ export default function InvoiceDrawer({
         </Field>
       </ConfirmDialog>
     </Drawer>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Line-level approval (#573)                                          */
+/* ------------------------------------------------------------------ */
+
+interface LineApprovalSummary {
+  invoiceId: string;
+  status: string;
+  currency: string;
+  lines: number;
+  reviewed: number;
+  unreviewed: number;
+  approved: number;
+  reduced: number;
+  rejected: number;
+  billed: number;
+  certified: number;
+  reduction: number;
+  decisions: Array<{
+    id: string;
+    invoiceLineItemId: string;
+    status: string;
+    approvedAmount: number;
+    billedAmount: number;
+    note: string | null;
+    reviewedBy: string;
+    reviewedAt: string;
+  }>;
+}
+
+interface LineDraft {
+  status: "approved" | "reduced" | "rejected";
+  approvedAmount: number | null;
+  note: string;
+}
+
+/**
+ * The reviewer decides each G703 row; the invoice's approval reads the
+ * certified figure from those decisions, so a reduction is recorded on the
+ * line it was made on, with its reason.
+ */
+function LineApprovalsPanel({
+  invoice,
+  onChanged,
+}: {
+  invoice: InvoiceDetailShape;
+  onChanged: () => void;
+}) {
+  const summary = useResource<LineApprovalSummary>(`/api/v1/invoices/${invoice.id}/line-approvals`);
+  const [drafts, setDrafts] = useState<Map<string, LineDraft>>(new Map());
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const reviewable = invoice.status === "submitted" || invoice.status === "under_review";
+  const decisionByLine = useMemo(
+    () => new Map((summary.data?.decisions ?? []).map((d) => [d.invoiceLineItemId, d])),
+    [summary.data],
+  );
+
+  async function save() {
+    if (drafts.size === 0) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.put(`/api/v1/invoices/${invoice.id}/line-approvals`, {
+        decisions: [...drafts.entries()].map(([lineId, d]) => ({
+          lineId,
+          status: d.status,
+          ...(d.status === "reduced" && d.approvedAmount !== null ? { approvedAmount: d.approvedAmount } : {}),
+          ...(d.note.trim() ? { note: d.note.trim() } : {}),
+        })),
+      });
+      toast.success("Line decisions recorded.");
+      setDrafts(new Map());
+      summary.reload();
+      onChanged();
+    } catch (err) {
+      setError(errorMessage(err, "The line decisions were refused"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!reviewable && (summary.data?.decisions.length ?? 0) === 0) return null;
+
+  return (
+    <Card>
+      <CardHeader
+        title="Line-by-line review"
+        subtitle={
+          reviewable
+            ? "Approve, reduce or reject each row. Approval of the invoice certifies the sum of these decisions; unreviewed rows count as billed."
+            : "The decisions recorded on this invoice's lines."
+        }
+        actions={
+          summary.data ? (
+            <span className="text-2xs text-content-subtle">
+              certified {money(summary.data.certified, invoice.currency)} of {money(summary.data.billed, invoice.currency)} billed
+              {summary.data.reduction > 0 ? ` · reduced by ${money(summary.data.reduction, invoice.currency)}` : ""}
+            </span>
+          ) : null
+        }
+      />
+      <CardBody className="space-y-2">
+        <ErrorAlert message={summary.error ?? error} />
+        <table className="w-full text-meta">
+          <thead>
+            <tr className="text-left text-content-subtle">
+              <th className="py-1">Line</th>
+              <th className="py-1 text-right">Billed</th>
+              <th className="py-1">Decision</th>
+              <th className="py-1 text-right">Certified</th>
+              <th className="py-1">Note</th>
+            </tr>
+          </thead>
+          <tbody>
+            {invoice.lines.map((line) => {
+              const decided = decisionByLine.get(line.id);
+              const draft = drafts.get(line.id);
+              const status = draft?.status ?? (decided?.status as LineDraft["status"] | undefined) ?? "approved";
+              const certified =
+                draft ? (draft.status === "approved" ? line.amount : draft.status === "rejected" ? 0 : (draft.approvedAmount ?? 0)) : decided ? decided.approvedAmount : line.amount;
+              const setDraft = (patch: Partial<LineDraft>) =>
+                setDrafts((prev) => {
+                  const next = new Map(prev);
+                  next.set(line.id, {
+                    status: patch.status ?? draft?.status ?? status,
+                    approvedAmount: patch.approvedAmount !== undefined ? patch.approvedAmount : (draft?.approvedAmount ?? decided?.approvedAmount ?? null),
+                    note: patch.note !== undefined ? patch.note : (draft?.note ?? decided?.note ?? ""),
+                  });
+                  return next;
+                });
+              return (
+                <tr key={line.id} className="border-t border-border-subtle align-top">
+                  <td className="py-1">
+                    <span className="font-mono">{line.lineNumber}</span> {line.description}
+                  </td>
+                  <td className="py-1 text-right tabular-nums">{money(line.amount, invoice.currency)}</td>
+                  <td className="py-1">
+                    {reviewable ? (
+                      <select
+                        className="rounded border border-border bg-surface px-1 py-0.5 text-meta"
+                        value={status}
+                        onChange={(e) => setDraft({ status: e.target.value as LineDraft["status"] })}
+                      >
+                        <option value="approved">Approved</option>
+                        <option value="reduced">Reduced</option>
+                        <option value="rejected">Rejected</option>
+                      </select>
+                    ) : (
+                      <Badge tone={status === "approved" ? "success" : status === "reduced" ? "warning" : "danger"} size="xs">
+                        {status}
+                      </Badge>
+                    )}
+                  </td>
+                  <td className="py-1 text-right tabular-nums">
+                    {reviewable && status === "reduced" ? (
+                      <NumberInput
+                        value={draft?.approvedAmount ?? decided?.approvedAmount ?? null}
+                        onChange={(v) => setDraft({ approvedAmount: v })}
+                        precision={2}
+                        align="right"
+                        min={0}
+                      />
+                    ) : (
+                      money(certified, invoice.currency)
+                    )}
+                  </td>
+                  <td className="py-1">
+                    {reviewable ? (
+                      <Input value={draft?.note ?? decided?.note ?? ""} onChange={(e) => setDraft({ note: e.target.value })} placeholder={status === "reduced" ? "Why (required)" : "Optional"} />
+                    ) : (
+                      <span className="text-content-muted">{decided?.note ?? "—"}</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        {reviewable ? (
+          <div className="flex justify-end">
+            <Button size="sm" onClick={() => void save()} disabled={busy || drafts.size === 0}>
+              {busy ? "Saving…" : `Record ${drafts.size} decision${drafts.size === 1 ? "" : "s"}`}
+            </Button>
+          </div>
+        ) : null}
+      </CardBody>
+    </Card>
   );
 }

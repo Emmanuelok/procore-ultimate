@@ -793,7 +793,17 @@ export const documentsModule: FastifyPluginAsync = async (app) => {
       if (vis.hidden.has(q.folderId)) return paginate([], 0, q);
       conds.push(eq(files.folderId, q.folderId));
     }
-    if (q.search) conds.push(ilike(files.name, `%${q.search}%`));
+    if (q.search) {
+      const like = `%${q.search}%`;
+      conds.push(
+        or(
+          ilike(files.name, like),
+          ilike(files.description, like),
+          ilike(files.revisionLabel, like),
+          sql`exists (select 1 from jsonb_array_elements_text(${files.tags}) t where t ilike ${like})`,
+        )!,
+      );
+    }
     if (q.documentType) conds.push(eq(files.documentType, q.documentType));
     if (q.tag) conds.push(sql`${files.tags} @> ${JSON.stringify([q.tag])}::jsonb`);
     if (q.uploadedBy) conds.push(eq(files.uploadedBy, q.uploadedBy));

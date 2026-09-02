@@ -291,6 +291,7 @@ export const offsiteUnits = pgTable(
   (t) => [
     uniqueIndex("offsite_units_uq").on(t.projectId, t.number),
     index("offsite_units_project_idx").on(t.projectId, t.status),
+    index("offsite_units_company_idx").on(t.companyId, t.status),
     index("offsite_units_factory_idx").on(t.factoryNodeId),
     index("offsite_units_task_idx").on(t.scheduleTaskId),
   ],
@@ -454,6 +455,7 @@ export const deliverySlots = pgTable(
     uniqueIndex("delivery_slots_uq").on(t.projectId, t.number),
     index("delivery_slots_gate_idx").on(t.gateId, t.startsAt),
     index("delivery_slots_project_idx").on(t.projectId, t.status, t.startsAt),
+    index("delivery_slots_company_status_idx").on(t.companyId, t.status, t.endsAt),
     index("delivery_slots_task_idx").on(t.scheduleTaskId),
     index("delivery_slots_item_idx").on(t.longLeadItemId),
   ],
@@ -519,6 +521,7 @@ export const materialTraceRecords = pgTable(
   (t) => [
     uniqueIndex("material_trace_records_uq").on(t.projectId, t.number),
     index("material_trace_project_idx").on(t.projectId, t.status),
+    index("material_trace_company_idx").on(t.companyId, t.status),
     index("material_trace_heat_idx").on(t.companyId, t.heatNumber),
     index("material_trace_batch_idx").on(t.companyId, t.batchNumber),
     index("material_trace_location_idx").on(t.installedLocationId),

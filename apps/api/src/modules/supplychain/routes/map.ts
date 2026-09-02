@@ -16,6 +16,7 @@ import {
   idSchema,
   ledger,
   nowISO,
+  patchSchemaOf,
   patchSet,
 } from "../shared.js";
 
@@ -36,7 +37,7 @@ const nodeBodySchema = z.object({
   notes: z.string().max(4000).nullable().optional(),
 });
 
-const nodePatchSchema = nodeBodySchema.partial().extend({
+const nodePatchSchema = patchSchemaOf(nodeBodySchema).extend({
   status: z.enum(SUPPLY_NODE_STATUSES).optional(),
 });
 

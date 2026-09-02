@@ -1083,6 +1083,67 @@ export function useResource<T>(path: string | null): Resource<T> {
   return { data, error, loading, reload };
 }
 
+
+/**
+ * Every page of a list endpoint, fetched sequentially at the API's page cap
+ * and concatenated — so a register with more rows than one page still loads
+ * in full, and one that fits in a page costs one request. Bounded at 25 pages
+ * (12,500 rows); beyond that `truncated` says so rather than pretending.
+ */
+export function useAllPages<T>(path: string | null, pageSize = 200): Resource<ListResponse<T>> & { truncated: boolean } {
+  const [data, setData] = useState<ListResponse<T> | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState<boolean>(path !== null);
+  const [truncated, setTruncated] = useState(false);
+  const [nonce, setNonce] = useState(0);
+
+  useEffect(() => {
+    if (!path) {
+      setData(null);
+      setLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    (async () => {
+      const items: T[] = [];
+      let total = 0;
+      let page = 1;
+      let more = true;
+      let cut = false;
+      while (more) {
+        const sep = path.includes("?") ? "&" : "?";
+        const body = await api.get<ListResponse<T>>(`${path}${sep}page=${page}&pageSize=${pageSize}`);
+        items.push(...body.items);
+        total = body.total;
+        more = body.items.length === pageSize && items.length < total;
+        page += 1;
+        if (more && page > 25) {
+          cut = true;
+          more = false;
+        }
+      }
+      if (!cancelled) {
+        setData({ items, total, page: 1, pageSize: items.length });
+        setTruncated(cut);
+      }
+    })()
+      .catch((err: unknown) => {
+        if (!cancelled) setError(errorMessage(err, `Failed to load ${path}`));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [path, nonce, pageSize]);
+
+  const reload = useCallback(() => setNonce((n) => n + 1), []);
+  return { data, error, loading, reload, truncated };
+}
+
 export interface ChangeContext {
   contracts: PrimeContractRow[];
   commitments: CommitmentRow[];
@@ -1107,15 +1168,9 @@ export interface ChangeContext {
  */
 export function useChangeContext(projectId: string): ChangeContext {
   const scope = projectId ? `/api/v1/projects/${projectId}` : null;
-  const contracts = useResource<ListResponse<PrimeContractRow>>(
-    scope && `${scope}/prime-contracts?page=1&pageSize=200`,
-  );
-  const commitments = useResource<ListResponse<CommitmentRow>>(
-    scope && `${scope}/commitments?page=1&pageSize=500`,
-  );
-  const vendors = useResource<ListResponse<VendorRow>>(
-    projectId ? "/api/v1/vendors?page=1&pageSize=500" : null,
-  );
+  const contracts = useAllPages<PrimeContractRow>(scope && `${scope}/prime-contracts`);
+  const commitments = useAllPages<CommitmentRow>(scope && `${scope}/commitments`);
+  const vendors = useAllPages<VendorRow>(projectId ? "/api/v1/vendors" : null);
 
   const contractRows = useMemo(() => contracts.data?.items ?? [], [contracts.data]);
   const commitmentRows = useMemo(() => commitments.data?.items ?? [], [commitments.data]);
@@ -1189,21 +1244,11 @@ export interface ChangeChain {
  */
 export function useChangeChain(projectId: string): ChangeChain {
   const scope = projectId ? `/api/v1/projects/${projectId}` : null;
-  const events = useResource<ListResponse<ChangeEventRow>>(
-    scope && `${scope}/change-events?page=1&pageSize=500`,
-  );
-  const pcos = useResource<ListResponse<PcoRow>>(
-    scope && `${scope}/potential-change-orders?page=1&pageSize=500`,
-  );
-  const quotes = useResource<ListResponse<QuoteRow>>(
-    scope && `${scope}/quote-requests?page=1&pageSize=500`,
-  );
-  const cors = useResource<ListResponse<CorRow>>(
-    scope && `${scope}/change-order-requests?page=1&pageSize=500`,
-  );
-  const packages = useResource<ListResponse<PackageRow>>(
-    scope && `${scope}/change-order-packages?page=1&pageSize=500`,
-  );
+  const events = useAllPages<ChangeEventRow>(scope && `${scope}/change-events`);
+  const pcos = useAllPages<PcoRow>(scope && `${scope}/potential-change-orders`);
+  const quotes = useAllPages<QuoteRow>(scope && `${scope}/quote-requests`);
+  const cors = useAllPages<CorRow>(scope && `${scope}/change-order-requests`);
+  const packages = useAllPages<PackageRow>(scope && `${scope}/change-order-packages`);
 
   const reload = useCallback(() => {
     events.reload();

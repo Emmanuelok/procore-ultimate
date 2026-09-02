@@ -18,6 +18,7 @@ import { and, asc, count, desc, eq, gte, inArray, isNull, lt, lte, or, sql } fro
 import {
   attentionItems,
   projectHealthSnapshots,
+  projectMemberships,
   projects,
   pulseBriefings,
   pulseSnapshots,
@@ -26,6 +27,7 @@ import type { HealthLevel, HealthRecomputeTrigger } from "@constructos/shared";
 import type { Db } from "../../lib/db.js";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
+import { pushNotifications } from "../notifications/service.js";
 import { rankCandidates } from "./attention-engine.js";
 import { collectAttentionCandidates, type ProjectLite } from "./attention-sources.js";
 import { scoreHealth, type HealthComputation } from "./health-engine.js";
@@ -262,6 +264,7 @@ export async function computeProjectHealth(
       objectType: "project_health",
       objectId: projectId,
       projectId,
+      storePayload: true,
       payload: {
         projectId,
         from: previousLevel,
@@ -272,12 +275,44 @@ export async function computeProjectHealth(
         basis: computed.basis,
       },
     });
+    if (computed.level === "off_track") {
+      await notifyOffTrack(db, companyId, project, computed);
+    }
   }
 
   const trend = await loadTrend(db, companyId, projectId, now);
   const health = snapshotToHealth(row, project, trend);
   health.basis = computed.basis;
   return { health, inserted, previousLevel, levelChanged };
+}
+
+/**
+ * A project that just went off track is the one thing the intelligence layer
+ * should say out loud: every member of the project is told once, on the
+ * transition, with the off-track dimensions in the body. Bounded — a project
+ * with a thousand members gets the first 200 told.
+ */
+async function notifyOffTrack(db: Db, companyId: string, project: ProjectLite, computed: HealthComputation): Promise<void> {
+  const members = await db
+    .select({ userId: projectMemberships.userId })
+    .from(projectMemberships)
+    .where(and(eq(projectMemberships.companyId, companyId), eq(projectMemberships.projectId, project.id)))
+    .limit(200);
+  if (members.length === 0) return;
+  const off = computed.dimensions.filter((d) => d.level === "off_track").map((d) => d.key);
+  await pushNotifications(
+    db,
+    members.map((m) => ({
+      companyId,
+      userId: m.userId,
+      projectId: project.id,
+      kind: "attention" as const,
+      title: `${project.name} is off track${computed.score !== null ? ` (${computed.score}/100)` : ""}`,
+      body: off.length > 0 ? `Off track: ${off.join(", ")}. ${computed.basis}` : computed.basis,
+      recordType: "project_health",
+      recordId: project.id,
+    })),
+  );
 }
 
 /** The latest snapshot as a ProjectHealth, or null when none has been taken. */
@@ -449,7 +484,7 @@ export async function refreshAttention(
   const stale = await db
     .select({ id: attentionItems.id })
     .from(attentionItems)
-    .where(and(eq(attentionItems.companyId, companyId), eq(attentionItems.status, "open"), lt(attentionItems.lastSeenAt, nowIso)));
+    .where(and(eq(attentionItems.companyId, companyId), eq(attentionItems.status, "open"), lte(attentionItems.lastSeenAt, nowIso)));
   const toResolve = stale.map((s) => s.id).filter((id) => !seen.has(id));
   if (toResolve.length > 0) {
     await db
@@ -717,11 +752,11 @@ export async function refreshPulse(db: Db, companyId: string, now: Date, force =
       id: newId("pls"),
       companyId,
       generatedAt: now.toISOString(),
-      portfolio,
+      portfolio: { ...portfolio },
       scores,
       attentionBySeverity: counts,
       openAttention: open,
-      changes,
+      changes: { ...changes },
     })
     .returning();
   return created!;

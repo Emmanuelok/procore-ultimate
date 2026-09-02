@@ -440,8 +440,8 @@ export const rfiRoutes: FastifyPluginAsync = async (app) => {
   /* Detail / edit                                                     */
   /* ---------------------------------------------------------------- */
 
-  app.get("/projects/:projectId/rfis/:rfiId", { preHandler: readGate }, async (req) => {
-    const { rfiId } = req.params as { rfiId: string };
+  /** The record plus its draft responses, related RFIs and what THIS caller may do. */
+  async function rfiDetail(rfiId: string, req: FastifyRequest) {
     const rfi = await fetchRfi(rfiId, req);
     const responses = await app.db
       .select()
@@ -471,6 +471,11 @@ export const rfiRoutes: FastifyPluginAsync = async (app) => {
         canEditQuestion: rfi.status === "draft",
       },
     };
+  }
+
+  app.get("/projects/:projectId/rfis/:rfiId", { preHandler: readGate }, async (req) => {
+    const { rfiId } = req.params as { rfiId: string };
+    return rfiDetail(rfiId, req);
   });
 
   app.patch("/projects/:projectId/rfis/:rfiId", { preHandler: standardGate }, async (req) => {
@@ -520,7 +525,7 @@ export const rfiRoutes: FastifyPluginAsync = async (app) => {
         },
       ]);
     }
-    return fetchRfi(rfiId, req);
+    return rfiDetail(rfiId, req);
   });
 
   /* ---------------------------------------------------------------- */
@@ -563,7 +568,7 @@ export const rfiRoutes: FastifyPluginAsync = async (app) => {
       });
     }
     await pushNotifications(app.db, targets);
-    return fetchRfi(rfiId, req);
+    return rfiDetail(rfiId, req);
   });
 
   async function recordOfficialResponse(
@@ -627,7 +632,7 @@ export const rfiRoutes: FastifyPluginAsync = async (app) => {
       scheduleImpactDays: body.scheduleImpactDays,
       authorId: me,
     });
-    return fetchRfi(rfiId, req);
+    return rfiDetail(rfiId, req);
   });
 
   /* ---------------------------------------------------------------- */
@@ -737,7 +742,7 @@ export const rfiRoutes: FastifyPluginAsync = async (app) => {
         authorId: draft.authorId,
         adoptedFrom: responseId,
       });
-      return fetchRfi(rfiId, req);
+      return rfiDetail(rfiId, req);
     },
   );
 
@@ -782,7 +787,7 @@ export const rfiRoutes: FastifyPluginAsync = async (app) => {
     }
     await app.db.update(rfis).set({ status: "closed", updatedAt: nowIso() }).where(eq(rfis.id, rfiId));
     await ledgerRfi("state_change", rfiId, req, { from: rfi.status, to: "closed" });
-    return fetchRfi(rfiId, req);
+    return rfiDetail(rfiId, req);
   });
 
   app.post("/projects/:projectId/rfis/:rfiId/void", { preHandler: standardGate }, async (req) => {
@@ -799,6 +804,6 @@ export const rfiRoutes: FastifyPluginAsync = async (app) => {
       .set({ status: "void", updatedAt: nowIso() })
       .where(and(eq(rfis.id, rfiId), ne(rfis.status, "void")));
     await ledgerRfi("state_change", rfiId, req, { from: rfi.status, to: "void" });
-    return fetchRfi(rfiId, req);
+    return rfiDetail(rfiId, req);
   });
 };

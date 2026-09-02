@@ -11,10 +11,12 @@
  *   GET  /pulse/briefing · GET /pulse/briefings   latest / recent company briefings
  *   POST /pulse/briefing                          AI (503 AiDisabled without a key)
  *   GET  /attention?projectId=&limit=…            ranked feed, visibility-filtered
- *   POST /attention/:id/dismiss · /reopen         ledgered
+ *   POST /attention/:id/dismiss · /reopen         ledgered; acting needs `standard` on the project
+ *   POST /projects/:projectId/attention/:id/dismiss · /reopen   same, behind the tool gate
  *   GET  /projects/:projectId/health              latest (computed on first read)
  *   POST /projects/:projectId/health/recompute    manual, ledgered
  *   GET  /projects/:projectId/health/history
+ *   GET  /projects/:projectId/health/inputs        the loader's raw metrics + reasons (plan §3.5)
  *   GET  /projects/:projectId/attention
  *   GET  /projects/:projectId/intelligence/activity
  *   GET/POST /projects/:projectId/intelligence/briefing(s)
@@ -36,6 +38,7 @@ import { addLedgerEmitHook, appendLedger } from "../../lib/ledger.js";
 import { forEachCompany } from "../../lib/scheduler.js";
 import { aiEnabled } from "../ai/service.js";
 import { generateBriefing } from "./briefing.js";
+import { loadHealthInputs } from "./health-inputs.js";
 import {
   computeProjectHealth,
   drainDirtyProjects,
@@ -54,7 +57,7 @@ import {
   runCompanyRefresh,
   setAttentionStatus,
 } from "./service.js";
-import { canSeeProject, visibleProjectIds } from "./visibility.js";
+import { canActOnProject, canSeeProject, visibleProjectIds } from "./visibility.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -154,6 +157,7 @@ export const intelligenceModule: FastifyPluginAsync = async (app) => {
       action: "update",
       objectType: "pulse_snapshot",
       objectId: result.pulseId,
+      storePayload: true,
       payload: { trigger: "manual", projects: result.projects, recomputed: result.recomputed, levelChanges: result.levelChanges, attention: result.attention },
     });
     return result;
@@ -253,20 +257,29 @@ export const intelligenceModule: FastifyPluginAsync = async (app) => {
     });
   });
 
-  const loadVisibleItem = async (req: FastifyRequest) => {
+  const loadVisibleItem = async (req: FastifyRequest, projectId?: string) => {
     const { id } = req.params as { id: string };
     const item = await getAttentionItem(app.db, req.companyId!, id);
     if (!item) throw notFound("Attention item not found");
+    if (projectId !== undefined) {
+      // project-scoped route: the item must belong to the project the gate resolved
+      if (item.projectId !== projectId) throw notFound("Attention item not found");
+      return item;
+    }
     const visible = await visibleProjectIds(app, req);
     if (!canSeeProject(visible, item.projectId)) throw notFound("Attention item not found");
+    // Seeing an item is not the same as setting it aside (plan §6.3): a
+    // project-scoped item needs `standard` on the project, never company
+    // membership alone, and an assurance grant is read-only.
+    if (!(await canActOnProject(app, req, item.projectId))) {
+      throw forbidden("Requires standard access to intelligence on this project");
+    }
     return item;
   };
 
-  app.post("/attention/:id/dismiss", { preHandler: companyGate }, async (req) => {
+  const dismiss = async (req: FastifyRequest, item: Awaited<ReturnType<typeof loadVisibleItem>>) => {
     const body = dismissBody.parse(req.body ?? {});
-    const item = await loadVisibleItem(req);
-    const now = new Date();
-    const updated = await setAttentionStatus(app.db, req.companyId!, item.id, "dismissed", req.user!.id, body.reason ?? null, now);
+    const updated = await setAttentionStatus(app.db, req.companyId!, item.id, "dismissed", req.user!.id, body.reason ?? null, new Date());
     await appendLedger(app.db, {
       companyId: req.companyId!,
       actorId: req.user!.id,
@@ -274,13 +287,13 @@ export const intelligenceModule: FastifyPluginAsync = async (app) => {
       objectType: "attention_item",
       objectId: item.id,
       projectId: item.projectId,
+      storePayload: true,
       payload: { from: item.status, to: "dismissed", reason: body.reason ?? null, kind: item.kind, sourceType: item.sourceType, sourceId: item.sourceId },
     });
     return rowToAttention(updated);
-  });
+  };
 
-  app.post("/attention/:id/reopen", { preHandler: companyGate }, async (req) => {
-    const item = await loadVisibleItem(req);
+  const reopen = async (req: FastifyRequest, item: Awaited<ReturnType<typeof loadVisibleItem>>) => {
     const updated = await setAttentionStatus(app.db, req.companyId!, item.id, "open", req.user!.id, null, new Date());
     await appendLedger(app.db, {
       companyId: req.companyId!,
@@ -289,10 +302,23 @@ export const intelligenceModule: FastifyPluginAsync = async (app) => {
       objectType: "attention_item",
       objectId: item.id,
       projectId: item.projectId,
+      storePayload: true,
       payload: { from: item.status, to: "open", kind: item.kind, sourceType: item.sourceType, sourceId: item.sourceId },
     });
     return rowToAttention(updated);
-  });
+  };
+
+  app.post("/attention/:id/dismiss", { preHandler: companyGate }, async (req) => dismiss(req, await loadVisibleItem(req)));
+
+  app.post("/attention/:id/reopen", { preHandler: companyGate }, async (req) => reopen(req, await loadVisibleItem(req)));
+
+  app.post("/projects/:projectId/attention/:id/dismiss", { preHandler: standardGate }, async (req) =>
+    dismiss(req, await loadVisibleItem(req, req.projectId!)),
+  );
+
+  app.post("/projects/:projectId/attention/:id/reopen", { preHandler: standardGate }, async (req) =>
+    reopen(req, await loadVisibleItem(req, req.projectId!)),
+  );
 
   /* ---------------------------------------------------------------- */
   /* Project health                                                    */
@@ -313,6 +339,7 @@ export const intelligenceModule: FastifyPluginAsync = async (app) => {
       objectType: "project_health",
       objectId: req.projectId!,
       projectId: req.projectId!,
+      storePayload: true,
       payload: { trigger: "manual", level: result.health.level, score: result.health.score, snapshotId: result.health.snapshotId, previousLevel: result.previousLevel },
     });
     // the feed and the company snapshot follow the recompute so the Pulse agrees with the project page
@@ -326,6 +353,27 @@ export const intelligenceModule: FastifyPluginAsync = async (app) => {
     const q = historyQuery.parse(req.query);
     const items = await listHealthHistory(app.db, req.companyId!, req.projectId!, new Date(), q.days);
     return { items, days: q.days };
+  });
+
+  // Plan §3.5 shape — { metrics, reasons } — plus the per-dimension inputs
+  // exactly as the engine receives them, so a score can always be traced.
+  app.get("/projects/:projectId/health/inputs", { preHandler: readGate }, async (req) => {
+    const inputs = await loadHealthInputs(app.db, req.companyId!, req.projectId!, new Date());
+    const metrics: Record<string, number | null> = {};
+    const { asOf, reasons, ...dims } = inputs;
+    for (const [dim, value] of Object.entries(dims)) {
+      if (value === null || value === undefined) continue;
+      for (const [k, v] of Object.entries(value as unknown as Record<string, unknown>)) {
+        if (typeof v === "number") metrics[`${dim}.${k}`] = v;
+        else if (v === null) metrics[`${dim}.${k}`] = null;
+        else if (v && typeof v === "object") {
+          for (const [k2, v2] of Object.entries(v as Record<string, unknown>)) {
+            if (typeof v2 === "number") metrics[`${dim}.${k}.${k2}`] = v2;
+          }
+        }
+      }
+    }
+    return { asOf, metrics, reasons: Object.values(reasons), inputs: dims, unrated: Object.keys(reasons) };
   });
 
   app.get("/projects/:projectId/attention", { preHandler: readGate }, async (req) => {

@@ -38,6 +38,7 @@ import { IconDownload, IconImport, IconWarning } from "../../ui/icons";
 import { FileDropzone } from "../../ui/inputs";
 import type { FileDropzoneHandle } from "../../ui/inputs";
 import { api } from "../../lib/api";
+import ErpImportPanel from "./ErpImportPanel";
 import {
   SectionHeading,
   count,
@@ -428,6 +429,8 @@ export default function ImportTab({ budget, currency, onChanged }: ImportTabProp
       ) : null}
 
       {dialog}
+
+      <ErpImportPanel budget={budget} currency={currency} onChanged={onChanged} />
     </div>
   );
 }

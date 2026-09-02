@@ -5,6 +5,9 @@ import { quoteRoutes } from "./quotes.js";
 import { corRoutes } from "./requests.js";
 import { packageRoutes } from "./packages.js";
 import { changeLogRoutes } from "./log.js";
+import { markupRoutes } from "./markups.js";
+import { changeConfigRoutes } from "./config.js";
+import { analyticsRoutes } from "./analytics.js";
 
 /**
  * CHANGE MANAGEMENT (M5, spec Vol I §3.4) — the chain from a field event to
@@ -31,6 +34,9 @@ import { changeLogRoutes } from "./log.js";
  *   /projects/:projectId/change-order-requests             the owner ask
  *   /projects/:projectId/change-order-packages             execution
  *   /projects/:projectId/change-log                        reconciliation
+ *   /projects/:projectId/change-log/{ageing,cycle-time,pass-down}  analytics (#560–562)
+ *   /projects/:projectId/change-markups                    markup schedules (#554)
+ *   /projects/:projectId/change-config                     tier configuration (#563)
  *
  * `read` sees the log, `standard` moves a change along the chain, and `admin`
  * is required for exactly one route — executing a package — because it is the
@@ -43,4 +49,7 @@ export const changesModule: FastifyPluginAsync = async (app) => {
   await app.register(corRoutes);
   await app.register(packageRoutes);
   await app.register(changeLogRoutes);
+  await app.register(markupRoutes);
+  await app.register(changeConfigRoutes);
+  await app.register(analyticsRoutes);
 };

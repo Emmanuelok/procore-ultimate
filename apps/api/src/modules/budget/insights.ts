@@ -503,7 +503,9 @@ export function detectLineAnomalies(
     });
   }
 
-  if (ev.cpi.value !== null && ev.cpi.value < thresholds.cpiFloor && line.jobToDateCosts > 0) {
+  // A CPI of exactly zero means no progress has been recorded at all; that is
+  // the cost_without_progress finding above, not a second finding here.
+  if (ev.cpi.value !== null && ev.cpi.value > 0 && ev.cpi.value < thresholds.cpiFloor && line.jobToDateCosts > 0) {
     out.push({
       kind: "cpi_below_threshold",
       severity: ev.cpi.value < 0.75 ? "high" : "medium",

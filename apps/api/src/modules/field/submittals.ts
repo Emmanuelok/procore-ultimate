@@ -15,7 +15,7 @@
  * this file accepts the seeds it produces).
  */
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
-import { and, asc, count, desc, eq, ilike, inArray, isNotNull, lt, type SQL } from "drizzle-orm";
+import { and, asc, count, desc, eq, ilike, inArray, isNotNull, isNull, lt, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import { submittalResponseCodes, submittalReviewSteps, submittals } from "@constructos/db";
 import { SUBMITTAL_STATUSES_EXTENDED, SUBMITTAL_TYPES } from "@constructos/shared";
@@ -212,12 +212,18 @@ export const submittalRoutes: FastifyPluginAsync = async (app) => {
     );
   }
 
+  /** Signed whole days from today to an ISO date: negative when it has passed. */
+  function daysUntil(isoDate: string, today: string): number {
+    return Math.round((Date.parse(`${isoDate}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000);
+  }
+
   function decorate(row: typeof submittals.$inferSelect, today: string, atRiskDays: number) {
     return {
       ...row,
       risk: submittalRisk(row, today, atRiskDays),
       label: label(row),
-      daysToSubmitBy: row.submitByDate ? -ageInDays(row.submitByDate, today) || (row.submitByDate >= today ? Math.round((Date.parse(`${row.submitByDate}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000) : 0) : null,
+      daysToSubmitBy: row.submitByDate ? daysUntil(row.submitByDate, today) : null,
+      daysInCourt: row.status === "in_review" ? ageInDays(row.submittedAt ?? row.updatedAt, today) : null,
     };
   }
 
@@ -395,7 +401,7 @@ export const submittalRoutes: FastifyPluginAsync = async (app) => {
         approved: closeout.filter((r) => r.responseCode === "approved" || r.responseCode === "approved_as_noted" || r.status === "closed").length,
         outstanding: closeout.filter((r) => (ACTIVE_STATUSES as readonly string[]).includes(r.status)).length,
       },
-      stranded: 0,
+      stranded: rows.filter((r) => r.status === "in_review" && chainIsStranded(r.status, steps.filter((s) => s.submittalId === r.id))).length,
       basis: `Turnaround measured from when a review group became current (activatedAt) to its response; in-court allowance ${settings.submittal.inCourtAllowanceDays} days; at-risk window ${settings.submittal.atRiskDays} days.`,
     };
   });
@@ -551,9 +557,10 @@ export const submittalRoutes: FastifyPluginAsync = async (app) => {
     const now = nowIso();
     const outcome = await app.db.transaction(async (tx) => {
       await tx.select({ id: submittals.id }).from(submittals).where(eq(submittals.id, submittalId)).for("update");
+      // Responded steps are history and stay; only the pending chain is replaced.
       await tx
         .delete(submittalReviewSteps)
-        .where(and(eq(submittalReviewSteps.submittalId, submittalId), eq(submittalReviewSteps.responseCode, "" ).if(false) ?? and(eq(submittalReviewSteps.submittalId, submittalId), isNullStep())));
+        .where(and(eq(submittalReviewSteps.submittalId, submittalId), isNull(submittalReviewSteps.responseCode)));
       await tx.insert(submittalReviewSteps).values(
         body.steps.map((s) => ({
           id: newId("subs"),
@@ -585,14 +592,6 @@ export const submittalRoutes: FastifyPluginAsync = async (app) => {
     const steps = await stepsOf(submittalId);
     return { items: steps, ballInCourtId: outcome.newBic ?? row.ballInCourtId };
   });
-
-  // Placeholder replaced below — keeps the "pending step" predicate in one spot.
-  function isNullStep(): SQL {
-    return isNullResponse();
-  }
-  function isNullResponse(): SQL {
-    return sqlIsNull(submittalReviewSteps.responseCode);
-  }
 
   app.post("/projects/:projectId/submittals/:submittalId/submit", { preHandler: standardGate }, async (req) => {
     const { submittalId } = req.params as { submittalId: string };
@@ -633,7 +632,10 @@ export const submittalRoutes: FastifyPluginAsync = async (app) => {
     if (!stepRow) throw notFound("Review step not found");
     const subPre = await fetchSubmittal(stepRow.submittalId, req.companyId!);
     if (req.projectId && subPre.projectId !== req.projectId) throw notFound("Review step not found");
-    await requireToolLevel(app, actorOf(req), subPre.projectId, "submittals", "standard");
+    // A reviewer is often a consultant with read-only access to the register;
+    // responding to their own step is the one write that role legitimately
+    // performs, so the gate is "read on the tool" plus "you are the reviewer".
+    await requireToolLevel(app, actorOf(req), subPre.projectId, "submittals", "read");
     const admin = isCompanyAdmin(req.companyRole) || (await hasToolAdmin(app, actorOf(req), subPre.projectId, "submittals"));
     const codes = await companyCodes(req.companyId!);
     if (!codes.some((c) => c.code === body.responseCode)) {
@@ -733,7 +735,7 @@ export const submittalRoutes: FastifyPluginAsync = async (app) => {
       const bic = group.steps[0]!.reviewerId;
       if (bic !== sub.ballInCourtId) {
         await tx.update(submittals).set({ ballInCourtId: bic, updatedAt: now }).where(eq(submittals.id, sub.id));
-        await tx.update(submittalReviewSteps).set({ activatedAt: now }).where(and(inArray(submittalReviewSteps.id, group.steps.map((s) => s.id)), sqlIsNull(submittalReviewSteps.activatedAt)));
+        await tx.update(submittalReviewSteps).set({ activatedAt: now }).where(and(inArray(submittalReviewSteps.id, group.steps.map((s) => s.id)), isNull(submittalReviewSteps.activatedAt)));
         return { action: "rebalanced" as const, sub, bic };
       }
       return { action: "none" as const, sub };
@@ -820,4 +822,3 @@ export const submittalRoutes: FastifyPluginAsync = async (app) => {
   });
 };
 
-import { isNull as sqlIsNull } from "drizzle-orm";

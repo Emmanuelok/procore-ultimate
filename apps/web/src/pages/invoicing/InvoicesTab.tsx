@@ -41,6 +41,8 @@ import {
   percent,
   periodAcceptsBilling,
   refusalFrom,
+  outstandingOf,
+  useAllPages,
   useResource,
   type InvoiceRow,
   type InvoicingContext,
@@ -277,7 +279,7 @@ function totalsByCurrency(rows: readonly InvoiceRow[]): CurrencyTotals[] {
     bucket.retainage += row.totalRetainage;
     bucket.net += row.currentPaymentDue;
     bucket.paid += row.amountPaid;
-    bucket.outstanding += row.currentPaymentDue - row.amountPaid;
+    bucket.outstanding += outstandingOf(row);
     buckets.set(key, bucket);
   }
   return [...buckets.values()]
@@ -310,9 +312,7 @@ export default function InvoicesTab({
   const [side, setSide] = useState<Side>("all");
   const [creating, setCreating] = useState(false);
 
-  const invoices = useResource<ListResponse<InvoiceRow>>(
-    `/api/v1/projects/${projectId}/invoices?page=1&pageSize=500`,
-  );
+  const invoices = useAllPages<InvoiceRow>(`/api/v1/projects/${projectId}/invoices`);
 
   const rows = useMemo(() => {
     const all = invoices.data?.items ?? [];
@@ -449,11 +449,11 @@ export default function InvoicesTab({
       {
         id: "outstanding",
         header: "Outstanding",
-        accessor: (row: InvoiceRow) => row.currentPaymentDue - row.amountPaid,
+        accessor: (row: InvoiceRow) => outstandingOf(row),
         type: "currency",
         width: 140,
         cell: (ctx) =>
-          money(ctx.row.currentPaymentDue - ctx.row.amountPaid, ctx.row.currency),
+          money(outstandingOf(ctx.row), ctx.row.currency),
       },
       {
         id: "waiver",

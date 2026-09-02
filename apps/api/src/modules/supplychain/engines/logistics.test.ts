@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   assessArrival,
   estimateTransportCarbon,
+  freeWindows,
   onTimeDelivery,
   overlaps,
   peakConcurrency,
@@ -149,5 +150,34 @@ describe("estimateTransportCarbon", () => {
   it("needs a load weight for tonne-km modes", () => {
     expect(estimateTransportCarbon({ transportMode: "sea", vehicleType: "other", transportKm: 5000, loadTonnes: null }).reasons[0]).toMatch(/load weight/);
     expect(estimateTransportCarbon({ transportMode: "sea", vehicleType: "other", transportKm: 5000, loadTonnes: 20 }).kgCo2e).toBe(1600);
+  });
+});
+
+describe("freeWindows", () => {
+  it("returns nothing for a closed gate and merges adjacent free steps", () => {
+    expect(freeWindows({ ...gate({ status: "closed" }), slotMinutes: 30 }, [], "2026-09-01")).toEqual([]);
+    const windows = freeWindows({ ...gate({ opensAt: "08:00", closesAt: "10:00" }), slotMinutes: 30 }, [], "2026-09-01");
+    expect(windows).toEqual([
+      { startsAt: "2026-09-01T08:00:00.000Z", endsAt: "2026-09-01T10:00:00.000Z", freeBays: 1, craneFree: true },
+    ]);
+  });
+
+  it("drops the steps a booking fills and marks the crane as committed", () => {
+    const windows = freeWindows(
+      { ...gate({ opensAt: "08:00", closesAt: "10:00", concurrentSlots: 2 }), slotMinutes: 30 },
+      [slot("s1", "2026-09-01T08:30:00Z", "2026-09-01T09:00:00Z", { craneRequired: true })],
+      "2026-09-01",
+    );
+    expect(windows.map((w) => [w.startsAt.slice(11, 16), w.endsAt.slice(11, 16), w.freeBays, w.craneFree])).toEqual([
+      ["08:00", "08:30", 2, true],
+      ["08:30", "09:00", 1, false],
+      ["09:00", "10:00", 2, true],
+    ]);
+    const full = freeWindows(
+      { ...gate({ opensAt: "08:00", closesAt: "09:00" }), slotMinutes: 30 },
+      [slot("s1", "2026-09-01T08:00:00Z", "2026-09-01T09:00:00Z")],
+      "2026-09-01",
+    );
+    expect(full).toEqual([]);
   });
 });

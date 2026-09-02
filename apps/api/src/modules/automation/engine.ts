@@ -210,13 +210,19 @@ export class AutomationEngine {
     }
   }
 
-  private originOf(objectType: string, objectId: string): Origin | null {
-    const o = this.origins.get(this.originKey(objectType, objectId));
+  /**
+   * Look up AND CONSUME the origin of a record. An executor marks a record
+   * immediately before its own ledger append, and that append is the very
+   * next event the hook sees for the record — so the first lookup is the
+   * attribution, and leaving the mark behind would wrongly attribute the
+   * next human edit of the same record to the rule for the rest of the TTL.
+   */
+  private takeOrigin(objectType: string, objectId: string): Origin | null {
+    const key = this.originKey(objectType, objectId);
+    const o = this.origins.get(key);
     if (!o) return null;
-    if (this.options.now().getTime() - o.at > this.options.originTtlMs) {
-      this.origins.delete(this.originKey(objectType, objectId));
-      return null;
-    }
+    this.origins.delete(key);
+    if (this.options.now().getTime() - o.at > this.options.originTtlMs) return null;
     return o;
   }
 
@@ -232,6 +238,9 @@ export class AutomationEngine {
   async onLedgerEvent(event: LedgerEvent): Promise<number> {
     this.health.eventsSeen += 1;
     if (event.objectType.startsWith(AUTOMATION_PREFIX)) return 0;
+    // Consumed before the rule lookup so a mark never outlives the event it
+    // was made for, whether or not any rule matches that event.
+    const origin = this.takeOrigin(event.objectType, event.objectId);
     try {
       const rules = await this.db
         .select()
@@ -249,7 +258,6 @@ export class AutomationEngine {
       if (rules.length === 0) return 0;
       this.health.eventsMatched += 1;
 
-      const origin = this.originOf(event.objectType, event.objectId);
       const snapshot = await loadSnapshot(this.db, event.companyId, event.objectType, event.objectId);
       const projectId = event.projectId ?? snapshot?.projectId ?? null;
       const context: AutomationRunContext = {

@@ -281,6 +281,8 @@ export interface SnapshotSummary {
   notes: string | null;
   capturedBy: string;
   capturedAt: string;
+  /** true once an admin voided the capture — it no longer guards the period */
+  void?: boolean;
 }
 
 export interface SnapshotLine {
@@ -453,6 +455,11 @@ export interface BudgetSummary {
 }
 
 export interface RecalculateResult {
+  /** platform-upgrade: the reconciliation record behind this run */
+  reconciliationId?: string;
+  reference?: string;
+  driftCount?: number;
+  driftAmount?: number;
   budgetId: string;
   currency: string;
   updatedLines: number;
@@ -1187,4 +1194,317 @@ export function SectionHeading({
       {actions ? <div className="flex shrink-0 items-center gap-2">{actions}</div> : null}
     </div>
   );
+}
+
+/* ========================================================================== */
+/* Platform-upgrade wire types — intelligence, views, ERP, contingency         */
+/* Mirrors apps/api/src/modules/budget/{intelligence,reconcile,insights}.ts   */
+/* ========================================================================== */
+
+export type InsightSeverity = "critical" | "high" | "medium" | "low" | "info";
+
+export interface InsightCitation {
+  type: "budget_line_item" | "budget_snapshot" | "schedule_task";
+  id: string;
+  reference?: string;
+}
+
+export interface InsightFinding {
+  kind: string;
+  severity: InsightSeverity;
+  lineItemId: string | null;
+  costCode: string | null;
+  title: string;
+  explanation: string;
+  inputs: Record<string, unknown>;
+  citations: InsightCitation[];
+}
+
+export interface EarnedValueLine {
+  bac: number;
+  pv: Figure;
+  ev: Figure;
+  ac: number;
+  cpi: Figure;
+  spi: Figure;
+  tcpi: Figure;
+  eacCpi: Figure;
+  eacBudgeted: Figure;
+  eacComposite: Figure;
+  eacLinear: Figure;
+  storedForecastFinal: number;
+  vac: Figure;
+  plannedFraction: number | null;
+  reasons: string[];
+}
+
+export interface InsightLineRow {
+  lineItemId: string;
+  costCode: string;
+  costType: string;
+  description: string;
+  revisedBudget: number;
+  jobToDateCosts: number;
+  percentComplete: number;
+  forecastFinal: number;
+  forecastMethod: ForecastMethod;
+  window: { taskIds: string[]; start: string | null; finish: string | null; taskPercentComplete: number | null } | null;
+  earnedValue: EarnedValueLine;
+  swing: { run: number; direction: "up" | "down" | "flat"; netMovement: number; points: Array<{ snapshotId: string; reference: string; asOfDate: string; forecastFinal: number; delta: number; share: number | null }> };
+  findings: Array<{ kind: string; severity: InsightSeverity; title: string }>;
+}
+
+export interface BudgetInsights {
+  budgetId: string;
+  currency: string;
+  asOf: string;
+  thresholds: Record<string, number>;
+  lineCount: number;
+  linesWithScheduleWindow: number;
+  earnedValue: { bac: number; ac: number; ev: Figure; pv: Figure; cpi: Figure; spi: Figure; eacCpi: Figure; vac: Figure; storedForecastFinal: number; linesWithPv: number; linesWithEv: number };
+  contingency: { drawnShare: number | null; progressShare: number | null; reasons: string[] };
+  findings: InsightFinding[];
+  findingCount: number;
+  bySeverity: Record<InsightSeverity, number>;
+  lastReconciliation: { id: string; reference: string; createdAt: string; driftCount: number; driftAmount: number; trigger: string } | null;
+  lines: InsightLineRow[];
+}
+
+export interface ReconciliationSummary {
+  id: string;
+  number: number;
+  reference: string;
+  trigger: "manual" | "scheduled";
+  runBy: string | null;
+  linesChecked: number;
+  linesUpdated: number;
+  driftCount: number;
+  driftAmount: number;
+  components: Record<string, { applied: boolean; reasons: string[] }>;
+  totals: Record<string, number>;
+  createdAt: string;
+}
+
+export interface ReconciliationDetail extends ReconciliationSummary {
+  drift: Array<{ lineItemId: string; costCode: string; costType: string; component: string; stored: number; rebuilt: number; delta: number }>;
+}
+
+export interface SourceRow {
+  sourceType: string;
+  sourceId: string;
+  reference: string;
+  description: string;
+  status: string | null;
+  currency: string;
+  amount: number;
+  excluded: string | null;
+  detail: Record<string, unknown>;
+}
+
+export interface ComponentExplanation {
+  component: string;
+  stored: number;
+  value: number | null;
+  drift: number | null;
+  rows: SourceRow[];
+  reasons: string[];
+  basis: string;
+}
+
+export interface LineTransactions {
+  lineItemId: string;
+  budgetId: string;
+  currency: string;
+  costCode: string;
+  asOf: string;
+  components: ComponentExplanation[];
+  postings: Array<{ id: string; component: string; sourceType: string; sourceId: string; sourceReference: string | null; amount: number; previousAmount: number; delta: number; basis: string | null; postedAt: string }>;
+  lastReconciliation: { id: string; reference: string; createdAt: string; driftCount: number } | null;
+}
+
+export interface VarianceGroup {
+  key: string;
+  label: string;
+  lineCount: number;
+  originalBudget: number;
+  revisedBudget: number;
+  committed: number;
+  pendingCommitments: number;
+  jobToDateCosts: number;
+  forecastFinal: number;
+  variance: number;
+  variancePct: number | null;
+  spentPct: number | null;
+  obligatedPct: number | null;
+  movement: { revisedBudget: number; jobToDateCosts: number; forecastFinal: number; variance: number } | null;
+  lines: Array<{ id: string; costCode: string; costType: string; description: string; revisedBudget: number; jobToDateCosts: number; forecastFinal: number; variance: number }>;
+}
+
+export interface VarianceReport {
+  budgetId: string;
+  currency: string;
+  asOf: string;
+  by: string;
+  lineCount: number;
+  groups: VarianceGroup[];
+  totals: BudgetTotals & { variancePct: number | null; spentPct: number | null };
+  worst: Array<{ id: string; costCode: string; description: string; variance: number; variancePct: number | null }>;
+  comparedWith: { snapshotId: string; reference: string; asOfDate: string } | null;
+  reasons: string[];
+}
+
+export interface CashFlowPeriod {
+  month: string;
+  planned: number;
+  committed: number;
+  actual: number;
+  forecast: number;
+  cumulativePlanned: number;
+  cumulativeCommitted: number;
+  cumulativeActual: number;
+  cumulativeForecast: number;
+}
+
+export interface CashFlow {
+  budgetId: string;
+  currency: string;
+  from: string;
+  to: string;
+  asOf: string;
+  periods: CashFlowPeriod[];
+  totals: { planned: number; committed: number; actual: number; forecast: number };
+  unphased: { planned: Array<{ id: string; reference: string; amount: number }>; committed: Array<{ id: string; reference: string; amount: number }>; actual: Array<{ id: string; reference: string; amount: number }> };
+  reasons: string[];
+  basis: Record<string, string>;
+}
+
+export interface CalculatedField {
+  key: string;
+  label: string;
+  expression: string;
+  format: "currency" | "number" | "percent";
+  reads?: string[];
+}
+
+export interface BudgetView {
+  id: string;
+  projectId: string;
+  budgetId: string | null;
+  name: string;
+  description: string | null;
+  isDefault: number;
+  columns: string[];
+  calculatedFields: CalculatedField[];
+  grouping: string;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface EvalResult {
+  value: number | null;
+  reasons: string[];
+}
+
+export interface ViewRowsResponse {
+  viewId: string;
+  budgetId: string;
+  currency: string;
+  columns: string[];
+  grouping: string;
+  fields: CalculatedField[];
+  errors: string[];
+  items: Array<BudgetLine & { calculated: Record<string, EvalResult> }>;
+  total: number;
+  totals: BudgetTotals;
+}
+
+export interface GlCostCodeMap {
+  id: string;
+  projectId: string | null;
+  erpSystem: string;
+  glAccount: string;
+  glSubAccount: string | null;
+  glDescription: string | null;
+  costCodeId: string;
+  costCode: string;
+  costType: CostType;
+  isActive: number;
+  createdAt: string;
+}
+
+export interface ErpDialect {
+  system: string;
+  label: string;
+  template: string;
+  accountHeaders: string[];
+  subAccountHeaders: string[];
+  amountHeaders: string[];
+}
+
+export interface ErpImportPreview {
+  dryRun: boolean;
+  budgetId: string;
+  erpSystem: string;
+  parsedRows: number;
+  unknownColumns: string[];
+  mappedLines: number;
+  unmappedRows: number;
+  unmapped: Array<{ rowNumber: number; glAccount: string; glSubAccount: string | null; amount: number; reason: string }>;
+  issues: ImportIssue[];
+  lines: Array<{ costCode: string; costType: string; description: string; originalBudget: number; glRows: number }>;
+  totalOriginalBudget: number;
+  unmappedAmount: number;
+  created?: number;
+  updated?: number;
+}
+
+export interface ContingencyLink {
+  linkId: string;
+  contingencyId: string;
+  name: string | null;
+  currency: string | null;
+  amount: number | null;
+  confidenceLevel: string | null;
+  isManagementReserve: number | null;
+  drawn: number | null;
+  notes: string | null;
+  agrees: { amount: boolean; drawn: boolean } | null;
+  reasons: string[];
+}
+
+export interface ContingencyView {
+  budgetId: string;
+  currency: string;
+  remaining: Figure;
+  totals: { original: number; drawn: number };
+  items: Array<{ lineItemId: string; costCode: string; costType: string; description: string; status: string; original: number; drawn: number; remaining: number; drawnShare: number | null; links: ContingencyLink[] }>;
+  unlinkedRiskContingencies: Array<{ id: string; name: string; currency: string; amount: number; confidenceLevel: string | null; isManagementReserve: number; drawn: number }>;
+}
+
+export const SEVERITY_TONE: Record<InsightSeverity, Tone> = {
+  critical: "danger",
+  high: "danger",
+  medium: "warning",
+  low: "info",
+  info: "neutral",
+};
+
+export const COMPONENT_LABEL: Record<string, string> = {
+  committedCost: "Committed",
+  pendingCommitments: "Pending commitments",
+  invoicedToDate: "Invoiced to date",
+  paidToDate: "Paid to date",
+  directCosts: "Direct cost",
+  jobToDateCosts: "Spent (job to date)",
+  budgetModifications: "Approved transfers",
+  approvedChanges: "Approved changes",
+  pendingBudgetChanges: "Pending changes",
+  forecastToComplete: "Forecast to complete",
+};
+
+/** A ratio such as CPI, printed to 2dp; null stays "—". */
+export function ratio(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return EM_DASH;
+  return value.toFixed(2);
 }

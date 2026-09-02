@@ -16,15 +16,22 @@ import { formatCurrency, formatNumber } from "../../ui/data";
 import { toneClass, type Tone } from "../../ui/tokens";
 import type {
   BillingView,
+  ChangeAnalytics,
+  ComplianceView,
   Component,
   ContractSummary,
   ContractView,
+  CostCodeRef,
   Identity,
   Paginated,
   PaymentApplication,
   PrimeChange,
   PrimeContract,
+  ReceiptsView,
+  ReceivablesView,
+  RetainageView,
   SovView,
+  StoredMaterialsView,
   Vendor,
 } from "./types";
 
@@ -291,18 +298,22 @@ export function RefusalPanel({
   title?: string;
 }) {
   if (!refusal) return null;
-  const segregation = refusal.control === "no_self_certification";
+  const segregation =
+    refusal.control === "no_self_certification" || refusal.control === "segregation_of_duties";
+  const gate = refusal.control === "compliance_gate";
   const currency = refusal.currency ?? "USD";
   return (
     <Alert
-      tone={segregation ? "warning" : "danger"}
+      tone={segregation || gate ? "warning" : "danger"}
       title={
         title ??
         (segregation
           ? "Segregation of duties — this control did its job"
-          : refusal.discrepancy !== null
-            ? "The schedule of values does not balance"
-            : "The server refused this")
+          : gate
+            ? "Compliance gate — a required document is missing or expired"
+            : refusal.discrepancy !== null
+              ? "The schedule of values does not balance"
+              : "The server refused this")
       }
       {...(onDismiss ? { onDismiss } : {})}
       className="mb-3"
@@ -518,6 +529,42 @@ export function useBilling(
 
 export function useVendors(): Loadable<Paginated<Vendor>> {
   return useResource<Paginated<Vendor>>("/api/v1/vendors?page=1&pageSize=200");
+}
+
+export function useCostCodes(projectId: string | undefined): Loadable<{ items: CostCodeRef[]; total: number }> {
+  return useResource<{ items: CostCodeRef[]; total: number }>(
+    projectId ? `/api/v1/projects/${projectId}/cost-codes` : null,
+  );
+}
+
+export function useCompliance(contractId: string | null): Loadable<ComplianceView> {
+  return useResource<ComplianceView>(contractId ? `/api/v1/prime-contracts/${contractId}/compliance` : null);
+}
+
+export function useStoredMaterials(contractId: string | null): Loadable<StoredMaterialsView> {
+  return useResource<StoredMaterialsView>(
+    contractId ? `/api/v1/prime-contracts/${contractId}/stored-materials` : null,
+  );
+}
+
+export function useRetainage(contractId: string | null): Loadable<RetainageView> {
+  return useResource<RetainageView>(contractId ? `/api/v1/prime-contracts/${contractId}/retainage` : null);
+}
+
+export function useReceivables(contractId: string | null): Loadable<ReceivablesView> {
+  return useResource<ReceivablesView>(contractId ? `/api/v1/prime-contracts/${contractId}/receivables` : null);
+}
+
+export function useReceipts(contractId: string | null, billingId: string | null): Loadable<ReceiptsView> {
+  return useResource<ReceiptsView>(
+    contractId && billingId ? `/api/v1/prime-contracts/${contractId}/billings/${billingId}/receipts` : null,
+  );
+}
+
+export function useChangeAnalytics(contractId: string | null): Loadable<ChangeAnalytics> {
+  return useResource<ChangeAnalytics>(
+    contractId ? `/api/v1/prime-contracts/${contractId}/changes/analytics` : null,
+  );
 }
 
 export function useAction(): {

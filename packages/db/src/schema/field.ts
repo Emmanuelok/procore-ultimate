@@ -355,6 +355,10 @@ export const photos = pgTable(
     index("photos_taken_idx").on(t.projectId, t.takenAt),
     index("photos_location_idx").on(t.projectId, t.locationId),
     index("photos_file_idx").on(t.fileId),
+    index("photos_uploader_idx").on(t.projectId, t.uploadedBy),
+    /** tag search uses jsonb containment (`tags @> '["x"]'`) — GIN serves it (#434) */
+    index("photos_tags_gin_idx").using("gin", t.tags),
+    index("photos_ai_tags_gin_idx").using("gin", t.aiTags),
   ],
 );
 

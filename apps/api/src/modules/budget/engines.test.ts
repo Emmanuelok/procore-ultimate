@@ -268,7 +268,9 @@ describe("cashflow.ts — S-curve spreading", () => {
     });
     expect(flow.periods.map((p) => p.month)).toEqual(["2026-01", "2026-02", "2026-03", "2026-04"]);
     expect(flow.totals.planned).toBe(1_200);
-    expect(flow.periods[1]?.committed).toBe(600);
+    // SC-001 lands wholly in February; SC-002 (no dates) is spread over the
+    // default 120-day window, 28 of which fall in February: 100 × 28 / 120.
+    expect(flow.periods[1]?.committed).toBe(623.33);
     expect(flow.periods[1]?.actual).toBe(300);
     expect(flow.periods[3]?.cumulativePlanned).toBe(1_200);
     // forecast = actual to date (300) + FTC spread over 15 Mar → 30 Apr (900)

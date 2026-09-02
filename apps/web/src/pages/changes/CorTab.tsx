@@ -409,6 +409,24 @@ function CorDrawer({
                 Mark under review
               </Button>
             ) : null}
+            {cor && ["submitted", "under_review", "negotiating", "revise_and_resubmit", "rejected"].includes(cor.status) ? (
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => void act("revise", { reason: "Revised for resubmission" }, "Back to draft for revision.")}
+              >
+                Revise
+              </Button>
+            ) : null}
+            {cor && ["draft", "submitted", "under_review", "negotiating", "revise_and_resubmit"].includes(cor.status) && !cor.changeOrderPackageId ? (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => void act("withdraw", {}, "Withdrawn — its PCOs are free to be re-requested.")}
+              >
+                Withdraw
+              </Button>
+            ) : null}
             {cor && ["submitted", "under_review", "negotiating"].includes(cor.status) ? (
               <>
                 <Button size="sm" variant="secondary" onClick={() => setNegotiating(true)}>

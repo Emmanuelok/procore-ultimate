@@ -344,52 +344,47 @@ export const automationModule: FastifyPluginAsync = async (app) => {
     return serializeRule(row!);
   }
 
-  async function summaryFor(companyId: string, projectFilter: SQL | undefined, now: Date) {
+  /**
+   * Rule and run counts for the caller's view. `visible` is the project list
+   * the caller may see (null = every project); company-wide rules and runs
+   * (projectId null) are always included.
+   */
+  async function summaryFor(companyId: string, visible: string[] | null, now: Date) {
     const dayAgo = new Date(now.getTime() - 86_400_000).toISOString();
+    const ruleScope = projectScope(automationRules.projectId, visible);
+    const runScope = projectScope(automationRuns.projectId, visible);
     const ruleRows = await app.db
       .select({ status: automationRules.status, n: count() })
       .from(automationRules)
-      .where(and(eq(automationRules.companyId, companyId), projectFilter))
+      .where(and(eq(automationRules.companyId, companyId), ruleScope))
       .groupBy(automationRules.status);
     const rulesByStatus: Record<string, number> = {};
     for (const s of AUTOMATION_RULE_STATUSES) rulesByStatus[s] = 0;
     for (const r of ruleRows) rulesByStatus[r.status] = Number(r.n);
     const runRows = await app.db
-      .select({ status: automationRuns.status, n: count() })
+      .select({ status: automationRuns.status, n: count(), actions: sql<number>`coalesce(sum(${automationRuns.actionCount}), 0)` })
       .from(automationRuns)
-      .where(
-        and(
-          eq(automationRuns.companyId, companyId),
-          gte(automationRuns.createdAt, dayAgo),
-          projectFilter ? projectScope(automationRuns.projectId, await projectIdsOf(projectFilter)) : undefined,
-        ),
-      )
+      .where(and(eq(automationRuns.companyId, companyId), gte(automationRuns.createdAt, dayAgo), runScope))
       .groupBy(automationRuns.status);
     const runs24h: Record<string, number> = {};
     for (const s of AUTOMATION_RUN_STATUSES) runs24h[s] = 0;
-    for (const r of runRows) runs24h[r.status] = Number(r.n);
-    const [actions] = await app.db
-      .select({ n: sql<number>`coalesce(sum(${automationRuns.actionCount}), 0)` })
+    let actions24h = 0;
+    for (const r of runRows) {
+      runs24h[r.status] = Number(r.n);
+      actions24h += Number(r.actions ?? 0);
+    }
+    const [queuedRow] = await app.db
+      .select({ n: count() })
       .from(automationRuns)
-      .where(and(eq(automationRuns.companyId, companyId), gte(automationRuns.createdAt, dayAgo)));
+      .where(and(eq(automationRuns.companyId, companyId), eq(automationRuns.status, "queued"), runScope));
     return {
       generatedAt: now.toISOString(),
       rulesByStatus,
       runs24h,
-      actions24h: Number(actions?.n ?? 0),
-      queued: runs24h["queued"] ?? 0,
+      actions24h,
+      /** every run still waiting, whatever its age */
+      queued: Number(queuedRow?.n ?? 0),
     };
-  }
-
-  // A small indirection so summaryFor can reuse the visibility list already
-  // computed by the caller; the SQL passed in is only ever the projectScope().
-  const scopeCache = new WeakMap<SQL, string[] | null>();
-  async function projectIdsOf(scope: SQL): Promise<string[] | null> {
-    return scopeCache.get(scope) ?? null;
-  }
-  function rememberScope(scope: SQL | undefined, ids: string[] | null): SQL | undefined {
-    if (scope) scopeCache.set(scope, ids);
-    return scope;
   }
 
   /* ---------------------------------------------------------------- */
@@ -600,8 +595,7 @@ export const automationModule: FastifyPluginAsync = async (app) => {
 
   app.get("/automation/summary", { preHandler: memberGate }, async (req) => {
     const visible = await visibleProjectIds(req);
-    const scope = rememberScope(projectScope(automationRules.projectId, visible), visible);
-    return summaryFor(req.companyId!, scope, new Date());
+    return summaryFor(req.companyId!, visible, new Date());
   });
 
   app.get("/automation/status", { preHandler: adminGate }, async () => ({
@@ -766,8 +760,7 @@ export const automationModule: FastifyPluginAsync = async (app) => {
   });
 
   app.get("/projects/:projectId/automation/summary", { preHandler: projectRead }, async (req) => {
-    const scope = rememberScope(or(eq(automationRules.projectId, req.projectId!), isNull(automationRules.projectId)), [req.projectId!]);
-    return summaryFor(req.companyId!, scope, new Date());
+    return summaryFor(req.companyId!, [req.projectId!], new Date());
   });
 
   /** Plan §3.5 — what the intelligence layer reads about this project's automation. */

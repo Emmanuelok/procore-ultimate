@@ -21,6 +21,7 @@ import {
   type AgingBucket,
 } from "./arithmetic.js";
 import {
+  outstandingOf,
   CENT,
   LIVE_INVOICE_STATUSES,
   byCurrency,
@@ -75,7 +76,7 @@ function ageInvoice(
   asOf: string,
   vendorName: Map<string, string>,
 ): AgedInvoice | UnagedInvoice {
-  const outstanding = round2(inv.currentPaymentDue - inv.amountPaid);
+  const outstanding = outstandingOf(inv);
   const anchor = inv.dueDate ?? inv.billingDate;
   if (!anchor) {
     return {
@@ -203,7 +204,7 @@ export const reportRoutes: FastifyPluginAsync = async (app) => {
     return rows.filter(
       (i) =>
         (LIVE_INVOICE_STATUSES as readonly string[]).includes(i.status) &&
-        i.currentPaymentDue - i.amountPaid > CENT,
+        outstandingOf(i) > CENT,
     );
   }
 
@@ -412,7 +413,7 @@ export const reportRoutes: FastifyPluginAsync = async (app) => {
     };
 
     for (const inv of live) {
-      const outstanding = round2(inv.currentPaymentDue - inv.amountPaid);
+      const outstanding = outstandingOf(inv);
       if (outstanding <= CENT) continue;
       const s = slice(inv.currency);
       const anchor = inv.dueDate ?? inv.billingDate;

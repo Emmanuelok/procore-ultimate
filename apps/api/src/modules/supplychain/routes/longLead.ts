@@ -33,6 +33,7 @@ import {
   ledger,
   loadTask,
   nowISO,
+  patchSchemaOf,
   patchSet,
   todayISO,
 } from "../shared.js";
@@ -65,7 +66,7 @@ const itemBodySchema = z.object({
   expeditingOwnerId: idSchema.nullable().optional(),
 });
 
-const itemPatchSchema = itemBodySchema.partial();
+const itemPatchSchema = patchSchemaOf(itemBodySchema);
 
 const listSchema = pageQuerySchema.extend({
   status: z.enum(LONG_LEAD_STATUSES).optional(),

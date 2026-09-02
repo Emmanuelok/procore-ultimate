@@ -872,6 +872,7 @@ CREATE TABLE "tax_determinations" (
 	"contract_type" text NOT NULL,
 	"amount" double precision NOT NULL,
 	"currency" text NOT NULL,
+	"tax_point_date" text,
 	"inputs" jsonb DEFAULT '{}'::jsonb NOT NULL,
 	"vat_treatment" text NOT NULL,
 	"vat_rate" double precision DEFAULT 0 NOT NULL,
@@ -1544,6 +1545,7 @@ CREATE INDEX "tax_determinations_project_idx" ON "tax_determinations" USING btre
 CREATE INDEX "tax_determinations_source_idx" ON "tax_determinations" USING btree ("source_type","source_id","source_line_id");--> statement-breakpoint
 CREATE INDEX "tax_determinations_vendor_idx" ON "tax_determinations" USING btree ("vendor_id");--> statement-breakpoint
 CREATE INDEX "tax_determinations_company_idx" ON "tax_determinations" USING btree ("company_id","created_at");--> statement-breakpoint
+CREATE INDEX "tax_determinations_tax_point_idx" ON "tax_determinations" USING btree ("project_id","tax_point_date");--> statement-breakpoint
 CREATE UNIQUE INDEX "tax_periods_uq" ON "tax_periods" USING btree ("project_id","regime","return_kind","period_start");--> statement-breakpoint
 CREATE INDEX "tax_periods_project_idx" ON "tax_periods" USING btree ("project_id","status");--> statement-breakpoint
 CREATE INDEX "tax_periods_due_idx" ON "tax_periods" USING btree ("status","due_date");--> statement-breakpoint
@@ -1561,6 +1563,7 @@ CREATE INDEX "withholding_certificates_period_idx" ON "withholding_certificates"
 CREATE UNIQUE INDEX "delivery_slots_uq" ON "delivery_slots" USING btree ("project_id","number");--> statement-breakpoint
 CREATE INDEX "delivery_slots_gate_idx" ON "delivery_slots" USING btree ("gate_id","starts_at");--> statement-breakpoint
 CREATE INDEX "delivery_slots_project_idx" ON "delivery_slots" USING btree ("project_id","status","starts_at");--> statement-breakpoint
+CREATE INDEX "delivery_slots_company_status_idx" ON "delivery_slots" USING btree ("company_id","status","ends_at");--> statement-breakpoint
 CREATE INDEX "delivery_slots_task_idx" ON "delivery_slots" USING btree ("schedule_task_id");--> statement-breakpoint
 CREATE INDEX "delivery_slots_item_idx" ON "delivery_slots" USING btree ("long_lead_item_id");--> statement-breakpoint
 CREATE INDEX "factory_inspections_project_idx" ON "factory_inspections" USING btree ("project_id","result");--> statement-breakpoint
@@ -1573,6 +1576,7 @@ CREATE INDEX "long_lead_items_task_idx" ON "long_lead_items" USING btree ("sched
 CREATE INDEX "long_lead_items_order_by_idx" ON "long_lead_items" USING btree ("company_id","order_by_date");--> statement-breakpoint
 CREATE UNIQUE INDEX "material_trace_records_uq" ON "material_trace_records" USING btree ("project_id","number");--> statement-breakpoint
 CREATE INDEX "material_trace_project_idx" ON "material_trace_records" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "material_trace_company_idx" ON "material_trace_records" USING btree ("company_id","status");--> statement-breakpoint
 CREATE INDEX "material_trace_heat_idx" ON "material_trace_records" USING btree ("company_id","heat_number");--> statement-breakpoint
 CREATE INDEX "material_trace_batch_idx" ON "material_trace_records" USING btree ("company_id","batch_number");--> statement-breakpoint
 CREATE INDEX "material_trace_location_idx" ON "material_trace_records" USING btree ("installed_location_id");--> statement-breakpoint
@@ -1580,6 +1584,7 @@ CREATE INDEX "material_trace_item_idx" ON "material_trace_records" USING btree (
 CREATE INDEX "offsite_stages_unit_idx" ON "offsite_production_stages" USING btree ("unit_id","position");--> statement-breakpoint
 CREATE UNIQUE INDEX "offsite_units_uq" ON "offsite_units" USING btree ("project_id","number");--> statement-breakpoint
 CREATE INDEX "offsite_units_project_idx" ON "offsite_units" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "offsite_units_company_idx" ON "offsite_units" USING btree ("company_id","status");--> statement-breakpoint
 CREATE INDEX "offsite_units_factory_idx" ON "offsite_units" USING btree ("factory_node_id");--> statement-breakpoint
 CREATE INDEX "offsite_units_task_idx" ON "offsite_units" USING btree ("schedule_task_id");--> statement-breakpoint
 CREATE INDEX "site_gates_project_idx" ON "site_gates" USING btree ("project_id","status");--> statement-breakpoint
@@ -1616,6 +1621,9 @@ CREATE INDEX "photos_album_idx" ON "photos" USING btree ("project_id","album");-
 CREATE INDEX "photos_taken_idx" ON "photos" USING btree ("project_id","taken_at");--> statement-breakpoint
 CREATE INDEX "photos_location_idx" ON "photos" USING btree ("project_id","location_id");--> statement-breakpoint
 CREATE INDEX "photos_file_idx" ON "photos" USING btree ("file_id");--> statement-breakpoint
+CREATE INDEX "photos_uploader_idx" ON "photos" USING btree ("project_id","uploaded_by");--> statement-breakpoint
+CREATE INDEX "photos_tags_gin_idx" ON "photos" USING gin ("tags");--> statement-breakpoint
+CREATE INDEX "photos_ai_tags_gin_idx" ON "photos" USING gin ("ai_tags");--> statement-breakpoint
 CREATE INDEX "punch_items_status_idx" ON "punch_items" USING btree ("project_id","status");--> statement-breakpoint
 CREATE INDEX "punch_items_location_idx" ON "punch_items" USING btree ("project_id","location_id");--> statement-breakpoint
 CREATE INDEX "punch_items_due_idx" ON "punch_items" USING btree ("project_id","status","due_date");--> statement-breakpoint

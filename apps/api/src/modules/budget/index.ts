@@ -1,18 +1,22 @@
 import type { FastifyInstance, FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
-import { and, asc, count, desc, eq, inArray, isNotNull } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, isNotNull, ne } from "drizzle-orm";
 import { z } from "zod";
 import {
   budgetChanges,
+  budgetContingencyLinks,
   budgetForecasts,
   budgetLineItems,
   budgetSnapshots,
   budgets,
+  changeLineItems,
   changeOrderPackages,
   commitmentSovLines,
-  commitments,
+  contingencyDrawdowns,
   costCodes,
+  glCostCodeMaps,
   invoiceLineItems,
-  invoices,
+  primeContractChanges,
+  primeContractSovLines,
   wbsSegments,
 } from "@constructos/db";
 import {
@@ -24,16 +28,16 @@ import {
   BUDGET_SNAPSHOT_KINDS,
   BUDGET_STATUSES,
   COST_TYPES,
+  ERP_SYSTEMS,
   FORECAST_METHODS,
   type BudgetChangeKind,
   type CostType,
-  type ForecastMethod,
   type PermissionLevel,
 } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
-import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
+import { AppError, badRequest, conflict, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import type { Db } from "../../lib/db.js";
 // The CSV reader is the ingestion module's, not a second one written here:
@@ -55,7 +59,6 @@ import {
   round2,
   round4,
   snapshotContentHash,
-  sumInCurrency,
   unavailable,
   type ChangeLeg,
   type Component,
@@ -63,6 +66,32 @@ import {
   type RollupLine,
   type SnapshotLine,
 } from "./calc.js";
+// The derived-column arithmetic is shared with the reconciliation engine so
+// a PATCH and the nightly rebuild write the same number for the same inputs.
+import { derivedColumns } from "./derive.js";
+import { mapErpRows, parseErpRows } from "./erp.js";
+import { budgetIntelligenceRoutes } from "./intelligence.js";
+import {
+  computeJobToDate,
+  readCommitmentSources,
+  readInvoicedSources,
+  readPaidSources,
+  runReconciliation,
+} from "./reconcile.js";
+import {
+  fetchBudget as fetchBudgetRow,
+  fetchLineWithBudget as fetchLineWithBudgetRow,
+  isVoidSnapshot,
+  latestSnapshot as latestLiveSnapshot,
+  linesOfBudget as linesOfBudgetRows,
+  nowIso,
+  pad3,
+  requireBudgetLevel as requireBudgetToolLevel,
+  today,
+  type BudgetRow,
+  type LineRow,
+  type SnapshotRow,
+} from "./shared.js";
 
 /* ------------------------------------------------------------------ */
 /* Wire schemas                                                        */
@@ -155,6 +184,16 @@ const csvImportSchema = z.object({
   mode: z.enum(["create", "upsert"]).optional(),
 });
 
+/** ERP import (#481): a GL export mapped through the company's GL → cost-code map. */
+const erpImportSchema = z.object({
+  csv: z.string().min(1).max(4 * 1024 * 1024),
+  erpSystem: z.enum(ERP_SYSTEMS).optional(),
+  dryRun: z.boolean().optional(),
+  mode: z.enum(["create", "upsert"]).optional(),
+});
+
+const snapshotVoidSchema = z.object({ reason: z.string().min(1).max(2000) });
+
 const changeLegSchema = z.object({
   lineItemId: idRef,
   amount: money,
@@ -238,23 +277,15 @@ const forecastPreviewQuery = z.object({
 /* Row types + local helpers                                           */
 /* ------------------------------------------------------------------ */
 
-type BudgetRow = typeof budgets.$inferSelect;
-type LineRow = typeof budgetLineItems.$inferSelect;
 type ChangeRow = typeof budgetChanges.$inferSelect;
-type SnapshotRow = typeof budgetSnapshots.$inferSelect;
 type ForecastRow = typeof budgetForecasts.$inferSelect;
 
-const pad3 = (n: number): string => String(n).padStart(3, "0");
-const today = (): string => new Date().toISOString().slice(0, 10);
-const nowIso = (): string => new Date().toISOString();
-
-/** Commitment statuses that count as committed cost vs. still-pending exposure. */
-const COMMITTED_STATUSES = ["approved", "complete"] as const;
-const PENDING_COMMITMENT_STATUSES = ["draft", "out_for_bid", "out_for_signature"] as const;
-/** Subcontractor invoice statuses that represent cost actually incurred. */
-const INCURRED_INVOICE_STATUSES = ["approved", "approved_as_noted", "paid"] as const;
 /** Rows per multi-value INSERT on the bulk/CSV import path. */
 const INSERT_CHUNK = 500;
+
+/** The one SoD control this module applies; the web renders it as "the control did its job". */
+const SOD_CONTROL = { control: "segregation_of_duties" } as const;
+const segregation = (message: string): AppError => new AppError(403, message, SOD_CONTROL);
 
 /** Cost-report projection of a line row — the exact shape calc.ts consumes. */
 const amountsOf = (l: LineRow): LineAmounts => ({
@@ -364,15 +395,12 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
    * is injected into params, and the standard gate runs — so a sub-resource
    * write enforces exactly the same budget tool level as a project route.
    */
-  async function requireBudgetLevel(
+  const requireBudgetLevel = (
     req: FastifyRequest,
     reply: FastifyReply,
     projectId: string,
     level: PermissionLevel,
-  ): Promise<void> {
-    (req.params as Record<string, string | undefined>)["projectId"] = projectId;
-    await (app as FastifyInstance).requireTool("budget", level)(req, reply);
-  }
+  ): Promise<void> => requireBudgetToolLevel(app as FastifyInstance, req, reply, projectId, level);
 
   async function ledger(
     req: FastifyRequest,
@@ -396,29 +424,14 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
   /* Fetch helpers                                                     */
   /* ---------------------------------------------------------------- */
 
-  async function fetchBudget(budgetId: string, companyId: string): Promise<BudgetRow> {
-    const rows = await app.db
-      .select()
-      .from(budgets)
-      .where(and(eq(budgets.id, budgetId), eq(budgets.companyId, companyId)))
-      .limit(1);
-    if (!rows[0]) throw notFound("Budget not found");
-    return rows[0];
-  }
+  const fetchBudget = (budgetId: string, companyId: string): Promise<BudgetRow> =>
+    fetchBudgetRow(app.db, budgetId, companyId);
 
-  async function fetchLineWithBudget(
+  const fetchLineWithBudget = (
     lineId: string,
     companyId: string,
-  ): Promise<{ line: LineRow; budget: BudgetRow }> {
-    const rows = await app.db
-      .select({ line: budgetLineItems, budget: budgets })
-      .from(budgetLineItems)
-      .innerJoin(budgets, eq(budgets.id, budgetLineItems.budgetId))
-      .where(and(eq(budgetLineItems.id, lineId), eq(budgetLineItems.companyId, companyId)))
-      .limit(1);
-    if (!rows[0]) throw notFound("Budget line item not found");
-    return rows[0];
-  }
+  ): Promise<{ line: LineRow; budget: BudgetRow }> =>
+    fetchLineWithBudgetRow(app.db, lineId, companyId);
 
   async function fetchChangeWithBudget(
     changeId: string,
@@ -448,12 +461,7 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
     return rows[0];
   }
 
-  const linesOfBudget = (budgetId: string) =>
-    app.db
-      .select()
-      .from(budgetLineItems)
-      .where(eq(budgetLineItems.budgetId, budgetId))
-      .orderBy(asc(budgetLineItems.sortOrder), asc(budgetLineItems.costCode));
+  const linesOfBudget = (budgetId: string): Promise<LineRow[]> => linesOfBudgetRows(app.db, budgetId);
 
   /* ---------------------------------------------------------------- */
   /* Cost-code / WBS binding                                           */
@@ -572,15 +580,9 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
   /* Period guards                                                     */
   /* ---------------------------------------------------------------- */
 
-  async function latestSnapshot(budgetId: string): Promise<SnapshotRow | null> {
-    const rows = await app.db
-      .select()
-      .from(budgetSnapshots)
-      .where(eq(budgetSnapshots.budgetId, budgetId))
-      .orderBy(desc(budgetSnapshots.asOfDate), desc(budgetSnapshots.number))
-      .limit(1);
-    return rows[0] ?? null;
-  }
+  /** The latest LIVE capture — a voided capture no longer guards a period. */
+  const latestSnapshot = (budgetId: string): Promise<SnapshotRow | null> =>
+    latestLiveSnapshot(app.db, budgetId);
 
   /**
    * A snapshot is the answer to "what did the budget say at month end", and
@@ -630,48 +632,8 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
   /* Derived-column maintenance                                        */
   /* ---------------------------------------------------------------- */
 
-  interface SettledForecast {
-    forecastToComplete: number;
-    /** why the line's method could not be applied; empty when it was */
-    reasons: string[];
-  }
-
-  /**
-   * Re-derive a line's forecast with its own recorded method. When the method
-   * cannot be applied (no progress recorded, no quantity on a measured
-   * method) the PREVIOUS figure is retained and the reason is handed back to
-   * the caller to surface — a stored cost column is never quietly replaced
-   * with a number the inputs do not support.
-   */
-  function settleForecast(
-    line: LineAmounts & { forecastMethod: string; forecastToComplete: number },
-    override?: number,
-  ): SettledForecast {
-    if (override !== undefined) return { forecastToComplete: round2(override), reasons: [] };
-    const result = computeForecast(line.forecastMethod as ForecastMethod, line);
-    if (result.forecastToComplete === null) {
-      return { forecastToComplete: line.forecastToComplete, reasons: result.reasons };
-    }
-    return { forecastToComplete: result.forecastToComplete, reasons: [] };
-  }
-
-  /** Everything derivable from a line's stored inputs, ready to persist. */
-  function derivedColumns(
-    line: LineAmounts & { forecastMethod: string; forecastToComplete: number },
-    override?: number,
-  ): { set: Record<string, unknown>; reasons: string[] } {
-    const settled = settleForecast(line, override);
-    const derived = deriveLine(line, settled.forecastToComplete);
-    return {
-      set: {
-        revisedBudget: derived.revisedBudget,
-        forecastToComplete: derived.forecastToComplete,
-        forecastFinal: derived.forecastFinal,
-        projectedOverUnder: derived.projectedOverUnder,
-      },
-      reasons: settled.reasons,
-    };
-  }
+  /* settleForecast / derivedColumns live in ./derive.ts — shared with the
+     reconciliation engine so both writers produce the same number. */
 
   /**
    * Recompute the budget's materialized rollups from its lines. Called after
@@ -935,7 +897,10 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
         "This budget has immutable period captures against it and cannot be deleted.",
       );
     }
+    const lineIds = (await linesOfBudget(budgetId)).map((l) => l.id);
+    await assertLinesUnreferenced(lineIds, `Budget ${budget.reference}`);
     await app.db.transaction(async (tx) => {
+      await tx.delete(budgetContingencyLinks).where(eq(budgetContingencyLinks.budgetId, budgetId));
       await tx.delete(budgetForecasts).where(eq(budgetForecasts.budgetId, budgetId));
       await tx.delete(budgetChanges).where(eq(budgetChanges.budgetId, budgetId));
       await tx.delete(budgetLineItems).where(eq(budgetLineItems.budgetId, budgetId));
@@ -976,7 +941,48 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
   interface PreparedLine {
     values: typeof budgetLineItems.$inferInsert;
     reasons: string[];
+    /** the fields the caller actually supplied — an upsert overwrites only these */
+    provided: Set<ProvidedField>;
   }
+
+  type ProvidedField =
+    | "originalBudget"
+    | "quantity"
+    | "unitRate"
+    | "directCosts"
+    | "jobToDateCosts"
+    | "percentComplete"
+    | "forecastMethod"
+    | "forecastToComplete"
+    | "description"
+    | "unit"
+    | "wbsPath"
+    | "subJob"
+    | "lineKind"
+    | "notes"
+    | "sortOrder"
+    | "status"
+    | "detail";
+
+  const PROVIDABLE: readonly ProvidedField[] = [
+    "originalBudget",
+    "quantity",
+    "unitRate",
+    "directCosts",
+    "jobToDateCosts",
+    "percentComplete",
+    "forecastMethod",
+    "forecastToComplete",
+    "description",
+    "unit",
+    "wbsPath",
+    "subJob",
+    "lineKind",
+    "notes",
+    "sortOrder",
+    "status",
+    "detail",
+  ];
 
   function prepareLine(
     budget: BudgetRow,
@@ -1010,7 +1016,11 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
       forecastToComplete: 0,
     };
     const derived = derivedColumns(amounts, body.forecastToComplete);
+    const provided = new Set<ProvidedField>(
+      PROVIDABLE.filter((k) => (body as Record<string, unknown>)[k] !== undefined),
+    );
     return {
+      provided,
       values: {
         id: newId("bli"),
         budgetId: budget.id,
@@ -1163,8 +1173,21 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
     const { line, budget } = await fetchLineWithBudget(lineId, req.companyId!);
     await requireBudgetLevel(req, reply, budget.projectId, "standard");
     if (budget.status === "closed") throw conflict("A closed budget cannot be edited.");
-    if (line.status === "locked" && Object.keys(body).length > 0) {
-      throw conflict(`Line ${line.costCode} is locked and cannot be edited.`);
+    const bodyKeys = Object.keys(body);
+    if (line.status === "locked" && bodyKeys.length > 0) {
+      // A locked line is frozen while one cost code is under audit; the one
+      // edit it accepts is the unlock itself, and only from a budget admin.
+      const statusOnly = bodyKeys.length === 1 && body.status !== undefined;
+      if (!statusOnly) {
+        throw conflict(
+          `Line ${line.costCode} is locked and cannot be edited. Unlock it first (a budget ` +
+            "admin may PATCH { status } alone).",
+        );
+      }
+      await requireBudgetLevel(req, reply, budget.projectId, "admin");
+    }
+    if (line.status !== "locked" && body.status === "locked") {
+      await requireBudgetLevel(req, reply, budget.projectId, "admin");
     }
 
     // Plan columns freeze at lock/capture; actuals and progress keep moving.
@@ -1244,8 +1267,14 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
     set["jobToDateCosts"] = jobToDateCosts;
     const percentComplete = round4(body.percentComplete ?? line.percentComplete);
     set["percentComplete"] = percentComplete;
-    const forecastMethod = body.forecastMethod ?? line.forecastMethod;
+    // A typed forecast-to-complete is a MANUAL forecast. Leaving the stored
+    // method as a formula would let the next recalculation silently replace
+    // the typed figure; the method flips so the override survives and is
+    // labelled as what it is.
+    const forecastMethod =
+      body.forecastMethod ?? (body.forecastToComplete !== undefined ? "manual" : line.forecastMethod);
     set["forecastMethod"] = forecastMethod;
+    const forecastMethodFlipped = forecastMethod !== line.forecastMethod && body.forecastMethod === undefined;
 
     const derived = derivedColumns(
       {
@@ -1277,17 +1306,71 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
       .from(budgetLineItems)
       .where(eq(budgetLineItems.id, lineId))
       .limit(1);
+    const notices = [
+      ...derived.reasons,
+      ...(forecastMethodFlipped
+        ? ["The typed forecast to complete was recorded as a manual forecast — the line's method changed to 'manual' so a later recalculation keeps it."]
+        : []),
+    ];
     return {
       ...updated[0],
-      forecastNotice: derived.reasons.length > 0 ? derived.reasons : undefined,
+      forecastNotice: notices.length > 0 ? notices : undefined,
     };
   });
+
+  /**
+   * Nothing on the platform may point at a budget line that no longer
+   * exists: commitment and prime SOV lines, invoice lines and change lines
+   * all carry `budgetLineItemId` without a database FK. Deleting under them
+   * silently turns their cost into "unmapped" on the next reconciliation,
+   * so the delete is refused and the references are named.
+   */
+  async function assertLinesUnreferenced(lineIds: readonly string[], what: string): Promise<void> {
+    if (lineIds.length === 0) return;
+    const ids = [...lineIds];
+    const [csov, psov, ivl, chl] = await Promise.all([
+      app.db
+        .select({ id: commitmentSovLines.id, lineNumber: commitmentSovLines.lineNumber, parent: commitmentSovLines.commitmentId })
+        .from(commitmentSovLines)
+        .where(inArray(commitmentSovLines.budgetLineItemId, ids)),
+      app.db
+        .select({ id: primeContractSovLines.id, lineNumber: primeContractSovLines.lineNumber, parent: primeContractSovLines.primeContractId })
+        .from(primeContractSovLines)
+        .where(inArray(primeContractSovLines.budgetLineItemId, ids)),
+      app.db
+        .select({ id: invoiceLineItems.id, lineNumber: invoiceLineItems.lineNumber, parent: invoiceLineItems.invoiceId })
+        .from(invoiceLineItems)
+        .where(inArray(invoiceLineItems.budgetLineItemId, ids)),
+      app.db
+        .select({ id: changeLineItems.id, lineNumber: changeLineItems.id, parent: changeLineItems.parentId })
+        .from(changeLineItems)
+        .where(inArray(changeLineItems.budgetLineItemId, ids)),
+    ]);
+    const references = [
+      ...csov.map((r) => ({ table: "commitment_sov_lines", id: r.id, parentId: r.parent })),
+      ...psov.map((r) => ({ table: "prime_contract_sov_lines", id: r.id, parentId: r.parent })),
+      ...ivl.map((r) => ({ table: "invoice_line_items", id: r.id, parentId: r.parent })),
+      ...chl.map((r) => ({ table: "change_line_items", id: r.id, parentId: r.parent })),
+    ];
+    if (references.length > 0) {
+      const byTable = new Map<string, number>();
+      for (const r of references) byTable.set(r.table, (byTable.get(r.table) ?? 0) + 1);
+      throw new AppError(
+        409,
+        `${what} is referenced by ${references.length} record(s) elsewhere on the platform (${[...byTable.entries()]
+          .map(([t, n]) => `${n} ${t}`)
+          .join(", ")}) and cannot be deleted — recode those records first, or close the line instead.`,
+        { references: references.slice(0, 100) },
+      );
+    }
+  }
 
   app.delete("/budget-lines/:lineId", { preHandler: companyGate }, async (req, reply) => {
     const { lineId } = req.params as { lineId: string };
     const { line, budget } = await fetchLineWithBudget(lineId, req.companyId!);
     await requireBudgetLevel(req, reply, budget.projectId, "admin");
     await assertPlanEditable(budget);
+    await assertLinesUnreferenced([lineId], `Line ${line.costCode} / ${line.costType}`);
     const withLeg = (
       await app.db
         .select({ id: budgetChanges.id, reference: budgetChanges.reference, lines: budgetChanges.lines })
@@ -1307,6 +1390,7 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
       );
     }
     await app.db.transaction(async (tx) => {
+      await tx.delete(budgetContingencyLinks).where(eq(budgetContingencyLinks.budgetLineItemId, lineId));
       await tx.delete(budgetForecasts).where(eq(budgetForecasts.lineItemId, lineId));
       await tx.delete(budgetLineItems).where(eq(budgetLineItems.id, lineId));
     });
@@ -1335,9 +1419,15 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
    * written in one transaction: a half-imported budget is worse than a
    * refused one, because nobody knows which half they are looking at.
    */
+  interface PreparedForWrite {
+    rowNumber: number;
+    values: typeof budgetLineItems.$inferInsert;
+    provided: Set<ProvidedField>;
+  }
+
   async function writeLines(
     budget: BudgetRow,
-    prepared: { rowNumber: number; values: typeof budgetLineItems.$inferInsert }[],
+    prepared: PreparedForWrite[],
     mode: "create" | "upsert",
     actorId: string,
   ): Promise<{ created: number; updated: number; issues: ImportIssue[] }> {
@@ -1381,23 +1471,50 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
         const key = `${item.values.costCode} ${item.values.costType as string}`;
         const clash = byKey.get(key);
         if (clash) {
+          // An upsert overwrites ONLY the fields the row supplied. A blank
+          // cell is "unchanged", never 0 — and the measured identity
+          // originalBudget = quantity × unitRate is re-derived over the
+          // MERGED quantity/rate, so a file that supplies only a quantity
+          // cannot leave a line whose budget disagrees with its extension.
+          const has = (k: ProvidedField): boolean => item.provided.has(k);
+          const quantity = has("quantity") ? (item.values.quantity ?? null) : clash.quantity;
+          const unitRate = has("unitRate") ? (item.values.unitRate ?? null) : clash.unitRate;
+          const originalBudget = resolveLineAmount(
+            quantity,
+            unitRate,
+            has("originalBudget") ? (item.values.originalBudget ?? 0) : undefined,
+            clash.originalBudget,
+          );
+          const directCosts = has("directCosts") ? (item.values.directCosts ?? 0) : clash.directCosts;
+          const jobToDateCosts = has("jobToDateCosts")
+            ? (item.values.jobToDateCosts ?? 0)
+            : has("directCosts")
+              ? round2(clash.jobToDateCosts - clash.directCosts + directCosts)
+              : clash.jobToDateCosts;
           const merged: LineAmounts & { forecastMethod: string; forecastToComplete: number } = {
             ...amountsOf(clash),
-            originalBudget: item.values.originalBudget ?? clash.originalBudget,
-            directCosts: item.values.directCosts ?? clash.directCosts,
-            jobToDateCosts: item.values.jobToDateCosts ?? clash.jobToDateCosts,
-            percentComplete: item.values.percentComplete ?? clash.percentComplete,
-            quantity: item.values.quantity ?? clash.quantity,
-            unitRate: item.values.unitRate ?? clash.unitRate,
-            forecastMethod: (item.values.forecastMethod ?? clash.forecastMethod) as string,
+            originalBudget,
+            directCosts,
+            jobToDateCosts,
+            percentComplete: has("percentComplete")
+              ? (item.values.percentComplete ?? 0)
+              : clash.percentComplete,
+            quantity,
+            unitRate,
+            forecastMethod: (has("forecastMethod")
+              ? item.values.forecastMethod
+              : clash.forecastMethod) as string,
             forecastToComplete: clash.forecastToComplete,
           };
-          const derived = derivedColumns(merged);
+          const derived = derivedColumns(
+            merged,
+            has("forecastToComplete") ? (item.values.forecastToComplete ?? undefined) : undefined,
+          );
           await tx
             .update(budgetLineItems)
             .set({
-              description: item.values.description ?? clash.description,
-              unit: item.values.unit ?? clash.unit,
+              description: has("description") ? item.values.description : clash.description,
+              unit: has("unit") ? (item.values.unit ?? null) : clash.unit,
               quantity: merged.quantity ?? null,
               unitRate: merged.unitRate ?? null,
               originalBudget: merged.originalBudget,
@@ -1405,10 +1522,10 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
               jobToDateCosts: merged.jobToDateCosts,
               percentComplete: merged.percentComplete,
               forecastMethod: merged.forecastMethod,
-              wbsPath: item.values.wbsPath ?? clash.wbsPath,
-              subJob: item.values.subJob ?? clash.subJob,
-              lineKind: item.values.lineKind ?? clash.lineKind,
-              notes: item.values.notes ?? clash.notes,
+              wbsPath: has("wbsPath") ? (item.values.wbsPath ?? null) : clash.wbsPath,
+              subJob: has("subJob") ? (item.values.subJob ?? null) : clash.subJob,
+              lineKind: has("lineKind") ? (item.values.lineKind ?? clash.lineKind) : clash.lineKind,
+              notes: has("notes") ? (item.values.notes ?? null) : clash.notes,
               updatedAt: nowIso(),
               ...derived.set,
             })
@@ -1435,12 +1552,12 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
     await assertPlanEditable(budget);
 
     const codeIndex = await loadCostCodes(budget.companyId, budget.projectId);
-    const prepared: { rowNumber: number; values: typeof budgetLineItems.$inferInsert }[] = [];
+    const prepared: PreparedForWrite[] = [];
     const issues: ImportIssue[] = [];
     for (const [index, line] of body.lines.entries()) {
       try {
         const p = prepareLine(budget, line, req.user!.id, codeIndex);
-        prepared.push({ rowNumber: index + 1, values: p.values });
+        prepared.push({ rowNumber: index + 1, values: p.values, provided: p.provided });
       } catch (err) {
         issues.push({
           row: index + 1,
@@ -1530,7 +1647,7 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
 
     const codeIndex = await loadCostCodes(budget.companyId, budget.projectId);
     const issues: ImportIssue[] = [];
-    const prepared: { rowNumber: number; values: typeof budgetLineItems.$inferInsert }[] = [];
+    const prepared: PreparedForWrite[] = [];
     const previews: unknown[] = [];
     for (let r = 1; r < rows.length; r += 1) {
       const row = rows[r]!;
@@ -1570,7 +1687,7 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
       }
       try {
         const p = prepareLine(budget, parsed.data, req.user!.id, codeIndex);
-        prepared.push({ rowNumber, values: p.values });
+        prepared.push({ rowNumber, values: p.values, provided: p.provided });
         previews.push({
           row: rowNumber,
           costCode: p.values.costCode,
@@ -1685,36 +1802,139 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
     return { legs, lines: byId };
   }
 
+  /**
+   * An owner_change is money entering the budget, and money enters a budget
+   * only behind an EXECUTED owner instrument: a prime-contract change-order
+   * package that has been executed, or an executed prime contract change
+   * order raised in the prime module. Each instrument funds the budget at
+   * most once — a second budget change citing the same instrument, or an
+   * instrument the changes module already funded automatically, is refused.
+   */
   async function assertOwnerChangeSource(
     budget: BudgetRow,
     sourceType: string | null | undefined,
     sourceId: string | null | undefined,
+    excludeChangeId: string | null = null,
   ): Promise<void> {
     if (!sourceType || !sourceId) {
       throw badRequest(
         "An owner_change is the downstream effect of an executed prime contract change " +
-          "order — it requires sourceType 'change_order_package' and the package's sourceId. " +
-          "Money does not enter a budget without a signed instrument behind it.",
+          "order — it requires sourceType 'change_order_package' (or 'prime_contract_change') " +
+          "and the executed instrument's sourceId. Money does not enter a budget without a " +
+          "signed instrument behind it.",
       );
     }
-    if (sourceType !== "change_order_package") {
+    if (sourceType === "change_order_package") {
+      const rows = await app.db
+        .select({
+          id: changeOrderPackages.id,
+          reference: changeOrderPackages.reference,
+          status: changeOrderPackages.status,
+          kind: changeOrderPackages.kind,
+          budgetChangeId: changeOrderPackages.budgetChangeId,
+        })
+        .from(changeOrderPackages)
+        .where(
+          and(
+            eq(changeOrderPackages.id, sourceId),
+            eq(changeOrderPackages.projectId, budget.projectId),
+          ),
+        )
+        .limit(1);
+      const pkg = rows[0];
+      if (!pkg) {
+        throw badRequest("sourceId does not reference a change order package on this project.");
+      }
+      if (pkg.kind !== "prime_contract") {
+        throw badRequest(
+          `${pkg.reference} is a ${pkg.kind} package — it changes what we owe a sub, not what the ` +
+            "owner funds. Only a prime_contract package can fund an owner_change.",
+        );
+      }
+      if (pkg.status !== "executed") {
+        throw badRequest(
+          `${pkg.reference} is ${pkg.status}, not executed. An owner_change needs an executed ` +
+            "instrument behind it — execute the package first.",
+        );
+      }
+      if (pkg.budgetChangeId && pkg.budgetChangeId !== excludeChangeId) {
+        throw conflict(
+          `${pkg.reference} already funded this budget when it was executed (budget change ` +
+            `${pkg.budgetChangeId}). One executed instrument funds the budget once.`,
+        );
+      }
+    } else if (sourceType === "prime_contract_change") {
+      const rows = await app.db
+        .select({ id: primeContractChanges.id, reference: primeContractChanges.reference, status: primeContractChanges.status })
+        .from(primeContractChanges)
+        .where(
+          and(
+            eq(primeContractChanges.id, sourceId),
+            eq(primeContractChanges.projectId, budget.projectId),
+            eq(primeContractChanges.companyId, budget.companyId),
+          ),
+        )
+        .limit(1);
+      const pcco = rows[0];
+      if (!pcco) {
+        throw badRequest("sourceId does not reference a prime contract change order on this project.");
+      }
+      if (pcco.status !== "executed") {
+        throw badRequest(
+          `${pcco.reference} is ${pcco.status}, not executed. An owner_change needs an executed ` +
+            "instrument behind it.",
+        );
+      }
+    } else {
       throw badRequest(
-        `sourceType "${sourceType}" cannot fund an owner_change; only ` +
-          "'change_order_package' can.",
+        `sourceType "${sourceType}" cannot fund an owner_change; only 'change_order_package' ` +
+          "or 'prime_contract_change' can.",
       );
     }
-    const rows = await app.db
-      .select({ id: changeOrderPackages.id, status: changeOrderPackages.status })
-      .from(changeOrderPackages)
+    const duplicates = await app.db
+      .select({ id: budgetChanges.id, reference: budgetChanges.reference, status: budgetChanges.status })
+      .from(budgetChanges)
       .where(
         and(
-          eq(changeOrderPackages.id, sourceId),
-          eq(changeOrderPackages.projectId, budget.projectId),
+          eq(budgetChanges.projectId, budget.projectId),
+          eq(budgetChanges.kind, "owner_change"),
+          eq(budgetChanges.sourceType, sourceType),
+          eq(budgetChanges.sourceId, sourceId),
+          ne(budgetChanges.status, "void"),
+          ne(budgetChanges.status, "rejected"),
         ),
-      )
-      .limit(1);
-    if (!rows[0]) {
-      throw badRequest("sourceId does not reference a change order package on this project.");
+      );
+    const other = duplicates.find((d) => d.id !== excludeChangeId);
+    if (other) {
+      throw conflict(
+        `${other.reference} (${other.status}) already carries this instrument into the budget. ` +
+          "One executed change order funds the budget once — void that change first if it is wrong.",
+      );
+    }
+  }
+
+  /**
+   * Claim a state transition atomically: UPDATE … WHERE status = <expected>
+   * and check the row count. Under two concurrent approvals the second
+   * update waits on the row lock, then matches nothing because the first
+   * already moved the status — so the legs are applied exactly once.
+   */
+  async function claimTransition(
+    db: Db,
+    changeId: string,
+    expected: string,
+    set: Partial<typeof budgetChanges.$inferInsert>,
+  ): Promise<void> {
+    const rows = await db
+      .update(budgetChanges)
+      .set(set)
+      .where(and(eq(budgetChanges.id, changeId), eq(budgetChanges.status, expected)))
+      .returning({ id: budgetChanges.id });
+    if (rows.length !== 1) {
+      throw conflict(
+        `This budget change is no longer ${expected} — another request moved it first. ` +
+          "Reload and check its state before acting on it again.",
+      );
     }
   }
 
@@ -1884,6 +2104,7 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
         budget,
         (set["sourceType"] as string | undefined) ?? change.sourceType,
         (set["sourceId"] as string | undefined) ?? change.sourceId,
+        change.id,
       );
     }
     set["lines"] = legs;
@@ -1919,16 +2140,17 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
     await assertPeriodOpen(budget.id, change.effectiveDate ?? today());
 
     await app.db.transaction(async (tx) => {
+      // The transition is claimed FIRST, predicated on the status we read:
+      // two concurrent submits both pass the check above, but only one row
+      // update matches, and the loser is refused before it can double the
+      // pending exposure.
+      await claimTransition(tx, changeId, "draft", {
+        status: "pending_approval",
+        requestedBy: req.user!.id,
+        requestedAt: nowIso(),
+        updatedAt: nowIso(),
+      });
       await applyPending(tx, legs, 1);
-      await tx
-        .update(budgetChanges)
-        .set({
-          status: "pending_approval",
-          requestedBy: req.user!.id,
-          requestedAt: nowIso(),
-          updatedAt: nowIso(),
-        })
-        .where(eq(budgetChanges.id, changeId));
     });
     await recomputeBudgetTotals(app.db, budget.id);
     await ledger(req, "state_change", "budget_change", changeId, {
@@ -1972,13 +2194,13 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
     }
     const actorId = req.user!.id;
     if (actorId === change.requestedBy) {
-      throw forbidden(
+      throw segregation(
         "Segregation of duties: the approver of a budget movement may not be the person who " +
           "requested it. Route this to another approver.",
       );
     }
     if (actorId === change.createdBy) {
-      throw forbidden(
+      throw segregation(
         "Segregation of duties: the approver of a budget movement may not be the person who " +
           "drafted it.",
       );
@@ -2032,8 +2254,31 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
       }
     }
 
+    // Contingency draws are mirrored onto the risk register's contingency
+    // record when the source line is linked to one (#499), so the two
+    // registers agree on what has been spent.
+    const contingencyLinks =
+      kind === "contingency_draw"
+        ? await app.db
+            .select()
+            .from(budgetContingencyLinks)
+            .where(
+              inArray(
+                budgetContingencyLinks.budgetLineItemId,
+                legs.filter((l) => l.amount < 0).map((l) => l.lineItemId),
+              ),
+            )
+        : [];
+
     const approvedAt = nowIso();
+    let drawdownsRecorded = 0;
     await app.db.transaction(async (tx) => {
+      await claimTransition(tx, changeId, "pending_approval", {
+        status: "approved",
+        approvedBy: actorId,
+        approvedAt,
+        updatedAt: approvedAt,
+      });
       await applyPending(tx, legs, -1);
       for (const leg of legs) {
         const row = byId.get(leg.lineItemId)!;
@@ -2055,15 +2300,23 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
           })
           .where(eq(budgetLineItems.id, leg.lineItemId));
       }
-      await tx
-        .update(budgetChanges)
-        .set({
-          status: "approved",
-          approvedBy: actorId,
-          approvedAt,
-          updatedAt: approvedAt,
-        })
-        .where(eq(budgetChanges.id, changeId));
+      for (const leg of legs) {
+        if (leg.amount >= 0) continue;
+        for (const link of contingencyLinks.filter((l) => l.budgetLineItemId === leg.lineItemId)) {
+          await tx.insert(contingencyDrawdowns).values({
+            id: newId("cdd"),
+            contingencyId: link.contingencyId,
+            companyId: budget.companyId,
+            projectId: budget.projectId,
+            amount: round2(Math.abs(leg.amount)),
+            reason: `${change.reference} — ${change.title}`,
+            riskId: null,
+            drawnAt: effectiveDate,
+            approvedBy: actorId,
+          });
+          drawdownsRecorded += 1;
+        }
+      }
       if (budget.status === "locked") {
         await tx
           .update(budgets)
@@ -2083,13 +2336,14 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
       amount: change.amount,
       netEffect: change.netEffect,
       revisedBudgetTotal: totals.revisedBudgetTotal,
+      contingencyDrawdownsRecorded: drawdownsRecorded,
     });
     const updated = await app.db
       .select()
       .from(budgetChanges)
       .where(eq(budgetChanges.id, changeId))
       .limit(1);
-    return { ...updated[0], budgetTotals: totals };
+    return { ...updated[0], budgetTotals: totals, contingencyDrawdownsRecorded: drawdownsRecorded };
   });
 
   app.post("/budget-changes/:changeId/reject", { preHandler: companyGate }, async (req, reply) => {
@@ -2101,24 +2355,21 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
       throw conflict(`Only a budget change pending approval can be rejected.`);
     }
     if (req.user!.id === change.requestedBy) {
-      throw forbidden(
+      throw segregation(
         "Segregation of duties: the person who requested a movement may not adjudicate it. " +
           "Void it instead if it should not proceed.",
       );
     }
     const legs = legsOf(change);
     await app.db.transaction(async (tx) => {
+      await claimTransition(tx, changeId, "pending_approval", {
+        status: "rejected",
+        rejectedBy: req.user!.id,
+        rejectedAt: nowIso(),
+        rejectionReason: body.reason,
+        updatedAt: nowIso(),
+      });
       await applyPending(tx, legs, -1);
-      await tx
-        .update(budgetChanges)
-        .set({
-          status: "rejected",
-          rejectedBy: req.user!.id,
-          rejectedAt: nowIso(),
-          rejectionReason: body.reason,
-          updatedAt: nowIso(),
-        })
-        .where(eq(budgetChanges.id, changeId));
     });
     await recomputeBudgetTotals(app.db, budget.id);
     await ledger(req, "state_change", "budget_change", changeId, {
@@ -2150,11 +2401,8 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
     if (change.status === "void") throw conflict("Budget change is already void.");
     const legs = legsOf(change);
     await app.db.transaction(async (tx) => {
+      await claimTransition(tx, changeId, change.status, { status: "void", updatedAt: nowIso() });
       if (change.status === "pending_approval") await applyPending(tx, legs, -1);
-      await tx
-        .update(budgetChanges)
-        .set({ status: "void", updatedAt: nowIso() })
-        .where(eq(budgetChanges.id, changeId));
     });
     await recomputeBudgetTotals(app.db, budget.id);
     await ledger(req, "state_change", "budget_change", changeId, {
@@ -2241,9 +2489,23 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
     const { budgetId } = req.params as { budgetId: string };
     const body = snapshotCreateSchema.parse(req.body);
     const budget = await fetchBudget(budgetId, req.companyId!);
-    await requireBudgetLevel(req, reply, budget.projectId, "standard");
+    // A capture freezes the plan and closes the period for every movement
+    // dated on or before it; only a manual working capture is a standard-
+    // level act. A month-end, baseline or audit capture is an admin's.
+    await requireBudgetLevel(
+      req,
+      reply,
+      budget.projectId,
+      (body.kind ?? "monthly_close") === "manual" ? "standard" : "admin",
+    );
 
     const asOfDate = body.asOfDate ?? today();
+    if (asOfDate > today()) {
+      throw badRequest(
+        `A capture cannot be dated in the future (${asOfDate}): it would freeze the budget ` +
+          "and close every period up to that date before it has happened.",
+      );
+    }
     const previous = await latestSnapshot(budgetId);
     if (previous && asOfDate < previous.asOfDate) {
       throw conflict(
@@ -2323,13 +2585,18 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
         notes: budgetSnapshots.notes,
         capturedBy: budgetSnapshots.capturedBy,
         capturedAt: budgetSnapshots.capturedAt,
+        detail: budgetSnapshots.detail,
       })
       .from(budgetSnapshots)
       .where(where)
       .orderBy(desc(budgetSnapshots.number))
       .limit(q.pageSize)
       .offset(pageOffset(q));
-    return paginate(items, Number(totalRow?.n ?? 0), q);
+    return paginate(
+      items.map((row) => ({ ...row, void: isVoidSnapshot(row) })),
+      Number(totalRow?.n ?? 0),
+      q,
+    );
   });
 
   /**
@@ -2393,6 +2660,63 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
     };
   });
 
+  /**
+   * Void a capture. The row and its hash stay — a capture that existed is
+   * evidence — but it stops guarding the period, so a future-dated or
+   * mistaken capture cannot freeze a budget forever. Admin only, reason
+   * required, ledgered with the payload.
+   */
+  app.post("/budget-snapshots/:snapshotId/void", { preHandler: companyGate }, async (req, reply) => {
+    const { snapshotId } = req.params as { snapshotId: string };
+    const body = snapshotVoidSchema.parse(req.body);
+    const rows = await app.db
+      .select()
+      .from(budgetSnapshots)
+      .where(
+        and(eq(budgetSnapshots.id, snapshotId), eq(budgetSnapshots.companyId, req.companyId!)),
+      )
+      .limit(1);
+    const snapshot = rows[0];
+    if (!snapshot) throw notFound("Budget snapshot not found");
+    await requireBudgetLevel(req, reply, snapshot.projectId, "admin");
+    if (isVoidSnapshot(snapshot)) throw conflict(`${snapshot.reference} is already void.`);
+    const voidedAt = nowIso();
+    await app.db
+      .update(budgetSnapshots)
+      .set({
+        detail: {
+          ...(snapshot.detail as Record<string, unknown>),
+          voidedAt,
+          voidedBy: req.user!.id,
+          voidReason: body.reason,
+        },
+      })
+      .where(eq(budgetSnapshots.id, snapshotId));
+    await appendLedger(app.db, {
+      companyId: snapshot.companyId,
+      projectId: snapshot.projectId,
+      actorId: req.user!.id,
+      action: "state_change",
+      objectType: "budget_snapshot",
+      objectId: snapshotId,
+      payload: {
+        budgetId: snapshot.budgetId,
+        reference: snapshot.reference,
+        asOfDate: snapshot.asOfDate,
+        contentHash: snapshot.contentHash,
+        to: "void",
+        reason: body.reason,
+      },
+      storePayload: true,
+    });
+    const updated = await app.db
+      .select()
+      .from(budgetSnapshots)
+      .where(eq(budgetSnapshots.id, snapshotId))
+      .limit(1);
+    return { ...updated[0], void: true };
+  });
+
   app.get("/budget-snapshots/:snapshotId", { preHandler: companyGate }, async (req, reply) => {
     const { snapshotId } = req.params as { snapshotId: string };
     const rows = await app.db
@@ -2414,6 +2738,7 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
       hashVerified: recomputed === snapshot.contentHash,
       recomputedContentHash: recomputed,
       immutable: true,
+      void: isVoidSnapshot(snapshot),
     };
   });
 
@@ -2625,12 +2950,12 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
       }
       const actorId = req.user!.id;
       if (actorId === forecast.createdBy) {
-        throw forbidden(
+        throw segregation(
           "Segregation of duties: the approver of a forecast may not be its author.",
         );
       }
       if (forecast.submittedBy && actorId === forecast.submittedBy) {
-        throw forbidden(
+        throw segregation(
           "Segregation of duties: the approver of a forecast may not be the person who " +
             "submitted it.",
         );
@@ -2775,200 +3100,18 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
   );
 
   /* ---------------------------------------------------------------- */
-  /* Source reads — commitments and invoices                           */
+  /* Recalculate = reconcile                                           */
   /* ---------------------------------------------------------------- */
 
-  interface SourceRead {
-    /** budgetLineItemId -> amount, only for rows that resolved to a line */
-    byLine: Map<string, number>;
-    component: Component;
-    /** rows whose budgetLineItemId is null — cost the budget cannot see */
-    unmapped: number;
-    unmappedAmount: number;
-  }
-
-  const emptySource = (reason: string): SourceRead => ({
-    byLine: new Map(),
-    component: unavailable([reason]),
-    unmapped: 0,
-    unmappedAmount: 0,
-  });
-
   /**
-   * Commitment cost against this budget's lines. Reads `commitment_sov_lines`
-   * joined to `commitments` for status and currency — the budget never
-   * invents a commitment total of its own.
-   */
-  async function readCommitments(
-    budget: BudgetRow,
-    which: "committed" | "pending",
-  ): Promise<SourceRead> {
-    const rows = await app.db
-      .select({
-        budgetLineItemId: commitmentSovLines.budgetLineItemId,
-        revisedScheduledValue: commitmentSovLines.revisedScheduledValue,
-        scheduledValue: commitmentSovLines.scheduledValue,
-        status: commitments.status,
-        currency: commitments.currency,
-      })
-      .from(commitmentSovLines)
-      .innerJoin(commitments, eq(commitments.id, commitmentSovLines.commitmentId))
-      .where(
-        and(
-          eq(commitmentSovLines.companyId, budget.companyId),
-          eq(commitmentSovLines.projectId, budget.projectId),
-        ),
-      );
-    if (rows.length === 0) {
-      return emptySource(
-        "No commitment schedule-of-values lines exist on this project yet, so committed cost " +
-          "is unknown rather than zero.",
-      );
-    }
-    const wanted: readonly string[] =
-      which === "committed" ? COMMITTED_STATUSES : PENDING_COMMITMENT_STATUSES;
-    const relevant = rows.filter((r) => wanted.includes(r.status));
-    if (relevant.length === 0) {
-      return emptySource(
-        which === "committed"
-          ? "No approved or complete commitments on this project — committed cost is unknown " +
-              "rather than zero."
-          : "No draft or out-for-signature commitments on this project.",
-      );
-    }
-    const summed = sumInCurrency(
-      relevant.map((r) => ({
-        amount: r.revisedScheduledValue || r.scheduledValue,
-        currency: r.currency,
-      })),
-      budget.currency,
-      which === "committed" ? "committed cost" : "pending commitment",
-    );
-    const byLine = new Map<string, number>();
-    let unmapped = 0;
-    let unmappedAmount = 0;
-    for (const row of relevant) {
-      if ((row.currency ?? budget.currency) !== budget.currency) continue;
-      const amount = row.revisedScheduledValue || row.scheduledValue;
-      if (!row.budgetLineItemId) {
-        unmapped += 1;
-        unmappedAmount += amount;
-        continue;
-      }
-      byLine.set(row.budgetLineItemId, round2((byLine.get(row.budgetLineItemId) ?? 0) + amount));
-    }
-    const reasons = [...summed.reasons];
-    if (unmapped > 0) {
-      reasons.push(
-        `${unmapped} commitment SOV line(s) worth ${round2(unmappedAmount).toFixed(2)} carry no ` +
-          "budgetLineItemId and are therefore outside every budget line — the project total " +
-          "and the budget total will differ by that amount until they are coded.",
-      );
-    }
-    return {
-      byLine,
-      component:
-        summed.value === null
-          ? unavailable(reasons, { rowsConsidered: relevant.length })
-          : { ...computed(summed.value, {
-              rowsConsidered: relevant.length,
-              rowsCounted: summed.counted,
-              rowsExcluded: summed.excluded,
-              excludedCurrencies: summed.excludedCurrencies,
-              unmappedLines: unmapped,
-              unmappedAmount: round2(unmappedAmount),
-            }), reasons },
-      unmapped,
-      unmappedAmount: round2(unmappedAmount),
-    };
-  }
-
-  /** Cost actually incurred: approved/paid subcontractor invoice lines. */
-  async function readInvoicedToDate(budget: BudgetRow): Promise<SourceRead> {
-    const rows = await app.db
-      .select({
-        budgetLineItemId: invoiceLineItems.budgetLineItemId,
-        totalCompletedAndStored: invoiceLineItems.totalCompletedAndStored,
-        status: invoices.status,
-        kind: invoices.kind,
-        currency: invoices.currency,
-      })
-      .from(invoiceLineItems)
-      .innerJoin(invoices, eq(invoices.id, invoiceLineItems.invoiceId))
-      .where(
-        and(
-          eq(invoiceLineItems.companyId, budget.companyId),
-          eq(invoiceLineItems.projectId, budget.projectId),
-        ),
-      );
-    if (rows.length === 0) {
-      return emptySource(
-        "No invoice lines exist on this project yet, so cost invoiced to date is unknown " +
-          "rather than zero.",
-      );
-    }
-    const relevant = rows.filter(
-      (r) =>
-        r.kind === "subcontractor_invoice" &&
-        (INCURRED_INVOICE_STATUSES as readonly string[]).includes(r.status),
-    );
-    if (relevant.length === 0) {
-      return emptySource(
-        "No approved or paid subcontractor invoices on this project — cost invoiced to date " +
-          "is unknown rather than zero.",
-      );
-    }
-    const summed = sumInCurrency(
-      relevant.map((r) => ({ amount: r.totalCompletedAndStored, currency: r.currency })),
-      budget.currency,
-      "subcontractor invoice",
-    );
-    const byLine = new Map<string, number>();
-    let unmapped = 0;
-    let unmappedAmount = 0;
-    for (const row of relevant) {
-      if ((row.currency ?? budget.currency) !== budget.currency) continue;
-      if (!row.budgetLineItemId) {
-        unmapped += 1;
-        unmappedAmount += row.totalCompletedAndStored;
-        continue;
-      }
-      byLine.set(
-        row.budgetLineItemId,
-        round2((byLine.get(row.budgetLineItemId) ?? 0) + row.totalCompletedAndStored),
-      );
-    }
-    const reasons = [...summed.reasons];
-    if (unmapped > 0) {
-      reasons.push(
-        `${unmapped} invoice line(s) worth ${round2(unmappedAmount).toFixed(2)} are not coded ` +
-          "to a budget line.",
-      );
-    }
-    return {
-      byLine,
-      component:
-        summed.value === null
-          ? unavailable(reasons, { rowsConsidered: relevant.length })
-          : { ...computed(summed.value, {
-              rowsConsidered: relevant.length,
-              rowsCounted: summed.counted,
-              rowsExcluded: summed.excluded,
-              excludedCurrencies: summed.excludedCurrencies,
-              unmappedLines: unmapped,
-              unmappedAmount: round2(unmappedAmount),
-            }), reasons },
-      unmapped,
-      unmappedAmount: round2(unmappedAmount),
-    };
-  }
-
-  /**
-   * Pull committed cost, pending commitments and invoiced cost down onto the
-   * budget lines from the source tables. A component whose source table holds
-   * nothing is SKIPPED, not zeroed: overwriting a stored figure with a
-   * fabricated 0 because a sibling module has not shipped yet would be the
-   * worst kind of quiet wrong answer.
+   * Pull committed cost, pending commitments, invoiced and paid cost down
+   * onto the budget lines from the source tables. This is the reconciliation
+   * engine (./reconcile.ts): the LATEST cumulative invoice per commitment
+   * SOV line, commitment payments counted once, every source row posted to
+   * `budget_postings`, drift recorded and ledgered. A component whose source
+   * table holds nothing is SKIPPED, not zeroed. `/recalculate` and
+   * `/reconcile` are the same act; both names are kept so the older web
+   * client keeps working.
    */
   app.post("/budgets/:budgetId/recalculate", { preHandler: companyGate }, async (req, reply) => {
     const { budgetId } = req.params as { budgetId: string };
@@ -2976,83 +3119,139 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
     await requireBudgetLevel(req, reply, budget.projectId, "standard");
     const lines = await linesOfBudget(budgetId);
     if (lines.length === 0) throw badRequest("This budget has no lines to recalculate.");
-
-    const committed = await readCommitments(budget, "committed");
-    const pending = await readCommitments(budget, "pending");
-    const invoiced = await readInvoicedToDate(budget);
-
-    const applyCommitted = committed.component.value !== null;
-    const applyPendingCommitments = pending.component.value !== null;
-    const applyInvoiced = invoiced.component.value !== null;
-
-    let updatedLines = 0;
-    await app.db.transaction(async (tx) => {
-      for (const line of lines) {
-        const committedCost = applyCommitted
-          ? (committed.byLine.get(line.id) ?? 0)
-          : line.committedCost;
-        const pendingCommitments = applyPendingCommitments
-          ? (pending.byLine.get(line.id) ?? 0)
-          : line.pendingCommitments;
-        const jobToDateCosts = applyInvoiced
-          ? round2((invoiced.byLine.get(line.id) ?? 0) + line.directCosts)
-          : line.jobToDateCosts;
-        const next: LineAmounts & { forecastMethod: string; forecastToComplete: number } = {
-          ...amountsOf(line),
-          committedCost,
-          pendingCommitments,
-          jobToDateCosts,
-          forecastMethod: line.forecastMethod,
-          forecastToComplete: line.forecastToComplete,
-        };
-        const derived = derivedColumns(next);
-        const changed =
-          committedCost !== line.committedCost ||
-          pendingCommitments !== line.pendingCommitments ||
-          jobToDateCosts !== line.jobToDateCosts ||
-          derived.set["forecastToComplete"] !== line.forecastToComplete ||
-          derived.set["revisedBudget"] !== line.revisedBudget;
-        if (!changed) continue;
-        updatedLines += 1;
-        await tx
-          .update(budgetLineItems)
-          .set({
-            committedCost,
-            pendingCommitments,
-            jobToDateCosts,
-            updatedAt: nowIso(),
-            ...derived.set,
-          })
-          .where(eq(budgetLineItems.id, line.id));
-      }
-    });
-    const totals = await recomputeBudgetTotals(app.db, budgetId);
-    await ledger(req, "update", "budget", budgetId, {
-      projectId: budget.projectId,
-      recalculated: true,
-      updatedLines,
-      revisedBudgetTotal: totals.revisedBudgetTotal,
+    const result = await runReconciliation(app.db, budget, {
+      trigger: "manual",
+      actorId: req.user!.id,
+      raiseSignal: true,
     });
     return {
       budgetId,
       currency: budget.currency,
-      updatedLines,
-      totals,
-      reconciliation: reconcile(totals),
-      applied: {
-        committedCost: applyCommitted,
-        pendingCommitments: applyPendingCommitments,
-        jobToDateCosts: applyInvoiced,
-      },
+      updatedLines: result.updatedLines,
+      totals: result.totals,
+      reconciliation: result.reconciliation,
+      applied: result.applied,
       /** why a component was left alone — never silently zeroed */
-      skipped: [
-        ...(applyCommitted ? [] : [{ component: "committedCost", reasons: committed.component.reasons }]),
-        ...(applyPendingCommitments
-          ? []
-          : [{ component: "pendingCommitments", reasons: pending.component.reasons }]),
-        ...(applyInvoiced ? [] : [{ component: "jobToDateCosts", reasons: invoiced.component.reasons }]),
-      ],
+      skipped: result.skipped,
+      drift: result.drift,
+      driftCount: result.driftCount,
+      driftAmount: result.driftAmount,
+      reconciliationId: result.id,
+      reference: result.reference,
+      postingsWritten: result.postingsWritten,
+      signalId: result.signalId,
     };
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* ERP import (#481)                                                 */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * A general-ledger budget export, mapped onto cost codes through the
+   * company's GL → cost-code map (gl_cost_code_maps; CRUD in
+   * ./intelligence.ts). Nothing is guessed: an unmapped account is reported
+   * by row and nothing is written, and every line written carries the GL
+   * rows that fed it on `detail.provenance`.
+   */
+  app.post("/budgets/:budgetId/lines/import-erp", { preHandler: companyGate }, async (req, reply) => {
+    const { budgetId } = req.params as { budgetId: string };
+    const body = erpImportSchema.parse(req.body);
+    const budget = await fetchBudget(budgetId, req.companyId!);
+    await requireBudgetLevel(req, reply, budget.projectId, "standard");
+    await assertPlanEditable(budget);
+    const erpSystem = body.erpSystem ?? "other";
+
+    const rows = parseCsv(body.csv);
+    if (rows.length < 2) throw badRequest("CSV must carry a header row and at least one data row.");
+    if (rows.length - 1 > 5000) throw badRequest("A single ERP import carries at most 5000 rows.");
+    const parsed = parseErpRows(rows, erpSystem);
+    const maps = await app.db
+      .select()
+      .from(glCostCodeMaps)
+      .where(eq(glCostCodeMaps.companyId, budget.companyId));
+    const mapped = mapErpRows(
+      parsed.rows,
+      maps.filter((m) => m.projectId === null || m.projectId === budget.projectId),
+      budget.projectId,
+      erpSystem,
+    );
+
+    const codeIndex = await loadCostCodes(budget.companyId, budget.projectId);
+    const prepared: PreparedForWrite[] = [];
+    const issues: ImportIssue[] = [
+      ...parsed.issues,
+      ...mapped.unmapped.map((u) => ({ row: u.rowNumber, field: "account", message: u.reason })),
+    ];
+    for (const [index, line] of mapped.lines.entries()) {
+      try {
+        const p = prepareLine(
+          budget,
+          {
+            costCodeId: line.costCodeId,
+            costType: line.costType,
+            description: line.description,
+            originalBudget: line.originalBudget,
+            ...(line.quantity !== null && line.unit !== null ? { quantity: line.quantity, unit: line.unit } : {}),
+            detail: { provenance: { sourceType: "erp_import", erpSystem, rows: line.provenance } },
+          },
+          req.user!.id,
+          codeIndex,
+        );
+        prepared.push({ rowNumber: index + 1, values: p.values, provided: p.provided });
+      } catch (err) {
+        issues.push({
+          row: line.provenance[0]?.row ?? index + 1,
+          field: null,
+          message: err instanceof Error ? err.message : "Invalid line",
+        });
+      }
+    }
+    const preview = {
+      erpSystem,
+      parsedRows: parsed.rows.length,
+      unknownColumns: parsed.unknownColumns,
+      mappedLines: mapped.lines.length,
+      unmappedRows: mapped.unmapped.length,
+      unmapped: mapped.unmapped.slice(0, 200),
+      issues,
+      lines: mapped.lines.slice(0, 200).map((l) => ({
+        costCode: l.costCode,
+        costType: l.costType,
+        description: l.description,
+        originalBudget: l.originalBudget,
+        glRows: l.provenance.length,
+      })),
+      totalOriginalBudget: round2(mapped.lines.reduce((s, l) => s + l.originalBudget, 0)),
+      unmappedAmount: round2(mapped.unmapped.reduce((s, u) => s + u.amount, 0)),
+    };
+    if (body.dryRun) return { dryRun: true, budgetId, ...preview };
+    if (issues.length > 0) {
+      throw badRequest(
+        `${issues.length} row(s) could not be imported; nothing was written. Map every GL ` +
+          "account or fix the file, then re-run.",
+        { issues, unmapped: mapped.unmapped.slice(0, 200) },
+      );
+    }
+    if (prepared.length === 0) throw badRequest("The export produced no budget lines.");
+    const result = await writeLines(budget, prepared, body.mode ?? "create", req.user!.id);
+    if (result.issues.length > 0) {
+      throw badRequest("One or more rows were rejected; nothing was written.", {
+        issues: result.issues,
+      });
+    }
+    await recomputeBudgetTotals(app.db, budgetId);
+    await ledger(req, "create", "budget_line_item", budgetId, {
+      projectId: budget.projectId,
+      budgetId,
+      erpImport: true,
+      erpSystem,
+      parsedRows: parsed.rows.length,
+      created: result.created,
+      updated: result.updated,
+      totalOriginalBudget: preview.totalOriginalBudget,
+    });
+    return reply.status(201).send({ dryRun: false, budgetId, ...preview, ...result });
   });
 
   /* ---------------------------------------------------------------- */
@@ -3125,30 +3324,54 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
     const lines = await linesOfBudget(budgetId);
     const totals = rollUpTotals(lines.map(rollupOf));
 
-    const [committed, pending, invoiced] = await Promise.all([
-      readCommitments(budget, "committed"),
-      readCommitments(budget, "pending"),
-      readInvoicedToDate(budget),
+    const [committed, pending, invoiced, paid] = await Promise.all([
+      readCommitmentSources(app.db, budget, "committed"),
+      readCommitmentSources(app.db, budget, "pending"),
+      readInvoicedSources(app.db, budget),
+      readPaidSources(app.db, budget),
     ]);
 
     const directCosts = computed(totals.directCostsTotal, {
       source: "budget_line_items.direct_costs",
       lineCount: lines.length,
     });
-    const jobToDate: Component =
-      invoiced.component.value === null
-        ? unavailable(
-            [
-              ...invoiced.component.reasons,
-              "Job-to-date cost is invoiced commitment cost plus direct cost; with the " +
-                "invoiced half unknown the total cannot be stated.",
-            ],
-            { directCosts: totals.directCostsTotal },
-          )
-        : computed(invoiced.component.value + totals.directCostsTotal, {
-            invoicedToDate: invoiced.component.value,
-            directCosts: totals.directCostsTotal,
-          });
+    // Job-to-date = commitment cost counted ONCE (invoiced, or paid when no
+    // invoice is approved yet) + direct cost from outside the commitment
+    // chain. Computed line by line, exactly as the reconciliation writes it.
+    let jobToDate: Component;
+    if (invoiced.component.value === null && paid.component.value === null) {
+      jobToDate = unavailable(
+        [
+          ...invoiced.component.reasons,
+          ...paid.component.reasons,
+          "Job-to-date cost is commitment cost plus direct cost; with the commitment half " +
+            "unknown the total cannot be stated.",
+        ],
+        { directCosts: totals.directCostsTotal },
+      );
+    } else {
+      let total = 0;
+      let commitmentCost = 0;
+      let nonCommitmentDirect = 0;
+      for (const line of lines) {
+        const jtd = computeJobToDate({
+          invoicedToDate: invoiced.component.value === null ? null : (invoiced.byLine.get(line.id) ?? 0),
+          paidToDate: paid.byLine.get(line.id) ?? 0,
+          directCosts: line.directCosts,
+        });
+        total += jtd.jobToDateCosts;
+        commitmentCost += jtd.commitmentCost;
+        nonCommitmentDirect += jtd.nonCommitmentDirectCosts;
+      }
+      jobToDate = computed(total, {
+        invoicedToDate: invoiced.component.value,
+        paidToDate: paid.component.value,
+        commitmentCost: round2(commitmentCost),
+        nonCommitmentDirectCosts: round2(nonCommitmentDirect),
+        directCosts: totals.directCostsTotal,
+        basis: "max(invoiced, paid) per line + direct cost net of commitment payments",
+      });
+    }
 
     const overruns = lines
       .filter((l) => l.projectedOverUnder < 0)
@@ -3202,13 +3425,14 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
         committed: committed.component,
         pendingCommitments: pending.component,
         invoicedToDate: invoiced.component,
+        paidToDate: paid.component,
         directCosts,
         jobToDateCosts: jobToDate,
         contingencyRemaining,
       },
       /**
        * Stored rollups vs. what the source tools say right now. A drift means
-       * the budget needs recalculating, and saying so is more useful than
+       * the budget needs reconciling, and saying so is more useful than
        * showing whichever figure happened to be read last.
        */
       drift: {
@@ -3224,4 +3448,10 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
       overrunLines: overruns,
     };
   });
+
+  /* ---------------------------------------------------------------- */
+  /* Intelligence layer: insights, variance, cash flow, views, ERP    */
+  /* maps, contingency links, reconciliation history, health inputs   */
+  /* ---------------------------------------------------------------- */
+  await app.register(budgetIntelligenceRoutes);
 };

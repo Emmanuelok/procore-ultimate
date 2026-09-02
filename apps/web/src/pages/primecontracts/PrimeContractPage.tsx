@@ -26,11 +26,17 @@ import {
   Select,
   Spinner,
   Tabs,
+  Textarea,
 } from "../../ui";
+import { IconPlus } from "../../ui/icons";
 import { api } from "../../lib/api";
 import BillingTab from "./BillingTab";
 import ChangesTab from "./ChangesTab";
+import ComplianceTab from "./ComplianceTab";
+import ReceivablesTab from "./ReceivablesTab";
+import RetainageTab from "./RetainageTab";
 import SovTab from "./SovTab";
+import StoredMaterialsTab from "./StoredMaterialsTab";
 import SummaryTab from "./SummaryTab";
 import {
   ComponentValue,
@@ -41,20 +47,38 @@ import {
   useAction,
   useBillings,
   useChanges,
+  useCompliance,
   useContract,
   useContractSummary,
   useContracts,
+  useReceivables,
+  useRetainage,
   useSov,
+  useStoredMaterials,
   useVendorNames,
+  useVendors,
 } from "./shared";
+import type { PrimeContract } from "./types";
 
-type TabKey = "summary" | "sov" | "billing" | "changes";
+type TabKey =
+  | "summary"
+  | "sov"
+  | "billing"
+  | "changes"
+  | "compliance"
+  | "materials"
+  | "retainage"
+  | "receivables";
 
 const TABS: Array<{ value: TabKey; label: string }> = [
   { value: "summary", label: "Summary" },
   { value: "sov", label: "Schedule of values" },
   { value: "billing", label: "Progress billing" },
   { value: "changes", label: "Contract changes" },
+  { value: "compliance", label: "Compliance" },
+  { value: "materials", label: "Stored materials" },
+  { value: "retainage", label: "Retainage" },
+  { value: "receivables", label: "Receivables" },
 ];
 
 export default function PrimeContractPage() {
@@ -69,6 +93,7 @@ export default function PrimeContractPage() {
   );
 
   const [executing, setExecuting] = useState(false);
+  const [creating, setCreating] = useState(false);
   const [executionDate, setExecutionDate] = useState(() =>
     new Date().toISOString().slice(0, 10),
   );
@@ -93,6 +118,10 @@ export default function PrimeContractPage() {
   const sov = useSov(contractId);
   const changes = useChanges(contractId);
   const billings = useBillings(contractId);
+  const compliance = useCompliance(contractId);
+  const stored = useStoredMaterials(contractId);
+  const retainage = useRetainage(contractId);
+  const receivables = useReceivables(contractId);
 
   function reloadContract() {
     contract.reload();
@@ -101,6 +130,10 @@ export default function PrimeContractPage() {
     billings.reload();
     summary.reload();
     contracts.reload();
+    compliance.reload();
+    stored.reload();
+    retainage.reload();
+    receivables.reload();
   }
 
   function selectTab(next: TabKey) {
@@ -151,8 +184,17 @@ export default function PrimeContractPage() {
           ? { count: billings.data.items.length }
           : {}),
         ...(t.value === "changes" && changes.data ? { count: changes.data.items.length } : {}),
+        ...(t.value === "compliance" && compliance.data && !compliance.data.gate.ok
+          ? { count: compliance.data.gate.blocking.length, tone: "danger" as const }
+          : {}),
+        ...(t.value === "materials" && stored.data && !stored.data.reconciliation.totals.identity.ok
+          ? { count: 1, tone: "warning" as const }
+          : {}),
+        ...(t.value === "receivables" && receivables.data && receivables.data.dunning.length > 0
+          ? { count: receivables.data.dunning.length, tone: "danger" as const }
+          : {}),
       })),
-    [view, billings.data, changes.data],
+    [view, billings.data, changes.data, compliance.data, stored.data, receivables.data],
   );
 
   if (!projectId) {
@@ -177,23 +219,28 @@ export default function PrimeContractPage() {
           ) : null
         }
         actions={
-          items.length > 1 ? (
-            <div className="w-72">
-              <Field label="Contract" labelClassName="sr-only">
-                <Select
-                  value={contractId ?? ""}
-                  onChange={(e) => selectContract(e.target.value)}
-                  aria-label="Prime contract"
-                >
-                  {items.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.reference} — {c.title} ({c.currency})
-                    </option>
-                  ))}
-                </Select>
-              </Field>
-            </div>
-          ) : null
+          <div className="flex items-center gap-2">
+            {items.length > 1 ? (
+              <div className="w-72">
+                <Field label="Contract" labelClassName="sr-only">
+                  <Select
+                    value={contractId ?? ""}
+                    onChange={(e) => selectContract(e.target.value)}
+                    aria-label="Prime contract"
+                  >
+                    {items.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.reference} — {c.title} ({c.currency})
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+              </div>
+            ) : null}
+            <Button size="sm" variant="secondary" leadingIcon={IconPlus} onClick={() => setCreating(true)}>
+              New prime contract
+            </Button>
+          </div>
         }
         tabs={
           contractId ? <Tabs items={tabItems} value={tab} onChange={selectTab} /> : undefined
@@ -213,6 +260,11 @@ export default function PrimeContractPage() {
         <EmptyState
           title="No prime contract on this project"
           hint="A prime contract is the owner-side agreement: its sum, its schedule of values, and the applications for payment raised against it. Nothing has been recorded here yet."
+          action={
+            <Button leadingIcon={IconPlus} onClick={() => setCreating(true)}>
+              Record the prime contract
+            </Button>
+          }
         />
       ) : contract.loading && !view ? (
         <div className="py-12">
@@ -234,15 +286,40 @@ export default function PrimeContractPage() {
           <SovTab contract={view} sov={sov} onChanged={reloadContract} />
         ) : tab === "billing" ? (
           <BillingTab contract={view} billings={billings} onChanged={reloadContract} />
-        ) : (
+        ) : tab === "changes" ? (
           <ChangesTab
             contract={view}
             changes={changes}
             sovLines={sov.data?.lines ?? []}
             onChanged={reloadContract}
           />
+        ) : tab === "compliance" ? (
+          <ComplianceTab contract={view} compliance={compliance} onChanged={reloadContract} />
+        ) : tab === "materials" ? (
+          <StoredMaterialsTab contract={view} stored={stored} sov={sov} onChanged={reloadContract} />
+        ) : tab === "retainage" ? (
+          <RetainageTab contract={view} retainage={retainage} />
+        ) : (
+          <ReceivablesTab
+            contract={view}
+            receivables={receivables}
+            onOpenApplication={() => selectTab("billing")}
+          />
         )
       ) : null}
+
+      <NewContractModal
+        open={creating}
+        projectId={projectId}
+        onClose={() => setCreating(false)}
+        onCreated={(created) => {
+          setCreating(false);
+          contracts.reload();
+          summary.reload();
+          selectContract(created.id);
+          selectTab("sov");
+        }}
+      />
 
       <Modal
         open={executing}
@@ -353,5 +430,140 @@ function PortfolioStrip({
         ))}
       </div>
     </div>
+  );
+}
+
+/**
+ * Recording the prime contract (#501). The sum typed here is the owner's
+ * agreement; the schedule of values must total it before the contract can
+ * be approved, executed or billed, so the modal hands off to the SOV tab.
+ */
+function NewContractModal({
+  open,
+  projectId,
+  onClose,
+  onCreated,
+}: {
+  open: boolean;
+  projectId: string;
+  onClose: () => void;
+  onCreated: (created: PrimeContract) => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const vendors = useVendors();
+  const [title, setTitle] = useState("");
+  const [currency, setCurrency] = useState("USD");
+  const [originalContractSum, setSum] = useState("");
+  const [ownerVendorId, setOwner] = useState("");
+  const [architectVendorId, setArchitect] = useState("");
+  const [retainage, setRetainage] = useState("10");
+  const [threshold, setThreshold] = useState("");
+  const [reduced, setReduced] = useState("");
+  const [contractDate, setContractDate] = useState("");
+  const [substantialCompletionDate, setSubstantial] = useState("");
+  const [paymentTermsDays, setTerms] = useState("30");
+  const [scopeOfWork, setScope] = useState("");
+  const sum = Number(originalContractSum);
+  const valid = title.trim() !== "" && Number.isFinite(sum) && sum >= 0 && currency.trim().length >= 3;
+
+  async function submit() {
+    const created = await run("create", () =>
+      api.post<PrimeContract>(`/api/v1/projects/${projectId}/prime-contracts`, {
+        title: title.trim(),
+        currency: currency.trim().toUpperCase(),
+        originalContractSum: sum,
+        ownerVendorId: ownerVendorId || null,
+        architectVendorId: architectVendorId || null,
+        defaultRetainagePercent: retainage.trim() === "" ? 0 : Number(retainage),
+        ...(threshold.trim() !== "" && reduced.trim() !== ""
+          ? { retainage: { reductionThresholdPercent: Number(threshold), reducedPercent: Number(reduced) } }
+          : {}),
+        contractDate: contractDate || null,
+        substantialCompletionDate: substantialCompletionDate || null,
+        paymentTermsDays: paymentTermsDays.trim() === "" ? null : Number(paymentTermsDays),
+        scopeOfWork: scopeOfWork.trim() || null,
+      }),
+    );
+    if (created !== null) {
+      setTitle("");
+      setSum("");
+      onCreated(created);
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      size="lg"
+      title="Record the prime contract"
+      description="The owner-side agreement. Its sum is frozen at execution; until then the schedule of values must be built to total it."
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button onClick={submit} disabled={!valid || busy !== null}>
+            Record contract
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        <RefusalPanel refusal={refusal} onDismiss={clear} />
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Title" required className="sm:col-span-2">
+            <Input value={title} onChange={(e) => setTitle(e.target.value)} autoFocus />
+          </Field>
+          <Field label="Original contract sum" required>
+            <Input value={originalContractSum} inputMode="decimal" onChange={(e) => setSum(e.target.value)} />
+          </Field>
+          <Field label="Currency" required hint="Cannot change once billed.">
+            <Input value={currency} maxLength={8} onChange={(e) => setCurrency(e.target.value)} className="max-w-32" />
+          </Field>
+          <Field label="Owner" optional hint="The paying party, from the directory.">
+            <Select value={ownerVendorId} onChange={(e) => setOwner(e.target.value)}>
+              <option value="">Not recorded</option>
+              {(vendors.data?.items ?? []).map((v) => (
+                <option key={v.id} value={v.id}>
+                  {v.name}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field label="Architect / certifier" optional>
+            <Select value={architectVendorId} onChange={(e) => setArchitect(e.target.value)}>
+              <option value="">Not recorded</option>
+              {(vendors.data?.items ?? []).map((v) => (
+                <option key={v.id} value={v.id}>
+                  {v.name}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field label="Retainage on work (%)">
+            <Input value={retainage} inputMode="decimal" onChange={(e) => setRetainage(e.target.value)} />
+          </Field>
+          <Field label="Payment terms (days)" optional hint="Drives due dates and the receivables ageing.">
+            <Input value={paymentTermsDays} inputMode="numeric" onChange={(e) => setTerms(e.target.value)} />
+          </Field>
+          <Field label="Step-down threshold (% complete)" optional>
+            <Input value={threshold} inputMode="decimal" onChange={(e) => setThreshold(e.target.value)} />
+          </Field>
+          <Field label="Reduced retainage (%)" optional>
+            <Input value={reduced} inputMode="decimal" onChange={(e) => setReduced(e.target.value)} />
+          </Field>
+          <Field label="Contract date" optional>
+            <Input type="date" value={contractDate} onChange={(e) => setContractDate(e.target.value)} />
+          </Field>
+          <Field label="Substantial completion" optional>
+            <Input type="date" value={substantialCompletionDate} onChange={(e) => setSubstantial(e.target.value)} />
+          </Field>
+          <Field label="Scope of work" optional className="sm:col-span-2">
+            <Textarea rows={3} value={scopeOfWork} onChange={(e) => setScope(e.target.value)} />
+          </Field>
+        </div>
+      </div>
+    </Modal>
   );
 }

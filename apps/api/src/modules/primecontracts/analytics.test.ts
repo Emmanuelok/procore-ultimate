@@ -31,7 +31,7 @@ describe("changeOrderAnalytics", () => {
     expect(a.pending.oldestDays).toBe(30);
     expect(a.byReason[0]).toEqual({ reason: "client_request", count: 2, amount: 80_000 });
     expect(a.byStatus.find((s) => s.status === "draft")?.amount).toBe(5_000);
-    expect(a.cycleTimeDays.createdToSubmitted).toBe(3); // (4 + 2 + 1) / 3
+    expect(a.cycleTimeDays.createdToSubmitted).toBeCloseTo(2.3333, 3); // (4 + 2 + 1) / 3
     expect(a.cycleTimeDays.submittedToApproved).toBe(10);
     expect(a.cycleTimeDays.approvedToExecuted).toBe(6); // 5 and 7
     expect(a.monthly.map((m) => m.cumulative)).toEqual([50_000, 40_000]);

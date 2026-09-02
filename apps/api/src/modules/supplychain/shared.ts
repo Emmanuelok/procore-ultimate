@@ -268,6 +268,22 @@ export function notFoundIfMissing<T>(row: T | undefined, what: string): T {
 /* Small utilities                                                     */
 /* ------------------------------------------------------------------ */
 
+/**
+ * `.partial()` keeps every `.default()`, so a PATCH parsed through it would
+ * silently reset untouched columns (tier → 1, lead time → 0, crane → off).
+ * Strip the defaults first: a PATCH body is only what the caller sent.
+ */
+type WithoutDefaults<T extends z.ZodRawShape> = {
+  [K in keyof T]: T[K] extends z.ZodDefault<infer Inner extends z.ZodTypeAny> ? Inner : T[K];
+};
+export function patchSchemaOf<T extends z.ZodRawShape>(schema: z.ZodObject<T>) {
+  const shape: Record<string, z.ZodTypeAny> = {};
+  for (const [key, field] of Object.entries(schema.shape)) {
+    shape[key] = (field instanceof z.ZodDefault ? field.removeDefault() : field) as z.ZodTypeAny;
+  }
+  return z.object(shape as unknown as WithoutDefaults<T>).partial();
+}
+
 /** Apply only the keys the caller actually sent, mapped to columns. */
 export function patchSet(
   body: Record<string, unknown>,

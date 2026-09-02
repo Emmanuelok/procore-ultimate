@@ -339,6 +339,7 @@ export async function generateBriefing(
     objectType: "pulse_briefing",
     objectId: briefingId,
     projectId: opts.projectId,
+    storePayload: true,
     payload: {
       runId: result.runId,
       headline: output.headline,
