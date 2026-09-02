@@ -475,3 +475,61 @@ export function compositeCompare(
   ctx.fillRect(0, 0, w, h); // final invert
   ctx.globalCompositeOperation = "source-over";
 }
+
+/* ------------------------------------------------------------------------- */
+/* Pen stroke simplification                                                  */
+/* ------------------------------------------------------------------------- */
+
+function perpendicularDistance(p: SheetPoint, a: SheetPoint, b: SheetPoint): number {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len2 = dx * dx + dy * dy;
+  if (len2 === 0) return Math.hypot(p.x - a.x, p.y - a.y);
+  const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2));
+  return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+}
+
+/**
+ * Douglas–Peucker in normalised sheet units. A 120 Hz scribble produces
+ * thousands of near-collinear points; at 0.0006 (≈ half a pixel on a fitted
+ * A1 sheet) the stroke is visually identical and an order of magnitude
+ * smaller, which keeps it under the API's per-stroke cap.
+ */
+export function simplifyStroke(points: SheetPoint[], tolerance = 0.0006): SheetPoint[] {
+  if (points.length <= 2) return points;
+  const keep = new Array<boolean>(points.length).fill(false);
+  keep[0] = true;
+  keep[points.length - 1] = true;
+  const stack: Array<[number, number]> = [[0, points.length - 1]];
+  while (stack.length > 0) {
+    const [start, end] = stack.pop()!;
+    let maxDist = 0;
+    let index = -1;
+    const a = points[start]!;
+    const b = points[end]!;
+    for (let i = start + 1; i < end; i++) {
+      const d = perpendicularDistance(points[i]!, a, b);
+      if (d > maxDist) {
+        maxDist = d;
+        index = i;
+      }
+    }
+    if (index !== -1 && maxDist > tolerance) {
+      keep[index] = true;
+      stack.push([start, index], [index, end]);
+    }
+  }
+  return points.filter((_, i) => keep[i]);
+}
+
+/** Split an over-long stroke into consecutive strokes that share a joint point. */
+export function splitStroke(points: SheetPoint[], max: number): SheetPoint[][] {
+  if (points.length <= max) return [points];
+  const out: SheetPoint[][] = [];
+  for (let i = 0; i < points.length; i += max - 1) {
+    const chunk = points.slice(i, i + max);
+    if (chunk.length >= 2) out.push(chunk);
+    if (i + max >= points.length) break;
+  }
+  return out;
+}

@@ -388,6 +388,7 @@ function ItpBody({
         onClose={() => setAddOpen(false)}
         base={base}
         onCreated={onMutated}
+        users={users}
       />
     </div>
   );
@@ -469,11 +470,13 @@ function AddActivityModal({
   onClose,
   base,
   onCreated,
+  users,
 }: {
   open: boolean;
   onClose: () => void;
   base: string;
   onCreated: () => void;
+  users: Map<string, string>;
 }) {
   const { busy, refusal, clear, run } = useAction();
   const [activity, setActivity] = useState("");
@@ -483,38 +486,51 @@ function AddActivityModal({
   const [noticeHours, setNoticeHours] = useState("");
   const [plannedDate, setPlannedDate] = useState("");
   const [criteria, setCriteria] = useState("");
-  const [party, setParty] = useState("");
+  /*
+   * The party is a TOKEN, not free text. The API validates it against
+   * ITP_RESPONSIBLE_PARTIES, so a typed "Engineer" — or "eng", or anything a
+   * human would write — came back as a 400 the form could not explain, and a
+   * hold point could not be created from this screen at all without guessing
+   * the vocabulary. It is a select over the same list the API accepts.
+   */
+  const [party, setParty] = useState<string>("engineer");
   const [partyName, setPartyName] = useState("");
+  /** the strongest nomination: a platform user, who alone may then release */
+  const [partyUserId, setPartyUserId] = useState("");
 
   async function create() {
-    const hours = noticeHours.trim() === "" ? null : Number(noticeHours);
+    const parsedHours = noticeHours.trim() === "" ? null : Number(noticeHours);
+    // The API takes an integer; a decimal typed here used to fail validation.
+    const hours =
+      parsedHours !== null && Number.isFinite(parsedHours) ? Math.round(parsedHours) : null;
     const created = await run("add", () =>
       api.post(`${base}/activities`, {
         activity: activity.trim(),
         activityCode: activityCode.trim() === "" ? null : activityCode.trim(),
         interventionPoint,
         responsibleParty,
-        noticePeriodHours: hours !== null && Number.isFinite(hours) ? hours : null,
+        noticePeriodHours: hours,
         plannedDate: plannedDate === "" ? null : plannedDate,
         acceptanceCriteria: criteria.trim() === "" ? null : criteria.trim(),
-        verifyingParties:
-          party.trim() === ""
-            ? []
-            : [
-                {
-                  party: party.trim(),
-                  interventionPoint,
-                  name: partyName.trim() === "" ? null : partyName.trim(),
-                },
-              ],
+        verifyingParties: releasable
+          ? [
+              {
+                party,
+                interventionPoint,
+                name: partyName.trim() === "" ? null : partyName.trim(),
+                userId: partyUserId === "" ? null : partyUserId,
+              },
+            ]
+          : [],
       }),
     );
     if (created) {
       setActivity("");
       setActivityCode("");
       setCriteria("");
-      setParty("");
+      setParty("engineer");
       setPartyName("");
+      setPartyUserId("");
       onClose();
       onCreated();
     }
@@ -610,19 +626,41 @@ function AddActivityModal({
           <Textarea rows={2} value={criteria} onChange={(e) => setCriteria(e.target.value)} />
         </Field>
         {releasable ? (
-          <div className="grid gap-3 sm:grid-cols-2">
-            <Field
-              label="Verifying party"
-              hint="Who holds this point. Without one the API refuses every release."
-            >
-              <Input
-                value={party}
-                onChange={(e) => setParty(e.target.value)}
-                placeholder="e.g. engineer"
-              />
-            </Field>
+          <div className="space-y-3">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field
+                label="Verifying party"
+                required
+                hint="Who holds this point. A hold point with none is refused: a point held by nobody in particular cannot be released by anybody in particular."
+              >
+                <Select value={party} onChange={(e) => setParty(e.target.value)}>
+                  {RESPONSIBLE_PARTIES.map((p) => (
+                    <option key={p} value={p}>
+                      {labelize(p)}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              <Field
+                label="Nominated user"
+                hint="The strongest form of nomination: only this user may release the point. Leave blank when the verifier is an organisation with no account here."
+              >
+                <Select value={partyUserId} onChange={(e) => setPartyUserId(e.target.value)}>
+                  <option value="">— organisation only —</option>
+                  {[...users.entries()].map(([id, name]) => (
+                    <option key={id} value={id}>
+                      {name}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+            </div>
             <Field label="Named individual">
-              <Input value={partyName} onChange={(e) => setPartyName(e.target.value)} />
+              <Input
+                value={partyName}
+                onChange={(e) => setPartyName(e.target.value)}
+                placeholder="e.g. A. Engineer, Notified Body Ltd"
+              />
             </Field>
           </div>
         ) : (

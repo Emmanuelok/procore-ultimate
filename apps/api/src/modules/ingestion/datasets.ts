@@ -1,10 +1,11 @@
 import {
+  ALL_INGESTION_DATASETS,
   ASSERTION_KINDS,
+  COST_TYPES,
   EVIDENCE_KINDS,
   FX_RATE_SOURCES,
-  INGESTION_DATASETS,
   RFI_STATUSES,
-  type IngestionDataset,
+  type AnyIngestionDataset,
 } from "@constructos/shared";
 
 /**
@@ -36,7 +37,7 @@ export interface DatasetField {
 }
 
 export interface DatasetDef {
-  dataset: IngestionDataset;
+  dataset: AnyIngestionDataset;
   label: string;
   /** where committed rows land — shown verbatim in the mapping UI */
   target: string;
@@ -69,13 +70,20 @@ const EXTERNAL_ID_FIELD: DatasetField = {
 };
 
 const SITE_ACCESS_SOURCES = ["turnstile", "biometric", "manual", "gate_log"] as const;
+
+/** Constraint vocabulary an imported programme may carry (see lib/cpm.ts). */
+export const TASK_CONSTRAINTS = [
+  "start_no_earlier_than",
+  "must_start_on",
+  "finish_no_later_than",
+] as const;
 const IMPACT_VALUES = ["yes", "no", "tbd"] as const;
 
 /* ------------------------------------------------------------------ */
 /* The registry — one entry per INGESTION_DATASETS member              */
 /* ------------------------------------------------------------------ */
 
-export const DATASET_REGISTRY: Record<IngestionDataset, DatasetDef> = {
+export const DATASET_REGISTRY: Record<AnyIngestionDataset, DatasetDef> = {
   vendors: {
     dataset: "vendors",
     label: "Vendors / subcontractor directory",
@@ -260,6 +268,33 @@ export const DATASET_REGISTRY: Record<IngestionDataset, DatasetDef> = {
       { key: "percentComplete", label: "% complete", required: false, type: "number" },
       { key: "actualStart", label: "Actual start", required: false, type: "date" },
       { key: "actualFinish", label: "Actual finish", required: false, type: "date" },
+      {
+        key: "constraintType",
+        label: "Constraint",
+        required: false,
+        type: "enum",
+        enumValues: TASK_CONSTRAINTS,
+      },
+      { key: "constraintDate", label: "Constraint date", required: false, type: "date" },
+      {
+        key: "taskCode",
+        label: "Task code",
+        required: false,
+        type: "string",
+        description:
+          "The programme's own activity id (P6 task_code, MSP UID). Predecessors are " +
+          "resolved against it, so an imported logic network needs one on every task.",
+      },
+      {
+        key: "predecessors",
+        label: "Predecessors",
+        required: false,
+        type: "string",
+        description:
+          "Semicolon- or comma-separated logic, each entry <taskCode>[:TYPE][+/-lag] — " +
+          "e.g. \"A100:FS+3; A110:SS\". Types are FS, SS, FF, SF (default FS). Tasks whose " +
+          "predecessor is not in the same run are reported and the task is still imported.",
+      },
       EXTERNAL_ID_FIELD,
     ],
     validateRow: (row) => {
@@ -268,6 +303,16 @@ export const DATASET_REGISTRY: Record<IngestionDataset, DatasetDef> = {
       const pc = row["percentComplete"];
       if (typeof pc === "number" && (pc < 0 || pc > 100)) {
         return `percentComplete ${pc} is outside 0-100`;
+      }
+      const preds = row["predecessors"];
+      if (typeof preds === "string" && preds.trim() !== "" && !row["taskCode"]) {
+        return "predecessors were given but this task has no taskCode, so nothing can link to it";
+      }
+      if (typeof preds === "string") {
+        const bad = parsePredecessorList(preds).invalid;
+        if (bad.length > 0) {
+          return `unreadable predecessor entr${bad.length === 1 ? "y" : "ies"}: ${bad.join(", ")}`;
+        }
       }
       return null;
     },
@@ -378,18 +423,96 @@ export const DATASET_REGISTRY: Record<IngestionDataset, DatasetDef> = {
       EXTERNAL_ID_FIELD,
     ],
   },
+
+  /* --------------------- WP-ANALYTICS additions --------------------- */
+
+  cost_codes: {
+    dataset: "cost_codes",
+    label: "Cost codes",
+    target:
+      "cost_codes — the company standard list, or a project-specific list when the run " +
+      "carries a projectId. A code that already exists for the same scope is skipped, not " +
+      "duplicated (the unique index is the authority).",
+    requiresProject: false,
+    fields: [
+      { key: "code", label: "Code", required: true, type: "string" },
+      { key: "title", label: "Title", required: true, type: "string" },
+      { key: "division", label: "Division", required: false, type: "string" },
+      {
+        key: "costType",
+        label: "Cost type",
+        required: false,
+        type: "enum",
+        enumValues: COST_TYPES,
+      },
+      {
+        key: "parentCode",
+        label: "Parent code",
+        required: false,
+        type: "string",
+        description:
+          "Code of the parent in the same list. Resolved after insert; an unresolvable " +
+          "parent leaves the code at the top level and is reported.",
+      },
+      EXTERNAL_ID_FIELD,
+    ],
+  },
+
+  budget_lines: {
+    dataset: "budget_lines",
+    label: "Budget lines",
+    target:
+      "budget_line_items on the project's ACTIVE budget (commit fails honestly when the " +
+      "project has no active budget). Amounts are booked as original budget; the budget " +
+      "header totals are recomputed from its lines afterwards.",
+    requiresProject: true,
+    fields: [
+      { key: "costCode", label: "Cost code", required: true, type: "string" },
+      { key: "description", label: "Description", required: true, type: "string" },
+      {
+        key: "costType",
+        label: "Cost type",
+        required: false,
+        type: "enum",
+        enumValues: COST_TYPES,
+      },
+      { key: "originalBudget", label: "Original budget", required: true, type: "number" },
+      { key: "unit", label: "Unit", required: false, type: "string" },
+      { key: "quantity", label: "Quantity", required: false, type: "number" },
+      { key: "unitRate", label: "Unit rate", required: false, type: "number" },
+      { key: "subJob", label: "Sub job / phase", required: false, type: "string" },
+      EXTERNAL_ID_FIELD,
+    ],
+    validateRow: (row) => {
+      const amount = row["originalBudget"];
+      if (typeof amount === "number" && !Number.isFinite(amount)) {
+        return "originalBudget is not a finite number";
+      }
+      const q = row["quantity"];
+      const r = row["unitRate"];
+      if (typeof q === "number" && typeof r === "number" && typeof amount === "number") {
+        const implied = q * r;
+        // A tenth of a percent of slack: rounding in a spreadsheet is fine, a
+        // rate that does not multiply out is a mapping error worth catching.
+        if (Math.abs(implied - amount) > Math.max(0.01, Math.abs(amount) * 0.001)) {
+          return `quantity x unitRate is ${implied}, which does not match originalBudget ${amount}`;
+        }
+      }
+      return null;
+    },
+  },
 };
 
-/** Look up a dataset definition; null for names outside INGESTION_DATASETS. */
+/** Look up a dataset definition; null for names outside the vocabulary. */
 export function datasetDef(name: string): DatasetDef | null {
-  return (INGESTION_DATASETS as readonly string[]).includes(name)
-    ? DATASET_REGISTRY[name as IngestionDataset]
+  return (ALL_INGESTION_DATASETS as readonly string[]).includes(name)
+    ? DATASET_REGISTRY[name as AnyIngestionDataset]
     : null;
 }
 
 /** Public shape for GET /ingestion/datasets — drives the web mapping UI. */
 export function datasetCatalog() {
-  return INGESTION_DATASETS.map((name) => {
+  return ALL_INGESTION_DATASETS.map((name) => {
     const def = DATASET_REGISTRY[name];
     return {
       dataset: def.dataset,
@@ -589,3 +712,59 @@ export const MAX_PUSH_RECORDS = 5000;
 export const MAX_REPORT_ENTRIES = 200;
 /** Raw-row preview returned when a run is created. */
 export const PREVIEW_ROWS = 5;
+
+/* ------------------------------------------------------------------ */
+/* Schedule logic (#349-350)                                           */
+/* ------------------------------------------------------------------ */
+
+export type DependencyKind = "FS" | "SS" | "FF" | "SF";
+
+export interface ParsedPredecessor {
+  taskCode: string;
+  type: DependencyKind;
+  lagDays: number;
+}
+
+const DEP_TYPES: readonly DependencyKind[] = ["FS", "SS", "FF", "SF"];
+
+/**
+ * Parse one predecessor list.
+ *
+ * Every programme exporter writes logic slightly differently, so the accepted
+ * shape is the intersection every one of them can produce: an activity id,
+ * optionally a relationship type, optionally a lag —
+ * `A100`, `A100:FS`, `A100:SS+3`, `A100FS-2`, `A100:FS+3d`. Anything it cannot
+ * read is returned in `invalid` and REPORTED rather than silently dropped: a
+ * schedule that quietly lost a link computes a finish date that is not the
+ * contractor's finish date.
+ */
+export function parsePredecessorList(raw: string): {
+  links: ParsedPredecessor[];
+  invalid: string[];
+} {
+  const links: ParsedPredecessor[] = [];
+  const invalid: string[] = [];
+  for (const part of raw.split(/[;,]/)) {
+    const entry = part.trim();
+    if (entry === "") continue;
+    const m = /^([A-Za-z0-9_.\-]+?)\s*(?::\s*|\s+)?(FS|SS|FF|SF)?\s*([+-]\s*\d+(?:\.\d+)?)?\s*d?$/i.exec(
+      entry,
+    );
+    if (!m || !m[1]) {
+      invalid.push(entry);
+      continue;
+    }
+    const type = (m[2]?.toUpperCase() ?? "FS") as DependencyKind;
+    if (!DEP_TYPES.includes(type)) {
+      invalid.push(entry);
+      continue;
+    }
+    const lag = m[3] ? Number(m[3].replace(/\s+/g, "")) : 0;
+    if (!Number.isFinite(lag)) {
+      invalid.push(entry);
+      continue;
+    }
+    links.push({ taskCode: m[1], type, lagDays: Math.trunc(lag) });
+  }
+  return { links, invalid };
+}

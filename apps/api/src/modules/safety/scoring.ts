@@ -182,6 +182,17 @@ export interface InspectionScore {
   criticalDefectCount: number;
   /** required items with no answer at all — completion is refused on these */
   unansweredRequired: string[];
+  /**
+   * Items the template marks `photoRequired` that were answered without one.
+   *
+   * A photograph is not decoration on a safety inspection: it is the only
+   * evidence that the inspector was at the thing they signed off. The quality
+   * module's checklist engine has always enforced this
+   * (`quality/checklistItems.ts`), and the two forms share one vocabulary, so
+   * a safety template that asks for a photo and accepts a pass without one
+   * makes the flag meaningless — and spec #621 silently unmet.
+   */
+  missingPhotos: string[];
   /** answers pointing at items the template does not contain */
   unknownItemIds: string[];
   answeredCount: number;
@@ -233,16 +244,31 @@ export function scoreInspection(
   for (const a of answers) if (byId.has(a.itemId)) answerById.set(a.itemId, a);
 
   const unansweredRequired: string[] = [];
+  const missingPhotos: string[] = [];
   for (const item of items) {
-    if (!item.required) continue;
-    if (NON_SCORING_ITEM_TYPES.has(item.itemType) && item.itemType === "section_header") continue;
     const a = answerById.get(item.id);
     const answered =
       a !== undefined &&
       (a.isPass !== undefined ||
         (a.response != null && a.response !== "") ||
         a.numericValue != null);
-    if (!answered) unansweredRequired.push(item.id);
+    if (item.required && !(NON_SCORING_ITEM_TYPES.has(item.itemType) && item.itemType === "section_header")) {
+      if (!answered) unansweredRequired.push(item.id);
+    }
+    /* The photo duty attaches to an ANSWERED item, required or not: a pass
+     * recorded against a photo-required question with no photograph is the
+     * case the flag exists to catch. An unanswered item is already caught
+     * above, and reporting it twice would just make the refusal noisier. */
+    if (item.photoRequired === true && answered && (a?.photoFileIds ?? []).length === 0) {
+      missingPhotos.push(item.id);
+    }
+  }
+  if (missingPhotos.length > 0) {
+    reasons.push(
+      `${missingPhotos.length} item(s) the template marks photo-required were answered without a ` +
+        `photograph (${missingPhotos.join(", ")}). The photograph is the evidence that the ` +
+        `inspector was at the thing they signed off; without it the answer is an assertion.`,
+    );
   }
 
   const defects: InspectionDefect[] = [];
@@ -334,6 +360,7 @@ export function scoreInspection(
     defectCount: defects.length,
     criticalDefectCount,
     unansweredRequired,
+    missingPhotos,
     unknownItemIds,
     answeredCount,
     notApplicableCount,

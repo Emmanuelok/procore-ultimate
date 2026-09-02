@@ -15,7 +15,7 @@
  */
 
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, ilike, isNull, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, ilike, inArray, isNull, or } from "drizzle-orm";
 import { z } from "zod";
 import {
   checklistResponses,
@@ -232,6 +232,9 @@ const CHECKLIST_PATCH_COLUMNS = [
 
 const OPEN_CHECKLIST_STATUSES = ["draft", "scheduled", "in_progress"];
 
+/** Statuses at which a record exists for a second party to witness. */
+const WITNESSABLE_CHECKLIST_STATUSES = ["complete", "failed", "reviewed", "closed"];
+
 /* ------------------------------------------------------------------ */
 /* Spec adapters                                                       */
 /* ------------------------------------------------------------------ */
@@ -310,6 +313,23 @@ function answerFromRow(row: ResponseRow): ChecklistAnswer {
 
 export const checklistRoutes: FastifyPluginAsync = async (app) => {
   const { memberGate, readGate, standardGate } = buildGates(app);
+
+  /*
+   * TEMPLATE WRITES ARE A CONTROLLED-DOCUMENT ACT.
+   *
+   * `memberGate` is company membership, and membership includes the role
+   * "guest". Until this gate existed, a guest with no quality permission on
+   * any project could create, edit, approve, revise and retire the controlled
+   * forms that every project checklist and every commissioning test is
+   * recorded against — the forms whose approval the module's own copy calls a
+   * control. Reads stay open to members (a subcontractor needs to see the form
+   * they are being inspected against); writes require a real company role.
+   */
+  const templateWriteGate = [
+    app.authenticate,
+    app.requireCompany,
+    app.requireCompanyRole(["owner", "admin", "member"]),
+  ];
 
   /* ---------------------------------------------------------------- */
   /* Templates (company-scoped)                                        */
@@ -399,7 +419,7 @@ export const checklistRoutes: FastifyPluginAsync = async (app) => {
     } satisfies typeof checklistTemplateItems.$inferInsert;
   }
 
-  app.post("/companies/current/checklist-templates", { preHandler: memberGate }, async (req, reply) => {
+  app.post("/companies/current/checklist-templates", { preHandler: templateWriteGate }, async (req, reply) => {
     const body = templateCreateSchema.parse(req.body);
     const dupe = await app.db
       .select({ id: checklistTemplates.id })
@@ -418,7 +438,18 @@ export const checklistRoutes: FastifyPluginAsync = async (app) => {
       );
     }
     const id = newId("clt");
-    const [created] = await app.db
+    /*
+     * A TEMPLATE AND ITS ITEMS ARE ONE THING.
+     *
+     * The items used to be inserted one at a time after the template, so an
+     * invalid item halfway down the list left a controlled form in the register
+     * with a partial question set — and a partial form is worse than none,
+     * because it looks complete to whoever fills it in next. Both go in one
+     * transaction; the ledger append stays outside it so the emitted event is
+     * never for a row that was rolled back.
+     */
+    const [created] = await app.db.transaction(async (tx) =>
+      tx
       .insert(checklistTemplates)
       .values({
         id,
@@ -439,12 +470,17 @@ export const checklistRoutes: FastifyPluginAsync = async (app) => {
         detail: body.detail ?? {},
         createdBy: req.user!.id,
       })
-      .returning();
-    for (const [index, item] of (body.items ?? []).entries()) {
-      await app.db
-        .insert(checklistTemplateItems)
-        .values(insertItemValues(created!, item, item.position ?? (index + 1) * 10));
-    }
+      .returning()
+      .then(async (rows) => {
+        const row = rows[0]!;
+        for (const [index, item] of (body.items ?? []).entries()) {
+          await tx
+            .insert(checklistTemplateItems)
+            .values(insertItemValues(row, item, item.position ?? (index + 1) * 10));
+        }
+        return rows;
+      }),
+    );
     await refreshItemCount(id);
     await ledger(app.db, {
       companyId: req.companyId!,
@@ -500,7 +536,7 @@ export const checklistRoutes: FastifyPluginAsync = async (app) => {
 
   app.patch(
     "/companies/current/checklist-templates/:templateId",
-    { preHandler: memberGate },
+    { preHandler: templateWriteGate },
     async (req) => {
       const { templateId } = req.params as { templateId: string };
       const body = templatePatchSchema.parse(req.body);
@@ -532,7 +568,7 @@ export const checklistRoutes: FastifyPluginAsync = async (app) => {
 
   app.post(
     "/companies/current/checklist-templates/:templateId/items",
-    { preHandler: memberGate },
+    { preHandler: templateWriteGate },
     async (req, reply) => {
       const { templateId } = req.params as { templateId: string };
       const body = templateItemSchema.parse(req.body);
@@ -566,7 +602,7 @@ export const checklistRoutes: FastifyPluginAsync = async (app) => {
 
   app.patch(
     "/companies/current/checklist-templates/:templateId/items/:itemId",
-    { preHandler: memberGate },
+    { preHandler: templateWriteGate },
     async (req) => {
       const { templateId, itemId } = req.params as { templateId: string; itemId: string };
       const body = templateItemSchema.partial().parse(req.body);
@@ -638,7 +674,7 @@ export const checklistRoutes: FastifyPluginAsync = async (app) => {
 
   app.delete(
     "/companies/current/checklist-templates/:templateId/items/:itemId",
-    { preHandler: memberGate },
+    { preHandler: templateWriteGate },
     async (req) => {
       const { templateId, itemId } = req.params as { templateId: string; itemId: string };
       const template = await fetchTemplate(templateId, req.companyId!);
@@ -671,7 +707,7 @@ export const checklistRoutes: FastifyPluginAsync = async (app) => {
   /** Issue the form. Never the author — an unreviewed form is not a control. */
   app.post(
     "/companies/current/checklist-templates/:templateId/approve",
-    { preHandler: memberGate },
+    { preHandler: templateWriteGate },
     async (req) => {
       const { templateId } = req.params as { templateId: string };
       const template = await fetchTemplate(templateId, req.companyId!);
@@ -709,7 +745,7 @@ export const checklistRoutes: FastifyPluginAsync = async (app) => {
 
   app.post(
     "/companies/current/checklist-templates/:templateId/revise",
-    { preHandler: memberGate },
+    { preHandler: templateWriteGate },
     async (req, reply) => {
       const { templateId } = req.params as { templateId: string };
       const template = await fetchTemplate(templateId, req.companyId!);
@@ -740,17 +776,23 @@ export const checklistRoutes: FastifyPluginAsync = async (app) => {
         })
         .returning();
       const items = await loadTemplateItems(templateId);
-      for (const item of items) {
-        const { id: _priorId, createdAt: _c, updatedAt: _u, ...carried } = item;
-        await app.db
-          .insert(checklistTemplateItems)
-          .values({ ...carried, id: newId("cti"), templateId: id });
-      }
+      // The new revision, its carried items and the retirement of the previous
+      // revision are one act: a half-copied revision would be a controlled form
+      // missing questions, and a retirement without its replacement would leave
+      // the project with no issued form at all.
+      await app.db.transaction(async (tx) => {
+        for (const item of items) {
+          const { id: _priorId, createdAt: _c, updatedAt: _u, ...carried } = item;
+          await tx
+            .insert(checklistTemplateItems)
+            .values({ ...carried, id: newId("cti"), templateId: id });
+        }
+        await tx
+          .update(checklistTemplates)
+          .set({ status: "retired", updatedAt: nowISO() })
+          .where(eq(checklistTemplates.id, templateId));
+      });
       await refreshItemCount(id);
-      await app.db
-        .update(checklistTemplates)
-        .set({ status: "retired", updatedAt: nowISO() })
-        .where(eq(checklistTemplates.id, templateId));
       await ledger(app.db, {
         companyId: req.companyId!,
         actorId: req.user!.id,
@@ -767,7 +809,7 @@ export const checklistRoutes: FastifyPluginAsync = async (app) => {
 
   app.post(
     "/companies/current/checklist-templates/:templateId/retire",
-    { preHandler: memberGate },
+    { preHandler: templateWriteGate },
     async (req) => {
       const { templateId } = req.params as { templateId: string };
       const template = await fetchTemplate(templateId, req.companyId!);
@@ -1281,7 +1323,70 @@ export const checklistRoutes: FastifyPluginAsync = async (app) => {
         throw badRequest(`${checklist.reference} has no answers and cannot be completed.`);
       }
 
+      /*
+       * CLAIM THE COMPLETION ATOMICALLY.
+       *
+       * The status check above is a read; the NCR-raising loop below is a
+       * write. Two concurrent completions — a double-clicked button, a retried
+       * request — both passed the read, both ran the loop, and both raised an
+       * NCR for the same failed item, because the per-response
+       * `if (response.ncrId) continue` guard was reading rows the other request
+       * had not written yet. The header promises exactly one NCR per failure,
+       * so the promise is now kept by the database: a single conditional
+       * UPDATE claims the completion, and the loser of the race gets a 409
+       * rather than a duplicate register entry.
+       *
+       * `performedAt` is the claim flag because it is null until completion and
+       * set by it. The claim is released in the catch below if anything after
+       * it fails, so a genuine retry is never locked out.
+       */
       const at = body.performedAt ?? nowISO();
+      const claimed = await app.db
+        .update(checklists)
+        .set({ performedAt: at, performedBy: req.user!.id, updatedAt: nowISO() })
+        .where(
+          and(
+            eq(checklists.id, checklistId),
+            isNull(checklists.performedAt),
+            inArray(checklists.status, OPEN_CHECKLIST_STATUSES),
+          ),
+        )
+        .returning({ id: checklists.id });
+      if (!claimed[0]) {
+        throw conflict(
+          `${checklist.reference} is already being completed by another request. Reload it: completing it twice would raise a second NCR for the same failure.`,
+        );
+      }
+
+      try {
+        return await completeClaimed(checklist, body, at, responses, score, specByResponseId, template, req);
+      } catch (err) {
+        // Release the claim so a corrected retry is possible; the completion
+        // never happened, and a checklist stuck half-completed would be worse
+        // than the error the caller is about to see.
+        await app.db
+          .update(checklists)
+          .set({ performedAt: null, performedBy: null, updatedAt: nowISO() })
+          .where(and(eq(checklists.id, checklistId), eq(checklists.status, checklist.status)));
+        throw err;
+      }
+    },
+  );
+
+  /** The body of a claimed completion — see the claim above for why it is split. */
+  async function completeClaimed(
+    checklist: Awaited<ReturnType<typeof fetchChecklist>>,
+    body: z.infer<typeof completeSchema>,
+    at: string,
+    responses: Awaited<ReturnType<typeof loadResponses>>,
+    score: Awaited<ReturnType<typeof scoreOf>>["score"],
+    specByResponseId: Awaited<ReturnType<typeof scoreOf>>["specByResponseId"],
+    template: Awaited<ReturnType<typeof scoreOf>>["template"],
+    req: { companyId?: string; projectId?: string; user?: { id: string } },
+  ) {
+    {
+      const checklistId = checklist.id;
+
       const raisedNcrs: { responseId: string; ncrId: string; reference: string }[] = [];
       const raisedPunchItems: { responseId: string; punchItemId: string; number: number }[] = [];
       const unraised: { responseId: string; reason: string }[] = [];
@@ -1450,8 +1555,8 @@ export const checklistRoutes: FastifyPluginAsync = async (app) => {
         scoring: score,
         raised: { ncrs: raisedNcrs, punchItems: raisedPunchItems, unraised },
       };
-    },
-  );
+    }
+  }
 
   /** Witnessing — a second party watching the same test. Never the performer. */
   app.post(
@@ -1461,6 +1566,17 @@ export const checklistRoutes: FastifyPluginAsync = async (app) => {
       const { checklistId } = req.params as { checklistId: string };
       const body = signOffSchema.parse(req.body ?? {});
       const checklist = await fetchChecklist(checklistId, req.companyId!, req.projectId!);
+      /*
+       * A witness attests to an inspection that took place. Until the record is
+       * completed `performedBy` is null, so the segregation check passed
+       * trivially and anybody could witness a draft nobody had performed — a
+       * signature on an empty form, which is worse than no signature.
+       */
+      if (!WITNESSABLE_CHECKLIST_STATUSES.includes(checklist.status)) {
+        throw badRequest(
+          `${checklist.reference} is ${checklist.status}. A witness signs a record that has been performed; complete it first.`,
+        );
+      }
       assertDistinctActor(
         req.user!.id,
         checklist.performedBy,

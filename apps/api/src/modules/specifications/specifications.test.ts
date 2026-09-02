@@ -1016,5 +1016,25 @@ describe("manual sections, references and coverage", () => {
       headers: { authorization: `Bearer ${other.accessToken}`, "x-company-id": other.companyId },
     });
     expect(denied.json().total).toBe(0);
+
+    // Plan §6.3: a company member who is on no project sees no project data,
+    // even though the library route is only company-gated.
+    const outsider = await registerActor(built.app);
+    await built.app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: uploader.companyId,
+      userId: outsider.userId,
+      role: "member",
+    });
+    const scoped = await built.app.inject({
+      method: "GET",
+      url: `/api/v1/spec-library/sections?code=033000`,
+      headers: { authorization: `Bearer ${outsider.accessToken}`, "x-company-id": uploader.companyId },
+    });
+    expect(scoped.statusCode).toBe(200);
+    expect(scoped.json().total).toBe(0);
+    // …while a member of the project does see it.
+    const member = await inject("GET", `/api/v1/spec-library/sections?code=033000`, readOnlyHeaders);
+    expect(member.json().total).toBe(1);
   });
 });

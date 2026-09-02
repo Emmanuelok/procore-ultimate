@@ -1,12 +1,12 @@
 import type { FastifyPluginAsync } from "fastify";
-import { and, eq } from "drizzle-orm";
+import { and, count, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
-import { commitments } from "@constructos/db";
+import { backcharges, commitmentPayments, commitments } from "@constructos/db";
 import { assessProjectCommitments } from "./compliance.js";
 import {
   buyoutLog,
   committedByCostCode,
-  reconcile,
+  reconcileProject,
   recomputeCommitmentTotals,
   syncBudgetCommitted,
 } from "./rollups.js";
@@ -50,6 +50,71 @@ export const reportRoutes: FastifyPluginAsync = async (app) => {
     app.requireCompany,
     app.requireTool("commitments", "standard"),
   ];
+
+  /**
+   * HEALTH INPUTS (plan §3.5) for the intelligence layer's `commercial` and
+   * `finance` dimensions. Counts only — never money — because a project may
+   * hold commitments in several currencies and a health score that silently
+   * adds them would be a number nobody can defend. A metric with no basis
+   * comes back null with the reason beside it, never as 0.
+   */
+  app.get(
+    "/projects/:projectId/commitments/health-inputs",
+    { preHandler: readGate },
+    async (req) => {
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      const [report, held, openBc, reconciliation] = await Promise.all([
+        assessProjectCommitments(app.db, companyId, projectId, todayIso()),
+        app.db
+          .select({ n: count() })
+          .from(commitmentPayments)
+          .where(
+            and(
+              eq(commitmentPayments.companyId, companyId),
+              eq(commitmentPayments.projectId, projectId),
+              eq(commitmentPayments.status, "on_hold"),
+            ),
+          ),
+        app.db
+          .select({ n: count() })
+          .from(backcharges)
+          .where(
+            and(
+              eq(backcharges.companyId, companyId),
+              eq(backcharges.projectId, projectId),
+              inArray(backcharges.status, ["issued", "disputed"]),
+            ),
+          ),
+        reconcileProject(app.db, companyId, projectId),
+      ]);
+      const reasons: string[] = [];
+      if (report.entries.length === 0) {
+        reasons.push("No live commitment on this project, so the buy-side dimensions are unrated.");
+      }
+      const failing = reconciliation.filter((r) => !r.reconciles).length;
+      if (failing > 0) {
+        reasons.push(
+          `${failing} commitment(s) do not reconcile; the committed-cost figures they feed cannot be trusted until they do.`,
+        );
+      }
+      return {
+        projectId,
+        asOf: report.asOf,
+        metrics: {
+          liveCommitments: report.entries.length,
+          complianceBlocked: report.summary.blocked,
+          complianceWarning: report.summary.warning,
+          complianceUnknown: report.summary.unknown,
+          paymentBlocked: report.summary.paymentBlocked,
+          paymentsOnHold: Number(held[0]?.n ?? 0),
+          openBackcharges: Number(openBc[0]?.n ?? 0),
+          reconciliationFailures: failing,
+        },
+        reasons,
+      };
+    },
+  );
 
   app.get(
     "/projects/:projectId/commitments/rollups/by-cost-code",
@@ -104,35 +169,17 @@ export const reportRoutes: FastifyPluginAsync = async (app) => {
     "/projects/:projectId/commitments/rollups/reconcile",
     { preHandler: readGate },
     async (req) => {
-      const rows = await app.db
-        .select({
-          id: commitments.id,
-          reference: commitments.reference,
-          title: commitments.title,
-          status: commitments.status,
-          currency: commitments.currency,
-        })
-        .from(commitments)
-        .where(
-          and(
-            eq(commitments.companyId, req.companyId!),
-            eq(commitments.projectId, req.projectId!),
-          ),
-        );
-      const results = [];
-      for (const row of rows) {
-        const r = await reconcile(app.db, row.id);
-        results.push({
-          commitmentId: row.id,
-          reference: row.reference,
-          title: row.title,
-          status: row.status,
-          currency: row.currency,
-          reconciles: r.reconciles,
-          failing: r.checks.filter((c) => !c.reconciles),
-          checks: r.checks,
-        });
-      }
+      /* three queries for the whole project, not three per commitment */
+      const results = (await reconcileProject(app.db, req.companyId!, req.projectId!)).map((r) => ({
+        commitmentId: r.commitment.id,
+        reference: r.commitment.reference,
+        title: r.commitment.title,
+        status: r.commitment.status,
+        currency: r.commitment.currency,
+        reconciles: r.reconciles,
+        failing: r.checks.filter((c) => !c.reconciles),
+        checks: r.checks,
+      }));
       const failing = results.filter((r) => !r.reconciles);
       return {
         projectId: req.projectId!,

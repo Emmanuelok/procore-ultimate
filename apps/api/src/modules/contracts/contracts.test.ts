@@ -41,7 +41,7 @@ beforeAll(async () => {
     companyId: owner.companyId,
     name: "Contract Intelligence Test Project",
   });
-});
+}, 180_000);
 
 afterAll(async () => {
   await built.close();
@@ -331,7 +331,7 @@ describe("contract events + time-bar engine", () => {
     expect(obl!.status).toBe("satisfied");
   });
 
-  it("recording a late notice raises a high-severity breach-risk signal", async () => {
+  it("recording a late notice keeps the event barred and persists the breach", async () => {
     const created = await createEvent(contractId, {
       kind: "claim_notice",
       clauseRef: "20.2",
@@ -346,9 +346,17 @@ describe("contract events + time-bar engine", () => {
       payload: { method: "registered_post" },
     });
     expect(served.statusCode).toBe(200);
-    const body = served.json() as { status: string; late: boolean };
-    expect(body.status).toBe("notice_served");
+    const body = served.json() as {
+      status: string;
+      late: boolean;
+      noticeServedLate: boolean;
+      deadlineAtService: string | null;
+    };
+    // a late notice does not launder a missed bar into a clean "notice served"
+    expect(body.status).toBe("time_barred");
     expect(body.late).toBe(true);
+    expect(body.noticeServedLate).toBe(true);
+    expect(body.deadlineAtService).toBeTruthy();
     const rows = await app.db
       .select()
       .from(signals)
@@ -360,19 +368,30 @@ describe("contract events + time-bar engine", () => {
     expect(rows[0]!.explanation).toContain("after the notice deadline");
   });
 
-  it("sweeps past-deadline open events to time_barred exactly once", async () => {
+  it("the scheduled sweep breaches past-deadline events exactly once", async () => {
     const created = await createEvent(contractId, {
       kind: "compensation_event",
       clauseRef: "20.2",
       title: "Unnotified variation work",
       eventDate: isoDaysFromToday(-40), // deadline passed ~12 days ago
     });
-    const ev = created.json() as { id: string; obligationId: string };
-
+    const ev = created.json() as { id: string; obligationId: string; status: string };
+    // Reading the register no longer performs the transition: the sweep is a
+    // scheduled job, so an unread contract is still policed.
+    expect(ev.status).toBe("open");
     const listUrl = `/api/v1/projects/${projectId}/contracts/${contractId}/events`;
-    const first = await app.inject({ method: "GET", url: listUrl, headers: owner.headers });
-    expect(first.statusCode).toBe(200);
-    const swept = (first.json() as { items: { id: string; status: string }[] }).items.find(
+    const beforeSweep = await app.inject({ method: "GET", url: listUrl, headers: owner.headers });
+    expect(
+      (beforeSweep.json() as { items: { id: string; status: string }[] }).items.find(
+        (i) => i.id === ev.id,
+      )!.status,
+    ).toBe("open");
+
+    await app.scheduler.runNow("contracts.time-bars");
+
+    const after = await app.inject({ method: "GET", url: listUrl, headers: owner.headers });
+    expect(after.statusCode).toBe(200);
+    const swept = (after.json() as { items: { id: string; status: string }[] }).items.find(
       (i) => i.id === ev.id,
     );
     expect(swept!.status).toBe("time_barred");
@@ -395,9 +414,8 @@ describe("contract events + time-bar engine", () => {
     const afterFirst = await signalCount();
     expect(afterFirst).toBe(1);
 
-    // second read must not duplicate the signal or re-transition
-    const second = await app.inject({ method: "GET", url: listUrl, headers: owner.headers });
-    expect(second.statusCode).toBe(200);
+    // a second sweep must not duplicate the signal or re-transition
+    await app.scheduler.runNow("contracts.time-bars");
     expect(await signalCount()).toBe(afterFirst);
   });
 
@@ -526,11 +544,29 @@ describe("EOT claims", () => {
     });
     expect(noDays.statusCode).toBe(400);
 
-    const assess = await app.inject({
+    // an assessment must name the delay-analysis method it used
+    const noMethod = await app.inject({
       method: "POST",
       url: statusUrl,
       headers: assessorHeaders,
       payload: { status: "assessed", daysAwarded: 10 },
+    });
+    expect(noMethod.statusCode).toBe(400);
+
+    const assess = await app.inject({
+      method: "POST",
+      url: statusUrl,
+      headers: assessorHeaders,
+      payload: {
+        status: "assessed",
+        daysAwarded: 10,
+        assessment: {
+          method: "time_impact_analysis",
+          concurrency: "none",
+          floatOwnership: "project",
+          reasons: "Storm damage delayed the pier works on the critical path.",
+        },
+      },
     });
     expect(assess.statusCode).toBe(200);
     const assessed = assess.json() as { daysAwarded: number; assessedBy: string };

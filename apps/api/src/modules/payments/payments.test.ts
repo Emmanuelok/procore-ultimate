@@ -443,7 +443,7 @@ describe("payment responses", () => {
     expect(res.statusCode).toBe(400);
   });
 
-  it("a late response raises a high signal, breaches the obligation and rescues no status", async () => {
+  it("a late response raises a high signal, breaches the obligation and never rescues an overdue claim from deemed", async () => {
     const oblId = await insertObligation();
     const claimId = await insertClaim({
       servedAt: isoTimestampDaysAgo(10),
@@ -461,7 +461,13 @@ describe("payment responses", () => {
     expect(res.statusCode).toBe(201);
     const body = res.json() as { status: string; response: { late: boolean } };
     expect(body.response.late).toBe(true);
-    expect(body.status).toBe("served"); // no promotion to responded
+    /*
+     * The deadline had passed before anyone opened the register: the sweep
+     * runs BEFORE the response is recorded, so the claim is deemed whether or
+     * not somebody happened to load the page in between (audit bug: a late
+     * response on an un-swept claim used to freeze it at "served" forever).
+     */
+    expect(body.status).toBe("deemed");
 
     const [obl] = await app.db.select().from(obligations).where(eq(obligations.id, oblId));
     expect(obl!.status).toBe("breached");

@@ -1017,7 +1017,7 @@ describe("lien waivers", () => {
   });
 
   it("blocks payment while the required waiver is not on file, and names it", async () => {
-    const res = await inject("POST", `/api/v1/invoices/${inv1}/payments`, owner.headers, {
+    const res = await inject("POST", `/api/v1/invoices/${inv1}/payments`, clerkH, {
       amount: 58500,
       method: "ach",
     });
@@ -1025,12 +1025,12 @@ describe("lien waivers", () => {
     const body = res.json();
     expect(body.details.control).toBe("lien_waiver_required");
     expect(body.message).toContain("INV-0001");
-    expect(body.message).toContain("none is received or verified");
+    expect(body.message).toContain("none covers this payment");
     expect(body.details.waivers[0].reference).toBe("LW-0001");
   });
 
   it("records an overridden payment ON HOLD, with the money not moving", async () => {
-    const res = await inject("POST", `/api/v1/invoices/${inv1}/payments`, owner.headers, {
+    const res = await inject("POST", `/api/v1/invoices/${inv1}/payments`, clerkH, {
       amount: 10000,
       method: "check",
       overrideMissingWaiver: true,
@@ -1096,7 +1096,7 @@ describe("lien waivers", () => {
 
 describe("payments", () => {
   it("refuses paying more than the invoice is owed, naming the overage", async () => {
-    const res = await inject("POST", `/api/v1/invoices/${inv1}/payments`, owner.headers, {
+    const res = await inject("POST", `/api/v1/invoices/${inv1}/payments`, clerkH, {
       amount: 60000,
       method: "ach",
     });
@@ -1126,7 +1126,7 @@ describe("payments", () => {
   });
 
   it("pays once the waiver is verified, and rolls the money through to the budget", async () => {
-    const res = await inject("POST", `/api/v1/invoices/${inv1}/payments`, owner.headers, {
+    const res = await inject("POST", `/api/v1/invoices/${inv1}/payments`, clerkH, {
       amount: 58500,
       method: "ach",
       transactionReference: "ACH-99120",

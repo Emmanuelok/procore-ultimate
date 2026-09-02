@@ -46,11 +46,34 @@ export const webhookEndpoints = pgTable(
     disabledReason: text("disabled_reason"),
     lastDeliveryAt: timestamp("last_delivery_at", { withTimezone: true, mode: "string" }),
     lastStatus: text("last_status"),
+    /* ------------------ WP-ANALYTICS: the upgrade wave ----------------- */
+    /**
+     * SECRET ROTATION. The signing secret is HKDF(masterKey, salt=id:vN), so
+     * rotating it is an increment of this counter. During the grace window
+     * both versions are computed and BOTH signatures are sent, so a receiver
+     * can adopt the new secret without dropping a delivery.
+     */
+    secretVersion: integer("secret_version").default(1).notNull(),
+    previousSecretVersion: integer("previous_secret_version"),
+    secretGraceUntil: timestamp("secret_grace_until", { withTimezone: true, mode: "string" }),
+    /**
+     * CIRCUIT BREAKER. Consecutive transport errors (not HTTP failures — a
+     * receiver answering 500 is alive) trip the breaker; while it is open the
+     * endpoint is skipped by the drain so one dead receiver cannot consume the
+     * delivery budget of every other tenant.
+     */
+    consecutiveErrors: integer("consecutive_errors").default(0).notNull(),
+    circuitOpenUntil: timestamp("circuit_open_until", { withTimezone: true, mode: "string" }),
+    /** the last resolved address the URL was verified against (SSRF guard) */
+    verifiedHost: text("verified_host"),
     createdBy: text("created_by").notNull(),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
-  (t) => [index("webhook_endpoints_company_idx").on(t.companyId)],
+  (t) => [
+    index("webhook_endpoints_company_idx").on(t.companyId),
+    index("webhook_endpoints_active_idx").on(t.isActive, t.circuitOpenUntil),
+  ],
 );
 
 /**
@@ -78,12 +101,77 @@ export const webhookDeliveries = pgTable(
     responseBody: text("response_body"),
     error: text("error"),
     deliveredAt: timestamp("delivered_at", { withTimezone: true, mode: "string" }),
+    /**
+     * LEASE. A delivery is CLAIMED before it is attempted, with a conditional
+     * update that only one process can win. Without it every API replica drains
+     * the same rows and every receiver is delivered to N times — the exact
+     * duplicate deployment.md called safe.
+     */
+    leaseUntil: timestamp("lease_until", { withTimezone: true, mode: "string" }),
+    leaseOwner: text("lease_owner"),
+    /** which secret version signed `signature` (and `signatureNext` during rotation) */
+    secretVersion: integer("secret_version").default(1).notNull(),
+    signatureNext: text("signature_next"),
     createdAt: createdAt(),
   },
   (t) => [
     index("webhook_deliveries_endpoint_idx").on(t.endpointId),
     index("webhook_deliveries_status_idx").on(t.status),
+    /** the drain's query: due rows, oldest first, across endpoints */
+    index("webhook_deliveries_due_idx").on(t.status, t.nextAttemptAt),
+    /** the operator's query and the retention sweep's */
+    index("webhook_deliveries_company_idx").on(t.companyId, t.status, t.createdAt),
   ],
+);
+
+/**
+ * An ERP mapping profile (#130-133). ConstructOS does not pretend to speak
+ * Sage 300 CRE, Viewpoint Vista or QuickBooks natively; it speaks a canonical
+ * AP/AR shape and lets an integrator declare, per system, which canonical field
+ * lands in which column of that system's import file. The profile is data, so a
+ * new ERP is a row rather than a release.
+ */
+export const integrationExportProfiles = pgTable(
+  "integration_export_profiles",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    name: text("name").notNull(),
+    /** sage300 | viewpoint | quickbooks | generic */
+    system: text("system").notNull(),
+    /** ap_invoices | job_cost | payments */
+    feed: text("feed").notNull(),
+    /** [{ target: "Vendor", source: "vendorReference", constant?: "…" }] */
+    fieldMap: jsonb("field_map").$type<unknown[]>().default([]).notNull(),
+    /** csv | json */
+    format: text("format").default("csv").notNull(),
+    /** written verbatim into the export header comment */
+    notes: text("notes"),
+    isActive: integer("is_active").default(1).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [index("integration_export_profiles_company_idx").on(t.companyId, t.feed)],
+);
+
+/**
+ * Developer sandbox tenants (#123). A tenant marked sandbox is a place to
+ * exercise the API without consequences, and every surface that could carry the
+ * consequence elsewhere says so: exports carry a SANDBOX banner, webhook
+ * envelopes carry `sandbox: true`, and a sandbox company may not contribute to
+ * the cross-tenant benchmark pool at all.
+ */
+export const developerSandboxes = pgTable(
+  "developer_sandboxes",
+  {
+    companyId: text("company_id").primaryKey(),
+    /** free text: what this sandbox is for */
+    purpose: text("purpose"),
+    enabledBy: text("enabled_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
 );
 
 /** An OAuth2 client-credentials machine caller (#120). */

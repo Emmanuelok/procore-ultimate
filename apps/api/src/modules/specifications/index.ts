@@ -1,17 +1,40 @@
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
-import { and, asc, count, desc, eq, ilike, inArray, isNotNull, isNull, ne } from "drizzle-orm";
+import {
+  and,
+  asc,
+  count,
+  desc,
+  eq,
+  gte,
+  ilike,
+  inArray,
+  isNotNull,
+  isNull,
+  lt,
+  ne,
+  notInArray,
+  or,
+  sql,
+} from "drizzle-orm";
 import { z } from "zod";
 import {
+  assuranceGrants,
+  bidPackages,
+  commitments,
   drawingSheets,
+  fileAccessLog,
   files,
   rfis,
   specBooks,
   specDivisions,
   specReferences,
+  specRevisionNotices,
   specSectionRevisions,
   specSections,
   specSubmittalRequirements,
+  projectMemberships,
   submittals,
+  users,
 } from "@constructos/db";
 import {
   SPEC_BOOK_STATUSES,
@@ -22,6 +45,7 @@ import {
   SPEC_REQUIREMENT_STATUSES,
   SPEC_SECTION_STATUSES,
   SUBMITTAL_TYPES,
+  type LedgerAction,
 } from "@constructos/shared";
 import { sha256Hex } from "@constructos/ledger";
 import { newId } from "../../lib/ids.js";
@@ -29,8 +53,15 @@ import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
+import { forEachCompany } from "../../lib/scheduler.js";
+import type { Db } from "../../lib/db.js";
+import { isExpired } from "../../lib/time.js";
 import { addDaysISO, isoDateSchema } from "../field/dates.js";
 import { nextRevisionLabel } from "../drawings/detectors.js";
+import { extractPdfPages, streamToBuffer } from "../drawings/pdf.js";
+import { sendRanged } from "../drawings/stream.js";
+import { classifyPdfUpload, safeFilename } from "../documents/inbound.js";
+import { pushNotifications } from "../notifications/service.js";
 import {
   detectSectionHeadings,
   diffClauses,
@@ -40,7 +71,9 @@ import {
   normaliseSectionCode,
   parseDivisionHeading,
   splitCsiParts,
+  type ClauseChange,
 } from "./parser.js";
+import { planReissue } from "./reissue.js";
 
 /**
  * SPECIFICATIONS (M19, spec Vol I §2.3) — tool key `specifications`.
@@ -90,7 +123,8 @@ const bookPatchSchema = z.object({
   issuedDate: isoDateSchema.nullable().optional(),
   issuedByOrganisation: z.string().max(300).nullable().optional(),
   classificationSystem: z.enum(SPEC_CLASSIFICATION_SYSTEMS).optional(),
-  status: z.enum(SPEC_BOOK_STATUSES).optional(),
+  /** current/superseded move ONLY through set-current, which supersedes two-way */
+  status: z.enum(["draft", "archived"]).optional(),
   contractId: z.string().max(64).nullable().optional(),
 });
 
@@ -118,7 +152,6 @@ const sectionCreateSchema = z.object({
 
 const sectionPatchSchema = z.object({
   title: z.string().min(1).max(300).optional(),
-  status: z.enum(SPEC_SECTION_STATUSES).optional(),
   divisionId: z.string().max(64).nullable().optional(),
   divisionCode: z.string().max(8).nullable().optional(),
   tradeCode: z.string().max(60).nullable().optional(),
@@ -175,6 +208,7 @@ const requirementsListQuery = pageQuerySchema.extend({
   extractionMethod: z.enum(SPEC_EXTRACTION_METHODS).optional(),
   minConfidence: z.coerce.number().min(0).max(1).optional(),
   registered: z.enum(["0", "1"]).optional(),
+  needsReconfirmation: z.enum(["0", "1"]).optional(),
 });
 
 const registerSchema = z.object({
@@ -225,33 +259,6 @@ function boolField(fields: unknown, key: string, fallback: boolean): boolean {
 interface PageText {
   pageIndex: number;
   text: string;
-}
-
-async function extractPdfPages(buf: Buffer): Promise<PageText[]> {
-  const { getDocument } = await import("pdfjs-dist/legacy/build/pdf.mjs");
-  const task = getDocument({ data: new Uint8Array(buf), useSystemFonts: true });
-  try {
-    const doc = await task.promise;
-    const pages: PageText[] = [];
-    for (let p = 1; p <= doc.numPages; p++) {
-      const page = await doc.getPage(p);
-      const tc = await page.getTextContent();
-      let text = "";
-      for (const item of tc.items) {
-        if (!("str" in item)) continue;
-        text += item.str;
-        text += item.hasEOL ? "\n" : " ";
-      }
-      pages.push({ pageIndex: p - 1, text });
-    }
-    return pages;
-  } finally {
-    try {
-      await task.destroy();
-    } catch {
-      /* ignore cleanup failures */
-    }
-  }
 }
 
 /** A section as the splitter found it in the book, before it touches the db. */
@@ -342,6 +349,29 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
   ];
   const companyRead = [app.authenticate, app.requireCompany];
 
+  /**
+   * Plan §6.3: a company-level list over project data is limited to the
+   * projects the caller can see. `null` means "every project in the company"
+   * (owner/admin, or a company-wide assurance grant).
+   */
+  async function visibleProjectIds(req: FastifyRequest): Promise<string[] | null> {
+    if (req.companyRole === "owner" || req.companyRole === "admin") return null;
+    const nowMs = Date.now();
+    const grants = await app.db
+      .select({ projectId: assuranceGrants.projectId, expiresAt: assuranceGrants.expiresAt })
+      .from(assuranceGrants)
+      .where(and(eq(assuranceGrants.companyId, req.companyId!), eq(assuranceGrants.userId, req.user!.id)));
+    const live = grants.filter((g) => !isExpired(g.expiresAt, nowMs));
+    if (live.some((g) => g.projectId === null)) return null;
+    const ids = new Set<string>(live.map((g) => g.projectId).filter((p): p is string => typeof p === "string"));
+    const memberships = await app.db
+      .select({ projectId: projectMemberships.projectId })
+      .from(projectMemberships)
+      .where(and(eq(projectMemberships.companyId, req.companyId!), eq(projectMemberships.userId, req.user!.id)));
+    for (const m of memberships) ids.add(m.projectId);
+    return [...ids];
+  }
+
   /* ---------------------------------------------------------------- */
   /* Fetchers                                                          */
   /* ---------------------------------------------------------------- */
@@ -427,7 +457,7 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
   }
 
   function ledger(
-    action: "create" | "update" | "delete" | "state_change",
+    action: LedgerAction,
     objectType: string,
     objectId: string,
     req: FastifyRequest,
@@ -474,12 +504,12 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
     };
   }
 
-  async function bumpSectionCounts(sectionId: string) {
-    const [total] = await app.db
+  async function bumpSectionCounts(db: Db, sectionId: string) {
+    const [total] = await db
       .select({ n: count() })
       .from(specSubmittalRequirements)
       .where(eq(specSubmittalRequirements.sectionId, sectionId));
-    const [confirmed] = await app.db
+    const [confirmed] = await db
       .select({ n: count() })
       .from(specSubmittalRequirements)
       .where(
@@ -488,7 +518,7 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
           inArray(specSubmittalRequirements.status, ["confirmed", "registered"]),
         ),
       );
-    await app.db
+    await db
       .update(specSections)
       .set({
         submittalRequirementCount: Number(total?.n ?? 0),
@@ -507,14 +537,264 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
     return rows.map((r) => r.sectionId);
   }
 
+  /*
+   * A WRITE CONTEXT lets the same helpers run either directly (one request,
+   * one section) or inside the book-split transaction. Inside the
+   * transaction the ledger is QUEUED and appended after commit, so a split
+   * that fails half-way leaves neither rows nor ledger entries behind — the
+   * chain never records a revision that was rolled back.
+   */
+  type LedgerFn = (
+    action: LedgerAction,
+    objectType: string,
+    objectId: string,
+    payload: unknown,
+  ) => Promise<void>;
+
+  interface WriteCtx {
+    db: Db;
+    ledger: LedgerFn;
+  }
+
+  interface QueuedLedger {
+    action: LedgerAction;
+    objectType: string;
+    objectId: string;
+    payload: unknown;
+  }
+
+  function liveCtx(req: FastifyRequest): WriteCtx {
+    return {
+      db: app.db,
+      ledger: (action, objectType, objectId, payload) =>
+        ledger(action, objectType, objectId, req, payload),
+    };
+  }
+
+  function queuedCtx(db: Db, queue: QueuedLedger[]): WriteCtx {
+    return {
+      db,
+      ledger: async (action, objectType, objectId, payload) => {
+        queue.push({ action, objectType, objectId, payload });
+      },
+    };
+  }
+
+  async function flushLedger(req: FastifyRequest, queue: QueuedLedger[]) {
+    for (const q of queue) await ledger(q.action, q.objectType, q.objectId, req, q.payload);
+  }
+
+  interface ReissueImpact {
+    noticeId: string;
+    superseded: number;
+    reconfirm: number;
+    flagged: number;
+    registeredChanged: number;
+    notified: number;
+  }
+
+  /**
+   * Reissue impact (#288): what the clause diff DOES to the register.
+   * Removed clause → requirement superseded; amended clause → a confirmed
+   * requirement drops back to identified and must be re-confirmed (the SoD
+   * chain re-runs); a registered requirement whose clause changed is reported
+   * against its submittal as a `superseded_by` reference and in the notice.
+   */
+  async function applyReissue(
+    req: FastifyRequest,
+    ctx: WriteCtx,
+    section: typeof specSections.$inferSelect,
+    rev: { revisionId: string; revision: string; bookId: string; previousId: string },
+    changes: ClauseChange[],
+  ): Promise<ReissueImpact> {
+    const rows = await ctx.db
+      .select()
+      .from(specSubmittalRequirements)
+      .where(eq(specSubmittalRequirements.sectionId, section.id));
+    const plan = planReissue(
+      changes,
+      rows.map((r) => ({
+        id: r.id,
+        paragraphRef: r.paragraphRef,
+        status: r.status,
+        registeredSubmittalId: r.registeredSubmittalId,
+      })),
+    );
+    const byId = new Map(rows.map((r) => [r.id, r] as const));
+    const now = new Date().toISOString();
+
+    if (plan.superseded.length > 0) {
+      await ctx.db
+        .update(specSubmittalRequirements)
+        .set({
+          status: "superseded",
+          supersededByRevisionId: rev.revisionId,
+          reissueNote: `The clause this was read from was removed in revision ${rev.revision}.`,
+          updatedAt: now,
+        })
+        .where(inArray(specSubmittalRequirements.id, plan.superseded));
+      for (const id of plan.superseded) {
+        await ctx.ledger("state_change", "spec_submittal_requirement", id, {
+          from: byId.get(id)?.status ?? null,
+          to: "superseded",
+          revisionId: rev.revisionId,
+          reason: "clause removed on reissue",
+        });
+      }
+    }
+    if (plan.reconfirm.length > 0) {
+      await ctx.db
+        .update(specSubmittalRequirements)
+        .set({
+          status: "identified",
+          confirmedBy: null,
+          confirmedAt: null,
+          needsReconfirmation: 1,
+          reissueNote: `The clause was amended in revision ${rev.revision} after confirmation; the confirmation is void until a person re-reads it.`,
+          updatedAt: now,
+        })
+        .where(inArray(specSubmittalRequirements.id, plan.reconfirm));
+      for (const id of plan.reconfirm) {
+        await ctx.ledger("state_change", "spec_submittal_requirement", id, {
+          from: "confirmed",
+          to: "identified",
+          revisionId: rev.revisionId,
+          confirmationVoided: byId.get(id)?.confirmedBy ?? null,
+          reason: "clause amended on reissue",
+        });
+      }
+    }
+    if (plan.flagged.length > 0) {
+      await ctx.db
+        .update(specSubmittalRequirements)
+        .set({
+          needsReconfirmation: 1,
+          reissueNote: `The clause was amended in revision ${rev.revision}; re-read it before confirming.`,
+          updatedAt: now,
+        })
+        .where(inArray(specSubmittalRequirements.id, plan.flagged));
+    }
+    const affected: unknown[] = [];
+    for (const rc of plan.registeredChanged) {
+      const [sub] = await ctx.db
+        .select({ number: submittals.number, title: submittals.title })
+        .from(submittals)
+        .where(eq(submittals.id, rc.submittalId))
+        .limit(1);
+      const refId = newId("sref");
+      await ctx.db.insert(specReferences).values({
+        id: refId,
+        companyId: section.companyId,
+        projectId: section.projectId,
+        sectionId: section.id,
+        sectionRevisionId: rev.revisionId,
+        paragraphRef: rc.paragraphRef,
+        targetType: "submittal",
+        targetId: rc.submittalId,
+        targetLabel: sub ? `SUB-${String(sub.number).padStart(3, "0")} ${sub.title}` : null,
+        referenceKind: "superseded_by",
+        note: `Clause ${rc.paragraphRef ?? "?"} was ${rc.kind} in revision ${rev.revision} after this submittal was registered against it.`,
+        extractionMethod: "ai_extracted",
+        extractionConfidence: null,
+        detail: { source: "reissue", kind: rc.kind, requirementId: rc.requirementId, previousRevisionId: rev.previousId },
+        createdBy: req.user!.id,
+      });
+      await ctx.db
+        .update(specSubmittalRequirements)
+        .set({
+          needsReconfirmation: 1,
+          reissueNote: `Clause ${rc.kind} in revision ${rev.revision} after registration — check the submittal still answers the spec.`,
+          updatedAt: now,
+        })
+        .where(eq(specSubmittalRequirements.id, rc.requirementId));
+      await ctx.ledger("create", "spec_reference", refId, {
+        sectionId: section.id,
+        referenceKind: "superseded_by",
+        targetType: "submittal",
+        targetId: rc.submittalId,
+        revisionId: rev.revisionId,
+      });
+      affected.push({ ...rc, submittalLabel: sub ? `SUB-${String(sub.number).padStart(3, "0")}` : null });
+    }
+
+    // Who is told: the section's responsible person, whoever confirmed a row
+    // now void, whoever registered a submittal now cited against a changed clause.
+    const recipients = new Set<string>();
+    if (section.responsibleUserId) recipients.add(section.responsibleUserId);
+    for (const id of plan.reconfirm) {
+      const c = byId.get(id)?.confirmedBy;
+      if (c) recipients.add(c);
+    }
+    for (const rc of plan.registeredChanged) {
+      const r = byId.get(rc.requirementId)?.registeredBy;
+      if (r) recipients.add(r);
+    }
+    recipients.delete(req.user!.id);
+    const noticeId = newId("srn");
+    await ctx.db.insert(specRevisionNotices).values({
+      id: noticeId,
+      companyId: section.companyId,
+      projectId: section.projectId,
+      sectionId: section.id,
+      sectionCode: section.code,
+      revisionId: rev.revisionId,
+      previousRevisionId: rev.previousId,
+      bookId: rev.bookId,
+      revision: rev.revision,
+      changedClauseCount: changes.length,
+      requirementsSuperseded: plan.superseded.length,
+      requirementsToReconfirm: plan.reconfirm.length,
+      requirementsNew: 0,
+      submittalsAffected: affected,
+      notifiedUserIds: [...recipients],
+      detail: { flagged: plan.flagged.length, changedRefs: changes.map((c) => `${c.kind}:${c.ref}`).slice(0, 200) },
+      createdBy: req.user!.id,
+    });
+    if (recipients.size > 0) {
+      await pushNotifications(
+        ctx.db,
+        [...recipients].map((userId) => ({
+          companyId: section.companyId,
+          userId,
+          projectId: section.projectId,
+          kind: "status_change" as const,
+          title: `Spec ${section.code} reissued as revision ${rev.revision}`,
+          body: `${changes.length} clause(s) changed: ${plan.superseded.length} requirement(s) superseded, ${plan.reconfirm.length} confirmation(s) voided, ${plan.registeredChanged.length} registered submittal(s) affected.`,
+          recordType: "spec_revision_notice",
+          recordId: noticeId,
+        })),
+      );
+    }
+    await ctx.ledger("create", "spec_revision_notice", noticeId, {
+      sectionId: section.id,
+      sectionCode: section.code,
+      revisionId: rev.revisionId,
+      changedClauses: changes.length,
+      superseded: plan.superseded.length,
+      reconfirm: plan.reconfirm.length,
+      registeredChanged: plan.registeredChanged.length,
+      notified: recipients.size,
+    });
+    return {
+      noticeId,
+      superseded: plan.superseded.length,
+      reconfirm: plan.reconfirm.length,
+      flagged: plan.flagged.length,
+      registeredChanged: plan.registeredChanged.length,
+      notified: recipients.size,
+    };
+  }
+
   /**
    * Insert a new revision of a section with TWO-WAY supersession, or return
    * `unchanged` when the text hashes identically to the revision in force —
    * a reissue that changed nothing must be provable as such rather than
-   * generating a phantom revision people then diff against.
+   * generating a phantom revision people then diff against. When the text
+   * did change, the reissue impact on the register is applied here (#288).
    */
   async function insertRevision(
     req: FastifyRequest,
+    ctx: WriteCtx,
     section: typeof specSections.$inferSelect,
     input: {
       bookId: string;
@@ -529,10 +809,10 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
       changeSummary?: string | null;
       issuedBy?: string | null;
     },
-  ): Promise<{ revisionId: string; unchanged: boolean; revision: string }> {
+  ): Promise<{ revisionId: string; unchanged: boolean; revision: string; impact: ReissueImpact | null }> {
     const previous = section.currentRevisionId
       ? ((
-          await app.db
+          await ctx.db
             .select()
             .from(specSectionRevisions)
             .where(eq(specSectionRevisions.id, section.currentRevisionId))
@@ -542,7 +822,7 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
 
     const contentSha256 = input.text ? sha256Hex(input.text) : null;
     if (previous && contentSha256 && previous.contentSha256 === contentSha256) {
-      return { revisionId: previous.id, unchanged: true, revision: previous.revision };
+      return { revisionId: previous.id, unchanged: true, revision: previous.revision, impact: null };
     }
 
     const label = input.revision ?? nextRevisionLabel(previous?.revision ?? null);
@@ -551,7 +831,7 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
     const changedClauses =
       previous?.extractedText && input.text ? diffClauses(previous.extractedText, input.text) : [];
 
-    await app.db.insert(specSectionRevisions).values({
+    await ctx.db.insert(specSectionRevisions).values({
       id: revisionId,
       companyId: req.companyId!,
       projectId: req.projectId!,
@@ -576,7 +856,7 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
     });
 
     if (previous) {
-      await app.db
+      await ctx.db
         .update(specSectionRevisions)
         .set({
           isSuperseded: 1,
@@ -586,48 +866,89 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
         })
         .where(eq(specSectionRevisions.id, previous.id));
     }
-    await app.db
+    await ctx.db
       .update(specSections)
       .set({
         currentRevisionId: revisionId,
         revisionCount: section.revisionCount + 1,
         status: "current",
+        withdrawnAt: null,
+        withdrawnBy: null,
+        withdrawnReason: null,
         updatedAt: now,
       })
       .where(eq(specSections.id, section.id));
 
-    return { revisionId, unchanged: false, revision: label };
+    let impact: ReissueImpact | null = null;
+    if (previous && changedClauses.length > 0) {
+      impact = await applyReissue(
+        req,
+        ctx,
+        section,
+        { revisionId, revision: label, bookId: input.bookId, previousId: previous.id },
+        changedClauses,
+      );
+      await ctx.db
+        .update(specSectionRevisions)
+        .set({
+          impact: {
+            superseded: impact.superseded,
+            reconfirm: impact.reconfirm,
+            flagged: impact.flagged,
+            registeredChanged: impact.registeredChanged,
+            noticeId: impact.noticeId,
+          },
+        })
+        .where(eq(specSectionRevisions.id, revisionId));
+      await bumpSectionCounts(ctx.db, section.id);
+    }
+
+    return { revisionId, unchanged: false, revision: label, impact };
   }
 
-  /** Insert extracted requirements for a revision, skipping ones already held. */
+  /**
+   * Insert extracted requirements for a revision, skipping ones already held.
+   * A row superseded by a reissue does not block a fresh reading of the same
+   * paragraph; the new row records which superseded row it replaces.
+   */
   async function extractInto(
     req: FastifyRequest,
+    ctx: WriteCtx,
     section: typeof specSections.$inferSelect,
     revisionId: string,
     text: string,
   ): Promise<{ created: number; skipped: number }> {
     const found = extractSubmittalRequirements(text);
     if (found.length === 0) return { created: 0, skipped: 0 };
-    const existing = await app.db
+    const existing = await ctx.db
       .select({
+        id: specSubmittalRequirements.id,
         paragraphRef: specSubmittalRequirements.paragraphRef,
         submittalType: specSubmittalRequirements.submittalType,
+        status: specSubmittalRequirements.status,
       })
       .from(specSubmittalRequirements)
       .where(eq(specSubmittalRequirements.sectionId, section.id));
-    const seen = new Set(existing.map((e) => `${e.paragraphRef ?? ""}|${e.submittalType}`));
+    const keyOf = (ref: string | null, type: string) => `${ref ?? ""}|${type}`;
+    const seen = new Set(
+      existing.filter((e) => e.status !== "superseded").map((e) => keyOf(e.paragraphRef, e.submittalType)),
+    );
+    const supersededByKey = new Map(
+      existing.filter((e) => e.status === "superseded").map((e) => [keyOf(e.paragraphRef, e.submittalType), e.id] as const),
+    );
 
     let created = 0;
     let skipped = 0;
     for (const r of found) {
-      const key = `${r.paragraphRef ?? ""}|${r.submittalType}`;
+      const key = keyOf(r.paragraphRef, r.submittalType);
       if (seen.has(key)) {
         skipped += 1;
         continue;
       }
       seen.add(key);
       const id = newId("sreq");
-      await app.db.insert(specSubmittalRequirements).values({
+      const supersedesRequirementId = supersededByKey.get(key) ?? null;
+      await ctx.db.insert(specSubmittalRequirements).values({
         id,
         companyId: req.companyId!,
         projectId: req.projectId!,
@@ -650,10 +971,11 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
           extractor: EXTRACTOR_VERSION,
           matchedTerm: r.matchedTerm,
           articleTitle: r.articleTitle,
+          ...(supersedesRequirementId ? { supersedesRequirementId } : {}),
         },
         createdBy: req.user!.id,
       });
-      await ledger("create", "spec_submittal_requirement", id, req, {
+      await ctx.ledger("create", "spec_submittal_requirement", id, {
         sectionId: section.id,
         sectionCode: section.code,
         paragraphRef: r.paragraphRef,
@@ -662,10 +984,11 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
         extractionMethod: "ai_extracted",
         extractionConfidence: r.confidence,
         extractor: EXTRACTOR_VERSION,
+        supersedesRequirementId,
       });
       created += 1;
     }
-    await bumpSectionCounts(section.id);
+    await bumpSectionCounts(ctx.db, section.id);
     return { created, skipped };
   }
 
@@ -676,9 +999,20 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
   app.post("/projects/:projectId/spec-books", { preHandler: standardGate }, async (req, reply) => {
     const mp = await req.file();
     if (!mp) throw badRequest("Expected a multipart PDF upload");
-    const buf = await mp.toBuffer();
-    const name =
-      fieldValue(mp.fields, "name") ?? mp.filename?.replace(/\.pdf$/i, "") ?? "Specification";
+    const filename = safeFilename(mp.filename, "specification.pdf");
+    const cls = classifyPdfUpload(mp.mimetype, filename);
+    if (!cls.ok) {
+      mp.file.resume();
+      throw badRequest(cls.reason ?? "Expected a PDF");
+    }
+    const buf = await streamToBuffer(mp.file);
+    if (mp.file.truncated) {
+      throw badRequest(
+        `File exceeds the ${Math.round(app.appConfig.UPLOAD_MAX_BYTES / (1024 * 1024))} MiB upload limit`,
+      );
+    }
+    if (buf.length === 0) throw badRequest("Empty file");
+    const name = fieldValue(mp.fields, "name") ?? filename.replace(/\.pdf$/i, "") ?? "Specification";
     const issueLabel = fieldValue(mp.fields, "issueLabel") ?? null;
     const issuedDate = fieldValue(mp.fields, "issuedDate") ?? null;
     const issuedByOrganisation = fieldValue(mp.fields, "issuedByOrganisation") ?? null;
@@ -700,11 +1034,12 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
       companyId: req.companyId!,
       projectId: req.projectId!,
       folderId: null,
-      name: mp.filename || `${name}.pdf`,
-      contentType: mp.mimetype || "application/pdf",
+      name: filename,
+      contentType: "application/pdf",
       sizeBytes: saved.sizeBytes,
       sha256: saved.sha256,
       storageKey: saved.storageKey,
+      documentType: "specification",
       metadata: { kind: "spec_book" },
       uploadedBy: req.user!.id,
     });
@@ -746,6 +1081,8 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
     let requirementsExtracted = 0;
     let pageCount: number | null = null;
     let failed: string | null = null;
+    const reissued: Array<{ sectionCode: string; revision: string } & ReissueImpact> = [];
+    const queue: QueuedLedger[] = [];
 
     try {
       const pages = await extractPdfPages(buf);
@@ -760,118 +1097,142 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
         );
       }
 
-      // Divisions: explicit DIVISION headings first, then any division a
-      // section code implies, titled from MasterFormat rather than invented.
-      const divisionIds = new Map<string, string>();
-      const divisionCodes = new Set<string>([
-        ...split.divisions.keys(),
-        ...split.sections.map((s) => s.divisionCode),
-      ]);
-      const sortedDivisions = [...divisionCodes].sort();
-      for (const [order, code] of sortedDivisions.entries()) {
-        const explicit = split.divisions.get(code);
-        const id = newId("sdiv");
-        const sectionsIn = split.sections.filter((s) => s.divisionCode === code);
-        await app.db.insert(specDivisions).values({
-          id,
-          companyId: req.companyId!,
-          projectId: req.projectId!,
-          bookId,
-          code,
-          title: explicit?.title ?? divisionTitle(code) ?? `Division ${code}`,
-          pageStart: explicit?.pageStart ?? sectionsIn[0]?.pageStart ?? null,
-          pageEnd:
-            explicit?.pageEnd ?? sectionsIn[sectionsIn.length - 1]?.pageEnd ?? null,
-          sortOrder: order,
-          sectionCount: sectionsIn.length,
-        });
-        divisionIds.set(code, id);
-        divisionsCreated += 1;
-      }
+      /*
+       * The split is ONE transaction: a failure on section 40 of 80 leaves no
+       * section pointing at a revision from a book that is then marked failed.
+       * Ledger entries are queued and appended after commit.
+       */
+      await app.db.transaction(async (tx) => {
+        const ctx = queuedCtx(tx as unknown as Db, queue);
 
-      for (const found of split.sections) {
-        const existing = await app.db
-          .select()
-          .from(specSections)
-          .where(
-            and(
-              eq(specSections.projectId, req.projectId!),
-              eq(specSections.normalisedCode, found.normalisedCode),
-            ),
-          )
-          .limit(1);
-
-        let section = existing[0];
-        if (!section) {
-          const sectionId = newId("ssec");
-          await app.db.insert(specSections).values({
-            id: sectionId,
+        // Divisions: explicit DIVISION headings first, then any division a
+        // section code implies, titled from MasterFormat rather than invented.
+        const divisionIds = new Map<string, string>();
+        const divisionCodes = new Set<string>([
+          ...split.divisions.keys(),
+          ...split.sections.map((s) => s.divisionCode),
+        ]);
+        const sortedDivisions = [...divisionCodes].sort();
+        for (const [order, code] of sortedDivisions.entries()) {
+          const explicit = split.divisions.get(code);
+          const id = newId("sdiv");
+          const sectionsIn = split.sections.filter((s) => s.divisionCode === code);
+          await ctx.db.insert(specDivisions).values({
+            id,
             companyId: req.companyId!,
             projectId: req.projectId!,
-            divisionId: divisionIds.get(found.divisionCode) ?? null,
-            code: found.code,
-            normalisedCode: found.normalisedCode,
-            title: found.title,
-            divisionCode: found.divisionCode,
-            status: "current",
-            detail: { headingConfidence: found.confidence, extractor: EXTRACTOR_VERSION },
-            createdBy: req.user!.id,
-          });
-          sectionsCreated += 1;
-          await ledger("create", "spec_section", sectionId, req, {
-            code: found.code,
-            title: found.title,
             bookId,
-            headingConfidence: found.confidence,
+            code,
+            title: explicit?.title ?? divisionTitle(code) ?? `Division ${code}`,
+            pageStart: explicit?.pageStart ?? sectionsIn[0]?.pageStart ?? null,
+            pageEnd: explicit?.pageEnd ?? sectionsIn[sectionsIn.length - 1]?.pageEnd ?? null,
+            sortOrder: order,
+            sectionCount: sectionsIn.length,
           });
-          section = (
-            await app.db.select().from(specSections).where(eq(specSections.id, sectionId)).limit(1)
-          )[0]!;
-        } else {
-          await app.db
-            .update(specSections)
-            .set({
-              divisionId: divisionIds.get(found.divisionCode) ?? section.divisionId,
-              updatedAt: new Date().toISOString(),
-            })
-            .where(eq(specSections.id, section.id));
+          divisionIds.set(code, id);
+          divisionsCreated += 1;
         }
 
-        const result = await insertRevision(req, section, {
-          bookId,
-          text: found.text,
-          issuedDate,
-          pageStart: found.pageStart,
-          pageEnd: found.pageEnd,
-          fileId,
-          fileSha256: saved.sha256,
-          issuedBy: issuedByOrganisation,
-          changeSummary: issueLabel ? `Issued with ${issueLabel}` : null,
-        });
-        if (result.unchanged) {
-          unchangedSections += 1;
-          continue;
-        }
-        revisionsAdded += 1;
-        await ledger("create", "spec_section_revision", result.revisionId, req, {
-          sectionId: section.id,
-          code: found.code,
-          revision: result.revision,
-          bookId,
-          pageStart: found.pageStart,
-          pageEnd: found.pageEnd,
-        });
+        for (const found of split.sections) {
+          const existing = await ctx.db
+            .select()
+            .from(specSections)
+            .where(
+              and(
+                eq(specSections.projectId, req.projectId!),
+                eq(specSections.normalisedCode, found.normalisedCode),
+              ),
+            )
+            .limit(1);
 
-        if (doExtract) {
-          const reloaded = (
-            await app.db.select().from(specSections).where(eq(specSections.id, section.id)).limit(1)
-          )[0]!;
-          const extracted = await extractInto(req, reloaded, result.revisionId, found.text);
-          requirementsExtracted += extracted.created;
+          let section = existing[0];
+          if (!section) {
+            const sectionId = newId("ssec");
+            await ctx.db.insert(specSections).values({
+              id: sectionId,
+              companyId: req.companyId!,
+              projectId: req.projectId!,
+              divisionId: divisionIds.get(found.divisionCode) ?? null,
+              code: found.code,
+              normalisedCode: found.normalisedCode,
+              title: found.title,
+              divisionCode: found.divisionCode,
+              status: "current",
+              detail: { headingConfidence: found.confidence, extractor: EXTRACTOR_VERSION },
+              createdBy: req.user!.id,
+            });
+            sectionsCreated += 1;
+            await ctx.ledger("create", "spec_section", sectionId, {
+              code: found.code,
+              title: found.title,
+              bookId,
+              headingConfidence: found.confidence,
+            });
+            section = (
+              await ctx.db.select().from(specSections).where(eq(specSections.id, sectionId)).limit(1)
+            )[0]!;
+          } else {
+            await ctx.db
+              .update(specSections)
+              .set({
+                divisionId: divisionIds.get(found.divisionCode) ?? section.divisionId,
+                updatedAt: new Date().toISOString(),
+              })
+              .where(eq(specSections.id, section.id));
+          }
+
+          const result = await insertRevision(req, ctx, section, {
+            bookId,
+            text: found.text,
+            issuedDate,
+            pageStart: found.pageStart,
+            pageEnd: found.pageEnd,
+            fileId,
+            fileSha256: saved.sha256,
+            issuedBy: issuedByOrganisation,
+            changeSummary: issueLabel ? `Issued with ${issueLabel}` : null,
+          });
+          if (result.unchanged) {
+            unchangedSections += 1;
+            continue;
+          }
+          revisionsAdded += 1;
+          await ctx.ledger("create", "spec_section_revision", result.revisionId, {
+            sectionId: section.id,
+            code: found.code,
+            revision: result.revision,
+            bookId,
+            pageStart: found.pageStart,
+            pageEnd: found.pageEnd,
+            impact: result.impact,
+          });
+          if (result.impact) reissued.push({ sectionCode: section.code, revision: result.revision, ...result.impact });
+
+          if (doExtract) {
+            const reloaded = (
+              await ctx.db.select().from(specSections).where(eq(specSections.id, section.id)).limit(1)
+            )[0]!;
+            const extracted = await extractInto(req, ctx, reloaded, result.revisionId, found.text);
+            requirementsExtracted += extracted.created;
+            if (result.impact && extracted.created > 0) {
+              await ctx.db
+                .update(specRevisionNotices)
+                .set({ requirementsNew: extracted.created })
+                .where(eq(specRevisionNotices.id, result.impact.noticeId));
+            }
+          }
         }
-      }
+      });
+      await flushLedger(req, queue);
     } catch (err) {
       failed = err instanceof Error ? err.message : "Spec book processing failed";
+      // the transaction rolled back: nothing this book touched survives
+      divisionsCreated = 0;
+      sectionsCreated = 0;
+      revisionsAdded = 0;
+      unchangedSections = 0;
+      requirementsExtracted = 0;
+      reissued.length = 0;
     }
 
     const now = new Date().toISOString();
@@ -883,7 +1244,7 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
         status: failed ? "failed" : "draft",
         pageCount,
         divisionCount: divisionsCreated,
-        sectionCount: sectionsInBook,
+        sectionCount: failed ? 0 : sectionsInBook,
         updatedAt: now,
       })
       .where(eq(specBooks.id, bookId));
@@ -895,9 +1256,11 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
       revisionsAdded,
       unchangedSections,
       requirementsExtracted,
+      reissued: reissued.length,
     });
 
-    if (!failed && makeCurrent) await promoteBookToCurrent(req, bookId);
+    let absentSections: AbsentSection[] = [];
+    if (!failed && makeCurrent) absentSections = await promoteBookToCurrent(req, bookId);
 
     const [book] = await app.db.select().from(specBooks).where(eq(specBooks.id, bookId)).limit(1);
     return reply.status(201).send({
@@ -910,12 +1273,59 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
       requirementsExtracted,
       /* Extraction is a machine reading: nothing here is confirmed. */
       requirementsConfirmed: 0,
+      reissued,
+      absentSections,
       error: failed,
+      rolledBack: failed !== null,
     });
   });
 
-  /** Two-way book supersession: exactly one current book drives the build. */
-  async function promoteBookToCurrent(req: FastifyRequest, bookId: string) {
+  interface AbsentSection {
+    sectionId: string;
+    code: string;
+    title: string;
+    status: string;
+    lastBookId: string | null;
+  }
+
+  /** Current sections that have no revision in `bookId`: candidates for withdrawal (#288). */
+  async function absentSectionsFor(req: FastifyRequest, bookId: string): Promise<AbsentSection[]> {
+    const inBook = await sectionIdsForBook(bookId);
+    const rows = await app.db
+      .select()
+      .from(specSections)
+      .where(
+        and(
+          eq(specSections.projectId, req.projectId!),
+          eq(specSections.status, "current"),
+          inBook.length ? notInArray(specSections.id, inBook) : undefined,
+        ),
+      )
+      .orderBy(asc(specSections.code));
+    const revIds = rows.map((r) => r.currentRevisionId).filter((v): v is string => v != null);
+    const revs = revIds.length
+      ? await app.db
+          .select({ id: specSectionRevisions.id, bookId: specSectionRevisions.bookId })
+          .from(specSectionRevisions)
+          .where(inArray(specSectionRevisions.id, revIds))
+      : [];
+    const bookOf = new Map(revs.map((r) => [r.id, r.bookId]));
+    return rows.map((r) => ({
+      sectionId: r.id,
+      code: r.code,
+      title: r.title,
+      status: r.status,
+      lastBookId: r.currentRevisionId ? (bookOf.get(r.currentRevisionId) ?? null) : null,
+    }));
+  }
+
+  /**
+   * Two-way book supersession: exactly one current book drives the build.
+   * Returns the sections absent from the new current issue so a person can
+   * withdraw them — coverage must stop counting dead sections, but only after
+   * someone confirms they are dead.
+   */
+  async function promoteBookToCurrent(req: FastifyRequest, bookId: string): Promise<AbsentSection[]> {
     const now = new Date().toISOString();
     const previous = await app.db
       .select()
@@ -954,11 +1364,14 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
         updatedAt: now,
       })
       .where(eq(specBooks.id, bookId));
+    const absent = await absentSectionsFor(req, bookId);
     await ledger("state_change", "spec_book", bookId, req, {
       status: "current",
       isCurrent: 1,
       supersedesId: previous[0]?.id ?? null,
+      absentSections: absent.length,
     });
+    return absent;
   }
 
   app.get("/projects/:projectId/spec-books", { preHandler: readGate }, async (req) => {
@@ -1056,8 +1469,24 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
       if (book.processing !== "ready") {
         throw badRequest("Only a fully processed book can become the current issue");
       }
-      await promoteBookToCurrent(req, bookId);
-      return fetchBook(req, bookId);
+      const absentSections = await promoteBookToCurrent(req, bookId);
+      return { ...(await fetchBook(req, bookId)), absentSections };
+    },
+  );
+
+  /** Sections marked current that this issue does not contain (#288). */
+  app.get(
+    "/projects/:projectId/spec-books/:bookId/absent-sections",
+    { preHandler: readGate },
+    async (req) => {
+      const { bookId } = req.params as { bookId: string };
+      await fetchBook(req, bookId);
+      const items = await absentSectionsFor(req, bookId);
+      return {
+        items,
+        total: items.length,
+        note: "A section absent from the current issue is only withdrawn when a person confirms it; coverage keeps counting it until then.",
+      };
     },
   );
 
@@ -1074,11 +1503,34 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
         .where(and(eq(files.id, book.sourceFileId), eq(files.companyId, req.companyId!)))
         .limit(1);
       if (!f) throw notFound("Source file not found");
-      return reply
-        .header("content-type", f.contentType || "application/pdf")
-        .header("content-disposition", `inline; filename="${f.name}"`)
-        .header("x-content-sha256", f.sha256)
-        .send(app.storage.readStream(f.storageKey));
+      if (!req.headers.range) {
+        await app.db.insert(fileAccessLog).values({
+          id: newId("fal"),
+          fileId: f.id,
+          userId: req.user!.id,
+          action: "view",
+          companyId: f.companyId,
+          projectId: f.projectId,
+          context: "spec_book",
+          version: f.version,
+        });
+        await appendLedger(app.db, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "access",
+          objectType: "spec_book",
+          objectId: bookId,
+          payload: { action: "view", fileId: f.id },
+          projectId: req.projectId!,
+        });
+      }
+      return sendRanged(app.storage, req, reply, {
+        storageKey: f.storageKey,
+        sizeBytes: f.sizeBytes,
+        contentType: f.contentType || "application/pdf",
+        filename: f.name,
+        sha256: f.sha256,
+      });
     },
   );
 
@@ -1149,7 +1601,7 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
       const section = (
         await app.db.select().from(specSections).where(eq(specSections.id, id)).limit(1)
       )[0]!;
-      const result = await insertRevision(req, section, {
+      const result = await insertRevision(req, liveCtx(req), section, {
         bookId: body.bookId!,
         revision: body.revision ?? "0",
         text: body.text,
@@ -1259,7 +1711,7 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
       const { sectionId } = req.params as { sectionId: string };
       const body = revisionCreateSchema.parse(req.body);
       const section = await fetchSection(req, sectionId);
-      const result = await insertRevision(req, section, {
+      const result = await insertRevision(req, liveCtx(req), section, {
         bookId: body.bookId,
         revision: body.revision,
         text: body.text ?? null,
@@ -1291,8 +1743,9 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
         sectionId,
         revision: result.revision,
         bookId: body.bookId,
+        impact: result.impact,
       });
-      return reply.status(201).send({ ...row, unchanged: false });
+      return reply.status(201).send({ ...row, unchanged: false, impact: result.impact });
     },
   );
 
@@ -1361,7 +1814,7 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
             "Upload a text-bearing PDF or add the section text by hand.",
         );
       }
-      const result = await extractInto(req, section, revisionId, revision.extractedText);
+      const result = await extractInto(req, liveCtx(req), section, revisionId, revision.extractedText);
       const items = await app.db
         .select()
         .from(specSubmittalRequirements)
@@ -1418,7 +1871,7 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
         detail: { extractor: "human" },
         createdBy: req.user!.id,
       });
-      await bumpSectionCounts(sectionId);
+      await bumpSectionCounts(app.db, sectionId);
       await ledger("create", "spec_submittal_requirement", id, req, {
         sectionId,
         sectionCode: section.code,
@@ -1445,28 +1898,29 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
         : undefined,
       q.registered === "1" ? isNotNull(specSubmittalRequirements.registeredSubmittalId) : undefined,
       q.registered === "0" ? isNull(specSubmittalRequirements.registeredSubmittalId) : undefined,
+      q.needsReconfirmation === "1" ? eq(specSubmittalRequirements.needsReconfirmation, 1) : undefined,
+      // The predicate lives in the WHERE so count and page agree: a human-typed
+      // row (no confidence) is never hidden by a confidence floor.
+      q.minConfidence !== undefined
+        ? or(
+            isNull(specSubmittalRequirements.extractionConfidence),
+            gte(specSubmittalRequirements.extractionConfidence, q.minConfidence),
+          )
+        : undefined,
       bookSectionIds ? inArray(specSubmittalRequirements.sectionId, bookSectionIds) : undefined,
     );
     const [totalRow] = await app.db
       .select({ n: count() })
       .from(specSubmittalRequirements)
       .where(where);
-    let items = await app.db
+    const items = await app.db
       .select()
       .from(specSubmittalRequirements)
       .where(where)
       .orderBy(asc(specSubmittalRequirements.sectionCode), asc(specSubmittalRequirements.paragraphRef))
       .limit(q.pageSize)
       .offset(pageOffset(q));
-    let total = Number(totalRow?.n ?? 0);
-    if (q.minConfidence !== undefined) {
-      // Confidence filtering is applied after paging deliberately: it is a
-      // review aid, and silently re-paginating would hide rows that exist.
-      const min = q.minConfidence;
-      items = items.filter((r) => (r.extractionConfidence ?? 1) >= min);
-      total = items.length;
-    }
-    return paginate(items.map(withProvenance), total, q);
+    return paginate(items.map(withProvenance), Number(totalRow?.n ?? 0), q);
   });
 
   app.get(
@@ -1488,6 +1942,19 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
     },
   );
 
+  /** Fields whose change alters WHAT the requirement claims — a confirmation cannot survive them. */
+  const REQUIREMENT_CONTENT_FIELDS = [
+    "title",
+    "description",
+    "clauseText",
+    "paragraphRef",
+    "submittalType",
+    "requiredBefore",
+    "requiredCopies",
+    "reviewDays",
+    "isDeferred",
+  ] as const;
+
   app.patch(
     "/projects/:projectId/spec-requirements/:requirementId",
     { preHandler: standardGate },
@@ -1500,19 +1967,71 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
           "A registered requirement is frozen — the submittal it produced is the live record now",
         );
       }
+      if (body.sectionRevisionId) {
+        const [rev] = await app.db
+          .select({ id: specSectionRevisions.id })
+          .from(specSectionRevisions)
+          .where(and(eq(specSectionRevisions.id, body.sectionRevisionId), eq(specSectionRevisions.sectionId, row.sectionId)))
+          .limit(1);
+        if (!rev) throw notFound("sectionRevisionId is not a revision of this requirement's section");
+      }
+      if (body.commitmentId) {
+        const [c] = await app.db
+          .select({ id: commitments.id })
+          .from(commitments)
+          .where(and(eq(commitments.id, body.commitmentId), eq(commitments.projectId, req.projectId!)))
+          .limit(1);
+        if (!c) throw notFound("commitmentId is not a commitment on this project");
+      }
+      if (body.bidPackageId) {
+        const [b] = await app.db
+          .select({ id: bidPackages.id })
+          .from(bidPackages)
+          .where(and(eq(bidPackages.id, body.bidPackageId), eq(bidPackages.projectId, req.projectId!)))
+          .limit(1);
+        if (!b) throw notFound("bidPackageId is not a bid package on this project");
+      }
       const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
+      const rowRecord = row as unknown as Record<string, unknown>;
+      let contentChanged = false;
       for (const [k, v] of Object.entries(body)) {
         if (v === undefined) continue;
-        set[k] = k === "isDeferred" ? (v ? 1 : 0) : v;
+        const stored = k === "isDeferred" ? (v ? 1 : 0) : v;
+        set[k] = stored;
+        if ((REQUIREMENT_CONTENT_FIELDS as readonly string[]).includes(k) && rowRecord[k] !== stored) {
+          contentChanged = true;
+        }
+      }
+      // Segregation of duties: a confirmation applies to the words the
+      // confirmer read. Change the words and the confirmation is void.
+      const confirmationReset = row.status === "confirmed" && contentChanged;
+      if (confirmationReset) {
+        set["status"] = "identified";
+        set["confirmedBy"] = null;
+        set["confirmedAt"] = null;
+        set["needsReconfirmation"] = 1;
+        set["reissueNote"] = "Content was edited after confirmation; the confirmation was reset.";
       }
       await app.db
         .update(specSubmittalRequirements)
         .set(set)
         .where(eq(specSubmittalRequirements.id, requirementId));
+      if (confirmationReset) await bumpSectionCounts(app.db, row.sectionId);
       await ledger("update", "spec_submittal_requirement", requirementId, req, {
         changed: Object.keys(body),
+        confirmationReset,
+        previousConfirmedBy: confirmationReset ? row.confirmedBy : undefined,
       });
-      return withProvenance(await fetchRequirement(req, requirementId));
+      if (confirmationReset) {
+        await ledger("state_change", "spec_submittal_requirement", requirementId, req, {
+          from: "confirmed",
+          to: "identified",
+          reason: "content edited after confirmation",
+          editedBy: req.user!.id,
+          confirmationVoided: row.confirmedBy,
+        });
+      }
+      return { ...withProvenance(await fetchRequirement(req, requirementId)), confirmationReset };
     },
   );
 
@@ -1549,6 +2068,7 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
           status: "confirmed",
           confirmedBy: req.user!.id,
           confirmedAt: now,
+          needsReconfirmation: 0,
           detail: {
             ...((row.detail as Record<string, unknown>) ?? {}),
             ...(body.note ? { confirmationNote: body.note } : {}),
@@ -1556,7 +2076,7 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
           updatedAt: now,
         })
         .where(eq(specSubmittalRequirements.id, requirementId));
-      await bumpSectionCounts(row.sectionId);
+      await bumpSectionCounts(app.db, row.sectionId);
       await ledger("state_change", "spec_submittal_requirement", requirementId, req, {
         from: row.status,
         to: "confirmed",
@@ -1584,7 +2104,7 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
         .update(specSubmittalRequirements)
         .set({ status: "not_required", notRequiredReason: body.reason, updatedAt: now })
         .where(eq(specSubmittalRequirements.id, requirementId));
-      await bumpSectionCounts(row.sectionId);
+      await bumpSectionCounts(app.db, row.sectionId);
       await ledger("state_change", "spec_submittal_requirement", requirementId, req, {
         from: row.status,
         to: "not_required",
@@ -1594,71 +2114,106 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
     },
   );
 
-  /** Build one register row: the requirement becomes a real submittal. */
+  /**
+   * Build one register row: the requirement becomes a real submittal.
+   *
+   * Atomic and conditional: the requirement is claimed with
+   * `UPDATE … WHERE status = 'confirmed'` inside one transaction before the
+   * submittal exists, so a double click or a build-register overlapping a
+   * single register cannot create two submittals or orphan one.
+   */
   async function registerRequirement(
     req: FastifyRequest,
     row: RequirementRow,
     overrides: z.infer<typeof registerSchema>,
   ) {
-    const number = await nextRecordNumber(app.db, req.projectId!, "submittal");
-    const submittalId = newId("sub");
-    const leadTimeDays = overrides.leadTimeDays ?? row.leadTimeDays ?? null;
-    const requiredOnSite = overrides.requiredOnSite ?? null;
-    const reviewDays = row.reviewDays ?? DEFAULT_REVIEW_ALLOWANCE_DAYS;
-    const submitByDate = requiredOnSite
-      ? addDaysISO(requiredOnSite, -((leadTimeDays ?? 0) + reviewDays))
-      : null;
-    await app.db.insert(submittals).values({
-      id: submittalId,
-      companyId: req.companyId!,
-      projectId: req.projectId!,
-      number,
-      revision: 0,
-      title: overrides.title ?? row.title,
-      specSection: row.sectionCode,
-      submittalType: row.submittalType,
-      status: "draft",
-      ballInCourtId: overrides.ballInCourtId ?? null,
-      requiredOnSite,
-      leadTimeDays,
-      submitByDate,
-      fileIds: [],
-      createdBy: req.user!.id,
+    return app.db.transaction(async (tx) => {
+      const db = tx as unknown as Db;
+      const now = new Date().toISOString();
+      const claimed = await db
+        .update(specSubmittalRequirements)
+        .set({ status: "registered", registeredAt: now, registeredBy: req.user!.id, updatedAt: now })
+        .where(
+          and(
+            eq(specSubmittalRequirements.id, row.id),
+            eq(specSubmittalRequirements.status, "confirmed"),
+          ),
+        )
+        .returning({ id: specSubmittalRequirements.id });
+      if (claimed.length === 0) {
+        throw conflict(
+          "This requirement is no longer confirmed — it was registered, reset or superseded by another request",
+        );
+      }
+      const number = await nextRecordNumber(db, req.projectId!, "submittal");
+      const submittalId = newId("sub");
+      const leadTimeDays = overrides.leadTimeDays ?? row.leadTimeDays ?? null;
+      const requiredOnSite = overrides.requiredOnSite ?? null;
+      const reviewDays = row.reviewDays ?? DEFAULT_REVIEW_ALLOWANCE_DAYS;
+      const submitByDate = requiredOnSite
+        ? addDaysISO(requiredOnSite, -((leadTimeDays ?? 0) + reviewDays))
+        : null;
+      await db.insert(submittals).values({
+        id: submittalId,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        number,
+        revision: 0,
+        title: overrides.title ?? row.title,
+        specSection: row.sectionCode,
+        submittalType: row.submittalType,
+        status: "draft",
+        ballInCourtId: overrides.ballInCourtId ?? null,
+        requiredOnSite,
+        leadTimeDays,
+        submitByDate,
+        fileIds: [],
+        createdBy: req.user!.id,
+      });
+      await db
+        .update(specSubmittalRequirements)
+        .set({ registeredSubmittalId: submittalId, updatedAt: now })
+        .where(eq(specSubmittalRequirements.id, row.id));
+      await bumpSectionCounts(db, row.sectionId);
+      await appendLedger(db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "submittal",
+        objectId: submittalId,
+        payload: {
+          number,
+          title: overrides.title ?? row.title,
+          specSection: row.sectionCode,
+          builtFromRequirementId: row.id,
+          paragraphRef: row.paragraphRef,
+          extractionMethod: row.extractionMethod,
+          extractionConfidence: row.extractionConfidence,
+          confirmedBy: row.confirmedBy,
+        },
+        projectId: req.projectId!,
+      });
+      await appendLedger(db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "spec_submittal_requirement",
+        objectId: row.id,
+        payload: {
+          from: "confirmed",
+          to: "registered",
+          registeredSubmittalId: submittalId,
+          registeredBy: req.user!.id,
+        },
+        projectId: req.projectId!,
+      });
+      const [submittal] = await db
+        .select()
+        .from(submittals)
+        .where(eq(submittals.id, submittalId))
+        .limit(1);
+      return submittal!;
     });
-    const now = new Date().toISOString();
-    await app.db
-      .update(specSubmittalRequirements)
-      .set({
-        status: "registered",
-        registeredSubmittalId: submittalId,
-        registeredAt: now,
-        registeredBy: req.user!.id,
-        updatedAt: now,
-      })
-      .where(eq(specSubmittalRequirements.id, row.id));
-    await bumpSectionCounts(row.sectionId);
-    await ledger("create", "submittal", submittalId, req, {
-      number,
-      title: overrides.title ?? row.title,
-      specSection: row.sectionCode,
-      builtFromRequirementId: row.id,
-      paragraphRef: row.paragraphRef,
-      extractionMethod: row.extractionMethod,
-      extractionConfidence: row.extractionConfidence,
-      confirmedBy: row.confirmedBy,
-    });
-    await ledger("state_change", "spec_submittal_requirement", row.id, req, {
-      from: "confirmed",
-      to: "registered",
-      registeredSubmittalId: submittalId,
-      registeredBy: req.user!.id,
-    });
-    const [submittal] = await app.db
-      .select()
-      .from(submittals)
-      .where(eq(submittals.id, submittalId))
-      .limit(1);
-    return submittal!;
   }
 
   /**
@@ -2147,6 +2702,321 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
   });
 
   /* ================================================================ */
+  /* 5b. Reissue tracking: withdrawal, notices, search, health         */
+  /* ================================================================ */
+
+  /** Withdraw a section absent from the current issue — a person's act, with a reason (#288). */
+  app.post(
+    "/projects/:projectId/spec-sections/:sectionId/withdraw",
+    { preHandler: standardGate },
+    async (req) => {
+      const { sectionId } = req.params as { sectionId: string };
+      const body = z.object({ reason: z.string().min(1).max(2000) }).parse(req.body);
+      const section = await fetchSection(req, sectionId);
+      if (section.status === "withdrawn") throw conflict("This section is already withdrawn");
+      const now = new Date().toISOString();
+      const [open] = await app.db
+        .select({ n: count() })
+        .from(specSubmittalRequirements)
+        .where(
+          and(
+            eq(specSubmittalRequirements.sectionId, sectionId),
+            inArray(specSubmittalRequirements.status, ["identified", "confirmed"]),
+          ),
+        );
+      await app.db
+        .update(specSections)
+        .set({
+          status: "withdrawn",
+          withdrawnAt: now,
+          withdrawnBy: req.user!.id,
+          withdrawnReason: body.reason,
+          updatedAt: now,
+        })
+        .where(eq(specSections.id, sectionId));
+      await ledger("state_change", "spec_section", sectionId, req, {
+        from: section.status,
+        to: "withdrawn",
+        reason: body.reason,
+        openRequirements: Number(open?.n ?? 0),
+      });
+      return {
+        ...(await fetchSection(req, sectionId)),
+        openRequirements: Number(open?.n ?? 0),
+        note:
+          Number(open?.n ?? 0) > 0
+            ? `${open!.n} unregistered requirement(s) remain on the record; coverage no longer counts this section.`
+            : "Coverage no longer counts this section.",
+      };
+    },
+  );
+
+  app.post(
+    "/projects/:projectId/spec-sections/:sectionId/reinstate",
+    { preHandler: standardGate },
+    async (req) => {
+      const { sectionId } = req.params as { sectionId: string };
+      const section = await fetchSection(req, sectionId);
+      if (section.status !== "withdrawn") throw conflict("Only a withdrawn section can be reinstated");
+      const now = new Date().toISOString();
+      await app.db
+        .update(specSections)
+        .set({ status: "current", withdrawnAt: null, withdrawnBy: null, withdrawnReason: null, updatedAt: now })
+        .where(eq(specSections.id, sectionId));
+      await ledger("state_change", "spec_section", sectionId, req, { from: "withdrawn", to: "current" });
+      return fetchSection(req, sectionId);
+    },
+  );
+
+  /** Reissue notices: what each reissue did to the register, and whether it was actioned (#288). */
+  app.get("/projects/:projectId/spec-revision-notices", { preHandler: readGate }, async (req) => {
+    const q = pageQuerySchema
+      .extend({ acknowledged: z.enum(["0", "1"]).optional(), sectionId: z.string().max(64).optional() })
+      .parse(req.query);
+    const where = and(
+      eq(specRevisionNotices.companyId, req.companyId!),
+      eq(specRevisionNotices.projectId, req.projectId!),
+      q.acknowledged === "1" ? isNotNull(specRevisionNotices.acknowledgedAt) : undefined,
+      q.acknowledged === "0" ? isNull(specRevisionNotices.acknowledgedAt) : undefined,
+      q.sectionId ? eq(specRevisionNotices.sectionId, q.sectionId) : undefined,
+    );
+    const [totalRow] = await app.db.select({ n: count() }).from(specRevisionNotices).where(where);
+    const items = await app.db
+      .select()
+      .from(specRevisionNotices)
+      .where(where)
+      .orderBy(desc(specRevisionNotices.createdAt))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    const sectionIds = [...new Set(items.map((i) => i.sectionId))];
+    const sections = sectionIds.length
+      ? await app.db
+          .select({ id: specSections.id, title: specSections.title, status: specSections.status })
+          .from(specSections)
+          .where(inArray(specSections.id, sectionIds))
+      : [];
+    const sectionMap = new Map(sections.map((s) => [s.id, s]));
+    const userIds = [...new Set(items.flatMap((i) => [i.createdBy, i.acknowledgedBy, ...i.notifiedUserIds]))].filter(
+      (v): v is string => v != null,
+    );
+    const people = userIds.length
+      ? await app.db.select({ id: users.id, name: users.name }).from(users).where(inArray(users.id, userIds))
+      : [];
+    const nameOf = new Map(people.map((p) => [p.id, p.name]));
+    const [open] = await app.db
+      .select({ n: count() })
+      .from(specRevisionNotices)
+      .where(
+        and(
+          eq(specRevisionNotices.projectId, req.projectId!),
+          isNull(specRevisionNotices.acknowledgedAt),
+        ),
+      );
+    return {
+      ...paginate(
+        items.map((n) => ({
+          ...n,
+          sectionTitle: sectionMap.get(n.sectionId)?.title ?? null,
+          sectionStatus: sectionMap.get(n.sectionId)?.status ?? null,
+          createdByName: nameOf.get(n.createdBy) ?? null,
+          acknowledgedByName: n.acknowledgedBy ? (nameOf.get(n.acknowledgedBy) ?? null) : null,
+          notifiedNames: n.notifiedUserIds.map((id) => nameOf.get(id) ?? id),
+        })),
+        Number(totalRow?.n ?? 0),
+        q,
+      ),
+      unacknowledged: Number(open?.n ?? 0),
+    };
+  });
+
+  app.post(
+    "/projects/:projectId/spec-revision-notices/:noticeId/acknowledge",
+    { preHandler: standardGate },
+    async (req) => {
+      const { noticeId } = req.params as { noticeId: string };
+      const body = z.object({ note: z.string().max(2000).optional() }).parse(req.body ?? {});
+      const [notice] = await app.db
+        .select()
+        .from(specRevisionNotices)
+        .where(
+          and(
+            eq(specRevisionNotices.id, noticeId),
+            eq(specRevisionNotices.companyId, req.companyId!),
+            eq(specRevisionNotices.projectId, req.projectId!),
+          ),
+        )
+        .limit(1);
+      if (!notice) throw notFound("Reissue notice not found");
+      if (notice.acknowledgedAt) throw conflict("This notice has already been acknowledged");
+      const now = new Date().toISOString();
+      await app.db
+        .update(specRevisionNotices)
+        .set({
+          acknowledgedBy: req.user!.id,
+          acknowledgedAt: now,
+          detail: { ...notice.detail, ...(body.note ? { acknowledgementNote: body.note } : {}) },
+        })
+        .where(eq(specRevisionNotices.id, noticeId));
+      await ledger("state_change", "spec_revision_notice", noticeId, req, {
+        acknowledgedBy: req.user!.id,
+        note: body.note ?? null,
+      });
+      const [updated] = await app.db.select().from(specRevisionNotices).where(eq(specRevisionNotices.id, noticeId)).limit(1);
+      return updated;
+    },
+  );
+
+  /** Full-text search over the text in force (#298): sections whose current revision matches. */
+  app.get("/projects/:projectId/spec-search", { preHandler: readGate }, async (req) => {
+    const q = z
+      .object({ q: z.string().min(2).max(200), limit: z.coerce.number().int().min(1).max(100).default(25) })
+      .parse(req.query);
+    const tsquery = sql`plainto_tsquery('english', ${q.q})`;
+    const vector = sql`to_tsvector('english', left(coalesce(${specSectionRevisions.extractedText}, ''), 400000))`;
+    const rows = await app.db
+      .select({
+        sectionId: specSections.id,
+        code: specSections.code,
+        title: specSections.title,
+        status: specSections.status,
+        revisionId: specSectionRevisions.id,
+        revision: specSectionRevisions.revision,
+        pageStart: specSectionRevisions.pageStart,
+        rank: sql<number>`ts_rank(${vector}, ${tsquery})`,
+        snippet: sql<string>`ts_headline('english', left(coalesce(${specSectionRevisions.extractedText}, ''), 400000), ${tsquery}, 'MaxWords=40, MinWords=15, StartSel=[[, StopSel=]]')`,
+      })
+      .from(specSections)
+      .innerJoin(specSectionRevisions, eq(specSectionRevisions.id, specSections.currentRevisionId))
+      .where(
+        and(
+          eq(specSections.companyId, req.companyId!),
+          eq(specSections.projectId, req.projectId!),
+          sql`${vector} @@ ${tsquery}`,
+        ),
+      )
+      .orderBy(sql`ts_rank(${vector}, ${tsquery}) desc`, asc(specSections.code))
+      .limit(q.limit);
+    return {
+      q: q.q,
+      items: rows.map((r) => ({ ...r, rank: Number(r.rank) })),
+      total: rows.length,
+      basis: "Postgres full-text search over the extracted text of each section's current revision; superseded text is not searched.",
+    };
+  });
+
+  /** Health inputs for the intelligence layer (plan §3.5). */
+  app.get("/projects/:projectId/specifications/health-inputs", { preHandler: readGate }, async (req) => {
+    const projectId = req.projectId!;
+    const [sections] = await app.db
+      .select({ n: count() })
+      .from(specSections)
+      .where(and(eq(specSections.projectId, projectId), ne(specSections.status, "withdrawn")));
+    const byStatus = await app.db
+      .select({ status: specSubmittalRequirements.status, n: count() })
+      .from(specSubmittalRequirements)
+      .where(eq(specSubmittalRequirements.projectId, projectId))
+      .groupBy(specSubmittalRequirements.status);
+    const statusMap = new Map(byStatus.map((r) => [r.status, Number(r.n)]));
+    const [reconfirm] = await app.db
+      .select({ n: count() })
+      .from(specSubmittalRequirements)
+      .where(and(eq(specSubmittalRequirements.projectId, projectId), eq(specSubmittalRequirements.needsReconfirmation, 1)));
+    const [notices] = await app.db
+      .select({ n: count() })
+      .from(specRevisionNotices)
+      .where(and(eq(specRevisionNotices.projectId, projectId), isNull(specRevisionNotices.acknowledgedAt)));
+    const [conflicts] = await app.db
+      .select({ n: count() })
+      .from(specReferences)
+      .where(
+        and(
+          eq(specReferences.projectId, projectId),
+          eq(specReferences.referenceKind, "conflicts_with"),
+          isNull(specReferences.resolvedAt),
+        ),
+      );
+    const [currentBook] = await app.db
+      .select({ n: count() })
+      .from(specBooks)
+      .where(and(eq(specBooks.projectId, projectId), eq(specBooks.isCurrent, 1)));
+    const reasons: string[] = [];
+    if (Number(sections?.n ?? 0) === 0) reasons.push("No spec sections exist on this project.");
+    if (Number(currentBook?.n ?? 0) === 0) reasons.push("No spec book is marked current, so the register has no single issue to be built from.");
+    return {
+      metrics: {
+        sections: Number(sections?.n ?? 0),
+        requirementsIdentified: statusMap.get("identified") ?? 0,
+        requirementsConfirmed: statusMap.get("confirmed") ?? 0,
+        requirementsRegistered: statusMap.get("registered") ?? 0,
+        needsReconfirmation: Number(reconfirm?.n ?? 0),
+        unacknowledgedReissues: Number(notices?.n ?? 0),
+        unresolvedConflicts: Number(conflicts?.n ?? 0),
+        hasCurrentBook: Number(currentBook?.n ?? 0) > 0 ? 1 : 0,
+      },
+      reasons,
+    };
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Scheduler: reissue notices nobody has actioned                    */
+  /* ---------------------------------------------------------------- */
+
+  const REISSUE_REMINDER_DAYS = 7;
+
+  async function sweepReissueReminders(db: Db, companyId: string, now: Date) {
+    const cutoff = new Date(now.getTime() - REISSUE_REMINDER_DAYS * 86_400_000).toISOString();
+    const due = await db
+      .select()
+      .from(specRevisionNotices)
+      .where(
+        and(
+          eq(specRevisionNotices.companyId, companyId),
+          isNull(specRevisionNotices.acknowledgedAt),
+          lt(specRevisionNotices.createdAt, cutoff),
+          sql`(${specRevisionNotices.detail}->>'remindedAt') is null`,
+        ),
+      )
+      .limit(200);
+    let reminded = 0;
+    for (const n of due) {
+      const recipients = n.notifiedUserIds.length > 0 ? n.notifiedUserIds : [n.createdBy];
+      await pushNotifications(
+        db,
+        recipients.map((userId) => ({
+          companyId,
+          userId,
+          projectId: n.projectId,
+          kind: "reminder" as const,
+          title: `Reissue of ${n.sectionCode} (rev ${n.revision}) still unactioned`,
+          body: `${n.requirementsToReconfirm} confirmation(s) to re-run, ${n.requirementsSuperseded} requirement(s) superseded, ${n.submittalsAffected.length} registered submittal(s) affected. Acknowledge the notice once the register has been checked.`,
+          recordType: "spec_revision_notice",
+          recordId: n.id,
+        })),
+      );
+      await db
+        .update(specRevisionNotices)
+        .set({ detail: { ...n.detail, remindedAt: now.toISOString() } })
+        .where(eq(specRevisionNotices.id, n.id));
+      reminded += 1;
+    }
+    return reminded;
+  }
+
+  app.scheduler.register({
+    name: "specifications.reissue-reminders",
+    description: `Remind the people told about a spec reissue when the notice sits unacknowledged for ${REISSUE_REMINDER_DAYS} days`,
+    everyMs: 12 * 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db, now }) => {
+      let reminded = 0;
+      const summary = await forEachCompany(db, async (companyId) => {
+        reminded += await sweepReissueReminders(db, companyId, now);
+      });
+      return { ...summary, reminded };
+    },
+  });
+
+  /* ================================================================ */
   /* 6. Company-level: the cross-project section library               */
   /* ================================================================ */
 
@@ -2158,8 +3028,11 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
         projectId: z.string().max(64).optional(),
       })
       .parse(req.query);
+    const visible = await visibleProjectIds(req);
+    if (visible !== null && visible.length === 0) return paginate([], 0, q);
     const where = and(
       eq(specSections.companyId, req.companyId!),
+      visible === null ? undefined : inArray(specSections.projectId, visible),
       q.code ? eq(specSections.normalisedCode, normaliseSectionCode(q.code)) : undefined,
       q.search ? ilike(specSections.title, `%${q.search}%`) : undefined,
       q.projectId ? eq(specSections.projectId, q.projectId) : undefined,

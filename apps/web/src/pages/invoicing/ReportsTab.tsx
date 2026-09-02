@@ -48,6 +48,18 @@ import {
 
 type Side = "payable" | "receivable";
 
+interface ErpPreview {
+  format: string;
+  currency: string | null;
+  currencies: string[];
+  invoiceCount: number;
+  lineCount: number;
+  paymentCount: number;
+  totals: { certified: number; paid: number; outstanding: number };
+  columns: { invoices: string[]; payments: string[] };
+  reasons: string[];
+}
+
 function AgingChart({ block, side }: { block: AgingCurrencyBlock; side: Side }) {
   const data = useMemo(
     () =>
@@ -169,6 +181,11 @@ export default function ReportsTab({ projectId }: { projectId: string }) {
   const aging = useResource<AgingReport>(`/api/v1/projects/${projectId}/invoicing/aging`);
   const cash = useResource<CashPosition>(`/api/v1/projects/${projectId}/invoicing/cash-position`);
   const [side, setSide] = useState<Side>("payable");
+  const [erpFormat, setErpFormat] = useState("generic");
+  const [erpCurrency, setErpCurrency] = useState("");
+  const erp = useResource<ErpPreview>(
+    `/api/v1/projects/${projectId}/invoicing/erp-export?format=${erpFormat}${erpCurrency ? `&currency=${erpCurrency}` : ""}`,
+  );
 
   const blocks =
     side === "payable"
@@ -350,6 +367,75 @@ export default function ReportsTab({ projectId }: { projectId: string }) {
           </CardBody>
         </Card>
       ) : null}
+
+      <Card>
+        <CardHeader
+          title="ERP export"
+          subtitle="Approved and paid invoices with their continuation-sheet lines and the payments against them, in the layout the finance system imports. One currency per batch."
+          icon={IconAnalytics}
+          actions={
+            <span className="flex items-center gap-2">
+              <select
+                className="rounded border border-border bg-surface px-1 py-0.5 text-meta"
+                value={erpFormat}
+                onChange={(e) => setErpFormat(e.target.value)}
+                aria-label="ERP format"
+              >
+                <option value="generic">Generic CSV</option>
+                <option value="sage">Sage 300 CRE</option>
+                <option value="quickbooks">QuickBooks</option>
+                <option value="viewpoint">Viewpoint Vista</option>
+              </select>
+              {erp.data && erp.data.currencies.length > 1 ? (
+                <select
+                  className="rounded border border-border bg-surface px-1 py-0.5 text-meta"
+                  value={erpCurrency}
+                  onChange={(e) => setErpCurrency(e.target.value)}
+                  aria-label="Currency"
+                >
+                  <option value="">Pick a currency…</option>
+                  {erp.data.currencies.map((c) => (
+                    <option key={c} value={c}>
+                      {c}
+                    </option>
+                  ))}
+                </select>
+              ) : null}
+            </span>
+          }
+        />
+        <CardBody className="space-y-2">
+          <ErrorAlert message={erp.error} />
+          {erp.data ? (
+            erp.data.currency === null ? (
+              <Reasons reasons={erp.data.reasons} tone="warning" title="Nothing to export yet" />
+            ) : (
+              <>
+                <div className="grid gap-3 sm:grid-cols-4">
+                  <Stat label="Invoices" value={erp.data.invoiceCount} hint={`${erp.data.lineCount} lines · ${erp.data.currency}`} />
+                  <Stat label="Payments" value={erp.data.paymentCount} />
+                  <Stat label="Certified" value={money(erp.data.totals.certified, erp.data.currency)} />
+                  <Stat label="Outstanding" value={money(erp.data.totals.outstanding, erp.data.currency)} />
+                </div>
+                <p className="text-2xs text-content-subtle">
+                  Columns ({erpFormat}): {erp.data.columns.invoices.join(", ")}
+                </p>
+                <a
+                  className="inline-flex items-center rounded border border-border px-2 py-1 text-meta hover:bg-surface-raised"
+                  href={`/api/v1/projects/${projectId}/invoicing/erp-export?format=${erpFormat}&output=csv${erp.data.currency ? `&currency=${erp.data.currency}` : ""}`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Download CSV
+                </a>
+                {erp.data.reasons.length > 0 ? <Reasons reasons={erp.data.reasons} tone="neutral" title="Excluded" /> : null}
+              </>
+            )
+          ) : (
+            <PanelSkeleton rows={2} />
+          )}
+        </CardBody>
+      </Card>
 
       {aging.data ? (
         <DescriptionList

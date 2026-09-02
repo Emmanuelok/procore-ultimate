@@ -196,7 +196,7 @@ export async function recomputePeriodRollups(db: Db, periodId: string): Promise<
       subcontractorBilledAmount: dominant?.subcontractorBilledAmount ?? 0,
       retainageHeldAmount: dominant?.retainageHeldAmount ?? 0,
       retainageReleasedAmount,
-      invoiceCount: invoiceRows.length,
+      invoiceCount: live.length,
       detail: {
         ...(period.detail as Record<string, unknown>),
         rollupCurrency: dominant?.currency ?? null,

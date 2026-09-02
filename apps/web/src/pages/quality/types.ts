@@ -745,6 +745,8 @@ export interface QualitySummary {
     backcharged: number;
     medianClosureDays: Figure;
     totalCostImpact: Figure;
+    /** one figure per currency; money is never summed across them */
+    costByCurrency: Figure[];
   };
   commissioning: {
     systems: number;
@@ -759,5 +761,1010 @@ export interface QualitySummary {
     assetsHandedOver: number;
     artefactCompleteness: Figure;
     gaps: Array<{ id: string; reference: string; status: string } & ArtefactGap>;
+  };
+  /** the Domain Z and closeout registers, as counts (WP-QUAL upgrade) */
+  registers: RegisterCounts;
+}
+
+export interface RegisterCounts {
+  concessions: {
+    total: number;
+    live: number;
+    expired: number;
+    awaitingDecision: number;
+    expiringWithin30Days: number;
+  };
+  concrete: {
+    pours: number;
+    poured: number;
+    failing: number;
+    awaitingResults: number;
+    pouredWithoutRelease: number;
+  };
+  welding: {
+    welds: number;
+    welded: number;
+    rejected: number;
+    ndtRecords: number;
+    pendingExaminations: number;
+    awaitingRequiredNdt: number;
+  };
+  certificates: {
+    total: number;
+    unverified: number;
+    failed: number;
+    withoutTraceability: number;
+  };
+  calibration: { instruments: number; overdue: number; dueSoon: number; unusable: number };
+  rework: {
+    total: number;
+    open: number;
+    costByCurrency: CurrencyTotal[];
+    uncosted: number;
+  };
+  audits: {
+    total: number;
+    open: number;
+    findings: number;
+    openFindings: number;
+    majorNonConformities: number;
+    overdueFindings: number;
+  };
+  closeout: {
+    liabilityPeriods: number;
+    expiringWithin60Days: number;
+    expired: number;
+    guarantees: number;
+    guaranteesNotMet: number;
+    guaranteesUnmeasured: number;
+  };
+}
+
+export interface CurrencyTotal {
+  currency: string;
+  amount: number;
+  recordCount: number;
+}
+
+/* ================================================================== */
+/* The sign-off chain (#1092–1094)                                     */
+/* ================================================================== */
+
+export interface ReleaseLeg {
+  id: string;
+  activityId: string;
+  itpId: string;
+  position: number;
+  party: string;
+  /** 0/1 — an invited party that does not block is a real and common row */
+  required: number;
+  userId: string | null;
+  vendorId: string | null;
+  organisation: string | null;
+  contactName: string | null;
+  contactEmail: string | null;
+  accreditation: string | null;
+  status: string;
+  notifiedAt: string | null;
+  notifiedBy: string | null;
+  attendedAt: string | null;
+  attendedByName: string | null;
+  releasedBy: string | null;
+  releasedAt: string | null;
+  releasedByName: string | null;
+  note: string | null;
+  reportFileId: string | null;
+  concessionId: string | null;
+}
+
+export interface ChainSummary {
+  legCount: number;
+  requiredCount: number;
+  releasedCount: number;
+  waivedCount: number;
+  rejectedCount: number;
+  outstanding: Array<{ id: string; position: number; party: string; status: string; label: string }>;
+  nextLegId: string | null;
+  complete: boolean;
+  rejected: boolean;
+  reasons: string[];
+}
+
+export interface ReleaseChain {
+  items: ReleaseLeg[];
+  summary: ChainSummary;
+  activityReleased?: boolean;
+}
+
+/* ================================================================== */
+/* Concessions (#1091)                                                 */
+/* ================================================================== */
+
+export interface ConcessionStanding {
+  live: boolean;
+  expired: boolean;
+  daysToExpiry: number | null;
+  reasons: string[];
+}
+
+export interface Concession {
+  id: string;
+  reference: string;
+  kind: string;
+  title: string;
+  description: string;
+  departureFromRequirement: string | null;
+  justification: string | null;
+  status: string;
+  ncrId: string | null;
+  itpActivityId: string | null;
+  locationText: string | null;
+  vendorId: string | null;
+  quantityLimit: number | null;
+  unit: string | null;
+  conditions: string | null;
+  expiryDate: string | null;
+  requestedBy: string;
+  requestedAt: string | null;
+  designerOrganisation: string | null;
+  approvedBy: string | null;
+  approvedAt: string | null;
+  approvalAuthority: string | null;
+  approvalComments: string | null;
+  rejectionReason: string | null;
+  valueImpact: number | null;
+  currency: string;
+  documentFileId: string | null;
+  createdBy: string;
+  createdAt: string;
+  standing: ConcessionStanding;
+}
+
+export interface ConcessionSummary {
+  total: number;
+  live: number;
+  byStatus: Record<string, number>;
+  byKind: Record<string, number>;
+  expiring: Array<{ id: string; reference: string; expiryDate: string | null; days: number | null }>;
+  expired: number;
+  awaitingDecision: number;
+  byVendor: Array<{ vendorId: string; concessions: number }>;
+  withoutExpiry: number;
+}
+
+/* ================================================================== */
+/* Concrete (#1085–1086)                                               */
+/* ================================================================== */
+
+export interface ConcreteSpecimen {
+  id: string;
+  pourId: string;
+  specimenRef: string;
+  specimenType: string;
+  castAt: string | null;
+  testAgeDays: number;
+  testDate: string | null;
+  strengthMpa: number | null;
+  result: string;
+  failureMode: string | null;
+  labName: string | null;
+  certificateNumber: string | null;
+  voidReason: string | null;
+  notes: string | null;
+}
+
+export interface AcceptanceCheck {
+  name: string;
+  passed: boolean | null;
+  requirement: string;
+  observed: string;
+}
+
+export interface PourAssessment {
+  code: string;
+  verdict: "accepted" | "rejected" | "inconclusive" | "not_assessable";
+  statistics: {
+    testedCount: number;
+    pendingCount: number;
+    voidCount: number;
+    mean: number | null;
+    min: number | null;
+    max: number | null;
+    standardDeviation: number | null;
+    values: number[];
+    reasons: string[];
+  };
+  checks: AcceptanceCheck[];
+  reasons: string[];
+}
+
+export interface ConcretePour {
+  id: string;
+  reference: string;
+  pourName: string;
+  elementType: string | null;
+  locationText: string | null;
+  status: string;
+  plannedDate: string | null;
+  pouredAt: string | null;
+  mixReference: string | null;
+  specifiedGrade: string | null;
+  specifiedStrengthMpa: number | null;
+  testAgeDays: number;
+  acceptanceCode: string;
+  volumeM3: number | null;
+  supplierVendorId: string | null;
+  batchPlant: string | null;
+  batchNumbers: string[];
+  slumpMm: number | null;
+  slumpSpecMin: number | null;
+  slumpSpecMax: number | null;
+  concreteTempC: number | null;
+  ambientTempC: number | null;
+  itpActivityId: string | null;
+  holdPointReleasedAt: string | null;
+  specimenCount: number;
+  testedSpecimenCount: number;
+  failedSpecimenCount: number;
+  meanStrengthMpa: number | null;
+  minStrengthMpa: number | null;
+  standardDeviationMpa: number | null;
+  acceptanceVerdict: string | null;
+  acceptanceReasons: string[];
+  ncrId: string | null;
+  detail: Record<string, unknown>;
+}
+
+export interface ConcretePourDetail extends ConcretePour {
+  specimens: ConcreteSpecimen[];
+  assessment: PourAssessment;
+  slump: { passed: boolean | null; reason: string };
+}
+
+export interface ConcreteSummary {
+  pours: number;
+  byStatus: Record<string, number>;
+  byVerdict: Record<string, number>;
+  failing: number;
+  untestedPours: number;
+  pouredWithoutRelease: number;
+  specimens: number;
+  specimensAwaitingResult: number;
+  mixes: Array<{
+    mixReference: string;
+    pours: number;
+    specifiedStrengthMpa: number | null;
+    resultCount: number;
+    meanStrengthMpa: number | null;
+    standardDeviationMpa: number | null;
+    minStrengthMpa: number | null;
+    reasons: string[];
+  }>;
+}
+
+/* ================================================================== */
+/* Welding and NDT (#1087–1088)                                        */
+/* ================================================================== */
+
+export interface Rate {
+  value: number | null;
+  numerator: number;
+  denominator: number;
+  reasons: string[];
+}
+
+export interface WeldingProcedure {
+  id: string;
+  wpsNumber: string;
+  title: string;
+  revision: string | null;
+  standard: string | null;
+  process: string;
+  positions: string[];
+  baseMaterialGroup: string | null;
+  thicknessMinMm: number | null;
+  thicknessMaxMm: number | null;
+  pqrReference: string | null;
+  status: string;
+  approvedBy: string | null;
+  approvedAt: string | null;
+  validFrom: string | null;
+  validUntil: string | null;
+  createdBy: string;
+}
+
+export interface QualificationStanding {
+  status: string;
+  continuityLapsesOn: string | null;
+  expiresInDays: number | null;
+  reasons: string[];
+}
+
+export interface WelderQualification {
+  id: string;
+  welderName: string;
+  welderStamp: string | null;
+  vendorId: string | null;
+  certificateNumber: string | null;
+  qualificationStandard: string | null;
+  processes: string[];
+  positions: string[];
+  thicknessMinMm: number | null;
+  thicknessMaxMm: number | null;
+  qualifiedFrom: string | null;
+  expiryDate: string | null;
+  continuityConfirmedAt: string | null;
+  continuityMonths: number;
+  status: string;
+  suspensionReason: string | null;
+  standing?: QualificationStanding;
+}
+
+export interface NdtRecord {
+  id: string;
+  reference: string;
+  weldId: string;
+  method: string;
+  acceptanceStandard: string | null;
+  performedAt: string | null;
+  performedByOrganisation: string | null;
+  technicianName: string | null;
+  technicianLevel: string | null;
+  result: string;
+  defectType: string | null;
+  defectLengthMm: number | null;
+  reportNumber: string | null;
+  ncrId: string | null;
+}
+
+export interface Weld {
+  id: string;
+  reference: string;
+  weldMapRef: string | null;
+  jointReference: string | null;
+  jointType: string | null;
+  drawingReference: string | null;
+  isometricRef: string | null;
+  systemId: string | null;
+  materialSpec: string | null;
+  thicknessMm: number | null;
+  diameterMm: number | null;
+  heatNumbers: string[];
+  wpsId: string | null;
+  welderQualificationId: string | null;
+  welderStamp: string | null;
+  weldedAt: string | null;
+  status: string;
+  visualResult: string | null;
+  ndtRequiredPercent: number | null;
+  ndtMethodsRequired: string[];
+  ndtRecordCount: number;
+  ndtAcceptCount: number;
+  ndtRejectCount: number;
+  repairCount: number;
+  ncrId: string | null;
+  detail: Record<string, unknown>;
+}
+
+export interface WeldDetail extends Weld {
+  wps: WeldingProcedure | null;
+  welderQualification: WelderQualification | null;
+  ndtRecords: NdtRecord[];
+  compliance: {
+    compliant: boolean;
+    checks: Array<{ name: string; passed: boolean | null; detail: string }>;
+    blockers: string[];
+  };
+}
+
+export interface WeldingSummary {
+  programme: {
+    weldCount: number;
+    weldedCount: number;
+    examinedCount: number;
+    acceptedCount: number;
+    rejectedCount: number;
+    repairCount: number;
+    ndtCoverage: Rate;
+    repairRate: Rate;
+    coverageShortfalls: Array<{
+      weldId: string;
+      reference: string;
+      required: number;
+      achieved: number;
+    }>;
+  };
+  welderPerformance: Array<{
+    welderQualificationId: string;
+    welderName: string;
+    welderStamp: string | null;
+    weldCount: number;
+    examinedCount: number;
+    rejectedCount: number;
+    repairRate: Rate;
+  }>;
+  qualifications: {
+    total: number;
+    valid: number;
+    expiring: number;
+    expired: number;
+    suspended: number;
+    items: Array<
+      QualificationStanding & {
+        id: string;
+        welderName: string;
+        welderStamp: string | null;
+        vendorId: string | null;
+      }
+    >;
+  };
+  procedures: { total: number; approved: number; draft: number };
+  nonCompliantWelds: Array<{ id: string; reference: string; reason: unknown }>;
+  ndtRecords: number;
+  pendingExaminations: number;
+}
+
+/* ================================================================== */
+/* Material test certificates (#1089)                                  */
+/* ================================================================== */
+
+export interface PropertyVerdict {
+  property: string;
+  required: string;
+  measured: string;
+  passed: boolean | null;
+  reason: string;
+}
+
+export interface CertificateCheck {
+  status: string;
+  verdicts: PropertyVerdict[];
+  reasons: string[];
+  lotTraceable: boolean;
+  independentlyWitnessed: boolean;
+}
+
+export interface MaterialCertificate {
+  id: string;
+  reference: string;
+  certificateNumber: string;
+  certificateType: string;
+  materialDescription: string;
+  materialGrade: string | null;
+  standard: string | null;
+  heatNumber: string | null;
+  batchNumber: string | null;
+  castNumber: string | null;
+  quantity: number | null;
+  unit: string | null;
+  manufacturer: string | null;
+  millName: string | null;
+  supplierVendorId: string | null;
+  issuedAt: string | null;
+  receivedAt: string | null;
+  requiredProperties: Array<{
+    property: string;
+    min?: number | null;
+    max?: number | null;
+    target?: number | null;
+    unit?: string | null;
+    text?: string | null;
+  }>;
+  measuredProperties: Array<{
+    property: string;
+    value?: number | null;
+    text?: string | null;
+    unit?: string | null;
+  }>;
+  verificationStatus: string;
+  verificationReasons: string[];
+  verifiedBy: string | null;
+  verifiedAt: string | null;
+  ncrId: string | null;
+  documentFileId: string | null;
+  createdBy: string;
+  check: CertificateCheck;
+}
+
+export interface CertificateSummary {
+  total: number;
+  byStatus: Record<string, number>;
+  byType: Record<string, number>;
+  unverified: number;
+  failed: number;
+  untraceable: number;
+  withoutDocument: number;
+  withoutHeat: number;
+  reasons: string[];
+}
+
+/* ================================================================== */
+/* Calibration (#1097)                                                 */
+/* ================================================================== */
+
+export interface InstrumentStanding {
+  status: string;
+  derivedDueDate: string | null;
+  daysUntilDue: number | null;
+  usable: boolean;
+  reasons: string[];
+}
+
+export interface Instrument {
+  id: string;
+  reference: string;
+  name: string;
+  instrumentType: string | null;
+  manufacturer: string | null;
+  model: string | null;
+  serialNumber: string | null;
+  ownerVendorId: string | null;
+  custodian: string | null;
+  rangeMin: number | null;
+  rangeMax: number | null;
+  rangeUnit: string | null;
+  accuracy: string | null;
+  calibrationStandard: string | null;
+  calibrationIntervalMonths: number;
+  lastCalibratedAt: string | null;
+  calibrationDueDate: string | null;
+  certificateNumber: string | null;
+  calibratedByOrganisation: string | null;
+  status: string;
+  outOfServiceReason: string | null;
+  standing: InstrumentStanding;
+}
+
+export interface CalibrationRecord {
+  id: string;
+  instrumentId: string;
+  calibratedAt: string;
+  calibrationDueDate: string | null;
+  result: string;
+  asFoundCondition: string | null;
+  asLeftCondition: string | null;
+  certificateNumber: string | null;
+  calibratedByOrganisation: string | null;
+  technicianName: string | null;
+  notes: string | null;
+}
+
+export interface InstrumentSummary {
+  total: number;
+  byStatus: Record<string, number>;
+  overdue: number;
+  dueSoon: number;
+  unusable: number;
+  withoutCertificate: number;
+  items: Array<{
+    id: string;
+    reference: string;
+    name: string;
+    serialNumber: string;
+    calibrationDueDate: string | null;
+    status: string;
+    daysUntilDue: number | null;
+    usable: boolean;
+    reasons: string[];
+  }>;
+}
+
+/* ================================================================== */
+/* Rework and the cost of quality (#1098–1100)                         */
+/* ================================================================== */
+
+export interface ReworkItem {
+  id: string;
+  reference: string;
+  title: string;
+  description: string | null;
+  status: string;
+  sourceType: string;
+  ncrId: string | null;
+  causeCategory: string;
+  causeDescription: string | null;
+  discoveryPhase: string;
+  discoveredAt: string | null;
+  responsibleVendorId: string | null;
+  trade: string | null;
+  locationText: string | null;
+  labourHours: number | null;
+  labourCost: number | null;
+  materialCost: number | null;
+  plantCost: number | null;
+  subcontractorCost: number | null;
+  otherCost: number | null;
+  totalCost: number | null;
+  currency: string;
+  costBasis: string;
+  scheduleImpactDays: number | null;
+  isBackcharged: number;
+  preventable: number;
+  completedAt: string | null;
+  verifiedBy: string | null;
+  verifiedAt: string | null;
+  createdBy: string;
+}
+
+export interface ReworkGroup {
+  key: string;
+  items: number;
+  costedItems: number;
+  uncostedItems: number;
+  totals: CurrencyTotal[];
+  labourHours: number;
+  reasons: string[];
+}
+
+export interface ReworkSummary {
+  total: number;
+  open: number;
+  verified: number;
+  cancelled: number;
+  preventable: number;
+  backcharged: number;
+  totals: CurrencyTotal[];
+  costedItems: number;
+  uncostedItems: number;
+  byCause: ReworkGroup[];
+  byPhase: ReworkGroup[];
+  byTrade: ReworkGroup[];
+  scheduleImpactDays: number;
+  reasons: string[];
+}
+
+export interface CostOfQuality {
+  buckets: Array<{
+    bucket: string;
+    label: string;
+    money: CurrencyTotal[];
+    recordCount: number;
+    costedRecordCount: number;
+    activityCount: number;
+    reasons: string[];
+  }>;
+  failureByCurrency: Array<{
+    currency: string;
+    internal: number;
+    external: number;
+    total: number;
+    externalShare: number | null;
+  }>;
+  reasons: string[];
+}
+
+export interface FirstTimeRightRow {
+  key: string;
+  label: string;
+  judged: number;
+  right: number;
+  failed: number;
+  rate: number | null;
+  reasons: string[];
+}
+
+export interface FirstTimeRight {
+  rows: FirstTimeRightRow[];
+  overall: FirstTimeRightRow;
+}
+
+/* ================================================================== */
+/* Audits and ISO 9001 evidence (#1095–1096)                           */
+/* ================================================================== */
+
+export interface AuditFinding {
+  id: string;
+  auditId: string;
+  position: number;
+  reference: string;
+  findingType: string;
+  clauseReference: string | null;
+  requirement: string | null;
+  evidence: string | null;
+  description: string;
+  status: string;
+  responsibleUserId: string | null;
+  responsibleVendorId: string | null;
+  responseDueDate: string | null;
+  dueDate: string | null;
+  response: string | null;
+  respondedAt: string | null;
+  rootCause: string | null;
+  verificationEvidence: string | null;
+  verifiedBy: string | null;
+  verifiedAt: string | null;
+  closedBy: string | null;
+  closedAt: string | null;
+}
+
+export interface QualityAudit {
+  id: string;
+  reference: string;
+  title: string;
+  auditType: string;
+  standard: string | null;
+  scope: string | null;
+  clauseReferences: string[];
+  auditedVendorId: string | null;
+  auditedFunction: string | null;
+  leadAuditorId: string | null;
+  leadAuditorName: string | null;
+  leadAuditorOrganisation: string | null;
+  status: string;
+  plannedDate: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  reportIssuedAt: string | null;
+  responseDueDate: string | null;
+  findingCount: number;
+  majorFindingCount: number;
+  minorFindingCount: number;
+  observationCount: number;
+  openFindingCount: number;
+  conformityPercent: number | null;
+  nextAuditDueDate: string | null;
+  createdBy: string;
+}
+
+export interface QualityAuditDetail extends QualityAudit {
+  findings: AuditFinding[];
+}
+
+export interface IsoEvidence {
+  generatedAt: string;
+  standard: string;
+  clauses: Array<{
+    clause: string;
+    title: string;
+    question: string;
+    records: Array<{ kind: string; count: number; href?: string }>;
+    evidenced: boolean;
+    reasons: string[];
+  }>;
+  coverage: { clausesReported: number; clausesEvidenced: number; percent: number };
+  reasons: string[];
+}
+
+/* ================================================================== */
+/* Closeout (Domain V)                                                 */
+/* ================================================================== */
+
+export interface DlpStanding {
+  status: string;
+  daysRemaining: number | null;
+  reasons: string[];
+}
+
+export interface Dlp {
+  id: string;
+  reference: string;
+  name: string;
+  scopeDescription: string | null;
+  turnoverPackageId: string | null;
+  vendorId: string | null;
+  contractClause: string | null;
+  startDate: string;
+  endDate: string;
+  durationMonths: number | null;
+  status: string;
+  makeGoodObligationId: string | null;
+  extendedToDate: string | null;
+  extensionReason: string | null;
+  retentionReleaseDate: string | null;
+  retentionAmount: number | null;
+  currency: string;
+  finalCertificateDate: string | null;
+  defectCount: number;
+  openDefectCount: number;
+  standing: DlpStanding;
+}
+
+export interface DlpDefect {
+  id: string;
+  dlpId: string;
+  reference: string;
+  title: string;
+  description: string | null;
+  reportedAt: string | null;
+  reportedByName: string | null;
+  reportedByOrganisation: string | null;
+  severity: string;
+  locationText: string | null;
+  responsibleVendorId: string | null;
+  status: string;
+  targetRectificationDate: string | null;
+  rectifiedAt: string | null;
+  verifiedBy: string | null;
+  verifiedAt: string | null;
+  cost: number | null;
+  currency: string;
+  detail: Record<string, unknown>;
+}
+
+export interface DlpDetail extends Dlp {
+  defects: DlpDefect[];
+}
+
+export interface GuaranteeAssessment {
+  status: string;
+  met: boolean | null;
+  shortfall: number | null;
+  shortfallPercent: number | null;
+  ldAmount: number | null;
+  ldCapped: boolean;
+  basis: string;
+  reasons: string[];
+}
+
+export interface PerformanceGuarantee {
+  id: string;
+  reference: string;
+  title: string;
+  parameter: string;
+  operator: string;
+  guaranteedValue: number | null;
+  guaranteedMin: number | null;
+  guaranteedMax: number | null;
+  unit: string | null;
+  tolerancePercent: number | null;
+  measurementMethod: string | null;
+  systemId: string | null;
+  vendorId: string | null;
+  contractClause: string | null;
+  measuredValue: number | null;
+  measuredAt: string | null;
+  measuredBy: string | null;
+  verifiedBy: string | null;
+  verifiedAt: string | null;
+  status: string;
+  shortfall: number | null;
+  shortfallPercent: number | null;
+  ldRatePerUnit: number | null;
+  ldRateUnit: string | null;
+  ldCapAmount: number | null;
+  ldAmount: number | null;
+  ldBasis: string | null;
+  currency: string;
+  waivedBy: string | null;
+  waiverReason: string | null;
+  assessment?: GuaranteeAssessment;
+}
+
+export interface TrainingRecord {
+  id: string;
+  reference: string;
+  title: string;
+  description: string | null;
+  trainingKind: string;
+  systemId: string | null;
+  turnoverPackageId: string | null;
+  vendorId: string | null;
+  trainerName: string | null;
+  trainerOrganisation: string | null;
+  status: string;
+  scheduledFor: string | null;
+  deliveredAt: string | null;
+  durationHours: number | null;
+  attendees: Array<{ name: string; organisation?: string | null; role?: string | null }>;
+  attendeeCount: number;
+  competencyAssessed: number;
+  acceptedBy: string | null;
+  acceptedAt: string | null;
+  createdBy: string;
+}
+
+export interface SparePart {
+  id: string;
+  reference: string;
+  description: string;
+  category: string;
+  partNumber: string | null;
+  manufacturer: string | null;
+  supplierVendorId: string | null;
+  systemId: string | null;
+  quantityRequired: number | null;
+  quantityDelivered: number;
+  unit: string | null;
+  unitCost: number | null;
+  currency: string;
+  leadTimeWeeks: number | null;
+  status: string;
+  deliveredAt: string | null;
+  storageLocation: string | null;
+  handedOverAt: string | null;
+}
+
+export interface Poe {
+  id: string;
+  reference: string;
+  title: string;
+  poeKind: string;
+  turnoverPackageId: string | null;
+  systemId: string | null;
+  status: string;
+  periodStart: string | null;
+  periodEnd: string | null;
+  scheduledFor: string | null;
+  completedAt: string | null;
+  conductedByOrganisation: string | null;
+  surveyResponseCount: number | null;
+  surveyInviteCount: number | null;
+  satisfactionScore: number | null;
+  satisfactionScale: string | null;
+  energyDesignValue: number | null;
+  energyActualValue: number | null;
+  energyUnit: string | null;
+  defectsRaisedCount: number | null;
+  warrantyClaimCount: number | null;
+  findings: string | null;
+  recommendations: string | null;
+  energyVariance: Figure;
+  surveyResponseRate: number | null;
+}
+
+export interface CloseoutSummary {
+  dlps: {
+    total: number;
+    byStatus: Record<string, number>;
+    expiringWithin60Days: Array<{
+      id: string;
+      reference: string;
+      name: string;
+      endDate: string;
+      daysRemaining: number | null;
+      openDefects: number;
+    }>;
+    openDefects: number;
+    defectCosts: CurrencyTotal[];
+    defectCostReasons: string[];
+    handedOverPackagesWithoutAPeriod: Array<{
+      id: string;
+      reference: string;
+      handedOverAt: string | null;
+    }>;
+  };
+  guarantees: {
+    total: number;
+    met: number;
+    notMet: number;
+    unmeasured: number;
+    waived: number;
+    exposure: {
+      byCurrency: Array<{ currency: string; amount: number; guarantees: number; capped: number }>;
+      unpricedShortfalls: Array<{
+        id: string;
+        reference: string;
+        parameter: string;
+        shortfall: number;
+      }>;
+      unmeasured: Array<{ id: string; reference: string; parameter: string }>;
+      reasons: string[];
+    };
+  };
+  training: {
+    total: number;
+    delivered: number;
+    accepted: number;
+    attendees: number;
+    outstanding: number;
+  };
+  spares: {
+    total: number;
+    handedOver: number;
+    outstanding: number;
+    byCategory: Record<string, number>;
+  };
+  poe: {
+    total: number;
+    complete: number;
+    items: Array<{
+      id: string;
+      reference: string;
+      title: string;
+      poeKind: string;
+      status: string;
+      satisfactionScore: number | null;
+      energyVariance: Figure;
+    }>;
   };
 }

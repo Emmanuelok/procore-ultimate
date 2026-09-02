@@ -5,6 +5,9 @@ import { retainageRoutes } from "./retainage.js";
 import { waiverRoutes } from "./waivers.js";
 import { paymentRoutes } from "./payments.js";
 import { reportRoutes } from "./reports.js";
+import { erpRoutes } from "./erp.js";
+import { lineApprovalRoutes } from "./approvals.js";
+import { portalRoutes } from "./portal.js";
 
 /**
  * INVOICING (M6, spec Vol I §3.5) — the money actually moving.
@@ -42,9 +45,16 @@ import { reportRoutes } from "./reports.js";
  * report returns per-currency buckets. A figure the platform cannot derive
  * comes back as null with reasons, never as a fabricated zero.
  *
- * Tables: billing_periods, invoices, invoice_line_items, payment_applications,
- * retainage_releases, lien_waivers (plus commitment_payments on the pay side).
- * Tool key: `invoicing`.
+ * Upgrade wave (WP-FIN2): one payment register service (register.ts) owns
+ * every `commitment_payments` transition so the invoicing and commitments
+ * routes cannot disagree about what a payment did; the compliance gate runs
+ * on the invoice pay route (#575); line-level approval (#573); vendor
+ * self-service portal (#567–568); ERP export (#582); lien-waiver automation
+ * on issue (#576–578).
+ *
+ * Tables: billing_periods, invoices, invoice_line_items, invoice_line_approvals,
+ * payment_applications, retainage_releases, lien_waivers, vendor_portal_tokens
+ * (plus commitment_payments on the pay side). Tool key: `invoicing`.
  */
 export const invoicingModule: FastifyPluginAsync = async (app) => {
   await app.register(periodRoutes);
@@ -53,4 +63,7 @@ export const invoicingModule: FastifyPluginAsync = async (app) => {
   await app.register(waiverRoutes);
   await app.register(paymentRoutes);
   await app.register(reportRoutes);
+  await app.register(erpRoutes);
+  await app.register(lineApprovalRoutes);
+  await app.register(portalRoutes);
 };

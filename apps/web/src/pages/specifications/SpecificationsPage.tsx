@@ -24,7 +24,9 @@ import { IconSpec } from "../../ui/icons";
 import BooksTab from "./BooksTab";
 import ConflictsTab from "./ConflictsTab";
 import CoverageTab from "./CoverageTab";
+import ReissuesTab from "./ReissuesTab";
 import ReviewQueueTab from "./ReviewQueueTab";
+import SearchTab from "./SearchTab";
 import SectionDrawer from "./SectionDrawer";
 import SectionsTab from "./SectionsTab";
 import {
@@ -36,17 +38,21 @@ import {
   useSpecCoverage,
   useSpecDivisions,
   useSpecRequirements,
+  useSpecRevisionNotices,
+  useSpecSearch,
   useSpecSections,
   type RequirementFilters,
   type SectionFilters,
 } from "./specShared";
 
-type TabKey = "books" | "sections" | "review" | "coverage" | "conflicts";
+type TabKey = "books" | "sections" | "search" | "review" | "reissues" | "coverage" | "conflicts";
 
 const TABS: Array<{ value: TabKey; label: string }> = [
   { value: "books", label: "Issues" },
   { value: "sections", label: "Sections" },
+  { value: "search", label: "Text search" },
   { value: "review", label: "Requirement review" },
+  { value: "reissues", label: "Reissues" },
   { value: "coverage", label: "Coverage" },
   { value: "conflicts", label: "Conflicts" },
 ];
@@ -68,6 +74,8 @@ export default function SpecificationsPage() {
     EMPTY_REQUIREMENT_FILTERS,
   );
   const [includeResolved, setIncludeResolved] = useState(false);
+  const [noticeScope, setNoticeScope] = useState<"open" | "done" | "all">("open");
+  const [textQuery, setTextQuery] = useState(() => searchParams.get("q") ?? "");
 
   /** Bumped by every write anywhere in the workspace; every read depends on it. */
   const [version, setVersion] = useState(0);
@@ -79,6 +87,12 @@ export default function SpecificationsPage() {
   const requirements = useSpecRequirements(projectId, requirementFilters, version);
   const coverage = useSpecCoverage(projectId, version);
   const conflicts = useSpecConflicts(projectId, includeResolved, version);
+  const notices = useSpecRevisionNotices(
+    projectId,
+    noticeScope === "open" ? "0" : noticeScope === "done" ? "1" : "",
+    version,
+  );
+  const textResults = useSpecSearch(projectId, textQuery, version);
 
   const selectTab = useCallback(
     (next: TabKey) => {
@@ -108,6 +122,18 @@ export default function SpecificationsPage() {
     ? coverage.data.summary.identified
     : (requirements.data?.items ?? []).filter((r) => r.status === "identified").length;
   const openConflicts = conflicts.data?.unresolved ?? 0;
+  const openNotices = notices.data?.unacknowledged ?? 0;
+
+  const runTextSearch = useCallback(
+    (next: string) => {
+      setTextQuery(next);
+      const params = new URLSearchParams(searchParams);
+      if (next.trim()) params.set("q", next.trim());
+      else params.delete("q");
+      setSearchParams(params, { replace: true });
+    },
+    [searchParams, setSearchParams],
+  );
 
   if (!projectId) {
     return (
@@ -127,6 +153,9 @@ export default function SpecificationsPage() {
       : {}),
     ...(t.value === "conflicts" && openConflicts > 0
       ? { count: openConflicts, tone: "danger" as const }
+      : {}),
+    ...(t.value === "reissues" && openNotices > 0
+      ? { count: openNotices, tone: "warning" as const }
       : {}),
   }));
 
@@ -185,6 +214,13 @@ export default function SpecificationsPage() {
           onFilters={setSectionFilters}
           onOpenSection={openSection}
         />
+      ) : tab === "search" ? (
+        <SearchTab
+          query={textQuery}
+          onQuery={runTextSearch}
+          results={textResults}
+          onOpenSection={openSection}
+        />
       ) : tab === "review" ? (
         <ReviewQueueTab
           projectId={projectId}
@@ -192,6 +228,15 @@ export default function SpecificationsPage() {
           books={bookItems}
           filters={requirementFilters}
           onFilters={setRequirementFilters}
+          onMutated={refresh}
+          onOpenSection={openSection}
+        />
+      ) : tab === "reissues" ? (
+        <ReissuesTab
+          projectId={projectId}
+          notices={notices}
+          scope={noticeScope}
+          onScope={setNoticeScope}
           onMutated={refresh}
           onOpenSection={openSection}
         />

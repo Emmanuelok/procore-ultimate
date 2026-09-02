@@ -78,6 +78,13 @@
       "when": 1788193139146,
       "tag": "0010_third_the_anarchist",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1788374244025,
+      "tag": "0011_platform_upgrade",
+      "breakpoints": true
     }
   ]
 }

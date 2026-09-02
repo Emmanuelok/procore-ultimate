@@ -10,7 +10,7 @@ import fastifyStatic from "@fastify/static";
 import { ZodError } from "zod";
 import { sql } from "drizzle-orm";
 import "./types.js";
-import { loadConfig, type Config } from "./config.js";
+import { loadConfig, productionWarnings, type Config } from "./config.js";
 import { createDb, type DbHandle } from "./lib/db.js";
 import { createLocalStorage } from "./lib/storage.js";
 import { createS3Storage } from "./lib/storage-s3.js";
@@ -132,6 +132,13 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
       ? (_address: string, hop: number) => hop < config.TRUST_PROXY_HOPS
       : false,
   });
+
+  // Configuration smells, said out loud exactly once at boot. These never stop
+  // the process (see config.ts) but they must never be silent either: an
+  // operator reading the deploy log has to be able to see that this instance is
+  // on the embedded database, or that its email links point at localhost.
+  const configWarnings = productionWarnings(config);
+  for (const warning of configWarnings) app.log.warn({ config: true }, warning);
 
   // Security headers. CSP is tuned for the SPA the API serves same-origin:
   // pdf.js needs blob: workers and blob: fetches, web-ifc needs WebAssembly
@@ -287,6 +294,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
       ok,
       db: config.DATABASE_URL ? "postgres" : "pglite",
       checks,
+      // Reduced-shape configuration, reported rather than hidden. Ready is
+      // still 200 with warnings present — they describe a smaller deployment,
+      // not a broken one.
+      warnings: configWarnings,
       time: new Date().toISOString(),
     });
   });

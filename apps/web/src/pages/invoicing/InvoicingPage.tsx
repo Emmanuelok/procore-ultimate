@@ -21,6 +21,7 @@ import PeriodsTab from "./PeriodsTab";
 import ReportsTab from "./ReportsTab";
 import RetainageTab from "./RetainageTab";
 import WaiversTab from "./WaiversTab";
+import PortalTab from "./PortalTab";
 import { useInvoicingContext } from "./invoicingShared";
 
 const TABS = [
@@ -29,6 +30,7 @@ const TABS = [
   { value: "retainage", label: "Retainage" },
   { value: "waivers", label: "Lien waivers" },
   { value: "reports", label: "Aging & cash" },
+  { value: "portal", label: "Vendor portal" },
 ] as const;
 
 type TabKey = (typeof TABS)[number]["value"];
@@ -140,6 +142,8 @@ export default function InvoicingPage() {
       {tab === "waivers" ? <WaiversTab projectId={projectId} context={context} /> : null}
 
       {tab === "reports" ? <ReportsTab projectId={projectId} /> : null}
+
+      {tab === "portal" ? <PortalTab projectId={projectId} context={context} /> : null}
     </div>
   );
 }

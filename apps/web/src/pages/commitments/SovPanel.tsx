@@ -21,8 +21,20 @@
  */
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../../lib/api";
-import { Alert, Badge, Card, CardBody, Spinner } from "../../ui";
+import {
+  Alert,
+  Badge,
+  Button,
+  Card,
+  CardBody,
+  Field,
+  Input,
+  Modal,
+  Spinner,
+  Textarea,
+} from "../../ui";
 import { DataTable, type DataCellChange, type DataColumns } from "../../ui/data";
+import { parseSovCsv } from "./CreateCommitmentModal";
 import { RefusalPanel, money, titleCase, useAction, type Loadable } from "./shared";
 import type { BuyoutRow, Commitment, SovLine, SovResponse } from "./types";
 
@@ -41,6 +53,8 @@ export default function SovPanel({
 }) {
   const { busy, refusal, clear, run } = useAction();
   const [pending, setPending] = useState<Map<string, Partial<SovLine>>>(new Map());
+  const [adding, setAdding] = useState(false);
+  const [replacing, setReplacing] = useState(false);
 
   /* A fresh load discards any drafted edit — the sheet on screen must be the
      sheet the server holds, never a stale overlay of the two. */
@@ -124,7 +138,10 @@ export default function SovPanel({
         header: "Budget line",
         headerTooltip:
           "The budget line this commitment consumes. Committed cost on the budget is re-derived from these bindings on every consequential write.",
-        accessor: (row) => (row.budgetLineItemId ? (budgetByLine.get(row.budgetLineItemId)?.costCode ?? row.budgetLineItemId) : ""),
+        accessor: (row) =>
+          row.budgetLineItemId
+            ? (budgetByLine.get(row.budgetLineItemId)?.costCode ?? row.budgetLineItemId)
+            : "",
         type: "text",
         width: 210,
         truncate: false,
@@ -304,6 +321,16 @@ export default function SovPanel({
     sov.reload();
   }
 
+  async function deleteLine(row: SovLine) {
+    const ok = await run(`delete:${row.id}`, () =>
+      api.del(`/api/v1/commitment-sov-lines/${row.id}`),
+    );
+    if (ok !== null) {
+      sov.reload();
+      onChanged();
+    }
+  }
+
   if (sov.loading && !sov.data) {
     return (
       <div className="py-10">
@@ -331,14 +358,25 @@ export default function SovPanel({
         <Alert tone="info" size="sm" title={`This commitment is ${commitment.status}`}>
           Its schedule of values is fixed. Scheduled value, quantity, unit rate and retainage are
           not editable here because the API refuses them — the commitment sum moves only through
-          change orders once it is approved. Description, cost coding and the budget binding
-          remain editable.
+          change orders once it is approved. Description, cost coding and the budget binding remain
+          editable.
         </Alert>
       ) : null}
       {dead ? (
         <Alert tone="danger" size="sm" title={`This commitment is ${commitment.status}`}>
           Nothing on this schedule can be edited.
         </Alert>
+      ) : null}
+
+      {!frozen && !dead ? (
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <Button size="sm" variant="secondary" onClick={() => setAdding(true)}>
+            Add a line
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => setReplacing(true)}>
+            Replace from a spreadsheet…
+          </Button>
+        </div>
       ) : null}
 
       <DataTable<SovLine>
@@ -362,12 +400,37 @@ export default function SovPanel({
           const value = change.value;
           setPending((prev) => {
             const next = new Map(prev);
-            next.set(change.rowId, { ...(next.get(change.rowId) ?? {}), scheduledValue: value });
+            next.set(change.rowId, {
+              ...(next.get(change.rowId) ?? {}),
+              scheduledValue: value,
+            });
             return next;
           });
         }}
         savedViews={false}
         exportFileName={`sov-${commitment.reference}`}
+        rowActions={
+          frozen || dead
+            ? undefined
+            : (row) => [
+                {
+                  id: "delete",
+                  label: "Delete this line",
+                  destructive: true,
+                  disabled: row.totalCompletedAndStored !== 0 || row.isChangeOrderLine === 1,
+                  onSelect: () => {
+                    if (
+                      !window.confirm(
+                        `Delete line ${row.lineNumber}? The commitment sum falls by ${money(row.revisedScheduledValue, currency)}.`,
+                      )
+                    ) {
+                      return;
+                    }
+                    void deleteLine(row);
+                  },
+                },
+              ]
+        }
         empty={{
           title: "This commitment has no schedule of values",
           description:
@@ -377,7 +440,218 @@ export default function SovPanel({
       />
 
       {busy ? <p className="text-meta text-content-subtle">Saving {busy}…</p> : null}
+
+      <AddLine
+        open={adding}
+        commitment={commitment}
+        currency={currency}
+        onClose={() => setAdding(false)}
+        onAdded={() => {
+          setAdding(false);
+          sov.reload();
+          onChanged();
+        }}
+      />
+
+      <ReplaceSchedule
+        open={replacing}
+        commitment={commitment}
+        currency={currency}
+        lineCount={lines.length}
+        onClose={() => setReplacing(false)}
+        onReplaced={() => {
+          setReplacing(false);
+          sov.reload();
+          onChanged();
+        }}
+      />
     </div>
+  );
+}
+
+/** One more line on an editable schedule. The sum moves with it, by design. */
+function AddLine({
+  open,
+  commitment,
+  currency,
+  onClose,
+  onAdded,
+}: {
+  open: boolean;
+  commitment: Commitment;
+  currency: string;
+  onClose: () => void;
+  onAdded: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [lineNumber, setLineNumber] = useState("");
+  const [description, setDescription] = useState("");
+  const [costCode, setCostCode] = useState("");
+  const [scheduledValue, setScheduledValue] = useState("");
+
+  const amount = Number(scheduledValue);
+  const valid = description.trim().length > 0 && Number.isFinite(amount);
+
+  async function submit() {
+    const ok = await run("add", () =>
+      api.post(`/api/v1/commitments/${commitment.id}/sov-lines`, {
+        ...(lineNumber.trim() ? { lineNumber: lineNumber.trim() } : {}),
+        description: description.trim(),
+        ...(costCode.trim() ? { costCode: costCode.trim() } : {}),
+        scheduledValue: amount,
+      }),
+    );
+    if (ok !== null) {
+      setLineNumber("");
+      setDescription("");
+      setCostCode("");
+      setScheduledValue("");
+      onAdded();
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={`Add a line to ${commitment.reference}`}
+      size="md"
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button disabled={!valid || busy !== null} onClick={() => void submit()}>
+            Add the line
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        <RefusalPanel refusal={refusal} onDismiss={clear} title="This line was refused" />
+        <p className="text-meta text-content-subtle">
+          The schedule IS the commitment sum, so adding{" "}
+          {money(Number.isFinite(amount) ? amount : 0, currency)} here raises the sum by exactly
+          that.
+        </p>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Line number" hint="Left blank, the next number is allocated.">
+            <Input value={lineNumber} onChange={(e) => setLineNumber(e.target.value)} />
+          </Field>
+          <Field label="Cost code">
+            <Input value={costCode} onChange={(e) => setCostCode(e.target.value)} />
+          </Field>
+        </div>
+        <Field label="Description" required>
+          <Input value={description} onChange={(e) => setDescription(e.target.value)} />
+        </Field>
+        <Field label={`Scheduled value (${currency})`} required>
+          <Input
+            value={scheduledValue}
+            inputMode="decimal"
+            onChange={(e) => setScheduledValue(e.target.value)}
+          />
+        </Field>
+      </div>
+    </Modal>
+  );
+}
+
+/**
+ * A schedule of values arrives as a spreadsheet. Pasting it replaces the whole
+ * schedule in one call — which the API refuses once anything has been billed,
+ * so the refusal is shown verbatim rather than pre-empted.
+ */
+function ReplaceSchedule({
+  open,
+  commitment,
+  currency,
+  lineCount,
+  onClose,
+  onReplaced,
+}: {
+  open: boolean;
+  commitment: Commitment;
+  currency: string;
+  lineCount: number;
+  onClose: () => void;
+  onReplaced: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [csv, setCsv] = useState("");
+  const parsed = useMemo(
+    () => parseSovCsv(csv, commitment.defaultRetainagePercent ?? 0),
+    [csv, commitment.defaultRetainagePercent],
+  );
+  const total = parsed.lines.reduce((s, l) => s + l.scheduledValue, 0);
+
+  async function submit() {
+    const ok = await run("replace", () =>
+      api.put(`/api/v1/commitments/${commitment.id}/sov`, {
+        lines: parsed.lines,
+      }),
+    );
+    if (ok !== null) {
+      setCsv("");
+      onReplaced();
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={`Replace the schedule of values on ${commitment.reference}`}
+      size="lg"
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            disabled={parsed.lines.length === 0 || busy !== null}
+            onClick={() => void submit()}
+          >
+            Replace {lineCount} line{lineCount === 1 ? "" : "s"} with {parsed.lines.length}
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        <RefusalPanel refusal={refusal} onDismiss={clear} title="The replacement was refused" />
+        <Alert tone="warning" size="sm" title="This replaces every line">
+          Every existing line is deleted and the pasted schedule is inserted, in one transaction.
+          The API refuses it once any line has been billed against, or once a change order has
+          appended a line.
+        </Alert>
+        <Field
+          label="Paste the schedule"
+          hint="One line per row: line, description, cost code, amount — or just description and amount. Comma or tab separated."
+        >
+          <Textarea rows={10} value={csv} onChange={(e) => setCsv(e.target.value)} />
+        </Field>
+        {parsed.problems.length > 0 ? (
+          <Alert
+            tone="danger"
+            size="sm"
+            title={`${parsed.problems.length} row(s) could not be read`}
+          >
+            <ul className="list-disc pl-4">
+              {parsed.problems.map((p) => (
+                <li key={p}>{p}</li>
+              ))}
+            </ul>
+          </Alert>
+        ) : null}
+        {parsed.lines.length > 0 ? (
+          <p className="text-meta text-content-muted">
+            {parsed.lines.length} line{parsed.lines.length === 1 ? "" : "s"} totalling{" "}
+            <span className="font-mono tabular-nums">{money(total, currency)}</span> — that becomes
+            the commitment sum.
+          </p>
+        ) : null}
+      </div>
+    </Modal>
   );
 }
 

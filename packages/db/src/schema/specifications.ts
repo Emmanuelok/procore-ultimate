@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   doublePrecision,
   index,
@@ -13,6 +14,7 @@ const createdAt = () =>
   timestamp("created_at", { withTimezone: true, mode: "string" }).defaultNow().notNull();
 const updatedAt = () =>
   timestamp("updated_at", { withTimezone: true, mode: "string" }).defaultNow().notNull();
+const ts = (name: string) => timestamp(name, { withTimezone: true, mode: "string" });
 
 /**
  * SPECIFICATIONS — the spec book as a first-class record (spec Vol I §2.3,
@@ -154,6 +156,10 @@ export const specSections = pgTable(
     /** true when a requirement extraction has been confirmed by a human */
     requirementsConfirmed: integer("requirements_confirmed").default(0).notNull(),
     submittalRequirementCount: integer("submittal_requirement_count").default(0).notNull(),
+    /** set when the section is absent from the current issue and a person withdrew it (#288) */
+    withdrawnAt: ts("withdrawn_at"),
+    withdrawnBy: text("withdrawn_by"),
+    withdrawnReason: text("withdrawn_reason"),
     detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
     createdBy: text("created_by").notNull(),
     createdAt: createdAt(),
@@ -201,6 +207,8 @@ export const specSectionRevisions = pgTable(
     changeSummary: text("change_summary"),
     /** clause-level diff against the previous revision: [{ ref, kind, text }] */
     changedClauses: jsonb("changed_clauses").$type<unknown[]>().default([]).notNull(),
+    /** what the reissue did to the register: { superseded, reconfirm, registeredChanged, newRequirements } (#288) */
+    impact: jsonb("impact").$type<Record<string, unknown>>(),
     isSuperseded: integer("is_superseded").default(0).notNull(),
     supersedesRevisionId: text("supersedes_revision_id"),
     supersededByRevisionId: text("superseded_by_revision_id"),
@@ -220,6 +228,11 @@ export const specSectionRevisions = pgTable(
     index("spec_section_revisions_section_idx").on(t.sectionId, t.revisionOrdinal),
     index("spec_section_revisions_book_idx").on(t.bookId),
     index("spec_section_revisions_project_idx").on(t.projectId),
+    /** full-text search over section text (#298) */
+    index("spec_section_revisions_fts_idx").using(
+      "gin",
+      sql`to_tsvector('english', left(coalesce(${t.extractedText}, ''), 400000))`,
+    ),
   ],
 );
 
@@ -263,6 +276,12 @@ export const specSubmittalRequirements = pgTable(
     confirmedAt: timestamp("confirmed_at", { withTimezone: true, mode: "string" }),
     /** why a requirement was marked not_required, e.g. "scope not in contract" */
     notRequiredReason: text("not_required_reason"),
+    /* --- reissue tracking (#288) --- */
+    /** 1 when the clause it was read from was amended after confirmation: the SoD chain re-runs */
+    needsReconfirmation: integer("needs_reconfirmation").default(0).notNull(),
+    /** the revision whose removal of the clause superseded this row */
+    supersededByRevisionId: text("superseded_by_revision_id"),
+    reissueNote: text("reissue_note"),
     /** THE build link: the submittals row (field.ts) created from this */
     registeredSubmittalId: text("registered_submittal_id"),
     registeredAt: timestamp("registered_at", { withTimezone: true, mode: "string" }),
@@ -280,6 +299,7 @@ export const specSubmittalRequirements = pgTable(
     index("spec_submittal_requirements_section_idx").on(t.sectionId, t.status),
     index("spec_submittal_requirements_project_idx").on(t.projectId, t.status),
     index("spec_submittal_requirements_submittal_idx").on(t.registeredSubmittalId),
+    index("spec_submittal_requirements_reconfirm_idx").on(t.projectId, t.needsReconfirmation),
   ],
 );
 
@@ -320,5 +340,45 @@ export const specReferences = pgTable(
     index("spec_references_section_idx").on(t.sectionId),
     index("spec_references_target_idx").on(t.targetType, t.targetId),
     index("spec_references_project_idx").on(t.projectId, t.referenceKind),
+  ],
+);
+
+/**
+ * A reissue notice (#288): one row per section revision that displaced an
+ * earlier text, recording what the change did to the register — which
+ * requirements were superseded, which must be re-confirmed, which registered
+ * submittals now cite a clause that changed under them — and who was told.
+ * It is the "spec changed after approval" trail a dispute reads.
+ */
+export const specRevisionNotices = pgTable(
+  "spec_revision_notices",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    sectionId: text("section_id").notNull(),
+    sectionCode: text("section_code").notNull(),
+    revisionId: text("revision_id").notNull(),
+    previousRevisionId: text("previous_revision_id"),
+    bookId: text("book_id"),
+    revision: text("revision").notNull(),
+    changedClauseCount: integer("changed_clause_count").default(0).notNull(),
+    requirementsSuperseded: integer("requirements_superseded").default(0).notNull(),
+    requirementsToReconfirm: integer("requirements_to_reconfirm").default(0).notNull(),
+    requirementsNew: integer("requirements_new").default(0).notNull(),
+    /** registered submittals whose clause changed: [{ submittalId, requirementId, paragraphRef, kind }] */
+    submittalsAffected: jsonb("submittals_affected").$type<unknown[]>().default([]).notNull(),
+    notifiedUserIds: jsonb("notified_user_ids").$type<string[]>().default([]).notNull(),
+    /** a person's acknowledgement that the reissue has been actioned */
+    acknowledgedBy: text("acknowledged_by"),
+    acknowledgedAt: ts("acknowledged_at"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    index("spec_revision_notices_project_idx").on(t.projectId, t.createdAt),
+    index("spec_revision_notices_section_idx").on(t.sectionId),
+    index("spec_revision_notices_ack_idx").on(t.projectId, t.acknowledgedAt),
   ],
 );

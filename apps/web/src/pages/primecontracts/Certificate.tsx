@@ -40,6 +40,7 @@ import {
   titleCase,
   useAction,
   useReason,
+  useReceipts,
   type Loadable,
 } from "./shared";
 import type { BillingView, ContractView, G703Line } from "./types";
@@ -60,8 +61,10 @@ export default function Certificate({
   const { ask, dialog: reasonDialog } = useReason();
   const [submitting, setSubmitting] = useState(false);
   const [certifying, setCertifying] = useState(false);
+  const [receiving, setReceiving] = useState(false);
 
   const view = billing.data;
+  const receipts = useReceipts(contract.id, view?.application.id ?? null);
 
   async function act(verb: string, path: string, body?: unknown) {
     if (!view) return null;
@@ -357,25 +360,106 @@ export default function Certificate({
           </Button>
         ) : null}
         {a.status === "certified" || a.status === "partially_certified" ? (
+          <Button size="sm" variant="secondary" disabled={busy !== null} onClick={() => setReceiving(true)}>
+            Record a receipt
+          </Button>
+        ) : null}
+        {a.status === "draft" || a.status === "submitted" || a.status === "rejected" ? (
           <Button
             size="sm"
-            variant="secondary"
+            variant="ghost"
             disabled={busy !== null}
             onClick={async () => {
-              const certified = a.certifiedAmount ?? a.currentPaymentDue;
-              const ok = await confirm({
-                title: `Record payment of ${money(certified, cur)}?`,
+              const reason = await ask({
+                title: `Void ${a.reference}?`,
                 description:
-                  "Settlement is recorded against the certified amount. The API refuses a payment larger than what was certified.",
-                confirmLabel: "Record the payment",
+                  "The application and its owner invoice are marked void, and the this-period figures it mirrored onto the schedule of values are reset to the certified position. A certified application cannot be voided. Admin only.",
+                label: "Why is this application void?",
+                confirmLabel: "Void it",
+                destructive: true,
               });
-              if (ok) await act("pay", "pay", {});
+              if (!reason) return;
+              await act("void", "void", { reason });
             }}
           >
-            Record payment
+            Void
           </Button>
         ) : null}
       </div>
+
+      {a.status === "certified" || a.status === "partially_certified" || a.status === "paid" ? (
+        <Card>
+          <CardBody className="space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-sm font-semibold">Settlement</h3>
+              {receipts.data ? (
+                <span className="text-meta">
+                  {money(receipts.data.paid, cur)} received of {money(receipts.data.certified, cur)} certified
+                  {receipts.data.outstanding !== null && receipts.data.outstanding > 0.005 ? (
+                    <Badge tone="warning" size="xs" className="ml-2">
+                      {money(receipts.data.outstanding, cur)} outstanding
+                    </Badge>
+                  ) : (
+                    <Badge tone="success" size="xs" className="ml-2">
+                      settled
+                    </Badge>
+                  )}
+                </span>
+              ) : null}
+            </div>
+            {receipts.error ? <Alert tone="danger" size="sm" title="Receipts could not be loaded">{receipts.error}</Alert> : null}
+            {(receipts.data?.items ?? []).length === 0 ? (
+              <p className="text-2xs text-content-subtle">
+                No receipt recorded yet. Each remittance from the owner is one receipt; the application is paid only when the receipts cover the certified amount.
+              </p>
+            ) : (
+              <ul className="divide-y divide-border-subtle text-meta">
+                {(receipts.data?.items ?? []).map((r) => (
+                  <li key={r.id} className="flex flex-wrap items-center justify-between gap-2 py-1">
+                    <span>
+                      <span className="font-mono">{r.reference}</span> · {isoDate(r.receivedDate)} · {titleCase(r.method)}
+                      {r.paymentReference ? ` · ${r.paymentReference}` : ""}
+                      {r.status === "void" ? (
+                        <Badge tone="neutral" size="xs" className="ml-1">
+                          void
+                        </Badge>
+                      ) : null}
+                    </span>
+                    <span className="flex items-center gap-2">
+                      <span className={"font-mono tabular-nums" + (r.status === "void" ? " line-through text-content-subtle" : "")}>{money(r.amount, cur)}</span>
+                      {r.status !== "void" ? (
+                        <Button
+                          size="xs"
+                          variant="ghost"
+                          disabled={busy !== null}
+                          onClick={async () => {
+                            const reason = await ask({
+                              title: `Void receipt ${r.reference}?`,
+                              description: "A bounced or mis-keyed remittance is voided, never deleted; the application's settlement is re-derived from the receipts that remain.",
+                              label: "Why is this receipt void?",
+                              confirmLabel: "Void the receipt",
+                              destructive: true,
+                            });
+                            if (!reason) return;
+                            const done = await run("void-receipt", () => api.post(`/api/v1/owner-payment-receipts/${r.id}/void`, { reason }));
+                            if (done !== null) {
+                              receipts.reload();
+                              billing.reload();
+                              onChanged();
+                            }
+                          }}
+                        >
+                          Void
+                        </Button>
+                      ) : null}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </CardBody>
+        </Card>
+      ) : null}
 
       {a.status === "certified" || a.status === "partially_certified" ? (
         <Alert
@@ -482,7 +566,124 @@ export default function Certificate({
           onChanged();
         }}
       />
+      <ReceiptDialog
+        open={receiving}
+        contractId={contract.id}
+        applicationId={a.id}
+        outstanding={receipts.data?.outstanding ?? (a.certifiedAmount ?? a.currentPaymentDue) - a.paidAmount}
+        currency={cur}
+        onClose={() => setReceiving(false)}
+        onDone={() => {
+          setReceiving(false);
+          receipts.reload();
+          billing.reload();
+          onChanged();
+        }}
+      />
     </div>
+  );
+}
+
+/**
+ * One remittance from the owner. Partial payments are the norm — an owner
+ * short-pays a retention dispute, or pays in two wires — so the receipt is
+ * the record and the application's settlement is derived from the receipts.
+ */
+function ReceiptDialog({
+  open,
+  contractId,
+  applicationId,
+  outstanding,
+  currency,
+  onClose,
+  onDone,
+}: {
+  open: boolean;
+  contractId: string;
+  applicationId: string;
+  outstanding: number;
+  currency: string;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [amount, setAmount] = useState("");
+  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [method, setMethod] = useState("ach");
+  const [reference, setReference] = useState("");
+  const [bankReference, setBankReference] = useState("");
+  const value = amount.trim() === "" ? outstanding : Number(amount);
+  const over = Number.isFinite(value) && value - outstanding > 0.005;
+
+  async function submit() {
+    const done = await run("receipt", () =>
+      api.post(`/api/v1/prime-contracts/${contractId}/billings/${applicationId}/receipts`, {
+        ...(amount.trim() === "" ? {} : { amount: Number(amount) }),
+        receivedDate: date,
+        method,
+        ...(reference.trim() ? { paymentReference: reference.trim() } : {}),
+        ...(bankReference.trim() ? { bankReference: bankReference.trim() } : {}),
+      }),
+    );
+    if (done !== null) {
+      setAmount("");
+      setReference("");
+      setBankReference("");
+      onDone();
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Record a receipt"
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button onClick={submit} disabled={over || !Number.isFinite(value) || value <= 0 || busy !== null}>
+            Record {money(Number.isFinite(value) ? value : 0, currency)}
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        <RefusalPanel refusal={refusal} onDismiss={clear} />
+        <p className="text-meta text-content-muted">
+          Outstanding on this certificate: <strong>{money(outstanding, currency)}</strong>. Σ receipts may never exceed the certified amount; the application becomes paid only when they cover it.
+        </p>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label={`Amount (${currency})`} hint="Leave blank to record the whole outstanding balance.">
+            <Input value={amount} inputMode="decimal" placeholder={String(outstanding)} onChange={(e) => setAmount(e.target.value)} />
+          </Field>
+          <Field label="Received on" required>
+            <Input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+          </Field>
+          <Field label="Method">
+            <select className="h-control w-full rounded-md border border-border bg-surface px-2 text-body" value={method} onChange={(e) => setMethod(e.target.value)} aria-label="Method">
+              {["ach", "wire", "check", "card", "other"].map((m) => (
+                <option key={m} value={m}>
+                  {titleCase(m)}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Payment reference" optional>
+            <Input value={reference} onChange={(e) => setReference(e.target.value)} />
+          </Field>
+          <Field label="Bank reference" optional className="sm:col-span-2">
+            <Input value={bankReference} onChange={(e) => setBankReference(e.target.value)} />
+          </Field>
+        </div>
+        {over ? (
+          <Alert tone="danger" size="sm" title="More than is outstanding">
+            The API refuses a receipt larger than the balance still due on the certificate.
+          </Alert>
+        ) : null}
+      </div>
+    </Modal>
   );
 }
 
@@ -578,7 +779,7 @@ function G702Sheet({
     {
       n: "7",
       label: "Less previous certificates for payment",
-      derivation: "line 6 from the prior certificate",
+      derivation: "sum of amounts certified on prior applications",
       value: g702.lessPreviousCertificates,
     },
     {
@@ -761,6 +962,8 @@ function CertifyDialog({
   const { busy, refusal, clear, run } = useAction();
   const [amount, setAmount] = useState("");
   const [notes, setNotes] = useState("");
+  const [certifierName, setCertifierName] = useState("");
+  const [documentHash, setDocumentHash] = useState("");
 
   const certified = amount.trim() === "" ? appliedFor : Number(amount);
   const over = Number.isFinite(certified) && certified - appliedFor > 0.005;
@@ -771,6 +974,9 @@ function CertifyDialog({
       api.post(`/api/v1/prime-contracts/${contractId}/billings/${applicationId}/certify`, {
         ...(amount.trim() === "" ? {} : { certifiedAmount: Number(amount) }),
         ...(notes.trim() ? { certificationNotes: notes.trim() } : {}),
+        ...(certifierName.trim()
+          ? { certifier: { name: certifierName.trim(), ...(documentHash.trim() ? { documentHash: documentHash.trim() } : {}) } }
+          : {}),
       }),
     );
     if (done !== null) {
@@ -833,6 +1039,14 @@ function CertifyDialog({
         <Field label="Certification notes" optional>
           <Textarea rows={3} value={notes} onChange={(e) => setNotes(e.target.value)} />
         </Field>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Signed by (owner / architect)" optional hint="The external certifier, recorded on the application and in the ledger.">
+            <Input value={certifierName} onChange={(e) => setCertifierName(e.target.value)} />
+          </Field>
+          <Field label="Signed document hash" optional hint="sha-256 of the signed certificate, if one was received.">
+            <Input value={documentHash} onChange={(e) => setDocumentHash(e.target.value)} className="font-mono" />
+          </Field>
+        </div>
       </div>
     </Modal>
   );

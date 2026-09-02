@@ -4,7 +4,7 @@
  * and the shared-identifier collusion scan.
  */
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   ENTITY_KINDS,
   ENTITY_RELATIONSHIP_KINDS,
@@ -35,12 +35,24 @@ import {
   pct,
   severityTone,
   StatCard,
+  TabBar,
   truncateMiddle,
   type EntityRelationshipRow,
   type EntityRow,
   type ListResponse,
   type SignalRow,
 } from "./assuranceShared";
+import CasesTab from "./CasesTab";
+import DetectorsTab from "./DetectorsTab";
+import IntegrityTab from "./IntegrityTab";
+
+const COMPANY_TABS = [
+  { key: "signals", label: "Signals" },
+  { key: "detectors", label: "Detectors" },
+  { key: "integrity", label: "Integrity scores" },
+  { key: "cases", label: "Cases" },
+  { key: "entities", label: "Entity register" },
+];
 
 interface SignalStats {
   total: number;
@@ -62,6 +74,41 @@ interface GraphResponse {
   edges: EntityRelationshipRow[];
 }
 
+interface ScreeningRow {
+  id: string;
+  list: string;
+  matchScore: number;
+  matchedName: string | null;
+  matchedRef: string | null;
+  listSource: string;
+  listSnapshotHash: string;
+  disposition: string;
+  screenedAt: string;
+}
+
+interface ExposurePath {
+  targetId: string;
+  targetName: string | null;
+  hops: number;
+  vendorId: string | null;
+  userId: string | null;
+  declared: boolean | null;
+  citations: {
+    relationshipId: string;
+    fromName: string | null;
+    toName: string | null;
+    kind: string;
+    source: string | null;
+  }[];
+}
+
+interface ExposureResponse {
+  root: { id: string; name: string };
+  depth: number;
+  paths: ExposurePath[];
+  note: string;
+}
+
 const IDENTIFIER_KEYS = ["bank_account", "address", "email_domain", "phone", "registration"] as const;
 
 interface EntityForm {
@@ -79,6 +126,11 @@ const emptyEntity: EntityForm = {
 };
 
 export default function CompanyAssurancePage() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [tab, setTab] = useState(() => {
+    const t = searchParams.get("tab");
+    return t && COMPANY_TABS.some((x) => x.key === t) ? t : "signals";
+  });
   const [stats, setStats] = useState<SignalStats | null>(null);
   const [signals, setSignals] = useState<SignalRow[] | null>(null);
   const [severity, setSeverity] = useState("");
@@ -102,6 +154,11 @@ export default function CompanyAssurancePage() {
   const [relKind, setRelKind] = useState<string>(ENTITY_RELATIONSHIP_KINDS[0]);
   const [relError, setRelError] = useState<string | null>(null);
   const [relBusy, setRelBusy] = useState(false);
+
+  const [screening, setScreening] = useState<ScreeningRow[] | null>(null);
+  const [screenBusy, setScreenBusy] = useState(false);
+  const [screenError, setScreenError] = useState<string | null>(null);
+  const [exposure, setExposure] = useState<ExposureResponse | null>(null);
 
   const [scanBusy, setScanBusy] = useState(false);
   const [scan, setScan] = useState<ScanResult | null>(null);
@@ -152,19 +209,46 @@ export default function CompanyAssurancePage() {
     setSelectedEntity(e);
     setRelationships(null);
     setGraph(null);
+    setScreening(null);
+    setExposure(null);
     setPanelError(null);
+    setScreenError(null);
     try {
-      const [rels, g] = await Promise.all([
+      const [rels, g, scr, exp] = await Promise.all([
         api.get<{ items: EntityRelationshipRow[] }>(`/api/v1/entities/${e.id}/relationships`),
         api.get<GraphResponse>(`/api/v1/entities/${e.id}/graph?depth=2`),
+        api.get<{ items: ScreeningRow[] }>(`/api/v1/entities/${e.id}/screening`),
+        api.get<ExposureResponse>(`/api/v1/entities/${e.id}/exposure?depth=3`),
       ]);
       setRelationships(rels.items);
       setGraph(g);
+      setScreening(scr.items);
+      setExposure(exp);
     } catch (err) {
       setRelationships([]);
       setPanelError(err instanceof Error ? err.message : "Failed to load entity detail");
     }
   }, []);
+
+  async function screenEntity(entityId: string) {
+    setScreenBusy(true);
+    setScreenError(null);
+    try {
+      await api.post(`/api/v1/entities/${entityId}/screen`, {});
+      const [scr, list] = await Promise.all([
+        api.get<{ items: ScreeningRow[] }>(`/api/v1/entities/${entityId}/screening`),
+        api.get<ListResponse<EntityRow>>("/api/v1/entities?pageSize=200"),
+      ]);
+      setScreening(scr.items);
+      setEntities(list.items);
+      const refreshed = list.items.find((e) => e.id === entityId);
+      if (refreshed) setSelectedEntity(refreshed);
+    } catch (err) {
+      setScreenError(err instanceof Error ? err.message : "Screening failed");
+    } finally {
+      setScreenBusy(false);
+    }
+  }
 
   async function onCreateEntity(e: FormEvent) {
     e.preventDefault();
@@ -242,6 +326,20 @@ export default function CompanyAssurancePage() {
         }
       />
 
+      <TabBar
+        tabs={COMPANY_TABS}
+        active={tab}
+        onSelect={(key) => {
+          setTab(key);
+          setSearchParams({ tab: key }, { replace: true });
+        }}
+      />
+
+      {tab === "detectors" ? <DetectorsTab /> : null}
+      {tab === "integrity" ? <IntegrityTab /> : null}
+      {tab === "cases" ? <CasesTab /> : null}
+
+      <div hidden={tab !== "entities"}>
       <ErrorAlert message={scanError} />
       {scan ? (
         <div className="mb-4 rounded-md bg-brand-50 px-4 py-3 text-sm text-brand-900 ring-1 ring-brand-200">
@@ -262,6 +360,9 @@ export default function CompanyAssurancePage() {
         </div>
       ) : null}
 
+      </div>
+
+      <div hidden={tab !== "signals"}>
       {stats ? (
         <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-5">
           <StatCard label="Total signals" value={stats.total} />
@@ -367,8 +468,11 @@ export default function CompanyAssurancePage() {
         </Table>
       )}
 
+      </div>
+
       {/* ------------------------- Entity register ------------------------- */}
 
+      <div hidden={tab !== "entities"}>
       <div className="mb-3 mt-8 flex items-center justify-between">
         <div>
           <h2 className="text-base font-semibold text-ink-900">Entity register</h2>
@@ -492,6 +596,88 @@ export default function CompanyAssurancePage() {
                   </ul>
                 )}
 
+                <div className="mb-1 flex items-center justify-between">
+                  <span className="text-xs font-semibold uppercase tracking-wide text-ink-400">
+                    Screening
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    disabled={screenBusy}
+                    onClick={() => void screenEntity(selectedEntity.id)}
+                  >
+                    {screenBusy ? "Screening…" : "Screen now"}
+                  </Button>
+                </div>
+                <ErrorAlert message={screenError} />
+                {screening === null ? (
+                  <p className="mb-3 text-xs text-ink-400">—</p>
+                ) : screening.length === 0 ? (
+                  <p className="mb-3 text-xs text-ink-400">
+                    Never screened. A negative result is only meaningful against a stated list
+                    snapshot, so nothing is claimed until it has been run.
+                  </p>
+                ) : (
+                  <ul className="mb-3 space-y-1 text-xs">
+                    {screening.slice(0, 6).map((r) => (
+                      <li key={r.id} className="rounded border border-ink-100 px-2 py-1">
+                        <div className="flex items-center gap-2">
+                          <Badge tone={r.matchedName ? "red" : "green"}>{humanize(r.list)}</Badge>
+                          <span className="text-ink-700">
+                            {r.matchedName ? `${r.matchedName} (${pct(r.matchScore)})` : "no match"}
+                          </span>
+                          <span className="ml-auto text-ink-400">{humanize(r.disposition)}</span>
+                        </div>
+                        <div
+                          className="mt-0.5 truncate text-[11px] text-ink-400"
+                          title={r.listSource}
+                        >
+                          snapshot {truncateMiddle(r.listSnapshotHash, 8)} · {r.listSource}
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+
+                <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-ink-400">
+                  Exposure paths
+                </div>
+                {exposure === null ? (
+                  <p className="mb-3 text-xs text-ink-400">—</p>
+                ) : exposure.paths.length === 0 ? (
+                  <p className="mb-3 text-xs text-ink-400">
+                    No entity is reachable from this one within three hops.
+                  </p>
+                ) : (
+                  <ul className="mb-3 space-y-1 text-xs">
+                    {exposure.paths.slice(0, 8).map((p) => (
+                      <li key={p.targetId} className="rounded border border-ink-100 px-2 py-1">
+                        <div className="flex items-center gap-2">
+                          <span className="font-medium text-ink-800">
+                            {p.targetName ?? p.targetId}
+                          </span>
+                          <span className="text-ink-400">
+                            {p.hops} hop{p.hops === 1 ? "" : "s"}
+                          </span>
+                          {p.declared === true ? (
+                            <Badge tone="green">declared</Badge>
+                          ) : p.declared === false ? (
+                            <Badge tone="red">undeclared</Badge>
+                          ) : null}
+                        </div>
+                        <div className="mt-0.5 text-[11px] text-ink-500">
+                          {p.citations
+                            .map(
+                              (c) =>
+                                `${c.fromName ?? "?"} —${humanize(c.kind)}→ ${c.toName ?? "?"}`,
+                            )
+                            .join("; ")}
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+
                 <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-ink-400">
                   Network (depth 2)
                 </div>
@@ -511,6 +697,8 @@ export default function CompanyAssurancePage() {
             />
           )}
         </div>
+      </div>
+
       </div>
 
       {/* Create entity modal */}

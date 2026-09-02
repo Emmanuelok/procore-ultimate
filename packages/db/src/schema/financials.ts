@@ -709,6 +709,7 @@ export const commitmentSovLines = pgTable(
     index("commitment_sov_lines_commitment_idx").on(t.commitmentId, t.sortOrder),
     index("commitment_sov_lines_budget_idx").on(t.budgetLineItemId),
     index("commitment_sov_lines_project_idx").on(t.projectId),
+    index("commitment_sov_lines_project_budget_idx").on(t.projectId, t.budgetLineItemId),
   ],
 );
 
@@ -761,6 +762,7 @@ export const commitmentChanges = pgTable(
     uniqueIndex("commitment_changes_uq").on(t.commitmentId, t.number),
     index("commitment_changes_project_idx").on(t.projectId, t.status),
     index("commitment_changes_package_idx").on(t.changeOrderPackageId),
+    index("commitment_changes_commitment_idx").on(t.commitmentId, t.status),
   ],
 );
 
@@ -815,6 +817,7 @@ export const commitmentPayments = pgTable(
     index("commitment_payments_project_idx").on(t.projectId, t.status),
     index("commitment_payments_invoice_idx").on(t.invoiceId),
     index("commitment_payments_vendor_idx").on(t.vendorId),
+    index("commitment_payments_commitment_idx").on(t.commitmentId, t.status),
   ],
 );
 
@@ -945,6 +948,7 @@ export const potentialChangeOrders = pgTable(
     index("potential_change_orders_event_idx").on(t.changeEventId),
     index("potential_change_orders_commitment_idx").on(t.commitmentId),
     index("potential_change_orders_project_idx").on(t.projectId, t.status),
+    index("potential_change_orders_cor_idx").on(t.changeOrderRequestId),
   ],
 );
 
@@ -1065,6 +1069,7 @@ export const changeOrderRequests = pgTable(
     index("change_order_requests_contract_idx").on(t.primeContractId, t.status),
     index("change_order_requests_event_idx").on(t.changeEventId),
     index("change_order_requests_project_idx").on(t.projectId, t.status),
+    index("change_order_requests_package_idx").on(t.changeOrderPackageId),
   ],
 );
 
@@ -1345,6 +1350,7 @@ export const invoices = pgTable(
     index("invoices_prime_idx").on(t.primeContractId, t.status),
     index("invoices_period_idx").on(t.billingPeriodId),
     index("invoices_vendor_idx").on(t.vendorId),
+    index("invoices_company_idx").on(t.companyId, t.status),
   ],
 );
 
@@ -1408,6 +1414,7 @@ export const invoiceLineItems = pgTable(
     index("invoice_line_items_prime_sov_idx").on(t.primeContractSovLineId),
     index("invoice_line_items_commitment_sov_idx").on(t.commitmentSovLineId),
     index("invoice_line_items_budget_idx").on(t.budgetLineItemId),
+    index("invoice_line_items_project_idx").on(t.projectId, t.companyId),
   ],
 );
 
@@ -1617,5 +1624,657 @@ export const lienWaivers = pgTable(
     index("lien_waivers_invoice_idx").on(t.invoiceId),
     index("lien_waivers_vendor_idx").on(t.vendorId, t.status),
     index("lien_waivers_through_idx").on(t.projectId, t.throughDate),
+  ],
+);
+
+/* ================================================================== */
+/* WP-FIN1 — Budget intelligence & prime contract lifecycle           */
+/* Appended by the budget / prime-contracts work package. WP-FIN2     */
+/* appends its own block below this banner; neither edits the tables  */
+/* above it.                                                          */
+/* ================================================================== */
+
+/**
+ * A saved budget view (#486–487): which columns are shown, in what order,
+ * grouped how, and the CALCULATED FIELDS the user defined over the stored
+ * columns. Expressions are evaluated server-side by a small safe evaluator
+ * (modules/budget/views.ts) — never `eval` — over the line's cost report
+ * columns, so a calculated column is reproducible and auditable.
+ */
+export const budgetViews = pgTable(
+  "budget_views",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    /** null = every budget on the project */
+    budgetId: text("budget_id"),
+    name: text("name").notNull(),
+    description: text("description"),
+    isDefault: integer("is_default").default(0).notNull(),
+    /** ordered visible column ids (stored + calculated keys) */
+    columns: jsonb("columns").$type<string[]>().default([]).notNull(),
+    /** [{ key, label, expression, format }] */
+    calculatedFields: jsonb("calculated_fields").$type<unknown[]>().default([]).notNull(),
+    /** grouping mode for the grid: none | division | cost_type | line_kind | sub_job | wbs */
+    grouping: text("grouping").default("none").notNull(),
+    filters: jsonb("filters").$type<Record<string, unknown>>().default({}).notNull(),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("budget_views_project_idx").on(t.projectId, t.budgetId),
+    index("budget_views_company_idx").on(t.companyId),
+  ],
+);
+
+/**
+ * The posting ledger behind every cost-side column (#495, #500). One row per
+ * (line, component, source): `amount` is the source's CURRENT contribution,
+ * `previousAmount`/`delta` bracket the last reconciliation, so the drawer
+ * can show the arithmetic and a drift can name the exact rows that disagree.
+ * Idempotent on the (line, component, sourceType, sourceId) coordinate.
+ */
+export const budgetPostings = pgTable(
+  "budget_postings",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    budgetId: text("budget_id").notNull(),
+    budgetLineItemId: text("budget_line_item_id").notNull(),
+    component: text("component").notNull(), // BudgetPostingComponent
+    sourceType: text("source_type").notNull(), // BudgetPostingSourceType
+    sourceId: text("source_id").notNull(),
+    /** human reference of the source row (SC-003, INV-012, PAY-004 …) */
+    sourceReference: text("source_reference"),
+    currency: text("currency").notNull(),
+    amount: doublePrecision("amount").default(0).notNull(),
+    previousAmount: doublePrecision("previous_amount").default(0).notNull(),
+    delta: doublePrecision("delta").default(0).notNull(),
+    /** one sentence: how this row's amount was read */
+    basis: text("basis"),
+    reconciliationId: text("reconciliation_id"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    postedAt: timestamp("posted_at", { withTimezone: true, mode: "string" }).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex("budget_postings_uq").on(t.budgetLineItemId, t.component, t.sourceType, t.sourceId),
+    index("budget_postings_line_idx").on(t.budgetLineItemId, t.component),
+    index("budget_postings_budget_idx").on(t.budgetId, t.postedAt),
+    index("budget_postings_project_idx").on(t.projectId),
+  ],
+);
+
+/**
+ * One reconciliation run: the cost-side columns rebuilt from source tables
+ * and compared with what was stored. Drift is a FINDING here and in the
+ * ledger, never a silent overwrite; a nightly job runs one per active budget.
+ */
+export const budgetReconciliations = pgTable(
+  "budget_reconciliations",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    budgetId: text("budget_id").notNull(),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    trigger: text("trigger").default("manual").notNull(), // BudgetReconciliationTrigger
+    /** null = the platform scheduler */
+    runBy: text("run_by"),
+    linesChecked: integer("lines_checked").default(0).notNull(),
+    linesUpdated: integer("lines_updated").default(0).notNull(),
+    driftCount: integer("drift_count").default(0).notNull(),
+    /** Σ |stored − rebuilt| across every component, in the budget's currency */
+    driftAmount: doublePrecision("drift_amount").default(0).notNull(),
+    /** [{ lineItemId, costCode, component, stored, rebuilt, delta }] */
+    drift: jsonb("drift").$type<unknown[]>().default([]).notNull(),
+    /** { component: { applied: boolean, reasons: string[] } } */
+    components: jsonb("components").$type<Record<string, unknown>>().default({}).notNull(),
+    totals: jsonb("totals").$type<Record<string, number>>().default({}).notNull(),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    uniqueIndex("budget_reconciliations_uq").on(t.budgetId, t.number),
+    index("budget_reconciliations_budget_idx").on(t.budgetId, t.createdAt),
+    index("budget_reconciliations_project_idx").on(t.projectId),
+  ],
+);
+
+/**
+ * ERP import (#481): the map from a general-ledger account to a cost code ×
+ * cost type. Company-wide when `projectId` is null; a project row wins over
+ * the company row for the same account.
+ */
+export const glCostCodeMaps = pgTable(
+  "gl_cost_code_maps",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id"),
+    erpSystem: text("erp_system").default("other").notNull(), // ErpSystem
+    glAccount: text("gl_account").notNull(),
+    glSubAccount: text("gl_sub_account"),
+    glDescription: text("gl_description"),
+    costCodeId: text("cost_code_id").notNull(),
+    costCode: text("cost_code").notNull(),
+    costType: text("cost_type").notNull(), // CostType
+    isActive: integer("is_active").default(1).notNull(),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("gl_cost_code_maps_uq").on(t.companyId, t.projectId, t.erpSystem, t.glAccount, t.glSubAccount),
+    index("gl_cost_code_maps_company_idx").on(t.companyId, t.erpSystem),
+    index("gl_cost_code_maps_project_idx").on(t.projectId),
+  ],
+);
+
+/**
+ * Contingency management (#499): a budget line of kind `contingency` linked
+ * to the risk register's `contingencies` row it funds. An approved
+ * contingency draw on the linked line records a drawdown against the risk
+ * contingency, so the two registers agree on what has been spent.
+ */
+export const budgetContingencyLinks = pgTable(
+  "budget_contingency_links",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    budgetId: text("budget_id").notNull(),
+    budgetLineItemId: text("budget_line_item_id").notNull(),
+    /** risk.contingencies.id */
+    contingencyId: text("contingency_id").notNull(),
+    notes: text("notes"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    uniqueIndex("budget_contingency_links_uq").on(t.budgetLineItemId, t.contingencyId),
+    index("budget_contingency_links_budget_idx").on(t.budgetId),
+    index("budget_contingency_links_contingency_idx").on(t.contingencyId),
+  ],
+);
+
+/**
+ * Contract compliance documents (#519): insurance, bonds, permits, tax
+ * forms, notice to proceed. `required = 1` documents gate the submission of
+ * an application for payment while missing or expired — the owner-side
+ * mirror of `commitments.paymentHold`.
+ */
+export const primeContractComplianceDocuments = pgTable(
+  "prime_contract_compliance_documents",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    primeContractId: text("prime_contract_id").notNull(),
+    kind: text("kind").notNull(), // PrimeComplianceDocumentKind
+    title: text("title").notNull(),
+    required: integer("required").default(1).notNull(),
+    status: text("status").default("missing").notNull(), // PrimeComplianceDocumentStatus
+    /** documents.id when the file is on the platform */
+    documentId: text("document_id"),
+    reference: text("reference"),
+    issuer: text("issuer"),
+    issuedDate: text("issued_date"), // ISO date
+    effectiveDate: text("effective_date"),
+    expiryDate: text("expiry_date"),
+    receivedAt: timestamp("received_at", { withTimezone: true, mode: "string" }),
+    verifiedBy: text("verified_by"),
+    verifiedAt: timestamp("verified_at", { withTimezone: true, mode: "string" }),
+    waivedBy: text("waived_by"),
+    waivedReason: text("waived_reason"),
+    notes: text("notes"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("prime_compliance_contract_idx").on(t.primeContractId, t.status),
+    index("prime_compliance_expiry_idx").on(t.status, t.expiryDate),
+    index("prime_compliance_project_idx").on(t.projectId),
+  ],
+);
+
+/**
+ * Owner payment receipts (#518): one row per remittance against a certified
+ * application. `paymentApplications.paidAmount` and `primeContracts.totalPaid`
+ * are DERIVED from the non-void receipts, never typed; an application is
+ * `paid` only once Σ receipts reaches the certified amount.
+ */
+export const ownerPaymentReceipts = pgTable(
+  "owner_payment_receipts",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    primeContractId: text("prime_contract_id").notNull(),
+    paymentApplicationId: text("payment_application_id").notNull(),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    status: text("status").default("recorded").notNull(), // OwnerPaymentReceiptStatus
+    amount: doublePrecision("amount").notNull(),
+    currency: text("currency").notNull(),
+    receivedDate: text("received_date").notNull(), // ISO date
+    method: text("method").default("ach").notNull(), // OwnerPaymentReceiptMethod
+    paymentReference: text("payment_reference"),
+    bankReference: text("bank_reference"),
+    notes: text("notes"),
+    voidReason: text("void_reason"),
+    voidedBy: text("voided_by"),
+    voidedAt: timestamp("voided_at", { withTimezone: true, mode: "string" }),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    recordedBy: text("recorded_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("owner_payment_receipts_uq").on(t.primeContractId, t.number),
+    index("owner_payment_receipts_application_idx").on(t.paymentApplicationId, t.status),
+    index("owner_payment_receipts_project_idx").on(t.projectId, t.receivedDate),
+  ],
+);
+
+/**
+ * Stored materials register (#516): every G703 column F figure must be
+ * backed by material that is actually stored, insured and evidenced. A row
+ * is the material; incorporation moves it off column F and into the work.
+ */
+export const primeStoredMaterials = pgTable(
+  "prime_stored_materials",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    primeContractId: text("prime_contract_id").notNull(),
+    sovLineId: text("sov_line_id").notNull(),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    description: text("description").notNull(),
+    status: text("status").default("stored").notNull(), // StoredMaterialStatus
+    location: text("location").default("on_site").notNull(), // StoredMaterialLocation
+    locationNotes: text("location_notes"),
+    quantity: doublePrecision("quantity"),
+    unit: text("unit"),
+    /** value claimed as stored — what column F carries for this item */
+    value: doublePrecision("value").notNull(),
+    /** value since incorporated into the work (moved into column D/E) */
+    incorporatedValue: doublePrecision("incorporated_value").default(0).notNull(),
+    storedDate: text("stored_date").notNull(), // ISO date
+    incorporatedDate: text("incorporated_date"),
+    /** the supplier invoice / bill of sale supporting the value */
+    supplierInvoiceReference: text("supplier_invoice_reference"),
+    supplierVendorId: text("supplier_vendor_id"),
+    insured: integer("insured").default(0).notNull(),
+    insuranceReference: text("insurance_reference"),
+    /** the application this item was first billed on */
+    billedOnApplicationId: text("billed_on_application_id"),
+    documentIds: jsonb("document_ids").$type<string[]>().default([]).notNull(),
+    notes: text("notes"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("prime_stored_materials_uq").on(t.primeContractId, t.number),
+    index("prime_stored_materials_line_idx").on(t.sovLineId, t.status),
+    index("prime_stored_materials_project_idx").on(t.projectId),
+  ],
+);
+
+/* ================================================================== */
+/* WP-FIN2 — commitments, change management, invoicing, statutory      */
+/* payments upgrade (spec Vol I §3.3–3.5 #525–594, Vol II F).          */
+/* Appended by the commitments / changes / invoicing / payments work   */
+/* package. Every table is tenant-scoped and indexed on its hot filter. */
+/* ================================================================== */
+
+/**
+ * Backcharges (#538) — cost we recover FROM a subcontractor for defective
+ * work, damage, cleanup or safety violations. Issuing one raises a NEGATIVE
+ * commitment change order through the ordinary allocation path, so the
+ * commitment sum moves with the same identities as any other change, and the
+ * open amount is reserved against the next payment until it settles.
+ */
+export const backcharges = pgTable(
+  "backcharges",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    commitmentId: text("commitment_id").notNull(),
+    vendorId: text("vendor_id"),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    reasonCode: text("reason_code").notNull(), // BackchargeReasonCode
+    title: text("title").notNull(),
+    description: text("description"),
+    amount: doublePrecision("amount").default(0).notNull(),
+    currency: text("currency").default("USD").notNull(),
+    status: text("status").default("draft").notNull(), // BackchargeStatus
+    /** links to the punch / quality / safety records that evidence it */
+    evidence: jsonb("evidence").$type<Array<{ type: string; id: string; label?: string }>>().default([]).notNull(),
+    /** the SOV line the recovery is allocated against; null appends a new line */
+    sovLineId: text("sov_line_id"),
+    /** the negative commitment change order issued for it */
+    commitmentChangeId: text("commitment_change_id"),
+    settledPaymentId: text("settled_payment_id"),
+    issuedBy: text("issued_by"),
+    issuedAt: timestamp("issued_at", { withTimezone: true, mode: "string" }),
+    disputedAt: timestamp("disputed_at", { withTimezone: true, mode: "string" }),
+    disputeReason: text("dispute_reason"),
+    settledAt: timestamp("settled_at", { withTimezone: true, mode: "string" }),
+    settledBy: text("settled_by"),
+    voidReason: text("void_reason"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("backcharges_uq").on(t.projectId, t.number),
+    index("backcharges_commitment_idx").on(t.commitmentId, t.status),
+    index("backcharges_project_idx").on(t.projectId, t.status),
+    index("backcharges_company_idx").on(t.companyId),
+  ],
+);
+
+/**
+ * Generated contract documents and their signature routing (#525–527).
+ * The merged document is stored through the documents module (`files`);
+ * this row is the routing record: who has to sign, in what order, and the
+ * e-sign webhook token that lets a provider record execution automatically.
+ */
+export const contractDocuments = pgTable(
+  "contract_documents",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    commitmentId: text("commitment_id").notNull(),
+    kind: text("kind").notNull(), // ContractDocumentKind
+    templateKey: text("template_key").notNull(),
+    title: text("title").notNull(),
+    version: integer("version").default(1).notNull(),
+    status: text("status").default("draft").notNull(), // ContractDocumentStatus
+    /** the generated file (PDF) in the documents module */
+    fileId: text("file_id"),
+    sha256: text("sha256"),
+    contentType: text("content_type"),
+    /** the merge data the document was rendered from — the audit trail */
+    mergeData: jsonb("merge_data").$type<Record<string, unknown>>().default({}).notNull(),
+    /** [{ name, email, order, role, signedAt, method, reference }] */
+    signers: jsonb("signers").$type<unknown[]>().default([]).notNull(),
+    routedAt: timestamp("routed_at", { withTimezone: true, mode: "string" }),
+    routedBy: text("routed_by"),
+    signedAt: timestamp("signed_at", { withTimezone: true, mode: "string" }),
+    /** the counter-signed copy, when a provider returns one */
+    signedFileId: text("signed_file_id"),
+    /** secret the e-sign provider posts back with; hashed */
+    webhookTokenHash: text("webhook_token_hash"),
+    voidReason: text("void_reason"),
+    generatedBy: text("generated_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("contract_documents_commitment_idx").on(t.commitmentId, t.status),
+    index("contract_documents_project_idx").on(t.projectId),
+    uniqueIndex("contract_documents_token_uq").on(t.webhookTokenHash),
+  ],
+);
+
+/**
+ * Commitment closeout checklist (#539): what must be on file before the
+ * final retainage leaves. One row per commitment; the items carry the
+ * evidence id that satisfied them so "closed" is provable, not asserted.
+ */
+export const commitmentCloseouts = pgTable(
+  "commitment_closeouts",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    commitmentId: text("commitment_id").notNull(),
+    status: text("status").default("open").notNull(), // CloseoutStatus
+    /** [{ key, label, required, done, evidenceType, evidenceId, note, completedBy, completedAt }] */
+    items: jsonb("items").$type<unknown[]>().default([]).notNull(),
+    overrideReason: text("override_reason"),
+    overriddenBy: text("overridden_by"),
+    overriddenAt: timestamp("overridden_at", { withTimezone: true, mode: "string" }),
+    finalReleasePaymentId: text("final_release_payment_id"),
+    closedAt: timestamp("closed_at", { withTimezone: true, mode: "string" }),
+    closedBy: text("closed_by"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("commitment_closeouts_uq").on(t.commitmentId),
+    index("commitment_closeouts_project_idx").on(t.projectId, t.status),
+  ],
+);
+
+/**
+ * What the last compliance sweep saw for each commitment (#532), so the
+ * daily job notifies on CHANGES — a newly blocked commitment, a certificate
+ * crossing the 30/14/7-day line — rather than repeating itself every morning.
+ */
+export const complianceSweepState = pgTable(
+  "compliance_sweep_state",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    commitmentId: text("commitment_id").notNull(),
+    lastStatus: text("last_status").notNull(),
+    lastFindingCodes: jsonb("last_finding_codes").$type<string[]>().default([]).notNull(),
+    /** expiry notices already sent: "cert:<id>:30" */
+    lastExpiryNotices: jsonb("last_expiry_notices").$type<string[]>().default([]).notNull(),
+    lastHoldNoticeAt: timestamp("last_hold_notice_at", { withTimezone: true, mode: "string" }),
+    sweptAt: timestamp("swept_at", { withTimezone: true, mode: "string" }).notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("compliance_sweep_state_uq").on(t.commitmentId),
+    index("compliance_sweep_state_project_idx").on(t.projectId),
+  ],
+);
+
+/**
+ * Markup schedules (#554): the contractual OH&P stack, per project with
+ * per-prime-contract overrides, optionally banded by the cost subtotal a
+ * change falls in ("15% under 50k, 10% to 250k, 5% above").
+ */
+export const changeMarkupSchedules = pgTable(
+  "change_markup_schedules",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    /** null = the project default */
+    primeContractId: text("prime_contract_id"),
+    name: text("name").notNull(),
+    /** MarkupRule[] applied when no band matches */
+    rules: jsonb("rules").$type<unknown[]>().default([]).notNull(),
+    /** [{ upTo: number | null, rules: MarkupRule[] }], ascending by upTo */
+    bands: jsonb("bands").$type<unknown[]>().default([]).notNull(),
+    createdBy: text("created_by").notNull(),
+    updatedBy: text("updated_by"),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("change_markup_schedules_project_idx").on(t.projectId, t.primeContractId),
+  ],
+);
+
+/**
+ * Every status transition on the change chain, materialised for ageing and
+ * cycle-time analytics (#560–562). Written by the change module's ledger
+ * helper so no transition can be recorded in one place and not the other.
+ */
+export const changeStatusHistory = pgTable(
+  "change_status_history",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    objectType: text("object_type").notNull(),
+    objectId: text("object_id").notNull(),
+    fromStatus: text("from_status"),
+    toStatus: text("to_status").notNull(),
+    actorId: text("actor_id"),
+    at: timestamp("at", { withTimezone: true, mode: "string" }).defaultNow().notNull(),
+  },
+  (t) => [
+    index("change_status_history_object_idx").on(t.objectId, t.at),
+    index("change_status_history_project_idx").on(t.projectId, t.objectType),
+  ],
+);
+
+/** Per-project change-management configuration (#563): the tier and defaults. */
+export const changeConfigs = pgTable(
+  "change_configs",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    tier: text("tier").default("two_tier").notNull(), // ChangeManagementTier
+    /** three-tier only: a subcontract PCO must carry an accepted RFQ before it packages */
+    requireQuoteForSubcontract: integer("require_quote_for_subcontract").default(0).notNull(),
+    updatedBy: text("updated_by"),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [uniqueIndex("change_configs_uq").on(t.projectId)],
+);
+
+/**
+ * Idempotency keys for money-moving POSTs. A retried approve / issue /
+ * execute with the same `Idempotency-Key` replays the stored response instead
+ * of releasing retainage twice.
+ */
+export const idempotencyKeys = pgTable(
+  "idempotency_keys",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    key: text("key").notNull(),
+    route: text("route").notNull(),
+    responseStatus: integer("response_status").notNull(),
+    responseBody: jsonb("response_body").$type<unknown>(),
+    createdAt: createdAt(),
+  },
+  (t) => [uniqueIndex("idempotency_keys_uq").on(t.companyId, t.key)],
+);
+
+/**
+ * Payment runs (#586–594): a batch of scheduled commitment payments approved
+ * and issued together on a date, with remittance advices generated per
+ * payment. One currency per run — a run is what the bank receives.
+ */
+export const paymentRuns = pgTable(
+  "payment_runs",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    name: text("name").notNull(),
+    status: text("status").default("draft").notNull(), // PaymentRunStatus
+    currency: text("currency").default("USD").notNull(),
+    scheduledDate: text("scheduled_date").notNull(), // ISO date
+    /** commitment_payments.id */
+    paymentIds: jsonb("payment_ids").$type<string[]>().default([]).notNull(),
+    totalAmount: doublePrecision("total_amount").default(0).notNull(),
+    paymentCount: integer("payment_count").default(0).notNull(),
+    remittanceSentAt: timestamp("remittance_sent_at", { withTimezone: true, mode: "string" }),
+    cancelReason: text("cancel_reason"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    approvedBy: text("approved_by"),
+    approvedAt: timestamp("approved_at", { withTimezone: true, mode: "string" }),
+    issuedBy: text("issued_by"),
+    issuedAt: timestamp("issued_at", { withTimezone: true, mode: "string" }),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("payment_runs_uq").on(t.projectId, t.number),
+    index("payment_runs_project_idx").on(t.projectId, t.status),
+  ],
+);
+
+/**
+ * Vendor portal tokens (#567–568): a subcontractor's self-service identity.
+ * The raw token is shown once and only its hash is stored; a token is bound
+ * to one vendor on one project and carries an explicit scope.
+ */
+export const vendorPortalTokens = pgTable(
+  "vendor_portal_tokens",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    vendorId: text("vendor_id").notNull(),
+    /** narrow the token to one commitment; null = every commitment with this vendor */
+    commitmentId: text("commitment_id"),
+    label: text("label").notNull(),
+    tokenHash: text("token_hash").notNull(),
+    scopes: jsonb("scopes").$type<string[]>().default(["invoices"]).notNull(),
+    contactEmail: text("contact_email"),
+    expiresAt: timestamp("expires_at", { withTimezone: true, mode: "string" }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true, mode: "string" }),
+    lastUsedAt: timestamp("last_used_at", { withTimezone: true, mode: "string" }),
+    useCount: integer("use_count").default(0).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("vendor_portal_tokens_hash_uq").on(t.tokenHash),
+    index("vendor_portal_tokens_vendor_idx").on(t.vendorId, t.projectId),
+  ],
+);
+
+/**
+ * Line-level invoice approval (#573): the reviewer's decision on each G703
+ * row. Approval of the invoice takes the certified amount from these when
+ * they exist, so a reduction is recorded where it was made.
+ */
+export const invoiceLineApprovals = pgTable(
+  "invoice_line_approvals",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    invoiceId: text("invoice_id").notNull(),
+    invoiceLineItemId: text("invoice_line_item_id").notNull(),
+    status: text("status").notNull(), // InvoiceLineApprovalStatus
+    /** the line's net amount as certified — equals the billed amount when approved */
+    approvedAmount: doublePrecision("approved_amount").default(0).notNull(),
+    billedAmount: doublePrecision("billed_amount").default(0).notNull(),
+    note: text("note"),
+    reviewedBy: text("reviewed_by").notNull(),
+    reviewedAt: timestamp("reviewed_at", { withTimezone: true, mode: "string" }).notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("invoice_line_approvals_uq").on(t.invoiceLineItemId),
+    index("invoice_line_approvals_invoice_idx").on(t.invoiceId),
   ],
 );

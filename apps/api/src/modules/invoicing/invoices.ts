@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
-import { and, asc, count, desc, eq, inArray, ne } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   commitmentSovLines,
@@ -9,6 +9,7 @@ import {
   paymentApplications,
   primeContractSovLines,
   primeContracts,
+  invoiceLineApprovals,
 } from "@constructos/db";
 import {
   INVOICE_KINDS,
@@ -19,9 +20,10 @@ import {
 } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
-import { badRequest, conflict, notFound } from "../../lib/errors.js";
+import { AppError, badRequest, conflict, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import type { Db } from "../../lib/db.js";
+import { clearLineApprovals } from "./approvals.js";
 import {
   computeCoverSheet,
   computeLine,
@@ -33,6 +35,8 @@ import {
 } from "./arithmetic.js";
 import { assertPeriodAcceptsBilling } from "./periods.js";
 import {
+  certifiedOf,
+  outstandingOf,
   APPROVED_INVOICE_STATUSES,
   CENT,
   DEAD_INVOICE_STATUSES,
@@ -152,6 +156,8 @@ const manualLineSchema = z.object({
 const submitSchema = z.object({
   invoiceNumber: z.string().max(100).nullable().optional(),
   notes: z.string().max(4000).nullable().optional(),
+  /** submit a subcontractor invoice outside the period's submission window — admin, on the record */
+  windowOverrideReason: z.string().min(1).max(4000).optional(),
 });
 
 const reviewSchema = z.object({ reviewNotes: z.string().max(4000).nullable().optional() });
@@ -324,6 +330,7 @@ export async function previousPaymentsFor(
       status: invoices.status,
       currency: invoices.currency,
       currentPaymentDue: invoices.currentPaymentDue,
+      detail: invoices.detail,
     })
     .from(invoices)
     .where(and(where, eq(invoices.kind, kind)));
@@ -334,8 +341,19 @@ export async function previousPaymentsFor(
       !(DEAD_INVOICE_STATUSES as readonly string[]).includes(r.status),
   );
   const same = live.filter((r) => r.currency.toUpperCase() === currency.toUpperCase());
+  /*
+   * "Less previous certificates": an approved or paid application counts for
+   * what was CERTIFIED (approved-as-noted honoured), so a 2,000 reduction on
+   * last month's invoice is billable again this month rather than vanishing
+   * from both. An application still in review counts for what it asked.
+   */
   return {
-    amount: round2(same.reduce((s, r) => s + r.currentPaymentDue, 0)),
+    amount: round2(
+      same.reduce(
+        (s, r) => s + (isApprovedInvoice(r.status) ? certifiedOf(r) : r.currentPaymentDue),
+        0,
+      ),
+    ),
     excluded: live.length - same.length,
   };
 }
@@ -534,6 +552,266 @@ export async function recomputePrimeBilling(db: Db, primeContractId: string): Pr
  *   - a line whose percent complete regresses without a stated credit reason
  *   - billing into a closed or locked billing period
  */
+
+/* ------------------------------------------------------------------ */
+/* Creation — shared by the route and the vendor portal                */
+/* ------------------------------------------------------------------ */
+
+export interface CreateInvoiceInput {
+  companyId: string;
+  projectId: string;
+  kind: InvoiceKind;
+  contractId: string;
+  actorId: string;
+  billingPeriodId: string | null;
+  title: string | null;
+  invoiceNumber: string | null;
+  billingDate: string | null;
+  dueDate: string | null;
+  periodStart: string | null;
+  periodEnd: string | null;
+  receivedDate: string | null;
+  requiresLienWaiver: boolean | undefined;
+  retainagePercent: number | undefined;
+  generateLines: boolean;
+  detail: Record<string, unknown>;
+}
+
+/**
+ * Create a draft invoice against an executed contract: the period gate, the
+ * one-live-invoice-per-contract rule, the snapshot of previous certificates
+ * and (by default) a continuation sheet seeded from the schedule of values.
+ * Pure of HTTP so the vendor portal (#567) raises invoices through exactly
+ * the same rules as a user.
+ */
+export async function createInvoice(
+  db: Db,
+  input: CreateInvoiceInput,
+): Promise<{ invoice: InvoiceRow; ctx: ContractContext; generated: number }> {
+  const { companyId, projectId, kind, contractId } = input;
+  const ctx = await loadContext(db, kind, contractId, companyId, projectId);
+  if (ctx.executed !== 1) {
+    throw conflict(
+      `${ctx.reference} is not executed. Nothing may be billed against an unsigned ` +
+        `${ctx.noun} — execute it first.`,
+    );
+  }
+
+  const period = await assertPeriodAcceptsBilling(
+    db,
+    input.billingPeriodId,
+    projectId,
+    companyId,
+    "raising an invoice",
+  );
+
+  // One live invoice per contract per period. Two open applications for the
+  // same month against the same contract is how the same work gets paid
+  // twice, and no accounts payable clerk can be expected to catch it.
+  const where =
+    kind === "owner_billing"
+      ? eq(invoices.primeContractId, contractId)
+      : eq(invoices.commitmentId, contractId);
+  if (input.billingPeriodId) {
+    const dupe = await db
+      .select({ reference: invoices.reference, status: invoices.status })
+      .from(invoices)
+      .where(
+        and(
+          where,
+          eq(invoices.kind, kind),
+          eq(invoices.billingPeriodId, input.billingPeriodId),
+          ne(invoices.status, "void"),
+          ne(invoices.status, "rejected"),
+        ),
+      )
+      .limit(1);
+    if (dupe[0]) {
+      throw conflict(
+        `${dupe[0].reference} already bills ${ctx.reference} for that billing period ` +
+          `(status ${dupe[0].status}) — one invoice per contract per period.`,
+      );
+    }
+  }
+  const open = await db
+    .select({ reference: invoices.reference, status: invoices.status })
+    .from(invoices)
+    .where(
+      and(
+        where,
+        eq(invoices.kind, kind),
+        inArray(invoices.status, ["draft", "submitted", "under_review", "revise_and_resubmit"]),
+      ),
+    )
+    .limit(1);
+  if (open[0]) {
+    throw conflict(
+      `${open[0].reference} is still open against ${ctx.reference} (status ` +
+        `${open[0].status}). Settle it before starting the next invoice — a schedule of ` +
+        "values cannot be billed twice concurrently without double-billing the same work.",
+    );
+  }
+
+  const billingDate = input.billingDate ?? period?.billingDate ?? todayIso();
+  // Payment terms on the contract are the more specific fact and win over
+  // the period's own due date; the period is the fallback for a contract
+  // that names no terms at all.
+  const dueDate =
+    input.dueDate ??
+    (ctx.paymentTermsDays != null ? addDays(billingDate, ctx.paymentTermsDays) : null) ??
+    period?.dueDate ??
+    null;
+  const previous = await previousPaymentsFor(db, kind, contractId, ctx.currency);
+
+  const number = await nextRecordNumber(db, projectId, invoiceCounterKey(kind));
+  const id = newId("inv");
+  const now = nowIso();
+  await db.insert(invoices).values({
+    id,
+    companyId,
+    projectId,
+    kind,
+    number,
+    reference: invoiceReference(kind, number),
+    title: input.title ?? `${ctx.reference} — ${period?.name ?? billingDate}`,
+    status: "draft",
+    primeContractId: kind === "owner_billing" ? contractId : null,
+    commitmentId: kind === "subcontractor_invoice" ? contractId : null,
+    vendorId: ctx.vendorId,
+    billingPeriodId: input.billingPeriodId ?? null,
+    invoiceNumber: input.invoiceNumber ?? null,
+    currency: ctx.currency,
+    billingDate,
+    periodStart: input.periodStart ?? period?.startDate ?? null,
+    periodEnd: input.periodEnd ?? period?.endDate ?? null,
+    dueDate,
+    receivedDate: input.receivedDate ?? null,
+    originalContractSum: ctx.originalSum,
+    netChangeOrders: ctx.approvedChangeSum,
+    revisedContractSum: ctx.revisedSum,
+    previousPaymentsAmount: previous.amount,
+    requiresLienWaiver: (input.requiresLienWaiver ?? ctx.requiresLienWaiver) ? 1 : 0,
+    lienWaiverStatus: null,
+    detail: {
+      ...input.detail,
+      previousPaymentsExcludedForeignInvoices: previous.excluded,
+    },
+    createdBy: input.actorId,
+    updatedAt: now,
+  });
+
+  let generated = 0;
+  if (input.generateLines) {
+    generated = await generateLinesFromSov(db, id, ctx, input.retainagePercent);
+  }
+  const invoice = await recomputeInvoice(db, id);
+  return { invoice, ctx, generated };
+}
+
+/**
+ * Seed the continuation sheet from the schedule of values, snapshotting
+ * each line's previously-billed position. Lines are copied, not joined:
+ * an executed change order landing next week must not retroactively change
+ * what this invoice's G703 says.
+ */
+async function generateLinesFromSov(
+  db: Db,
+  invoiceId: string,
+  ctx: ContractContext,
+  retainageOverride?: number,
+): Promise<number> {
+  const now = nowIso();
+  if (ctx.kind === "owner_billing") {
+    const sov = await db
+      .select()
+      .from(primeContractSovLines)
+      .where(eq(primeContractSovLines.primeContractId, ctx.id))
+      .orderBy(asc(primeContractSovLines.sortOrder), asc(primeContractSovLines.lineNumber));
+    for (const [i, s] of sov.entries()) {
+      await db.insert(invoiceLineItems).values({
+        id: newId("ivl"),
+        companyId: s.companyId,
+        projectId: s.projectId,
+        invoiceId,
+        lineNumber: s.lineNumber,
+        sortOrder: s.sortOrder || i,
+        primeContractSovLineId: s.id,
+        costCodeId: s.costCodeId,
+        costCode: s.costCode,
+        costType: s.costType,
+        budgetLineItemId: s.budgetLineItemId,
+        description: s.description,
+        source: s.isChangeOrderLine === 1 ? "change_order" : "contract_sov",
+        billingMethod: s.billingMethod,
+        unit: s.unit,
+        quantity: s.quantity,
+        unitRate: s.unitRate,
+        changeOrderPackageId: s.changeOrderPackageId,
+        scheduledValue: round2(s.scheduledValue + s.changeOrderValue),
+        previousBilled: s.previousBilled,
+        previousStoredMaterials: s.previousStoredMaterials,
+        materialsPresentlyStored: s.previousStoredMaterials,
+        totalCompletedAndStored: round2(s.previousBilled + s.previousStoredMaterials),
+        percentComplete: s.percentComplete,
+        balanceToFinish: round2(
+          s.scheduledValue + s.changeOrderValue - s.previousBilled - s.previousStoredMaterials,
+        ),
+        retainagePercent: retainageOverride ?? s.retainagePercent,
+        retainageHeldToDate: round2(
+          ((retainageOverride ?? s.retainagePercent) / 100) *
+            (s.previousBilled + s.previousStoredMaterials),
+        ),
+        updatedAt: now,
+      });
+    }
+    return sov.length;
+  }
+  const sov = await db
+    .select()
+    .from(commitmentSovLines)
+    .where(eq(commitmentSovLines.commitmentId, ctx.id))
+    .orderBy(asc(commitmentSovLines.sortOrder), asc(commitmentSovLines.lineNumber));
+  for (const [i, s] of sov.entries()) {
+    await db.insert(invoiceLineItems).values({
+      id: newId("ivl"),
+      companyId: s.companyId,
+      projectId: s.projectId,
+      invoiceId,
+      lineNumber: s.lineNumber,
+      sortOrder: s.sortOrder || i,
+      commitmentSovLineId: s.id,
+      costCodeId: s.costCodeId,
+      costCode: s.costCode,
+      costType: s.costType,
+      budgetLineItemId: s.budgetLineItemId,
+      description: s.description,
+      source: s.isChangeOrderLine === 1 ? "change_order" : "contract_sov",
+      billingMethod: s.billingMethod,
+      unit: s.unit,
+      quantity: s.quantity,
+      unitRate: s.unitRate,
+      changeOrderPackageId: s.changeOrderPackageId,
+      scheduledValue: round2(s.scheduledValue + s.changeOrderValue),
+      previousBilled: s.previousBilled,
+      previousStoredMaterials: s.previousStoredMaterials,
+      materialsPresentlyStored: s.previousStoredMaterials,
+      totalCompletedAndStored: round2(s.previousBilled + s.previousStoredMaterials),
+      percentComplete: s.percentComplete,
+      balanceToFinish: round2(
+        s.scheduledValue + s.changeOrderValue - s.previousBilled - s.previousStoredMaterials,
+      ),
+      retainagePercent: retainageOverride ?? s.retainagePercent,
+      retainageHeldToDate: round2(
+        ((retainageOverride ?? s.retainagePercent) / 100) *
+          (s.previousBilled + s.previousStoredMaterials),
+      ),
+      taxPercent: s.taxable === 1 ? s.taxPercent : null,
+      updatedAt: now,
+    });
+  }
+  return sov.length;
+}
+
 export const invoiceRoutes: FastifyPluginAsync = async (app) => {
   const companyGate = [app.authenticate, app.requireCompany];
   const readGate = [...companyGate, app.requireTool("invoicing", "read")];
@@ -593,124 +871,26 @@ export const invoiceRoutes: FastifyPluginAsync = async (app) => {
           : "A subcontractor invoice needs a commitmentId — it bills the commitment's SOV.",
       );
     }
-
-    const ctx = await loadContext(app.db, body.kind, contractId, companyId, projectId);
-    if (ctx.executed !== 1) {
-      throw conflict(
-        `${ctx.reference} is not executed. Nothing may be billed against an unsigned ` +
-          `${ctx.noun} — execute it first.`,
-      );
-    }
-
-    const period = await assertPeriodAcceptsBilling(
-      app.db,
-      body.billingPeriodId,
-      projectId,
-      companyId,
-      "raising an invoice",
-    );
-
-    // One live invoice per contract per period. Two open applications for the
-    // same month against the same contract is how the same work gets paid
-    // twice, and no accounts payable clerk can be expected to catch it.
-    const where =
-      body.kind === "owner_billing"
-        ? eq(invoices.primeContractId, contractId)
-        : eq(invoices.commitmentId, contractId);
-    if (body.billingPeriodId) {
-      const dupe = await app.db
-        .select({ reference: invoices.reference, status: invoices.status })
-        .from(invoices)
-        .where(
-          and(
-            where,
-            eq(invoices.kind, body.kind),
-            eq(invoices.billingPeriodId, body.billingPeriodId),
-            ne(invoices.status, "void"),
-            ne(invoices.status, "rejected"),
-          ),
-        )
-        .limit(1);
-      if (dupe[0]) {
-        throw conflict(
-          `${dupe[0].reference} already bills ${ctx.reference} for that billing period ` +
-            `(status ${dupe[0].status}) — one invoice per contract per period.`,
-        );
-      }
-    }
-    const open = await app.db
-      .select({ reference: invoices.reference, status: invoices.status })
-      .from(invoices)
-      .where(
-        and(
-          where,
-          eq(invoices.kind, body.kind),
-          inArray(invoices.status, ["draft", "submitted", "under_review", "revise_and_resubmit"]),
-        ),
-      )
-      .limit(1);
-    if (open[0]) {
-      throw conflict(
-        `${open[0].reference} is still open against ${ctx.reference} (status ` +
-          `${open[0].status}). Settle it before starting the next invoice — a schedule of ` +
-          "values cannot be billed twice concurrently without double-billing the same work.",
-      );
-    }
-
-    const billingDate = body.billingDate ?? period?.billingDate ?? todayIso();
-    // Payment terms on the contract are the more specific fact and win over
-    // the period's own due date; the period is the fallback for a contract
-    // that names no terms at all.
-    const dueDate =
-      body.dueDate ??
-      (ctx.paymentTermsDays != null ? addDays(billingDate, ctx.paymentTermsDays) : null) ??
-      period?.dueDate ??
-      null;
-    const previous = await previousPaymentsFor(app.db, body.kind, contractId, ctx.currency);
-
-    const number = await nextRecordNumber(app.db, projectId, invoiceCounterKey(body.kind));
-    const id = newId("inv");
-    const now = nowIso();
-    await app.db.insert(invoices).values({
-      id,
+    const { invoice: inv, ctx, generated } = await createInvoice(app.db, {
       companyId,
       projectId,
       kind: body.kind,
-      number,
-      reference: invoiceReference(body.kind, number),
-      title: body.title ?? `${ctx.reference} — ${period?.name ?? billingDate}`,
-      status: "draft",
-      primeContractId: body.kind === "owner_billing" ? contractId : null,
-      commitmentId: body.kind === "subcontractor_invoice" ? contractId : null,
-      vendorId: ctx.vendorId,
+      contractId,
+      actorId: req.user!.id,
       billingPeriodId: body.billingPeriodId ?? null,
+      title: body.title ?? null,
       invoiceNumber: body.invoiceNumber ?? null,
-      currency: ctx.currency,
-      billingDate,
-      periodStart: body.periodStart ?? period?.startDate ?? null,
-      periodEnd: body.periodEnd ?? period?.endDate ?? null,
-      dueDate,
+      billingDate: body.billingDate ?? null,
+      dueDate: body.dueDate ?? null,
+      periodStart: body.periodStart ?? null,
+      periodEnd: body.periodEnd ?? null,
       receivedDate: body.receivedDate ?? null,
-      originalContractSum: ctx.originalSum,
-      netChangeOrders: ctx.approvedChangeSum,
-      revisedContractSum: ctx.revisedSum,
-      previousPaymentsAmount: previous.amount,
-      requiresLienWaiver: (body.requiresLienWaiver ?? ctx.requiresLienWaiver) ? 1 : 0,
-      lienWaiverStatus: null,
-      detail: {
-        ...(body.detail ?? {}),
-        previousPaymentsExcludedForeignInvoices: previous.excluded,
-      },
-      createdBy: req.user!.id,
-      updatedAt: now,
+      requiresLienWaiver: body.requiresLienWaiver,
+      retainagePercent: body.retainagePercent,
+      generateLines: body.generateLines !== false,
+      detail: body.detail ?? {},
     });
-
-    let generated = 0;
-    if (body.generateLines !== false) {
-      generated = await generateLinesFromSov(id, ctx, body.retainagePercent);
-    }
-    const inv = await recomputeInvoice(app.db, id);
-    await ledger(app.db, req, "create", "invoice", id, {
+    await ledger(app.db, req, "create", "invoice", inv.id, {
       kind: inv.kind,
       reference: inv.reference,
       contract: ctx.reference,
@@ -719,111 +899,8 @@ export const invoiceRoutes: FastifyPluginAsync = async (app) => {
       lineCount: generated,
       previousPaymentsAmount: inv.previousPaymentsAmount,
     }, projectId);
-    return reply.status(201).send({ ...inv, lines: await invoiceLines(app.db, id) });
+    return reply.status(201).send({ ...inv, lines: await invoiceLines(app.db, inv.id) });
   });
-
-  /**
-   * Seed the continuation sheet from the schedule of values, snapshotting
-   * each line's previously-billed position. Lines are copied, not joined:
-   * an executed change order landing next week must not retroactively change
-   * what this invoice's G703 says.
-   */
-  async function generateLinesFromSov(
-    invoiceId: string,
-    ctx: ContractContext,
-    retainageOverride?: number,
-  ): Promise<number> {
-    const now = nowIso();
-    if (ctx.kind === "owner_billing") {
-      const sov = await app.db
-        .select()
-        .from(primeContractSovLines)
-        .where(eq(primeContractSovLines.primeContractId, ctx.id))
-        .orderBy(asc(primeContractSovLines.sortOrder), asc(primeContractSovLines.lineNumber));
-      for (const [i, s] of sov.entries()) {
-        await app.db.insert(invoiceLineItems).values({
-          id: newId("ivl"),
-          companyId: s.companyId,
-          projectId: s.projectId,
-          invoiceId,
-          lineNumber: s.lineNumber,
-          sortOrder: s.sortOrder || i,
-          primeContractSovLineId: s.id,
-          costCodeId: s.costCodeId,
-          costCode: s.costCode,
-          costType: s.costType,
-          budgetLineItemId: s.budgetLineItemId,
-          description: s.description,
-          source: s.isChangeOrderLine === 1 ? "change_order" : "contract_sov",
-          billingMethod: s.billingMethod,
-          unit: s.unit,
-          quantity: s.quantity,
-          unitRate: s.unitRate,
-          changeOrderPackageId: s.changeOrderPackageId,
-          scheduledValue: round2(s.scheduledValue + s.changeOrderValue),
-          previousBilled: s.previousBilled,
-          previousStoredMaterials: s.previousStoredMaterials,
-          materialsPresentlyStored: s.previousStoredMaterials,
-          totalCompletedAndStored: round2(s.previousBilled + s.previousStoredMaterials),
-          percentComplete: s.percentComplete,
-          balanceToFinish: round2(
-            s.scheduledValue + s.changeOrderValue - s.previousBilled - s.previousStoredMaterials,
-          ),
-          retainagePercent: retainageOverride ?? s.retainagePercent,
-          retainageHeldToDate: round2(
-            ((retainageOverride ?? s.retainagePercent) / 100) *
-              (s.previousBilled + s.previousStoredMaterials),
-          ),
-          updatedAt: now,
-        });
-      }
-      return sov.length;
-    }
-    const sov = await app.db
-      .select()
-      .from(commitmentSovLines)
-      .where(eq(commitmentSovLines.commitmentId, ctx.id))
-      .orderBy(asc(commitmentSovLines.sortOrder), asc(commitmentSovLines.lineNumber));
-    for (const [i, s] of sov.entries()) {
-      await app.db.insert(invoiceLineItems).values({
-        id: newId("ivl"),
-        companyId: s.companyId,
-        projectId: s.projectId,
-        invoiceId,
-        lineNumber: s.lineNumber,
-        sortOrder: s.sortOrder || i,
-        commitmentSovLineId: s.id,
-        costCodeId: s.costCodeId,
-        costCode: s.costCode,
-        costType: s.costType,
-        budgetLineItemId: s.budgetLineItemId,
-        description: s.description,
-        source: s.isChangeOrderLine === 1 ? "change_order" : "contract_sov",
-        billingMethod: s.billingMethod,
-        unit: s.unit,
-        quantity: s.quantity,
-        unitRate: s.unitRate,
-        changeOrderPackageId: s.changeOrderPackageId,
-        scheduledValue: round2(s.scheduledValue + s.changeOrderValue),
-        previousBilled: s.previousBilled,
-        previousStoredMaterials: s.previousStoredMaterials,
-        materialsPresentlyStored: s.previousStoredMaterials,
-        totalCompletedAndStored: round2(s.previousBilled + s.previousStoredMaterials),
-        percentComplete: s.percentComplete,
-        balanceToFinish: round2(
-          s.scheduledValue + s.changeOrderValue - s.previousBilled - s.previousStoredMaterials,
-        ),
-        retainagePercent: retainageOverride ?? s.retainagePercent,
-        retainageHeldToDate: round2(
-          ((retainageOverride ?? s.retainagePercent) / 100) *
-            (s.previousBilled + s.previousStoredMaterials),
-        ),
-        taxPercent: s.taxable === 1 ? s.taxPercent : null,
-        updatedAt: now,
-      });
-    }
-    return sov.length;
-  }
 
   /* ---------------------------------------------------------------- */
   /* Read                                                              */
@@ -840,6 +917,10 @@ export const invoiceRoutes: FastifyPluginAsync = async (app) => {
     if (q.vendorId) clauses.push(eq(invoices.vendorId, q.vendorId));
     if (q.unpaidOnly) {
       clauses.push(inArray(invoices.status, [...APPROVED_INVOICE_STATUSES]));
+      /* the predicate lives in the WHERE so `total` and the page agree */
+      clauses.push(
+        sql`coalesce((${invoices.detail} ->> 'approvedAmount')::double precision, ${invoices.currentPaymentDue}) - ${invoices.amountPaid} > ${CENT}`,
+      );
     }
     const where = and(...clauses);
     const [totalRow] = await app.db.select({ n: count() }).from(invoices).where(where);
@@ -850,21 +931,28 @@ export const invoiceRoutes: FastifyPluginAsync = async (app) => {
       .orderBy(desc(invoices.billingDate), desc(invoices.number))
       .limit(q.pageSize)
       .offset(pageOffset(q));
-    const filtered = q.unpaidOnly
-      ? items.filter((i) => i.currentPaymentDue - i.amountPaid > CENT)
-      : items;
-    return paginate(filtered, Number(totalRow?.n ?? 0), q);
+    return paginate(
+      items.map((i) => ({ ...i, certified: certifiedOf(i), outstanding: outstandingOf(i) })),
+      Number(totalRow?.n ?? 0),
+      q,
+    );
   });
 
   app.get("/invoices/:invoiceId", { preHandler: companyGate }, async (req, reply) => {
     const { invoiceId } = req.params as { invoiceId: string };
     const inv = await loadForWrite(req, reply, invoiceId, "read");
     const lines = await invoiceLines(app.db, invoiceId);
+    const approvals = await app.db
+      .select()
+      .from(invoiceLineApprovals)
+      .where(eq(invoiceLineApprovals.invoiceId, invoiceId));
     return {
       ...inv,
       lines,
+      lineApprovals: approvals,
       reconciliation: reconcileInvoice(inv),
-      outstanding: round2(inv.currentPaymentDue - inv.amountPaid),
+      certified: certifiedOf(inv),
+      outstanding: outstandingOf(inv),
     };
   });
 
@@ -1204,13 +1292,35 @@ export const invoiceRoutes: FastifyPluginAsync = async (app) => {
     if (!isOpenInvoice(inv.status)) {
       throw conflict(`Invoice ${inv.reference} is ${inv.status} and cannot be submitted`);
     }
-    await assertPeriodAcceptsBilling(
+    const period = await assertPeriodAcceptsBilling(
       app.db,
       inv.billingPeriodId,
       inv.projectId,
       req.companyId!,
       "submitting an invoice",
     );
+    /*
+     * The subcontractor submission window is a rule, not a caption. Outside
+     * it a subcontractor invoice is refused unless an invoicing admin
+     * overrides with a reason that goes in the ledger.
+     */
+    const today = todayIso();
+    const windowOpen = period?.subcontractorSubmitStart ?? null;
+    const windowClose = period?.subcontractorSubmitEnd ?? null;
+    const outsideWindow =
+      inv.kind === "subcontractor_invoice" &&
+      ((windowOpen !== null && today < windowOpen) || (windowClose !== null && today > windowClose));
+    if (outsideWindow) {
+      if (!body.windowOverrideReason) {
+        throw new AppError(
+          409,
+          `${period!.reference} accepts subcontractor invoices ${windowOpen ? `from ${windowOpen}` : ""}${windowClose ? ` until ${windowClose}` : ""}; ` +
+            `today is ${today}. Send windowOverrideReason (invoicing admin) to submit anyway on the record.`,
+          { control: "submission_window", subcontractorSubmitStart: windowOpen, subcontractorSubmitEnd: windowClose, today },
+        );
+      }
+      await requireInvoicingLevel(app, req, reply, inv.projectId, "admin");
+    }
     const lines = await invoiceLines(app.db, invoiceId);
     if (lines.length === 0) {
       throw badRequest(
@@ -1245,6 +1355,7 @@ export const invoiceRoutes: FastifyPluginAsync = async (app) => {
       totalCompletedAndStored: refreshed.totalCompletedAndStored,
       totalRetainage: refreshed.totalRetainage,
       currentPaymentDue: refreshed.currentPaymentDue,
+      ...(outsideWindow ? { submissionWindowOverride: body.windowOverrideReason, submissionWindow: [windowOpen, windowClose] } : {}),
     }, inv.projectId, true);
     return fetchInvoice(app.db, invoiceId, req.companyId!);
   });
@@ -1344,33 +1455,86 @@ export const invoiceRoutes: FastifyPluginAsync = async (app) => {
           "may certify less than was asked for, never more.",
       );
     }
+    /*
+     * LINE-LEVEL APPROVAL (#573). When the reviewer has decided line by line,
+     * the certified figure is the sum of those decisions (unreviewed lines
+     * count as billed). A header approvedAmount may not exceed it — the
+     * reduction is recorded where it was made.
+     */
+    const lineDecisions = await app.db
+      .select()
+      .from(invoiceLineApprovals)
+      .where(eq(invoiceLineApprovals.invoiceId, invoiceId));
+    let approvedAmount = body.approvedAmount;
+    let lineCertified: number | null = null;
+    if (lineDecisions.length > 0) {
+      const lines = await invoiceLines(app.db, invoiceId);
+      const byLine = new Map(lineDecisions.map((d) => [d.invoiceLineItemId, d]));
+      const reductions = round2(
+        lines.reduce((s, l) => {
+          const d = byLine.get(l.id);
+          return s + (d ? Math.max(0, l.amount - d.approvedAmount) : 0);
+        }, 0),
+      );
+      lineCertified = round2(Math.max(0, refreshed.currentPaymentDue - reductions));
+      if (approvedAmount !== undefined && approvedAmount - lineCertified > CENT) {
+        throw badRequest(
+          `Approved amount ${formatMoney(approvedAmount)} exceeds the ${formatMoney(lineCertified)} ` +
+            "the line-by-line review certified. The header cannot certify more than the lines.",
+        );
+      }
+      if (approvedAmount === undefined && lineCertified < refreshed.currentPaymentDue - CENT) {
+        approvedAmount = lineCertified;
+      }
+    }
+    const asNotedFinal = asNoted || (approvedAmount !== undefined && approvedAmount < refreshed.currentPaymentDue - CENT);
+    if (asNotedFinal && !asNoted && !(body.reviewNotes ?? "").trim()) {
+      const notes = lineDecisions.filter((d) => d.note).map((d) => d.note).join("; ");
+      if (!notes) {
+        throw badRequest(
+          "The line review certifies less than was applied for. Say why in reviewNotes (or on the " +
+            "reduced lines) — an unexplained reduction is a dispute waiting to happen.",
+        );
+      }
+      body.reviewNotes = `Line review: ${notes}`;
+    }
     const now = nowIso();
-    await app.db
-      .update(invoices)
-      .set({
-        status: asNoted ? "approved_as_noted" : "approved",
-        approvedBy: req.user!.id,
-        approvedAt: now,
-        ...(body.reviewNotes !== undefined ? { reviewNotes: body.reviewNotes } : {}),
-        detail: {
-          ...(refreshed.detail as Record<string, unknown>),
-          ...(body.approvedAmount !== undefined ? { approvedAmount: body.approvedAmount } : {}),
-        },
-        updatedAt: now,
-      })
-      .where(eq(invoices.id, invoiceId));
+    /* the status flip and the schedule-of-values roll-forward land together or not at all */
+    const posted = await app.db.transaction(async (tx) => {
+      const locked = await tx.select({ status: invoices.status }).from(invoices).where(eq(invoices.id, invoiceId)).for("update");
+      if (locked[0]?.status !== "submitted" && locked[0]?.status !== "under_review") {
+        throw conflict(`Invoice ${inv.reference} is now ${locked[0]?.status ?? "gone"}; somebody else moved it first.`);
+      }
+      await tx
+        .update(invoices)
+        .set({
+          status: asNotedFinal ? "approved_as_noted" : "approved",
+          approvedBy: req.user!.id,
+          approvedAt: now,
+          ...(body.reviewNotes !== undefined ? { reviewNotes: body.reviewNotes } : {}),
+          detail: {
+            ...(refreshed.detail as Record<string, unknown>),
+            ...(approvedAmount !== undefined ? { approvedAmount } : {}),
+            ...(lineCertified !== null ? { lineCertified, lineDecisions: lineDecisions.length } : {}),
+          },
+          updatedAt: now,
+        })
+        .where(eq(invoices.id, invoiceId));
+      const approvedRow = await fetchInvoice(tx, invoiceId, req.companyId!);
+      return postInvoiceToSov(tx, approvedRow);
+    });
     const approved = await fetchInvoice(app.db, invoiceId, req.companyId!);
-    const posted = await postInvoiceToSov(app.db, approved);
     await ledger(app.db, req, "state_change", "invoice", invoiceId, {
       from: inv.status,
       to: approved.status,
-      approvedAmount: body.approvedAmount ?? approved.currentPaymentDue,
+      approvedAmount: approvedAmount ?? approved.currentPaymentDue,
+      lineCertified,
       totalCompletedAndStored: approved.totalCompletedAndStored,
       totalRetainage: approved.totalRetainage,
       currentPaymentDue: approved.currentPaymentDue,
       sovRolledForward: posted.posted,
     }, inv.projectId, true);
-    return { ...(await fetchInvoice(app.db, invoiceId, req.companyId!)), sovRolledForward: posted.posted };
+    return { ...approved, certified: certifiedOf(approved), sovRolledForward: posted.posted };
   });
 
   app.post("/invoices/:invoiceId/reject", { preHandler: companyGate }, async (req, reply) => {
@@ -1412,6 +1576,8 @@ export const invoiceRoutes: FastifyPluginAsync = async (app) => {
       .update(invoices)
       .set({ status: "revise_and_resubmit", reviewNotes: body.reason, updatedAt: now })
       .where(eq(invoices.id, invoiceId));
+    /* the lines may change on resubmission, so line-level decisions are void */
+    await clearLineApprovals(app.db, invoiceId);
     await ledger(app.db, req, "state_change", "invoice", invoiceId, {
       from: inv.status,
       to: "revise_and_resubmit",

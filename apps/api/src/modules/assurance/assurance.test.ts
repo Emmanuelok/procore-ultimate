@@ -353,7 +353,7 @@ describe("evidence", () => {
 /* ------------------------------------------------------------------ */
 
 describe("obligations", () => {
-  it("upcoming window returns due obligations and lazily breaches overdue ones", async () => {
+  it("upcoming is READ-ONLY; the scheduled sweep breaches overdue obligations as the system", async () => {
     const past = new Date(Date.now() - 3 * 24 * 3600 * 1000).toISOString();
     const soon = new Date(Date.now() + 5 * 24 * 3600 * 1000).toISOString();
     const far = new Date(Date.now() + 90 * 24 * 3600 * 1000).toISOString();
@@ -377,16 +377,33 @@ describe("obligations", () => {
     const upcoming = await mk(soon);
     await mk(far);
 
+    // REGRESSION (audit: read-only route mutated state and attributed the
+    // change to the reader). Reading the window must not breach anything.
     const res = await app.inject({
       method: "GET",
       url: `/api/v1/projects/${projectId}/obligations/upcoming?days=30`,
       headers: owner.headers,
     });
     expect(res.statusCode).toBe(200);
-    const body = res.json() as { items: { id: string }[]; breached: number };
-    expect(body.breached).toBe(1);
+    const body = res.json() as {
+      items: { id: string }[];
+      breached: number;
+      awaitingSweep: number;
+    };
+    expect(body.breached).toBe(0);
+    expect(body.awaitingSweep).toBeGreaterThanOrEqual(1);
     expect(body.items.map((i) => i.id)).toContain(upcoming.id);
     expect(body.items.map((i) => i.id)).not.toContain(overdue.id);
+
+    const stillOpen = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/obligations/${overdue.id}`,
+      headers: owner.headers,
+    });
+    expect(stillOpen.json().status).toBe("open");
+
+    // The scheduler does the transition, attributed to the system.
+    await app.scheduler.runNow("assurance.obligation-breach");
 
     const check = await app.inject({
       method: "GET",
@@ -394,6 +411,22 @@ describe("obligations", () => {
       headers: owner.headers,
     });
     expect(check.json().status).toBe("breached");
+
+    const entries = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(eq(ledgerEntries.objectId, overdue.id));
+    const stateChange = entries.find((e) => e.action === "state_change");
+    expect(stateChange).toBeDefined();
+    expect(stateChange!.actorId).toBeNull();
+
+    const after = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/obligations/upcoming?days=30`,
+      headers: owner.headers,
+    });
+    expect(after.json().breached).toBe(1);
+    expect(after.json().awaitingSweep).toBe(0);
   });
 
   it("satisfy attaches evidence; waive records the reason in the ledger", async () => {

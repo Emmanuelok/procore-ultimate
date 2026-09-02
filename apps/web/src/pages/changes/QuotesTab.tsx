@@ -308,6 +308,18 @@ function ComparisonDrawer({
     }
   }
 
+  async function transition(quoteId: string, path: "decline" | "void", body: unknown, success: string) {
+    setError(null);
+    try {
+      await api.post(`/api/v1/projects/${projectId}/quote-requests/${quoteId}/${path}`, body);
+      toast.success(success);
+      comparison.reload();
+      onChanged();
+    } catch (err) {
+      setError(errorMessage(err, `The quote could not be ${path === "decline" ? "declined" : "voided"}`));
+    }
+  }
+
   return (
     <Drawer
       open
@@ -473,15 +485,44 @@ function ComparisonDrawer({
                             {quote.turnaroundDays === null ? "—" : `${num(quote.turnaroundDays, 1)} d`}
                           </td>
                           <td className="py-2 text-right">
-                            {quote.status === "quoted" && !quote.expired ? (
-                              <Button size="xs" onClick={() => setAccepting(quote.id)}>
-                                Select
-                              </Button>
-                            ) : quote.status === "accepted" ? (
-                              <Badge tone="success" size="xs">
-                                selected
-                              </Badge>
-                            ) : null}
+                            <span className="inline-flex flex-wrap justify-end gap-1">
+                              {quote.status === "quoted" && !quote.expired ? (
+                                <Button size="xs" onClick={() => setAccepting(quote.id)}>
+                                  Select
+                                </Button>
+                              ) : quote.status === "accepted" ? (
+                                <Badge tone="success" size="xs">
+                                  selected
+                                </Badge>
+                              ) : null}
+                              {["sent", "viewed", "quoted"].includes(quote.status) ? (
+                                <Button
+                                  size="xs"
+                                  variant="ghost"
+                                  onClick={() => {
+                                    const reason = window.prompt(`Why is ${quote.reference} declined?`);
+                                    if (reason && reason.trim()) {
+                                      void transition(quote.id, "decline", { declineReason: reason.trim() }, `${quote.reference} declined.`);
+                                    }
+                                  }}
+                                >
+                                  Decline
+                                </Button>
+                              ) : null}
+                              {!["accepted", "void"].includes(quote.status) ? (
+                                <Button
+                                  size="xs"
+                                  variant="ghost"
+                                  onClick={() => {
+                                    if (window.confirm(`Void ${quote.reference}? It stays on the record as void.`)) {
+                                      void transition(quote.id, "void", {}, `${quote.reference} voided.`);
+                                    }
+                                  }}
+                                >
+                                  Void
+                                </Button>
+                              ) : null}
+                            </span>
                           </td>
                         </tr>
                       ))}

@@ -9,11 +9,13 @@
  * whether an estimator typed it or a formula extrapolated it, and a report
  * that shows only the figure hides which it is.
  */
-import { Badge, Button, Card, CardBody, Drawer, Skeleton } from "../../ui";
+import { useState } from "react";
+import { Badge, Button, Card, CardBody, Drawer, Skeleton, Table, Td, Th, Tr } from "../../ui";
 import { DescriptionList, Timeline } from "../../ui/data";
 import type { DescriptionItem, TimelineItem } from "../../ui/data";
 import { api } from "../../lib/api";
 import {
+  COMPONENT_LABEL,
   EM_DASH,
   FORECAST_METHOD_HINT,
   FORECAST_METHOD_LABEL,
@@ -34,6 +36,7 @@ import {
   varianceWord,
   VARIANCE_BAND_NOTE,
   type BudgetLineDetail,
+  type LineTransactions,
 } from "./budgetShared";
 
 export interface LineDrawerProps {
@@ -61,6 +64,11 @@ export default function LineDrawer({
 
   const row = line.data;
   const band = row ? varianceBand(row.projectedOverUnder, row.revisedBudget) : null;
+  const transactions = useResource<LineTransactions>(
+    (signal) => api.get<LineTransactions>(`/api/v1/budget-lines/${lineId}/transactions`, { signal }),
+    [lineId ?? ""],
+    lineId !== null,
+  );
 
   const amounts: DescriptionItem[] = row
     ? [
@@ -273,6 +281,17 @@ export default function LineDrawer({
           ) : null}
 
           <section>
+            <h3 className="mb-2 text-label uppercase text-content-subtle">Where the numbers come from</h3>
+            {transactions.error ? (
+              <LoadError message={transactions.error} onRetry={transactions.reload} title="The source transactions could not be loaded" />
+            ) : transactions.loading && !transactions.data ? (
+              <Skeleton height={120} />
+            ) : transactions.data ? (
+              <ExplainTable data={transactions.data} currency={currency} />
+            ) : null}
+          </section>
+
+          <section>
             <h3 className="mb-2 text-label uppercase text-content-subtle">Forecast history</h3>
             {history.length === 0 ? (
               <p className="text-meta text-content-muted">
@@ -291,5 +310,109 @@ export default function LineDrawer({
         </div>
       ) : null}
     </Drawer>
+  );
+}
+
+/**
+ * "Explain this number" (#500): per stored column, the source rows that
+ * compose it, read live, with the stored figure beside the rebuilt one so a
+ * drift names the exact rows that disagree.
+ */
+function ExplainTable({ data, currency }: { data: LineTransactions; currency: string }) {
+  const [open, setOpen] = useState<string | null>(null);
+  return (
+    <div className="space-y-2">
+      <Table dense>
+        <thead>
+          <tr>
+            <Th>Column</Th>
+            <Th numeric>Stored</Th>
+            <Th numeric>From sources</Th>
+            <Th numeric>Drift</Th>
+            <Th numeric>Rows</Th>
+          </tr>
+        </thead>
+        <tbody>
+          {data.components.map((c) => (
+            <Tr key={c.component} interactive onClick={() => setOpen(open === c.component ? null : c.component)}>
+              <Td>{COMPONENT_LABEL[c.component] ?? labelize(c.component)}</Td>
+              <Td numeric>{money(c.stored, currency)}</Td>
+              <Td numeric>
+                {c.value === null ? (
+                  <span className="text-content-muted" title={c.reasons.join(" ")}>
+                    Not available
+                  </span>
+                ) : (
+                  money(c.value, currency)
+                )}
+              </Td>
+              <Td numeric>
+                {c.drift === null ? (
+                  EM_DASH
+                ) : Math.abs(c.drift) < 0.005 ? (
+                  <Badge tone="success" size="xs">
+                    agrees
+                  </Badge>
+                ) : (
+                  <Badge tone="warning" size="xs">
+                    {money(c.drift, currency, { signed: true })}
+                  </Badge>
+                )}
+              </Td>
+              <Td numeric muted>{c.rows.length}</Td>
+            </Tr>
+          ))}
+        </tbody>
+      </Table>
+      {open ? (
+        (() => {
+          const c = data.components.find((x) => x.component === open);
+          if (!c) return null;
+          return (
+            <Card variant="sunken">
+              <CardBody className="space-y-2">
+                <p className="text-meta text-content-muted">{c.basis}</p>
+                {c.reasons.length > 0 ? <ReasonList reasons={c.reasons} /> : null}
+                {c.rows.length === 0 ? (
+                  <p className="text-meta text-content-subtle">No source row composes this column.</p>
+                ) : (
+                  <Table dense>
+                    <thead>
+                      <tr>
+                        <Th>Source</Th>
+                        <Th>Reference</Th>
+                        <Th>Status</Th>
+                        <Th numeric>Amount</Th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {c.rows.map((r) => (
+                        <Tr key={`${r.sourceType}-${r.sourceId}`}>
+                          <Td muted>{labelize(r.sourceType)}</Td>
+                          <Td>
+                            <span className="font-mono text-code">{r.reference}</span>
+                            <span className="block truncate text-meta text-content-subtle">{r.description}</span>
+                            {r.excluded ? <span className="block text-2xs text-warning-fg">{r.excluded}</span> : null}
+                          </Td>
+                          <Td muted>{r.status ? labelize(r.status) : EM_DASH}</Td>
+                          <Td numeric className={r.excluded ? "line-through text-content-subtle" : undefined}>
+                            {money(r.amount, r.currency)}
+                          </Td>
+                        </Tr>
+                      ))}
+                    </tbody>
+                  </Table>
+                )}
+              </CardBody>
+            </Card>
+          );
+        })()
+      ) : null}
+      <p className="text-2xs text-content-subtle">
+        {data.lastReconciliation
+          ? `Last reconciled ${dateTime(data.lastReconciliation.createdAt)} (${data.lastReconciliation.reference}, ${data.lastReconciliation.driftCount} drift row${data.lastReconciliation.driftCount === 1 ? "" : "s"}); ${data.postings.length} posting${data.postings.length === 1 ? "" : "s"} on record for this line.`
+          : "No reconciliation has run on this budget yet; the stored columns have not been checked against their sources."}
+      </p>
+    </div>
   );
 }

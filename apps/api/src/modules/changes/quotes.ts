@@ -63,7 +63,12 @@ const recordQuoteSchema = z.object({
   quoteNotes: z.string().max(20000).nullable().optional(),
   quoteValidUntil: isoDateSchema.nullable().optional(),
   quoteDocumentIds: z.array(idSchema).max(200).optional(),
-  respondedAt: z.string().min(4).optional(),
+  respondedAt: z
+    .string()
+    .min(4)
+    .refine((v) => !Number.isNaN(Date.parse(v)), "respondedAt must be an ISO timestamp")
+    .transform((v) => new Date(v).toISOString())
+    .optional(),
 });
 
 const declineSchema = z.object({ declineReason: z.string().min(1).max(4000) });
@@ -445,6 +450,25 @@ export const quoteRoutes: FastifyPluginAsync = async (app) => {
         );
       }
       const pco = await fetchPco(app.db, quote.potentialChangeOrderId, companyId, projectId);
+      /*
+       * A quote re-prices the PCO. A PCO that has been submitted, approved,
+       * rolled into an owner request or packaged carries a figure other
+       * people have signed off; accepting a different quote under it would
+       * move the commitment sum by an unapproved amount at execution. Refuse:
+       * the PCO must be revised and re-approved first.
+       */
+      if (!["draft", "pending_quote", "priced"].includes(pco.status)) {
+        throw conflict(
+          `${pco.reference} is ${pco.status}; a quote cannot re-price it. Revise the PCO (which ` +
+            "withdraws its approval) and accept the quote against the revised position.",
+        );
+      }
+      if (pco.changeOrderRequestId || pco.changeOrderPackageId) {
+        throw conflict(
+          `${pco.reference} is inside ${pco.changeOrderPackageId ? "a change order package" : "an owner change order request"}; ` +
+            "accepting a quote would change a figure that has already been asked for. Remove it from the request first.",
+        );
+      }
       const siblings = await app.db
         .select()
         .from(changeQuoteRequests)
@@ -477,7 +501,7 @@ export const quoteRoutes: FastifyPluginAsync = async (app) => {
             quotedAmount: round2(quote.quotedAmount!),
             amount: accepted,
             scheduleImpactDays: quote.quotedScheduleImpactDays ?? pco.scheduleImpactDays,
-            status: pco.status === "submitted" || pco.status === "approved" ? pco.status : "priced",
+            status: "priced",
             detail: {
               ...(pco.detail ?? {}),
               acceptedQuoteId: quoteId,

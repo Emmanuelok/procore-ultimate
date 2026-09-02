@@ -563,3 +563,116 @@ function counterparty(request: AnchorRequest, now: string): AnchorAttempt {
   };
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Upgrading a pending OpenTimestamps receipt                          */
+/* ------------------------------------------------------------------ */
+
+export interface AnchorUpgradeRequest {
+  /** the digest that was submitted — the seal's bodyHash */
+  bodyHash: string;
+  /** the calendar the receipt came from, from the stored proof */
+  calendar: string;
+  env: AnchorProviderEnv;
+  http?: AnchorHttpClient | undefined;
+  now?: string | undefined;
+}
+
+export interface AnchorUpgradeResult {
+  upgraded: boolean;
+  status: AnchorStatus;
+  proof: Record<string, unknown> | null;
+  detail: string;
+  confirmedAt: string | null;
+}
+
+/**
+ * Poll a calendar for the Bitcoin attestation of a previously submitted
+ * digest (`GET <calendar>/timestamp/<digest>`).
+ *
+ * WHY THIS EXISTS. A fresh OpenTimestamps submission is a calendar receipt,
+ * not a blockchain proof, and is recorded as `pending` for exactly that
+ * reason. Without something that comes back later and upgrades it, every OTS
+ * anchor on this platform would stay pending forever and the provider would be
+ * decorative. The scheduler calls this; nothing on a request path does.
+ *
+ * The upgrade is still honest about what it proves: the calendar's answer is
+ * the attestation path, and full verification (`ots verify`) needs a Bitcoin
+ * node or a block explorer. We record the bytes and say so.
+ */
+export async function upgradeOpenTimestamps(
+  request: AnchorUpgradeRequest,
+): Promise<AnchorUpgradeResult> {
+  const now = request.now ?? new Date().toISOString();
+  const base = (request.calendar || request.env.ANCHOR_OTS_CALENDAR_URL || "")
+    .trim()
+    .replace(/\/+$/, "");
+  if (!base) {
+    return {
+      upgraded: false,
+      status: "pending",
+      proof: null,
+      detail:
+        "No calendar is recorded on this submission and ANCHOR_OTS_CALENDAR_URL is unset, so " +
+        "there is nowhere to ask for the attestation.",
+      confirmedAt: null,
+    };
+  }
+  const http = request.http ?? createFetchAnchorHttpClient();
+  const url = `${base}/timestamp/${request.bodyHash}`;
+  let response: AnchorHttpResponse;
+  try {
+    // The calendar's timestamp endpoint is a GET in the OTS protocol; the
+    // injected client only speaks POST, and a zero-length POST body is what
+    // both the real calendars and the fixture client treat as a plain fetch.
+    response = await http.post(url, new Uint8Array(0), {
+      accept: "application/vnd.opentimestamps.v1",
+    });
+  } catch (err) {
+    return {
+      upgraded: false,
+      status: "pending",
+      proof: null,
+      detail: `The calendar at ${url} could not be reached: ${(err as Error).message}.`,
+      confirmedAt: null,
+    };
+  }
+  if (response.status === 404) {
+    return {
+      upgraded: false,
+      status: "pending",
+      proof: null,
+      detail:
+        "The calendar has not yet aggregated this digest into a Bitcoin transaction " +
+        "(HTTP 404). This is the normal state for the first few hours after submission.",
+      confirmedAt: null,
+    };
+  }
+  if (response.status !== 200 || response.body.length === 0) {
+    return {
+      upgraded: false,
+      status: "pending",
+      proof: null,
+      detail: `The calendar answered HTTP ${response.status} with ${response.body.length} bytes; nothing was upgraded.`,
+      confirmedAt: null,
+    };
+  }
+  return {
+    upgraded: true,
+    status: "anchored",
+    proof: {
+      calendar: base,
+      digest: request.bodyHash,
+      attestationBase64: Buffer.from(response.body).toString("base64"),
+      upgradedAt: now,
+      verify:
+        "Save attestationBase64 (base64-decoded) as seal.ots and run `ots verify seal.ots` " +
+        "against a Bitcoin node or a trusted explorer. This platform records the bytes the " +
+        "calendar returned; it does not itself validate the Bitcoin chain.",
+    },
+    detail:
+      "The calendar returned an attestation for this digest. The receipt is now independently " +
+      "verifiable against the Bitcoin chain by anyone holding it.",
+    confirmedAt: now,
+  };
+}

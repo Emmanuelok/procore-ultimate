@@ -19,6 +19,7 @@ import { useParams, useSearchParams } from "react-router-dom";
 import { EmptyState, ErrorAlert, PageHeader, Tabs } from "../../ui";
 import { IconChangeOrder } from "../../ui/icons";
 import ChangeLogTab from "./ChangeLogTab";
+import ConfigTab from "./ConfigTab";
 import CorTab from "./CorTab";
 import EventsTab from "./EventsTab";
 import PackagesTab from "./PackagesTab";
@@ -40,6 +41,7 @@ const TABS = [
   { value: "cors", label: "Owner requests (COR)" },
   { value: "packages", label: "Execution" },
   { value: "log", label: "Change log" },
+  { value: "config", label: "Configuration" },
 ] as const;
 
 type TabKey = (typeof TABS)[number]["value"];
@@ -212,6 +214,8 @@ export default function ChangesPage() {
           reload={changeLog.reload}
         />
       ) : null}
+
+      {tab === "config" ? <ConfigTab projectId={projectId} context={context} /> : null}
     </div>
   );
 }

@@ -5,9 +5,10 @@ import { commitments, invoices, lienWaivers, vendors } from "@constructos/db";
 import { LIEN_WAIVER_STATUSES, LIEN_WAIVER_TYPES } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
-import { badRequest, conflict, notFound } from "../../lib/errors.js";
+import { AppError, badRequest, conflict, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import type { Db } from "../../lib/db.js";
+import { appendLedger } from "../../lib/ledger.js";
 import {
   APPROVED_INVOICE_STATUSES,
   CENT,
@@ -22,6 +23,7 @@ import {
   ledger,
   nonNegativeMoneySchema,
   nowIso,
+  outstandingOf,
   reasonSchema,
   requireInvoicingLevel,
   round2,
@@ -130,6 +132,10 @@ export async function waiverGateFor(
     vendorId: string | null;
     currentPaymentDue: number;
     currency: string;
+    amountPaid?: number;
+    detail?: unknown;
+    periodEnd?: string | null;
+    billingDate?: string | null;
   },
 ): Promise<WaiverGate> {
   const rows = await db
@@ -140,13 +146,51 @@ export async function waiverGateFor(
       status: lienWaivers.status,
       throughDate: lienWaivers.throughDate,
       amount: lienWaivers.amount,
+      currency: lienWaivers.currency,
       tier: lienWaivers.tier,
     })
     .from(lienWaivers)
     .where(eq(lienWaivers.invoiceId, invoice.id));
   const required = invoice.requiresLienWaiver === 1;
-  const onFile = rows.filter((w) => isSatisfyingWaiver(w.status));
   const reasons: string[] = [];
+  /*
+   * A waiver on file must actually COVER the payment (audit: a 1.00 USD
+   * conditional waiver through last year must not unblock a 500,000 payment
+   * this month). Through date, amount and currency are each checked, and
+   * every shortfall is named so the register can fix the right one.
+   */
+  const detail = (invoice.detail ?? {}) as Record<string, unknown>;
+  const approved = detail["approvedAmount"];
+  const certified =
+    typeof approved === "number" && Number.isFinite(approved)
+      ? Math.min(approved, invoice.currentPaymentDue)
+      : invoice.currentPaymentDue;
+  const payable = round2(Math.max(0, certified - (invoice.amountPaid ?? 0)));
+  const coverThrough = invoice.periodEnd ?? invoice.billingDate ?? null;
+  const isFinal = detail["isFinal"] === true;
+  const shortfalls: string[] = [];
+  const onFile = rows.filter((w) => {
+    if (!isSatisfyingWaiver(w.status)) return false;
+    if (w.status === "not_required") return true;
+    const problems: string[] = [];
+    if (w.currency.toUpperCase() !== invoice.currency.toUpperCase()) {
+      problems.push(`is in ${w.currency}, the invoice is in ${invoice.currency}`);
+    }
+    if (coverThrough && w.throughDate && w.throughDate < coverThrough) {
+      problems.push(`waives work only through ${w.throughDate}, before the billing period end ${coverThrough}`);
+    }
+    if (w.amount > CENT && payable - w.amount > CENT) {
+      problems.push(`covers ${formatMoney(w.amount)}, less than the ${formatMoney(payable)} payable`);
+    }
+    if (isFinal && !w.waiverType.endsWith("_final")) {
+      problems.push(`is a ${w.waiverType} waiver on a final invoice — a final waiver is required`);
+    }
+    if (problems.length > 0) {
+      shortfalls.push(`${w.reference} (${w.status}) ${problems.join("; ")}.`);
+      return false;
+    }
+    return true;
+  });
   if (required && onFile.length === 0) {
     reasons.push(
       rows.length === 0
@@ -154,10 +198,11 @@ export async function waiverGateFor(
           `Paying ${formatMoney(invoice.currentPaymentDue)} ${invoice.currency} without one ` +
           "leaves the project exposed to a lien for work already paid for."
         : `Invoice ${invoice.reference} requires a lien waiver. ${rows.length} waiver(s) exist ` +
-          `but none is received or verified: ${rows
+          `but none covers this payment: ${rows
             .map((w) => `${w.reference} (${w.status})`)
             .join(", ")}.`,
     );
+    reasons.push(...shortfalls);
   }
   return {
     required,
@@ -165,6 +210,83 @@ export async function waiverGateFor(
     waivers: rows,
     reasons,
   };
+}
+
+/**
+ * Lien-waiver automation tied to payment release (#576–578, #589). When a
+ * payment against an invoice that REQUIRES a waiver is issued and no waiver is
+ * on file or in flight, a conditional progress waiver request is raised
+ * against the invoice, addressed to the vendor, for the amount paid and
+ * through the billing period end. The request is a record with the payment's
+ * id on it, so the outstanding-waiver report can chase it and the vendor
+ * portal can return it. Returns null when nothing needed raising.
+ */
+export async function requestWaiverForPayment(
+  db: Db,
+  paymentId: string,
+  actorId: string,
+): Promise<{ id: string; reference: string; waiverType: string } | null> {
+  const { commitmentPayments } = await import("@constructos/db");
+  const payRows = await db
+    .select()
+    .from(commitmentPayments)
+    .where(eq(commitmentPayments.id, paymentId))
+    .limit(1);
+  const payment = payRows[0];
+  if (!payment?.invoiceId) return null;
+  const invRows = await db.select().from(invoices).where(eq(invoices.id, payment.invoiceId)).limit(1);
+  const inv = invRows[0];
+  if (!inv || inv.requiresLienWaiver !== 1) return null;
+  const existing = await db
+    .select({ id: lienWaivers.id, status: lienWaivers.status })
+    .from(lienWaivers)
+    .where(eq(lienWaivers.invoiceId, inv.id));
+  const inFlight = existing.filter((w) => !["void", "rejected"].includes(w.status));
+  if (inFlight.length > 0) return null;
+  const detail = (inv.detail ?? {}) as Record<string, unknown>;
+  const waiverType = detail["isFinal"] === true ? "conditional_final" : "conditional_progress";
+  const number = await nextRecordNumber(db, inv.projectId, WAIVER_COUNTER);
+  const id = newId("lwv");
+  const now = nowIso();
+  await db.insert(lienWaivers).values({
+    id,
+    companyId: inv.companyId,
+    projectId: inv.projectId,
+    number,
+    reference: waiverReference(number),
+    waiverType,
+    status: "requested",
+    commitmentId: inv.commitmentId,
+    invoiceId: inv.id,
+    paymentId,
+    billingPeriodId: inv.billingPeriodId,
+    vendorId: inv.vendorId ?? payment.vendorId,
+    tier: 1,
+    amount: round2(payment.amount),
+    currency: inv.currency,
+    throughDate: inv.periodEnd ?? inv.billingDate ?? todayIso(),
+    notes: `Raised automatically when payment ${payment.reference} was issued (#576).`,
+    detail: { autoRequestedForPaymentId: paymentId },
+    requestedBy: actorId,
+    requestedAt: now,
+    createdBy: actorId,
+    updatedAt: now,
+  });
+  await db
+    .update(invoices)
+    .set({ lienWaiverStatus: "requested", updatedAt: now })
+    .where(eq(invoices.id, inv.id));
+  await appendLedger(db, {
+    companyId: inv.companyId,
+    actorId,
+    action: "create",
+    objectType: "lien_waiver",
+    objectId: id,
+    projectId: inv.projectId,
+    payload: { automatic: true, paymentId, invoiceId: inv.id, waiverType, amount: payment.amount },
+    storePayload: true,
+  });
+  return { id, reference: waiverReference(number), waiverType };
 }
 
 /* ------------------------------------------------------------------ */
@@ -211,9 +333,10 @@ export const waiverRoutes: FastifyPluginAsync = async (app) => {
     to: string,
     patch: Record<string, unknown>,
     payload: Record<string, unknown> = {},
+    level: "standard" | "admin" = "standard",
   ): Promise<WaiverRow> {
     const waiver = await fetchWaiver(waiverId, req.companyId!);
-    await requireInvoicingLevel(app, req, reply, waiver.projectId, "standard");
+    await requireInvoicingLevel(app, req, reply, waiver.projectId, level);
     if (!from.includes(waiver.status)) {
       throw conflict(
         `Lien waiver ${waiver.reference} is ${waiver.status}; ${to} requires it to be ` +
@@ -432,6 +555,28 @@ export const waiverRoutes: FastifyPluginAsync = async (app) => {
       else waiversByInvoice.set(w.invoiceId, [w]);
     }
 
+    /* a recorded exemption is a decision — reported in its own bucket, never hidden */
+    const excused = invoiceRows
+      .filter((inv) => (waiversByInvoice.get(inv.id) ?? []).some((w) => w.status === "not_required"))
+      .map((inv) => {
+        const w = (waiversByInvoice.get(inv.id) ?? []).find((x) => x.status === "not_required")!;
+        const d = (w.detail ?? {}) as Record<string, unknown>;
+        return {
+          invoiceId: inv.id,
+          reference: inv.reference,
+          vendorId: inv.vendorId,
+          vendorName: inv.vendorId ? (vendorName.get(inv.vendorId) ?? null) : null,
+          currency: inv.currency,
+          currentPaymentDue: round2(inv.currentPaymentDue),
+          amountPaid: round2(inv.amountPaid),
+          waiverId: w.id,
+          waiverReference: w.reference,
+          excusedBy: typeof d["notRequiredBy"] === "string" ? (d["notRequiredBy"] as string) : null,
+          excusedAt: typeof d["notRequiredAt"] === "string" ? (d["notRequiredAt"] as string) : null,
+          reason: typeof d["notRequiredReason"] === "string" ? (d["notRequiredReason"] as string) : w.notes,
+        };
+      });
+
     const exposures = invoiceRows
       .map((inv) => {
         const mine = waiversByInvoice.get(inv.id) ?? [];
@@ -451,6 +596,8 @@ export const waiverRoutes: FastifyPluginAsync = async (app) => {
           currency: inv.currency,
           currentPaymentDue: round2(inv.currentPaymentDue),
           amountPaid: paidAmount,
+          /** certified less paid — honours an approved-as-noted reduction */
+          outstanding: outstandingOf(inv),
           /** money already out of the door against unwaived work */
           paidUnwaived: paidAmount,
           billingDate: inv.billingDate,
@@ -502,12 +649,14 @@ export const waiverRoutes: FastifyPluginAsync = async (app) => {
           blockedFromPayment: round2(
             rows
               .filter((r) => r.blocking === "payment_blocked")
-              .reduce((s, r) => s + (r.currentPaymentDue - r.amountPaid), 0),
+              .reduce((s, r) => s + r.outstanding, 0),
           ),
         }),
       ),
       outstanding: exposures,
       inFlight,
+      /** invoices whose waiver was excused on the record — a decision, listed as one */
+      excused,
       /** second-tier claimants are the classic route to a lien on a paid job */
       untieredWarning:
         waiverRows.length > 0 && waiverRows.every((w) => w.tier === 1)
@@ -648,14 +797,53 @@ export const waiverRoutes: FastifyPluginAsync = async (app) => {
   app.post("/lien-waivers/:waiverId/not-required", { preHandler: companyGate }, async (req, reply) => {
     const { waiverId } = req.params as { waiverId: string };
     const body = reasonSchema.parse(req.body);
+    /*
+     * Excusing a waiver satisfies the payment gate, so it is an ADMIN act by
+     * somebody other than the person who raised the waiver or the invoice —
+     * otherwise the biller could neutralise the control on their own invoice.
+     */
+    const waiver = await fetchWaiver(waiverId, req.companyId!);
+    const parties: { createdBy?: string | null; submittedBy?: string | null; requestedBy?: string | null } = {
+      createdBy: waiver.createdBy,
+      requestedBy: waiver.requestedBy,
+    };
+    if (waiver.invoiceId) {
+      const inv = (
+        await app.db
+          .select({ createdBy: invoices.createdBy, submittedBy: invoices.submittedBy })
+          .from(invoices)
+          .where(eq(invoices.id, waiver.invoiceId))
+          .limit(1)
+      )[0];
+      if (inv) {
+        if (inv.createdBy === req.user!.id) {
+          throw new AppError(403, "Segregation of duties: the person who raised the invoice may not excuse its lien waiver.", {
+            control: "no_self_approval",
+            role: "invoice_created_by",
+          });
+        }
+        if (inv.submittedBy) parties.submittedBy = inv.submittedBy;
+      }
+    }
+    assertSegregation(req.user!.id, parties, "lien waiver");
+    const now = nowIso();
     return transition(
       req,
       reply,
       waiverId,
       ["draft", "requested", "sent"],
       "not_required",
-      { notes: body.reason },
-      { reason: body.reason },
+      {
+        notes: body.reason,
+        detail: {
+          ...(waiver.detail as Record<string, unknown>),
+          notRequiredBy: req.user!.id,
+          notRequiredAt: now,
+          notRequiredReason: body.reason,
+        },
+      },
+      { reason: body.reason, notRequiredBy: req.user!.id },
+      "admin",
     );
   });
 

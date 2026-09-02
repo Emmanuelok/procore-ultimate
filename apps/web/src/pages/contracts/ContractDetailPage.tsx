@@ -17,19 +17,31 @@ import {
   contractStatusTone,
   eventStatusTone,
   formLabel,
+  isNecForm,
   TabBar,
   type ContractDetail,
   type LdExposure,
 } from "./contractsShared";
+import { useCompanyUsers } from "../commercial/commercialShared";
 import ClausesTab from "./ClausesTab";
 import EventsTab from "./EventsTab";
 import EotTab from "./EotTab";
+import CeTab from "./CeTab";
+import ProgrammesTab from "./ProgrammesTab";
+import ComplianceTab from "./ComplianceTab";
+import EditTermsModal from "./EditTermsModal";
 
-const TABS = [
+const BASE_TABS = [
   { key: "overview", label: "Overview" },
   { key: "clauses", label: "Clauses" },
   { key: "events", label: "Events & Notices" },
   { key: "eot", label: "EOT Claims" },
+  { key: "compliance", label: "Insurance & Bonds" },
+];
+
+const NEC_TABS = [
+  { key: "ce", label: "Compensation Events" },
+  { key: "programmes", label: "Programmes" },
 ];
 
 const STATUS_ACTIONS: Record<string, { status: string; label: string; danger?: boolean }[]> = {
@@ -65,6 +77,8 @@ export default function ContractDetailPage() {
   );
   const [statusError, setStatusError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
+  const { nameOf } = useCompanyUsers();
 
   const load = useCallback(async () => {
     if (!projectId || !contractId) return;
@@ -131,6 +145,8 @@ export default function ContractDetailPage() {
 
   const actions = STATUS_ACTIONS[contract.status] ?? [];
   const totalEvents = Object.values(contract.eventCounts).reduce((a, b) => a + b, 0);
+  const tabs = isNecForm(contract.form) ? [...BASE_TABS, ...NEC_TABS] : BASE_TABS;
+  const editable = contract.status !== "completed" && contract.status !== "terminated";
 
   return (
     <div>
@@ -148,6 +164,11 @@ export default function ContractDetailPage() {
         actions={
           <>
             <Badge tone={contractStatusTone(contract.status)}>{humanize(contract.status)}</Badge>
+            {editable ? (
+              <Button variant="secondary" size="sm" onClick={() => setEditOpen(true)}>
+                Edit terms
+              </Button>
+            ) : null}
             {actions.map((a) => (
               <Button
                 key={a.status}
@@ -166,6 +187,18 @@ export default function ContractDetailPage() {
         <Badge tone="blue">
           {contract.obligationCount} obligation{contract.obligationCount === 1 ? "" : "s"}
         </Badge>
+        {contract.amendedClauseCount > 0 ? (
+          <Badge tone="violet">
+            {contract.amendedClauseCount} amended clause
+            {contract.amendedClauseCount === 1 ? "" : "s"}
+          </Badge>
+        ) : null}
+        {(contract.obligationStatus["breached"] ?? 0) > 0 ? (
+          <Badge tone="red">{contract.obligationStatus["breached"]} breached</Badge>
+        ) : null}
+        {contract.calendarBasis === "working" ? (
+          <Badge tone="gray">Working-day deadlines</Badge>
+        ) : null}
         <Badge tone="gray">
           {totalEvents} event{totalEvents === 1 ? "" : "s"}
         </Badge>
@@ -178,11 +211,19 @@ export default function ContractDetailPage() {
         )}
       </div>
 
-      <TabBar tabs={TABS} active={tab} onSelect={selectTab} />
+      <TabBar tabs={tabs} active={tab} onSelect={selectTab} />
 
       {tab === "overview" ? <OverviewTab contract={contract} ld={ld} /> : null}
       {tab === "clauses" ? (
-        <ClausesTab clauses={contract.effectiveClauses} onRaiseEvent={raiseEventUnderClause} />
+        <ClausesTab
+          projectId={projectId!}
+          contractId={contractId!}
+          clauses={contract.effectiveClauses}
+          particularConditions={contract.particularConditions}
+          editable={editable}
+          onRaiseEvent={raiseEventUnderClause}
+          onChanged={load}
+        />
       ) : null}
       {tab === "events" ? (
         <EventsTab
@@ -204,6 +245,36 @@ export default function ContractDetailPage() {
           onChanged={load}
         />
       ) : null}
+      {tab === "compliance" ? (
+        <ComplianceTab
+          projectId={projectId!}
+          contractId={contractId!}
+          currency={contract.currency}
+        />
+      ) : null}
+      {tab === "ce" ? (
+        <CeTab
+          projectId={projectId!}
+          contractId={contractId!}
+          currency={contract.currency}
+          necBasis={contract.necBasis}
+          onChanged={load}
+        />
+      ) : null}
+      {tab === "programmes" ? (
+        <ProgrammesTab projectId={projectId!} contractId={contractId!} users={nameOf} />
+      ) : null}
+
+      <EditTermsModal
+        open={editOpen}
+        base={base}
+        contract={contract}
+        onClose={() => setEditOpen(false)}
+        onSaved={async () => {
+          setEditOpen(false);
+          await load();
+        }}
+      />
 
       <Modal
         open={pendingStatus !== null}
@@ -239,6 +310,7 @@ function OverviewTab({ contract, ld }: { contract: ContractDetail; ld: LdExposur
     { label: "Base date", value: contract.baseDate },
     { label: "Commencement", value: contract.commencementDate },
     { label: "Completion", value: contract.completionDate },
+    { label: "Taking-over", value: contract.takingOverDate },
   ];
   const applicable = ld !== null && ld.applicable;
   const capPct =
@@ -353,7 +425,9 @@ function OverviewTab({ contract, ld }: { contract: ContractDetail; ld: LdExposur
             </div>
             {!applicable ? (
               <p className="mt-1 text-sm text-ink-500">
-                Not applicable — an LD rate and a completion date are required to compute exposure.
+                {ld && !ld.applicable
+                  ? ld.reason
+                  : "Not applicable — an LD rate and a completion date are required to compute exposure."}
               </p>
             ) : (
               <>
@@ -368,7 +442,11 @@ function OverviewTab({ contract, ld }: { contract: ContractDetail; ld: LdExposur
                       ? `${ld.daysLate} day${ld.daysLate === 1 ? "" : "s"} past completion (${formatDate(ld.completionDate)})`
                       : `on programme — completion ${formatDate(ld.completionDate)}`}
                   </span>
+                  {ld.frozen ? <Badge tone="gray">Accrual stopped</Badge> : null}
                 </div>
+                {ld.accrualEndBasis ? (
+                  <p className="mt-1 text-xs text-ink-500">{ld.accrualEndBasis}</p>
+                ) : null}
                 {capPct !== null ? (
                   <div className="mt-2">
                     <div className="h-2 w-full overflow-hidden rounded-full bg-ink-200">

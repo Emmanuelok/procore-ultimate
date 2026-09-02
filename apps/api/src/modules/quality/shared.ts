@@ -137,6 +137,26 @@ export type QualityObjectType =
   | "commissioning_system"
   | "commissioning_test_record"
   | "turnover_package"
+  /* Domain Z and closeout registers (WP-QUAL upgrade) */
+  | "quality_concession"
+  | "concrete_pour"
+  | "concrete_test_specimen"
+  | "welding_procedure"
+  | "welder_qualification"
+  | "weld"
+  | "ndt_record"
+  | "material_test_certificate"
+  | "calibrated_instrument"
+  | "calibration_record"
+  | "rework_item"
+  | "quality_audit"
+  | "quality_audit_finding"
+  | "defects_liability_period"
+  | "dlp_defect"
+  | "performance_guarantee"
+  | "operator_training_record"
+  | "spare_part"
+  | "post_occupancy_evaluation"
   /* registers quality writes INTO rather than duplicating */
   | "punch_item"
   | "safety_corrective_action"
@@ -174,12 +194,27 @@ export async function ledger(
 /* Signals                                                             */
 /* ------------------------------------------------------------------ */
 
-/** The four detectors the quality sweeps raise. */
+/**
+ * The detectors the quality sweeps raise. Each one is keyed in
+ * `signals.evidenceRefs.key` so a second pass over the same condition raises
+ * nothing — the sweeps run on a scheduler and on list reads, and both must be
+ * safe to repeat.
+ */
 export const QUALITY_DETECTORS = {
   holdPointUnreleased: "quality_hold_point_unreleased",
   ncrResponseOverdue: "quality_ncr_response_overdue",
   turnoverArtefactsMissing: "quality_turnover_artefacts_missing",
   systemDeficienciesOverdue: "quality_system_deficiencies_overdue",
+  /* Domain Z and closeout registers */
+  concessionExpiring: "quality_concession_expiring",
+  calibrationOverdue: "quality_calibration_overdue",
+  welderQualificationLapsed: "quality_welder_qualification_lapsed",
+  concreteAcceptanceFailed: "quality_concrete_acceptance_failed",
+  ndtCoverageShort: "quality_ndt_coverage_short",
+  certificateUnverified: "quality_certificate_unverified",
+  auditFindingOverdue: "quality_audit_finding_overdue",
+  dlpExpiring: "quality_dlp_expiring",
+  seasonalTestDue: "quality_seasonal_test_due",
 } as const;
 
 export type QualityDetector = (typeof QUALITY_DETECTORS)[keyof typeof QUALITY_DETECTORS];
@@ -356,3 +391,60 @@ export const figure = (
   inputs: Record<string, unknown>,
   reasons: string[] = [],
 ): Figure => ({ value, unit, inputs, reasons });
+
+/* ------------------------------------------------------------------ */
+/* Money                                                               */
+/* ------------------------------------------------------------------ */
+
+export interface CurrencyTotal {
+  currency: string;
+  amount: number;
+  recordCount: number;
+}
+
+/**
+ * Money, bucketed by currency, never summed across them.
+ *
+ * A project with GBP and USD non-conformances has two totals and no third
+ * one; reporting their arithmetic sum under whichever currency happened to be
+ * on the first row is how a cost report becomes fiction. Rows with no amount
+ * are counted separately so the caller can say the total is a floor.
+ */
+export function totalsByCurrency(
+  rows: Array<{ amount: number | null | undefined; currency: string | null | undefined }>,
+): { totals: CurrencyTotal[]; withAmount: number; withoutAmount: number } {
+  const byCurrency = new Map<string, { amount: number; recordCount: number }>();
+  let withAmount = 0;
+  let withoutAmount = 0;
+  for (const row of rows) {
+    if (typeof row.amount !== "number" || !Number.isFinite(row.amount)) {
+      withoutAmount += 1;
+      continue;
+    }
+    withAmount += 1;
+    const key = row.currency || "USD";
+    const bucket = byCurrency.get(key) ?? { amount: 0, recordCount: 0 };
+    bucket.amount += row.amount;
+    bucket.recordCount += 1;
+    byCurrency.set(key, bucket);
+  }
+  return {
+    totals: [...byCurrency.entries()]
+      .map(([currency, v]) => ({ currency, amount: round2(v.amount), recordCount: v.recordCount }))
+      .sort((a, b) => (a.currency < b.currency ? -1 : 1)),
+    withAmount,
+    withoutAmount,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Registers                                                           */
+/* ------------------------------------------------------------------ */
+
+/** Days between two ISO dates, or null when either is unreadable. */
+export function daysUntil(fromIso: string, toIso: string): number | null {
+  const a = Date.parse(`${fromIso}T00:00:00Z`);
+  const b = Date.parse(`${toIso}T00:00:00Z`);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
+  return Math.round((b - a) / 86_400_000);
+}

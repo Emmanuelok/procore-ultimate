@@ -28,6 +28,7 @@ import {
 } from "./arithmetic.js";
 import { assessCorTimeImpact, type DelayEventRow } from "./reconcile.js";
 import { registerLineRoutes } from "./lines.js";
+import { resolveMarkups } from "./markups.js";
 import {
   actorOf,
   assertSameCurrency,
@@ -213,16 +214,6 @@ export const corRoutes: FastifyPluginAsync = async (app) => {
     return rows[0];
   }
 
-  /** The contract's standard markup stack, when the project carries one. */
-  async function defaultMarkups(projectId: string): Promise<MarkupRule[]> {
-    const rows = await app.db
-      .select({ settings: projects.settings })
-      .from(projects)
-      .where(eq(projects.id, projectId))
-      .limit(1);
-    return readMarkups((rows[0]?.settings ?? {})["changeMarkups"]);
-  }
-
   async function loadMemberPcos(
     pcoIds: readonly string[],
     companyId: string,
@@ -310,7 +301,17 @@ export const corRoutes: FastifyPluginAsync = async (app) => {
         ...commitmentRows.map((c) => ({ label: c.reference, currency: c.currency })),
       ]);
 
-      const markups = body.markups ?? (await defaultMarkups(projectId));
+      /* the markup schedule (#554): request → contract override → project → legacy setting → none */
+      const pcoSubtotal = round2(pcos.reduce((s, p) => s + p.amount, 0));
+      const resolvedMarkups = await resolveMarkups(
+        app.db,
+        companyId,
+        projectId,
+        contract.id,
+        body.markups,
+        pcoSubtotal,
+      );
+      const markups = resolvedMarkups.rules;
       const problems = validateMarkupStack(markups);
       if (problems.length > 0) throw badRequest(problems.join(" "), { problems });
 
@@ -353,7 +354,14 @@ export const corRoutes: FastifyPluginAsync = async (app) => {
             pcos.reduce((max, p) => Math.max(max, p.scheduleImpactDays), 0),
           dueDate: body.dueDate ?? null,
           documentIds: body.documentIds ?? [],
-          detail: { ...(body.detail ?? {}), negotiationHistory: [], delayEventIds: [] },
+          detail: {
+            ...(body.detail ?? {}),
+            negotiationHistory: [],
+            delayEventIds: [],
+            markupSource: resolvedMarkups.source,
+            markupScheduleId: resolvedMarkups.scheduleId,
+            markupBandUpTo: resolvedMarkups.band?.upTo ?? null,
+          },
           createdBy: actorId,
         });
 
@@ -794,24 +802,44 @@ export const corRoutes: FastifyPluginAsync = async (app) => {
         "change order request",
       );
       const now = nowIso();
-      await app.db
-        .update(changeOrderRequests)
-        .set({
-          status: "rejected",
-          rejectedBy: actorId,
-          rejectedAt: now,
-          rejectionReason: body.rejectionReason,
-          ownerResponseDate: body.ownerResponseDate ?? todayIso(),
-          approvedAmount: 0,
-          updatedAt: now,
-        })
-        .where(eq(changeOrderRequests.id, corId));
+      /*
+       * A rejected request releases its PCOs: the priced positions survive
+       * and can be re-requested under a revised COR. The rejected request
+       * keeps its member list (`pcoIds`) as the record of what was asked.
+       */
+      await app.db.transaction(async (tx) => {
+        await tx
+          .update(changeOrderRequests)
+          .set({
+            status: "rejected",
+            rejectedBy: actorId,
+            rejectedAt: now,
+            rejectionReason: body.rejectionReason,
+            ownerResponseDate: body.ownerResponseDate ?? todayIso(),
+            approvedAmount: 0,
+            detail: { ...(cor.detail as Record<string, unknown>), releasedPcoIds: cor.pcoIds },
+            updatedAt: now,
+          })
+          .where(eq(changeOrderRequests.id, corId));
+        if (cor.pcoIds.length > 0) {
+          await tx
+            .update(potentialChangeOrders)
+            .set({ changeOrderRequestId: null, updatedAt: now })
+            .where(
+              and(
+                inArray(potentialChangeOrders.id, cor.pcoIds),
+                eq(potentialChangeOrders.changeOrderRequestId, corId),
+              ),
+            );
+        }
+      });
       await ledgerChange(app.db, req, "state_change", "change_order_request", corId, {
         reference: cor.reference,
         from: cor.status,
         to: "rejected",
         asked: round2(cor.amount),
         rejectionReason: body.rejectionReason,
+        releasedPcoIds: cor.pcoIds,
       });
       return fetchCor(app.db, corId, companyId, projectId);
     },
@@ -1007,11 +1035,39 @@ export async function corTimeImpact(
     detail: Record<string, unknown>;
   },
 ) {
-  const ids = delayEventIdsOf(cor);
+  return (await corTimeImpactBatch(db, [cor]))[0]!;
+}
+
+/**
+ * Time impact for MANY requests in one delay-event query. The project-wide
+ * time-impact report calls this once, not once per request.
+ */
+export async function corTimeImpactBatch(
+  db: Db,
+  cors: ReadonlyArray<{
+    id: string;
+    reference: string;
+    title: string;
+    status: string;
+    scheduleImpactDays: number;
+    scheduleImpactApprovedDays: number;
+    detail: Record<string, unknown>;
+  }>,
+) {
+  const allIds = [...new Set(cors.flatMap((c) => delayEventIdsOf(c)))];
   const rows =
-    ids.length > 0
-      ? await db.select().from(delayEvents).where(inArray(delayEvents.id, ids))
+    allIds.length > 0
+      ? await db.select().from(delayEvents).where(inArray(delayEvents.id, allIds))
       : [];
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  return cors.map((cor) => {
+    const ids = delayEventIdsOf(cor);
+    const mine = ids.map((id) => byId.get(id)).filter((r): r is (typeof rows)[number] => r !== undefined);
+    return assessCorTimeImpact(cor, ids, mapDelayRows(mine));
+  });
+}
+
+function mapDelayRows(rows: Array<typeof delayEvents.$inferSelect>): DelayEventRow[] {
   const linked: DelayEventRow[] = rows.map((r) => {
     const tia = (r.tiaResult ?? {}) as Record<string, unknown>;
     const delta = tia["completionDeltaDays"];
@@ -1028,6 +1084,6 @@ export async function corTimeImpact(
       completionDeltaDays: typeof delta === "number" && Number.isFinite(delta) ? delta : null,
     };
   });
-  return assessCorTimeImpact(cor, ids, linked);
+  return linked;
 }
 

@@ -15,6 +15,22 @@ export interface ListResponse<T> {
   pageSize: number;
 }
 
+/**
+ * A Particular Condition is STRUCTURED (#201-202): `amendment` is the human
+ * text, and the optional fields are what the time-bar engine acts on. An
+ * amendment with no structured bar is still flagged as amended so the UI can
+ * warn that the wording moved even where the engine cannot act on it.
+ */
+export interface ParticularCondition {
+  clauseRef: string;
+  amendment: string;
+  timeBarDays?: number | null;
+  noticeRequired?: boolean;
+  calendarBasis?: "calendar" | "working";
+  warnDaysBefore?: number;
+  deleted?: boolean;
+}
+
 export interface ContractRow {
   id: string;
   name: string;
@@ -24,14 +40,21 @@ export interface ContractRow {
   baseDate: string | null;
   commencementDate: string | null;
   completionDate: string | null;
+  takingOverDate: string | null;
+  actualCompletionDate: string | null;
   currency: string;
   contractSum: number | null;
   retentionPercent: number;
   retentionCap: number | null;
+  retentionReleaseAtTakingOver: number;
   defectsPeriodMonths: number | null;
   ldRatePerDay: number | null;
   ldCap: number | null;
-  particularConditions: { clauseRef: string; amendment: string }[];
+  paymentDueDays: number | null;
+  calendarBasis: string;
+  holidays: string[];
+  jurisdiction: string | null;
+  particularConditions: ParticularCondition[];
   status: string;
   createdAt: string;
 }
@@ -41,7 +64,14 @@ export interface EffectiveClause {
   title: string;
   summary: string;
   category: string;
+  /** the bar actually in force — the library value unless a PC replaces it */
   timeBarDays?: number | null;
+  /** the standard form's own bar, kept visible next to the amended one */
+  libraryTimeBarDays?: number | null;
+  deadlineSource?: string;
+  calendarBasis?: string;
+  warnDaysBefore?: number;
+  deleted?: boolean;
   noticeBy?: string | null;
   noticeRequired: boolean;
   standingObligation?: { party: string; description: string } | null;
@@ -49,10 +79,19 @@ export interface EffectiveClause {
   amendment: string | null;
 }
 
+export interface NecBasis {
+  basis: string;
+  painGainShare: boolean;
+  explanation: string;
+}
+
 export interface ContractDetail extends ContractRow {
   effectiveClauses: EffectiveClause[];
+  amendedClauseCount: number;
   obligationCount: number;
+  obligationStatus: Record<string, number>;
   eventCounts: Record<string, number>;
+  necBasis: NecBasis | null;
 }
 
 export interface ContractEventRow {
@@ -63,15 +102,111 @@ export interface ContractEventRow {
   title: string;
   description: string | null;
   eventDate: string;
+  awarenessDate: string | null;
   noticeDeadline: string | null;
+  effectiveTimeBarDays: number | null;
+  deadlineSource: string | null;
+  calendarBasis: string;
+  warnDaysBefore: number | null;
+  warnedAt: string | null;
   noticeServedAt: string | null;
   noticeMethod: string | null;
   noticeReference: string | null;
+  noticeServedLate: boolean;
+  deadlineAtService: string | null;
+  lateReason: string | null;
+  serviceEvidenceRef: string | null;
   status: string;
+  obligationId: string | null;
+  chainParentId: string | null;
+  chainStage: string | null;
+  ceState: string | null;
+  quotationDueDate: string | null;
+  replyDueDate: string | null;
   costImpactEstimate: number | null;
   timeImpactDaysEstimate: number | null;
   daysToDeadline?: number | null;
+  deadlineExplanation?: string;
+  chainedEvents?: Array<{
+    id: string;
+    number?: number;
+    title?: string;
+    clauseRef: string;
+    deadline?: string;
+    noticeDeadline?: string | null;
+    status?: string;
+    chainStage?: string | null;
+  }>;
   createdAt: string;
+}
+
+/* -------------------------- NEC compensation events ------------------------ */
+
+export interface CeQuotationRow {
+  id: string;
+  eventId: string;
+  number: number;
+  status: string;
+  currency: string;
+  components: Array<{
+    component: string;
+    description: string;
+    unit?: string | null;
+    qty: number;
+    rate: number;
+    amount: number;
+  }>;
+  definedCost: number;
+  feePercent: number;
+  fee: number;
+  riskAllowance: number;
+  total: number;
+  timeImpactDays: number;
+  assumptions: string | null;
+  submittedBy: string;
+  submittedAt: string;
+  replyDueDate: string | null;
+  repliedBy: string | null;
+  repliedAt: string | null;
+  replyReason: string | null;
+  deemedAcceptedAt: string | null;
+  clock?: { deemed: boolean; overdue: boolean; daysOverdue: number; reason: string };
+}
+
+export interface ProgrammeRow {
+  id: string;
+  number: number;
+  revision: string | null;
+  submittedAt: string;
+  submittedBy: string;
+  status: string;
+  decisionDueDate: string | null;
+  decisionAt: string | null;
+  decisionBy: string | null;
+  rejectionReason: string | null;
+  rejectionDetail: string | null;
+  plannedCompletion: string | null;
+  terminalFloatDays: number | null;
+  notes: string | null;
+}
+
+export interface ComplianceCheckRow {
+  id: string;
+  contractId: string;
+  contractName?: string | null;
+  kind: string;
+  clauseRef: string | null;
+  requirement: string;
+  requiredAmount: number | null;
+  currency: string;
+  requiredUntil: string | null;
+  evidenceType: string | null;
+  evidenceId: string | null;
+  evidenceExpiry: string | null;
+  evidenceAmount: number | null;
+  status: string;
+  reason: string | null;
+  lastCheckedAt: string | null;
 }
 
 export interface EotClaimRow {
@@ -98,20 +233,31 @@ export interface DeadlineItem {
   clauseRef: string | null;
   clauseTitle: string | null;
   eventDate: string;
+  awarenessDate?: string | null;
   noticeDeadline: string | null;
+  effectiveTimeBarDays?: number | null;
+  deadlineSource?: string | null;
+  calendarBasis?: string;
+  warnDaysBefore?: number | null;
   daysRemaining: number;
+  inWarningWindow?: boolean;
 }
 
 export type LdExposure =
-  | { applicable: false }
+  | { applicable: false; reason: string; currency?: string }
   | {
       applicable: true;
+      reason: string;
       completionDate: string;
+      accrualEndDate: string | null;
+      accrualEndBasis: string | null;
       daysLate: number;
       ldRatePerDay: number;
       ldCap: number | null;
       accrued: number;
       capReached: boolean;
+      frozen: boolean;
+      currency?: string;
     };
 
 /* --------------------------------- Labels ---------------------------------- */
@@ -332,4 +478,68 @@ export function DetailRow({ label, children }: { label: string; children: ReactN
       <span className="text-right text-sm text-ink-800">{children}</span>
     </div>
   );
+}
+
+
+/** Where a computed deadline came from, in words a user can act on. */
+export function deadlineSourceLabel(source: string | null | undefined): string {
+  switch (source) {
+    case "particular_condition":
+      return "Particular Condition";
+    case "library":
+      return "Standard form";
+    case "manual":
+      return "Entered for this event";
+    case "chain":
+      return "Follows the preceding notice";
+    default:
+      return "—";
+  }
+}
+
+export function complianceTone(status: string): string {
+  switch (status) {
+    case "compliant":
+      return "green";
+    case "expiring":
+      return "amber";
+    case "non_compliant":
+      return "red";
+    default:
+      return "gray";
+  }
+}
+
+export function ceStateTone(state: string | null | undefined): string {
+  switch (state) {
+    case "notified":
+      return "blue";
+    case "quotation_requested":
+      return "amber";
+    case "quotation_submitted":
+      return "violet";
+    case "pm_replied":
+      return "blue";
+    case "pm_assessment":
+      return "amber";
+    case "implemented":
+      return "green";
+    case "rejected":
+      return "red";
+    default:
+      return "gray";
+  }
+}
+
+export function programmeTone(status: string): string {
+  switch (status) {
+    case "accepted":
+      return "green";
+    case "rejected":
+      return "red";
+    case "superseded":
+      return "gray";
+    default:
+      return "blue";
+  }
 }

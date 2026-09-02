@@ -27,6 +27,7 @@ import {
   formLabel,
   isNecForm,
   type ContractRow,
+  deadlineSourceLabel,
   type DeadlineItem,
   type ListResponse,
 } from "./contractsShared";
@@ -211,10 +212,22 @@ export default function ContractsPage() {
                   onClick={() =>
                     navigate(`/projects/${projectId}/contracts/${d.contractId}?tab=events`)
                   }
-                  title={`${d.contractName ?? "Contract"} — ${d.title} (deadline ${formatDate(d.noticeDeadline)})`}
+                  title={`${d.contractName ?? "Contract"} — ${d.title} (deadline ${formatDate(d.noticeDeadline)}${
+                    d.effectiveTimeBarDays != null
+                      ? `, ${d.effectiveTimeBarDays} ${d.calendarBasis === "working" ? "working" : "calendar"} days`
+                      : ""
+                  }, ${deadlineSourceLabel(d.deadlineSource)})`}
                   className={`inline-flex max-w-full items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${radarChipClass(d.daysRemaining)}`}
                 >
                   {d.clauseRef ? <span className="font-mono">{d.clauseRef}</span> : null}
+                  {d.deadlineSource === "particular_condition" ? (
+                    <span
+                      className="rounded bg-violet-600 px-1 text-[10px] font-semibold text-white"
+                      title="This deadline comes from the contract's Particular Conditions, not the standard form"
+                    >
+                      PC
+                    </span>
+                  ) : null}
                   <span className="truncate">{d.title}</span>
                   <span className="font-semibold whitespace-nowrap">
                     {d.daysRemaining < 0

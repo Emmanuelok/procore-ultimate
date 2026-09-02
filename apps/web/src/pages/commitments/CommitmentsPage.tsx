@@ -15,11 +15,15 @@
  */
 import { useState } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
-import { Alert, PageHeader, Tabs } from "../../ui";
+import { Alert, Button, PageHeader, Tabs } from "../../ui";
+import BackchargesTab from "./BackchargesTab";
 import BuyoutTab from "./BuyoutTab";
 import CommitmentDrawer from "./CommitmentDrawer";
+import CreateCommitmentModal from "./CreateCommitmentModal";
 import ComplianceTab from "./ComplianceTab";
+import IntegrityTab from "./IntegrityTab";
 import RegisterTab from "./RegisterTab";
+import RunsTab from "./RunsTab";
 import {
   EMPTY_FILTERS,
   useBuyoutLog,
@@ -29,12 +33,15 @@ import {
   type RegisterFilters,
 } from "./shared";
 
-type TabKey = "register" | "compliance" | "buyout";
+type TabKey = "register" | "compliance" | "buyout" | "runs" | "backcharges" | "integrity";
 
 const TABS: Array<{ value: TabKey; label: string }> = [
   { value: "register", label: "Register" },
   { value: "compliance", label: "Compliance" },
   { value: "buyout", label: "Buyout log" },
+  { value: "runs", label: "Payment runs" },
+  { value: "backcharges", label: "Backcharges" },
+  { value: "integrity", label: "Integrity" },
 ];
 
 export default function CommitmentsPage() {
@@ -46,6 +53,7 @@ export default function CommitmentsPage() {
   });
   const [filters, setFilters] = useState<RegisterFilters>(EMPTY_FILTERS);
   const [openId, setOpenId] = useState<string | null>(() => searchParams.get("commitment"));
+  const [creating, setCreating] = useState(false);
 
   const register = useCommitmentRegister(projectId, filters);
   const compliance = useComplianceReport(projectId);
@@ -98,6 +106,7 @@ export default function CommitmentsPage() {
             </span>
           ) : null
         }
+        actions={<Button onClick={() => setCreating(true)}>Raise a commitment</Button>}
         tabs={
           <Tabs
             items={TABS.map((t) => ({
@@ -126,10 +135,28 @@ export default function CommitmentsPage() {
           onOpen={open}
         />
       ) : tab === "compliance" ? (
-        <ComplianceTab report={compliance} onOpen={open} />
-      ) : (
+        <ComplianceTab projectId={projectId} report={compliance} onOpen={open} />
+      ) : tab === "buyout" ? (
         <BuyoutTab log={buyout} />
+      ) : tab === "runs" ? (
+        <RunsTab projectId={projectId} />
+      ) : tab === "backcharges" ? (
+        <BackchargesTab projectId={projectId} onOpenCommitment={open} />
+      ) : (
+        <IntegrityTab projectId={projectId} onSynced={refreshProjectLevel} />
       )}
+
+      <CreateCommitmentModal
+        open={creating}
+        projectId={projectId}
+        vendors={vendors.data?.items ?? []}
+        onClose={() => setCreating(false)}
+        onCreated={(id) => {
+          setCreating(false);
+          refreshProjectLevel();
+          open(id);
+        }}
+      />
 
       <CommitmentDrawer
         commitmentId={openId}

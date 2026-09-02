@@ -7,6 +7,7 @@ import {
   changeOrderPackages,
   changeOrderRequests,
   changeQuoteRequests,
+  changeStatusHistory,
   contractEvents,
   dailyLogs,
   drawingRevisions,
@@ -104,7 +105,32 @@ export async function ledgerChange(
     payload: { projectId: projectOf(req), ...payload },
     storePayload: options.storePayload ?? false,
   });
+  /*
+   * Every status transition on the chain is ALSO materialised for the ageing
+   * and cycle-time analytics (#560–562). One hook point, so a transition
+   * cannot be ledgered without being dated here.
+   */
+  if (action === "state_change" && typeof payload["to"] === "string" && CHAIN_OBJECT_TYPES.has(objectType)) {
+    await db.insert(changeStatusHistory).values({
+      id: newId("csh"),
+      companyId: companyOf(req),
+      projectId: projectOf(req),
+      objectType,
+      objectId,
+      fromStatus: typeof payload["from"] === "string" ? (payload["from"] as string) : null,
+      toStatus: payload["to"] as string,
+      actorId: actorOf(req),
+    });
+  }
 }
+
+const CHAIN_OBJECT_TYPES = new Set([
+  "change_event",
+  "potential_change_order",
+  "change_quote_request",
+  "change_order_request",
+  "change_order_package",
+]);
 
 /* ------------------------------------------------------------------ */
 /* Segregation of duties (ADR 0004)                                    */

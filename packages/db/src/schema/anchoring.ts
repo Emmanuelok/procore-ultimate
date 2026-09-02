@@ -158,3 +158,46 @@ export const escrowReceipts = pgTable(
     index("escrow_receipts_seal_idx").on(t.sealId),
   ],
 );
+
+/**
+ * Per-company verification watermark (platform upgrade wave).
+ *
+ * WHY. Verifying a chain by loading every entry is O(chain) on a hot read
+ * path, and the chain grows with every mutation across 66 modules. The
+ * watermark makes verification incremental: the link from entry N to entry
+ * N+1 was checked once and cannot un-check itself unless the row changes, so
+ * a later verify only has to walk `seq > lastVerifiedSeq` starting from
+ * `lastVerifiedHash` — and a mismatch at the boundary is itself a finding
+ * (someone edited a range that was already verified).
+ *
+ * `deepVerifiedSeq` tracks the separate, more expensive pass that re-hashes
+ * stored payload SNAPSHOTS: the chain covers `payloadHash`, never the
+ * snapshot, so an insider who rewrites what an entry SAYS while leaving the
+ * hashes alone is only caught by reading the payloads. That pass runs in
+ * bounded batches from the scheduler, never on a request.
+ */
+export const chainWatermarks = pgTable(
+  "chain_watermarks",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    /** highest ledger seq whose link and content hash have been verified */
+    lastVerifiedSeq: integer("last_verified_seq").default(0).notNull(),
+    /** entryHash at that seq — the anchor the next incremental pass starts from */
+    lastVerifiedHash: text("last_verified_hash"),
+    /** entries verified so far (the running count, not a re-count) */
+    verifiedCount: integer("verified_count").default(0).notNull(),
+    /** highest seq whose stored payload snapshot was re-hashed */
+    deepVerifiedSeq: integer("deep_verified_seq").default(0).notNull(),
+    /** last verdict this watermark was left in: ok | broken */
+    lastVerdict: text("last_verdict").default("ok").notNull(),
+    /** when broken: where, and why, in words */
+    brokenAtSeq: integer("broken_at_seq"),
+    brokenReason: text("broken_reason"),
+    verifiedAt: timestamp("verified_at", { withTimezone: true, mode: "string" })
+      .defaultNow()
+      .notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [uniqueIndex("chain_watermarks_company_uq").on(t.companyId)],
+);

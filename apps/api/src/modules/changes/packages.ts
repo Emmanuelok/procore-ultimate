@@ -10,6 +10,7 @@ import {
   primeContractChanges,
   primeContractSovLines,
   primeContracts,
+  changeQuoteRequests,
 } from "@constructos/db";
 import {
   CHANGE_ORDER_PACKAGE_KINDS,
@@ -18,11 +19,12 @@ import {
 } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
-import { badRequest, conflict } from "../../lib/errors.js";
+import { AppError, badRequest, conflict } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { checkIdentity, round2 } from "./arithmetic.js";
 import { executeCommitmentPackage, executePrimePackage } from "./execute.js";
 import { recomputeEventRollup } from "./events.js";
+import { loadChangeConfig, skippedStages } from "./config.js";
 import {
   actorOf,
   assertSegregation,
@@ -182,6 +184,46 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
         "A commitment change order package must carry potential change orders against exactly one " +
           "commitment. Self-performed work has no subcontract to amend.",
       );
+    }
+    /*
+     * Tier enforcement (#563): a three-tier project refuses to package a PCO
+     * that skipped a mandatory stage — an approved owner request, and (when
+     * configured) an accepted RFQ for subcontract cost.
+     */
+    const config = await loadChangeConfig(app.db, projectId);
+    if (config.tier === "three_tier") {
+      const corIds = [...new Set(rows.map((r) => r.changeOrderRequestId).filter((x): x is string => !!x))];
+      const cors = corIds.length
+        ? await app.db
+            .select({ id: changeOrderRequests.id, status: changeOrderRequests.status })
+            .from(changeOrderRequests)
+            .where(inArray(changeOrderRequests.id, corIds))
+        : [];
+      const approvedCor = new Set(cors.filter((c) => c.status === "approved" || c.status === "partially_approved").map((c) => c.id));
+      const quotes = await app.db
+        .select({ pcoId: changeQuoteRequests.potentialChangeOrderId, status: changeQuoteRequests.status })
+        .from(changeQuoteRequests)
+        .where(inArray(changeQuoteRequests.potentialChangeOrderId, rows.map((r) => r.id)));
+      const accepted = new Set(quotes.filter((q) => q.status === "accepted").map((q) => q.pcoId));
+      const violations = rows
+        .map((r) => ({
+          reference: r.reference,
+          skipped: skippedStages(config, {
+            hasCor: !!r.changeOrderRequestId && approvedCor.has(r.changeOrderRequestId),
+            hasAcceptedQuote: accepted.has(r.id),
+            subcontract: r.commitmentId !== null,
+          }),
+        }))
+        .filter((v) => v.skipped.length > 0);
+      if (violations.length > 0) {
+        throw new AppError(
+          409,
+          `This project runs ${config.definition.label.toLowerCase()} change management (${config.stages.join(" → ")}). ` +
+            violations.map((v) => `${v.reference} skipped: ${v.skipped.join(", ")}`).join("; ") +
+            ". Complete the missing stage before packaging.",
+          { control: "change_tier", tier: config.tier, stages: config.stages, members: violations },
+        );
+      }
     }
     return rows;
   }

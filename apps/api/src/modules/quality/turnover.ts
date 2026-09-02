@@ -1008,170 +1008,190 @@ export const turnoverRoutes: FastifyPluginAsync = async (app) => {
         );
       }
 
-      for (const asset of assetRows) {
-        const fromIdx = ASSET_LIFECYCLE.indexOf(
-          asset.status as (typeof ASSET_LIFECYCLE)[number],
-        );
-        const toIdx = ASSET_LIFECYCLE.indexOf("operational");
-        const nextStatus = toIdx > fromIdx ? "operational" : asset.status;
-        await app.db
-          .update(assets)
-          .set({
-            status: nextStatus,
-            commissionedAt: asset.commissionedAt ?? today,
-            warrantyStart: asset.warrantyStart ?? warrantyStartDate,
-            updatedAt: at,
-          })
-          .where(eq(assets.id, asset.id));
-        linkedAssets.push(asset.id);
-        await ledger(app.db, {
-          companyId: req.companyId!,
-          projectId: req.projectId!,
-          actorId: req.user!.id,
-          action: "state_change",
-          objectType: "asset",
-          objectId: asset.id,
-          payload: {
-            from: asset.status,
-            to: nextStatus,
-            handedOverBy: pkg.reference,
-            turnoverPackageId: packageId,
-            warrantyStart: asset.warrantyStart ?? warrantyStartDate,
-          },
-          storePayload: true,
-        });
+      /*
+       * THE HAND-OVER IS ONE ACT.
+       *
+       * Assets move to operational, their IFC GUIDs are bound, warranty rows
+       * are created, the package is stamped and every system in it is turned
+       * over. Before this transaction those writes ran in sequence, so a
+       * failure halfway through left assets marked operational under a package
+       * that had never been accepted — an owner's asset register saying the
+       * building was handed over when it was not, and nothing to retry safely.
+       * Ledger appends are collected and written AFTER the commit, so the chain
+       * never records a hand-over that was rolled back.
+       */
+      interface PendingEntry {
+        action: "create" | "update" | "state_change";
+        objectType: "asset" | "asset_element_link" | "warranty" | "commissioning_system";
+        objectId: string;
+        payload: Record<string, unknown>;
+        storePayload?: boolean;
       }
+      const pending: PendingEntry[] = [];
 
-      // IFC bindings: each system's GUIDs belong to that system's asset.
-      const guidPairs: { assetId: string; globalId: string }[] = [];
-      for (const system of systems) {
-        if (!system.assetId) continue;
-        for (const globalId of system.ifcGlobalIds) {
-          guidPairs.push({ assetId: system.assetId, globalId });
+      const ifcGlobalIds = await app.db.transaction(async (tx) => {
+        for (const asset of assetRows) {
+          const fromIdx = ASSET_LIFECYCLE.indexOf(asset.status as (typeof ASSET_LIFECYCLE)[number]);
+          const toIdx = ASSET_LIFECYCLE.indexOf("operational");
+          const nextStatus = toIdx > fromIdx ? "operational" : asset.status;
+          await tx
+            .update(assets)
+            .set({
+              status: nextStatus,
+              commissionedAt: asset.commissionedAt ?? today,
+              warrantyStart: asset.warrantyStart ?? warrantyStartDate,
+              updatedAt: at,
+            })
+            .where(eq(assets.id, asset.id));
+          linkedAssets.push(asset.id);
+          pending.push({
+            action: "state_change",
+            objectType: "asset",
+            objectId: asset.id,
+            payload: {
+              from: asset.status,
+              to: nextStatus,
+              handedOverBy: pkg.reference,
+              turnoverPackageId: packageId,
+              warrantyStart: asset.warrantyStart ?? warrantyStartDate,
+            },
+            storePayload: true,
+          });
         }
-      }
-      // Anything the caller passed explicitly binds to the package's primary asset.
-      const primaryAssetId = systemAssetIds[0] ?? assetIdSet[0] ?? null;
-      for (const globalId of body.ifcGlobalIds ?? []) {
-        if (primaryAssetId) guidPairs.push({ assetId: primaryAssetId, globalId });
-      }
-      if ((body.ifcGlobalIds ?? []).length > 0 && !primaryAssetId) {
-        handoverReasons.push(
-          "IFC GUIDs were supplied but the package has no asset to bind them to, so no element links were created.",
-        );
-      }
-      for (const pair of uniq(guidPairs.map((p) => `${p.assetId}::${p.globalId}`))) {
-        const [assetId, globalId] = pair.split("::") as [string, string];
-        const existing = await app.db
-          .select({ id: assetElementLinks.id })
-          .from(assetElementLinks)
-          .where(
-            and(
-              eq(assetElementLinks.assetId, assetId),
-              eq(assetElementLinks.globalId, globalId),
-            ),
-          )
-          .limit(1);
-        if (existing[0]) continue;
-        const linkId = newId("ael");
-        await app.db.insert(assetElementLinks).values({
-          id: linkId,
-          assetId,
-          projectId: req.projectId!,
-          globalId,
-        });
-        createdLinks.push({ assetId, globalId });
-        await ledger(app.db, {
-          companyId: req.companyId!,
-          projectId: req.projectId!,
-          actorId: req.user!.id,
-          action: "create",
-          objectType: "asset_element_link",
-          objectId: linkId,
-          payload: { assetId, globalId, turnoverPackageId: packageId },
-        });
-      }
 
-      // Warranties are only created where the platform actually holds the
-      // dates and the provider — never invented from a default period.
-      if (warrantyEndDate && (body.warrantyProvider || pkg.vendorId)) {
-        for (const assetId of linkedAssets) {
-          const warrantyId = newId("wty");
-          await app.db.insert(warranties).values({
-            id: warrantyId,
-            companyId: req.companyId!,
-            projectId: req.projectId!,
+        // IFC bindings: each system's GUIDs belong to that system's asset.
+        const guidPairs: { assetId: string; globalId: string }[] = [];
+        for (const system of systems) {
+          if (!system.assetId) continue;
+          for (const globalId of system.ifcGlobalIds) {
+            guidPairs.push({ assetId: system.assetId, globalId });
+          }
+        }
+        // Anything the caller passed explicitly binds to the package's primary asset.
+        const primaryAssetId = systemAssetIds[0] ?? assetIdSet[0] ?? null;
+        for (const globalId of body.ifcGlobalIds ?? []) {
+          if (primaryAssetId) guidPairs.push({ assetId: primaryAssetId, globalId });
+        }
+        if ((body.ifcGlobalIds ?? []).length > 0 && !primaryAssetId) {
+          handoverReasons.push(
+            "IFC GUIDs were supplied but the package has no asset to bind them to, so no element links were created.",
+          );
+        }
+        for (const pair of uniq(guidPairs.map((p) => `${p.assetId}::${p.globalId}`))) {
+          const [assetId, globalId] = pair.split("::") as [string, string];
+          const existing = await tx
+            .select({ id: assetElementLinks.id })
+            .from(assetElementLinks)
+            .where(
+              and(eq(assetElementLinks.assetId, assetId), eq(assetElementLinks.globalId, globalId)),
+            )
+            .limit(1);
+          if (existing[0]) continue;
+          const linkId = newId("ael");
+          await tx.insert(assetElementLinks).values({
+            id: linkId,
             assetId,
-            provider: body.warrantyProvider ?? pkg.vendorId!,
-            description: `Warranty handed over under turnover package ${pkg.reference}`,
-            startDate: warrantyStartDate,
-            endDate: warrantyEndDate,
-          });
-          createdWarranties.push(warrantyId);
-          await ledger(app.db, {
-            companyId: req.companyId!,
             projectId: req.projectId!,
-            actorId: req.user!.id,
+            globalId,
+          });
+          createdLinks.push({ assetId, globalId });
+          pending.push({
             action: "create",
-            objectType: "warranty",
-            objectId: warrantyId,
-            payload: { assetId, startDate: warrantyStartDate, endDate: warrantyEndDate },
+            objectType: "asset_element_link",
+            objectId: linkId,
+            payload: { assetId, globalId, turnoverPackageId: packageId },
           });
         }
-      } else {
-        handoverReasons.push(
-          warrantyEndDate
-            ? "No warranty provider is recorded on the package or the accepting call, so no warranty rows were created in the twin."
-            : "No warranty end date is recorded, so no warranty rows were created in the twin — a warranty with an invented expiry is worse than none.",
-        );
-      }
 
-      const ifcGlobalIds = uniq([...pkg.ifcGlobalIds, ...guidPairs.map((p) => p.globalId)]);
-      await app.db
-        .update(turnoverPackages)
-        .set({
-          status: "handed_over",
-          acceptedBy: req.user!.id,
-          acceptedAt: at,
-          handedOverAt: at,
-          assetHandoverCompletedAt: at,
-          assetIds: linkedAssets,
-          assetCount: linkedAssets.length,
-          ifcGlobalIds,
-          cobieFileId: body.cobieFileId ?? pkg.cobieFileId,
-          warrantyIds: uniq([...pkg.warrantyIds, ...createdWarranties]),
-          warrantyStartDate,
-          warrantyEndDate,
-          beneficialUseDate,
-          requiredArtefactCount: readiness.artefacts.requiredArtefactCount,
-          presentArtefactCount: readiness.artefacts.presentArtefactCount,
-          openPunchItemCount: readiness.openPunchItems.length,
-          openNcrCount: readiness.openNcrs.length,
-          updatedAt: at,
-        })
-        .where(eq(turnoverPackages.id, packageId));
+        // Warranties are only created where the platform actually holds the
+        // dates and the provider — never invented from a default period.
+        if (warrantyEndDate && (body.warrantyProvider || pkg.vendorId)) {
+          for (const assetId of linkedAssets) {
+            const warrantyId = newId("wty");
+            await tx.insert(warranties).values({
+              id: warrantyId,
+              companyId: req.companyId!,
+              projectId: req.projectId!,
+              assetId,
+              provider: body.warrantyProvider ?? pkg.vendorId!,
+              description: `Warranty handed over under turnover package ${pkg.reference}`,
+              startDate: warrantyStartDate,
+              endDate: warrantyEndDate,
+            });
+            createdWarranties.push(warrantyId);
+            pending.push({
+              action: "create",
+              objectType: "warranty",
+              objectId: warrantyId,
+              payload: { assetId, startDate: warrantyStartDate, endDate: warrantyEndDate },
+            });
+          }
+        } else {
+          handoverReasons.push(
+            warrantyEndDate
+              ? "No warranty provider is recorded on the package or the accepting call, so no warranty rows were created in the twin."
+              : "No warranty end date is recorded, so no warranty rows were created in the twin — a warranty with an invented expiry is worse than none.",
+          );
+        }
 
-      for (const system of systems) {
-        await app.db
-          .update(commissioningSystems)
+        const allGuids = uniq([...pkg.ifcGlobalIds, ...guidPairs.map((p) => p.globalId)]);
+        await tx
+          .update(turnoverPackages)
           .set({
-            status: "turned_over",
-            turnoverPackageId: packageId,
-            warrantyStartDate: system.warrantyStartDate ?? warrantyStartDate,
-            beneficialUseDate: system.beneficialUseDate ?? beneficialUseDate,
-            actualCompletionDate: system.actualCompletionDate ?? today,
-            percentComplete: 100,
+            status: "handed_over",
+            acceptedBy: req.user!.id,
+            acceptedAt: at,
+            handedOverAt: at,
+            assetHandoverCompletedAt: at,
+            assetIds: linkedAssets,
+            assetCount: linkedAssets.length,
+            ifcGlobalIds: allGuids,
+            cobieFileId: body.cobieFileId ?? pkg.cobieFileId,
+            warrantyIds: uniq([...pkg.warrantyIds, ...createdWarranties]),
+            warrantyStartDate,
+            warrantyEndDate,
+            beneficialUseDate,
+            requiredArtefactCount: readiness.artefacts.requiredArtefactCount,
+            presentArtefactCount: readiness.artefacts.presentArtefactCount,
+            openPunchItemCount: readiness.openPunchItems.length,
+            openNcrCount: readiness.openNcrs.length,
             updatedAt: at,
           })
-          .where(eq(commissioningSystems.id, system.id));
+          .where(eq(turnoverPackages.id, packageId));
+
+        for (const system of systems) {
+          await tx
+            .update(commissioningSystems)
+            .set({
+              status: "turned_over",
+              turnoverPackageId: packageId,
+              warrantyStartDate: system.warrantyStartDate ?? warrantyStartDate,
+              beneficialUseDate: system.beneficialUseDate ?? beneficialUseDate,
+              actualCompletionDate: system.actualCompletionDate ?? today,
+              percentComplete: 100,
+              updatedAt: at,
+            })
+            .where(eq(commissioningSystems.id, system.id));
+          pending.push({
+            action: "state_change",
+            objectType: "commissioning_system",
+            objectId: system.id,
+            payload: { from: system.status, to: "turned_over", turnoverPackageId: packageId },
+          });
+        }
+        return allGuids;
+      });
+
+      for (const entry of pending) {
         await ledger(app.db, {
           companyId: req.companyId!,
           projectId: req.projectId!,
           actorId: req.user!.id,
-          action: "state_change",
-          objectType: "commissioning_system",
-          objectId: system.id,
-          payload: { from: system.status, to: "turned_over", turnoverPackageId: packageId },
+          action: entry.action,
+          objectType: entry.objectType,
+          objectId: entry.objectId,
+          payload: entry.payload,
+          storePayload: entry.storePayload,
         });
       }
 

@@ -1,11 +1,12 @@
 import type { FastifyPluginAsync } from "fastify";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import {
   billingPeriods,
   commitmentSovLines,
   commitments,
   invoices,
+  lienWaivers,
   primeContractSovLines,
   primeContracts,
   projects,
@@ -21,6 +22,7 @@ import {
   type AgingBucket,
 } from "./arithmetic.js";
 import {
+  outstandingOf,
   CENT,
   LIVE_INVOICE_STATUSES,
   byCurrency,
@@ -75,7 +77,7 @@ function ageInvoice(
   asOf: string,
   vendorName: Map<string, string>,
 ): AgedInvoice | UnagedInvoice {
-  const outstanding = round2(inv.currentPaymentDue - inv.amountPaid);
+  const outstanding = outstandingOf(inv);
   const anchor = inv.dueDate ?? inv.billingDate;
   if (!anchor) {
     return {
@@ -203,7 +205,7 @@ export const reportRoutes: FastifyPluginAsync = async (app) => {
     return rows.filter(
       (i) =>
         (LIVE_INVOICE_STATUSES as readonly string[]).includes(i.status) &&
-        i.currentPaymentDue - i.amountPaid > CENT,
+        outstandingOf(i) > CENT,
     );
   }
 
@@ -216,6 +218,72 @@ export const reportRoutes: FastifyPluginAsync = async (app) => {
    * Boundaries are inclusive at the top of each band: 30 days is 0-30, 31 is
    * 31-60, 60 is 31-60, 61 is 61-90, 90 is 61-90, 91 is 90+.
    */
+  /**
+   * HEALTH INPUTS (plan §3.5) for the intelligence layer's `finance`
+   * dimension. Counts and day-counts only: the money on this project may be
+   * in several currencies and adding them would produce a health score that
+   * is arithmetically wrong. Nothing here is invented — where a figure has no
+   * basis it is null and the reason says so.
+   */
+  app.get("/projects/:projectId/invoicing/health-inputs", { preHandler: readGate }, async (req) => {
+    const projectId = req.projectId!;
+    const asOf = todayIso();
+    const [live, waiverRows] = await Promise.all([
+      app.db.select().from(invoices).where(eq(invoices.projectId, projectId)),
+      app.db
+        .select({ invoiceId: lienWaivers.invoiceId, status: lienWaivers.status })
+        .from(lienWaivers)
+        .where(eq(lienWaivers.projectId, projectId)),
+    ]);
+    const satisfying = new Set(
+      waiverRows
+        .filter((w) => ["received", "verified", "not_required"].includes(w.status))
+        .map((w) => w.invoiceId)
+        .filter((id): id is string => !!id),
+    );
+    const outstanding = live.filter(
+      (i) => (LIVE_INVOICE_STATUSES as readonly string[]).includes(i.status) && outstandingOf(i) > CENT,
+    );
+    const overdue = outstanding.filter((i) => {
+      const basis = i.dueDate ?? i.billingDate;
+      return basis !== null && basis < asOf;
+    });
+    const undateable = outstanding.filter((i) => i.dueDate === null && i.billingDate === null);
+    const awaitingApproval = live.filter((i) =>
+      ["submitted", "under_review"].includes(i.status),
+    ).length;
+    const unwaived = live.filter(
+      (i) =>
+        i.requiresLienWaiver === 1 &&
+        ["approved", "approved_as_noted", "paid"].includes(i.status) &&
+        !satisfying.has(i.id),
+    ).length;
+    const ages = overdue
+      .map((i) => daysBetween(i.dueDate ?? i.billingDate!, asOf))
+      .sort((a, b) => b - a);
+    const reasons: string[] = [];
+    if (live.length === 0) reasons.push("Nothing has been billed on this project yet.");
+    if (undateable.length > 0) {
+      reasons.push(
+        `${undateable.length} outstanding invoice(s) carry neither a due date nor a billing date and cannot be aged.`,
+      );
+    }
+    return {
+      projectId,
+      asOf,
+      metrics: {
+        invoices: live.length,
+        outstandingInvoices: outstanding.length,
+        overdueInvoices: overdue.length,
+        oldestOverdueDays: ages.length > 0 ? ages[0]! : null,
+        invoicesAwaitingApproval: awaitingApproval,
+        paidWithoutWaiverOnFile: unwaived,
+        undateableInvoices: undateable.length,
+      },
+      reasons,
+    };
+  });
+
   app.get("/projects/:projectId/invoicing/aging", { preHandler: readGate }, async (req) => {
     const q = agingQuery.parse(req.query ?? {});
     const asOf = q.asOf ?? todayIso();
@@ -412,7 +480,7 @@ export const reportRoutes: FastifyPluginAsync = async (app) => {
     };
 
     for (const inv of live) {
-      const outstanding = round2(inv.currentPaymentDue - inv.amountPaid);
+      const outstanding = outstandingOf(inv);
       if (outstanding <= CENT) continue;
       const s = slice(inv.currency);
       const anchor = inv.dueDate ?? inv.billingDate;

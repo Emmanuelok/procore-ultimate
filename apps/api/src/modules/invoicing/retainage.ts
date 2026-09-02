@@ -112,6 +112,8 @@ interface HeldLine {
 
 interface HeldPosition {
   contractId: string;
+  /** the project the contract belongs to — a release on another project is refused */
+  projectId: string;
   reference: string;
   currency: string;
   vendorId: string | null;
@@ -152,6 +154,7 @@ async function heldPosition(
     if (!c) throw badRequest("primeContractId does not reference a prime contract");
     return {
       contractId,
+      projectId: c.projectId,
       reference: c.reference,
       currency: c.currency,
       vendorId: c.ownerVendorId,
@@ -185,6 +188,7 @@ async function heldPosition(
   if (!c) throw badRequest("commitmentId does not reference a commitment");
   return {
     contractId,
+    projectId: c.projectId,
     reference: c.reference,
     currency: c.currency,
     vendorId: c.vendorId,
@@ -200,6 +204,71 @@ async function heldPosition(
       retainageReleased: l.retainageReleased,
       totalCompletedAndStored: l.totalCompletedAndStored,
     })),
+  };
+}
+
+/**
+ * Every held position on a project in FOUR queries, not two per contract.
+ * The retainage summary calls this; a project with 150 subcontracts used to
+ * issue ~300 statements to open the tab.
+ */
+async function heldPositionsForProject(
+  db: Db,
+  companyId: string,
+  projectId: string,
+): Promise<{ primes: Array<HeldPosition & { title: string }>; commitments: Array<HeldPosition & { title: string }> }> {
+  const [primes, subs, primeLines, subLines] = await Promise.all([
+    db.select().from(primeContracts).where(and(eq(primeContracts.projectId, projectId), eq(primeContracts.companyId, companyId))),
+    db.select().from(commitments).where(and(eq(commitments.projectId, projectId), eq(commitments.companyId, companyId))),
+    db.select().from(primeContractSovLines).where(and(eq(primeContractSovLines.projectId, projectId), eq(primeContractSovLines.companyId, companyId))),
+    db.select().from(commitmentSovLines).where(and(eq(commitmentSovLines.projectId, projectId), eq(commitmentSovLines.companyId, companyId))),
+  ]);
+  const fold = <L extends HeldLine & { sortOrder: number }>(lines: L[]): HeldPosition["lines"] =>
+    lines
+      .sort((a, b) => a.sortOrder - b.sortOrder || a.lineNumber.localeCompare(b.lineNumber))
+      .map((l) => ({
+        id: l.id,
+        lineNumber: l.lineNumber,
+        costCode: l.costCode,
+        description: l.description,
+        retainagePercent: l.retainagePercent,
+        retainageHeld: l.retainageHeld,
+        retainageReleased: l.retainageReleased,
+        totalCompletedAndStored: l.totalCompletedAndStored,
+      }));
+  const primeBy = new Map<string, typeof primeLines>();
+  for (const l of primeLines) primeBy.set(l.primeContractId, [...(primeBy.get(l.primeContractId) ?? []), l]);
+  const subBy = new Map<string, typeof subLines>();
+  for (const l of subLines) subBy.set(l.commitmentId, [...(subBy.get(l.commitmentId) ?? []), l]);
+  return {
+    primes: primes.map((c) => {
+      const lines = primeBy.get(c.id) ?? [];
+      return {
+        contractId: c.id,
+        projectId: c.projectId,
+        reference: c.reference,
+        title: c.title,
+        currency: c.currency,
+        vendorId: c.ownerVendorId,
+        retainageHeld: round2(lines.reduce((s, l) => s + l.retainageHeld, 0)),
+        retainageReleased: round2(lines.reduce((s, l) => s + l.retainageReleased, 0)),
+        lines: fold(lines),
+      };
+    }),
+    commitments: subs.map((c) => {
+      const lines = subBy.get(c.id) ?? [];
+      return {
+        contractId: c.id,
+        projectId: c.projectId,
+        reference: c.reference,
+        title: c.title,
+        currency: c.currency,
+        vendorId: c.vendorId,
+        retainageHeld: round2(lines.reduce((s, l) => s + l.retainageHeld, 0)),
+        retainageReleased: round2(lines.reduce((s, l) => s + l.retainageReleased, 0)),
+        lines: fold(lines),
+      };
+    }),
   };
 }
 
@@ -296,6 +365,42 @@ export const retainageRoutes: FastifyPluginAsync = async (app) => {
     }
   }
 
+  /**
+   * A waiver named on a release must be THIS tenant's, on THIS project, and —
+   * for a commitment release — on THIS commitment. A prime-contract release
+   * has no subcontractor waiver to name.
+   */
+  async function assertWaiverLink(
+    scope: RetainageScope,
+    lienWaiverId: string,
+    companyId: string,
+    projectId: string,
+    contractId: string,
+  ): Promise<void> {
+    if (scope === "prime_contract") {
+      throw badRequest(
+        "A prime-contract retainage release is the owner's release to us; a subcontractor lien " +
+          "waiver does not gate it. Drop lienWaiverId, or raise the release on the commitment.",
+      );
+    }
+    const rows = await app.db
+      .select({ id: lienWaivers.id, commitmentId: lienWaivers.commitmentId, status: lienWaivers.status })
+      .from(lienWaivers)
+      .where(
+        and(
+          eq(lienWaivers.id, lienWaiverId),
+          eq(lienWaivers.companyId, companyId),
+          eq(lienWaivers.projectId, projectId),
+        ),
+      )
+      .limit(1);
+    const w = rows[0];
+    if (!w) throw badRequest("lienWaiverId does not reference a lien waiver on this project");
+    if (w.commitmentId !== contractId) {
+      throw badRequest("lienWaiverId references a waiver on a different commitment");
+    }
+  }
+
   app.post("/projects/:projectId/retainage-releases", { preHandler: standardGate }, async (req, reply) => {
     const body = releaseCreateSchema.parse(req.body);
     const projectId = req.projectId!;
@@ -317,6 +422,15 @@ export const retainageRoutes: FastifyPluginAsync = async (app) => {
       "recording a retainage release",
     );
     const position = await heldPosition(app.db, body.scope, contractId, companyId);
+    if (position.projectId !== projectId) {
+      throw badRequest(
+        `${position.reference} belongs to a different project. A retainage release is raised on ` +
+          "the project that holds the contract, by somebody with invoicing rights there.",
+      );
+    }
+    if (body.lienWaiverId) {
+      await assertWaiverLink(body.scope, body.lienWaiverId, companyId, projectId, contractId);
+    }
     const amount = round2(body.amount ?? position.retainageHeld);
     assertWithinHeld(position, amount, "This release");
 
@@ -372,7 +486,7 @@ export const retainageRoutes: FastifyPluginAsync = async (app) => {
       conditions: body.conditions ?? null,
       requiresLienWaiver: body.requiresLienWaiver === true ? 1 : 0,
       lienWaiverId: body.lienWaiverId ?? null,
-      detail: { ...(body.detail ?? {}), currency: position.currency },
+      detail: { ...(body.detail ?? {}), currency: position.currency, explicitAllocation: body.lines !== undefined },
       createdBy: req.user!.id,
       updatedAt: nowIso(),
     });
@@ -417,48 +531,30 @@ export const retainageRoutes: FastifyPluginAsync = async (app) => {
   app.get("/projects/:projectId/retainage-summary", { preHandler: readGate }, async (req) => {
     const projectId = req.projectId!;
     const companyId = req.companyId!;
-    const [primes, subs, releases] = await Promise.all([
-      app.db
-        .select()
-        .from(primeContracts)
-        .where(and(eq(primeContracts.projectId, projectId), eq(primeContracts.companyId, companyId))),
-      app.db
-        .select()
-        .from(commitments)
-        .where(and(eq(commitments.projectId, projectId), eq(commitments.companyId, companyId))),
+    const [positions, releases] = await Promise.all([
+      heldPositionsForProject(app.db, companyId, projectId),
       app.db
         .select()
         .from(retainageReleases)
         .where(eq(retainageReleases.projectId, projectId)),
     ]);
-
-    const receivable = await Promise.all(
-      primes.map(async (c) => {
-        const p = await heldPosition(app.db, "prime_contract", c.id, companyId);
-        return {
-          contractId: c.id,
-          reference: c.reference,
-          title: c.title,
-          currency: c.currency,
-          retainageHeld: p.retainageHeld,
-          retainageReleased: p.retainageReleased,
-        };
-      }),
-    );
-    const payable = await Promise.all(
-      subs.map(async (c) => {
-        const p = await heldPosition(app.db, "commitment", c.id, companyId);
-        return {
-          commitmentId: c.id,
-          reference: c.reference,
-          title: c.title,
-          vendorId: c.vendorId,
-          currency: c.currency,
-          retainageHeld: p.retainageHeld,
-          retainageReleased: p.retainageReleased,
-        };
-      }),
-    );
+    const receivable = positions.primes.map((p) => ({
+      contractId: p.contractId,
+      reference: p.reference,
+      title: p.title,
+      currency: p.currency,
+      retainageHeld: p.retainageHeld,
+      retainageReleased: p.retainageReleased,
+    }));
+    const payable = positions.commitments.map((p) => ({
+      commitmentId: p.contractId,
+      reference: p.reference,
+      title: p.title,
+      vendorId: p.vendorId,
+      currency: p.currency,
+      retainageHeld: p.retainageHeld,
+      retainageReleased: p.retainageReleased,
+    }));
 
     const fold = <T extends { currency: string; retainageHeld: number; retainageReleased: number }>(
       rows: T[],
@@ -533,6 +629,15 @@ export const retainageRoutes: FastifyPluginAsync = async (app) => {
     );
     const amount = body.amount !== undefined ? round2(body.amount) : release.amount;
     assertWithinHeld(position, amount, release.reference);
+    if (body.lienWaiverId) {
+      await assertWaiverLink(
+        release.scope as RetainageScope,
+        body.lienWaiverId,
+        req.companyId!,
+        release.projectId,
+        contractIdOf(release),
+      );
+    }
     const allocation =
       body.lines ??
       (body.amount !== undefined ? proRata(position.lines, amount) : (release.lines as unknown[]));
@@ -695,118 +800,179 @@ export const retainageRoutes: FastifyPluginAsync = async (app) => {
       );
     }
     if (release.requiresLienWaiver === 1 && body.overrideMissingWaiver !== true) {
-      const waivers = await app.db
-        .select({ id: lienWaivers.id, reference: lienWaivers.reference, status: lienWaivers.status })
-        .from(lienWaivers)
-        .where(
-          release.lienWaiverId
-            ? eq(lienWaivers.id, release.lienWaiverId)
-            : eq(lienWaivers.commitmentId, release.commitmentId ?? ""),
+      if (release.scope === "prime_contract") {
+        /*
+         * The owner releases retainage TO us; there is no subcontractor waiver
+         * to gate it on. The flag is inapplicable here and is reported, never
+         * silently turned into a permanent block.
+         */
+      } else {
+        const waivers = await app.db
+          .select({ id: lienWaivers.id, reference: lienWaivers.reference, status: lienWaivers.status, commitmentId: lienWaivers.commitmentId })
+          .from(lienWaivers)
+          .where(
+            and(
+              eq(lienWaivers.companyId, req.companyId!),
+              eq(lienWaivers.projectId, release.projectId),
+              release.lienWaiverId
+                ? eq(lienWaivers.id, release.lienWaiverId)
+                : eq(lienWaivers.commitmentId, release.commitmentId ?? ""),
+            ),
+          );
+        const onFile = waivers.filter(
+          (w) => isSatisfyingWaiver(w.status) && w.commitmentId === release.commitmentId,
         );
-      const onFile = waivers.filter((w) => isSatisfyingWaiver(w.status));
-      if (onFile.length === 0) {
-        throw new AppError(
-          409,
-          `Retainage release ${release.reference} requires a lien waiver and none is on file` +
-            (waivers.length > 0
-              ? `: ${waivers.map((w) => `${w.reference} (${w.status})`).join(", ")}.`
-              : ".") +
-            " Final retainage is the payment most often followed by a lien claim.",
-          { control: "lien_waiver_required", waivers },
-        );
+        if (onFile.length === 0) {
+          throw new AppError(
+            409,
+            `Retainage release ${release.reference} requires a lien waiver and none is on file` +
+              (waivers.length > 0
+                ? `: ${waivers.map((w) => `${w.reference} (${w.status})`).join(", ")}.`
+                : ".") +
+              " Final retainage is the payment most often followed by a lien claim.",
+            { control: "lien_waiver_required", waivers },
+          );
+        }
       }
     }
 
     const contractId = contractIdOf(release);
-    const position = await heldPosition(
-      app.db,
-      release.scope as RetainageScope,
-      contractId,
-      req.companyId!,
-    );
-    assertWithinHeld(position, release.amount, release.reference);
-
-    const allocation = (release.lines as Array<{ sovLineId: string; amount: number }>).length
-      ? (release.lines as Array<{ sovLineId: string; amount: number }>)
-      : proRata(position.lines, release.amount);
     const now = nowIso();
-    const byId = new Map(position.lines.map((l) => [l.id, l]));
-    for (const alloc of allocation) {
-      const line = byId.get(alloc.sovLineId);
-      if (!line) continue;
-      const released = round2(line.retainageReleased + alloc.amount);
-      const held = round2(line.retainageHeld - alloc.amount);
-      if (release.scope === "prime_contract") {
-        await app.db
-          .update(primeContractSovLines)
-          .set({
-            retainageReleased: released,
-            retainageHeld: held,
-            ...(release.newRetainagePercent != null
-              ? { retainagePercent: release.newRetainagePercent }
-              : {}),
-            updatedAt: now,
-          })
-          .where(eq(primeContractSovLines.id, line.id));
-      } else {
-        await app.db
-          .update(commitmentSovLines)
-          .set({
-            retainageReleased: released,
-            retainageHeld: held,
-            ...(release.newRetainagePercent != null
-              ? { retainagePercent: release.newRetainagePercent }
-              : {}),
-            updatedAt: now,
-          })
-          .where(eq(commitmentSovLines.id, line.id));
+    let after: HeldPosition | null = null;
+    let allocation: Array<{ sovLineId: string; amount: number }> = [];
+    let positionBefore: HeldPosition | null = null;
+    /*
+     * ONE transaction with the contract's lines re-read inside it: the
+     * position is the position NOW, not the draft's. If it moved since the
+     * draft the pro-rata is re-run over the live lines; an explicit
+     * allocation that would drive any line negative is refused, naming the
+     * line, rather than written.
+     */
+    await app.db.transaction(async (tx) => {
+      const position = await heldPosition(tx, release.scope as RetainageScope, contractId, req.companyId!);
+      positionBefore = position;
+      assertWithinHeld(position, release.amount, release.reference);
+      const stored = release.lines as Array<{ sovLineId: string; amount: number }>;
+      const byId = new Map(position.lines.map((l) => [l.id, l]));
+      const stillValid =
+        stored.length > 0 &&
+        Math.abs(round2(stored.reduce((s, a) => s + a.amount, 0)) - release.amount) <= CENT &&
+        stored.every((a) => {
+          const line = byId.get(a.sovLineId);
+          return line !== undefined && a.amount - line.retainageHeld <= CENT;
+        });
+      const wasExplicit = ((release.detail as Record<string, unknown>)["explicitAllocation"] as boolean | undefined) === true;
+      if (!stillValid && wasExplicit && stored.length > 0) {
+        const offending = stored.filter((a) => {
+          const line = byId.get(a.sovLineId);
+          return !line || a.amount - line.retainageHeld > CENT;
+        });
+        throw conflict(
+          `The allocation on ${release.reference} no longer fits the retainage held: ` +
+            offending
+              .map((a) => {
+                const line = byId.get(a.sovLineId);
+                return line
+                  ? `line ${line.lineNumber} holds ${formatMoney(line.retainageHeld)} but is allocated ${formatMoney(a.amount)}`
+                  : `line ${a.sovLineId} no longer exists`;
+              })
+              .join("; ") +
+            ". Re-allocate the release against the current position.",
+          );
       }
-    }
-    if (release.scope === "prime_contract") await recomputePrimeBilling(app.db, contractId);
-    else await recomputeCommitmentBilling(app.db, contractId);
+      allocation = stillValid ? stored : proRata(position.lines, release.amount);
+      for (const alloc of allocation) {
+        const line = byId.get(alloc.sovLineId);
+        if (!line) continue;
+        const released = round2(line.retainageReleased + alloc.amount);
+        const held = round2(line.retainageHeld - alloc.amount);
+        if (held < -CENT) {
+          throw conflict(
+            `Line ${line.lineNumber} on ${position.reference} holds ${formatMoney(line.retainageHeld)} ` +
+              `and cannot release ${formatMoney(alloc.amount)}.`,
+          );
+        }
+        if (release.scope === "prime_contract") {
+          await tx
+            .update(primeContractSovLines)
+            .set({
+              retainageReleased: released,
+              retainageHeld: Math.max(0, held),
+              ...(release.newRetainagePercent != null
+                ? { retainagePercent: release.newRetainagePercent }
+                : {}),
+              updatedAt: now,
+            })
+            .where(eq(primeContractSovLines.id, line.id));
+        } else {
+          await tx
+            .update(commitmentSovLines)
+            .set({
+              retainageReleased: released,
+              retainageHeld: Math.max(0, held),
+              ...(release.newRetainagePercent != null
+                ? { retainagePercent: release.newRetainagePercent }
+                : {}),
+              updatedAt: now,
+            })
+            .where(eq(commitmentSovLines.id, line.id));
+        }
+      }
+      if (release.scope === "prime_contract") await recomputePrimeBilling(tx, contractId);
+      else await recomputeCommitmentBilling(tx, contractId);
 
-    const after = await heldPosition(
-      app.db,
-      release.scope as RetainageScope,
-      contractId,
-      req.companyId!,
-    );
-    await app.db
-      .update(retainageReleases)
-      .set({
-        status: "released",
-        releaseDate: body.releaseDate ?? todayIso(),
-        retainageHeldAfter: after.retainageHeld,
-        lines: allocation,
-        detail: {
-          ...(release.detail as Record<string, unknown>),
-          ...(body.overrideMissingWaiver === true
-            ? { waiverOverriddenBy: req.user!.id, waiverOverriddenAt: now }
-            : {}),
-        },
-        updatedAt: now,
-      })
-      .where(eq(retainageReleases.id, releaseId));
+      after = await heldPosition(tx, release.scope as RetainageScope, contractId, req.companyId!);
+      await tx
+        .update(retainageReleases)
+        .set({
+          status: "released",
+          releaseDate: body.releaseDate ?? todayIso(),
+          retainageHeldBefore: position.retainageHeld,
+          retainageHeldAfter: after.retainageHeld,
+          lines: allocation,
+          detail: {
+            ...(release.detail as Record<string, unknown>),
+            reallocatedAtRelease: !stillValid,
+            ...(body.overrideMissingWaiver === true
+              ? { waiverOverriddenBy: req.user!.id, waiverOverriddenAt: now }
+              : {}),
+          },
+          updatedAt: now,
+        })
+        .where(eq(retainageReleases.id, releaseId));
 
-    // The invoice that carried the release, if any, now shows it on its face.
-    if (release.invoiceId) {
-      await app.db
-        .update(invoices)
-        .set({ retainageReleased: release.amount, updatedAt: now })
-        .where(eq(invoices.id, release.invoiceId));
-    }
+      /*
+       * The invoice that carried the release shows the releases ACCUMULATED
+       * on its face — a second release against the same invoice adds to the
+       * first rather than replacing it. Its sworn columns are otherwise
+       * untouched.
+       */
+      if (release.invoiceId) {
+        const inv = (
+          await tx.select({ retainageReleased: invoices.retainageReleased }).from(invoices).where(eq(invoices.id, release.invoiceId)).limit(1)
+        )[0];
+        if (inv) {
+          await tx
+            .update(invoices)
+            .set({ retainageReleased: round2(inv.retainageReleased + release.amount), updatedAt: now })
+            .where(eq(invoices.id, release.invoiceId));
+        }
+      }
+    });
+    const position = positionBefore!;
+    const afterPos = after!;
 
     await ledger(app.db, req, "state_change", "retainage_release", releaseId, {
       from: "approved",
       to: "released",
       amount: release.amount,
       retainageHeldBefore: position.retainageHeld,
-      retainageHeldAfter: after.retainageHeld,
+      retainageHeldAfter: afterPos.retainageHeld,
       newRetainagePercent: release.newRetainagePercent,
       allocation,
       waiverOverridden: body.overrideMissingWaiver === true,
     }, release.projectId, true);
-    return { ...(await fetchRelease(releaseId, req.companyId!)), currentlyHeld: after.retainageHeld };
+    return { ...(await fetchRelease(releaseId, req.companyId!)), currentlyHeld: afterPos.retainageHeld };
   });
 
   app.post("/retainage-releases/:releaseId/void", { preHandler: companyGate }, async (req, reply) => {

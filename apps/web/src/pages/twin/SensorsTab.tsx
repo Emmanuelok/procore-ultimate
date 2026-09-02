@@ -1,14 +1,27 @@
 /**
- * Sensor / IoT tab — channels bound to assets, hourly-bucketed sparklines
- * with threshold lines, and a 24h synthetic-data simulator that demonstrates
- * threshold breach detection (spec Domain L #659-661).
+ * Sensors tab — channels, telemetry and the alert register
+ * (spec Domain L #659-661).
+ *
+ * The whole tab loads in ONE request (`/sensors/overview`): the previous
+ * version issued a readings query per sensor on every mount, which is a
+ * GROUP BY per sensor over 48 hours of data every time somebody looked at the
+ * page. Charts are fetched only for the sensor a person actually opens.
+ *
+ * The "simulate" control writes telemetry tagged as synthetic, is only shown
+ * when the API says the environment allows it, and raises no alerts, events
+ * or signals — a demo must not be able to write into the assurance record.
  */
 import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { toast } from "sonner";
 import { SENSOR_KINDS } from "@constructos/shared";
 import { api, ApiClientError } from "../../lib/api";
 import {
   Badge,
   Button,
+  Card,
+  CardBody,
+  Drawer,
+  DrawerBody,
   EmptyState,
   ErrorAlert,
   Field,
@@ -23,66 +36,65 @@ import {
 import { formatDateTime, humanize } from "../format";
 import {
   Sparkline,
-  type Asset,
+  type AssetRow,
+  type CompanyUser,
   type ListResponse,
   type ReadingBucket,
-  type Sensor,
+  type SensorAlert,
+  type SensorOverviewRow,
+  type TwinSummary,
 } from "./twinShared";
 
-interface LastValue {
-  value: number;
-  at: string;
-}
-
-export default function SensorsTab({ projectId }: { projectId: string }) {
-  const [items, setItems] = useState<Sensor[] | null>(null);
-  const [assets, setAssets] = useState<Asset[]>([]);
+export default function SensorsTab({
+  projectId,
+  summary,
+  onChanged,
+}: {
+  projectId: string;
+  summary: TwinSummary | null;
+  onChanged: () => void;
+}) {
+  const [rows, setRows] = useState<SensorOverviewRow[] | null>(null);
+  const [alerts, setAlerts] = useState<SensorAlert[] | null>(null);
+  const [assets, setAssets] = useState<AssetRow[]>([]);
+  const [users, setUsers] = useState<CompanyUser[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [lastValues, setLastValues] = useState<Record<string, LastValue | null>>({});
-
-  const [expandedId, setExpandedId] = useState<string | null>(null);
-  const [buckets, setBuckets] = useState<ReadingBucket[] | null>(null);
-  const [bucketsError, setBucketsError] = useState<string | null>(null);
-  const [simBusy, setSimBusy] = useState(false);
-  const [simNote, setSimNote] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
   const [createOpen, setCreateOpen] = useState(false);
   const [form, setForm] = useState({
     name: "",
     kind: "temperature",
-    unit: "°C",
+    unit: "",
     assetId: "",
+    ownerId: "",
     minValue: "",
     maxValue: "",
+    designSetpoint: "",
+    staleAfterMinutes: "",
   });
-  const [createError, setCreateError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+
+  const [detail, setDetail] = useState<SensorOverviewRow | null>(null);
+  const [buckets, setBuckets] = useState<ReadingBucket[] | null>(null);
+  const [readingsNote, setReadingsNote] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
     try {
-      const res = await api.get<ListResponse<Sensor>>(
-        `/api/v1/projects/${projectId}/sensors?pageSize=100`,
-      );
-      setItems(res.items);
-      // fetch a compact last-value per sensor (48h window, hourly buckets)
-      const from = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
-      const results = await Promise.all(
-        res.items.map(async (s) => {
-          try {
-            const r = await api.get<{ items: ReadingBucket[] }>(
-              `/api/v1/sensors/${s.id}/readings?from=${encodeURIComponent(from)}&bucketMinutes=60`,
-            );
-            const last = r.items[r.items.length - 1];
-            return [s.id, last ? { value: last.avg, at: last.bucketStart } : null] as const;
-          } catch {
-            return [s.id, null] as const;
-          }
-        }),
-      );
-      setLastValues(Object.fromEntries(results));
+      const [overview, alertList] = await Promise.all([
+        api.get<{ items: SensorOverviewRow[] }>(
+          `/api/v1/projects/${projectId}/sensors/overview?hours=24`,
+        ),
+        api.get<ListResponse<SensorAlert>>(
+          `/api/v1/projects/${projectId}/sensor-alerts?pageSize=50`,
+        ),
+      ]);
+      setRows(overview.items);
+      setAlerts(alertList.items);
     } catch (err) {
-      setItems([]);
+      setRows([]);
+      setAlerts([]);
       setError(err instanceof Error ? err.message : "Failed to load sensors");
     }
   }, [projectId]);
@@ -93,82 +105,18 @@ export default function SensorsTab({ projectId }: { projectId: string }) {
 
   useEffect(() => {
     api
-      .get<ListResponse<Asset>>(`/api/v1/projects/${projectId}/assets?pageSize=100`)
+      .get<ListResponse<AssetRow>>(`/api/v1/projects/${projectId}/assets?pageSize=200`)
       .then((res) => setAssets(res.items))
       .catch(() => setAssets([]));
+    api
+      .get<ListResponse<CompanyUser>>("/api/v1/company/users?pageSize=200")
+      .then((res) => setUsers(res.items))
+      .catch(() => setUsers([]));
   }, [projectId]);
 
-  const loadBuckets = useCallback(async (sensorId: string) => {
-    setBuckets(null);
-    setBucketsError(null);
-    try {
-      const from = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
-      const res = await api.get<{ items: ReadingBucket[] }>(
-        `/api/v1/sensors/${sensorId}/readings?from=${encodeURIComponent(from)}&bucketMinutes=60`,
-      );
-      setBuckets(res.items);
-    } catch (err) {
-      setBuckets([]);
-      setBucketsError(err instanceof Error ? err.message : "Failed to load readings");
-    }
-  }, []);
-
-  function toggleExpand(sensorId: string) {
-    setSimNote(null);
-    if (expandedId === sensorId) {
-      setExpandedId(null);
-      setBuckets(null);
-      return;
-    }
-    setExpandedId(sensorId);
-    void loadBuckets(sensorId);
-  }
-
-  /**
-   * Simulate 24h of hourly readings: a sine wave around the threshold
-   * midpoint with one deliberate outlier above max to demo breach handling.
-   */
-  async function simulate(sensor: Sensor) {
-    setSimBusy(true);
-    setSimNote(null);
-    setBucketsError(null);
-    try {
-      const min = sensor.minValue;
-      const max = sensor.maxValue;
-      const mid = min !== null && max !== null ? (min + max) / 2 : (max ?? min ?? 21);
-      const amp =
-        min !== null && max !== null ? Math.max((max - min) / 3, 0.5) : Math.abs(mid) * 0.1 + 1;
-      const now = Date.now();
-      const readings = Array.from({ length: 24 }, (_, i) => {
-        const at = new Date(now - (23 - i) * 3600 * 1000).toISOString();
-        let value = mid + amp * Math.sin((2 * Math.PI * i) / 24);
-        if (i === 18) {
-          // one outlier beyond the max threshold to demonstrate a breach
-          value = max !== null ? max + amp : mid + amp * 3;
-        }
-        return { value: Number(value.toFixed(3)), at };
-      });
-      const res = await api.post<{ inserted: number; breaches: number }>(
-        `/api/v1/sensors/${sensor.id}/readings`,
-        { readings },
-      );
-      setSimNote(
-        `Ingested ${res.inserted} readings — ${res.breaches} threshold breach${
-          res.breaches === 1 ? "" : "es"
-        } detected and written to the assurance event stream.`,
-      );
-      await loadBuckets(sensor.id);
-      await load();
-    } catch (err) {
-      setBucketsError(err instanceof ApiClientError ? err.message : "Simulation failed.");
-    } finally {
-      setSimBusy(false);
-    }
-  }
-
-  async function onCreate(e: FormEvent) {
+  async function createSensor(e: FormEvent) {
     e.preventDefault();
-    setCreateError(null);
+    setFormError(null);
     setBusy(true);
     try {
       const payload: Record<string, unknown> = {
@@ -177,171 +125,283 @@ export default function SensorsTab({ projectId }: { projectId: string }) {
         unit: form.unit.trim(),
       };
       if (form.assetId) payload["assetId"] = form.assetId;
-      if (form.minValue !== "") payload["minValue"] = Number(form.minValue);
-      if (form.maxValue !== "") payload["maxValue"] = Number(form.maxValue);
+      if (form.ownerId) payload["ownerId"] = form.ownerId;
+      if (form.minValue) payload["minValue"] = Number(form.minValue);
+      if (form.maxValue) payload["maxValue"] = Number(form.maxValue);
+      if (form.designSetpoint) payload["designSetpoint"] = Number(form.designSetpoint);
+      if (form.staleAfterMinutes) payload["staleAfterMinutes"] = Number(form.staleAfterMinutes);
       await api.post(`/api/v1/projects/${projectId}/sensors`, payload);
       setCreateOpen(false);
-      setForm({ name: "", kind: "temperature", unit: "°C", assetId: "", minValue: "", maxValue: "" });
+      setForm({
+        name: "",
+        kind: "temperature",
+        unit: "",
+        assetId: "",
+        ownerId: "",
+        minValue: "",
+        maxValue: "",
+        designSetpoint: "",
+        staleAfterMinutes: "",
+      });
       await load();
+      onChanged();
     } catch (err) {
-      setCreateError(err instanceof ApiClientError ? err.message : "Failed to create the sensor.");
+      setFormError(err instanceof ApiClientError ? err.message : "Failed to create the sensor.");
     } finally {
       setBusy(false);
     }
   }
 
-  const assetName = (assetId: string | null) =>
-    assetId ? (assets.find((a) => a.id === assetId)?.tagCode ?? "linked") : null;
+  async function openDetail(sensor: SensorOverviewRow) {
+    setDetail(sensor);
+    setBuckets(null);
+    setReadingsNote(null);
+    try {
+      const res = await api.get<{ items: ReadingBucket[]; bucketMinutes: number }>(
+        `/api/v1/sensors/${sensor.id}/readings?bucketMinutes=60`,
+      );
+      setBuckets(res.items);
+      setReadingsNote(
+        res.items.length === 0
+          ? "No readings have been ingested for this channel yet."
+          : `${res.items.length} hourly buckets.`,
+      );
+    } catch (err) {
+      setBuckets([]);
+      setReadingsNote(err instanceof Error ? err.message : "Readings unavailable");
+    }
+  }
+
+  async function toggleActive(sensor: SensorOverviewRow) {
+    setBusy(true);
+    try {
+      await api.patch(`/api/v1/sensors/${sensor.id}`, { isActive: sensor.isActive !== "true" });
+      await load();
+    } catch (err) {
+      toast.error(err instanceof ApiClientError ? err.message : "The change was refused.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function acknowledge(alert: SensorAlert) {
+    setBusy(true);
+    try {
+      await api.patch(`/api/v1/sensor-alerts/${alert.id}`, { status: "acknowledged" });
+      toast.success("Alert acknowledged.");
+      await load();
+      onChanged();
+    } catch (err) {
+      toast.error(err instanceof ApiClientError ? err.message : "The change was refused.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function simulate(sensor: SensorOverviewRow) {
+    setBusy(true);
+    try {
+      const res = await api.post<{ inserted: number; note: string }>(
+        `/api/v1/projects/${projectId}/sensors/${sensor.id}/simulate`,
+        { hours: 24 },
+      );
+      toast.success(`${res.inserted} synthetic readings written. ${res.note}`);
+      await load();
+    } catch (err) {
+      toast.error(
+        err instanceof ApiClientError ? err.message : "Synthetic telemetry is not available here.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const openAlerts = (alerts ?? []).filter(
+    (a) => a.status === "open" || a.status === "acknowledged",
+  );
 
   return (
     <div>
-      <div className="mb-4 flex items-center justify-between">
-        <span className="text-xs text-ink-400">
-          Sensor channels stream operational data into the twin; thresholds feed the assurance
-          event stream on breach.
-        </span>
+      <div className="mb-3 flex items-center justify-between">
+        <h2 className="text-sm font-semibold text-ink-900">Sensor channels</h2>
         <Button onClick={() => setCreateOpen(true)}>New sensor</Button>
       </div>
 
       <ErrorAlert message={error} />
 
-      {items === null ? (
+      {openAlerts.length > 0 ? (
+        <Card className="mb-4">
+          <CardBody>
+            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-500">
+              Open alerts ({openAlerts.length})
+            </h3>
+            <Table>
+              <thead>
+                <tr>
+                  <Th>Sensor</Th>
+                  <Th>Asset</Th>
+                  <Th>Kind</Th>
+                  <Th className="text-right">Worst value</Th>
+                  <Th className="text-right">Breaches</Th>
+                  <Th>Since</Th>
+                  <Th className="text-right">Actions</Th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-ink-100">
+                {openAlerts.map((a) => (
+                  <tr key={a.id}>
+                    <Td>{a.sensorName ?? a.sensorId}</Td>
+                    <Td>{a.assetTag ? `${a.assetTag} — ${a.assetName}` : "—"}</Td>
+                    <Td>
+                      <Badge tone={a.kind === "stale" ? "warning" : "danger"} size="sm">
+                        {humanize(a.kind)}
+                      </Badge>
+                    </Td>
+                    <Td className="text-right tabular-nums">
+                      {a.value === null ? "—" : `${a.value} ${a.unit ?? ""}`}
+                      {a.threshold !== null ? (
+                        <span className="block text-[11px] text-ink-400">
+                          limit {a.threshold}
+                        </span>
+                      ) : null}
+                    </Td>
+                    <Td className="text-right tabular-nums">{a.breachCount}</Td>
+                    <Td className="text-xs">{formatDateTime(a.firstBreachAt)}</Td>
+                    <Td className="text-right">
+                      {a.status === "open" ? (
+                        <Button size="sm" variant="secondary" disabled={busy} onClick={() => void acknowledge(a)}>
+                          Acknowledge
+                        </Button>
+                      ) : (
+                        <span className="text-[11px] text-ink-400">acknowledged</span>
+                      )}
+                    </Td>
+                  </tr>
+                ))}
+              </tbody>
+            </Table>
+          </CardBody>
+        </Card>
+      ) : null}
+
+      {rows === null ? (
         <Spinner label="Loading sensors…" />
-      ) : items.length === 0 ? (
+      ) : rows.length === 0 ? (
         <EmptyState
-          title="No sensors yet"
-          hint="Create a sensor channel (temperature, energy, vibration…) and bind it to an asset, then simulate 24h of readings to see thresholds in action."
-          action={<Button onClick={() => setCreateOpen(true)}>Create a sensor</Button>}
+          title="No sensors"
+          hint="Create a channel and point a gateway at the project-scoped ingest route; readings are unique per instant, so a retried batch is a no-op."
+          action={<Button onClick={() => setCreateOpen(true)}>Add a sensor</Button>}
         />
       ) : (
         <Table>
           <thead>
             <tr>
-              <Th></Th>
               <Th>Sensor</Th>
               <Th>Kind</Th>
-              <Th>Unit</Th>
               <Th>Asset</Th>
-              <Th>Thresholds</Th>
               <Th className="text-right">Last value</Th>
+              <Th className="text-right">24h average</Th>
+              <Th>Thresholds</Th>
+              <Th>State</Th>
+              <Th className="text-right">Actions</Th>
             </tr>
           </thead>
           <tbody className="divide-y divide-ink-100">
-            {items.map((s) => {
-              const last = lastValues[s.id];
-              const breach =
-                last != null &&
-                ((s.maxValue !== null && last.value > s.maxValue) ||
-                  (s.minValue !== null && last.value < s.minValue));
-              const expanded = expandedId === s.id;
-              return [
+            {rows.map((s) => {
+              const asset = assets.find((a) => a.id === s.assetId);
+              return (
                 <tr key={s.id} className="hover:bg-ink-50/60">
-                  <Td className="w-8">
-                    <button
-                      type="button"
-                      onClick={() => toggleExpand(s.id)}
-                      className="rounded p-1 text-ink-400 hover:bg-ink-100 hover:text-ink-700"
-                      aria-label={expanded ? "Collapse" : "Expand"}
-                    >
-                      {expanded ? "▾" : "▸"}
-                    </button>
-                  </Td>
                   <Td>
                     <button
                       type="button"
-                      onClick={() => toggleExpand(s.id)}
                       className="font-medium text-brand-700 hover:text-brand-800"
+                      onClick={() => void openDetail(s)}
                     >
                       {s.name}
                     </button>
+                    {s.openAlerts > 0 ? (
+                      <Badge tone="danger" size="sm" className="ml-2">
+                        {s.openAlerts} alert{s.openAlerts === 1 ? "" : "s"}
+                      </Badge>
+                    ) : null}
                   </Td>
-                  <Td>
-                    <Badge tone="blue">{humanize(s.kind)}</Badge>
-                  </Td>
-                  <Td>{s.unit}</Td>
-                  <Td className="font-mono text-xs">{assetName(s.assetId) ?? "—"}</Td>
-                  <Td className="text-xs text-ink-500">
-                    {s.minValue !== null || s.maxValue !== null
-                      ? `${s.minValue ?? "−∞"} … ${s.maxValue ?? "+∞"}`
-                      : "—"}
+                  <Td>{humanize(s.kind)}</Td>
+                  <Td>{asset ? `${asset.tagCode}` : "—"}</Td>
+                  <Td className="text-right tabular-nums">
+                    {s.lastValue === null ? (
+                      <span className="text-ink-300">—</span>
+                    ) : (
+                      `${s.lastValue} ${s.unit}`
+                    )}
+                    <span className="block text-[11px] text-ink-400">
+                      {s.lastReadingAt ? formatDateTime(s.lastReadingAt) : "never reported"}
+                    </span>
                   </Td>
                   <Td className="text-right tabular-nums">
-                    {last === undefined ? (
-                      <span className="text-ink-300">…</span>
-                    ) : last === null ? (
-                      "—"
-                    ) : (
-                      <span className={breach ? "font-semibold text-red-600" : ""}>
-                        {last.value.toFixed(2)} {s.unit}
+                    {s.window.avg === null ? (
+                      <span className="text-ink-300" title={s.window.basis}>
+                        —
                       </span>
+                    ) : (
+                      Math.round(s.window.avg * 100) / 100
                     )}
                   </Td>
-                </tr>,
-                expanded ? (
-                  <tr key={`${s.id}-detail`}>
-                    <td className="bg-ink-50/40 px-4 py-2.5" colSpan={7}>
-                      <div className="px-2 py-2">
-                        <div className="mb-2 flex items-center justify-between">
-                          <span className="text-xs font-medium text-ink-600">
-                            Last 48h — hourly averages
-                            {last?.at ? (
-                              <span className="ml-2 text-ink-400">
-                                latest bucket {formatDateTime(last.at)}
-                              </span>
-                            ) : null}
-                          </span>
-                          <Button
-                            size="sm"
-                            variant="secondary"
-                            disabled={simBusy}
-                            onClick={() => void simulate(s)}
-                          >
-                            {simBusy ? "Simulating…" : "Simulate 24h"}
-                          </Button>
-                        </div>
-                        {simNote && (
-                          <div className="mb-2 rounded-md bg-emerald-50 px-3 py-1.5 text-xs text-emerald-800 ring-1 ring-emerald-100">
-                            {simNote}
-                          </div>
-                        )}
-                        <ErrorAlert message={bucketsError} />
-                        {buckets === null ? (
-                          <Spinner />
-                        ) : (
-                          <Sparkline
-                            buckets={buckets}
-                            minValue={s.minValue}
-                            maxValue={s.maxValue}
-                            unit={s.unit}
-                          />
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                ) : null,
-              ];
+                  <Td className="text-xs">
+                    {s.minValue === null && s.maxValue === null
+                      ? "none"
+                      : `${s.minValue ?? "−∞"} … ${s.maxValue ?? "∞"} ${s.unit}`}
+                  </Td>
+                  <Td>
+                    <Badge tone={s.isActive === "true" ? "success" : "neutral"} size="sm">
+                      {s.isActive === "true" ? "active" : "inactive"}
+                    </Badge>
+                  </Td>
+                  <Td className="text-right">
+                    <div className="flex justify-end gap-1">
+                      <Button size="sm" variant="ghost" disabled={busy} onClick={() => void toggleActive(s)}>
+                        {s.isActive === "true" ? "Deactivate" : "Activate"}
+                      </Button>
+                      {summary?.simulationAvailable ? (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          disabled={busy}
+                          title="Writes synthetic readings, tagged as simulation, excluded from statistics and alerts"
+                          onClick={() => void simulate(s)}
+                        >
+                          Simulate
+                        </Button>
+                      ) : null}
+                    </div>
+                  </Td>
+                </tr>
+              );
             })}
           </tbody>
         </Table>
       )}
 
-      <Modal open={createOpen} title="New sensor channel" onClose={() => setCreateOpen(false)}>
-        <ErrorAlert message={createError} />
-        <form onSubmit={onCreate} className="space-y-4">
-          <Field label="Name">
-            <Input
-              required
-              value={form.name}
-              onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
-              placeholder="AHU-L3-01 supply air temperature"
-            />
-          </Field>
-          <div className="grid grid-cols-2 gap-4">
+      {summary && !summary.simulationAvailable ? (
+        <p className="mt-2 text-[11px] text-ink-400">
+          Synthetic telemetry is disabled in this environment, so every figure above comes from
+          ingested readings.
+        </p>
+      ) : null}
+
+      {/* ------------------------------ create ------------------------------ */}
+      <Modal open={createOpen} onClose={() => setCreateOpen(false)} title="New sensor channel" wide>
+        <form onSubmit={createSensor} className="space-y-3">
+          <ErrorAlert message={formError} />
+          <div className="grid grid-cols-3 gap-3">
+            <Field label="Name">
+              <Input
+                required
+                value={form.name}
+                onChange={(e) => setForm({ ...form, name: e.target.value })}
+              />
+            </Field>
             <Field label="Kind">
-              <Select
-                value={form.kind}
-                onChange={(e) => setForm((f) => ({ ...f, kind: e.target.value }))}
-              >
+              <Select value={form.kind} onChange={(e) => setForm({ ...form, kind: e.target.value })}>
                 {SENSOR_KINDS.map((k) => (
                   <option key={k} value={k}>
                     {humanize(k)}
@@ -353,54 +413,134 @@ export default function SensorsTab({ projectId }: { projectId: string }) {
               <Input
                 required
                 value={form.unit}
-                onChange={(e) => setForm((f) => ({ ...f, unit: e.target.value }))}
-                placeholder="°C"
+                onChange={(e) => setForm({ ...form, unit: e.target.value })}
+                placeholder="C, kWh, ppm…"
               />
             </Field>
           </div>
-          <Field label="Bound asset" hint="Optional — breach notifications route to the asset owner.">
-            <Select
-              value={form.assetId}
-              onChange={(e) => setForm((f) => ({ ...f, assetId: e.target.value }))}
-            >
-              <option value="">Not bound</option>
-              {assets.map((a) => (
-                <option key={a.id} value={a.id}>
-                  {a.tagCode} — {a.name}
-                </option>
-              ))}
-            </Select>
-          </Field>
-          <div className="grid grid-cols-2 gap-4">
-            <Field label="Min threshold">
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Asset">
+              <Select
+                value={form.assetId}
+                onChange={(e) => setForm({ ...form, assetId: e.target.value })}
+              >
+                <option value="">Not bound to an asset</option>
+                {assets.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.tagCode} — {a.name}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Alert owner" hint="Falls back to the asset owner, then its creator.">
+              <Select
+                value={form.ownerId}
+                onChange={(e) => setForm({ ...form, ownerId: e.target.value })}
+              >
+                <option value="">Default</option>
+                {users.map((u) => (
+                  <option key={u.id} value={u.id}>
+                    {u.name}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          </div>
+          <div className="grid grid-cols-4 gap-3">
+            <Field label="Min">
               <Input
                 type="number"
                 step="any"
                 value={form.minValue}
-                onChange={(e) => setForm((f) => ({ ...f, minValue: e.target.value }))}
-                placeholder="16"
+                onChange={(e) => setForm({ ...form, minValue: e.target.value })}
               />
             </Field>
-            <Field label="Max threshold">
+            <Field label="Max">
               <Input
                 type="number"
                 step="any"
                 value={form.maxValue}
-                onChange={(e) => setForm((f) => ({ ...f, maxValue: e.target.value }))}
-                placeholder="26"
+                onChange={(e) => setForm({ ...form, maxValue: e.target.value })}
+              />
+            </Field>
+            <Field label="Design setpoint">
+              <Input
+                type="number"
+                step="any"
+                value={form.designSetpoint}
+                onChange={(e) => setForm({ ...form, designSetpoint: e.target.value })}
+              />
+            </Field>
+            <Field label="Stale after (min)">
+              <Input
+                type="number"
+                min={1}
+                value={form.staleAfterMinutes}
+                onChange={(e) => setForm({ ...form, staleAfterMinutes: e.target.value })}
               />
             </Field>
           </div>
           <div className="flex justify-end gap-2">
-            <Button variant="secondary" onClick={() => setCreateOpen(false)}>
+            <Button type="button" variant="secondary" onClick={() => setCreateOpen(false)}>
               Cancel
             </Button>
-            <Button type="submit" disabled={busy || !form.name.trim() || !form.unit.trim()}>
-              {busy ? "Creating…" : "Create sensor"}
+            <Button type="submit" disabled={busy}>
+              Create
             </Button>
           </div>
         </form>
       </Modal>
+
+      {/* ------------------------------ detail ------------------------------ */}
+      <Drawer
+        open={detail !== null}
+        onOpenChange={(open) => !open && setDetail(null)}
+        title={detail?.name ?? "Sensor"}
+        description={detail ? `${humanize(detail.kind)} · ${detail.unit}` : undefined}
+        size="lg"
+      >
+        <DrawerBody>
+          {detail ? (
+            <div className="space-y-4">
+              <Card>
+                <CardBody>
+                  {buckets === null ? (
+                    <Spinner label="Loading readings…" />
+                  ) : (
+                    <Sparkline
+                      buckets={buckets}
+                      minValue={detail.minValue}
+                      maxValue={detail.maxValue}
+                      unit={detail.unit}
+                    />
+                  )}
+                  {readingsNote ? (
+                    <p className="mt-1 text-[11px] text-ink-400">{readingsNote}</p>
+                  ) : null}
+                </CardBody>
+              </Card>
+              <div className="grid grid-cols-2 gap-3 text-xs text-ink-600">
+                <div>
+                  <div className="text-ink-400">Last reading</div>
+                  {detail.lastReadingAt ? formatDateTime(detail.lastReadingAt) : "never"}
+                </div>
+                <div>
+                  <div className="text-ink-400">24h window</div>
+                  {detail.window.basis}
+                </div>
+                <div>
+                  <div className="text-ink-400">Design setpoint</div>
+                  {detail.designSetpoint === null ? "not recorded" : `${detail.designSetpoint} ${detail.unit}`}
+                </div>
+                <div>
+                  <div className="text-ink-400">Alert cool-down</div>
+                  {detail.cooldownMinutes} minutes
+                </div>
+              </div>
+            </div>
+          ) : null}
+        </DrawerBody>
+      </Drawer>
     </div>
   );
 }

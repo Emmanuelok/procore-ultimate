@@ -947,8 +947,25 @@ export const commissioningRoutes: FastifyPluginAsync = async (app) => {
       const { recordId } = req.params as { recordId: string };
       const body = resultSchema.parse(req.body);
       const record = await fetchTest(recordId, req.companyId!, req.projectId!);
-      if (record.status === "accepted") {
-        throw badRequest(`${record.reference} has already been accepted; raise a retest instead.`);
+      /*
+       * ONE RESULT PER RECORD.
+       *
+       * Only `accepted` used to be refused, so a record already `complete` or
+       * `retest_required` could take a second result — and the deficiency loop
+       * below creates a punch item or an NCR for every deficiency in the body
+       * every time it runs. Two submissions of the same list produced duplicate
+       * punch items in the field register and duplicate NCRs, both of which then
+       * block turnover against work that has one defect, not two. A test that
+       * has been performed is evidence of what happened on the day; correcting
+       * it is a retest (POST .../retest), which is a new record that names this
+       * one.
+       */
+      if (SETTLED_TEST_STATUSES.includes(record.status) || record.status === "retest_required") {
+        throw badRequest(
+          `${record.reference} already records a result (${record.result ?? record.status}) performed at ${record.performedAt ?? "an unrecorded time"}. ` +
+            `A test record carries what happened on the day it was performed; recording a second result over it would raise the same deficiencies twice. ` +
+            `Raise a retest instead: POST /projects/:projectId/commissioning/test-records/${record.id}/retest.`,
+        );
       }
       const performedAt = body.performedAt ?? nowISO();
       const onDate = performedAt.slice(0, 10);
@@ -1081,6 +1098,17 @@ export const commissioningRoutes: FastifyPluginAsync = async (app) => {
       const { recordId } = req.params as { recordId: string };
       const body = witnessSchema.parse(req.body ?? {});
       const record = await fetchTest(recordId, req.companyId!, req.projectId!);
+      /*
+       * A witness watches a test being carried out. Recording one against a
+       * scheduled record that nobody has performed says a second party watched
+       * something that has not happened, and the segregation check passes
+       * trivially because `performedBy` is still null.
+       */
+      if (!record.performedAt) {
+        throw badRequest(
+          `${record.reference} has not been performed (it is ${record.status}). A witness attests to a test that took place; record the result first, then the witness.`,
+        );
+      }
       if (!body.thirdPartyWitness) {
         assertDistinctActor(
           req.user!.id,

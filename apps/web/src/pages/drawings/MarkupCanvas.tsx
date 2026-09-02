@@ -1,5 +1,7 @@
 /**
- * Screen-space overlay canvas: published markup layers (read-only), my
+ * Screen-space overlay canvas: published markup layers (read-only), markups
+ * published on OTHER revisions of the sheet shown dimmed (spec #269), shapes
+ * carried forward that land inside a changed region flagged with a halo, my
  * personal layer, the in-progress draft shape, selection halo, calibration
  * picks and record pins. Redraws on every prop change — shapes are converted
  * from normalized sheet coordinates through the current view transform, so
@@ -23,6 +25,11 @@ export interface MarkupCanvasProps {
   transform: ViewTransform;
   publishedShapes: MarkupShape[];
   showPublished: boolean;
+  /** published on an earlier/later revision of the same sheet: drawn dimmed */
+  priorShapes: MarkupShape[];
+  showPrior: boolean;
+  /** carried-forward shapes that overlap a changed region: drawn with a review halo */
+  flaggedShapes: MarkupShape[];
   myShapes: MarkupShape[];
   showMine: boolean;
   draft: MarkupShape | null;
@@ -79,9 +86,17 @@ export default function MarkupCanvas(props: MarkupCanvasProps) {
     if (!page) return;
 
     if (!props.compareMode) {
+      if (props.showPrior) {
+        for (const shape of props.priorShapes) {
+          drawShape(ctx, shape, page, transform, { alpha: 0.3 });
+        }
+      }
       if (props.showPublished) {
         for (const shape of props.publishedShapes) {
           drawShape(ctx, shape, page, transform, { alpha: 0.85 });
+        }
+        for (const shape of props.flaggedShapes) {
+          drawShape(ctx, shape, page, transform, { alpha: 0.95, selected: true });
         }
       }
       if (props.showMine) {

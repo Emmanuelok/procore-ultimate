@@ -68,6 +68,9 @@ beforeAll(async () => {
     projectId: projA,
     name: "Main works contract",
     form: "fidic_red_1999",
+    // the bills raised against this contract are priced in GBP; a BoQ whose
+    // currency disagrees with its contract is now refused (#178)
+    currency: "GBP",
     createdBy: u1.userId,
   });
   sheetA = newId("sheet");
@@ -78,7 +81,7 @@ beforeAll(async () => {
     number: "A-101",
     title: "Foundation plan",
   });
-});
+}, 180_000);
 
 afterAll(async () => {
   await built.close();
@@ -820,14 +823,67 @@ describe("Commercial summary", () => {
 
     const res = await inject("GET", `/api/v1/projects/${projD}/commercial/summary`, u1.headers);
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({
-      boqTotal: 1000,
-      certifiedToDate: 475,
-      retentionHeld: 25,
-      variationsAgreed: 200,
-      variationsPending: 100,
-      forecastFinal: 1300, // 1000 + 200 + 100
+    const summary = res.json() as {
+      currency: string | null;
+      boqTotal: number | null;
+      certifiedToDate: number | null;
+      retentionHeld: number | null;
+      variationsAgreed: number | null;
+      variationsPending: number | null;
+      forecastFinal: number | null;
+      byCurrency: Array<{ currency: string; boqTotal: number; forecastFinal: number }>;
+      reasons: string[];
+    };
+    // one currency on this project, so the flat totals are populated
+    expect(summary.currency).toBe("USD");
+    expect(summary.boqTotal).toBe(1000);
+    expect(summary.certifiedToDate).toBe(475);
+    expect(summary.retentionHeld).toBe(25);
+    expect(summary.variationsAgreed).toBe(200);
+    expect(summary.variationsPending).toBe(100);
+    expect(summary.forecastFinal).toBe(1300); // 1000 + 200 + 100
+    expect(summary.byCurrency).toHaveLength(1);
+    expect(summary.byCurrency[0]).toMatchObject({ currency: "USD", boqTotal: 1000, forecastFinal: 1300 });
+    expect(summary.reasons).toEqual([]);
+  });
+
+  it("refuses to add money across currencies and says why", async () => {
+    // a second bill on the same project, priced in AED
+    const aed = await inject("POST", `/api/v1/projects/${projD}/boqs`, u1.headers, {
+      name: "AED package",
+      method: "nrm2",
+      currency: "AED",
     });
+    const aedId = aed.json().id as string;
+    const bill = await inject("POST", `/api/v1/boqs/${aedId}/items`, u1.headers, {
+      level: "bill",
+      code: "1",
+      description: "Works",
+    });
+    await inject("POST", `/api/v1/boqs/${aedId}/items`, u1.headers, {
+      level: "item",
+      code: "1.A",
+      description: "Imported facade",
+      parentId: bill.json().id,
+      quantity: 10,
+      rate: 470,
+    });
+    await inject("PATCH", `/api/v1/boqs/${aedId}`, u1.headers, { status: "issued" });
+
+    const res = await inject("GET", `/api/v1/projects/${projD}/commercial/summary`, u1.headers);
+    const summary = res.json() as {
+      currency: string | null;
+      boqTotal: number | null;
+      byCurrency: Array<{ currency: string; boqTotal: number }>;
+      reasons: string[];
+    };
+    // 1,000 USD + 4,700 AED is not 5,700 of anything
+    expect(summary.boqTotal).toBeNull();
+    expect(summary.currency).toBeNull();
+    expect(summary.byCurrency).toHaveLength(2);
+    expect(summary.byCurrency.find((c) => c.currency === "AED")?.boqTotal).toBe(4700);
+    expect(summary.byCurrency.find((c) => c.currency === "USD")?.boqTotal).toBe(1000);
+    expect(summary.reasons.join(" ")).toContain("2 currencies");
   });
 });
 

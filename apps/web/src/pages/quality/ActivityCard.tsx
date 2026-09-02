@@ -45,6 +45,7 @@ import {
 } from "../../ui/icons";
 import { toneClass } from "../../ui/tokens";
 import { api } from "../../lib/api";
+import SignOffChain from "./SignOffChain";
 import {
   ACTIVITY_STATUS_TONE,
   EM_DASH,
@@ -125,6 +126,9 @@ export default function ActivityCard({
   const [note, setNote] = useState("");
   const [releaseOpen, setReleaseOpen] = useState(false);
   const [releaseNote, setReleaseNote] = useState("");
+  const [chainOpen, setChainOpen] = useState(false);
+  /** bumped by every transition so the chain panel reloads with the card */
+  const [chainVersion, setChainVersion] = useState(0);
 
   const overdue = isOverdueHoldPoint(activity);
   const held = !activity.mayProceed.allowed;
@@ -156,6 +160,67 @@ export default function ActivityCard({
     if (done) {
       setReleaseOpen(false);
       setReleaseNote("");
+      onMutated();
+    }
+  }
+
+  /**
+   * The explicit transitions. They replaced a patchable status: a hold point
+   * used to be closable straight from a PATCH with no verifying party, no
+   * reason and no record of who did it.
+   */
+  async function fail() {
+    const reason = await ask({
+      title: "Record a failed verification",
+      description:
+        "The verification happened and the work did not pass. Say what failed — it is what the contractor answers, and what the re-inspection is checked against.",
+      label: "What failed?",
+      confirmLabel: "Record the failure",
+    });
+    if (!reason) return;
+    const done = await run("fail", () => api.post(`${base}/fail`, { reason }));
+    if (done) {
+      setChainVersion((n) => n + 1);
+      onMutated();
+    }
+  }
+
+  async function notApplicable() {
+    const reason = await ask({
+      title: "Mark the point not applicable",
+      description:
+        "Terminal, so it is segregated exactly like a release: the person who raised or served notice on a hold point may not be the one who decides it never applied.",
+      label: "Why does this point not apply?",
+      confirmLabel: "Record it",
+    });
+    if (!reason) return;
+    const done = await run("na", () => api.post(`${base}/not-applicable`, { reason }));
+    if (done) {
+      setChainVersion((n) => n + 1);
+      onMutated();
+    }
+  }
+
+  async function closePoint() {
+    const done = await run("close", () => api.post(`${base}/close`, {}));
+    if (done) {
+      setChainVersion((n) => n + 1);
+      onMutated();
+    }
+  }
+
+  async function reopen() {
+    const reason = await ask({
+      title: "Reopen this point",
+      description:
+        "Reopening clears the release and the waiver: a reopened point that still carried a signature would read as released by somebody who released different work.",
+      label: "Why is it being reopened?",
+      confirmLabel: "Reopen it",
+    });
+    if (!reason) return;
+    const done = await run("reopen", () => api.post(`${base}/reopen`, { reason }));
+    if (done) {
+      setChainVersion((n) => n + 1);
       onMutated();
     }
   }
@@ -327,6 +392,31 @@ export default function ActivityCard({
           ) : null}
         </div>
 
+        {/* ---------------- the sign-off chain ---------------- */}
+        {activity.interventionPoint !== "surveillance_point" ? (
+          <div>
+            <button
+              type="button"
+              className="text-2xs font-medium text-content-muted underline-offset-2 hover:underline"
+              onClick={() => setChainOpen((open) => !open)}
+            >
+              {chainOpen ? "Hide the sign-off chain" : "Sign-off chain — who signs, in what order"}
+            </button>
+            {chainOpen ? (
+              <div className="mt-1.5">
+                <SignOffChain
+                  projectId={projectId}
+                  itpId={activity.itpId}
+                  activityId={activity.id}
+                  users={users}
+                  version={chainVersion}
+                  onMutated={onMutated}
+                />
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+
         {/* ---------------- criteria ---------------- */}
         <Facts
           columns={3}
@@ -387,10 +477,39 @@ export default function ActivityCard({
               Open the plan
             </Button>
           ) : null}
+          <Button
+            size="sm"
+            variant="ghost"
+            icon={IconAlert}
+            disabled={terminal}
+            loading={busy === "fail"}
+            onClick={fail}
+          >
+            Fail
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={terminal}
+            loading={busy === "na"}
+            onClick={notApplicable}
+          >
+            Not applicable
+          </Button>
+          {activity.status === "released" || activity.status === "waived" ? (
+            <Button size="sm" variant="ghost" loading={busy === "close"} onClick={closePoint}>
+              Close
+            </Button>
+          ) : null}
+          {terminal ? (
+            <Button size="sm" variant="ghost" loading={busy === "reopen"} onClick={reopen}>
+              Reopen
+            </Button>
+          ) : null}
           {terminal ? (
             <span className="text-2xs text-content-subtle">
-              This point is {labelize(activity.status).toLowerCase()} — there is nothing left to
-              notify or release.
+              This point is {labelize(activity.status).toLowerCase()} — reopening it clears the
+              release, because a signature belongs to the work it was given against.
             </span>
           ) : null}
         </div>

@@ -158,6 +158,39 @@ export const isOpenInvoice = (s: string): boolean => has(OPEN_INVOICE_STATUSES, 
 export const isSatisfyingWaiver = (s: string): boolean => has(SATISFYING_WAIVER_STATUSES, s);
 export const isReleasedRetainage = (s: string): boolean => has(RELEASED_RETAINAGE_STATUSES, s);
 
+/** A commitment payment that has actually moved money. */
+export const isPaidStatus = (s: string): boolean => s === "issued" || s === "cleared";
+
+/* ------------------------------------------------------------------ */
+/* Certified amount — the one reading of "approved as noted"           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * What an invoice is CERTIFIED for. An invoice approved as noted at 8,000
+ * against 10,000 applied for is owed 8,000 — not 10,000, and not 10,000 with
+ * 2,000 quietly "outstanding" forever on the aging report. The reduction is
+ * recorded on `detail.approvedAmount` at approval (the invoice table's frozen
+ * columns are the sworn application and are not rewritten), and this is the
+ * ONE function every report, gate and payment reads it through.
+ */
+export function certifiedOf(inv: { detail: unknown; currentPaymentDue: number }): number {
+  const detail = (inv.detail ?? {}) as Record<string, unknown>;
+  const approved = detail["approvedAmount"];
+  if (typeof approved === "number" && Number.isFinite(approved)) {
+    return round2(Math.min(approved, inv.currentPaymentDue));
+  }
+  return round2(inv.currentPaymentDue);
+}
+
+/** Still owed: certified less paid. Never below zero. */
+export function outstandingOf(inv: {
+  detail: unknown;
+  currentPaymentDue: number;
+  amountPaid: number;
+}): number {
+  return round2(Math.max(0, certifiedOf(inv) - inv.amountPaid));
+}
+
 /* ------------------------------------------------------------------ */
 /* Segregation of duties (ADR 0004)                                    */
 /* ------------------------------------------------------------------ */

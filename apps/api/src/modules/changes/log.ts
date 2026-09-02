@@ -23,7 +23,7 @@ import {
   type PackageRow,
   type PcoRow,
 } from "./reconcile.js";
-import { corTimeImpact } from "./requests.js";
+import { corTimeImpactBatch } from "./requests.js";
 import { changeGates, companyOf, projectOf } from "./shared.js";
 
 const logQuery = z.object({
@@ -278,10 +278,8 @@ export const changeLogRoutes: FastifyPluginAsync = async (app) => {
         )
         .orderBy(asc(changeOrderRequests.number));
 
-      const assessed = [];
-      for (const cor of cors) {
-        assessed.push(await corTimeImpact(app.db, cor));
-      }
+      /* one delay-event query for every request, not one per request */
+      const assessed = await corTimeImpactBatch(app.db, cors);
       const live = assessed.filter((a) => a.status !== "void" && a.status !== "withdrawn");
       const daysClaimed = live.reduce((s, a) => s + a.daysClaimed, 0);
       const daysApproved = live.reduce((s, a) => s + a.daysApproved, 0);
@@ -367,6 +365,13 @@ export const changeLogRoutes: FastifyPluginAsync = async (app) => {
               agrees: Math.abs(running - c.revisedContractSum) <= 0.005,
             };
           });
+        const ratio = (n: number): Component =>
+          contract.originalContractSum > 0
+            ? computed(Math.round((n / contract.originalContractSum) * 10000) / 100, {
+                numerator: round2(n),
+                originalContractSum: round2(contract.originalContractSum),
+              })
+            : unavailable(["The contract has no original sum, so a percentage of it cannot be stated."], {});
         out.push({
           primeContractId: contract.id,
           reference: contract.reference,
@@ -375,6 +380,10 @@ export const changeLogRoutes: FastifyPluginAsync = async (app) => {
           approvedChangeSum: round2(contract.approvedChangeSum),
           pendingChangeSum: round2(contract.pendingChangeSum),
           revisedContractSum: round2(contract.revisedContractSum),
+          /** approved change as a % of the original sum (#562) */
+          approvedChangePercent: ratio(contract.approvedChangeSum),
+          /** pending (priced, unapproved) change as a % of the original sum */
+          pendingChangePercent: ratio(contract.pendingChangeSum),
           executedChanges: log,
           reconciles:
             Math.abs(running - contract.revisedContractSum) <= 0.005 && log.every((l) => l.agrees),

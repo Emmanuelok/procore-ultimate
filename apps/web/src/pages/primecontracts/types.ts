@@ -154,6 +154,8 @@ export interface ContractView extends PrimeContract {
   retainageTerms: RetainageTerms;
   sov: { totals: SovTotals; identity: SovIdentityCheck };
   percentComplete: Component;
+  /** this-period work on an open (uncertified) application — outside totalBilled */
+  draftBilled: number;
   identities: Identity[];
   reconciled: boolean;
 }
@@ -275,6 +277,8 @@ export interface PrimeChange {
 export interface ChangeExecution {
   change: PrimeChange;
   appendedLines: Array<{ id: string; lineNumber: string; scheduledValue: number }>;
+  /** the owner-funded budget increase written in the same transaction */
+  budget: ExecutionBudgetEffect;
   contract: ContractView;
 }
 
@@ -414,4 +418,214 @@ export interface Vendor {
   id: string;
   name: string;
   status: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* Platform-upgrade wire types — transcribed from                     */
+/* apps/api/src/modules/primecontracts/{lifecycle,analytics,shared}.ts */
+/* ------------------------------------------------------------------ */
+
+export type ComplianceKind =
+  | "insurance_certificate"
+  | "performance_bond"
+  | "payment_bond"
+  | "permit"
+  | "tax_form"
+  | "notice_to_proceed"
+  | "lien_waiver"
+  | "warranty"
+  | "other";
+
+export type ComplianceStatus = "missing" | "received" | "verified" | "expired" | "waived";
+
+export interface ComplianceDocument {
+  id: string;
+  primeContractId: string;
+  kind: ComplianceKind;
+  title: string;
+  required: number;
+  status: ComplianceStatus;
+  documentId: string | null;
+  reference: string | null;
+  issuer: string | null;
+  issuedDate: string | null;
+  effectiveDate: string | null;
+  expiryDate: string | null;
+  receivedAt: string | null;
+  verifiedBy: string | null;
+  verifiedAt: string | null;
+  waivedBy: string | null;
+  waivedReason: string | null;
+  notes: string | null;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ComplianceGate {
+  ok: boolean;
+  blocking: Array<{ id: string; kind: string; title: string; status: string; problem: string }>;
+  expiringSoon: Array<{ id: string; kind: string; title: string; expiryDate: string; daysLeft: number }>;
+  summary: { required: number; satisfied: number; missing: number; expired: number; waived: number; optional: number };
+}
+
+export interface ComplianceView {
+  primeContractId: string;
+  items: ComplianceDocument[];
+  total: number;
+  gate: ComplianceGate;
+}
+
+export type StoredMaterialStatus = "stored" | "partially_incorporated" | "incorporated" | "removed";
+
+export interface StoredMaterial {
+  id: string;
+  primeContractId: string;
+  sovLineId: string;
+  number: number;
+  reference: string;
+  description: string;
+  status: StoredMaterialStatus;
+  location: string;
+  locationNotes: string | null;
+  quantity: number | null;
+  unit: string | null;
+  value: number;
+  incorporatedValue: number;
+  storedDate: string;
+  incorporatedDate: string | null;
+  supplierInvoiceReference: string | null;
+  supplierVendorId: string | null;
+  insured: number;
+  insuranceReference: string | null;
+  billedOnApplicationId: string | null;
+  notes: string | null;
+  createdBy: string;
+  createdAt: string;
+}
+
+export interface StoredMaterialsView {
+  primeContractId: string;
+  currency: string;
+  items: StoredMaterial[];
+  total: number;
+  reconciliation: {
+    lines: Array<{ sovLineId: string; lineNumber: string; registerValue: number; billedValue: number; identity: Identity; items: number; uninsured: number; unevidenced: number }>;
+    totals: { registerValue: number; billedValue: number; identity: Identity };
+    reasons: string[];
+  };
+}
+
+export interface OwnerReceipt {
+  id: string;
+  paymentApplicationId: string;
+  number: number;
+  reference: string;
+  status: "recorded" | "void";
+  amount: number;
+  currency: string;
+  receivedDate: string;
+  method: string;
+  paymentReference: string | null;
+  bankReference: string | null;
+  notes: string | null;
+  voidReason: string | null;
+  recordedBy: string;
+  createdAt: string;
+}
+
+export interface ReceiptsView {
+  applicationId: string;
+  reference: string;
+  currency: string;
+  certified: number | null;
+  paid: number;
+  outstanding: number | null;
+  items: OwnerReceipt[];
+  total: number;
+}
+
+export interface AgedReceivable {
+  applicationId: string;
+  reference: string;
+  certifiedAt: string | null;
+  dueDate: string | null;
+  certified: number;
+  paid: number;
+  outstanding: number;
+  state: "unpaid" | "partially_paid" | "paid";
+  daysOutstanding: number | null;
+  daysOverdue: number | null;
+  bucket: "current" | "1-30" | "31-60" | "61-90" | "90+" | "unknown";
+}
+
+export interface ReceivablesView {
+  primeContractId: string;
+  asOf: string;
+  currency: string;
+  paymentTermsDays: number | null;
+  items: AgedReceivable[];
+  totals: { certified: number; paid: number; outstanding: number; overdue: number };
+  buckets: Array<{ bucket: AgedReceivable["bucket"]; amount: number; count: number }>;
+  dunning: AgedReceivable[];
+  reasons: string[];
+  receipts: number;
+}
+
+export interface RetainageRelease {
+  id: string;
+  reference: string;
+  status: string;
+  basis: string;
+  amount: number;
+  retainageHeldBefore: number;
+  retainageHeldAfter: number;
+  newRetainagePercent: number | null;
+  effectiveDate: string | null;
+  releaseDate: string | null;
+  reason: string | null;
+  createdAt: string;
+}
+
+export interface RetainageView {
+  primeContractId: string;
+  currency: string;
+  held: number;
+  released: number;
+  percentComplete: Component;
+  byLine: Array<{ sovLineId: string; lineNumber: string; description: string; retainagePercent: number; retainageHeld: number; retainageReleased: number; totalCompletedAndStored: number }>;
+  releases: RetainageRelease[];
+  proposal: { kind: "none" | "step_down" | "final"; amount: Component; gate: { ok: boolean; reasons: string[] }; rationale: string };
+  gate: { compliance: ComplianceGate; outstandingLienWaivers: Array<{ id: string; reference: string }>; openApplications: number };
+}
+
+export interface ChangeAnalytics {
+  primeContractId: string;
+  currency: string;
+  asOf: string;
+  byStatus: Array<{ status: string; count: number; amount: number }>;
+  byReason: Array<{ reason: string; count: number; amount: number }>;
+  executed: { count: number; amount: number; shareOfOriginal: number | null; scheduleImpactDays: number };
+  pending: { count: number; amount: number; oldestDays: number | null; averageAgeDays: number | null };
+  cycleTimeDays: { createdToSubmitted: number | null; submittedToApproved: number | null; approvedToExecuted: number | null; createdToExecuted: number | null; samples: number };
+  monthly: Array<{ month: string; count: number; amount: number; cumulative: number }>;
+  reasons: string[];
+}
+
+/** What `/changes/:id/execute` reports about the budget side. */
+export interface ExecutionBudgetEffect {
+  applied: boolean;
+  budgetId: string | null;
+  budgetChangeId: string | null;
+  linesMoved: number;
+  amount: number;
+  reasons: string[];
+}
+
+export interface CostCodeRef {
+  id: string;
+  code: string;
+  title: string;
+  costType: string | null;
+  isActive: number;
 }

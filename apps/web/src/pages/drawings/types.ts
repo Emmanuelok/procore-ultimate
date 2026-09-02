@@ -9,8 +9,17 @@ export interface DrawingSetItem {
   id: string;
   name: string;
   issuedDate?: string | null;
+  area?: string | null;
   processing: string; // pending | processing | ready | failed
+  processingError?: string | null;
+  pageCount?: number | null;
+  processedPages?: number;
+  sheetsCreated?: number;
+  revisionsAdded?: number;
+  autoLinksCreated?: number;
+  unresolvedCallouts?: number;
   sheetCount?: number;
+  uploadedByName?: string | null;
   createdAt?: string;
   error?: string | null;
 }
@@ -24,6 +33,12 @@ export interface RevisionSummary {
   isSuperseded?: number | boolean;
   calibration?: SheetCalibration | null;
   createdAt?: string;
+  changeVerdict?: string | null;
+  changedRegionCount?: number;
+  supersedesRevisionId?: string | null;
+  hasTextLayer?: number;
+  detection?: Record<string, unknown> | null;
+  set?: { id: string; name: string; issuedDate: string | null } | null;
 }
 
 export interface SheetListItem {
@@ -35,21 +50,35 @@ export interface SheetListItem {
   needsReview: number | boolean;
   currentRevisionId?: string | null;
   currentRevision?: RevisionSummary | null;
+  canEdit?: boolean;
   updatedAt?: string;
 }
 
 export interface SheetDetail extends SheetListItem {
   revisions: RevisionSummary[];
   pinsCount?: number;
+  access?: { canEdit: boolean; canAdmin: boolean; level: string };
 }
 
 export interface MarkupRecord {
   id: string;
   revisionId: string;
   authorId: string;
+  authorName?: string | null;
   layer: "personal" | "published" | string;
   shapes: MarkupShape[];
+  carriedFromRevisionId?: string | null;
+  reviewFlags?: number[];
+  prior?: boolean;
+  revisionLabel?: string | null;
   updatedAt?: string;
+}
+
+export interface MarkupsResponse {
+  items: MarkupRecord[];
+  prior: MarkupRecord[];
+  total: number;
+  changedRegions: ChangedRegion[];
 }
 
 export interface PinRecord {
@@ -57,10 +86,60 @@ export interface PinRecord {
   sheetId: string;
   recordType: string;
   recordId: string;
+  label?: string | null;
+  locationId?: string | null;
   x: number;
   y: number;
   createdBy?: string;
   createdAt?: string;
+}
+
+export interface HyperlinkRecord {
+  id: string;
+  fromRevisionId: string;
+  toSheetId: string | null;
+  targetNumber: string | null;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  label: string | null;
+  source: string;
+  confidence: number | null;
+  status: string;
+  detail?: Record<string, unknown>;
+  target?: { id: string; number: string; title: string; currentRevisionId: string | null } | null;
+}
+
+export interface ChangedRegion {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  kind: "added" | "removed" | "moved";
+  items: number;
+  sample: string;
+}
+
+export interface RevisionDiff {
+  revisionId: string;
+  againstRevisionId: string | null;
+  verdict: "changed" | "unchanged" | "unknown";
+  regions: ChangedRegion[];
+  stats: {
+    prevItems: number;
+    nextItems: number;
+    added: number;
+    removed: number;
+    moved: number;
+    common: number;
+    changeRatio: number | null;
+  } | null;
+  basis: string;
+  computedAt: string | null;
+  stored: boolean;
+  against?: { id: string; revision: string };
+  pinsInChangedRegions: Array<{ id: string; recordType: string; recordId: string; label: string | null }>;
 }
 
 export interface ListResponse<T> {
@@ -127,3 +206,6 @@ export const MARKUP_COLORS = [
 ] as const;
 
 export const MARKUP_WIDTHS = [1, 2, 4, 6] as const;
+
+/** The API caps a pen stroke at this many points; the viewer simplifies before it gets there. */
+export const MAX_PEN_POINTS = 5000;

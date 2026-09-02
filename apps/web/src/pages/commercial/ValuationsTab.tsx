@@ -1,6 +1,9 @@
 /**
- * Valuations tab — interim valuations / payment applications (#162-167) and
- * certification with an application-vs-certificate variance statement (#179-180).
+ * Valuations tab — interim valuations / payment applications with typed
+ * sections beyond the BQ lines (#162-167, #132), retention with the contract's
+ * percentage and cap (#254), the statutory payment due date and its clause
+ * basis, and certification with an application-vs-certificate variance
+ * statement (#179-180).
  */
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { VALUATION_BASES } from "@constructos/shared";
@@ -29,6 +32,7 @@ import {
   parseNum,
   qty,
   round2,
+  sectionKindLabel,
   todayIso,
   valuationStatusTone,
   type BoqRow,
@@ -485,10 +489,8 @@ export default function ValuationsTab({
 
   const currency = currencyOf(detail?.boqId);
   const isDraft = detail?.status === "draft";
-  const gross =
-    detail !== null
-      ? round2(detail.workDoneToDate + detail.materialsOnSite + detail.materialsOffSite)
-      : 0;
+  // the server owns the arithmetic: gross includes the typed sections
+  const gross = detail?.grossTotal ?? 0;
 
   return (
     <div>
@@ -646,12 +648,23 @@ export default function ValuationsTab({
                     <dt className="text-ink-500">Materials off site</dt>
                     <dd className="tabular-nums">{money(detail.materialsOffSite, currency)}</dd>
                   </div>
+                  <div className="flex justify-between">
+                    <dt className="text-ink-500">Sections (variations, dayworks, claims)</dt>
+                    <dd className="tabular-nums">{money(detail.sectionsTotal, currency)}</dd>
+                  </div>
                   <div className="flex justify-between border-t border-ink-100 pt-1">
                     <dt className="text-ink-500">Gross valuation</dt>
                     <dd className="tabular-nums">{money(gross, currency)}</dd>
                   </div>
                   <div className="flex justify-between">
-                    <dt className="text-ink-500">Retention held ({detail.retentionPercent}%)</dt>
+                    <dt className="text-ink-500">
+                      Retention held ({detail.retentionPercent}%)
+                      {detail.retentionCap != null ? (
+                        <span className="block text-xs text-ink-400">
+                          capped at {money(detail.retentionCap, currency)}
+                        </span>
+                      ) : null}
+                    </dt>
                     <dd className="tabular-nums text-red-600">
                       −{money(detail.retentionHeld, currency)}
                     </dd>
@@ -671,9 +684,26 @@ export default function ValuationsTab({
                     </dd>
                   </div>
                 </dl>
+                {detail.dueDate ? (
+                  <p className="mt-3 rounded-md bg-ink-50 p-2 text-xs text-ink-500">
+                    Payment due {formatDate(detail.dueDate)}
+                    {detail.dueDateBasis ? ` — ${detail.dueDateBasis}` : ""}
+                  </p>
+                ) : null}
               </CardBody>
             </Card>
           </div>
+
+          <SectionsPanel
+            valuation={detail}
+            currency={currency}
+            editable={isDraft}
+            onChanged={() => {
+              void loadDetail(detail.id);
+              void loadList();
+              onMutate();
+            }}
+          />
 
           {certifyOpen ? (
             <CertifyModal
@@ -691,6 +721,204 @@ export default function ValuationsTab({
           ) : null}
         </>
       )}
+    </div>
+  );
+}
+
+
+/* ------------------------------ Valuation sections ------------------------- */
+
+const SECTION_KINDS = [
+  "variation",
+  "daywork",
+  "claim",
+  "fluctuation",
+  "materials_on_site",
+  "materials_off_site",
+  "contra_charge",
+  "provisional_sum",
+  "other",
+] as const;
+
+/**
+ * Everything in the application that is not a BQ line (#132, #166-167).
+ * Contra charges are deductions and are excluded from the retention base;
+ * materials on and off site must cite the vesting certificate or off-site bond
+ * that transfers title, which is why the evidence field is mandatory for them.
+ */
+function SectionsPanel({
+  valuation,
+  currency,
+  editable,
+  onChanged,
+}: {
+  valuation: ValuationDetail;
+  currency: string;
+  editable: boolean;
+  onChanged: () => void;
+}) {
+  const [kind, setKind] = useState<string>("variation");
+  const [description, setDescription] = useState("");
+  const [amount, setAmount] = useState("");
+  const [evidenceRef, setEvidenceRef] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const sections = valuation.sections ?? [];
+  const needsEvidence = kind === "materials_on_site" || kind === "materials_off_site";
+
+  async function act(fn: () => Promise<unknown>) {
+    setError(null);
+    setBusy(true);
+    try {
+      await fn();
+      onChanged();
+    } catch (err) {
+      setError(err instanceof ApiClientError ? err.message : "The action failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mt-5">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h3 className="text-sm font-semibold text-ink-900">Application sections</h3>
+          <p className="text-xs text-ink-500">
+            Agreed variations, verified dayworks, claims, fluctuations, materials and contra
+            charges — each naming the record it came from.
+          </p>
+        </div>
+        {editable ? (
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={busy}
+            onClick={() =>
+              void act(() => api.post(`/api/v1/valuations/${valuation.id}/sections/sync`, {}))
+            }
+          >
+            Pull agreed variations & dayworks
+          </Button>
+        ) : null}
+      </div>
+      <ErrorAlert message={error} />
+      <Table>
+        <thead>
+          <tr>
+            <Th>Kind</Th>
+            <Th>Description</Th>
+            <Th>Source</Th>
+            <Th className="text-right">Previous</Th>
+            <Th className="text-right">To date</Th>
+            <Th className="text-right">This period</Th>
+            <Th>Retention</Th>
+            {editable ? <Th /> : null}
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-ink-100">
+          {sections.map((sec) => (
+            <tr key={sec.id}>
+              <Td>
+                <Badge tone={sec.kind === "contra_charge" ? "red" : "blue"}>
+                  {sectionKindLabel(sec.kind)}
+                </Badge>
+              </Td>
+              <Td className="max-w-md">
+                {sec.description}
+                {sec.evidenceRef ? (
+                  <span className="block text-xs text-ink-400">{sec.evidenceRef}</span>
+                ) : null}
+              </Td>
+              <Td className="text-xs text-ink-400">
+                {sec.sourceType ? humanize(sec.sourceType) : "manual"}
+              </Td>
+              <Td className="text-right tabular-nums">{money(sec.previousAmount, currency)}</Td>
+              <Td className="text-right font-medium tabular-nums">
+                {money(sec.amountToDate, currency)}
+              </Td>
+              <Td className="text-right tabular-nums">{money(sec.thisPeriod, currency)}</Td>
+              <Td className="text-xs">
+                {sec.retentionApplies ? (
+                  <span className="text-ink-500">Retained</span>
+                ) : (
+                  <span className="text-amber-700">Excluded</span>
+                )}
+              </Td>
+              {editable ? (
+                <Td className="text-right">
+                  <button
+                    type="button"
+                    className="text-xs font-medium text-red-600 hover:text-red-800"
+                    disabled={busy}
+                    onClick={() => void act(() => api.del(`/api/v1/valuation-sections/${sec.id}`))}
+                  >
+                    Remove
+                  </button>
+                </Td>
+              ) : null}
+            </tr>
+          ))}
+          {sections.length === 0 ? (
+            <tr>
+              <Td colSpan={editable ? 8 : 7} className="text-center text-sm text-ink-400">
+                Nothing beyond the BQ lines in this application.
+              </Td>
+            </tr>
+          ) : null}
+        </tbody>
+      </Table>
+
+      {editable ? (
+        <div className="mt-3 rounded-md bg-ink-50 p-3">
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <Field label="Kind">
+              <Select value={kind} onChange={(e) => setKind(e.target.value)}>
+                {SECTION_KINDS.map((k) => (
+                  <option key={k} value={k}>
+                    {sectionKindLabel(k)}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Description">
+              <Input value={description} onChange={(e) => setDescription(e.target.value)} />
+            </Field>
+            <Field label={kind === "contra_charge" ? "Amount (negative)" : "Amount to date"}>
+              <Input value={amount} inputMode="decimal" onChange={(e) => setAmount(e.target.value)} />
+            </Field>
+            <Field label={needsEvidence ? "Vesting / bond reference (required)" : "Evidence reference"}>
+              <Input value={evidenceRef} onChange={(e) => setEvidenceRef(e.target.value)} />
+            </Field>
+          </div>
+          <div className="mt-2 flex justify-end">
+            <Button
+              size="sm"
+              disabled={
+                busy ||
+                !description.trim() ||
+                parseNum(amount) == null ||
+                (needsEvidence && evidenceRef.trim().length === 0)
+              }
+              onClick={() =>
+                void act(async () => {
+                  await api.post(`/api/v1/valuations/${valuation.id}/sections`, {
+                    kind,
+                    description,
+                    amountToDate: parseNum(amount),
+                    evidenceRef: evidenceRef || null,
+                  });
+                  setDescription("");
+                  setAmount("");
+                  setEvidenceRef("");
+                })
+              }
+            >
+              Add section
+            </Button>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

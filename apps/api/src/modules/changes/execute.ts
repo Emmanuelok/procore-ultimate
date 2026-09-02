@@ -25,6 +25,8 @@ import {
   round2,
   type Identity,
 } from "./arithmetic.js";
+import { applyChangeAllocation } from "../commitments/allocation.js";
+import { recomputeCommitmentTotals, syncBudgetCommitted } from "../commitments/rollups.js";
 import { loadLines, loadLinesForParents, nowIso, pad3, todayIso, type ChangeLineRow } from "./shared.js";
 
 /**
@@ -410,65 +412,6 @@ async function recomputeBudgetTotals(db: Db, budgetId: string): Promise<void> {
     .where(eq(budgets.id, budgetId));
 }
 
-/**
- * Re-derive committed and pending commitment cost on the budget lines a
- * commitment touches.
- *
- * This mirrors the commitments module's own rule exactly — an approved or
- * complete commitment is committed cost, a draft or out-for-bid one is
- * exposure, and a terminated or void one is neither — because a budget whose
- * committed column depends on WHICH module last wrote it is not a budget.
- */
-async function syncBudgetCommitted(
-  db: Db,
-  companyId: string,
-  projectId: string,
-  budgetLineIds: readonly string[],
-): Promise<number> {
-  if (budgetLineIds.length === 0) return 0;
-  const rows = await db
-    .select({
-      budgetLineItemId: commitmentSovLines.budgetLineItemId,
-      revisedScheduledValue: commitmentSovLines.revisedScheduledValue,
-      status: commitments.status,
-      currency: commitments.currency,
-    })
-    .from(commitmentSovLines)
-    .innerJoin(commitments, eq(commitments.id, commitmentSovLines.commitmentId))
-    .where(
-      and(
-        eq(commitmentSovLines.companyId, companyId),
-        eq(commitmentSovLines.projectId, projectId),
-        inArray(commitmentSovLines.budgetLineItemId, [...budgetLineIds]),
-      ),
-    );
-  const committed = new Map<string, number>();
-  const pending = new Map<string, number>();
-  for (const r of rows) {
-    if (!r.budgetLineItemId) continue;
-    if (r.status === "terminated" || r.status === "void") continue;
-    const target = ["approved", "complete"].includes(r.status)
-      ? committed
-      : ["draft", "out_for_bid", "out_for_signature"].includes(r.status)
-        ? pending
-        : null;
-    if (!target) continue;
-    target.set(r.budgetLineItemId, (target.get(r.budgetLineItemId) ?? 0) + r.revisedScheduledValue);
-  }
-  let updated = 0;
-  for (const id of budgetLineIds) {
-    await db
-      .update(budgetLineItems)
-      .set({
-        committedCost: round2(committed.get(id) ?? 0),
-        pendingCommitments: round2(pending.get(id) ?? 0),
-        updatedAt: nowIso(),
-      })
-      .where(eq(budgetLineItems.id, id));
-    updated += 1;
-  }
-  return updated;
-}
 
 /* ------------------------------------------------------------------ */
 /* Prime contract execution                                            */
@@ -869,24 +812,6 @@ export async function executeCommitmentPackage(
   }
 
   const changeNumber = await nextRecordNumber(db, projectId, `commitment_change:${commitment.id}`);
-  const existingSov = await db
-    .select({ lineNumber: commitmentSovLines.lineNumber, sortOrder: commitmentSovLines.sortOrder })
-    .from(commitmentSovLines)
-    .where(eq(commitmentSovLines.commitmentId, commitment.id));
-  const taken = new Set(existingSov.map((l) => l.lineNumber));
-  const lineNumbers = sovLineNumbers(changeNumber, legs.length, taken);
-  const baseSort = existingSov.reduce((max, l) => Math.max(max, l.sortOrder), 0) + 10;
-
-  const priorChanges = await db
-    .select({ status: commitmentChanges.status, amount: commitmentChanges.amount })
-    .from(commitmentChanges)
-    .where(eq(commitmentChanges.commitmentId, commitment.id));
-  const sums = bucketSums(
-    commitment.originalCommitmentSum,
-    [...priorChanges, { status: "executed", amount: pkg.amount }],
-    COMMITMENT_IN_SUM,
-    COMMITMENT_PENDING,
-  );
 
   const changeId = newId("cco");
   const changeReference = `${commitment.reference}-CCO-${pad3(changeNumber)}`;
@@ -896,7 +821,35 @@ export async function executeCommitmentPackage(
     ...new Set(legs.map((l) => l.budgetLineItemId).filter((x): x is string => !!x)),
   ];
 
+  /*
+   * THE COMMITMENTS MODULE OWNS THE ARITHMETIC. The change order row is
+   * written here; its value lands on the schedule of values through
+   * `applyChangeAllocation` (scheduledValue 0 / changeOrderValue = amount, so
+   * the ORIGINAL commitment sum stays the original subcontract), and the
+   * header sums are re-derived by `recomputeCommitmentTotals` — the same two
+   * functions a CCO approved inside the commitments module goes through.
+   * One implementation, one identity, one transaction.
+   */
+  const allocation = legs.map((leg) => ({
+    sovLineId: null,
+    costCode: leg.costCode,
+    costType: leg.costType,
+    description: `${changeReference} — ${leg.description}`,
+    amount: leg.amount,
+    budgetLineItemId: leg.budgetLineItemId,
+  }));
+  let appendedSovLineIds: string[] = [];
+  let totals: Awaited<ReturnType<typeof recomputeCommitmentTotals>> | null = null;
+  let budgetLinesMoved = 0;
   await db.transaction(async (tx) => {
+    const locked = await tx
+      .select({ status: changeOrderPackages.status })
+      .from(changeOrderPackages)
+      .where(eq(changeOrderPackages.id, pkg.id))
+      .for("update");
+    if (locked[0]?.status !== "approved") {
+      throw conflict(`${pkg.reference} is now ${locked[0]?.status ?? "gone"}; it was executed by somebody else a moment ago.`);
+    }
     await tx.insert(commitmentChanges).values({
       id: changeId,
       companyId,
@@ -912,14 +865,8 @@ export async function executeCommitmentPackage(
       status: "executed",
       amount: round2(pkg.amount),
       scheduleImpactDays: pkg.scheduleImpactDays,
-      lines: legs.map((leg) => ({
-        sovLineId: null,
-        costCode: leg.costCode,
-        costType: leg.costType,
-        description: leg.description,
-        amount: leg.amount,
-      })),
-      revisedCommitmentSum: sums.revised,
+      lines: allocation,
+      revisedCommitmentSum: round2(commitment.revisedCommitmentSum + pkg.amount),
       requestedDate: pkg.submittedAt ? pkg.submittedAt.slice(0, 10) : null,
       executedDate,
       signedChangeOrderReceivedDate: options.signedDate ?? pkg.signedDate ?? null,
@@ -932,48 +879,15 @@ export async function executeCommitmentPackage(
       executedBy: actorId,
     });
 
-    for (const [i, leg] of legs.entries()) {
-      await tx.insert(commitmentSovLines).values({
-        id: newId("csv"),
-        companyId,
-        projectId,
-        commitmentId: commitment.id,
-        lineNumber: lineNumbers[i]!,
-        sortOrder: baseSort + i,
-        costCode: leg.costCode,
-        costType: leg.costType,
-        budgetLineItemId: leg.budgetLineItemId,
-        description: `${changeReference} — ${leg.description}`,
-        billingMethod: "percent_complete",
-        scheduledValue: leg.amount,
-        changeOrderValue: 0,
-        revisedScheduledValue: leg.amount,
-        balanceToFinish: leg.amount,
-        retainagePercent: commitment.defaultRetainagePercent,
-        isChangeOrderLine: 1,
-        changeOrderPackageId: pkg.id,
-        taxable: commitment.taxable,
-        taxPercent: commitment.taxPercent,
-        detail: { changeId, legKey: leg.key },
-      });
-    }
-
+    const applied = await applyChangeAllocation(tx, commitment, changeNumber, allocation, {
+      changeOrderPackageId: pkg.id,
+    });
+    appendedSovLineIds = applied.appendedSovLineIds;
+    totals = await recomputeCommitmentTotals(tx, commitment.id);
     await tx
-      .update(commitments)
-      .set({
-        approvedChangeSum: sums.approvedChangeSum,
-        pendingChangeSum: sums.pendingChangeSum,
-        draftChangeSum: sums.draftChangeSum,
-        revisedCommitmentSum: sums.revised,
-        balanceToFinish: round2(sums.revised - commitment.totalInvoiced),
-        taxAmount:
-          commitment.taxable === 1 && commitment.taxPercent !== null
-            ? round2((commitment.taxPercent / 100) * sums.revised)
-            : commitment.taxAmount,
-        totalsCalculatedAt: now,
-        updatedAt: now,
-      })
-      .where(eq(commitments.id, commitment.id));
+      .update(commitmentChanges)
+      .set({ revisedCommitmentSum: totals.revisedCommitmentSum })
+      .where(eq(commitmentChanges.id, changeId));
 
     await tx
       .update(changeOrderPackages)
@@ -986,9 +900,13 @@ export async function executeCommitmentPackage(
         updatedAt: now,
       })
       .where(eq(changeOrderPackages.id, pkg.id));
-  });
 
-  const budgetLinesMoved = await syncBudgetCommitted(db, companyId, projectId, budgetLineIds);
+    if (budgetLineIds.length > 0) {
+      const sync = await syncBudgetCommitted(tx, companyId, projectId, budgetLineIds);
+      budgetLinesMoved = sync.budgetLinesUpdated;
+    }
+  });
+  const sums = totals!;
   let budgetId: string | null = null;
   if (budgetLinesMoved > 0) {
     const [row] = await db
@@ -1011,16 +929,16 @@ export async function executeCommitmentPackage(
     legs,
     primeContractChangeId: null,
     primeContractChangeReference: null,
-    appendedSovLineIds: [],
+    appendedSovLineIds,
     contractSums: null,
     commitmentChangeId: changeId,
     commitmentChangeReference: changeReference,
     commitmentSums: {
-      originalCommitmentSum: round2(commitment.originalCommitmentSum),
-      approvedChangeSum: sums.approvedChangeSum,
-      pendingChangeSum: sums.pendingChangeSum,
-      draftChangeSum: sums.draftChangeSum,
-      revisedCommitmentSum: sums.revised,
+      originalCommitmentSum: round2(sums.originalCommitmentSum),
+      approvedChangeSum: round2(sums.approvedChangeSum),
+      pendingChangeSum: round2(sums.pendingChangeSum),
+      draftChangeSum: round2(sums.draftChangeSum),
+      revisedCommitmentSum: round2(sums.revisedCommitmentSum),
     },
     budget: {
       applied: budgetLinesMoved > 0,
@@ -1041,8 +959,13 @@ export async function executeCommitmentPackage(
       checkIdentity("Σ appended SOV lines = package amount", legTotal, pkg.amount),
       checkIdentity(
         "originalCommitmentSum + approvedChangeSum = revisedCommitmentSum",
-        commitment.originalCommitmentSum + sums.approvedChangeSum,
-        sums.revised,
+        sums.originalCommitmentSum + sums.approvedChangeSum,
+        sums.revisedCommitmentSum,
+      ),
+      checkIdentity(
+        "originalCommitmentSum is unchanged by execution",
+        sums.originalCommitmentSum,
+        commitment.originalCommitmentSum,
       ),
     ],
   };

@@ -137,6 +137,7 @@ export default function SnapshotsTab({
 }: SnapshotsTabProps) {
   const [createOpen, setCreateOpen] = useState(false);
   const [openId, setOpenId] = useState<string | null>(null);
+  const [voiding, setVoiding] = useState<SnapshotSummary | null>(null);
   const [localVersion, setLocalVersion] = useState(0);
   const [fromRef, setFromRef] = useState("");
   const [toRef, setToRef] = useState("");
@@ -228,12 +229,20 @@ export default function SnapshotsTab({
                 <Th numeric>Revised budget</Th>
                 <Th numeric>Forecast at completion</Th>
                 <Th>Captured</Th>
+                <Th />
               </tr>
             </thead>
             <tbody>
               {items.map((snapshot) => (
                 <Tr key={snapshot.id} interactive onClick={() => setOpenId(snapshot.id)}>
-                  <Td className="font-mono text-code">{snapshot.reference}</Td>
+                  <Td className="font-mono text-code">
+                    {snapshot.reference}
+                    {snapshot.void ? (
+                      <Badge tone="neutral" size="xs" className="ml-1">
+                        void
+                      </Badge>
+                    ) : null}
+                  </Td>
                   <Td truncate>{snapshot.name}</Td>
                   <Td muted>{SNAPSHOT_KIND_LABEL[snapshot.kind] ?? labelize(snapshot.kind)}</Td>
                   <Td>{isoDate(snapshot.asOfDate)}</Td>
@@ -251,12 +260,36 @@ export default function SnapshotsTab({
                       {dateTime(snapshot.capturedAt)}
                     </span>
                   </Td>
+                  <Td>
+                    {snapshot.void ? null : (
+                      <Button
+                        size="xs"
+                        variant="ghost"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setVoiding(snapshot);
+                        }}
+                      >
+                        Void
+                      </Button>
+                    )}
+                  </Td>
                 </Tr>
               ))}
             </tbody>
           </Table>
         )}
       </section>
+
+      <VoidSnapshotModal
+        snapshot={voiding}
+        onClose={() => setVoiding(null)}
+        onVoided={() => {
+          setVoiding(null);
+          setLocalVersion((n) => n + 1);
+          onChanged();
+        }}
+      />
 
       <section>
         <SectionHeading
@@ -843,8 +876,8 @@ function CaptureModal({
             ))}
           </Select>
         </Field>
-        <Field label="As at" hint="The date the capture speaks for.">
-          <DatePicker value={asOf} onChange={setAsOf} aria-label="As at date" />
+        <Field label="As at" hint="The date the capture speaks for. It cannot be in the future — a capture closes every period up to its date.">
+          <DatePicker value={asOf} onChange={setAsOf} aria-label="As at date" max={new Date()} />
         </Field>
         <Field label="Period start" optional>
           <DatePicker value={periodStart} onChange={setPeriodStart} aria-label="Period start" />
@@ -863,6 +896,71 @@ function CaptureModal({
         onChange={(event) => setAcknowledged(event.target.checked)}
         label={`I understand this capture is immutable and freezes the plan amounts on ${budget.reference}.`}
       />
+    </Modal>
+  );
+}
+
+/**
+ * Void a capture (budget admin, reason required). The row and its hash stay
+ * — a capture that existed is evidence — but it stops freezing the plan and
+ * closing the period, which is how a mistaken or future-dated capture is
+ * undone without pretending it never happened.
+ */
+function VoidSnapshotModal({
+  snapshot,
+  onClose,
+  onVoided,
+}: {
+  snapshot: SnapshotSummary | null;
+  onClose: () => void;
+  onVoided: () => void;
+}) {
+  const [reason, setReason] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (snapshot) {
+      setReason("");
+      setError(null);
+    }
+  }, [snapshot]);
+
+  async function submit() {
+    if (!snapshot || reason.trim() === "") return;
+    setSaving(true);
+    setError(null);
+    try {
+      await api.post(`/api/v1/budget-snapshots/${snapshot.id}/void`, { reason: reason.trim() });
+      onVoided();
+    } catch (err) {
+      setError(errorMessage(err, "The capture could not be voided"));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Modal
+      open={snapshot !== null}
+      onClose={onClose}
+      title={snapshot ? `Void ${snapshot.reference}?` : "Void capture"}
+      description="The capture keeps its hashed row as evidence but stops guarding the period: plan amounts become editable again and movements may be dated after the previous live capture. Budget admin only."
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="danger" onClick={() => void submit()} loading={saving} disabled={reason.trim() === ""}>
+            Void the capture
+          </Button>
+        </>
+      }
+    >
+      <ErrorAlert message={error} />
+      <Field label="Reason" required hint="Stored on the capture and in the ledger.">
+        <Textarea rows={3} value={reason} onChange={(event) => setReason(event.target.value)} autoFocus />
+      </Field>
     </Modal>
   );
 }
