@@ -766,6 +766,23 @@ function incidentNotificationState(row: IncidentRow, asOfISO: string): Notificat
   });
 }
 
+/**
+ * Whether 29 CFR Part 1904 was actually applied to this incident.
+ *
+ * `oshaCaseType` is set to `under_assessment` both when a rule could not be
+ * decided AND when OSHA was never in the assessed regime list at all
+ * (reportability.ts). Those two states mean opposite things to a rate: the
+ * first is an open question, the second is a question nobody asked. Only the
+ * stored determination can tell them apart, so an incident with no stored
+ * determination counts as unassessed.
+ */
+function assessedUnderOsha(row: IncidentRow): boolean {
+  const det = storedDetermination(row);
+  if (det) return det.assessedRegimes.includes("osha");
+  const regimes = storedRegimes(row);
+  return regimes != null && regimes.includes("osha");
+}
+
 /** Regimes recorded on the incident, for reassessment without re-supplying them. */
 function storedRegimes(row: IncidentRow): string[] | null {
   const a = detailObject(row, "reportabilityInputs");
@@ -4392,6 +4409,27 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
             `question list than the form actually asks.`,
         );
       }
+      /* A template item marked `photoRequired` means the answer is not
+       * believable without the photograph. The flag existed on the schema and
+       * on the create/patch schema, and nothing read it: a pass could be
+       * recorded against "guardrail continuous to the east edge" with no
+       * image, which is exactly the answer somebody gives from the site
+       * cabin. The quality module has always enforced it on the same
+       * vocabulary; safety now does too. */
+      if (scored.missingPhotos.length > 0) {
+        const labels = scored.missingPhotos
+          .map((id) => {
+            const item = items.find((i) => i.id === id);
+            return item ? `${id} (${item.text})` : id;
+          })
+          .join("; ");
+        throw badRequest(
+          `Template ${template.reference} marks these items photo-required and they were answered ` +
+            `with no photograph: ${labels}. The photograph is what distinguishes an inspection that ` +
+            `was carried out from one that was filled in — attach one to each, or answer the item ` +
+            `not-applicable if the feature is not present.`,
+        );
+      }
 
       const performedAt = body.performedAt ?? new Date().toISOString();
       const nextDue =
@@ -5585,6 +5623,14 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       underAssessment: incidents.filter(
         (i) => (storedDetermination(i)?.indeterminateRuleIds ?? []).length > 0,
       ).length,
+      /* Incidents on which the OSHA question was never asked at all. On a
+       * RIDDOR-only project every incident carries `oshaCaseType:
+       * "under_assessment"` because 29 CFR 1904 was not among the assessed
+       * regimes — so counting recordable cases by OSHA case type returns zero,
+       * and TRIR 0.00 goes onto a prequalification questionnaire from a
+       * register holding specified injuries. computeSafetyRates refuses TRIR
+       * and DART when this is non-zero. */
+      unassessedForOsha: incidents.filter((i) => !assessedUnderOsha(i)).length,
     };
 
     const observationRows = await app.db

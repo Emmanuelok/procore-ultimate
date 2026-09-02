@@ -4940,6 +4940,747 @@ CREATE TABLE "term_contracts" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
+CREATE TABLE "site_access_passes" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"induction_id" text,
+	"worker_id" text,
+	"person_name" text NOT NULL,
+	"person_kind" text DEFAULT 'worker' NOT NULL,
+	"vendor_id" text,
+	"badge_code" text NOT NULL,
+	"credential_type" text DEFAULT 'badge' NOT NULL,
+	"status" text DEFAULT 'active' NOT NULL,
+	"valid_from" text,
+	"valid_until" text,
+	"zones_allowed" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"issued_by" text,
+	"issued_at" timestamp with time zone,
+	"revoked_at" timestamp with time zone,
+	"revoked_by" text,
+	"revoke_reason" text,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_drone_flights" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"number" integer NOT NULL,
+	"reference" text NOT NULL,
+	"purpose" text DEFAULT 'progress' NOT NULL,
+	"status" text DEFAULT 'planned' NOT NULL,
+	"pilot_name" text,
+	"pilot_licence_ref" text,
+	"operator_vendor_id" text,
+	"aircraft" text,
+	"planned_for" timestamp with time zone,
+	"flown_at" timestamp with time zone,
+	"duration_minutes" double precision,
+	"permission_status" text DEFAULT 'pending' NOT NULL,
+	"permission_ref" text,
+	"airspace_notes" text,
+	"max_altitude_m" double precision,
+	"area_covered_m2" double precision,
+	"image_count" integer,
+	"weather_observation_id" text,
+	"risk_assessment_ref" text,
+	"grounded_reason" text,
+	"outputs" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"file_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_environmental_events" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"number" integer NOT NULL,
+	"reference" text NOT NULL,
+	"category" text NOT NULL,
+	"detected_via" text DEFAULT 'observation' NOT NULL,
+	"occurred_at" timestamp with time zone NOT NULL,
+	"duration_minutes" double precision,
+	"magnitude" double precision,
+	"magnitude_unit" text,
+	"threshold_value" double precision,
+	"threshold_unit" text,
+	"exceeded_threshold" integer DEFAULT 0 NOT NULL,
+	"severity" text DEFAULT 'low' NOT NULL,
+	"status" text DEFAULT 'open' NOT NULL,
+	"location_id" text,
+	"zone_id" text,
+	"lat" double precision,
+	"lon" double precision,
+	"sensor_ref" text,
+	"impact" text,
+	"work_stopped" integer DEFAULT 0 NOT NULL,
+	"stoppage_minutes" double precision,
+	"actions_taken" text,
+	"weather_observation_id" text,
+	"assurance_event_id" text,
+	"signal_id" text,
+	"closed_at" timestamp with time zone,
+	"closed_by" text,
+	"file_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"notes" text,
+	"reported_by_name" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_exclusion_zones" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"name" text NOT NULL,
+	"kind" text DEFAULT 'other' NOT NULL,
+	"permit_id" text,
+	"ring" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"centre_lat" double precision,
+	"centre_lon" double precision,
+	"radius_m" double precision,
+	"status" text DEFAULT 'planned' NOT NULL,
+	"severity" text DEFAULT 'high' NOT NULL,
+	"active_from" timestamp with time zone,
+	"active_to" timestamp with time zone,
+	"lifted_at" timestamp with time zone,
+	"lifted_by" text,
+	"description" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_gate_events" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"gate_name" text DEFAULT 'main' NOT NULL,
+	"device_id" text,
+	"pass_id" text,
+	"worker_id" text,
+	"badge_code" text,
+	"person_name" text,
+	"person_kind" text,
+	"vendor_id" text,
+	"direction" text NOT NULL,
+	"occurred_at" timestamp with time zone NOT NULL,
+	"source" text DEFAULT 'turnstile' NOT NULL,
+	"accepted" integer DEFAULT 1 NOT NULL,
+	"refusal_reason" text,
+	"zone_id" text,
+	"lat" double precision,
+	"lon" double precision,
+	"external_ref" text,
+	"raw" jsonb,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_geotech_investigations" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"number" integer NOT NULL,
+	"reference" text NOT NULL,
+	"hole_ref" text NOT NULL,
+	"kind" text DEFAULT 'borehole' NOT NULL,
+	"status" text DEFAULT 'planned' NOT NULL,
+	"is_baseline" integer DEFAULT 0 NOT NULL,
+	"baseline_investigation_id" text,
+	"contractor_vendor_id" text,
+	"investigated_on" text,
+	"location_description" text,
+	"lat" double precision,
+	"lon" double precision,
+	"easting" double precision,
+	"northing" double precision,
+	"ground_level_m" double precision,
+	"depth_m" double precision,
+	"water_strike_depth_m" double precision,
+	"strata" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"lab_test_refs" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"file_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_ground_findings" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"investigation_id" text NOT NULL,
+	"baseline_investigation_id" text,
+	"category" text NOT NULL,
+	"severity" text DEFAULT 'medium' NOT NULL,
+	"depth_from_m" double precision,
+	"depth_to_m" double precision,
+	"baseline_description" text,
+	"observed_description" text NOT NULL,
+	"differs_from_baseline" integer DEFAULT 1 NOT NULL,
+	"variance_notes" text,
+	"detected_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"detection_method" text DEFAULT 'comparison' NOT NULL,
+	"status" text DEFAULT 'open' NOT NULL,
+	"assessed_by" text,
+	"assessed_at" timestamp with time zone,
+	"assessment_notes" text,
+	"change_event_id" text,
+	"signal_id" text,
+	"created_by" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_inductions" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"worker_id" text,
+	"person_name" text NOT NULL,
+	"person_kind" text DEFAULT 'worker' NOT NULL,
+	"vendor_id" text,
+	"induction_type" text DEFAULT 'general' NOT NULL,
+	"language" text,
+	"conducted_by" text,
+	"conducted_by_name" text,
+	"conducted_at" timestamp with time zone,
+	"valid_from" text,
+	"valid_until" text,
+	"status" text DEFAULT 'pending' NOT NULL,
+	"topics" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"score_percent" double precision,
+	"pass_mark" double precision,
+	"file_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"revoked_at" timestamp with time zone,
+	"revoked_by" text,
+	"revoke_reason" text,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_lone_worker_checkins" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"session_id" text NOT NULL,
+	"checked_in_at" timestamp with time zone NOT NULL,
+	"due_at" timestamp with time zone,
+	"late_seconds" double precision,
+	"lat" double precision,
+	"lon" double precision,
+	"method" text DEFAULT 'mobile' NOT NULL,
+	"ok" integer DEFAULT 1 NOT NULL,
+	"note" text,
+	"recorded_by" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_lone_worker_sessions" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"worker_id" text,
+	"pass_id" text,
+	"person_name" text NOT NULL,
+	"activity" text NOT NULL,
+	"location_id" text,
+	"location_description" text,
+	"lat" double precision,
+	"lon" double precision,
+	"started_at" timestamp with time zone NOT NULL,
+	"interval_minutes" integer DEFAULT 30 NOT NULL,
+	"next_due_at" timestamp with time zone NOT NULL,
+	"last_check_in_at" timestamp with time zone,
+	"check_in_count" integer DEFAULT 0 NOT NULL,
+	"missed_count" integer DEFAULT 0 NOT NULL,
+	"expected_end_at" timestamp with time zone,
+	"status" text DEFAULT 'active' NOT NULL,
+	"escalated_at" timestamp with time zone,
+	"escalation_signal_id" text,
+	"completed_at" timestamp with time zone,
+	"completed_by" text,
+	"contact_name" text,
+	"contact_phone" text,
+	"watcher_user_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_muster_checkins" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"muster_id" text NOT NULL,
+	"person_key" text NOT NULL,
+	"person_name" text NOT NULL,
+	"pass_id" text,
+	"worker_id" text,
+	"status" text DEFAULT 'present' NOT NULL,
+	"unexpected" integer DEFAULT 0 NOT NULL,
+	"method" text DEFAULT 'manual' NOT NULL,
+	"checked_in_at" timestamp with time zone,
+	"checked_in_by" text,
+	"notes" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_musters" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"number" integer NOT NULL,
+	"reference" text NOT NULL,
+	"kind" text DEFAULT 'drill' NOT NULL,
+	"muster_point" text,
+	"declared_at" timestamp with time zone NOT NULL,
+	"declared_by" text NOT NULL,
+	"status" text DEFAULT 'open' NOT NULL,
+	"expected_count" integer DEFAULT 0 NOT NULL,
+	"accounted_count" integer DEFAULT 0 NOT NULL,
+	"unaccounted_count" integer DEFAULT 0 NOT NULL,
+	"unexpected_count" integer DEFAULT 0 NOT NULL,
+	"expected_register" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"cleared_at" timestamp with time zone,
+	"reconciled_at" timestamp with time zone,
+	"reconciled_by" text,
+	"duration_seconds" double precision,
+	"signal_id" text,
+	"notes" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_permit_entries" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"permit_id" text NOT NULL,
+	"person_name" text NOT NULL,
+	"worker_id" text,
+	"pass_id" text,
+	"attendant_name" text,
+	"entered_at" timestamp with time zone NOT NULL,
+	"expected_exit_at" timestamp with time zone,
+	"exited_at" timestamp with time zone,
+	"status" text DEFAULT 'inside' NOT NULL,
+	"overdue_at" timestamp with time zone,
+	"gas_readings" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"signal_id" text,
+	"notes" text,
+	"recorded_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_permits" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"number" integer NOT NULL,
+	"reference" text NOT NULL,
+	"permit_type" text NOT NULL,
+	"title" text NOT NULL,
+	"description" text,
+	"location_id" text,
+	"location_description" text,
+	"exclusion_zone_id" text,
+	"vendor_id" text,
+	"supervisor_name" text,
+	"status" text DEFAULT 'draft' NOT NULL,
+	"valid_from" timestamp with time zone,
+	"valid_to" timestamp with time zone,
+	"requested_by" text NOT NULL,
+	"requested_at" timestamp with time zone,
+	"approved_by" text,
+	"approved_at" timestamp with time zone,
+	"rejected_by" text,
+	"rejected_at" timestamp with time zone,
+	"rejection_reason" text,
+	"issued_at" timestamp with time zone,
+	"suspended_at" timestamp with time zone,
+	"suspend_reason" text,
+	"closed_by" text,
+	"closed_at" timestamp with time zone,
+	"closure_notes" text,
+	"expired_at" timestamp with time zone,
+	"precautions" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"isolations" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"max_occupancy" integer,
+	"requires_gas_test" integer DEFAULT 0 NOT NULL,
+	"gas_test_interval_minutes" integer,
+	"fire_watch_minutes" integer,
+	"fire_watch_completed_at" timestamp with time zone,
+	"utility_scan_id" text,
+	"risk_assessment_ref" text,
+	"safety_record_id" text,
+	"file_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"signal_id" text,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_photo_tour_stations" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"tour_id" text NOT NULL,
+	"name" text NOT NULL,
+	"sequence" integer DEFAULT 0 NOT NULL,
+	"captured_at" timestamp with time zone,
+	"file_id" text,
+	"photo_id" text,
+	"lat" double precision,
+	"lon" double precision,
+	"elevation_m" double precision,
+	"heading_deg" double precision,
+	"location_id" text,
+	"notes" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_photo_tours" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"name" text NOT NULL,
+	"captured_at" timestamp with time zone,
+	"captured_by_name" text,
+	"location_id" text,
+	"level" text,
+	"status" text DEFAULT 'draft' NOT NULL,
+	"station_count" integer DEFAULT 0 NOT NULL,
+	"coverage_notes" text,
+	"scan_id" text,
+	"drone_flight_id" text,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_progress_observations" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"number" integer NOT NULL,
+	"reference" text NOT NULL,
+	"zone_name" text NOT NULL,
+	"location_id" text,
+	"schedule_task_id" text,
+	"work_package_ref" text,
+	"claimed_percent" double precision NOT NULL,
+	"observed_percent" double precision NOT NULL,
+	"variance_percent" double precision NOT NULL,
+	"method" text DEFAULT 'visual' NOT NULL,
+	"observed_at" timestamp with time zone NOT NULL,
+	"observed_by" text NOT NULL,
+	"observed_by_name" text,
+	"claim_source_type" text DEFAULT 'manual' NOT NULL,
+	"claim_source_id" text,
+	"claimant_id" text NOT NULL,
+	"claimant_kind" text DEFAULT 'user' NOT NULL,
+	"claimed_at" timestamp with time zone,
+	"scan_id" text,
+	"drone_flight_id" text,
+	"file_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"assertion_id" text NOT NULL,
+	"evidence_id" text NOT NULL,
+	"reconciliation_id" text NOT NULL,
+	"result" text NOT NULL,
+	"confidence" double precision,
+	"independence_score" double precision,
+	"signal_id" text,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_scan_deviations" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"scan_id" text NOT NULL,
+	"model_id" text,
+	"model_version" text,
+	"reference" text NOT NULL,
+	"number" integer NOT NULL,
+	"method" text DEFAULT 'cloud_to_mesh' NOT NULL,
+	"tolerance_mm" double precision NOT NULL,
+	"marginal_factor" double precision DEFAULT 0.8 NOT NULL,
+	"element_count" integer DEFAULT 0 NOT NULL,
+	"within_tolerance_count" integer DEFAULT 0 NOT NULL,
+	"marginal_count" integer DEFAULT 0 NOT NULL,
+	"out_of_tolerance_count" integer DEFAULT 0 NOT NULL,
+	"max_deviation_mm" double precision,
+	"mean_abs_deviation_mm" double precision,
+	"rms_deviation_mm" double precision,
+	"verdict" text DEFAULT 'not_assessable' NOT NULL,
+	"status" text DEFAULT 'draft' NOT NULL,
+	"by_zone" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"items" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"reasons" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"signal_id" text,
+	"accepted_by" text,
+	"accepted_at" timestamp with time zone,
+	"notes" text,
+	"generated_by" text NOT NULL,
+	"generated_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_scans" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"number" integer NOT NULL,
+	"reference" text NOT NULL,
+	"name" text NOT NULL,
+	"method" text DEFAULT 'terrestrial_laser' NOT NULL,
+	"status" text DEFAULT 'planned' NOT NULL,
+	"captured_at" timestamp with time zone,
+	"captured_by_name" text,
+	"vendor_id" text,
+	"location_id" text,
+	"area_description" text,
+	"drone_flight_id" text,
+	"setup_count" integer,
+	"point_count_millions" double precision,
+	"size_mb" double precision,
+	"coordinate_system" text,
+	"registration_status" text DEFAULT 'unregistered' NOT NULL,
+	"registration_error_mm" double precision,
+	"control_point_refs" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"model_id" text,
+	"file_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_setting_out_records" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"number" integer NOT NULL,
+	"reference" text NOT NULL,
+	"description" text NOT NULL,
+	"element_ref" text,
+	"location_id" text,
+	"schedule_task_id" text,
+	"drawing_id" text,
+	"drawing_revision" text,
+	"method" text DEFAULT 'total_station' NOT NULL,
+	"control_point_refs" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"tolerance_mm" double precision,
+	"max_deviation_mm" double precision,
+	"set_out_by" text NOT NULL,
+	"set_out_by_name" text,
+	"set_out_at" timestamp with time zone,
+	"checked_by" text,
+	"checked_by_name" text,
+	"checked_at" timestamp with time zone,
+	"approved_by" text,
+	"approved_at" timestamp with time zone,
+	"status" text DEFAULT 'draft' NOT NULL,
+	"rejection_reason" text,
+	"file_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_survey_points" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"point_ref" text NOT NULL,
+	"kind" text DEFAULT 'control' NOT NULL,
+	"easting" double precision,
+	"northing" double precision,
+	"elevation" double precision,
+	"lat" double precision,
+	"lon" double precision,
+	"coordinate_system" text,
+	"datum" text,
+	"method" text DEFAULT 'gnss' NOT NULL,
+	"accuracy_mm" double precision,
+	"established_by_name" text,
+	"established_at" timestamp with time zone,
+	"status" text DEFAULT 'active' NOT NULL,
+	"last_checked_at" timestamp with time zone,
+	"last_checked_by" text,
+	"last_delta_mm" double precision,
+	"superseded_by_id" text,
+	"description" text,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_utility_services" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"service_ref" text NOT NULL,
+	"utility_type" text DEFAULT 'unknown' NOT NULL,
+	"owner_name" text,
+	"specification" text,
+	"depth_m" double precision,
+	"route" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"detection_method" text DEFAULT 'records' NOT NULL,
+	"confidence" text DEFAULT 'unknown' NOT NULL,
+	"survey_scan_id" text,
+	"marked_out_at" timestamp with time zone,
+	"marked_out_by_name" text,
+	"mark_valid_until" text,
+	"status" text DEFAULT 'unknown' NOT NULL,
+	"file_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_utility_strikes" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"number" integer NOT NULL,
+	"reference" text NOT NULL,
+	"occurred_at" timestamp with time zone NOT NULL,
+	"utility_type" text DEFAULT 'unknown' NOT NULL,
+	"service_id" text,
+	"permit_id" text,
+	"severity" text DEFAULT 'near_miss' NOT NULL,
+	"status" text DEFAULT 'reported' NOT NULL,
+	"location_description" text,
+	"lat" double precision,
+	"lon" double precision,
+	"depth_m" double precision,
+	"injuries" integer DEFAULT 0 NOT NULL,
+	"services_lost" text,
+	"contractor_vendor_id" text,
+	"operative_name" text,
+	"plant_type" text,
+	"permit_in_place" integer DEFAULT 0 NOT NULL,
+	"scan_completed" integer DEFAULT 0 NOT NULL,
+	"marks_present" integer DEFAULT 0 NOT NULL,
+	"root_cause" text,
+	"immediate_actions" text,
+	"reported_to_owner_at" timestamp with time zone,
+	"cost_estimate" double precision,
+	"currency" text DEFAULT 'USD' NOT NULL,
+	"incident_id" text,
+	"signal_id" text,
+	"closed_at" timestamp with time zone,
+	"closed_by" text,
+	"file_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_weather_analyses" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"number" integer NOT NULL,
+	"reference" text NOT NULL,
+	"baseline_id" text NOT NULL,
+	"period_start" text NOT NULL,
+	"period_end" text NOT NULL,
+	"status" text DEFAULT 'draft' NOT NULL,
+	"days_in_period" integer DEFAULT 0 NOT NULL,
+	"days_observed" integer DEFAULT 0 NOT NULL,
+	"observed_adverse_days" double precision,
+	"baseline_adverse_days" double precision,
+	"exceptional_days" double precision,
+	"hours_lost" double precision,
+	"coverage_percent" double precision,
+	"by_month" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"adverse_day_detail" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"reasons" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"delay_event_id" text,
+	"issued_at" timestamp with time zone,
+	"issued_by" text,
+	"superseded_by_id" text,
+	"notes" text,
+	"generated_by" text NOT NULL,
+	"generated_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_weather_baselines" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"name" text NOT NULL,
+	"source" text DEFAULT 'contract' NOT NULL,
+	"contract_ref" text,
+	"method" text,
+	"period_start" text,
+	"period_end" text,
+	"thresholds" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"monthly_expected_adverse_days" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"is_active" integer DEFAULT 1 NOT NULL,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "site_weather_observations" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"observed_on" text NOT NULL,
+	"source" text DEFAULT 'manual' NOT NULL,
+	"provider" text,
+	"station_ref" text,
+	"temp_min_c" double precision,
+	"temp_max_c" double precision,
+	"temp_mean_c" double precision,
+	"precipitation_mm" double precision,
+	"snowfall_mm" double precision,
+	"wind_mean_kph" double precision,
+	"wind_gust_kph" double precision,
+	"humidity_pct" double precision,
+	"visibility_m" double precision,
+	"sea_state_m" double precision,
+	"conditions" text,
+	"work_stopped" integer DEFAULT 0 NOT NULL,
+	"hours_lost" double precision,
+	"affected_activities" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"adverse" integer,
+	"adverse_reasons" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"raw" jsonb,
+	"recorded_by" text,
+	"notes" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
 CREATE TABLE "agent_actions" (
 	"id" text PRIMARY KEY NOT NULL,
 	"company_id" text NOT NULL,
@@ -5904,6 +6645,88 @@ CREATE INDEX "target_cost_contracts_project_idx" ON "target_cost_contracts" USIN
 CREATE UNIQUE INDEX "term_contracts_uq" ON "term_contracts" USING btree ("company_id","reference");--> statement-breakpoint
 CREATE INDEX "term_contracts_company_idx" ON "term_contracts" USING btree ("company_id","status");--> statement-breakpoint
 CREATE INDEX "term_contracts_vendor_idx" ON "term_contracts" USING btree ("company_id","vendor_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "site_passes_badge_uq" ON "site_access_passes" USING btree ("project_id","badge_code");--> statement-breakpoint
+CREATE INDEX "site_passes_project_idx" ON "site_access_passes" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "site_passes_worker_idx" ON "site_access_passes" USING btree ("project_id","worker_id");--> statement-breakpoint
+CREATE INDEX "site_passes_expiry_idx" ON "site_access_passes" USING btree ("status","valid_until");--> statement-breakpoint
+CREATE UNIQUE INDEX "site_flights_ref_uq" ON "site_drone_flights" USING btree ("project_id","reference");--> statement-breakpoint
+CREATE INDEX "site_flights_project_idx" ON "site_drone_flights" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "site_flights_planned_idx" ON "site_drone_flights" USING btree ("project_id","planned_for");--> statement-breakpoint
+CREATE UNIQUE INDEX "site_env_events_ref_uq" ON "site_environmental_events" USING btree ("project_id","reference");--> statement-breakpoint
+CREATE INDEX "site_env_events_project_idx" ON "site_environmental_events" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "site_env_events_occurred_idx" ON "site_environmental_events" USING btree ("project_id","occurred_at");--> statement-breakpoint
+CREATE INDEX "site_env_events_category_idx" ON "site_environmental_events" USING btree ("project_id","category");--> statement-breakpoint
+CREATE INDEX "site_zones_project_idx" ON "site_exclusion_zones" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "site_zones_active_idx" ON "site_exclusion_zones" USING btree ("status","active_to");--> statement-breakpoint
+CREATE INDEX "site_zones_permit_idx" ON "site_exclusion_zones" USING btree ("permit_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "site_gate_events_external_uq" ON "site_gate_events" USING btree ("project_id","external_ref");--> statement-breakpoint
+CREATE INDEX "site_gate_events_project_time_idx" ON "site_gate_events" USING btree ("project_id","occurred_at");--> statement-breakpoint
+CREATE INDEX "site_gate_events_pass_idx" ON "site_gate_events" USING btree ("project_id","pass_id","occurred_at");--> statement-breakpoint
+CREATE INDEX "site_gate_events_badge_idx" ON "site_gate_events" USING btree ("project_id","badge_code","occurred_at");--> statement-breakpoint
+CREATE INDEX "site_gate_events_company_idx" ON "site_gate_events" USING btree ("company_id","occurred_at");--> statement-breakpoint
+CREATE UNIQUE INDEX "site_geotech_ref_uq" ON "site_geotech_investigations" USING btree ("project_id","reference");--> statement-breakpoint
+CREATE INDEX "site_geotech_project_idx" ON "site_geotech_investigations" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "site_geotech_baseline_idx" ON "site_geotech_investigations" USING btree ("project_id","is_baseline");--> statement-breakpoint
+CREATE INDEX "site_geotech_hole_idx" ON "site_geotech_investigations" USING btree ("project_id","hole_ref");--> statement-breakpoint
+CREATE INDEX "site_ground_findings_project_idx" ON "site_ground_findings" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "site_ground_findings_investigation_idx" ON "site_ground_findings" USING btree ("investigation_id");--> statement-breakpoint
+CREATE INDEX "site_ground_findings_category_idx" ON "site_ground_findings" USING btree ("project_id","category");--> statement-breakpoint
+CREATE INDEX "site_inductions_project_idx" ON "site_inductions" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "site_inductions_worker_idx" ON "site_inductions" USING btree ("project_id","worker_id");--> statement-breakpoint
+CREATE INDEX "site_inductions_expiry_idx" ON "site_inductions" USING btree ("status","valid_until");--> statement-breakpoint
+CREATE INDEX "site_inductions_company_idx" ON "site_inductions" USING btree ("company_id","project_id");--> statement-breakpoint
+CREATE INDEX "site_lw_checkins_session_idx" ON "site_lone_worker_checkins" USING btree ("session_id","checked_in_at");--> statement-breakpoint
+CREATE INDEX "site_lw_checkins_project_idx" ON "site_lone_worker_checkins" USING btree ("project_id");--> statement-breakpoint
+CREATE INDEX "site_lone_worker_project_idx" ON "site_lone_worker_sessions" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "site_lone_worker_due_idx" ON "site_lone_worker_sessions" USING btree ("status","next_due_at");--> statement-breakpoint
+CREATE INDEX "site_lone_worker_company_idx" ON "site_lone_worker_sessions" USING btree ("company_id","status");--> statement-breakpoint
+CREATE UNIQUE INDEX "site_muster_checkins_uq" ON "site_muster_checkins" USING btree ("muster_id","person_key");--> statement-breakpoint
+CREATE INDEX "site_muster_checkins_muster_idx" ON "site_muster_checkins" USING btree ("muster_id","status");--> statement-breakpoint
+CREATE INDEX "site_muster_checkins_project_idx" ON "site_muster_checkins" USING btree ("project_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "site_musters_ref_uq" ON "site_musters" USING btree ("project_id","reference");--> statement-breakpoint
+CREATE INDEX "site_musters_project_idx" ON "site_musters" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "site_musters_declared_idx" ON "site_musters" USING btree ("project_id","declared_at");--> statement-breakpoint
+CREATE INDEX "site_permit_entries_permit_idx" ON "site_permit_entries" USING btree ("permit_id","status");--> statement-breakpoint
+CREATE INDEX "site_permit_entries_project_idx" ON "site_permit_entries" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "site_permit_entries_overdue_idx" ON "site_permit_entries" USING btree ("status","expected_exit_at");--> statement-breakpoint
+CREATE UNIQUE INDEX "site_permits_ref_uq" ON "site_permits" USING btree ("project_id","reference");--> statement-breakpoint
+CREATE INDEX "site_permits_project_status_idx" ON "site_permits" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "site_permits_validity_idx" ON "site_permits" USING btree ("status","valid_to");--> statement-breakpoint
+CREATE INDEX "site_permits_type_idx" ON "site_permits" USING btree ("project_id","permit_type","status");--> statement-breakpoint
+CREATE INDEX "site_permits_company_idx" ON "site_permits" USING btree ("company_id","status");--> statement-breakpoint
+CREATE INDEX "site_tour_stations_tour_idx" ON "site_photo_tour_stations" USING btree ("tour_id","sequence");--> statement-breakpoint
+CREATE INDEX "site_tour_stations_project_idx" ON "site_photo_tour_stations" USING btree ("project_id");--> statement-breakpoint
+CREATE INDEX "site_tours_project_idx" ON "site_photo_tours" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "site_tours_captured_idx" ON "site_photo_tours" USING btree ("project_id","captured_at");--> statement-breakpoint
+CREATE UNIQUE INDEX "site_progress_obs_ref_uq" ON "site_progress_observations" USING btree ("project_id","reference");--> statement-breakpoint
+CREATE INDEX "site_progress_obs_project_idx" ON "site_progress_observations" USING btree ("project_id","observed_at");--> statement-breakpoint
+CREATE INDEX "site_progress_obs_result_idx" ON "site_progress_observations" USING btree ("project_id","result");--> statement-breakpoint
+CREATE INDEX "site_progress_obs_task_idx" ON "site_progress_observations" USING btree ("project_id","schedule_task_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "site_deviations_ref_uq" ON "site_scan_deviations" USING btree ("project_id","reference");--> statement-breakpoint
+CREATE INDEX "site_deviations_scan_idx" ON "site_scan_deviations" USING btree ("scan_id");--> statement-breakpoint
+CREATE INDEX "site_deviations_project_idx" ON "site_scan_deviations" USING btree ("project_id","status");--> statement-breakpoint
+CREATE UNIQUE INDEX "site_scans_ref_uq" ON "site_scans" USING btree ("project_id","reference");--> statement-breakpoint
+CREATE INDEX "site_scans_project_idx" ON "site_scans" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "site_scans_captured_idx" ON "site_scans" USING btree ("project_id","captured_at");--> statement-breakpoint
+CREATE UNIQUE INDEX "site_setting_out_ref_uq" ON "site_setting_out_records" USING btree ("project_id","reference");--> statement-breakpoint
+CREATE INDEX "site_setting_out_project_idx" ON "site_setting_out_records" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "site_setting_out_task_idx" ON "site_setting_out_records" USING btree ("project_id","schedule_task_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "site_survey_points_uq" ON "site_survey_points" USING btree ("project_id","point_ref");--> statement-breakpoint
+CREATE INDEX "site_survey_points_project_idx" ON "site_survey_points" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "site_survey_points_kind_idx" ON "site_survey_points" USING btree ("project_id","kind");--> statement-breakpoint
+CREATE UNIQUE INDEX "site_utility_services_uq" ON "site_utility_services" USING btree ("project_id","service_ref");--> statement-breakpoint
+CREATE INDEX "site_utility_services_project_idx" ON "site_utility_services" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "site_utility_services_type_idx" ON "site_utility_services" USING btree ("project_id","utility_type");--> statement-breakpoint
+CREATE UNIQUE INDEX "site_strikes_ref_uq" ON "site_utility_strikes" USING btree ("project_id","reference");--> statement-breakpoint
+CREATE INDEX "site_strikes_project_idx" ON "site_utility_strikes" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "site_strikes_occurred_idx" ON "site_utility_strikes" USING btree ("project_id","occurred_at");--> statement-breakpoint
+CREATE UNIQUE INDEX "site_weather_analyses_ref_uq" ON "site_weather_analyses" USING btree ("project_id","reference");--> statement-breakpoint
+CREATE INDEX "site_weather_analyses_project_idx" ON "site_weather_analyses" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "site_weather_analyses_period_idx" ON "site_weather_analyses" USING btree ("project_id","period_start","period_end");--> statement-breakpoint
+CREATE INDEX "site_weather_baselines_project_idx" ON "site_weather_baselines" USING btree ("project_id","is_active");--> statement-breakpoint
+CREATE UNIQUE INDEX "site_weather_obs_uq" ON "site_weather_observations" USING btree ("project_id","observed_on","source");--> statement-breakpoint
+CREATE INDEX "site_weather_obs_project_idx" ON "site_weather_observations" USING btree ("project_id","observed_on");--> statement-breakpoint
+CREATE INDEX "site_weather_obs_company_idx" ON "site_weather_observations" USING btree ("company_id","observed_on");--> statement-breakpoint
 CREATE INDEX "agent_actions_company_idx" ON "agent_actions" USING btree ("company_id","status");--> statement-breakpoint
 CREATE INDEX "agent_actions_project_idx" ON "agent_actions" USING btree ("project_id");--> statement-breakpoint
 CREATE INDEX "agent_actions_target_idx" ON "agent_actions" USING btree ("target_type","target_id");--> statement-breakpoint
