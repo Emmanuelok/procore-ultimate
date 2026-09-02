@@ -843,7 +843,9 @@ describe("schedules (#736)", () => {
       headers: owner.headers,
     });
     expect(list.json().items).toHaveLength(1);
-    expect(list.json().delivery.enabled).toBe(false);
+    // the job runs; whether anything is SENT depends on the transport
+    expect(list.json().delivery.enabled).toBe(true);
+    expect(list.json().delivery.dispatches).toBe(false);
 
     const removed = await app.inject({
       method: "DELETE",

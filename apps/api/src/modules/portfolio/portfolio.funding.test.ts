@@ -539,6 +539,31 @@ describe("allocations (#427, #430, #434)", () => {
     expect(cancelled.json().status).toBe("cancelled");
   });
 
+  it("refuses to strip an allocation of every source it draws on", async () => {
+    const created = await post("/portfolio/allocations", {
+      projectId: projectB,
+      appropriationId: liveAppropriationId,
+      currency: "GBP",
+      amount: 10_000,
+    });
+    expect(created.statusCode).toBe(201);
+    const id = created.json().id as string;
+    const stripped = await patch(`/portfolio/allocations/${id}`, { appropriationId: null });
+    expect(stripped.statusCode).toBe(400);
+    expect(stripped.json().message).toMatch(/no stated source/i);
+
+    // moving it onto a facility instead is fine
+    const moved = await patch(`/portfolio/allocations/${id}`, {
+      appropriationId: null,
+      fundingSourceId,
+    });
+    expect(moved.statusCode).toBe(200);
+    expect(moved.json().appropriationId).toBeNull();
+    expect(moved.json().fundingSourceId).toBe(fundingSourceId);
+
+    await post(`/portfolio/allocations/${id}/cancel`, { reason: "test fixture" });
+  });
+
   it("refuses to shrink a facility below what is allocated against it", async () => {
     const res = await patch(`/portfolio/funding-sources/${fundingSourceId}`, { amount: 100 });
     expect(res.statusCode).toBe(409);

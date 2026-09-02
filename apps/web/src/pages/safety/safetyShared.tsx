@@ -602,6 +602,23 @@ export interface ProgrammeRecord {
   reviewOverdue: boolean;
   acknowledgementShortfall: number | null;
   isCriticalKind: boolean;
+  /**
+   * Who has confirmed they read it, and — the field that matters after an
+   * incident — whether they confirmed it themselves or somebody recorded it
+   * on their behalf.
+   */
+  acknowledgements?: Acknowledgement[];
+}
+
+export interface Acknowledgement {
+  workerId: string | null;
+  userId: string | null;
+  acknowledgedAt: string;
+  method: string;
+  recordedBy?: string | null;
+  selfRecorded?: boolean;
+  recordedOnBehalf?: { by: string; role: string | null } | null;
+  attestation?: string | null;
 }
 
 /* --- rates.ts ------------------------------------------------------------- */
@@ -1996,3 +2013,221 @@ export function RegisterPager({
     </div>
   );
 }
+
+/* ========================================================================== */
+/* Platform upgrade wave — devices, statutory forms, index, scorecards         */
+/* ========================================================================== */
+
+export interface SensorEvent {
+  id: string;
+  projectId: string;
+  number: number;
+  reference: string;
+  source: string;
+  kind: string;
+  severity: string;
+  deviceId: string | null;
+  deviceModel: string | null;
+  workerId: string | null;
+  reportedPersonName: string | null;
+  vendorId: string | null;
+  occurredAt: string;
+  receivedAt: string;
+  locationText: string | null;
+  measurementValue: number | null;
+  measurementUnit: string | null;
+  thresholdValue: number | null;
+  status: string;
+  acknowledgeDueAt: string | null;
+  acknowledgedAt: string | null;
+  acknowledgedBy: string | null;
+  responseSeconds: number | null;
+  responseNote: string | null;
+  resolvedAt: string | null;
+  resolvedBy: string | null;
+  outcome: string | null;
+  incidentId: string | null;
+  observationId: string | null;
+  signalId: string | null;
+  externalId: string | null;
+  createdAt: string;
+  /** decorateSensorEvent */
+  isLifeSafety: boolean;
+  responseDeadlineMinutes: number;
+  acknowledgementOverdue: boolean;
+  minutesLate: number | null;
+  responseMinutes: number | null;
+  note: string | null;
+}
+
+export interface SensorEventDetail extends SensorEvent {
+  workerName: string | null;
+}
+
+export interface FormField<T> {
+  value: T | null;
+  reason: string | null;
+}
+
+export interface RegulatoryReportRow {
+  id: string;
+  reference: string;
+  form: string;
+  status: string;
+  periodYear: number | null;
+  periodFrom: string | null;
+  periodTo: string | null;
+  incidentId: string | null;
+  sha256: string;
+  fileId: string | null;
+  rowCount: number;
+  caveats: string[];
+  certifiedBy: string | null;
+  certifiedAt: string | null;
+  certifierTitle: string | null;
+  submittedAt: string | null;
+  submissionReference: string | null;
+  supersedesId: string | null;
+  supersededById: string | null;
+  generatedBy: string;
+  createdAt: string;
+}
+
+export interface RegulatoryPreview {
+  form: string;
+  stored: boolean;
+  note: string;
+  payload: Record<string, unknown>;
+  rowCount: number;
+  caveats: string[];
+  periodYear: number | null;
+  incidentId: string | null;
+}
+
+export interface RiskComponent {
+  key: string;
+  name: string;
+  value: number | null;
+  weight: number;
+  contribution: number | null;
+  basis: string;
+  inputs: Record<string, number | null>;
+  reasons: string[];
+}
+
+export interface RiskIndex {
+  projectId: string;
+  from: string;
+  to: string;
+  asOf: string;
+  score: number | null;
+  band: string;
+  components: RiskComponent[];
+  coverage: number;
+  reasons: string[];
+  drivers: Array<{ key: string; name: string; contribution: number; advice: string }>;
+  explanation: string;
+  trend: Array<{ asOfDate: string; score: number | null; band: string; coverage: number | null }>;
+  note: string;
+  snapshotId?: string | null;
+  signalId?: string | null;
+}
+
+export interface UnderReportingFinding {
+  key: string;
+  title: string;
+  confidence: number;
+  severity: string;
+  expected: string;
+  observed: string;
+  explanation: string;
+  refutedBy: string;
+  inputs: Record<string, number | string | null>;
+}
+
+export interface UnderReportingResult {
+  projectId: string;
+  from: string;
+  to: string;
+  findings: UnderReportingFinding[];
+  reasons: string[];
+  note: string;
+}
+
+export interface ScorecardMetric {
+  key: string;
+  name: string;
+  value: number | null;
+  unit: string;
+  direction: "higher_is_better" | "lower_is_better";
+  basis: string;
+  inputs: Record<string, number | string | null>;
+  reasons: string[];
+  points: number | null;
+  weight: number;
+}
+
+export interface VendorScorecard {
+  vendorId: string;
+  vendorName: string | null;
+  projectId: string | null;
+  from: string;
+  to: string;
+  metrics: ScorecardMetric[];
+  score: number | null;
+  grade: string;
+  coverage: number;
+  recordCount: number;
+  reasons: string[];
+  flags: string[];
+  computedAt: string;
+}
+
+export interface ScorecardResponse {
+  from: string;
+  to: string;
+  scorecards: VendorScorecard[];
+  reasons: string[];
+  note: string;
+}
+
+export const RISK_BAND_LABEL: Record<string, string> = {
+  low: "Low",
+  elevated: "Elevated",
+  high: "High",
+  severe: "Severe",
+  unrated: "Unrated",
+};
+
+export const RISK_BAND_TONE_MAP: Record<string, Tone> = {
+  low: "success",
+  elevated: "info",
+  high: "warning",
+  severe: "danger",
+  unrated: "neutral",
+};
+
+export const ALARM_STATUS_TONE: Record<string, Tone> = {
+  open: "danger",
+  acknowledged: "warning",
+  auto_resolved: "info",
+  resolved: "success",
+  escalated: "danger",
+  false_alarm: "neutral",
+  void: "neutral",
+};
+
+export const REGULATORY_FORM_LABEL: Record<string, string> = {
+  osha_300: "OSHA 300 log",
+  osha_300a: "OSHA 300A annual summary",
+  osha_301: "OSHA 301 incident report",
+  riddor_f2508: "RIDDOR F2508",
+  riddor_f2508a: "RIDDOR F2508A (disease)",
+};
+
+export const REGULATORY_STATUS_TONE: Record<string, Tone> = {
+  generated: "info",
+  submitted: "success",
+  superseded: "neutral",
+  void: "neutral",
+};

@@ -141,14 +141,24 @@ function xerRecords(table: XerTable | undefined): Record<string, string>[] {
 }
 
 /** P6 constraint codes → the platform's constraint vocabulary. */
+/**
+ * P6 constraint codes mapped into the three the platform's CPM understands
+ * (TASK_CONSTRAINTS in ./datasets.ts).
+ *
+ * A code with no faithful equivalent maps to NOTHING rather than to the
+ * nearest-looking one. "Start on or before" is not "finish no later than", and
+ * silently substituting it would move the critical path in a way nobody could
+ * trace back to the import — the worst possible failure for a module whose
+ * output is used in delay analysis. Dropped constraints are counted and
+ * disclosed on the result instead.
+ */
 const XER_CONSTRAINTS: Record<string, string> = {
-  CS_MSO: "must_start_on",
-  CS_MSOA: "start_no_earlier_than",
-  CS_MSOB: "finish_no_later_than",
-  CS_MEO: "finish_no_later_than",
-  CS_MEOA: "start_no_earlier_than",
-  CS_MEOB: "finish_no_later_than",
-  CS_ALAP: "start_no_earlier_than",
+  CS_MSO: "must_start_on", // Mandatory start
+  CS_MSOA: "start_no_earlier_than", // Start on or after
+  CS_MEOB: "finish_no_later_than", // Finish on or before
+  CS_MEO: "finish_no_later_than", // Mandatory finish — the closest of the three
+  // Not representable: CS_MSOB (start on or before), CS_MEOA (finish on or
+  // after), CS_ALAP (as late as possible).
 };
 
 const XER_LINK_TYPES: Record<string, string> = {
@@ -197,6 +207,7 @@ export function parseXer(text: string): ProgrammeParseResult {
   }
 
   const rows: ProgrammeTaskRow[] = [];
+  const droppedConstraints = new Map<string, number>();
   let earliest: string | null = null;
   for (const t of tasks) {
     const code = t["task_code"] || t["task_id"] || "";
@@ -209,7 +220,11 @@ export function parseXer(text: string): ProgrammeParseResult {
     for (const d of [actualStart, start]) {
       if (d && (earliest === null || d < earliest)) earliest = d;
     }
-    const constraintType = XER_CONSTRAINTS[t["cstr_type"] ?? ""] ?? null;
+    const rawConstraint = t["cstr_type"] ?? "";
+    const constraintType = XER_CONSTRAINTS[rawConstraint] ?? null;
+    if (rawConstraint !== "" && constraintType === null) {
+      droppedConstraints.set(rawConstraint, (droppedConstraints.get(rawConstraint) ?? 0) + 1);
+    }
     rows.push({
       taskCode: code,
       name: t["task_name"] || code,
@@ -241,6 +256,16 @@ export function parseXer(text: string): ProgrammeParseResult {
         "WBS short name is carried on each task as its wbsCode.",
       ...(dangling > 0
         ? [`${dangling} relationship(s) referenced an activity outside this file and were dropped.`]
+        : []),
+      ...(droppedConstraints.size > 0
+        ? [
+            "Constraint types with no equivalent in this platform's CPM were dropped rather " +
+              "than approximated — the activities are imported without them: " +
+              [...droppedConstraints.entries()]
+                .map(([code, n]) => `${code} x${n}`)
+                .join(", ") +
+              ". Re-apply them by hand if they govern the programme.",
+          ]
         : []),
     ],
   };

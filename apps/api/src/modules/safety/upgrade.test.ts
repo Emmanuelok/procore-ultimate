@@ -1092,6 +1092,39 @@ describe("multi-regime statutory duty", () => {
 });
 
 /* ------------------------------------------------------------------ */
+/* The header's source of truth — unfiltered, unwindowed                */
+/* ------------------------------------------------------------------ */
+
+describe("statutory standing on the summary", () => {
+  it("counts duties across the WHOLE register, not the page on screen", async () => {
+    const summary = await get(`/projects/${gbProject}/safety/summary`);
+    expect(summary.statusCode).toBe(200);
+    const standing = summary.json().statutory;
+    expect(standing.note).toContain("per DUTY");
+    expect(standing.reportableCount).toBeGreaterThan(0);
+    // the dual-regime incident whose OSHA duty was never filed
+    expect(standing.missedNotification).toBeGreaterThan(0);
+    expect(standing.missedDuties).toBeGreaterThanOrEqual(standing.missedNotification);
+    expect(standing.missedRefs.some((r: { regimes: string[] }) => r.regimes.includes("osha"))).toBe(
+      true,
+    );
+
+    // filtering the incident register must not change what the header says
+    const filtered = await get(
+      `/projects/${gbProject}/safety/incidents?incidentType=property_damage`,
+    );
+    expect(filtered.json().items).toHaveLength(0);
+    const again = await get(`/projects/${gbProject}/safety/summary`);
+    expect(again.json().statutory.missedDuties).toBe(standing.missedDuties);
+  });
+
+  it("shuts another company out of the summary", async () => {
+    const res = await get(`/projects/${gbProject}/safety/summary`, stranger.headers);
+    expect(res.statusCode).toBe(403);
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /* AUDIT BUG 2 — the obligation left open after a reassessment         */
 /* ------------------------------------------------------------------ */
 

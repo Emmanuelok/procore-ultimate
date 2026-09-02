@@ -392,14 +392,20 @@ export const overviewRoutes: FastifyPluginAsync = async (app) => {
       )
       .groupBy(signals.detector, signals.severity);
 
-    const ventureCount = await app.db
-      .select({ n: count() })
-      .from(jointVentures)
-      .where(
-        ids.length > 0
-          ? and(eq(jointVentures.companyId, companyId), inArray(jointVentures.projectId, ids))
-          : eq(jointVentures.companyId, restricted ? "__none__" : companyId),
-      );
+    /* Ventures follow the same visibility rule as the projects above: an
+       owner or admin sees the company's, everyone else only those on the
+       projects they are a member of, and a portfolio filter narrows both. */
+    const scopeVentures = restricted || Boolean(q.portfolioId);
+    let ventureCount = 0;
+    if (!(scopeVentures && ids.length === 0)) {
+      const clauses: SQL[] = [eq(jointVentures.companyId, companyId)];
+      if (scopeVentures) clauses.push(inArray(jointVentures.projectId, ids));
+      const [row] = await app.db
+        .select({ n: count() })
+        .from(jointVentures)
+        .where(and(...clauses));
+      ventureCount = Number(row?.n ?? 0);
+    }
 
     return {
       generatedAt: nowISO(),
@@ -434,7 +440,7 @@ export const overviewRoutes: FastifyPluginAsync = async (app) => {
           (f) => f.daysToExpiry !== null && f.daysToExpiry >= 0 && f.daysToExpiry <= 90,
         ).length,
       },
-      ventures: Number(ventureCount[0]?.n ?? 0),
+      ventures: ventureCount,
       signals: openSignals.map((s) => ({
         detector: s.detector,
         severity: s.severity,

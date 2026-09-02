@@ -138,6 +138,13 @@ export interface IssueSessionOptions {
   identityId?: string | null;
   providerId?: string | null;
   nowMs?: number;
+  /**
+   * #23 — the tenant's absolute session lifetime in hours, from the resolved
+   * security policy (modules/account/policy.ts). Unset falls back to
+   * SESSION_ABSOLUTE_TTL_DAYS, which is what every caller did before tenant
+   * policy existed.
+   */
+  absoluteTtlHours?: number | null;
 }
 
 export interface IssuedSession {
@@ -183,9 +190,11 @@ export async function issueUserSession(
 
   const deviceLabel = deviceLabelFor(ctx.userAgent);
   const fingerprint = deviceFingerprintOf(ctx.userAgent, ctx.ip);
-  const expiresAt = new Date(
-    nowMs + app.appConfig.SESSION_ABSOLUTE_TTL_DAYS * 24 * 3600 * 1000,
-  ).toISOString();
+  const ttlHours =
+    options.absoluteTtlHours && options.absoluteTtlHours > 0
+      ? Math.min(options.absoluteTtlHours, app.appConfig.SESSION_ABSOLUTE_TTL_DAYS * 24)
+      : app.appConfig.SESSION_ABSOLUTE_TTL_DAYS * 24;
+  const expiresAt = new Date(nowMs + ttlHours * 3600 * 1000).toISOString();
 
   if (options.sessionId) {
     const [existing] = await app.db

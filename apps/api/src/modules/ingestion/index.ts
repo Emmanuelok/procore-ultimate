@@ -713,6 +713,70 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
   /* Commit writers — one per INGESTION_DATASETS member                */
   /* ---------------------------------------------------------------- */
 
+  /**
+   * Apply an operator-approved restatement to the record it matched.
+   *
+   * WHY ONLY SOME DATASETS. An update is only honest where the target is a
+   * MUTABLE REGISTER whose fields the import owns — the vendor directory is
+   * exactly that. An assertion, a payroll entry, a site-access event or a piece
+   * of evidence is a RECORD OF SOMETHING THAT HAPPENED: restating it is not an
+   * update, it is a new claim, and silently rewriting it would destroy the
+   * independence that makes it evidence. So those datasets refuse the update
+   * and say why, rather than pretending to apply it.
+   */
+  async function applyReconcileUpdate(
+    db: Db,
+    dataset: AnyIngestionDataset,
+    ctx: CommitCtx,
+    row: StagedRow,
+  ): Promise<RowOutcome> {
+    const p = row.payload;
+    const str = (k: string) => p[k] as string | undefined;
+    if (dataset !== "vendors") {
+      return {
+        skipped:
+          `Reconcile updates are not applied to the ${dataset} dataset: those rows record ` +
+          "something that happened, so a restatement is a new claim rather than an edit. " +
+          "Choose insert to record it alongside, or skip to leave the register as it is.",
+      };
+    }
+    const [existing] = await db
+      .select()
+      .from(vendors)
+      .where(and(eq(vendors.id, row.matchedRecordId!), eq(vendors.companyId, ctx.companyId)))
+      .limit(1);
+    if (!existing) {
+      return {
+        skipped: `The record this row restates (${row.matchedRecordId}) no longer exists.`,
+      };
+    }
+    // Only the fields the row actually carries are written: a sparse re-export
+    // must not blank a column the operator filled in by hand.
+    const patch: Partial<typeof vendors.$inferInsert> = { updatedAt: new Date().toISOString() };
+    if (str("name") !== undefined) patch.name = str("name")!;
+    for (const key of [
+      "address",
+      "city",
+      "country",
+      "phone",
+      "email",
+      "website",
+      "taxId",
+      "registrationNumber",
+    ] as const) {
+      if (str(key) !== undefined) patch[key] = str(key)!;
+    }
+    const trades = str("tradeCodes");
+    if (trades !== undefined) {
+      patch.tradeCodes = trades
+        .split(/[,;]/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
+    await db.update(vendors).set(patch).where(eq(vendors.id, existing.id));
+    return { recordId: existing.id };
+  }
+
   async function commitRows(
     db: Db,
     dataset: AnyIngestionDataset,
@@ -1365,7 +1429,7 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
     run: RunRow,
     recordActorId: string,
     ledgerActorId: string | null,
-  ): Promise<{ committed: number; skipped: number }> {
+  ): Promise<{ committed: number; skipped: number; updated: number }> {
     const def = datasetDef(run.dataset)!;
     const rows = await app.db
       .select()
@@ -1453,29 +1517,77 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
       fileSha256: run.fileSha256,
     };
 
+    /*
+     * RECONCILE. A row that restates an already-committed record is not an
+     * insert; what happens to it is the OPERATOR'S DECISION, recorded on the
+     * staged row, and the commit executes that decision rather than a policy
+     * buried here. A matched row with no decision is skipped and says so — the
+     * safe default, because applying an unreviewed restatement silently
+     * overwrites a record somebody may have edited since.
+     */
+    const inserts: StagedRow[] = [];
+    const updates: StagedRow[] = [];
+    const decided = new Map<string, "insert" | "update" | "skip">();
+    for (const row of rows) {
+      if (!row.matchedRecordId) {
+        inserts.push(row);
+        continue;
+      }
+      const decision = (row.resolution ?? "skip") as "insert" | "update" | "skip";
+      decided.set(row.id, decision);
+      if (decision === "insert") inserts.push(row);
+      else if (decision === "update") updates.push(row);
+    }
+
     let committed = 0;
     let skipped = 0;
+    let updated = 0;
     try {
       await app.db.transaction(async (tx) => {
         // PgTransaction extends PgDatabase, so the writers run unchanged
         // inside the transaction; the cast keeps their signature on Db.
         const dbh = tx as unknown as Db;
-        const outcomes = await commitRows(dbh, def.dataset, ctx, rows, prep);
+        const outcomes = await commitRows(dbh, def.dataset, ctx, inserts, prep);
         const committedAt = new Date().toISOString();
-        for (let i = 0; i < rows.length; i += 1) {
-          const outcome = outcomes[i]!;
+        const outcomeByRow = new Map<string, RowOutcome>();
+        for (let i = 0; i < inserts.length; i += 1) {
+          outcomeByRow.set(inserts[i]!.id, outcomes[i]!);
+        }
+        for (const row of updates) {
+          const applied = await applyReconcileUpdate(dbh, def.dataset, ctx, row);
+          outcomeByRow.set(row.id, applied);
+        }
+
+        for (const row of rows) {
+          const outcome = outcomeByRow.get(row.id);
+          if (!outcome) {
+            // a matched row the operator did not decide on
+            skipped += 1;
+            await dbh
+              .update(ingestedRecords)
+              .set({
+                status: "skipped",
+                reason:
+                  `Restates committed record ${row.matchedRecordId} and no decision was ` +
+                  "recorded, so nothing was changed. Choose update, insert or skip " +
+                  "(POST /ingestion/runs/{runId}/records/{recordId}/resolution).",
+              })
+              .where(eq(ingestedRecords.id, row.id));
+            continue;
+          }
           if ("recordId" in outcome) {
             committed += 1;
+            if (decided.get(row.id) === "update") updated += 1;
             await dbh
               .update(ingestedRecords)
               .set({ status: "committed", committedRecordId: outcome.recordId, reason: null })
-              .where(eq(ingestedRecords.id, rows[i]!.id));
+              .where(eq(ingestedRecords.id, row.id));
           } else {
             skipped += 1;
             await dbh
               .update(ingestedRecords)
               .set({ status: "skipped", reason: outcome.skipped })
-              .where(eq(ingestedRecords.id, rows[i]!.id));
+              .where(eq(ingestedRecords.id, row.id));
           }
         }
         await dbh
@@ -1484,6 +1596,7 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
             status: "committed",
             committedCount: committed,
             skippedCount: skipped,
+            updatedCount: updated,
             committedBy: recordActorId,
             committedAt,
             updatedAt: committedAt,
@@ -1534,12 +1647,14 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
         committed,
         skipped,
         rejected: run.rejectedCount,
+        updated,
+        mode: run.mode,
         ...followUp,
       },
       storePayload: true,
     });
 
-    return { committed, skipped, ...followUp };
+    return { committed, skipped, updated, ...followUp };
   }
 
   /* ---------------------------------------------------------------- */

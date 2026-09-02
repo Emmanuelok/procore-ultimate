@@ -401,6 +401,8 @@ export interface EquipmentReconcileInput {
   currency: string;
   hireRateAmount: number | null;
   hireRateUnit: HireRateUnit | null;
+  /** owned plant's internal charge-out rate, per hour (#714) */
+  internalRateAmount?: number | null;
   operatorRateAmount: number | null;
   days: TelematicsDayInput[];
 }
@@ -557,10 +559,19 @@ export function reconcileEquipment(input: EquipmentReconcileInput): EquipmentRec
       .reduce((s, d) => s + (d.varianceHours ?? 0), 0),
   );
   if (unsupportedHours > 0) {
-    if (input.hireRateUnit === "hour" && input.hireRateAmount !== null) {
-      valueAtRisk = round2(
-        unsupportedHours * (input.hireRateAmount + (input.operatorRateAmount ?? 0)),
-      );
+    const hourlyRate =
+      input.hireRateUnit === "hour" && input.hireRateAmount !== null
+        ? input.hireRateAmount
+        : (input.internalRateAmount ?? null);
+    if (hourlyRate !== null) {
+      valueAtRisk = round2(unsupportedHours * (hourlyRate + (input.operatorRateAmount ?? 0)));
+      if (input.hireRateUnit !== "hour" || input.hireRateAmount === null) {
+        reasons.push(
+          "this machine carries no hourly hire rate, so the unsupported hours are priced at its " +
+            "internal charge-out rate — the right basis for an owned machine and the wrong one for " +
+            "a claim against a hire company",
+        );
+      }
       if (input.operatorRateAmount === null) {
         reasons.push(
           "no operator rate is recorded, so the value at risk covers plant hire only — the " +

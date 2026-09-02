@@ -25,6 +25,20 @@ import { Alert, Badge, PageHeader, Tabs } from "../../ui";
 import { IconSafety } from "../../ui/icons";
 import { api } from "../../lib/api";
 import ActionDrawer from "./ActionDrawer";
+import {
+  NewInspectionModal,
+  NewProgrammeRecordModal,
+  NewTalkModal,
+  NewTemplateModal,
+} from "./CreateModals";
+import DevicesTab, {
+  EMPTY_DEVICE_FILTERS,
+  deviceQueryString,
+  type DeviceFilters,
+} from "./DevicesTab";
+import ProgrammeDrawer from "./ProgrammeDrawer";
+import RiskTab from "./RiskTab";
+import StatutoryTab from "./StatutoryTab";
 import ActionsTab, {
   EMPTY_ACTION_FILTERS,
   actionQueryString,
@@ -73,6 +87,7 @@ import {
   type SafetyObservation,
   type SafetyStatistics,
   type SafetySummary,
+  type SensorEvent,
   type ToolboxTalk,
 } from "./safetyShared";
 
@@ -83,7 +98,10 @@ type TabKey =
   | "actions"
   | "inspections"
   | "talks"
-  | "programme";
+  | "programme"
+  | "devices"
+  | "statutory"
+  | "risk";
 
 const TABS: Array<{ value: TabKey; label: string }> = [
   { value: "dashboard", label: "Dashboard" },
@@ -93,6 +111,9 @@ const TABS: Array<{ value: TabKey; label: string }> = [
   { value: "inspections", label: "Inspections" },
   { value: "talks", label: "Toolbox talks" },
   { value: "programme", label: "Programme" },
+  { value: "devices", label: "Device alarms" },
+  { value: "statutory", label: "Statutory forms" },
+  { value: "risk", label: "Leading indicators" },
 ];
 
 const isTabKey = (value: string | null): value is TabKey =>
@@ -127,6 +148,7 @@ export default function SafetyPage() {
   const [talkFilters, setTalkFilters] = useState<TalkFilters>(EMPTY_TALK_FILTERS);
   const [programmeFilters, setProgrammeFilters] =
     useState<ProgrammeFilters>(EMPTY_PROGRAMME_FILTERS);
+  const [deviceFilters, setDeviceFilters] = useState<DeviceFilters>(EMPTY_DEVICE_FILTERS);
 
   const [openIncident, setOpenIncident] = useState<string | null>(() =>
     searchParams.get("incident"),
@@ -140,6 +162,12 @@ export default function SafetyPage() {
   );
   const [openTalk, setOpenTalk] = useState<string | null>(() => searchParams.get("talk"));
   const [newRecord, setNewRecord] = useState<NewRecordKind | null>(null);
+  const [openProgrammeRecord, setOpenProgrammeRecord] = useState<string | null>(() =>
+    searchParams.get("record"),
+  );
+  const [creating, setCreating] = useState<
+    "inspection" | "template" | "talk" | "programme" | null
+  >(null);
 
   const users = useCompanyUsers();
   const vendors = useVendors();
@@ -253,6 +281,16 @@ export default function SafetyPage() {
       set(changedSomethingElse ? { ...next, page: "1" } : next);
     };
   }
+
+  const sensorEvents = useResource<Paged<SensorEvent>>(
+    (signal) =>
+      api.get<Paged<SensorEvent>>(
+        `/api/v1/projects/${projectKey}/safety/sensor-events?${deviceQueryString(deviceFilters)}`,
+        { signal },
+      ),
+    [projectKey, version, JSON.stringify(deviceFilters)],
+    enabled,
+  );
 
   const selectTab = useCallback(
     (next: TabKey) => {
@@ -451,7 +489,28 @@ export default function SafetyPage() {
             setOpenInspection(id);
             setParam("inspection", id);
           }}
+          onNew={() => setCreating("inspection")}
+          onNewTemplate={() => setCreating("template")}
         />
+      ) : tab === "devices" ? (
+        <DevicesTab
+          projectId={projectKey}
+          events={sensorEvents}
+          filters={deviceFilters}
+          onFilters={withPageReset(deviceFilters, setDeviceFilters)}
+          users={users}
+          onMutated={refresh}
+        />
+      ) : tab === "statutory" ? (
+        <StatutoryTab
+          projectId={projectKey}
+          incidents={incidents}
+          users={users}
+          version={version}
+          onMutated={refresh}
+        />
+      ) : tab === "risk" ? (
+        <RiskTab projectId={projectKey} version={version} onMutated={refresh} />
       ) : tab === "talks" ? (
         <TalksTab
           talks={talks}
@@ -463,6 +522,7 @@ export default function SafetyPage() {
             setOpenTalk(id);
             setParam("talk", id);
           }}
+          onNew={() => setCreating("talk")}
         />
       ) : (
         <ProgrammeTab
@@ -471,6 +531,11 @@ export default function SafetyPage() {
           onFilters={withPageReset(programmeFilters, setProgrammeFilters)}
           users={users}
           vendors={vendors}
+          onOpen={(id) => {
+            setOpenProgrammeRecord(id);
+            setParam("record", id);
+          }}
+          onNew={() => setCreating("programme")}
         />
       )}
 
@@ -532,6 +597,65 @@ export default function SafetyPage() {
           setParam("talk", null);
         }}
         onMutated={refresh}
+      />
+
+      <ProgrammeDrawer
+        recordId={openProgrammeRecord}
+        users={users}
+        vendors={vendors}
+        onClose={() => {
+          setOpenProgrammeRecord(null);
+          setParam("record", null);
+        }}
+        onMutated={refresh}
+      />
+
+      <NewInspectionModal
+        projectId={projectKey}
+        open={creating === "inspection"}
+        templates={templates}
+        onClose={() => setCreating(null)}
+        onCreated={(id) => {
+          setCreating(null);
+          refresh();
+          setOpenInspection(id);
+          setParam("inspection", id);
+        }}
+      />
+
+      <NewTemplateModal
+        open={creating === "template"}
+        onClose={() => setCreating(null)}
+        onCreated={() => {
+          setCreating(null);
+          refresh();
+        }}
+      />
+
+      <NewTalkModal
+        projectId={projectKey}
+        open={creating === "talk"}
+        vendors={vendors}
+        onClose={() => setCreating(null)}
+        onCreated={(id) => {
+          setCreating(null);
+          refresh();
+          setOpenTalk(id);
+          setParam("talk", id);
+        }}
+      />
+
+      <NewProgrammeRecordModal
+        projectId={projectKey}
+        open={creating === "programme"}
+        vendors={vendors}
+        onClose={() => setCreating(null)}
+        onCreated={(id) => {
+          setCreating(null);
+          refresh();
+          setOpenProgrammeRecord(id);
+          setParam("record", id);
+        }}
       />
 
       <NewRecordModal

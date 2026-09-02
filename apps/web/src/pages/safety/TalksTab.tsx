@@ -91,6 +91,7 @@ export default function TalksTab({
   users,
   vendors,
   onOpen,
+  onNew,
 }: {
   talks: Resource<Paged<ToolboxTalk>>;
   filters: TalkFilters;
@@ -98,6 +99,7 @@ export default function TalksTab({
   users: Map<string, string>;
   vendors: Map<string, string>;
   onOpen: (id: string) => void;
+  onNew: () => void;
 }) {
   const rows = talks.data?.items ?? [];
   const [showLanguage, setShowLanguage] = useState(true);
@@ -324,6 +326,12 @@ export default function TalksTab({
           </Field>
         </CardBody>
       </Card>
+
+      <div className="flex justify-end">
+        <Button size="xs" onClick={onNew}>
+          Plan a toolbox talk
+        </Button>
+      </div>
 
       <DataTable<ToolboxTalk>
         tableId="safety-toolbox-talks"

@@ -1,5 +1,9 @@
 import { authEvents, authSecurityEvents } from "@constructos/db";
-import type { AuthEventKind, AuthEventOutcome } from "@constructos/shared";
+import type {
+  AuthEventKind,
+  AuthEventOutcome,
+  ExtraAuthEventKind,
+} from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import type { Db } from "../../lib/db.js";
 
@@ -23,8 +27,18 @@ import type { Db } from "../../lib/db.js";
  * schema.
  */
 
+/**
+ * The kinds a writer may record. `AUTH_EVENT_KINDS` lives in the frozen
+ * enums.ts; `EXTRA_AUTH_EVENT_KINDS` (enums-auth.ts) adds the ones this wave
+ * needed — a tenant policy change, an IP refusal, a SCIM deprovision — which
+ * previously had to go unrecorded because borrowing a neighbouring kind would
+ * have put a false statement in the log an auditor reads literally. The column
+ * is `text`, so the union is the only thing that had to widen.
+ */
+export type AnyAuthEventKind = AuthEventKind | ExtraAuthEventKind;
+
 export interface SecurityEventInput {
-  kind: AuthEventKind;
+  kind: AnyAuthEventKind;
   outcome?: AuthEventOutcome;
   userId?: string | null;
   companyId?: string | null;
@@ -38,10 +52,46 @@ export interface SecurityEventInput {
   metadata?: Record<string, unknown>;
 }
 
+/**
+ * SUBSCRIBERS TO THE TRAIL.
+ *
+ * Security event webhooks (docs/security.md §"Security event webhooks") need
+ * to see every row this function writes, and the alternative — every caller
+ * remembering to also enqueue a delivery — is the kind of coupling that is
+ * correct on the day it is written and wrong a month later. The hook list is
+ * the same pattern lib/ledger.ts uses for ledger emits.
+ *
+ * A HOOK MAY NOT FAIL THE REQUEST. It is invoked inside the same try/catch
+ * that already guarantees the trail never breaks a sign-in, and its own
+ * rejection is swallowed. A webhook subscriber that throws must not be able to
+ * stop people logging in.
+ */
+export type SecurityEventHook = (
+  db: Db,
+  event: SecurityEventInput & { id: string; at: string },
+) => void | Promise<void>;
+
+const securityEventHooks: SecurityEventHook[] = [];
+
+export function addSecurityEventHook(hook: SecurityEventHook): () => void {
+  securityEventHooks.push(hook);
+  return () => {
+    const idx = securityEventHooks.indexOf(hook);
+    if (idx !== -1) securityEventHooks.splice(idx, 1);
+  };
+}
+
+/** Test seam: drop every registered subscriber. */
+export function clearSecurityEventHooks(): void {
+  securityEventHooks.length = 0;
+}
+
 export async function recordAuthEvent(db: Db, input: SecurityEventInput): Promise<void> {
+  const id = newId("ase");
+  const at = new Date().toISOString();
   try {
     await db.insert(authSecurityEvents).values({
-      id: newId("ase"),
+      id,
       companyId: input.companyId ?? null,
       userId: input.userId ?? null,
       email: input.email ?? null,
@@ -57,6 +107,14 @@ export async function recordAuthEvent(db: Db, input: SecurityEventInput): Promis
     });
   } catch {
     /* the trail must never fail the request it describes */
+    return;
+  }
+  for (const hook of securityEventHooks) {
+    try {
+      await hook(db, { ...input, id, at });
+    } catch {
+      /* a subscriber must never fail the request either */
+    }
   }
 }
 

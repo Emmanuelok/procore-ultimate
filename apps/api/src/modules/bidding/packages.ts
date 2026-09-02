@@ -4,9 +4,13 @@ import { z } from "zod";
 import {
   bidAwards,
   bidInvitations,
+  bidLevellingEntries,
   bidLevellingItems,
   bidPackages,
+  bidSubmissionLines,
   bidSubmissions,
+  budgetLineItems,
+  signals,
   vendors,
 } from "@constructos/db";
 import {
@@ -50,7 +54,12 @@ import {
   sealState,
   type SealState,
 } from "./sealing.js";
-import { effectiveLimit, sweepPrequalification, vendorPrequalStatus } from "./prequal-status.js";
+import {
+  batchVendorPrequalStatus,
+  effectiveLimit,
+  sweepPrequalification,
+} from "./prequal-status.js";
+import { findScopeGaps } from "./analytics-math.js";
 import { checkContractAgainstLimit } from "./financial-limits.js";
 
 /* ------------------------------------------------------------------ */
@@ -215,8 +224,7 @@ export function addendaWithAcknowledgement(
             !acknowledgedBy.includes(inv.vendorId) &&
             inv.status !== "declined" &&
             inv.status !== "withdrawn" &&
-            inv.status !== "disqualified" &&
-            inv.status !== "draft",
+            inv.status !== "disqualified",
         )
         .map((inv) => inv.vendorId),
     };
@@ -374,6 +382,43 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
     }
   }
 
+  /**
+   * The budget lines an award will be charged against must EXIST on this
+   * project. The column accepted arbitrary strings, and the first thing that
+   * noticed was `insertSovLine` — throwing after the award approval had
+   * already created a commitment, which left an orphan. Validation belongs
+   * where the value is entered.
+   */
+  async function assertBudgetLines(
+    companyId: string,
+    projectId: string,
+    ids: readonly string[] | undefined,
+  ): Promise<void> {
+    if (!ids || ids.length === 0) return;
+    const unique = [...new Set(ids)];
+    const rows = await app.db
+      .select({ id: budgetLineItems.id })
+      .from(budgetLineItems)
+      .where(
+        and(
+          eq(budgetLineItems.companyId, companyId),
+          eq(budgetLineItems.projectId, projectId),
+          inArray(budgetLineItems.id, unique),
+        ),
+      );
+    const found = new Set(rows.map((r) => r.id));
+    const missing = unique.filter((id) => !found.has(id));
+    if (missing.length > 0) {
+      throw badRequest(
+        `${missing.length} budgetLineItemId(s) are not budget lines on this project: ` +
+          `${missing.join(", ")}. The award created from this package charges its committed cost ` +
+          "to the first of these, so an id that does not resolve produces a commitment with " +
+          "nowhere to land — and it fails half way through the approval, after the commitment " +
+          "has been created.",
+      );
+    }
+  }
+
   function assertCriteria(criteria: z.infer<typeof criterionSchema>[] | undefined): void {
     if (!criteria) return;
     const keys = new Set<string>();
@@ -481,6 +526,7 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
     const projectId = req.projectId!;
     assertWeights(body.priceWeight ?? null, body.qualityWeight ?? null);
     assertCriteria(body.evaluationCriteria);
+    await assertBudgetLines(companyId, projectId, body.budgetLineItemIds);
 
     if (body.isSealed && !body.bidDueAt && !body.sealedUntil) {
       throw badRequest(
@@ -714,6 +760,7 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
         body.qualityWeight !== undefined ? (body.qualityWeight ?? null) : pkg.qualityWeight,
       );
       assertCriteria(body.evaluationCriteria);
+      await assertBudgetLines(req.companyId!, req.projectId!, body.budgetLineItemIds);
 
       const detail: Record<string, unknown> = {
         ...(pkg.detail as Record<string, unknown>),
@@ -1185,6 +1232,347 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
   );
 
   /* ---------------------------------------------------------------- */
+  /* Bid board publication (#180)                                      */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * PUBLISHING A PACKAGE TO THE BID BOARD.
+   *
+   * The board is how a supply chain finds out work exists without being on a
+   * list somebody drew up years ago — which is the single most effective
+   * thing a buyer can do about a closed, rotating bidder set. What the board
+   * shows is deliberately narrow: the scope, the trade, the timetable and how
+   * to express interest. NEVER the pre-tender estimate, never the budget,
+   * never who else has been invited. A board that publishes the estimate has
+   * priced the job for the market.
+   */
+  app.post(
+    "/projects/:projectId/bid-packages/:packageId/publish",
+    { preHandler: standardGate },
+    async (req) => {
+      const { packageId } = req.params as { packageId: string };
+      const body = z
+        .object({
+          publish: z.boolean().default(true),
+          publicSummary: z.string().trim().min(20).max(8000).nullable().optional(),
+        })
+        .parse(req.body ?? {});
+      const pkg = await fetchPackage(app.db, packageId, req.companyId!, req.projectId!);
+      if (body.publish) {
+        if (!pkg.approvedBy) {
+          throw conflict(
+            "This package has not been approved for issue, so it cannot be published to the " +
+              "bid board. Publishing an unapproved scope invites the market to price the wrong " +
+              "job.",
+          );
+        }
+        if (!pkg.bidDueAt) {
+          throw badRequest(
+            "Set bidDueAt before publishing. A board entry with no closing date tells nobody " +
+              "when to respond by.",
+          );
+        }
+      }
+      const now = new Date().toISOString();
+      await app.db
+        .update(bidPackages)
+        .set({
+          isPublished: body.publish ? 1 : 0,
+          publishedAt: body.publish ? (pkg.publishedAt ?? now) : null,
+          publishedBy: body.publish ? (pkg.publishedBy ?? req.user!.id) : null,
+          publicSummary:
+            body.publicSummary !== undefined ? body.publicSummary : pkg.publicSummary,
+          updatedAt: now,
+        })
+        .where(eq(bidPackages.id, packageId));
+      await ledger(app.db, req, "state_change", "bid_package", packageId, {
+        projectId: req.projectId!,
+        event: body.publish ? "published_to_bid_board" : "withdrawn_from_bid_board",
+        reference: pkg.reference,
+        tradeCode: pkg.tradeCode,
+        bidDueAt: pkg.bidDueAt,
+      }, req.projectId!, true);
+      return packageDetail(
+        app.db,
+        await fetchPackage(app.db, packageId, req.companyId!, req.projectId!),
+      );
+    },
+  );
+
+  /**
+   * The board itself, company-wide. Available to any company member: finding
+   * out what this company is buying is not a privileged act, and the numbers
+   * that ARE privileged are not on it.
+   */
+  app.get(
+    "/companies/current/bid-board",
+    { preHandler: [app.authenticate, app.requireCompany] },
+    async (req) => {
+      const q = z
+        .object({
+          tradeCode: z.string().max(60).optional(),
+          openOnly: z
+            .union([z.boolean(), z.string()])
+            .optional()
+            .transform((v) => v === true || v === "true"),
+        })
+        .parse(req.query ?? {});
+      const rows = await app.db
+        .select()
+        .from(bidPackages)
+        .where(
+          and(
+            eq(bidPackages.companyId, req.companyId!),
+            eq(bidPackages.isPublished, 1),
+            ...(q.tradeCode ? [eq(bidPackages.tradeCode, q.tradeCode)] : []),
+          ),
+        )
+        .orderBy(asc(bidPackages.bidDueAt))
+        .limit(200);
+      const nowMs = Date.now();
+      const items = rows
+        .filter((p) => {
+          if (p.status === "cancelled" || p.status === "awarded") return false;
+          if (!q.openOnly) return true;
+          return p.bidDueAt !== null && (epochMs(p.bidDueAt) ?? 0) > nowMs;
+        })
+        .map((p) => ({
+          id: p.id,
+          projectId: p.projectId,
+          reference: p.reference,
+          title: p.title,
+          summary: p.publicSummary ?? p.scopeDescription,
+          packageKind: p.packageKind,
+          procurementRoute: p.procurementRoute,
+          tradeCode: p.tradeCode,
+          csiDivision: p.csiDivision,
+          currency: p.currency,
+          status: p.status,
+          publishedAt: p.publishedAt,
+          questionsDueAt: p.questionsDueAt,
+          bidDueAt: p.bidDueAt,
+          siteVisitAt: p.siteVisitAt,
+          isSiteVisitMandatory: p.isSiteVisitMandatory === 1,
+          prequalificationRequired: p.prequalificationRequired === 1,
+          closed: p.bidDueAt === null ? null : (epochMs(p.bidDueAt) ?? 0) <= nowMs,
+          hoursToClose:
+            p.bidDueAt === null
+              ? null
+              : round2(((epochMs(p.bidDueAt) ?? nowMs) - nowMs) / 3_600_000),
+        }));
+      return {
+        items,
+        total: items.length,
+        note:
+          "The board carries the scope, the trade and the timetable. It never carries the " +
+          "pre-tender estimate, the budget or the list of who else has been invited — a board " +
+          "that publishes the estimate has priced the job for the market.",
+      };
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Scope gaps across bids (#172)                                     */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * WHERE THE BIDS DISAGREE ABOUT WHAT THEY ARE BUYING.
+   *
+   * The failure this catches makes the cheapest bid the most expensive: a
+   * scope row nobody priced, or that only the expensive bidders priced. The
+   * low bid is then low because it is missing work, which will be bought
+   * after the award from the winner, with no competition.
+   */
+  app.get(
+    "/projects/:projectId/bid-packages/:packageId/scope-gaps",
+    { preHandler: readGate },
+    async (req) => {
+      const { packageId } = req.params as { packageId: string };
+      const pkg = await fetchPackage(app.db, packageId, req.companyId!, req.projectId!);
+      const seal = sealState(pkg);
+      if (seal.amountsWithheld) {
+        return {
+          seal,
+          sealed: true,
+          gaps: [],
+          summary: { rows: 0, gapRows: 0, universalGaps: 0, exposure: null },
+          note: `Scope coverage is part of the comparison and the comparison is sealed. ${seal.note}`,
+        };
+      }
+      const items = await app.db
+        .select()
+        .from(bidLevellingItems)
+        .where(eq(bidLevellingItems.packageId, packageId))
+        .orderBy(asc(bidLevellingItems.position));
+      const entries = await app.db
+        .select()
+        .from(bidLevellingEntries)
+        .where(eq(bidLevellingEntries.packageId, packageId));
+      const subs = await app.db
+        .select()
+        .from(bidSubmissions)
+        .where(eq(bidSubmissions.packageId, packageId));
+      const contenders = subs.filter(
+        (sub) => isInContention(sub.status) && !(sub.isLate === 1 && !sub.lateAcceptedBy),
+      );
+      const contenderIds = new Set(contenders.map((c) => c.id));
+      const vendorIds = [...new Set(contenders.map((c) => c.vendorId))];
+      const vendorRows = vendorIds.length
+        ? await app.db
+            .select({ id: vendors.id, name: vendors.name })
+            .from(vendors)
+            .where(inArray(vendors.id, vendorIds))
+        : [];
+      const names = new Map(vendorRows.map((v) => [v.id, v.name] as const));
+
+      const result = findScopeGaps(
+        items.map((item) => ({
+          itemId: item.id,
+          itemCode: item.itemCode,
+          description: item.description,
+          isMandatory: item.isMandatory === 1,
+          engineersEstimate: item.engineersEstimate,
+          answers: entries
+            .filter((e) => e.levellingItemId === item.id && contenderIds.has(e.submissionId))
+            .map((e) => ({
+              submissionId: e.submissionId,
+              vendorId: e.vendorId,
+              vendorName: names.get(e.vendorId) ?? null,
+              includedStatus: e.includedStatus,
+              levelledAmount: e.levelledAmount,
+              adjustmentAmount: e.adjustmentAmount,
+            })),
+        })),
+        contenders.length,
+      );
+      return {
+        seal,
+        sealed: false,
+        contenders: contenders.length,
+        ...result,
+        vendors: contenders.map((c) => ({
+          submissionId: c.id,
+          vendorId: c.vendorId,
+          vendorName: names.get(c.vendorId) ?? null,
+        })),
+        note:
+          items.length === 0
+            ? "This package has no levelling scope rows, so there is nothing to test coverage " +
+              "against. Scope gaps are found by asking every bidder the same question about " +
+              "the same row — without the rows, the question cannot be asked."
+            : result.summary.universalGaps > 0
+              ? `${result.summary.universalGaps} scope row(s) are in NOBODY's price. That work ` +
+                "will be bought after the award, from the winner, without competition."
+              : `${result.summary.gapRows} of ${items.length} scope row(s) are not carried by ` +
+                "every bidder. Until the levelling adjusts for them, the totals are not " +
+                "like-for-like.",
+      };
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Health inputs — what this module contributes to project health     */
+  /* ---------------------------------------------------------------- */
+
+  app.get(
+    "/projects/:projectId/bidding/health-inputs",
+    { preHandler: readGate },
+    async (req) => {
+      const projectId = req.projectId!;
+      const companyId = req.companyId!;
+      const packages = await app.db
+        .select()
+        .from(bidPackages)
+        .where(
+          and(eq(bidPackages.companyId, companyId), eq(bidPackages.projectId, projectId)),
+        );
+      const nowMs = Date.now();
+      const reasons: string[] = [];
+      if (packages.length === 0) {
+        reasons.push("No bid packages exist on this project, so procurement contributes nothing.");
+        return {
+          metrics: {
+            packages: 0,
+            liveTenders: null,
+            overdueTenders: null,
+            packagesWithoutEstimate: null,
+            thinFields: null,
+            awardsAwaitingApproval: null,
+            openIntegrityFindings: null,
+            averageBiddersPerPackage: null,
+          },
+          reasons,
+        };
+      }
+      const live = packages.filter((p) =>
+        ["invitations_sent", "open", "closed", "under_evaluation", "levelled"].includes(p.status),
+      );
+      const overdue = live.filter(
+        (p) => p.bidDueAt !== null && (epochMs(p.bidDueAt) ?? 0) < nowMs && p.status !== "levelled",
+      );
+      const noEstimate = packages.filter((p) => p.engineersEstimate === null);
+      const thin = live.filter((p) => p.submissionCount < 3);
+      const awards = await app.db
+        .select({ status: bidAwards.status })
+        .from(bidAwards)
+        .where(and(eq(bidAwards.companyId, companyId), eq(bidAwards.projectId, projectId)));
+      const awaiting = awards.filter(
+        (a) => a.status === "recommended" || a.status === "pending_approval",
+      ).length;
+      const findings = await app.db
+        .select({ id: signals.id, detector: signals.detector, disposition: signals.disposition })
+        .from(signals)
+        .where(and(eq(signals.companyId, companyId), eq(signals.projectId, projectId)))
+        .limit(500);
+      const openIntegrity = findings.filter(
+        (f) =>
+          f.detector.startsWith("bid_integrity_") &&
+          f.disposition !== "dismissed" &&
+          f.disposition !== "closed",
+      ).length;
+      const bidders =
+        live.length === 0
+          ? null
+          : round2(live.reduce((sum, p) => sum + p.submissionCount, 0) / live.length);
+
+      if (overdue.length > 0) {
+        reasons.push(
+          `${overdue.length} tender(s) are past their bid deadline without a completed ` +
+            "levelling — the procurement is holding the programme.",
+        );
+      }
+      if (thin.length > 0) {
+        reasons.push(
+          `${thin.length} live tender(s) have fewer than three bids. A field of two is a ` +
+            "quotation, not a market, and the price it produces is not a market price.",
+        );
+      }
+      if (noEstimate.length > 0) {
+        reasons.push(
+          `${noEstimate.length} package(s) carry no pre-tender estimate, so nothing measures ` +
+            "whether the market came back over or under.",
+        );
+      }
+      if (openIntegrity > 0) {
+        reasons.push(`${openIntegrity} open bid-integrity finding(s) on this project.`);
+      }
+      return {
+        metrics: {
+          packages: packages.length,
+          liveTenders: live.length,
+          overdueTenders: overdue.length,
+          packagesWithoutEstimate: noEstimate.length,
+          thinFields: thin.length,
+          awardsAwaitingApproval: awaiting,
+          openIntegrityFindings: openIntegrity,
+          averageBiddersPerPackage: bidders,
+        },
+        reasons,
+      };
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
   /* Bid tabulation — the report, still bound by the seal               */
   /* ---------------------------------------------------------------- */
 
@@ -1208,9 +1596,16 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
         : [];
       const vendorName = new Map(vendorRows.map((v) => [v.id, v.name] as const));
 
+      // One batched standing lookup for the whole tabulation rather than
+      // three queries per row: a 12-bidder tabulation was 36 statements.
+      const standing = await batchVendorPrequalStatus(
+        app.db,
+        req.companyId!,
+        subs.map((s) => s.vendorId),
+      );
       const rows = await Promise.all(
         subs.map(async (s) => {
-          const status = await vendorPrequalStatus(app.db, req.companyId!, s.vendorId);
+          const status = standing.get(s.vendorId)!;
           const cap = effectiveLimit(status);
           const limitCheck = seal.amountsWithheld
             ? null

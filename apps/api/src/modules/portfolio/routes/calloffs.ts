@@ -35,6 +35,7 @@ import {
 } from "@constructos/db";
 import { CALL_OFF_ROUTES, CALL_OFF_STATUSES } from "@constructos/shared";
 import { badRequest, conflict, notFound } from "../../../lib/errors.js";
+import type { Db } from "../../../lib/db.js";
 import { newId } from "../../../lib/ids.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.js";
 import {
@@ -213,7 +214,7 @@ export const callOffRoutes: FastifyPluginAsync = async (app) => {
    * `excludeOrderId` measures the order out of the position it is replacing.
    */
   async function assertCeiling(
-    db: typeof app.db,
+    db: Db,
     companyId: string,
     order: { id: string; frameworkId: string | null; lotId: string | null; currency: string; orderValue: number },
   ): Promise<void> {
@@ -479,10 +480,6 @@ export const callOffRoutes: FastifyPluginAsync = async (app) => {
         );
       }
 
-      if (frameworkId && !body.frameworkId && body.route !== "mini_competition") {
-        // defensive: nothing else may set it
-        frameworkId = body.frameworkId ?? null;
-      }
       if (frameworkId) {
         const [fw] = await app.db
           .select({ currency: frameworkAgreements.currency, reference: frameworkAgreements.reference })
@@ -668,7 +665,7 @@ export const callOffRoutes: FastifyPluginAsync = async (app) => {
         throw badRequest("An order with no value cannot be issued; price it first.");
       }
       await app.db.transaction(async (tx) => {
-        await assertCeiling(tx as typeof app.db, companyId, {
+        await assertCeiling(tx, companyId, {
           id: row.id,
           frameworkId: row.frameworkId,
           lotId: row.lotId,

@@ -647,6 +647,14 @@ function ReportabilitySection({
       ) : null}
 
       {/* ---------------------------------------------------------------- */}
+      <InjuryFactsCard
+        projectId={projectId}
+        incident={incident}
+        mutation={mutation}
+        onSaved={onReloadAssessment}
+      />
+
+      {/* ---------------------------------------------------------------- */}
       <section>
         <SectionHeading
           title="The assessment answers"
@@ -774,8 +782,77 @@ function ReportabilitySection({
       <section>
         <SectionHeading
           title="Notification to the regulator"
-          hint="One entry per regime. It cannot be written twice: when the regulator was actually told is the single fact the whole duty turns on."
+          hint="ONE DUTY PER REGIME. An incident answerable to two authorities owes two notifications, on two clocks, to two bodies, on two forms — and discharging one discharges nothing of the other."
         />
+
+        {incident.notification.duties && incident.notification.duties.length > 0 ? (
+          <ul className="mb-3 space-y-1.5">
+            {incident.notification.duties.map((duty) => (
+              <li
+                key={duty.regime}
+                className={cx(
+                  "rounded-md border px-2.5 py-2",
+                  duty.state === "missed"
+                    ? "border-danger-border bg-danger-subtle/50"
+                    : duty.state === "notified_late"
+                      ? "border-warning-border bg-warning-subtle/40"
+                      : "border-border bg-surface-raised",
+                )}
+              >
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <span className="min-w-0">
+                    <span className="block text-meta font-medium text-content">
+                      {REGIME_LABEL[duty.regime] ?? duty.regime}
+                      {duty.authority ? (
+                        <span className="font-normal text-content-muted"> — {duty.authority}</span>
+                      ) : null}
+                    </span>
+                    {duty.citation ? (
+                      <span className="block text-2xs text-content-subtle">{duty.citation}</span>
+                    ) : null}
+                  </span>
+                  <Badge
+                    tone={
+                      duty.state === "missed"
+                        ? "danger"
+                        : duty.state === "notified_late"
+                          ? "warning"
+                          : duty.state === "notified"
+                            ? "success"
+                            : "info"
+                    }
+                    size="xs"
+                    dot
+                  >
+                    {labelize(duty.state)}
+                  </Badge>
+                </div>
+                <p className="mt-1 text-2xs text-content-muted">
+                  {duty.state === "notified" || duty.state === "notified_late"
+                    ? `Notified ${dateTime(duty.notifiedAt)}${
+                        duty.reference ? ` · ${duty.reference}` : ""
+                      }${duty.hoursLate !== null ? ` · ${duty.hoursLate} hour(s) late` : ""}`
+                    : duty.dueAt
+                      ? `Due ${dateTime(duty.dueAt)}${
+                          duty.hoursRemaining !== null
+                            ? ` · ${duty.hoursRemaining} hour(s) left`
+                            : duty.hoursLate !== null
+                              ? ` · ${duty.hoursLate} hour(s) past it`
+                              : ""
+                        }`
+                      : "No deadline is recorded against this regime."}
+                </p>
+                {duty.state === "missed" && duty.consequenceIfMissed ? (
+                  <p className="mt-1 text-2xs text-danger-fg">{duty.consequenceIfMissed}</p>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        ) : null}
+
+        {incident.notification.reasons && incident.notification.reasons.length > 0 ? (
+          <ReasonList reasons={incident.notification.reasons} className="mb-3" />
+        ) : null}
         {incident.notification.notifications.length > 0 ? (
           <Timeline
             timeFormat="absolute"
@@ -1265,7 +1342,19 @@ function LifecycleFooter({
       `The investigation is \`${incident.investigation.status}\`. An incident closed without an approved investigation is a record that something happened and nothing was learned.`,
     );
   }
-  if (incident.isReportable && !incident.notification.notifiedAt) {
+  /* Per DUTY, not per column. The old check read a single derived
+   * `regulator_notified_at`, so filing the F2508 on a dual-regime incident
+   * made the screen say closure was available while the OSHA duty was live. */
+  const owedDuties = (incident.notification.duties ?? []).filter(
+    (d) => d.state === "outstanding" || d.state === "missed",
+  );
+  if (incident.isReportable && owedDuties.length > 0) {
+    blockers.push(
+      `${owedDuties.length} statutory notification duty/duties are undischarged (${owedDuties
+        .map((d) => `${d.regime} — ${labelize(d.state)}`)
+        .join("; ")}). Closing it would take a live statutory duty off the register.`,
+    );
+  } else if (incident.isReportable && (incident.notification.duties ?? []).length === 0 && !incident.notification.notifiedAt) {
     blockers.push(
       "This incident is classified reportable and no notification has been recorded. Closing it would take a live statutory duty off the register.",
     );
@@ -1352,5 +1441,270 @@ function LifecycleFooter({
         )}
       </CardBody>
     </Card>
+  );
+}
+
+/* ========================================================================== */
+/* The injury facts the statutory tests turn on                                */
+/* ========================================================================== */
+
+const TREATMENT_LEVELS = [
+  "none",
+  "first_aid",
+  "medical_treatment",
+  "emergency_department",
+  "hospitalised",
+  "fatality",
+];
+
+const INJURY_NATURES = [
+  "laceration",
+  "contusion",
+  "fracture",
+  "sprain_strain",
+  "burn_thermal",
+  "burn_chemical",
+  "amputation",
+  "crush",
+  "puncture",
+  "foreign_body",
+  "dislocation",
+  "concussion",
+  "electric_shock",
+  "asphyxiation",
+  "hearing_loss",
+  "respiratory",
+  "dermatitis",
+  "heat_illness",
+  "hypothermia",
+  "psychological",
+  "multiple",
+  "other",
+];
+
+const BODY_PARTS = [
+  "head",
+  "eye",
+  "face",
+  "neck",
+  "shoulder",
+  "arm",
+  "elbow",
+  "wrist",
+  "hand",
+  "finger",
+  "chest",
+  "abdomen",
+  "back_upper",
+  "back_lower",
+  "hip",
+  "leg",
+  "knee",
+  "ankle",
+  "foot",
+  "toe",
+  "internal",
+  "multiple",
+  "not_applicable",
+];
+
+/**
+ * The columns the reportability engine actually reads.
+ *
+ * These are the facts that decide whether a report is owed at all — an ankle
+ * FRACTURE is a RIDDOR Schedule 1 specified injury whatever the days off are;
+ * nine days away crosses the over-seven-day test and five does not; a case
+ * moved from days-away to restricted duty leaves TRIR unchanged and DART
+ * unchanged too. They arrive over days, from the clinic and from the person's
+ * return, and until this form existed they could only be corrected through the
+ * API — which meant the deadline on the register was frozen at whatever was
+ * known in the first hour.
+ *
+ * Saving reassesses. If the corrected facts mean nothing is reportable any
+ * more, the obligation the first assessment raised is withdrawn on the
+ * register rather than left open against an incident the safety register says
+ * is not reportable.
+ */
+function InjuryFactsCard({
+  projectId,
+  incident,
+  mutation,
+  onSaved,
+}: {
+  projectId: string;
+  incident: IncidentDetail;
+  mutation: Mutation;
+  onSaved: () => void;
+}) {
+  const [treatmentLevel, setTreatmentLevel] = useState(incident.treatmentLevel ?? "");
+  const [injuryNature, setInjuryNature] = useState(incident.injuryNature ?? "");
+  const [bodyPart, setBodyPart] = useState(incident.bodyPart ?? "");
+  const [isLostTime, setIsLostTime] = useState(incident.isLostTime);
+  const [lostTimeDays, setLostTimeDays] = useState(
+    incident.lostTimeDays === null ? "" : String(incident.lostTimeDays),
+  );
+  const [restrictedDutyDays, setRestrictedDutyDays] = useState(
+    incident.restrictedDutyDays === null ? "" : String(incident.restrictedDutyDays),
+  );
+  const [returnToWorkDate, setReturnToWorkDate] = useState(incident.returnToWorkDate ?? "");
+
+  useEffect(() => {
+    setTreatmentLevel(incident.treatmentLevel ?? "");
+    setInjuryNature(incident.injuryNature ?? "");
+    setBodyPart(incident.bodyPart ?? "");
+    setIsLostTime(incident.isLostTime);
+    setLostTimeDays(incident.lostTimeDays === null ? "" : String(incident.lostTimeDays));
+    setRestrictedDutyDays(
+      incident.restrictedDutyDays === null ? "" : String(incident.restrictedDutyDays),
+    );
+    setReturnToWorkDate(incident.returnToWorkDate ?? "");
+  }, [incident]);
+
+  const editable = incident.status !== "closed" && incident.status !== "void";
+
+  async function save() {
+    await api.patch(`/api/v1/projects/${projectId}/safety/incidents/${incident.id}`, {
+      treatmentLevel: treatmentLevel === "" ? null : treatmentLevel,
+      injuryNature: injuryNature === "" ? null : injuryNature,
+      bodyPart: bodyPart === "" ? null : bodyPart,
+      isLostTime,
+      lostTimeDays: lostTimeDays === "" ? null : Number(lostTimeDays),
+      restrictedDutyDays: restrictedDutyDays === "" ? null : Number(restrictedDutyDays),
+      returnToWorkDate: returnToWorkDate === "" ? null : returnToWorkDate,
+    });
+    await api.post(
+      `/api/v1/projects/${projectId}/safety/incidents/${incident.id}/reportability`,
+      {},
+    );
+    onSaved();
+  }
+
+  return (
+    <section>
+      <SectionHeading
+        title="The injury facts"
+        hint="What the statutory tests actually turn on. They arrive over days — from the clinic, and from the person's return — and correcting them here reassesses the classification and the deadline rather than leaving both frozen at what was known in the first hour."
+      />
+      <Card>
+        <CardBody className="space-y-3">
+          {!editable ? (
+            <Alert tone="info" size="sm" title="This incident is closed">
+              Its facts cannot be amended. Reopen it first — an investigated incident whose facts
+              change after closure is a different incident, and the classification computed from
+              those facts has to be recomputed on the record.
+            </Alert>
+          ) : null}
+
+          <div className="grid gap-3 sm:grid-cols-3">
+            <Field
+              label="Treatment level"
+              hint="OSHA's recordability test turns on treatment beyond the closed first-aid list; RIDDOR's on admission."
+            >
+              <Select
+                value={treatmentLevel}
+                disabled={!editable}
+                onChange={(e) => setTreatmentLevel(e.target.value)}
+              >
+                <option value="">Not recorded</option>
+                {TREATMENT_LEVELS.map((t) => (
+                  <option key={t} value={t}>
+                    {labelize(t)}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Nature of injury">
+              <Select
+                value={injuryNature}
+                disabled={!editable}
+                onChange={(e) => setInjuryNature(e.target.value)}
+              >
+                <option value="">Not recorded</option>
+                {INJURY_NATURES.map((t) => (
+                  <option key={t} value={t}>
+                    {labelize(t)}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Body part">
+              <Select
+                value={bodyPart}
+                disabled={!editable}
+                onChange={(e) => setBodyPart(e.target.value)}
+              >
+                <option value="">Not recorded</option>
+                {BODY_PARTS.map((t) => (
+                  <option key={t} value={t}>
+                    {labelize(t)}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-4">
+            <Field label="Lost time">
+              <Select
+                value={isLostTime ? "true" : "false"}
+                disabled={!editable}
+                onChange={(e) => setIsLostTime(e.target.value === "true")}
+              >
+                <option value="false">No days away</option>
+                <option value="true">Days away from work</option>
+              </Select>
+            </Field>
+            <Field
+              label="Days away"
+              hint="Over seven crosses RIDDOR reg. 4(3); over three is a recording duty only."
+            >
+              <Input
+                type="number"
+                min={0}
+                value={lostTimeDays}
+                disabled={!editable}
+                onChange={(e) => setLostTimeDays(e.target.value)}
+              />
+            </Field>
+            <Field
+              label="Restricted / transferred days"
+              hint="A case moved from days-away to restricted duty leaves DART unchanged — which is the point of publishing both."
+            >
+              <Input
+                type="number"
+                min={0}
+                value={restrictedDutyDays}
+                disabled={!editable}
+                onChange={(e) => setRestrictedDutyDays(e.target.value)}
+              />
+            </Field>
+            <Field label="Returned to work">
+              <Input
+                type="date"
+                value={returnToWorkDate}
+                disabled={!editable}
+                onChange={(e) => setReturnToWorkDate(e.target.value)}
+              />
+            </Field>
+          </div>
+
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={!editable}
+            loading={mutation.busy === "injury-facts"}
+            onClick={() =>
+              void mutation.run(
+                "injury-facts",
+                "The injury facts could not be amended",
+                save,
+              )
+            }
+          >
+            Save and reassess
+          </Button>
+        </CardBody>
+      </Card>
+    </section>
   );
 }

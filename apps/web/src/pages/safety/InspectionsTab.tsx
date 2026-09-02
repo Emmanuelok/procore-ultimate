@@ -18,6 +18,7 @@
 import { useMemo, useState } from "react";
 import {
   Badge,
+  Button,
   Card,
   CardBody,
   DataTable,
@@ -122,6 +123,8 @@ export default function InspectionsTab({
   onFilters,
   users,
   onOpen,
+  onNew,
+  onNewTemplate,
 }: {
   inspections: Resource<Paged<SafetyInspection>>;
   templates: Resource<Paged<InspectionTemplate>>;
@@ -129,6 +132,8 @@ export default function InspectionsTab({
   onFilters: (next: InspectionFilters) => void;
   users: Map<string, string>;
   onOpen: (id: string) => void;
+  onNew: () => void;
+  onNewTemplate: () => void;
 }) {
   const [pane, setPane] = useState<"performed" | "templates">("performed");
   const rows = inspections.data?.items ?? [];
@@ -345,17 +350,27 @@ export default function InspectionsTab({
         />
       ) : null}
 
-      <Tabs
-        items={[
-          { value: "performed", label: "Performed" },
-          { value: "templates", label: "Templates", count: templateRows.length },
-        ]}
-        value={pane}
-        onChange={setPane}
-        size="sm"
-        variant="pill"
-        aria-label="Inspection views"
-      />
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <Tabs
+          items={[
+            { value: "performed", label: "Performed" },
+            { value: "templates", label: "Templates", count: templateRows.length },
+          ]}
+          value={pane}
+          onChange={setPane}
+          size="sm"
+          variant="pill"
+          aria-label="Inspection views"
+        />
+        <div className="flex flex-wrap items-center gap-1.5">
+          <Button size="xs" variant="outline" onClick={onNewTemplate}>
+            New template
+          </Button>
+          <Button size="xs" onClick={onNew}>
+            Schedule an inspection
+          </Button>
+        </div>
+      </div>
 
       {pane === "performed" ? (
         <>

@@ -189,13 +189,12 @@ describe("the drain", () => {
     // A transport that never resolves would hang the test; instead the row is
     // leased by hand to stand in for another replica that has already claimed
     // it, which is exactly the condition the claim must respect.
-    let calls = 0;
-    dispatcher().setHttpClient(
-      createRecordingWebhookClient(() => {
-        calls += 1;
-        return { status: 200, body: "ok" };
-      }),
-    );
+    // Count only the calls for THIS endpoint: other endpoints created by
+    // sibling tests share the queue, which is the point of the drain.
+    const client = createRecordingWebhookClient(() => ({ status: 200, body: "ok" }));
+    dispatcher().setHttpClient(client);
+    const callsFor = () =>
+      client.calls.filter((c) => c.headers["x-constructos-endpoint"] === endpoint.id).length;
     await emit(owner.companyId, "leased");
     const [row] = await app.db
       .select()
@@ -209,15 +208,15 @@ describe("the drain", () => {
       })
       .where(eq(webhookDeliveries.id, row!.id));
 
-    const before = calls;
+    const before = callsFor();
     await dispatcher().dispatchDue();
-    expect(calls).toBe(before);
+    expect(callsFor()).toBe(before);
 
     // once the lease expires the row is reclaimed — a process that died does
     // not strand its work
     clock = new Date(clock.getTime() + 60_000);
     await dispatcher().dispatchDue();
-    expect(calls).toBeGreaterThan(before);
+    expect(callsFor()).toBeGreaterThan(before);
     const [after] = await app.db
       .select()
       .from(webhookDeliveries)
@@ -241,9 +240,15 @@ describe("the drain", () => {
     for (const id of ["d-1", "d-2", "d-3", "d-4"]) await emit(owner.companyId, "dead", id);
 
     const summary = await dispatcher().dispatchDue();
-    // threshold is 2 transport errors: two attempted, the rest deferred
-    expect(summary.attempted).toBe(2);
-    expect(summary.circuitDeferred).toBe(2);
+    // The queue is shared with sibling tests' endpoints, so the assertion is
+    // about THIS endpoint: the threshold is 2 transport errors, so exactly two
+    // of its four deliveries are attempted and the rest are deferred.
+    expect(summary.circuitDeferred).toBeGreaterThanOrEqual(2);
+    const attempted = await app.db
+      .select()
+      .from(webhookDeliveries)
+      .where(eq(webhookDeliveries.endpointId, endpoint.id));
+    expect(attempted.filter((d) => d.attempts > 0)).toHaveLength(2);
 
     const [ep] = await app.db
       .select()
@@ -252,10 +257,22 @@ describe("the drain", () => {
     expect(ep!.consecutiveErrors).toBeGreaterThanOrEqual(2);
     expect(ep!.circuitOpenUntil).toBeTruthy();
 
-    // while the breaker is open the endpoint is skipped entirely
-    const second = await dispatcher().dispatchDue();
-    expect(second.attempted).toBe(0);
-    expect(second.circuitDeferred).toBeGreaterThan(0);
+    // while the breaker is open the endpoint is skipped entirely: its rows are
+    // handed back with a due time and nothing further is attempted on it
+    await dispatcher().dispatchDue();
+    const after = await app.db
+      .select()
+      .from(webhookDeliveries)
+      .where(eq(webhookDeliveries.endpointId, endpoint.id));
+    expect(after.filter((d) => d.attempts > 0)).toHaveLength(2);
+    // the untouched rows are handed back with a due time at (or after) the
+    // instant the breaker reopens, and hold no lease
+    const deferred = after.filter((d) => d.attempts === 0);
+    expect(deferred).toHaveLength(2);
+    for (const row of deferred) {
+      expect(row.leaseUntil).toBeNull();
+      expect(Date.parse(row.nextAttemptAt!)).toBeGreaterThan(clock.getTime());
+    }
   });
 
   it("does NOT open the breaker on HTTP failures — a 500 means the receiver is alive", async () => {
@@ -298,7 +315,12 @@ describe("the drain", () => {
   });
 
   it("prunes settled deliveries and never prunes one still owed", async () => {
-    const endpoint = await createEndpoint(owner, { name: "retained" });
+    // A narrow subscription keeps sibling tests' events out of this endpoint's
+    // queue, so the assertion is about the five rows the test itself planted.
+    const endpoint = await createEndpoint(owner, {
+      name: "retained",
+      eventKinds: ["retention.create"],
+    });
     const old = new Date(clock.getTime() - 60 * 86_400_000).toISOString();
     const rows = [
       { id: newId("whd"), status: "delivered" as const },
@@ -320,11 +342,13 @@ describe("the drain", () => {
       });
     }
     const out = await dispatcher().prune(clock);
-    expect(out.deleted).toBe(2); // delivered + skipped; exhausted is kept longer
+    expect(out.deleted).toBeGreaterThanOrEqual(2); // delivered + skipped
     const left = await app.db
       .select()
       .from(webhookDeliveries)
       .where(eq(webhookDeliveries.endpointId, endpoint.id));
+    // exhausted is kept longer — it is the evidence of an outage; pending and
+    // failed are never pruned because they are still owed to a receiver
     expect(left.map((r) => r.status).sort()).toEqual(["exhausted", "failed", "pending"]);
   });
 });

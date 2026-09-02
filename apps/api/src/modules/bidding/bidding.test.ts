@@ -227,7 +227,7 @@ describe("bid packages", () => {
       qualityWeight: 10,
     });
     expect(res.statusCode).toBe(409);
-    expect(res.json().message).toMatch(/cannot be changed after the package has been issued/i);
+    expect(res.json().message).toMatch(/cannot be changed once the package has been issued/i);
     // a non-basis field is still editable
     const ok = await patch(`/projects/${openProject}/bid-packages/${pkg.id}`, {
       scopeDescription: "Revised scope narrative",

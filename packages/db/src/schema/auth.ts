@@ -184,6 +184,28 @@ export const identityProviders = pgTable(
     groupRoleMappings: jsonb("group_role_mappings").$type<unknown[]>().default([]).notNull(),
     /** may a member of this company still sign in with a password? */
     allowPasswordLogin: boolean("allow_password_login").default(true).notNull(),
+    /**
+     * WP-AUTH: projects a JIT-provisioned user is given access to, using
+     * `default_template_key`. Before this the template key was resolved,
+     * written into the ledger payload and then applied to nothing, so a
+     * provisioned member held a company membership and could not reach a
+     * single :projectId route. An empty list means "company membership only",
+     * which is now a stated choice rather than an accident.
+     */
+    provisionProjectIds: jsonb("provision_project_ids").$type<string[]>().default([]).notNull(),
+    /**
+     * WP-AUTH: does this connection's identity provider perform MFA itself?
+     * When true and the assertion's `amr`/`acr` carries one of
+     * `mfa_amr_values`, the resulting session is marked MFA-satisfied and a
+     * tenant that requires a second factor is satisfied by the IdP's. When
+     * false (the default) a tenant MFA policy applies to SSO sign-ins exactly
+     * as it does to password sign-ins: the callback returns a challenge, not a
+     * session. Trusting an IdP's word is a decision an administrator takes
+     * explicitly — never a default.
+     */
+    idpPerformsMfa: boolean("idp_performs_mfa").default(false).notNull(),
+    /** amr/acr values that count as a second factor, e.g. ["mfa","otp","hwk"] */
+    mfaAmrValues: jsonb("mfa_amr_values").$type<string[]>().default([]).notNull(),
 
     isEnabled: boolean("is_enabled").default(false).notNull(),
     disabledReason: text("disabled_reason"),
@@ -685,7 +707,286 @@ export const authSecurityEvents = pgTable(
   (t) => [
     index("auth_security_events_user_idx").on(t.userId, t.at),
     index("auth_security_events_company_idx").on(t.companyId, t.at),
-    index("auth_security_events_email_idx").on(t.email),
+    // (email, at) rather than (email): every lockout evaluation filters on the
+    // address AND a time horizon, and the bare index made the second half of
+    // that a heap scan. See the note on the ip index below.
+    index("auth_security_events_email_idx").on(t.email, t.at),
     index("auth_security_events_kind_idx").on(t.kind, t.outcome),
+    // THE LOGIN HOT PATH. `ipLockout` (modules/account/lockout.ts) runs BEFORE
+    // the password is compared, on every sign-in attempt, filtering this table
+    // by ip + at + kind. With no index on ip that was a sequential scan over a
+    // table that grows by a row per login, per failure, per dispatch and per
+    // MFA event across every tenant — so sign-in latency grew with the size of
+    // the trail and the cheapest denial-of-service on the platform was to type
+    // a wrong password repeatedly. Leading column is the IP because that is the
+    // equality predicate; `at` follows so the range is satisfied in the index.
+    index("auth_security_events_ip_at_idx").on(t.ip, t.at),
   ],
+);
+
+/* ==================================================================== */
+/* PLATFORM UPGRADE WAVE — WP-AUTH                                       */
+/*                                                                       */
+/* Everything below this banner was added by the security-hardening and  */
+/* production-readiness package. Five concerns, in the order the spec    */
+/* asks for them:                                                        */
+/*                                                                       */
+/*   #23/#24/#25  the tenant security policy (sessions, passwords, IP)   */
+/*   #25          password history, so "must not reuse" is enforceable   */
+/*   #21          SCIM 2.0 provisioning tokens                           */
+/*   §0.2         security event webhooks and their delivery log         */
+/*   §0.2         durable SSO flow/ticket state, so replicas are safe    */
+/* ==================================================================== */
+
+/**
+ * ONE ROW PER TENANT: the security policy an administrator sets and every
+ * authentication path enforces.
+ *
+ * WHY A TABLE RATHER THAN `companies.settings`. The MFA policy already lives
+ * in that JSON blob and it demonstrated the cost: nothing can be indexed,
+ * nothing can be constrained, every reader re-implements the defaults, and a
+ * typo in one writer's merge silently drops another module's key. A policy
+ * that governs whether a person can sign in at all deserves columns.
+ *
+ * WHY THE DEFAULTS ARE NULLABLE where they are: `null` means "the platform
+ * default applies", which is not the same as a tenant deliberately choosing
+ * the same number. An administrator who has never opened the page must be
+ * distinguishable from one who considered the question — the difference shows
+ * up the day the platform default changes.
+ *
+ * THE ONE RULE THE ENGINE KEEPS (modules/account/policy.ts): where a user
+ * belongs to several companies, THE STRICTEST POLICY WINS. Anything else
+ * would let a member of a lax tenant hold a session that a strict tenant's
+ * data is then read through.
+ */
+export const companySecurityPolicies = pgTable(
+  "company_security_policies",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+
+    /* --- #23 sessions --- */
+    /** sign out a session idle for this long; null = no idle timeout */
+    sessionIdleTimeoutMinutes: integer("session_idle_timeout_minutes"),
+    /** absolute lifetime regardless of activity; null = platform default */
+    sessionAbsoluteTimeoutHours: integer("session_absolute_timeout_hours"),
+    /** how long a device may skip the second factor after satisfying it */
+    rememberDeviceDays: integer("remember_device_days"),
+
+    /* --- #25 passwords --- */
+    passwordMinLength: integer("password_min_length"),
+    /** require a mix of character classes (upper/lower/digit/symbol) */
+    passwordRequireComplexity: boolean("password_require_complexity").default(false).notNull(),
+    /** refuse the last N passwords; 0/null = reuse is not checked */
+    passwordHistoryDepth: integer("password_history_depth"),
+    /** force a change after this many days; null = passwords do not expire */
+    passwordMaxAgeDays: integer("password_max_age_days"),
+
+    /* --- lockout --- */
+    lockoutMaxAttempts: integer("lockout_max_attempts"),
+    lockoutWindowMinutes: integer("lockout_window_minutes"),
+    lockoutDurationMinutes: integer("lockout_duration_minutes"),
+
+    /* --- #24 network --- */
+    /** IpAllowlistMode — off | monitor | enforce */
+    ipAllowlistMode: text("ip_allowlist_mode").default("off").notNull(),
+    /** CIDR blocks (v4 and v6) and bare addresses this tenant may be used from */
+    ipAllowlist: jsonb("ip_allowlist").$type<string[]>().default([]).notNull(),
+    /**
+     * BREAK GLASS. User ids exempt from the allowlist. Without it the first
+     * administrator to fat-finger a CIDR locks the whole tenant out of its own
+     * platform with no way back in that does not involve a database console.
+     */
+    ipAllowlistBreakGlassUserIds: jsonb("ip_allowlist_break_glass_user_ids")
+      .$type<string[]>()
+      .default([])
+      .notNull(),
+
+    /* --- authentication methods --- */
+    /** tenant requires a second factor (mirrors the MFA policy route) */
+    mfaRequired: boolean("mfa_required").default(false).notNull(),
+    /** accept an IdP's own MFA when the assertion's amr/acr says so */
+    mfaAcceptedAmrValues: jsonb("mfa_accepted_amr_values")
+      .$type<string[]>()
+      .default([])
+      .notNull(),
+
+    updatedBy: text("updated_by"),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [uniqueIndex("company_security_policies_company_uq").on(t.companyId)],
+);
+
+/**
+ * Past password hashes, so "must not reuse your last N" is enforceable.
+ *
+ * Only the HASH is kept, at the cost it was written at — a reuse check is a
+ * bcrypt comparison against each retained hash, never a comparison of
+ * plaintext. The row is pruned to the deepest history any of the user's
+ * companies asks for, so a tenant that lowers the depth stops retaining what
+ * it no longer needs.
+ */
+export const passwordHistory = pgTable(
+  "password_history",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id").notNull(),
+    passwordHash: text("password_hash").notNull(),
+    /** why this hash was retired: changed | reset | invitation | admin */
+    reason: text("reason"),
+    createdAt: createdAt(),
+  },
+  (t) => [index("password_history_user_idx").on(t.userId, t.createdAt)],
+);
+
+/**
+ * A per-tenant SCIM 2.0 bearer token (spec #21).
+ *
+ * Hashed like every other credential on this platform: the raw token is shown
+ * once, at creation, and the row holds `sha256(token)` plus an identifying
+ * prefix so an operator can tell two tokens apart in a list without either of
+ * them being usable from the list.
+ *
+ * A SCIM token authenticates a DIRECTORY, not a person. It therefore carries
+ * no user id and no company role: its authority is exactly "provision, update
+ * and deactivate members of this one company", which is why `companyId` is
+ * mandatory and why every SCIM handler filters on it rather than on a
+ * caller-supplied tenant.
+ */
+export const scimTokens = pgTable(
+  "scim_tokens",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    name: text("name").notNull(),
+    tokenHash: text("token_hash").notNull(),
+    /** first 10 chars of the raw token — identification without capability */
+    tokenPrefix: text("token_prefix").notNull(),
+    createdBy: text("created_by").notNull(),
+    lastUsedAt: timestamp("last_used_at", { withTimezone: true, mode: "string" }),
+    lastUsedIp: text("last_used_ip"),
+    useCount: integer("use_count").default(0).notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true, mode: "string" }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true, mode: "string" }),
+    revokedBy: text("revoked_by"),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    uniqueIndex("scim_tokens_hash_uq").on(t.tokenHash),
+    index("scim_tokens_company_idx").on(t.companyId),
+  ],
+);
+
+/**
+ * Where a tenant's security events are pushed.
+ *
+ * Deliberately SEPARATE from `webhook_endpoints` (integrations): that one
+ * carries ledger events about the works, and its subscribers are line-of-
+ * business systems. This one carries sign-ins, lockouts, policy changes and
+ * provider changes, and its subscriber is a SIEM. Mixing them would mean a
+ * project-management integration receiving the failed-login stream.
+ *
+ * The signing secret is DERIVED, never stored (see modules/integrations/
+ * signing.ts): HKDF over the endpoint id under WEBHOOK_SIGNING_KEY. The row
+ * keeps only a fingerprint so an operator can confirm which secret is live.
+ */
+export const securityWebhooks = pgTable(
+  "security_webhooks",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    name: text("name").notNull(),
+    url: text("url").notNull(),
+    /** AuthEventKind[] — empty means every kind */
+    eventKinds: jsonb("event_kinds").$type<string[]>().default([]).notNull(),
+    /** sha256 of the derived secret; the secret itself is never stored */
+    secretFingerprint: text("secret_fingerprint"),
+    isEnabled: boolean("is_enabled").default(true).notNull(),
+    /** set when consecutive failures disabled it, so silence is explained */
+    disabledReason: text("disabled_reason"),
+    consecutiveFailures: integer("consecutive_failures").default(0).notNull(),
+    lastDeliveryAt: timestamp("last_delivery_at", { withTimezone: true, mode: "string" }),
+    lastStatus: text("last_status"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [index("security_webhooks_company_idx").on(t.companyId, t.isEnabled)],
+);
+
+/**
+ * One attempted delivery. `status = pending` is a delivery the retry sweep
+ * still owns; `failed` is one that exhausted its attempts. Nothing is ever
+ * reported as delivered on the strength of having been enqueued.
+ */
+export const securityWebhookDeliveries = pgTable(
+  "security_webhook_deliveries",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    webhookId: text("webhook_id").notNull(),
+    /** AuthEventKind of the event that triggered this */
+    eventKind: text("event_kind").notNull(),
+    eventId: text("event_id"),
+    payload: jsonb("payload").$type<Record<string, unknown>>().default({}).notNull(),
+    /** SecurityWebhookStatus — pending | delivered | failed | refused */
+    status: text("status").default("pending").notNull(),
+    statusCode: integer("status_code"),
+    attempts: integer("attempts").default(0).notNull(),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true, mode: "string" }),
+    error: text("error"),
+    deliveredAt: timestamp("delivered_at", { withTimezone: true, mode: "string" }),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    index("security_webhook_deliveries_company_idx").on(t.companyId, t.createdAt),
+    index("security_webhook_deliveries_webhook_idx").on(t.webhookId, t.createdAt),
+    index("security_webhook_deliveries_pending_idx").on(t.status, t.nextAttemptAt),
+  ],
+);
+
+/**
+ * In-flight SSO authorization-code state, moved out of process memory.
+ *
+ * The original store was a Map keyed by the database handle, with an honest
+ * comment saying a multi-replica deployment needed sticky routing or a shared
+ * store. This is that shared store. The consequence it removes is real: the
+ * callback from the identity provider lands on whichever replica the platform
+ * edge picks, and with an in-memory map that is a one-in-N chance of a
+ * sign-in that fails with "this link is not valid any more".
+ *
+ * The lookup key is `sha256(state)`, never the state itself, for the same
+ * reason every other credential here is hashed: a database reader must not be
+ * able to complete somebody else's in-flight sign-in.
+ */
+export const ssoFlows = pgTable(
+  "sso_flows",
+  {
+    /** sha256 of the `state` parameter */
+    id: text("id").primaryKey(),
+    providerId: text("provider_id").notNull(),
+    companyId: text("company_id").notNull(),
+    /** PKCE verifier, nonce, redirect_uri, mode, returnTo, linkUserId, binding */
+    record: jsonb("record").$type<Record<string, unknown>>().notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true, mode: "string" }).notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [index("sso_flows_expires_idx").on(t.expiresAt)],
+);
+
+/**
+ * A completed SSO sign-in parked for exactly one exchange, so a refresh token
+ * never travels in a redirect URL. Same hashing rule as the flow.
+ */
+export const ssoTickets = pgTable(
+  "sso_tickets",
+  {
+    /** sha256 of the ticket */
+    id: text("id").primaryKey(),
+    payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true, mode: "string" }).notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [index("sso_tickets_expires_idx").on(t.expiresAt)],
 );

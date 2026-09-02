@@ -1250,15 +1250,24 @@ export const fundingRoutes: FastifyPluginAsync = async (app) => {
         `The allocation cannot be reduced below the ${row.drawnAmount} ${row.currency} already drawn against it.`,
       );
     }
+    /* An allocation must always name where its authority comes from. Clearing
+       both parents would leave money attached to a project with no source. */
+    const nextAppropriation =
+      body.appropriationId !== undefined ? (body.appropriationId ?? null) : row.appropriationId;
+    const nextSource =
+      body.fundingSourceId !== undefined ? (body.fundingSourceId ?? null) : row.fundingSourceId;
+    if (!nextAppropriation && !nextSource) {
+      throw badRequest(
+        "An allocation must name the appropriation or the funding source it draws on; money with no stated source is not authority.",
+      );
+    }
 
     const revertsApproval = changesMoney && ALLOCATION_LOCKED.includes(row.status);
     await app.db.transaction(async (tx) => {
       if (changesMoney) {
         await assertHeadroom(tx, companyId, {
-          fundingSourceId:
-            body.fundingSourceId !== undefined ? (body.fundingSourceId ?? null) : row.fundingSourceId,
-          appropriationId:
-            body.appropriationId !== undefined ? (body.appropriationId ?? null) : row.appropriationId,
+          fundingSourceId: nextSource,
+          appropriationId: nextAppropriation,
           currency: row.currency,
           amount: body.amount ?? row.amount,
           excludeAllocationId: row.id,

@@ -1,9 +1,13 @@
 import { randomBytes } from "node:crypto";
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
-import { and, asc, count, eq, inArray } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
-import { bidInvitations, bidPackages } from "@constructos/db";
-import { BID_DECLINE_REASONS, BID_INVITATION_STATUSES } from "@constructos/shared";
+import { bidDocumentAccess, bidInvitations, bidPackages, vendors } from "@constructos/db";
+import {
+  BID_DECLINE_REASONS,
+  BID_DOCUMENT_ACCESS_KINDS,
+  BID_INVITATION_STATUSES,
+} from "@constructos/shared";
 import { sha256Hex } from "@constructos/ledger";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
@@ -23,10 +27,12 @@ import {
 } from "./shared.js";
 import { addendaOf, requirementsOf, timetableOf } from "./packages.js";
 import {
+  batchVendorPrequalStatus,
   effectiveLimit,
   evaluatePrequalGate,
   sweepPrequalification,
   vendorPrequalStatus,
+  type VendorPrequalStatus,
 } from "./prequal-status.js";
 import { checkContractAgainstLimit } from "./financial-limits.js";
 
@@ -87,6 +93,25 @@ export function mintPortalToken(): { raw: string; hash: string; display: string 
   return { raw, hash: sha256Hex(raw), display: `${raw.slice(0, 8)}...` };
 }
 
+/** How long a bidder token outlives the deadline it was issued against. */
+export const PORTAL_TOKEN_TAIL_DAYS = 7;
+
+/**
+ * When a bidder's portal access ends: the bid deadline plus a tail, or — for
+ * a package with no deadline yet — the tail from now. A credential with no
+ * expiry outlives the tender it belongs to, and the tender is the only reason
+ * the holder was ever trusted.
+ */
+export function portalTokenExpiry(
+  pkg: BidPackageRow,
+  tailDays: number = PORTAL_TOKEN_TAIL_DAYS,
+  now: Date = new Date(),
+): string {
+  const base = pkg.bidDueAt ? Date.parse(pkg.bidDueAt) : now.getTime();
+  const from = Number.isFinite(base) ? base : now.getTime();
+  return new Date(Math.max(from, now.getTime()) + tailDays * 86_400_000).toISOString();
+}
+
 /** Invitations never leave this module carrying the token hash. */
 export function viewInvitation(row: BidInvitationRow) {
   const { portalTokenHash, ...rest } = row;
@@ -133,9 +158,17 @@ export const invitationRoutes: FastifyPluginAsync = async (app) => {
    * it: where this vendor's prequalification actually stands right now, and
    * whether the value of this package is inside the capacity they were
    * approved for.
+   *
+   * `standing` is passed in rather than fetched, because this used to run
+   * four queries per invitation: a list of 200 invitations issued roughly 600
+   * statements and got slower every time the supply chain grew. See
+   * `decorateMany`.
    */
-  async function decorate(db: Db, companyId: string, pkg: BidPackageRow, inv: BidInvitationRow) {
-    const status = await vendorPrequalStatus(db, companyId, inv.vendorId);
+  function decorateOne(
+    pkg: BidPackageRow,
+    inv: BidInvitationRow,
+    status: VendorPrequalStatus,
+  ) {
     const gate = evaluatePrequalGate(pkg, status, "Invitation", false);
     const cap = effectiveLimit(status);
     const capacity = checkContractAgainstLimit({
@@ -179,7 +212,63 @@ export const invitationRoutes: FastifyPluginAsync = async (app) => {
           Boolean(inv.sentAt) && !inv.respondedAt && !inv.viewedAt && inv.remindersSent > 0,
         remindersSent: inv.remindersSent,
       },
+      portal: {
+        issued: Boolean(inv.portalTokenHash),
+        expiresAt: inv.portalTokenExpiresAt,
+        expired:
+          Boolean(inv.portalTokenHash) &&
+          inv.portalTokenExpiresAt !== null &&
+          Date.parse(inv.portalTokenExpiresAt) < Date.now(),
+        lastAccessAt: inv.portalLastAccessAt,
+      },
     };
+  }
+
+  /** Standing for every vendor in one batch, then decorate in memory. */
+  async function decorateMany(
+    db: Db,
+    companyId: string,
+    pkg: BidPackageRow,
+    rows: readonly BidInvitationRow[],
+  ) {
+    const standing = await batchVendorPrequalStatus(
+      db,
+      companyId,
+      rows.map((r) => r.vendorId),
+    );
+    return rows.map((row) =>
+      decorateOne(
+        pkg,
+        row,
+        standing.get(row.vendorId) ?? {
+          vendorId: row.vendorId,
+          vendorName: null,
+          submissionId: null,
+          reference: null,
+          questionnaireId: null,
+          status: null,
+          outcome: null,
+          state: "none",
+          validFrom: null,
+          expiresAt: null,
+          daysToExpiry: null,
+          singleProjectLimit: null,
+          aggregateLimit: null,
+          currency: null,
+          tradeScopeApproved: [],
+          conditions: null,
+          knockoutFailed: false,
+          knockoutReason: null,
+          recommendedLimit: null,
+          note: "This vendor is not in the directory for this company.",
+        },
+      ),
+    );
+  }
+
+  async function decorate(db: Db, companyId: string, pkg: BidPackageRow, inv: BidInvitationRow) {
+    const [only] = await decorateMany(db, companyId, pkg, [inv]);
+    return only!;
   }
 
   async function invitationContext(
@@ -211,6 +300,11 @@ export const invitationRoutes: FastifyPluginAsync = async (app) => {
 
       const created: string[] = [];
       const warnings: { vendorId: string; message: string }[] = [];
+      const standing = await batchVendorPrequalStatus(
+        app.db,
+        companyId,
+        wanted.map((w) => w.vendorId),
+      );
       for (const item of wanted) {
         const vendor = await assertVendor(app.db, item.vendorId, companyId);
         const [existing] = await app.db
@@ -230,7 +324,9 @@ export const invitationRoutes: FastifyPluginAsync = async (app) => {
         // The prequalification gate at invitation FLAGS but never refuses:
         // a vendor whose approval lapsed last week may renew before the
         // deadline, and telling them to is the entire point of the flag.
-        const status = await vendorPrequalStatus(app.db, companyId, item.vendorId);
+        const status =
+          standing.get(item.vendorId) ??
+          (await vendorPrequalStatus(app.db, companyId, item.vendorId));
         const gate = evaluatePrequalGate(pkg, status, "Invitation", false);
         if (!gate.ok && gate.message) warnings.push({ vendorId: item.vendorId, message: gate.message });
 
@@ -245,7 +341,14 @@ export const invitationRoutes: FastifyPluginAsync = async (app) => {
           contactName: item.contactName ?? null,
           contactEmail: item.contactEmail ?? null,
           status: "draft",
-          isPrequalified: gate.ok && status.state === "approved" ? 1 : 0,
+          /*
+           * A vendor whose approval is valid but inside its 60-day renewal
+           * window is state "expiring" — the gate passes them, they may bid,
+           * and they may be awarded. Recording them as NOT prequalified made
+           * every downstream consumer of `is_prequalified` misread them. The
+           * expiry is recorded separately, which is where the urgency lives.
+           */
+          isPrequalified: gate.ok ? 1 : 0,
           prequalificationSubmissionId: status.submissionId,
           prequalificationExpiresAt: status.expiresAt,
           detail: { ...(item.detail ?? {}), prequalificationAtInvitation: status.state },
@@ -268,7 +371,7 @@ export const invitationRoutes: FastifyPluginAsync = async (app) => {
         .select()
         .from(bidInvitations)
         .where(inArray(bidInvitations.id, created));
-      const items = await Promise.all(rows.map((r) => decorate(app.db, companyId, pkg, r)));
+      const items = await decorateMany(app.db, companyId, pkg, rows);
       return reply.status(201).send({ items, total: items.length, warnings });
     },
   );
@@ -293,7 +396,7 @@ export const invitationRoutes: FastifyPluginAsync = async (app) => {
         .orderBy(asc(bidInvitations.createdAt))
         .limit(q.pageSize)
         .offset(pageOffset(q));
-      const items = await Promise.all(rows.map((r) => decorate(app.db, req.companyId!, pkg, r)));
+      const items = await decorateMany(app.db, req.companyId!, pkg, rows);
       return {
         ...paginate(items, Number(totalRow?.n ?? 0), q),
         summary: {
@@ -533,10 +636,32 @@ export const invitationRoutes: FastifyPluginAsync = async (app) => {
     async (req, reply) => {
       const { invitation } = await invitationContext(req);
       await requireBiddingLevel(app, req, reply, invitation.projectId, "standard");
+      const pkg = await fetchPackage(app.db, invitation.packageId, req.companyId!);
+      if (pkg.status === "awarded" || pkg.status === "cancelled") {
+        throw conflict(
+          `${pkg.reference} is ${pkg.status}. A bidder portal token issued now would open a ` +
+            "tender that is over.",
+        );
+      }
+      const body = z
+        .object({ validityDays: z.number().int().min(1).max(365).optional() })
+        .parse(req.body ?? {});
       const token = mintPortalToken();
+      /*
+       * A BIDDER TOKEN EXPIRES. It used to be permanent: valid after the
+       * deadline, after the award and after the package was cancelled, so a
+       * tender that closed in March was still readable in November by anyone
+       * holding the link. The default life is the bid deadline plus a tail
+       * long enough to cover the debrief.
+       */
+      const expiresAt = portalTokenExpiry(pkg, body.validityDays ?? PORTAL_TOKEN_TAIL_DAYS);
       await app.db
         .update(bidInvitations)
-        .set({ portalTokenHash: token.hash, updatedAt: new Date().toISOString() })
+        .set({
+          portalTokenHash: token.hash,
+          portalTokenExpiresAt: expiresAt,
+          updatedAt: new Date().toISOString(),
+        })
         .where(eq(bidInvitations.id, invitation.id));
       await ledger(app.db, req, "create", "bid_invitation", invitation.id, {
         projectId: invitation.projectId,
@@ -544,12 +669,14 @@ export const invitationRoutes: FastifyPluginAsync = async (app) => {
         event: "portal_token_issued",
         // the DISPLAY prefix only; the token itself never reaches the ledger
         tokenPrefix: token.display,
+        expiresAt,
         replacedPrevious: Boolean(invitation.portalTokenHash),
       }, invitation.projectId, true);
       return reply.status(201).send({
         token: token.raw,
         tokenPrefix: token.display,
         invitationId: invitation.id,
+        expiresAt,
         note:
           "This token is shown once and is not recoverable. Only its sha256 is stored, exactly " +
           "as the platform's API tokens are, so nobody — including us — can read it back. " +
@@ -601,8 +728,43 @@ export const invitationRoutes: FastifyPluginAsync = async (app) => {
     if (invitation.status === "disqualified" || invitation.status === "withdrawn") {
       throw unauthorized(`This invitation is ${invitation.status}.`);
     }
+    if (
+      invitation.portalTokenExpiresAt &&
+      Date.parse(invitation.portalTokenExpiresAt) < Date.now()
+    ) {
+      throw unauthorized(
+        `This bidder portal link expired on ${invitation.portalTokenExpiresAt}. A tender access ` +
+          "credential that never expires is a credential that outlives the tender; ask the " +
+          "buyer for a new one if the package is still live.",
+      );
+    }
     const pkg = await fetchPackage(app.db, invitation.packageId, invitation.companyId);
+    if (pkg.status === "awarded" || pkg.status === "cancelled") {
+      throw unauthorized(
+        `${pkg.reference} is ${pkg.status}; the bidder portal for it is closed. The award and ` +
+          "the debrief are communicated directly, not through a tender portal that is still " +
+          "accepting responses.",
+      );
+    }
     return { invitation, pkg };
+  }
+
+  /** Ledger an action a BIDDER took, with the pathway instead of an actor. */
+  async function ledgerPortal(
+    invitation: BidInvitationRow,
+    action: "access" | "update" | "state_change",
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    await appendLedger(app.db, {
+      companyId: invitation.companyId,
+      actorId: null,
+      action,
+      objectType: "bid_invitation",
+      objectId: invitation.id,
+      payload: { via: "portal_token", vendorId: invitation.vendorId, ...payload },
+      projectId: invitation.projectId,
+      storePayload: true,
+    });
   }
 
   function bidderView(invitation: BidInvitationRow, pkg: BidPackageRow) {
@@ -693,6 +855,23 @@ export const invitationRoutes: FastifyPluginAsync = async (app) => {
           "failure on the buyer's side, and that only shows up if the reason is recorded.",
       );
     }
+    /*
+     * A BIDDER WHO HAS SUBMITTED CANNOT THEN DECLINE. The staff-side route
+     * refuses exactly this; the portal did not, so a bidder could withdraw a
+     * bid the buyer already held by flipping a boolean, with no reason, no
+     * withdrawal record and no ledger entry.
+     */
+    if (
+      !body.intentToBid &&
+      (invitation.status === "submitted" ||
+        invitation.status === "disqualified" ||
+        invitation.status === "withdrawn")
+    ) {
+      throw conflict(
+        `This invitation is ${invitation.status}. A bid that has been submitted is withdrawn ` +
+          "through the buyer, with a reason on the record — not by changing an intention.",
+      );
+    }
     const now = new Date().toISOString();
     await app.db
       .update(bidInvitations)
@@ -707,6 +886,15 @@ export const invitationRoutes: FastifyPluginAsync = async (app) => {
       })
       .where(eq(bidInvitations.id, invitation.id));
     await recountInvitations(app.db, invitation.packageId);
+    await ledgerPortal(invitation, "state_change", {
+      packageId: invitation.packageId,
+      packageReference: pkg.reference,
+      event: body.intentToBid ? "portal_intent_to_bid" : "portal_declined",
+      intentToBid: body.intentToBid,
+      declineReason: body.intentToBid ? null : (body.declineReason ?? null),
+      declineNote: body.intentToBid ? null : (body.declineNote ?? null),
+      from: invitation.status,
+    });
     const fresh = await fetchInvitation(app.db, invitation.id, invitation.companyId);
     return bidderView(fresh, pkg);
   });
@@ -731,8 +919,176 @@ export const invitationRoutes: FastifyPluginAsync = async (app) => {
           updatedAt: new Date().toISOString(),
         })
         .where(eq(bidInvitations.id, invitation.id));
+      await ledgerPortal(invitation, "update", {
+        packageId: invitation.packageId,
+        packageReference: pkg.reference,
+        event: "portal_addendum_acknowledged",
+        addendumRef: body.addendumRef,
+      });
     }
     const fresh = await fetchInvitation(app.db, invitation.id, invitation.companyId);
     return bidderView(fresh, pkg);
   });
+
+  /* ---------------------------------------------------------------- */
+  /* Bidder document access — logged per file, per bidder (#169)       */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * A bidder telling us they opened a document.
+   *
+   * The log answers the two questions a procurement challenge asks: did every
+   * bidder receive the same documents, and did the one complaining about the
+   * addendum ever open it. It is deliberately an assertion by the portal
+   * rather than a proxied download — this platform does not serve the tender
+   * files itself — so what it proves is that the bidder's client said it
+   * fetched them, which is exactly what a download log ever proves.
+   */
+  app.post("/bid-portal/document-access", async (req, reply) => {
+    const body = z
+      .object({
+        fileId: z.string().min(1).max(64),
+        fileName: z.string().max(400).nullable().optional(),
+        documentKind: z
+          .enum(["tender_document", "addendum", "drawing", "specification", "other"])
+          .default("tender_document"),
+        addendumRef: z.string().max(60).nullable().optional(),
+        accessKind: z.enum(BID_DOCUMENT_ACCESS_KINDS).default("download"),
+      })
+      .parse(req.body);
+    const { invitation, pkg } = await portalSession(req.headers.authorization);
+    const known = new Set<string>([
+      ...((pkg.documentFileIds as string[]) ?? []),
+      ...addendaOf(pkg).flatMap((a) => a.fileIds ?? []),
+    ]);
+    if (!known.has(body.fileId)) {
+      throw badRequest(
+        `File ${body.fileId} is not one of the documents issued with ${pkg.reference}. A bidder ` +
+          "cannot record access to a file the tender never carried.",
+      );
+    }
+    const now = new Date().toISOString();
+    await app.db.insert(bidDocumentAccess).values({
+      id: newId("bda"),
+      companyId: invitation.companyId,
+      projectId: invitation.projectId,
+      packageId: invitation.packageId,
+      invitationId: invitation.id,
+      vendorId: invitation.vendorId,
+      fileId: body.fileId,
+      fileName: body.fileName ?? null,
+      documentKind: body.documentKind,
+      addendumRef: body.addendumRef ?? null,
+      accessKind: body.accessKind,
+      via: "portal_token",
+      actorId: null,
+      userAgent: (req.headers["user-agent"] ?? "").slice(0, 400) || null,
+      accessedAt: now,
+    });
+    if (body.accessKind === "download") {
+      await app.db
+        .update(bidInvitations)
+        .set({
+          downloadCount: invitation.downloadCount + 1,
+          firstDownloadAt: invitation.firstDownloadAt ?? now,
+          viewedAt: invitation.viewedAt ?? now,
+          portalLastAccessAt: now,
+          status:
+            LIVE.includes(invitation.status) &&
+            invitation.status !== "intent_to_bid" &&
+            invitation.status !== "submitted"
+              ? "downloaded"
+              : invitation.status,
+          updatedAt: now,
+        })
+        .where(eq(bidInvitations.id, invitation.id));
+    }
+    await ledgerPortal(invitation, "access", {
+      packageId: invitation.packageId,
+      packageReference: pkg.reference,
+      event: "portal_document_access",
+      fileId: body.fileId,
+      documentKind: body.documentKind,
+      addendumRef: body.addendumRef ?? null,
+      accessKind: body.accessKind,
+    });
+    return reply.status(201).send({
+      recorded: true,
+      fileId: body.fileId,
+      accessKind: body.accessKind,
+      at: now,
+    });
+  });
+
+  /**
+   * The access log for one package — who opened what, and who never did.
+   * `neverAccessed` is the useful half: a bidder who submitted a price
+   * without ever opening the drawings priced something else.
+   */
+  app.get(
+    "/projects/:projectId/bid-packages/:packageId/document-access",
+    { preHandler: readGate },
+    async (req) => {
+      const { packageId } = req.params as { packageId: string };
+      const pkg = await fetchPackage(app.db, packageId, req.companyId!, req.projectId!);
+      const rows = await app.db
+        .select()
+        .from(bidDocumentAccess)
+        .where(eq(bidDocumentAccess.packageId, packageId))
+        .orderBy(desc(bidDocumentAccess.accessedAt))
+        .limit(1000);
+      const invites = await app.db
+        .select()
+        .from(bidInvitations)
+        .where(eq(bidInvitations.packageId, packageId));
+      const vendorIds = [...new Set(invites.map((i) => i.vendorId))];
+      const vendorRows = vendorIds.length
+        ? await app.db
+            .select({ id: vendors.id, name: vendors.name })
+            .from(vendors)
+            .where(inArray(vendors.id, vendorIds))
+        : [];
+      const names = new Map(vendorRows.map((v) => [v.id, v.name] as const));
+      const files = [
+        ...((pkg.documentFileIds as string[]) ?? []).map((fileId) => ({
+          fileId,
+          documentKind: "tender_document" as const,
+          addendumRef: null as string | null,
+        })),
+        ...addendaOf(pkg).flatMap((a) =>
+          (a.fileIds ?? []).map((fileId) => ({
+            fileId,
+            documentKind: "addendum" as const,
+            addendumRef: a.reference,
+          })),
+        ),
+      ];
+      return {
+        items: rows.map((r) => ({ ...r, vendorName: names.get(r.vendorId ?? "") ?? null })),
+        total: rows.length,
+        files,
+        byVendor: invites.map((inv) => {
+          const mine = rows.filter((r) => r.vendorId === inv.vendorId);
+          const opened = new Set(mine.map((r) => r.fileId));
+          return {
+            vendorId: inv.vendorId,
+            vendorName: names.get(inv.vendorId) ?? null,
+            invitationId: inv.id,
+            status: inv.status,
+            accesses: mine.length,
+            filesOpened: opened.size,
+            filesIssued: files.length,
+            neverAccessed: files.filter((f) => !opened.has(f.fileId)).map((f) => f.fileId),
+            firstAccessAt: mine.length ? (mine[mine.length - 1]?.accessedAt ?? null) : null,
+            lastAccessAt: mine.length ? (mine[0]?.accessedAt ?? null) : null,
+          };
+        }),
+        note:
+          "A bidder who priced a package without ever opening its drawings priced something " +
+          "else. The log records what each bidder's portal reported fetching; where a bidder " +
+          "received the documents by another route, that route is not in here and the gap is " +
+          "not evidence on its own.",
+      };
+    },
+  );
 };

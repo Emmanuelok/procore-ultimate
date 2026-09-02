@@ -687,6 +687,16 @@ describe("open-book verification, disallowed cost and audit rights (#1063–#106
     expect(partial.json().totals.verified).toBe(550_000);
     expect(partial.json().totals.disallowed).toBe(100_000);
 
+    // a disallowing verdict with no ground is refused: it would put an amount
+    // on the register citing nothing (#1066)
+    const groundless = await post(
+      `/projects/${projectA}/portfolio/verifications/${verificationId}/items/${byComponent("subcontractors").id}/verdict`,
+      { verdict: "disallowed" },
+      admin2Headers,
+    );
+    expect(groundless.statusCode).toBe(400);
+    expect(groundless.json().message).toMatch(/ground it rests on/i);
+
     const subs = byComponent("subcontractors");
     const queried = await post(
       `/projects/${projectA}/portfolio/verifications/${verificationId}/items/${subs.id}/verdict`,

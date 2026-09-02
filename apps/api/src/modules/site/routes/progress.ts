@@ -97,6 +97,9 @@ export const progressRoutes: FastifyPluginAsync = async (app) => {
         claimantId: idSchema,
         claimantKind: z.enum(["user", "entity", "vendor"]).default("user"),
         claimantVendorId: idSchema.nullish(),
+        /** the observer's employer, when the observation was not made by the
+         *  client's own staff — it lowers the independence of the evidence */
+        observerVendorId: idSchema.nullish(),
         claimedAt: isoTimestampSchema.nullish(),
         scanId: idSchema.nullish(),
         droneFlightId: idSchema.nullish(),
@@ -108,15 +111,16 @@ export const progressRoutes: FastifyPluginAsync = async (app) => {
 
     if (body.locationId) await assertLocation(app.db, projectId, body.locationId);
     if (body.scheduleTaskId) await assertTask(app.db, projectId, body.scheduleTaskId);
-    if (body.claimantVendorId) {
+    for (const vendorId of [body.claimantVendorId, body.observerVendorId]) {
+      if (!vendorId) continue;
       const vendor = (
         await app.db
           .select({ id: vendors.id })
           .from(vendors)
-          .where(and(eq(vendors.id, body.claimantVendorId), eq(vendors.companyId, companyId)))
+          .where(and(eq(vendors.id, vendorId), eq(vendors.companyId, companyId)))
           .limit(1)
       )[0];
-      if (!vendor) throw badRequest(`Vendor ${body.claimantVendorId} not found in this company.`);
+      if (!vendor) throw badRequest(`Vendor ${vendorId} not found in this company.`);
     }
 
     let assessment;
@@ -128,7 +132,7 @@ export const progressRoutes: FastifyPluginAsync = async (app) => {
         claimantId: body.claimantId,
         observerId: req.user!.id,
         claimantVendorId: body.claimantVendorId ?? null,
-        observerVendorId: null,
+        observerVendorId: body.observerVendorId ?? null,
         attachmentCount: body.fileIds.length,
         hasCaptureRecord: Boolean(body.scanId || body.droneFlightId),
         ...(body.tolerancePercent === undefined ? {} : { tolerancePercent: body.tolerancePercent }),
@@ -143,7 +147,7 @@ export const progressRoutes: FastifyPluginAsync = async (app) => {
       app.db,
       companyId,
       projectId,
-      { userId: req.user!.id, vendorId: null },
+      { userId: req.user!.id, vendorId: body.observerVendorId ?? null },
       {
         zoneName: body.zoneName,
         locationId: body.locationId ?? null,

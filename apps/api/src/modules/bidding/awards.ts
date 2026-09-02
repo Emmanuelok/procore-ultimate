@@ -1,18 +1,22 @@
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
-import { and, asc, desc, eq, ne } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, ne, or } from "drizzle-orm";
 import { z } from "zod";
 import {
+  awardDelegations,
   bidAwards,
   bidPackages,
   bidSubmissions,
+  budgetLineItems,
   commitments,
   vendors,
 } from "@constructos/db";
 import { newId } from "../../lib/ids.js";
+import { appendLedger } from "../../lib/ledger.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
-import { badRequest, conflict } from "../../lib/errors.js";
+import { AppError, badRequest, conflict } from "../../lib/errors.js";
 import { epochMs } from "../../lib/time.js";
 import type { Db } from "../../lib/db.js";
+import { AWARD_DELEGATION_SUBJECTS } from "@constructos/shared";
 import { commitmentReference } from "../commitments/shared.js";
 import { insertSovLine, sovContext, type SovLineInput } from "../commitments/sov.js";
 import { budgetLineIdsFor, recomputeCommitmentTotals, syncBudgetCommitted } from "../commitments/rollups.js";
@@ -35,6 +39,13 @@ import {
   type BidSubmissionRow,
 } from "./shared.js";
 import { assertLateBidUsable, assertUnsealedForAnalysis } from "./sealing.js";
+import { detectApprovalBehaviour } from "./integrity.js";
+import {
+  INTEGRITY_ACKNOWLEDGEMENT_KEY,
+  integritySignalsForPackage,
+  persistIntegrityFindings,
+  runPackageIntegrityAndPersist,
+} from "./integrity-service.js";
 import { effectiveLimit, evaluatePrequalGate, vendorPrequalStatus } from "./prequal-status.js";
 import { checkContractAgainstLimit } from "./financial-limits.js";
 
@@ -52,6 +63,18 @@ const recommendSchema = z.object({
   /** days between telling the losers and signing anything */
   standstillDays: z.number().int().min(0).max(90).optional(),
   approvalAuthority: z.string().max(300).nullable().optional(),
+  /**
+   * REQUIRED when open bid-integrity findings of high or critical severity
+   * bear on this package. Not a veto — a sentence saying what was checked and
+   * what the explanation was.
+   */
+  integrityAcknowledgement: justificationSchema.nullable().optional(),
+  /** partial award: the levelling rows this award covers */
+  scopeLevellingItemIds: z.array(z.string().min(1).max(64)).max(2000).optional(),
+});
+
+const withdrawSchema = z.object({
+  reason: justificationSchema,
 });
 
 const approveSchema = z.object({
@@ -159,6 +182,125 @@ export function buildAwardComparison(
 }
 
 /* ------------------------------------------------------------------ */
+/* Delegated authority (Domain A #41)                                  */
+/* ------------------------------------------------------------------ */
+
+export interface AuthorityCheck {
+  permitted: boolean;
+  /** the delegation that permitted it, in words, for the approval record */
+  authority: string | null;
+  basis: string;
+  limit: number | null;
+  currency: string | null;
+  message: string;
+}
+
+/**
+ * AN APPROVAL LIMIT IS ONLY A CONTROL IF THE PLATFORM REFUSES THE APPROVAL
+ * THAT EXCEEDS IT.
+ *
+ * Delegations are recorded per company against a named person or a company
+ * role, per currency, optionally narrowed to one project or one package
+ * kind. The rule is deliberately permissive where nothing has been recorded:
+ * a company that has not written its scheme of delegation down is not told
+ * that nobody may approve anything — it is told, on the approval record, that
+ * no limit was found. Silence is reported, never invented.
+ */
+export async function checkAwardAuthority(
+  db: Db,
+  input: {
+    companyId: string;
+    projectId: string;
+    userId: string;
+    role: string | null;
+    amount: number;
+    currency: string;
+    packageKind: string;
+  },
+  asOf: string = new Date().toISOString().slice(0, 10),
+): Promise<AuthorityCheck> {
+  const rows = await db
+    .select()
+    .from(awardDelegations)
+    .where(
+      and(
+        eq(awardDelegations.companyId, input.companyId),
+        eq(awardDelegations.isActive, 1),
+        or(
+          and(
+            eq(awardDelegations.subjectKind, "user"),
+            eq(awardDelegations.subjectId, input.userId),
+          ),
+          input.role
+            ? and(
+                eq(awardDelegations.subjectKind, "company_role"),
+                eq(awardDelegations.subjectId, input.role),
+              )
+            : undefined,
+        ),
+      ),
+    );
+  const applicable = rows.filter(
+    (d) =>
+      d.currency.toUpperCase() === input.currency.toUpperCase() &&
+      (d.projectId === null || d.projectId === input.projectId) &&
+      (d.packageKind === null || d.packageKind === input.packageKind) &&
+      (d.validFrom === null || d.validFrom <= asOf) &&
+      (d.validTo === null || d.validTo >= asOf),
+  );
+  if (applicable.length === 0) {
+    const wrongCurrency = rows.filter(
+      (d) => d.currency.toUpperCase() !== input.currency.toUpperCase(),
+    );
+    return {
+      permitted: true,
+      authority: null,
+      limit: null,
+      currency: null,
+      basis:
+        "No delegated award authority is recorded for this approver" +
+        (wrongCurrency.length > 0
+          ? ` in ${input.currency} (their limits are stated in ` +
+            `${[...new Set(wrongCurrency.map((d) => d.currency))].join(", ")}, and limits in ` +
+            "different currencies are never converted here)"
+          : "") +
+        ". The approval proceeds and this absence is recorded on it: a scheme of delegation " +
+        "the platform does not hold cannot be enforced by the platform, and pretending " +
+        "otherwise would be worse than saying so.",
+      message: "No delegated authority limit is on record for this approver.",
+    };
+  }
+  const best = applicable.reduce((a, b) => (b.maxAwardAmount > a.maxAwardAmount ? b : a));
+  if (input.amount > best.maxAwardAmount) {
+    return {
+      permitted: false,
+      authority: best.label ?? best.id,
+      limit: best.maxAwardAmount,
+      currency: best.currency,
+      basis: best.basis ?? "",
+      message:
+        `This award is ${input.currency} ${input.amount} and the delegated authority held by ` +
+        `this approver is ${best.currency} ${best.maxAwardAmount}` +
+        (best.label ? ` (${best.label})` : "") +
+        ". Approving above your own limit is the control failure a scheme of delegation exists " +
+        "to prevent, and it is the finding an auditor writes up first. Route it to somebody " +
+        "who holds the authority, or record a higher delegation with the basis for it.",
+    };
+  }
+  return {
+    permitted: true,
+    authority: best.label ?? `Delegation ${best.id}`,
+    limit: best.maxAwardAmount,
+    currency: best.currency,
+    basis:
+      best.basis ??
+      `Within the delegated authority of ${best.currency} ${best.maxAwardAmount} held by this ` +
+        "approver.",
+    message: `Within a delegated authority of ${best.currency} ${best.maxAwardAmount}.`,
+  };
+}
+
+/* ------------------------------------------------------------------ */
 /* Routes                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -239,9 +381,33 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
           award.approvedBy && award.recommendedBy && award.approvedBy !== award.recommendedBy,
         ),
         isLowestBid: award.isLowestBid === 1,
+        /** the AS-BID contract sum — what the commitment will be raised for */
+        asBidContractSum: award.awardAmount,
+        /** the figure the comparison was actually made on */
+        recommendedComparableAmount:
+          award.recommendedComparableAmount ??
+          ((award.detail as Record<string, unknown>)["recommendedComparableAmount"] as
+            | number
+            | undefined) ??
+          null,
         lowestBidAmount: award.lowestBidAmount,
+        comparableAmountsNote:
+          (award.comparisonBasis ??
+            (award.detail as Record<string, unknown>)["comparisonBasis"]) === "levelled"
+            ? "The recommended and lowest amounts below are LEVELLED figures. The award amount " +
+              "is the as-bid contract sum, which is a different number and is what the " +
+              "commitment is raised for."
+            : "This package was not levelled, so the compared amounts are as-bid totals — the " +
+              "cheapest of which frequently belongs to whoever read the scope least carefully.",
         notLowestJustification: award.notLowestJustification,
-        comparisonBasis: (award.detail as Record<string, unknown>)["comparisonBasis"] ?? null,
+        comparisonBasis:
+          award.comparisonBasis ??
+          (award.detail as Record<string, unknown>)["comparisonBasis"] ??
+          null,
+        integrityAcknowledgement:
+          (award.detail as Record<string, unknown>)[INTEGRITY_ACKNOWLEDGEMENT_KEY] ?? null,
+        approvalAuthorityBasis:
+          (award.detail as Record<string, unknown>)["approvalAuthorityBasis"] ?? null,
         recommendationBasis: award.recommendationBasis,
         savingAgainstEstimate: award.savingAgainstEstimate,
         engineersEstimate: pkg.engineersEstimate,
@@ -344,6 +510,42 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
         );
       }
 
+      /*
+       * THE INTEGRITY FINDINGS ARE PUT IN FRONT OF THE RECOMMENDER.
+       *
+       * Detectors that nobody reads are decoration. The run happens here, at
+       * the moment somebody is about to choose a winner, and an open finding
+       * of high or critical severity must be ACKNOWLEDGED in writing before
+       * the recommendation is accepted — the same discipline as the
+       * not-lowest justification, and for the same reason: the control that
+       * makes somebody write a sentence is the one that leaves a record.
+       */
+      await runPackageIntegrityAndPersist(app.db, pkg, req.user!.id);
+      const integritySignals = await integritySignalsForPackage(app.db, companyId, packageId);
+      const blocking = integritySignals.filter(
+        (sig) =>
+          (sig.severity === "critical" || sig.severity === "high") &&
+          sig.disposition !== "dismissed" &&
+          sig.disposition !== "closed" &&
+          sig.closedAt === null,
+      );
+      if (blocking.length > 0 && !body.integrityAcknowledgement) {
+        throw badRequest(
+          `${blocking.length} open bid-integrity finding(s) bear on ${pkg.reference} and must be ` +
+            "acknowledged before a bidder is recommended: " +
+            blocking.map((sig) => `${sig.detector} — ${sig.title}`).join("; ") +
+            ". A finding is a question rather than an accusation, and the ordinary answer is an " +
+            "innocent explanation — but the explanation has to exist somewhere, and afterwards " +
+            "is too late. Supply integrityAcknowledgement saying what was checked and what was " +
+            "found.",
+          {
+            control: "integrity_findings_require_acknowledgement",
+            signalIds: blocking.map((sig) => sig.id),
+            detectors: blocking.map((sig) => sig.detector),
+          },
+        );
+      }
+
       // The prequalification gate at award — refuse or warn per the package's
       // configured strictness, and either way name the lapse.
       const prequal = await vendorPrequalStatus(app.db, companyId, chosen.vendorId);
@@ -394,6 +596,17 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
         notLowestJustification: isLowest ? null : (body.notLowestJustification ?? null),
         // recorded whether or not we took it — this is the auditor's anchor
         lowestBidAmount: comparison.lowest.comparableAmount,
+        /*
+         * `awardAmount` is the AS-BID contract sum; `lowestBidAmount` is the
+         * LEVELLED figure wherever the package was levelled. Showing them side
+         * by side as if they were comparable let a levelled-lowest bid display
+         * a recommended amount above the "lowest bid amount" while asserting
+         * that it was the lowest. The comparable figure is now a column of its
+         * own, and the basis both are on is stated next to them.
+         */
+        recommendedComparableAmount: chosenCandidate.comparableAmount,
+        comparisonBasis: comparison.basis,
+        scopeLevellingItemIds: body.scopeLevellingItemIds ?? [],
         savingAgainstEstimate: saving,
         recommendedBy: req.user!.id,
         recommendedAt: now,
@@ -402,8 +615,9 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
         detail: {
           comparisonBasis: comparison.basis,
           comparisonBasisNote: comparison.basisNote,
-          recommendedComparableAmount: chosenCandidate.comparableAmount,
           lowestBidSubmissionId: comparison.lowest.submissionId,
+          [INTEGRITY_ACKNOWLEDGEMENT_KEY]: body.integrityAcknowledgement ?? null,
+          integritySignalIds: blocking.map((sig) => sig.id),
           lowestBidVendorId: comparison.lowest.vendorId,
           standstillDays: body.standstillDays ?? 0,
           prequalificationAtRecommendation: prequal.state,
@@ -522,65 +736,61 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
     const projectId = award.projectId;
     const now = new Date().toISOString();
 
-    /* ---- the commitment ---- */
-    const kind = pkg.packageKind === "supply_only" ? "purchase_order" : "subcontract";
-    const commitmentNumber = await nextRecordNumber(app.db, projectId, "commitment");
-    const commitmentRef = commitmentReference(kind, commitmentNumber);
-    const commitmentId = newId("cmt");
-    await app.db.insert(commitments).values({
-      id: commitmentId,
+    /* ---- delegated authority: the approver's own limit ---- */
+    const authority = await checkAwardAuthority(app.db, {
       companyId,
       projectId,
-      kind,
-      number: commitmentNumber,
-      reference: commitmentRef,
-      title: pkg.title,
-      description: `Awarded from bid package ${pkg.reference} (award ${award.reference}).`,
-      scopeOfWork: award.scopeSummary ?? pkg.scopeDescription ?? null,
-      vendorId: award.vendorId,
-      pricingType: "lump_sum",
-      status: "draft",
+      userId: req.user!.id,
+      role: req.companyRole ?? null,
+      amount: award.awardAmount,
       currency: award.currency,
-      defaultRetainagePercent: submission.retentionPercent ?? pkg.retentionPercent ?? 0,
-      contractDate: body.contractDate ?? null,
-      startDate: body.startDate ?? submission.proposedStartDate ?? null,
-      estimatedCompletionDate:
-        body.estimatedCompletionDate ?? submission.proposedCompletionDate ?? null,
-      paymentTermsDays: submission.paymentTermsDays ?? pkg.paymentTermsDays ?? null,
-      inclusions: submission.assumptions ?? null,
-      exclusions: submission.exclusions ?? null,
-      detail: {
-        sourceBidPackageId: pkg.id,
-        sourceBidPackageReference: pkg.reference,
-        sourceBidAwardId: award.id,
-        sourceBidAwardReference: award.reference,
-        sourceBidSubmissionId: submission.id,
-        bidQualifications: submission.qualifications ?? null,
-      },
-      createdBy: req.user!.id,
+      packageKind: pkg.packageKind,
     });
-
-    const budgetLineItemId =
-      body.budgetLineItemId ?? ((pkg.budgetLineItemIds as string[])[0] ?? null);
-    const ctx = await sovContext(app.db, companyId, projectId, {
-      id: commitmentId,
-      kind,
-      defaultRetainagePercent: submission.retentionPercent ?? pkg.retentionPercent ?? 0,
-    });
-    const sovLine: SovLineInput = {
-      description: award.scopeSummary ?? pkg.title,
-      scheduledValue: award.awardAmount,
-      billingMethod: "percent_complete",
-      budgetLineItemId,
-    };
-    await insertSovLine(ctx, sovLine);
-    await recomputeCommitmentTotals(app.db, commitmentId);
-    const budgetLines = await budgetLineIdsFor(app.db, commitmentId);
-    if (budgetLines.length > 0) {
-      await syncBudgetCommitted(app.db, companyId, projectId, budgetLines);
+    if (!authority.permitted) {
+      throw new AppError(403, authority.message, {
+        control: "delegated_authority",
+        limit: authority.limit,
+        currency: authority.currency,
+        awardAmount: award.awardAmount,
+      });
     }
 
-    /* ---- the award ---- */
+    /*
+     * THE BUDGET LINE IS RESOLVED AND CHECKED BEFORE ANYTHING IS WRITTEN.
+     *
+     * `insertSovLine` throws when the budget line is not on this project, and
+     * it used to throw AFTER the commitment row had been inserted — leaving a
+     * draft commitment with no schedule of values, an award still at
+     * "recommended", a package not marked awarded, and a retry that created a
+     * second commitment. `bid_packages.budgetLineItemIds` accepts arbitrary
+     * strings, so this was reachable from ordinary data entry.
+     */
+    const budgetLineItemId =
+      body.budgetLineItemId ?? ((pkg.budgetLineItemIds as string[])[0] ?? null);
+    if (budgetLineItemId) {
+      const [line] = await app.db
+        .select({ id: budgetLineItems.id })
+        .from(budgetLineItems)
+        .where(
+          and(
+            eq(budgetLineItems.id, budgetLineItemId),
+            eq(budgetLineItems.companyId, companyId),
+            eq(budgetLineItems.projectId, projectId),
+          ),
+        )
+        .limit(1);
+      if (!line) {
+        throw badRequest(
+          `Budget line ${budgetLineItemId} is not a budget line on this project, so the ` +
+            "committed cost has nowhere to land. Correct the package's budgetLineItemIds (or " +
+            "pass budgetLineItemId on this approval) before approving: an award that cannot be " +
+            "charged anywhere is an award nobody has funded.",
+          { control: "budget_line_not_on_project", budgetLineItemId },
+        );
+      }
+    }
+
+    const kind = pkg.packageKind === "supply_only" ? "purchase_order" : "subcontract";
     const standstillDays =
       body.standstillDays ??
       ((award.detail as Record<string, unknown>)["standstillDays"] as number | undefined) ??
@@ -590,54 +800,172 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
         ? new Date(Date.now() + standstillDays * 86_400_000).toISOString()
         : null;
 
-    await app.db
-      .update(bidAwards)
-      .set({
-        status: "approved",
-        approvedBy: req.user!.id,
-        approvedAt: now,
-        approvalAuthority: body.approvalAuthority ?? award.approvalAuthority,
-        approvalReference: body.approvalReference ?? null,
-        commitmentId,
-        standstillEndsAt,
-        detail: {
-          ...(award.detail as Record<string, unknown>),
-          approvalNote: body.note ?? null,
-          prequalificationAtApproval: prequal.state,
-          prequalificationFlagAtApproval: gate.message,
-          commitmentReference: commitmentRef,
-        },
-        updatedAt: now,
-      })
-      .where(eq(bidAwards.id, award.id));
+    /*
+     * ONE TRANSACTION, AND THE STATUS CHECK IS IN THE STATEMENT.
+     *
+     * Approval creates a commitment, a schedule-of-values line, two rollups,
+     * an award update, a package update and a status change on every other
+     * bid. Done outside a transaction, a failure anywhere after the first
+     * insert left an orphan commitment and an award that still looked
+     * approvable — and two concurrent approvals both passed the read-then-
+     * check and each created a commitment, double-committing the budget. The
+     * conditional UPDATE is the lock: exactly one request can move the award
+     * out of "recommended".
+     */
+    const commitmentId = newId("cmt");
+    let commitmentRef = "";
+    await app.db.transaction(async (tx) => {
+      const db = tx as unknown as Db;
+      const claimed = await db
+        .update(bidAwards)
+        .set({
+          status: "approved",
+          approvedBy: req.user!.id,
+          approvedAt: now,
+          approvalAuthority:
+            body.approvalAuthority ?? authority.authority ?? award.approvalAuthority,
+          approvalReference: body.approvalReference ?? null,
+          commitmentId,
+          standstillEndsAt,
+          detail: {
+            ...(award.detail as Record<string, unknown>),
+            approvalNote: body.note ?? null,
+            prequalificationAtApproval: prequal.state,
+            prequalificationFlagAtApproval: gate.message,
+            approvalAuthorityBasis: authority.basis,
+          },
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(bidAwards.id, award.id),
+            inArray(bidAwards.status, ["recommended", "pending_approval"]),
+            isNull(bidAwards.approvedBy),
+          ),
+        )
+        .returning({ id: bidAwards.id });
+      if (claimed.length === 0) {
+        throw conflict(
+          `${award.reference} was approved by another request while this one was in flight. ` +
+            "One approval creates one commitment; a second would double-commit the budget.",
+        );
+      }
 
-    /* ---- the package and the bidders ---- */
-    await app.db
-      .update(bidPackages)
-      .set({
-        status: "awarded",
-        awardedSubmissionId: award.submissionId,
-        awardedVendorId: award.vendorId,
-        awardedAmount: award.awardAmount,
-        awardedAt: now,
-        updatedAt: now,
-      })
-      .where(eq(bidPackages.id, pkg.id));
-    await app.db
-      .update(bidSubmissions)
-      .set({ status: "awarded", updatedAt: now })
-      .where(eq(bidSubmissions.id, award.submissionId));
-    const others = await app.db
-      .select()
-      .from(bidSubmissions)
-      .where(eq(bidSubmissions.packageId, pkg.id));
-    for (const other of others) {
-      if (other.id === award.submissionId) continue;
-      if (!isInContention(other.status)) continue;
-      await app.db
+      const commitmentNumber = await nextRecordNumber(db, projectId, "commitment");
+      commitmentRef = commitmentReference(kind, commitmentNumber);
+      await db.insert(commitments).values({
+        id: commitmentId,
+        companyId,
+        projectId,
+        kind,
+        number: commitmentNumber,
+        reference: commitmentRef,
+        title: pkg.title,
+        description: `Awarded from bid package ${pkg.reference} (award ${award.reference}).`,
+        scopeOfWork: award.scopeSummary ?? pkg.scopeDescription ?? null,
+        vendorId: award.vendorId,
+        pricingType: "lump_sum",
+        status: "draft",
+        currency: award.currency,
+        defaultRetainagePercent: submission.retentionPercent ?? pkg.retentionPercent ?? 0,
+        contractDate: body.contractDate ?? null,
+        startDate: body.startDate ?? submission.proposedStartDate ?? null,
+        estimatedCompletionDate:
+          body.estimatedCompletionDate ?? submission.proposedCompletionDate ?? null,
+        paymentTermsDays: submission.paymentTermsDays ?? pkg.paymentTermsDays ?? null,
+        inclusions: submission.assumptions ?? null,
+        exclusions: submission.exclusions ?? null,
+        detail: {
+          sourceBidPackageId: pkg.id,
+          sourceBidPackageReference: pkg.reference,
+          sourceBidAwardId: award.id,
+          sourceBidAwardReference: award.reference,
+          sourceBidSubmissionId: submission.id,
+          bidQualifications: submission.qualifications ?? null,
+        },
+        createdBy: req.user!.id,
+      });
+
+      const ctx = await sovContext(db, companyId, projectId, {
+        id: commitmentId,
+        kind,
+        defaultRetainagePercent: submission.retentionPercent ?? pkg.retentionPercent ?? 0,
+      });
+      const sovLine: SovLineInput = {
+        description: award.scopeSummary ?? pkg.title,
+        scheduledValue: award.awardAmount,
+        billingMethod: "percent_complete",
+        budgetLineItemId,
+      };
+      await insertSovLine(ctx, sovLine);
+      await recomputeCommitmentTotals(db, commitmentId);
+      const budgetLines = await budgetLineIdsFor(db, commitmentId);
+      if (budgetLines.length > 0) {
+        await syncBudgetCommitted(db, companyId, projectId, budgetLines);
+      }
+      await db
+        .update(bidAwards)
+        .set({
+          detail: {
+            ...(award.detail as Record<string, unknown>),
+            approvalNote: body.note ?? null,
+            prequalificationAtApproval: prequal.state,
+            prequalificationFlagAtApproval: gate.message,
+            approvalAuthorityBasis: authority.basis,
+            commitmentReference: commitmentRef,
+          },
+        })
+        .where(eq(bidAwards.id, award.id));
+
+      /* ---- the package and the bidders ---- */
+      await db
+        .update(bidPackages)
+        .set({
+          status: "awarded",
+          awardedSubmissionId: award.submissionId,
+          awardedVendorId: award.vendorId,
+          awardedAmount: award.awardAmount,
+          awardedAt: now,
+          updatedAt: now,
+        })
+        .where(eq(bidPackages.id, pkg.id));
+      await db
         .update(bidSubmissions)
-        .set({ status: "unsuccessful", updatedAt: now })
-        .where(eq(bidSubmissions.id, other.id));
+        .set({ status: "awarded", updatedAt: now })
+        .where(eq(bidSubmissions.id, award.submissionId));
+      const others = await db
+        .select()
+        .from(bidSubmissions)
+        .where(eq(bidSubmissions.packageId, pkg.id));
+      for (const other of others) {
+        if (other.id === award.submissionId) continue;
+        if (!isInContention(other.status)) continue;
+        await db
+          .update(bidSubmissions)
+          .set({ status: "unsuccessful", updatedAt: now })
+          .where(eq(bidSubmissions.id, other.id));
+      }
+    });
+
+    /*
+     * Approval behaviour is examined AFTER the money is safely committed: a
+     * detector must never be able to fail an award. Velocity and out-of-hours
+     * findings are signals for somebody to look at, not gates.
+     */
+    const behaviour = detectApprovalBehaviour({
+      awardId: award.id,
+      reference: award.reference,
+      packageId: pkg.id,
+      projectId,
+      vendorId: award.vendorId,
+      awardAmount: award.awardAmount,
+      currency: award.currency,
+      recommendedAt: award.recommendedAt,
+      approvedAt: now,
+      approvedBy: req.user!.id,
+    });
+    if (behaviour.length > 0) {
+      await persistIntegrityFindings(app.db, companyId, projectId, req.user!.id, behaviour);
     }
 
     await ledger(
@@ -932,6 +1260,291 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
     }, award.projectId, true);
     return awardDetail(app.db, await fetchAward(app.db, award.id, req.companyId!));
   });
+
+  /* ---------------------------------------------------------------- */
+  /* Unwinding an award                                                */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * WITHDRAWING AN APPROVED AWARD.
+   *
+   * Awards get unwound: the winner goes into administration, the funding
+   * falls through, the challenge succeeds. The unwind has to put the package
+   * back into a state that can be recommended again WITHOUT pretending the
+   * first decision never happened — so the commitment is voided rather than
+   * deleted, the losing bids are restored to contention, and the whole thing
+   * is one transaction with a written reason. The person unwinding may not be
+   * the person who approved: an approver who can quietly reverse their own
+   * award has no approval control at all.
+   */
+  app.post("/bid-awards/:awardId/withdraw", { preHandler: companyGate }, async (req, reply) => {
+    const body = withdrawSchema.parse(req.body);
+    const { award, pkg } = await awardContext(req);
+    await requireBiddingLevel(app, req, reply, award.projectId, "standard");
+    if (!["approved", "letter_of_intent", "recommended", "pending_approval"].includes(award.status)) {
+      throw conflict(
+        `An award at status "${award.status}" cannot be withdrawn. A contract that has been ` +
+          "issued or executed is unwound through the commitment and the contract, not by " +
+          "editing the procurement record that preceded them.",
+      );
+    }
+    assertSegregation(req.user!.id, { recommendedBy: award.recommendedBy }, "award");
+    const now = new Date().toISOString();
+    const restored: string[] = [];
+    await app.db.transaction(async (tx) => {
+      const db = tx as unknown as Db;
+      const claimed = await db
+        .update(bidAwards)
+        .set({
+          status: "withdrawn",
+          withdrawnAt: now,
+          withdrawnBy: req.user!.id,
+          withdrawnReason: body.reason,
+          updatedAt: now,
+        })
+        .where(and(eq(bidAwards.id, award.id), eq(bidAwards.status, award.status)))
+        .returning({ id: bidAwards.id });
+      if (claimed.length === 0) {
+        throw conflict("This award changed status while the withdrawal was in flight.");
+      }
+      if (award.commitmentId) {
+        await db
+          .update(commitments)
+          .set({
+            status: "void",
+            updatedAt: now,
+            detail: {
+              sourceBidAwardId: award.id,
+              voidedBecause: `Bid award ${award.reference} was withdrawn: ${body.reason}`,
+              voidedAt: now,
+            },
+          })
+          .where(
+            and(
+              eq(commitments.id, award.commitmentId),
+              eq(commitments.companyId, award.companyId),
+              eq(commitments.status, "draft"),
+            ),
+          );
+      }
+      // Every bid the award knocked out comes back into contention: the
+      // package is live again and they are entitled to be considered.
+      const subs = await db
+        .select()
+        .from(bidSubmissions)
+        .where(eq(bidSubmissions.packageId, award.packageId));
+      for (const sub of subs) {
+        if (sub.status !== "unsuccessful" && sub.status !== "awarded") continue;
+        if (sub.supersededById) continue;
+        await db
+          .update(bidSubmissions)
+          .set({ status: "under_review", updatedAt: now })
+          .where(eq(bidSubmissions.id, sub.id));
+        restored.push(sub.id);
+      }
+      await db
+        .update(bidPackages)
+        .set({
+          status: "under_evaluation",
+          awardedSubmissionId: null,
+          awardedVendorId: null,
+          awardedAmount: null,
+          awardedAt: null,
+          updatedAt: now,
+        })
+        .where(eq(bidPackages.id, award.packageId));
+    });
+
+    await ledger(
+      app.db,
+      req,
+      "state_change",
+      "bid_award",
+      award.id,
+      {
+        projectId: award.projectId,
+        packageId: award.packageId,
+        packageReference: pkg.reference,
+        to: "withdrawn",
+        from: award.status,
+        reason: body.reason,
+        withdrawnBy: req.user!.id,
+        approvedBy: award.approvedBy,
+        commitmentId: award.commitmentId,
+        commitmentVoided: Boolean(award.commitmentId),
+        restoredSubmissionIds: restored,
+        awardAmount: award.awardAmount,
+        currency: award.currency,
+      },
+      award.projectId,
+      true,
+    );
+    return {
+      ...(await awardDetail(app.db, await fetchAward(app.db, award.id, req.companyId!))),
+      restored: restored.length,
+      note:
+        `${award.reference} is withdrawn. ` +
+        (award.commitmentId
+          ? `Commitment ${award.commitmentId} was voided — a draft commitment raised for an ` +
+            "award that no longer exists would otherwise sit in the budget as committed cost " +
+            "against nothing. "
+          : "") +
+        `${restored.length} bid(s) are back in contention and ${pkg.reference} can be ` +
+        "recommended again. The withdrawn award stays on the record with its reason: the " +
+        "history of a procurement includes the decisions that were reversed.",
+    };
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Delegated award authority (Domain A #41)                          */
+  /* ---------------------------------------------------------------- */
+
+  app.get(
+    "/companies/current/award-delegations",
+    { preHandler: [app.authenticate, app.requireCompany] },
+    async (req) => {
+      const rows = await app.db
+        .select()
+        .from(awardDelegations)
+        .where(eq(awardDelegations.companyId, req.companyId!))
+        .orderBy(desc(awardDelegations.maxAwardAmount));
+      return {
+        items: rows.map((r) => ({ ...r, isActive: r.isActive === 1 })),
+        total: rows.length,
+        note:
+          rows.length === 0
+            ? "No scheme of delegation is recorded. Awards are approved by anyone who is not " +
+              "the recommender, and the absence of a limit is stated on each approval rather " +
+              "than a limit being invented. Recording the scheme here makes it enforceable."
+            : "An approval above the approver's own limit is refused, and the limit that " +
+              "permitted an approval is written onto the award.",
+      };
+    },
+  );
+
+  app.post(
+    "/companies/current/award-delegations",
+    {
+      preHandler: [
+        app.authenticate,
+        app.requireCompany,
+        app.requireCompanyRole(["owner", "admin"]),
+      ],
+    },
+    async (req, reply) => {
+      const body = z
+        .object({
+          subjectKind: z.enum(AWARD_DELEGATION_SUBJECTS).default("user"),
+          subjectId: z.string().min(1).max(64),
+          label: z.string().max(200).nullable().optional(),
+          maxAwardAmount: z.number().finite().min(0),
+          currency: z.string().min(3).max(8).transform((c) => c.toUpperCase()),
+          projectId: z.string().min(1).max(64).nullable().optional(),
+          packageKind: z.string().max(60).nullable().optional(),
+          validFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
+          validTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
+          basis: z.string().max(4000).nullable().optional(),
+        })
+        .parse(req.body);
+      const id = newId("awd");
+      await app.db.insert(awardDelegations).values({
+        id,
+        companyId: req.companyId!,
+        subjectKind: body.subjectKind,
+        subjectId: body.subjectId,
+        label: body.label ?? null,
+        maxAwardAmount: body.maxAwardAmount,
+        currency: body.currency,
+        projectId: body.projectId ?? null,
+        packageKind: body.packageKind ?? null,
+        validFrom: body.validFrom ?? null,
+        validTo: body.validTo ?? null,
+        basis: body.basis ?? null,
+        createdBy: req.user!.id,
+      });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "award_delegation",
+        objectId: id,
+        payload: {
+          subjectKind: body.subjectKind,
+          subjectId: body.subjectId,
+          maxAwardAmount: body.maxAwardAmount,
+          currency: body.currency,
+          projectId: body.projectId ?? null,
+        },
+        storePayload: true,
+      });
+      const [created] = await app.db
+        .select()
+        .from(awardDelegations)
+        .where(eq(awardDelegations.id, id))
+        .limit(1);
+      return reply.status(201).send(created);
+    },
+  );
+
+  app.patch(
+    "/companies/current/award-delegations/:delegationId",
+    {
+      preHandler: [
+        app.authenticate,
+        app.requireCompany,
+        app.requireCompanyRole(["owner", "admin"]),
+      ],
+    },
+    async (req) => {
+      const { delegationId } = req.params as { delegationId: string };
+      const body = z
+        .object({
+          maxAwardAmount: z.number().finite().min(0).optional(),
+          isActive: z.boolean().optional(),
+          validTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
+          basis: z.string().max(4000).nullable().optional(),
+          label: z.string().max(200).nullable().optional(),
+        })
+        .parse(req.body);
+      const [existing] = await app.db
+        .select()
+        .from(awardDelegations)
+        .where(
+          and(
+            eq(awardDelegations.id, delegationId),
+            eq(awardDelegations.companyId, req.companyId!),
+          ),
+        )
+        .limit(1);
+      if (!existing) throw badRequest("That delegation is not in this company.");
+      await app.db
+        .update(awardDelegations)
+        .set({
+          ...(body.maxAwardAmount !== undefined ? { maxAwardAmount: body.maxAwardAmount } : {}),
+          ...(body.isActive !== undefined ? { isActive: body.isActive ? 1 : 0 } : {}),
+          ...(body.validTo !== undefined ? { validTo: body.validTo } : {}),
+          ...(body.basis !== undefined ? { basis: body.basis } : {}),
+          ...(body.label !== undefined ? { label: body.label } : {}),
+          updatedAt: new Date().toISOString(),
+        })
+        .where(eq(awardDelegations.id, delegationId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "award_delegation",
+        objectId: delegationId,
+        payload: { changed: Object.keys(body), previous: existing.maxAwardAmount },
+        storePayload: true,
+      });
+      const [updated] = await app.db
+        .select()
+        .from(awardDelegations)
+        .where(eq(awardDelegations.id, delegationId))
+        .limit(1);
+      return updated;
+    },
+  );
 
   app.post("/bid-awards/:awardId/debrief", { preHandler: companyGate }, async (req, reply) => {
     const { award } = await awardContext(req);

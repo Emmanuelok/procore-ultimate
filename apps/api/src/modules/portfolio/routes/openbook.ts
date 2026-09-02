@@ -642,6 +642,18 @@ export const openBookRoutes: FastifyPluginAsync = async (app) => {
         );
       }
 
+      /* #1066: a disallowance needs a ground. Recording a disallowing verdict
+         without one would put an amount on the register that cites nothing,
+         which is an opinion and will not survive adjudication. */
+      if (
+        (body.verdict === "disallowed" || body.verdict === "partially_disallowed") &&
+        !body.disallowance
+      ) {
+        throw badRequest(
+          "A disallowing verdict must state the ground it rests on. Send a `disallowance` with its category (and the contract clause where there is one); a disallowance with no ground is an opinion.",
+        );
+      }
+
       let verifiedAmount = 0;
       if (body.verdict === "verified") {
         verifiedAmount = body.verifiedAmount ?? item.claimedAmount;

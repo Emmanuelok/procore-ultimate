@@ -275,6 +275,92 @@ export default function WebhooksTab({
     }
   }
 
+  /* --------------------------- rotate & replay ---------------------------- */
+
+  const [rotationResult, setRotationResult] = useState<{
+    endpoint: EndpointView;
+    secret: string;
+    secretVersion: number;
+    graceUntil: string | null;
+    rotation: { note: string; headers?: Record<string, string> };
+  } | null>(null);
+  const [rotating, setRotating] = useState<string | null>(null);
+
+  /**
+   * Rotate an endpoint's signing secret with an overlap.
+   *
+   * Before this, changing a secret meant deleting the endpoint and creating
+   * another — which loses the delivery history and guarantees a gap. During the
+   * grace window every delivery carries two valid signatures, so a receiver
+   * adopts the new secret without dropping one.
+   */
+  async function onRotate(e: EndpointView) {
+    if (
+      !window.confirm(
+        `Rotate the signing secret for "${e.name}"?\n\nThe new secret is shown once. For the ` +
+          "next 24 hours every delivery carries BOTH signatures, so the receiver can switch " +
+          "without missing an event.",
+      )
+    ) {
+      return;
+    }
+    setRotating(e.id);
+    setError(null);
+    try {
+      const res = await api.post<{
+        secret: string;
+        secretVersion: number;
+        graceUntil: string | null;
+        rotation: { note: string; headers?: Record<string, string> };
+      }>(`/api/v1/integrations/webhooks/${e.id}/rotate-secret`, {});
+      setRotationResult({ endpoint: e, ...res });
+      await load();
+    } catch (err) {
+      setError(errorMessage(err, "The secret could not be rotated"));
+    } finally {
+      setRotating(null);
+    }
+  }
+
+  /**
+   * Re-derive deliveries from the ledger after an outage, or for an endpoint
+   * added to a platform that has been running for months.
+   */
+  async function onReplay(e: EndpointView) {
+    const raw = window.prompt(
+      `Replay events to "${e.name}" from which ledger sequence?\n\n` +
+        "Every entry from that sequence forward that this endpoint subscribes to is re-queued " +
+        "as a NEW delivery. A receiver that dedupes on x-constructos-delivery will process each " +
+        "event once per replay.",
+      "1",
+    );
+    if (raw === null) return;
+    const fromSeq = Number(raw);
+    if (!Number.isFinite(fromSeq) || fromSeq < 0) {
+      setError("The starting sequence must be a non-negative number.");
+      return;
+    }
+    setError(null);
+    try {
+      const res = await api.post<{ enqueued: number; scanned: number; lastSeq: number | null }>(
+        `/api/v1/integrations/webhooks/${e.id}/replay`,
+        { fromSeq, limit: 200 },
+      );
+      setError(null);
+      window.alert(
+        `${res.enqueued} deliveries queued from ${res.scanned} ledger entries` +
+          (res.lastSeq !== null ? ` (up to sequence ${res.lastSeq}).` : ".") +
+          (res.scanned >= 200
+            ? "\n\nThe scan stopped at its page limit — replay again from the next sequence to continue."
+            : ""),
+      );
+      await load();
+      onStatusChanged();
+    } catch (err) {
+      setError(errorMessage(err, "The replay could not be started"));
+    }
+  }
+
   /* ------------------------------- detail --------------------------------- */
 
   const [detail, setDetail] = useState<EndpointDetailResponse | null>(null);
@@ -478,6 +564,34 @@ export default function WebhooksTab({
                       {e.isActive ? "Disable" : "Re-enable"}
                     </Button>
                     <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={!isAdmin || rotating === e.id}
+                      title={
+                        isAdmin
+                          ? "Issue a new signing secret; both are valid during a 24-hour overlap."
+                          : ADMIN_ONLY_HINT
+                      }
+                      onClick={() => void onRotate(e)}
+                    >
+                      {rotating === e.id ? "Rotating…" : "Rotate secret"}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={!isAdmin || !e.isActive}
+                      title={
+                        !isAdmin
+                          ? ADMIN_ONLY_HINT
+                          : !e.isActive
+                            ? "Re-enable the endpoint first — replayed deliveries to a disabled endpoint would only be skipped."
+                            : "Re-derive deliveries from the ledger after an outage."
+                      }
+                      onClick={() => void onReplay(e)}
+                    >
+                      Replay
+                    </Button>
+                    <Button
                       variant="danger"
                       size="sm"
                       disabled={!isAdmin}
@@ -661,6 +775,52 @@ export default function WebhooksTab({
           </div>
         ) : null}
       </SecretRevealModal>
+
+      {/* ---------------------------- rotated secret --------------------------- */}
+      <Modal
+        open={rotationResult !== null}
+        wide
+        title={
+          rotationResult
+            ? `New signing secret — ${rotationResult.endpoint.name}`
+            : "New signing secret"
+        }
+        onClose={() => setRotationResult(null)}
+      >
+        {rotationResult ? (
+          <div className="space-y-3">
+            <Caveat tone="amber">
+              <span className="font-semibold">Shown once.</span> The database holds only its
+              fingerprint, and no route will return it again. Save it now.
+            </Caveat>
+            <div className="rounded-md bg-ink-50 p-3">
+              <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-ink-500">
+                Secret (version {rotationResult.secretVersion})
+              </div>
+              <div className="flex items-center gap-2">
+                <code className="break-all font-mono text-xs">{rotationResult.secret}</code>
+                <CopyButton text={rotationResult.secret} />
+              </div>
+            </div>
+            <p className="text-xs leading-relaxed text-ink-600">{rotationResult.rotation.note}</p>
+            {rotationResult.rotation.headers ? (
+              <dl className="space-y-1 text-xs">
+                {Object.entries(rotationResult.rotation.headers).map(([k, v]) => (
+                  <div key={k} className="flex gap-2">
+                    <dt className="w-24 shrink-0 text-ink-400">{k}</dt>
+                    <dd className="font-mono text-[11px]">{v}</dd>
+                  </div>
+                ))}
+              </dl>
+            ) : null}
+            <div className="flex justify-end">
+              <Button variant="secondary" onClick={() => setRotationResult(null)}>
+                Done
+              </Button>
+            </div>
+          </div>
+        ) : null}
+      </Modal>
 
       {/* ------------------------------ test result ---------------------------- */}
       <Modal
