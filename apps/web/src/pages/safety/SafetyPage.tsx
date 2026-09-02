@@ -233,6 +233,27 @@ export default function SafetyPage() {
     enabled,
   );
 
+  /**
+   * Changing any filter returns the register to its first page.
+   *
+   * Without this a reader on page 4 who narrows the filter is shown "no rows"
+   * for a register that has plenty — the emptiest possible lie a filtered view
+   * can tell.
+   */
+  function withPageReset<T extends { page: string }>(
+    current: T,
+    set: (next: T) => void,
+  ): (next: T) => void {
+    return (next) => {
+      const changedSomethingElse = Object.keys(next).some(
+        (key) =>
+          key !== "page" &&
+          (next as Record<string, string>)[key] !== (current as Record<string, string>)[key],
+      );
+      set(changedSomethingElse ? { ...next, page: "1" } : next);
+    };
+  }
+
   const selectTab = useCallback(
     (next: TabKey) => {
       setTab(next);
@@ -253,15 +274,26 @@ export default function SafetyPage() {
     [searchParams, setSearchParams],
   );
 
-  /** The two facts that outrank everything else on this screen. */
+  /**
+   * The two facts that outrank everything else on this screen.
+   *
+   * Read from the SUMMARY, which is unfiltered and unwindowed. They used to be
+   * derived from `incidents.data.items` — the current tab's filtered first
+   * page — so applying any incident filter that excluded the offending record,
+   * or holding more than one page of incidents, silently removed the red
+   * "statutory notification deadline has passed" banner from the whole
+   * workspace while the duty was still live.
+   */
   const alarm = useMemo(() => {
-    const rows = incidents.data?.items ?? [];
+    const standing = summary.data?.statutory;
     return {
-      missed: rows.filter((i) => i.notification.missed),
-      unsettled: rows.filter((i) => i.notification.needsHumanReview === true),
-      awaiting: rows.filter((i) => i.isReportable && !i.notification.notifiedAt),
+      missed: standing?.missedRefs ?? [],
+      missedDuties: standing?.missedDuties ?? 0,
+      unsettled: standing?.reviewRefs ?? [],
+      awaiting: standing?.awaitingRefs ?? [],
+      outstandingDuties: standing?.outstandingDuties ?? 0,
     };
-  }, [incidents.data]);
+  }, [summary.data]);
 
   if (!projectId) {
     return (
@@ -321,17 +353,22 @@ export default function SafetyPage() {
         <div className="mb-3">
           <Alert
             tone="danger"
-            title={`${alarm.missed.length} statutory notification deadline${alarm.missed.length === 1 ? " has" : "s have"} passed`}
+            title={`${alarm.missedDuties} statutory notification deadline${alarm.missedDuties === 1 ? " has" : "s have"} passed`}
           >
             <p>
               {alarm.missed
                 .slice(0, 4)
-                .map((i) => i.reference)
+                .map((i) =>
+                  i.regimes && i.regimes.length > 0
+                    ? `${i.reference} (${i.regimes.join(", ")})`
+                    : i.reference,
+                )
                 .join(", ")}
               {alarm.missed.length > 4 ? ` and ${alarm.missed.length - 4} more` : ""}. Failing to
               notify is an offence in its own right, separate from whatever caused the incident. The
               deadline does not stop mattering once it has passed — record the notification and the
-              date it was actually made.
+              date it was actually made. An incident answerable to two authorities owes two
+              notifications: discharging one discharges nothing of the other.
             </p>
           </Alert>
         </div>
@@ -370,7 +407,7 @@ export default function SafetyPage() {
         <IncidentsTab
           incidents={incidents}
           filters={incidentFilters}
-          onFilters={setIncidentFilters}
+          onFilters={withPageReset(incidentFilters, setIncidentFilters)}
           users={users}
           vendors={vendors}
           onOpen={(id) => {
@@ -383,7 +420,7 @@ export default function SafetyPage() {
         <ObservationsTab
           observations={observations}
           filters={observationFilters}
-          onFilters={setObservationFilters}
+          onFilters={withPageReset(observationFilters, setObservationFilters)}
           users={users}
           onOpen={(id) => {
             setOpenObservation(id);
@@ -395,7 +432,7 @@ export default function SafetyPage() {
         <ActionsTab
           actions={actions}
           filters={actionFilters}
-          onFilters={setActionFilters}
+          onFilters={withPageReset(actionFilters, setActionFilters)}
           users={users}
           vendors={vendors}
           onOpen={(id) => {
@@ -408,7 +445,7 @@ export default function SafetyPage() {
           inspections={inspections}
           templates={templates}
           filters={inspectionFilters}
-          onFilters={setInspectionFilters}
+          onFilters={withPageReset(inspectionFilters, setInspectionFilters)}
           users={users}
           onOpen={(id) => {
             setOpenInspection(id);
@@ -419,7 +456,7 @@ export default function SafetyPage() {
         <TalksTab
           talks={talks}
           filters={talkFilters}
-          onFilters={setTalkFilters}
+          onFilters={withPageReset(talkFilters, setTalkFilters)}
           users={users}
           vendors={vendors}
           onOpen={(id) => {
@@ -431,7 +468,7 @@ export default function SafetyPage() {
         <ProgrammeTab
           records={programme}
           filters={programmeFilters}
-          onFilters={setProgrammeFilters}
+          onFilters={withPageReset(programmeFilters, setProgrammeFilters)}
           users={users}
           vendors={vendors}
         />

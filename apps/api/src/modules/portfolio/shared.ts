@@ -76,9 +76,21 @@ export function addDaysISO(iso: string, days: number): string {
  * Turn a create schema into a patch schema: every key optional, nothing new
  * accepted. Status and approval fields are never in a create schema, so they
  * can never leak into a generic PATCH (plan §6.3).
+ *
+ * `.partial()` alone keeps every `.default()`, and a PATCH parsed through that
+ * would silently reset untouched columns to their default. The defaults are
+ * stripped first: a PATCH body is only what the caller actually sent.
  */
-export function patchSchemaOf<T extends z.ZodObject<z.ZodRawShape>>(schema: T) {
-  return schema.partial();
+type WithoutDefaults<T extends z.ZodRawShape> = {
+  [K in keyof T]: T[K] extends z.ZodDefault<infer Inner extends z.ZodTypeAny> ? Inner : T[K];
+};
+
+export function patchSchemaOf<T extends z.ZodRawShape>(schema: z.ZodObject<T>) {
+  const shape: Record<string, z.ZodTypeAny> = {};
+  for (const [key, field] of Object.entries(schema.shape)) {
+    shape[key] = (field instanceof z.ZodDefault ? field.removeDefault() : field) as z.ZodTypeAny;
+  }
+  return z.object(shape as unknown as WithoutDefaults<T>).partial();
 }
 
 /** Copy the keys the caller actually sent onto an update set, with a stamp. */

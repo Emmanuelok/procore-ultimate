@@ -5,6 +5,7 @@ import { dayworkRoutes } from "./dayworks.js";
 import { registerCommercialJobs } from "./jobs.js";
 import { measureRoutes } from "./measure.js";
 import { reportingRoutes } from "./reporting.js";
+import { registerCommercialSearch } from "./search.js";
 import { summaryRoutes } from "./summary.js";
 import { valuationRoutes } from "./valuations.js";
 import { variationRoutes } from "./variations.js";
@@ -37,5 +38,6 @@ export const commercialModule: FastifyPluginAsync = async (app) => {
   await app.register(analysisRoutes);
   await app.register(reportingRoutes);
   await app.register(summaryRoutes);
+  registerCommercialSearch();
   registerCommercialJobs(app);
 };

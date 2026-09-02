@@ -45,6 +45,7 @@ import {
   type DataView,
 } from "../../ui";
 import {
+  IconCopy,
   IconGridView,
   IconLocation,
   IconPlus,
@@ -73,6 +74,17 @@ import {
   validateProjectForm,
   type ProjectFormValues,
 } from "../../layouts/project/ProjectForm";
+
+/**
+ * `GET /projects` returns the whole row, including the two flags the shared
+ * ProjectRecord does not name yet. A template or a sandbox is not an
+ * operational job and must be readable as such in the register (#5, #6).
+ */
+type PortfolioProject = ProjectRecord & {
+  isTemplate?: number | null;
+  isSandbox?: number | null;
+  clonedFromId?: string | null;
+};
 
 const PAGE_SIZE = 200;
 /** Five requests of 200. Past this the list is truncated and says so. */
@@ -219,6 +231,7 @@ export default function ProjectsPage() {
 
   const [view, setView] = useState<ViewMode>("table");
   const [createOpen, setCreateOpen] = useState(false);
+  const [cloneSource, setCloneSource] = useState<PortfolioProject | null>(null);
 
   const portfolioName = useMemo(() => {
     const map = new Map<string, string>();
@@ -259,6 +272,27 @@ export default function ProjectsPage() {
             {stageLabel(String(value))}
           </Badge>
         ),
+      },
+      {
+        id: "kind",
+        header: "Kind",
+        headerTooltip:
+          "A template or a sandbox is not an operational job: it exists to be cloned or experimented in.",
+        accessor: (row) => {
+          const p = row as PortfolioProject;
+          return p.isTemplate ? "Template" : p.isSandbox ? "Sandbox" : "Live";
+        },
+        type: "enum",
+        width: 110,
+        groupable: true,
+        cell: ({ value }) =>
+          value === "Live" ? (
+            <span className="text-2xs text-content-subtle">Live</span>
+          ) : (
+            <Badge tone={value === "Template" ? "info" : "warning"} size="xs" variant="subtle">
+              {String(value)}
+            </Badge>
+          ),
       },
       {
         id: "portfolio",
@@ -393,6 +427,19 @@ export default function ProjectsPage() {
                 { value: "cards", label: "Cards", icon: IconGridView },
               ]}
             />
+            <Button
+              variant="secondary"
+              leadingIcon={IconCopy}
+              disabled={projects.items.length === 0}
+              onClick={() => setCloneSource((projects.items[0] as PortfolioProject) ?? null)}
+              title={
+                projects.items.length === 0
+                  ? "Nothing to clone yet"
+                  : "Copy a project's shape — locations, cost codes, custom fields, WBS — into a new job"
+              }
+            >
+              Clone
+            </Button>
             <Button leadingIcon={IconPlus} onClick={() => setCreateOpen(true)}>
               New project
             </Button>
@@ -463,6 +510,15 @@ export default function ProjectsPage() {
         open={createOpen}
         onClose={() => setCreateOpen(false)}
         onCreated={projects.reload}
+      />
+
+      <CloneProjectDrawer
+        open={cloneSource !== null}
+        source={cloneSource}
+        candidates={projects.items as PortfolioProject[]}
+        onPickSource={setCloneSource}
+        onClose={() => setCloneSource(null)}
+        onCloned={projects.reload}
       />
     </div>
   );
@@ -892,6 +948,195 @@ function CreateProjectDrawer({
             </p>
           }
         />
+      </form>
+    </Drawer>
+  );
+}
+
+/* ========================================================================== */
+/* Clone (#5, #6)                                                             */
+/* ========================================================================== */
+
+const CLONE_PARTS = [
+  { key: "locations", label: "Locations", hint: "the whole hierarchy, ids remapped" },
+  { key: "costCodes", label: "Cost codes", hint: "project overrides only" },
+  { key: "customFields", label: "Custom fields", hint: "definitions, not values" },
+  { key: "wbs", label: "WBS", hint: "work breakdown segments" },
+  { key: "workflowTemplates", label: "Workflow templates", hint: "project-scoped chains" },
+  { key: "memberships", label: "Memberships", hint: "the same people, same templates" },
+  { key: "distributionGroups", label: "Distribution groups", hint: "recipients carried over" },
+] as const;
+
+/**
+ * Clone a project's SHAPE — never its transactions.
+ *
+ * What gets copied is the configuration a new job needs on day one. Nothing
+ * operational (RFIs, budgets, invoices) comes across: a clone of a live
+ * project's records would be an invented history, and the drawer says so
+ * rather than leaving people to discover it.
+ */
+function CloneProjectDrawer({
+  open,
+  source,
+  candidates,
+  onPickSource,
+  onClose,
+  onCloned,
+}: {
+  open: boolean;
+  source: PortfolioProject | null;
+  candidates: PortfolioProject[];
+  onPickSource: (p: PortfolioProject | null) => void;
+  onClose: () => void;
+  onCloned: () => void;
+}) {
+  const navigate = useNavigate();
+  const [name, setName] = useState("");
+  const [number, setNumber] = useState("");
+  const [parts, setParts] = useState<string[]>([
+    "locations",
+    "costCodes",
+    "customFields",
+    "wbs",
+  ]);
+  const [asTemplate, setAsTemplate] = useState(false);
+  const [asSandbox, setAsSandbox] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    setError(null);
+    setName(source ? `${source.name} (copy)` : "");
+    setNumber("");
+  }, [open, source]);
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    if (!source) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await api.post<{ id: string; copied?: Record<string, number> }>(
+        `/api/v1/projects/${source.id}/clone`,
+        {
+          name: name.trim(),
+          ...(number.trim() ? { number: number.trim() } : {}),
+          include: parts,
+          ...(asTemplate ? { asTemplate: true } : {}),
+          ...(asSandbox ? { asSandbox: true } : {}),
+        },
+      );
+      const copied = Object.entries(res.copied ?? {})
+        .filter(([, n]) => n > 0)
+        .map(([k, n]) => `${n} ${k}`)
+        .join(", ");
+      toast.success(`Created — ${copied || "no configuration to copy"}`);
+      onCloned();
+      onClose();
+      navigate(`/projects/${res.id}`);
+    } catch (err) {
+      setError(
+        err instanceof ApiClientError || err instanceof Error
+          ? err.message
+          : "Failed to clone the project",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Drawer open={open} onClose={onClose} size="md" title="Clone a project">
+      <form onSubmit={submit} className="space-y-4 p-4">
+        <ErrorAlert message={error} />
+
+        <Alert tone="info" size="sm">
+          Only the shape is copied. No RFI, budget line, commitment or invoice comes across —
+          a clone of a live project's records would be an invented history.
+        </Alert>
+
+        <label className="block">
+          <span className="mb-1 block text-xs font-medium text-content">Copy from</span>
+          <Select
+            value={source?.id ?? ""}
+            onChange={(e) =>
+              onPickSource(candidates.find((p) => p.id === e.target.value) ?? null)
+            }
+          >
+            {candidates.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+                {p.isTemplate ? " — template" : ""}
+              </option>
+            ))}
+          </Select>
+        </label>
+
+        <label className="block">
+          <span className="mb-1 block text-xs font-medium text-content">New project name</span>
+          <input
+            className="w-full rounded border border-border px-2 py-1.5 text-sm"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            required
+          />
+        </label>
+
+        <label className="block">
+          <span className="mb-1 block text-xs font-medium text-content">Number</span>
+          <input
+            className="w-full rounded border border-border px-2 py-1.5 text-sm"
+            value={number}
+            onChange={(e) => setNumber(e.target.value)}
+            placeholder="Optional"
+          />
+        </label>
+
+        <fieldset>
+          <legend className="mb-1 text-xs font-medium text-content">Include</legend>
+          <div className="space-y-1">
+            {CLONE_PARTS.map((part) => (
+              <Checkbox
+                key={part.key}
+                checked={parts.includes(part.key)}
+                onChange={() =>
+                  setParts((prev) =>
+                    prev.includes(part.key)
+                      ? prev.filter((x) => x !== part.key)
+                      : [...prev, part.key],
+                  )
+                }
+                label={part.label}
+                description={part.hint}
+              />
+            ))}
+          </div>
+        </fieldset>
+
+        <div className="space-y-1">
+          <Checkbox
+            checked={asTemplate}
+            onChange={() => setAsTemplate((v) => !v)}
+            label="Create as a template"
+            description="Hidden from operational views; exists to be cloned again."
+          />
+          <Checkbox
+            checked={asSandbox}
+            onChange={() => setAsSandbox((v) => !v)}
+            label="Create as a sandbox"
+            description="A safe place to try a configuration without touching a live job."
+          />
+        </div>
+
+        <div className="flex justify-end gap-2 border-t border-border-subtle pt-3">
+          <Button variant="secondary" type="button" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button type="submit" loading={busy} disabled={!source || name.trim().length === 0}>
+            Clone
+          </Button>
+        </div>
       </form>
     </Drawer>
   );

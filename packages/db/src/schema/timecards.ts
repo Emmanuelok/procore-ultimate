@@ -156,7 +156,13 @@ export const timecardBatches = pgTable(
     doubleTimeHours: doublePrecision("double_time_hours").default(0).notNull(),
     premiumHours: doublePrecision("premium_hours").default(0).notNull(),
     totalHours: doublePrecision("total_hours").default(0).notNull(),
-    totalCost: doublePrecision("total_cost").default(0).notNull(),
+    /**
+     * NULL when any card in the batch could not be costed. Nullable on
+     * purpose: a batch total that silently omits the three cards with no
+     * overtime rate is a smaller, plausible, wrong number, and payroll is
+     * paid from this column.
+     */
+    totalCost: doublePrecision("total_cost"),
     currency: text("currency").default("USD").notNull(),
     /** aggregate claimed-vs-access variance across the batch */
     varianceHours: doublePrecision("variance_hours"),

@@ -986,6 +986,132 @@ describe("LD exposure and health inputs", () => {
     expect(Object.keys(body.metrics)).toContain("worstDaysLate");
   });
 
+  /* ---------------------------------------------------------------- */
+  /* Notice pack and the AI drafting hook (#228, #1006-1007)           */
+  /* ---------------------------------------------------------------- */
+
+  it("builds a deterministic notice pack that names its basis and its gaps", async () => {
+    const contractId = await createContract({
+      name: "Notice pack contract",
+      form: "fidic_red_2017",
+      contractSum: 3_000_000,
+      currency: "GBP",
+      parties: { employer: "Metro Authority", contractor: "Buildco", administrator: "Consult Eng" },
+      particularConditions: [
+        { clauseRef: "20.2", amendment: "Notice period extended to 56 days", timeBarDays: 56 },
+      ],
+    });
+    const created = await createEvent(contractId, {
+      kind: "claim_notice",
+      clauseRef: "20.2",
+      title: "Unforeseeable ground conditions in Zone 4",
+      description: "Rock encountered at 2.4 m below the level shown on the geotechnical baseline.",
+      eventDate: isoDaysFromToday(-3),
+      awarenessDate: isoDaysFromToday(-2),
+    });
+    expect(created.statusCode).toBe(201);
+    const eventId = created.json().id as string;
+
+    const res = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/contracts/${contractId}/events/${eventId}/notice-pack`,
+      owner.headers,
+    );
+    expect(res.statusCode).toBe(200);
+    const pack = res.json() as {
+      clauseRef: string;
+      basis: string;
+      addressee: string;
+      addresseeRole: string;
+      urgency: string;
+      serviceRules: string[];
+      requirements: Array<{ key: string; satisfied: boolean }>;
+      missing: string[];
+      draft: string;
+      aiAvailable: boolean;
+      note: string;
+    };
+    expect(pack.clauseRef).toBe("20.2");
+    // The pack must quote the AMENDED bar, not the standard form's 28 days.
+    expect(pack.basis).toContain("56 calendar days");
+    expect(pack.basis).toContain("Particular Conditions");
+    expect(pack.addressee).toBe("Consult Eng");
+    expect(pack.addresseeRole).toBe("administrator");
+    expect(pack.serviceRules.join(" ")).toContain("1.3");
+    expect(pack.draft).toContain("Consult Eng");
+    expect(pack.draft).toContain("Rock encountered");
+    expect(pack.requirements.find((r) => r.key === "clause_ref")?.satisfied).toBe(true);
+    // No key configured in tests: the pack still exists, and says why.
+    expect(pack.aiAvailable).toBe(false);
+    expect(pack.note).toContain("deterministically");
+  });
+
+  it("brackets every fact the record does not hold instead of inventing it", async () => {
+    const contractId = await createContract({
+      name: "Sparse contract",
+      form: "fidic_red_2017",
+      parties: { employer: "Metro Authority" },
+    });
+    const created = await createEvent(contractId, {
+      kind: "claim_notice",
+      clauseRef: "20.2",
+      title: "Access",
+      eventDate: isoDaysFromToday(-1),
+    });
+    const eventId = created.json().id as string;
+    const res = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/contracts/${contractId}/events/${eventId}/notice-pack`,
+      owner.headers,
+    );
+    const pack = res.json() as { missing: string[]; draft: string; addressee: string | null };
+    expect(pack.addressee).toBeNull();
+    expect(pack.missing.length).toBeGreaterThanOrEqual(3);
+    expect(pack.draft).toContain("NOT ON RECORD");
+  });
+
+  it("returns 503 AiDisabled from the drafting hook while the pack keeps working", async () => {
+    const contractId = await createContract({ name: "AI hook contract", form: "nec4_ecc", necOption: "C" });
+    const created = await createEvent(contractId, {
+      kind: "compensation_event",
+      clauseRef: "61.3",
+      title: "Late access to the working areas",
+      eventDate: isoDaysFromToday(-2),
+    });
+    const eventId = created.json().id as string;
+    const draft = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/contracts/${contractId}/events/${eventId}/draft-notice`,
+      owner.headers,
+      {},
+    );
+    expect(draft.statusCode).toBe(503);
+    expect(draft.json().error).toBe("AiDisabled");
+
+    const pack = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/contracts/${contractId}/events/${eventId}/notice-pack`,
+      owner.headers,
+    );
+    expect(pack.statusCode).toBe(200);
+    // NEC notifications are governed by clause 13, not FIDIC 1.3.
+    expect((pack.json() as { serviceRules: string[] }).serviceRules.join(" ")).toContain("13.1");
+  });
+
+  it("refuses the notice pack to a company member who is not on the project", async () => {
+    const contractId = await createContract({ name: "Notice tenancy", form: "fidic_red_2017" });
+    const created = await createEvent(contractId, {
+      kind: "claim_notice",
+      clauseRef: "20.2",
+      title: "Tenancy check",
+      eventDate: isoDaysFromToday(-1),
+    });
+    const eventId = created.json().id as string;
+    const url = `/api/v1/projects/${projectId}/contracts/${contractId}/events/${eventId}/notice-pack`;
+    expect((await inject("GET", url, outsiderHeaders)).statusCode).toBe(403);
+    expect([403, 404]).toContain((await inject("GET", url, stranger.headers)).statusCode);
+  });
+
   it("keeps every contract route inside its tenant and its project", async () => {
     const contractId = await createContract({ name: "Tenancy", form: "fidic_red_2017" });
     const otherCompany = await inject(

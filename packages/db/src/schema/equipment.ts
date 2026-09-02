@@ -534,6 +534,11 @@ export const equipmentTelematicsReadings = pgTable(
     index("equipment_telematics_readings_equipment_idx").on(t.equipmentId, t.recordedAt),
     index("equipment_telematics_readings_run_idx").on(t.ingestionRunId),
     index("equipment_telematics_readings_company_idx").on(t.companyId, t.recordedAt),
+    index("equipment_telematics_readings_device_idx").on(
+      t.companyId,
+      t.deviceId,
+      t.recordedAt,
+    ),
   ],
 );
 
@@ -578,6 +583,12 @@ export const materialItems = pgTable(
     unitCost: doublePrecision("unit_cost"),
     currency: text("currency").default("USD").notNull(),
     leadTimeDays: integer("lead_time_days"),
+    /** the programme activity this material is needed for (#918) */
+    scheduleActivityId: text("schedule_activity_id"),
+    /** the date the material must be on site — the order-by anchor */
+    requiredOnSiteDate: text("required_on_site_date"),
+    /** when the purchase order was actually placed */
+    orderPlacedAt: text("order_placed_at"),
     /* materialized quantities */
     quantityRequired: doublePrecision("quantity_required").default(0).notNull(),
     quantityOrdered: doublePrecision("quantity_ordered").default(0).notNull(),
@@ -615,6 +626,7 @@ export const materialItems = pgTable(
     index("material_items_project_idx").on(t.projectId, t.status),
     index("material_items_supplier_idx").on(t.supplierVendorId),
     index("material_items_commitment_idx").on(t.commitmentId),
+    index("material_items_required_idx").on(t.companyId, t.requiredOnSiteDate),
   ],
 );
 

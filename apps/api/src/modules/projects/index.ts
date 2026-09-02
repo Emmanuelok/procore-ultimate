@@ -44,6 +44,7 @@ import {
   invoiceLineItems,
   legalHolds,
   locations,
+  notifications,
   portfolios,
   projectMemberships,
   projects,
@@ -59,6 +60,7 @@ import {
   users,
   watchers,
   wbsSegments,
+  workflowInstances,
   workflowTemplates,
 } from "@constructos/db";
 import {
@@ -70,6 +72,7 @@ import {
 } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
+import type { Db } from "../../lib/db.js";
 import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { pushNotifications, notifyWatchers } from "../notifications/service.js";
@@ -829,20 +832,52 @@ export const projectsModule: FastifyPluginAsync = async (app) => {
       await del("savedViews", () =>
         tx.delete(savedViews).where(eq(savedViews.projectId, projectId)).returning({ id: savedViews.id }),
       );
+      /*
+       * Notifications go with the project.
+       *
+       * A notification deep-links to /projects/<id>; once the project is
+       * gone the link 403s, so leaving the row behind produces an inbox item
+       * that can never be opened and a badge count that can never be
+       * cleared by acting on it.
+       */
+      await del("notifications", () =>
+        tx
+          .delete(notifications)
+          .where(eq(notifications.projectId, projectId))
+          .returning({ id: notifications.id }),
+      );
+      await del("workflowInstances", () =>
+        tx
+          .delete(workflowInstances)
+          .where(eq(workflowInstances.projectId, projectId))
+          .returning({ id: workflowInstances.id }),
+      );
       await tx.delete(projects).where(eq(projects.id, projectId));
+      /*
+       * The ledger append is INSIDE this transaction.
+       *
+       * Everywhere else in the codebase the operational write commits first
+       * and the ledger append follows, so a failing append leaves exactly the
+       * unledgered mutation lib/ledger.ts says is unacceptable. For a purge
+       * that is unrecoverable: the rows are gone and nothing records that
+       * they were. `appendLedger` opens a nested transaction (a savepoint)
+       * when handed a transaction handle, and its per-company advisory lock
+       * is held to the outer commit — so either the purge and its ledger
+       * entry both land, or neither does.
+       */
+      await appendLedger(tx as Db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "delete",
+        objectType: "project",
+        objectId: projectId,
+        payload: { event: "purged", name: project.name, removed: counts },
+        storePayload: true,
+        projectId,
+      });
       return counts;
     });
 
-    await appendLedger(app.db, {
-      companyId: req.companyId!,
-      actorId: req.user!.id,
-      action: "delete",
-      objectType: "project",
-      objectId: projectId,
-      payload: { event: "purged", name: project.name, removed },
-      storePayload: true,
-      projectId,
-    });
     return { ok: true, purged: true, removed };
   });
 

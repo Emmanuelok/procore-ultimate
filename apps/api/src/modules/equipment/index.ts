@@ -121,6 +121,12 @@ import {
   type TelematicsDayInput,
 } from "./telematics.js";
 import {
+  companyScopeOf,
+  companyToolGate,
+  scopeProjectFilter,
+  type CompanyScope,
+} from "./gates.js";
+import {
   certificateVerdict,
   EQUIPMENT_DETECTORS,
   IN_SERVICE_ASSIGNMENT_STATUSES,
@@ -203,11 +209,30 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     app.requireCompany,
     app.requireTool("equipment", "standard"),
   ];
-  const companyRead = [app.authenticate, app.requireCompany];
+  /**
+   * The fleet register sits ABOVE the projects, so `requireTool` (which
+   * resolves permission through `:projectId`) cannot gate it. `companyToolGate`
+   * asks the same question against every project the caller is a member of:
+   * hold `equipment` at this level on at least one job, or be an owner/admin.
+   * Before this the company routes ran on membership alone, and a company
+   * guest could read the whole fleet, every certificate and the raw telematics
+   * feed while any member could register, off-hire and verify plant.
+   */
+  const companyRead = [
+    app.authenticate,
+    app.requireCompany,
+    companyToolGate(app, "equipment", "read"),
+  ];
   const companyWrite = [
     app.authenticate,
     app.requireCompany,
-    app.requireCompanyRole(["owner", "admin", "member"]),
+    companyToolGate(app, "equipment", "standard"),
+  ];
+  /** Verification, off-hire and device remapping — the irreversible three. */
+  const companyAdmin = [
+    app.authenticate,
+    app.requireCompany,
+    companyToolGate(app, "equipment", "admin"),
   ];
 
   /* ---------------------------------------------------------------- */
@@ -392,11 +417,28 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
 
   /** Keys already raised for a detector in this company — the idempotence
    *  guard the whole lazy-sweep pattern rests on. */
-  async function alreadySignalled(companyId: string, detector: string): Promise<Set<string>> {
+  async function alreadySignalled(
+    companyId: string,
+    detector: string,
+    candidateKeys?: string[],
+  ): Promise<Set<string>> {
+    // Bounded by the keys we are about to consider: an unbounded scan of
+    // every signal a detector ever raised runs on every list read.
+    const clauses = [eq(signals.companyId, companyId), eq(signals.detector, detector)];
+    if (candidateKeys && candidateKeys.length > 0) {
+      clauses.push(
+        sql`${signals.evidenceRefs}->>'key' in (${sql.join(
+          candidateKeys.map((k) => sql`${k}`),
+          sql`, `,
+        )})`,
+      );
+    } else if (candidateKeys) {
+      return new Set<string>();
+    }
     const rows = await app.db
       .select({ refs: signals.evidenceRefs })
       .from(signals)
-      .where(and(eq(signals.companyId, companyId), eq(signals.detector, detector)));
+      .where(and(...clauses));
     const keys = new Set<string>();
     for (const row of rows) {
       const refs = row.refs as { key?: unknown } | null;
@@ -1047,7 +1089,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
    */
   app.post(
     "/companies/current/equipment/:equipmentId/verify",
-    { preHandler: companyWrite },
+    { preHandler: companyAdmin },
     async (req) => {
       const { equipmentId } = req.params as { equipmentId: string };
       const body = z
@@ -1103,7 +1145,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
    */
   app.post(
     "/companies/current/equipment/:equipmentId/off-hire",
-    { preHandler: companyWrite },
+    { preHandler: companyAdmin },
     async (req) => {
       const { equipmentId } = req.params as { equipmentId: string };
       const body = z
@@ -2675,7 +2717,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
    *  is not a rare thing on a busy site. */
   app.post(
     "/companies/current/equipment-certificates/:certificateId/verify",
-    { preHandler: companyWrite },
+    { preHandler: companyAdmin },
     async (req) => {
       const { certificateId } = req.params as { certificateId: string };
       const body = z
@@ -3227,7 +3269,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
    *  performed it — a fitter signing off their own repair is not a check. */
   app.post(
     "/companies/current/equipment-maintenance-records/:recordId/verify",
-    { preHandler: companyWrite },
+    { preHandler: companyAdmin },
     async (req) => {
       const { recordId } = req.params as { recordId: string };
       const body = z
@@ -3932,7 +3974,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
 
   /** Map a device to a machine — and BACKFILL the readings already stored
    *  under it, which is the entire reason they were kept. */
-  app.post("/companies/current/telematics/devices/map", { preHandler: companyWrite }, async (req) => {
+  app.post("/companies/current/telematics/devices/map", { preHandler: companyAdmin }, async (req) => {
     const body = z
       .object({
         providerKey: z.enum(TELEMATICS_PROVIDERS),

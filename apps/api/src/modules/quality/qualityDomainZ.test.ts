@@ -627,6 +627,41 @@ describe("material test certificates", () => {
     expect(summary.json().failed).toBe(1);
     expect(summary.json().unverified).toBe(1);
   });
+
+  /*
+   * The scheduled sweep, not the read-path one. A certificate sitting
+   * unverified is the state the register exists to make visible, and the
+   * moment to reject the material is before it is installed — so the sweep
+   * raises it whether or not anybody opened the page. Twice, to prove one
+   * signal.
+   */
+  it("raises the unread certificate on the scheduled sweep, once", async () => {
+    const old = new Date(Date.now() - 45 * 86_400_000).toISOString().slice(0, 10);
+    const created = await post(`${base()}/material-certificates`, {
+      certificateNumber: "MC-99820",
+      materialDescription: "Rebar B500B, 16mm",
+      heatNumber: "H-7000",
+      receivedAt: old,
+    });
+    expect(created.statusCode).toBe(201);
+
+    const first = await app.scheduler.runNow("quality.certificates");
+    expect(first.lastError).toBeNull();
+    const second = await app.scheduler.runNow("quality.certificates");
+    expect(second.lastError).toBeNull();
+    expect(second.runCount).toBeGreaterThanOrEqual(2);
+
+    const rows = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "quality_certificate_unverified"),
+        ),
+      );
+    expect(rows.filter((r) => r.explanation.includes("MC-99820"))).toHaveLength(1);
+  });
 });
 
 /* ================================================================== */
@@ -926,5 +961,85 @@ describe("quality summary", () => {
     expect(health.json().metrics.rejectedWelds).toBeGreaterThanOrEqual(0);
     expect(health.json().metrics.firstTimeRightPercent).toBeNull();
     expect(health.json().reasons.join(" ")).toContain("unmeasured rather than perfect");
+  });
+});
+
+/* ================================================================== */
+/* Tenant isolation across every Domain Z register                     */
+/* ================================================================== */
+
+/**
+ * One block for all of them, because the failure mode is identical and the
+ * cost of missing it is identical: a heat number, a welder's name, a failed
+ * cube and an audit finding are all somebody else's commercially damaging
+ * facts. `stranger` holds a valid session in a company of their own, which is
+ * exactly the caller a per-route companyId filter is there to stop.
+ */
+describe("every Domain Z register is refused to another company", () => {
+  const readPaths = [
+    "/concrete-pours",
+    "/concrete-summary",
+    "/welding-procedures",
+    "/welder-qualifications",
+    "/welds",
+    "/welding-summary",
+    "/material-certificates",
+    "/instruments",
+    "/instruments-summary",
+    "/rework-items",
+    "/rework-summary",
+    "/quality-audits",
+    "/audit-findings",
+    "/iso9001-evidence",
+    "/quality/cost-of-quality",
+    "/quality/first-time-right",
+    "/quality/summary",
+    "/quality/health-inputs",
+    "/surveillance",
+    "/concessions-summary",
+  ];
+
+  it("refuses every register read", async () => {
+    for (const path of readPaths) {
+      const res = await get(`${base()}${path}`, stranger.headers);
+      expect([403, 404]).toContain(res.statusCode);
+    }
+  });
+
+  it("refuses every register write", async () => {
+    const writes: Array<[string, Record<string, unknown>]> = [
+      ["/concrete-pours", { pourName: "Slab", plannedDate: "2025-01-01" }],
+      ["/welding-procedures", { reference: "WPS-X", title: "x", process: "smaw" }],
+      ["/welder-qualifications", { welderName: "X", welderStamp: "S1" }],
+      ["/welds", { weldNumber: "W-X" }],
+      ["/material-certificates", { certificateNumber: "C-X", materialDescription: "Steel" }],
+      ["/instruments", { name: "Gauge", serialNumber: "SN-X" }],
+      ["/rework-items", { title: "Rework" }],
+      ["/quality-audits", { title: "Audit" }],
+      ["/concessions", { title: "x", description: "y" }],
+      ["/dlps", { name: "DLP", startDate: "2025-01-01", durationMonths: 12 }],
+      ["/performance-guarantees", { title: "G", parameter: "COP", guaranteedValue: 3 }],
+      ["/training-records", { title: "T" }],
+      ["/spare-parts", { description: "Filter" }],
+      ["/poe", { title: "POE" }],
+    ];
+    for (const [path, payload] of writes) {
+      const res = await post(`${base()}${path}`, payload, stranger.headers);
+      expect([403, 404]).toContain(res.statusCode);
+    }
+  });
+
+  it("refuses the company-wide heat-number trace to a caller with no records of their own", async () => {
+    const trace = await get(
+      "/companies/current/material-certificates/trace?heatNumber=H-1",
+      stranger.headers,
+    );
+    // The route is company-scoped, so a stranger may call it — but it must
+    // never return this company's certificates.
+    if (trace.statusCode === 200) {
+      expect(trace.json().total).toBe(0);
+    } else {
+      expect([403, 404]).toContain(trace.statusCode);
+    }
   });
 });

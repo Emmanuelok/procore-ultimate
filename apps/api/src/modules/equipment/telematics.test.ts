@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  assessFaults,
+  checkGeofence,
   classifyDay,
   coerceTelematicsRow,
+  engineHoursForDay,
   engineHoursFromCounter,
+  reconcileFuel,
   reconcileEquipment,
   reconcileTelematics,
   telematicsKey,
@@ -214,5 +218,161 @@ describe("coerceTelematicsRow", () => {
     expect(telematicsKey("generic_aemp", "DEV-1", "2026-08-03T06:00:00Z")).toBe(
       telematicsKey("generic_aemp", "DEV-1", "2026-08-03T06:00:00.000Z"),
     );
+  });
+});
+
+/* ================================================================== */
+/* Telematics intelligence (WP-EQUIP upgrade)                          */
+/* ================================================================== */
+
+describe("engineHoursForDay — the counter does not stop at midnight", () => {
+  it("carries the previous day's last reading in as the opening point", () => {
+    const out = engineHoursForDay({
+      openingReading: { recordedAt: "2026-08-02T21:00:00.000Z", engineHours: 1200 },
+      dayReadings: [
+        { recordedAt: "2026-08-03T08:00:00.000Z", engineHours: 1201 },
+        { recordedAt: "2026-08-03T17:00:00.000Z", engineHours: 1210 },
+      ],
+    });
+    // 1210 − 1200 = 10, not the 9 that last-minus-first inside the day gives.
+    expect(out.hours).toBe(10);
+    expect(out.reasons).toHaveLength(0);
+  });
+
+  it("states a day's hours from a device that reports once a day", () => {
+    const out = engineHoursForDay({
+      openingReading: { recordedAt: "2026-08-02T23:00:00.000Z", engineHours: 1200 },
+      dayReadings: [{ recordedAt: "2026-08-03T23:00:00.000Z", engineHours: 1208.5 }],
+    });
+    expect(out.hours).toBe(8.5);
+  });
+
+  it("falls back to within-day and says what was lost when there is no carry-in", () => {
+    const out = engineHoursForDay({
+      openingReading: null,
+      dayReadings: [
+        { recordedAt: "2026-08-03T08:00:00.000Z", engineHours: 1201 },
+        { recordedAt: "2026-08-03T17:00:00.000Z", engineHours: 1210 },
+      ],
+    });
+    expect(out.hours).toBe(9);
+    expect(out.reasons.join(" ")).toContain("no reading exists before this day");
+  });
+
+  it("refuses a figure when the counter went backwards", () => {
+    const out = engineHoursForDay({
+      openingReading: { recordedAt: "2026-08-02T21:00:00.000Z", engineHours: 1200 },
+      dayReadings: [{ recordedAt: "2026-08-03T17:00:00.000Z", engineHours: 40 }],
+    });
+    expect(out.hours).toBeNull();
+    expect(out.reasons.join(" ")).toContain("reset or replaced");
+  });
+
+  it("does not turn silence into zero hours", () => {
+    const out = engineHoursForDay({
+      openingReading: { recordedAt: "2026-08-02T21:00:00.000Z", engineHours: 1200 },
+      dayReadings: [],
+    });
+    expect(out.hours).toBeNull();
+    expect(out.reasons.join(" ")).toContain("not distinguishable");
+  });
+});
+
+describe("checkGeofence", () => {
+  const site = { latitude: 51.5, longitude: -0.12 };
+
+  it("says nothing when the project has no location", () => {
+    const out = checkGeofence({
+      site: null,
+      readings: [{ latitude: 52, longitude: 0, recordedAt: "2026-08-03T09:00:00.000Z", engineRunning: 1 }],
+    });
+    expect(out.breaches).toHaveLength(0);
+    expect(out.reasons.join(" ")).toContain("no fence to test");
+  });
+
+  it("finds a machine running well outside the fence", () => {
+    const out = checkGeofence({
+      site,
+      radiusMetres: 1000,
+      readings: [
+        { latitude: 51.5, longitude: -0.121, recordedAt: "2026-08-03T08:00:00.000Z", engineRunning: 1 },
+        { latitude: 51.7, longitude: -0.12, recordedAt: "2026-08-03T09:00:00.000Z", engineRunning: 1 },
+        { latitude: 51.7, longitude: -0.12, recordedAt: "2026-08-03T13:00:00.000Z", engineRunning: 1 },
+      ],
+    });
+    expect(out.breaches).toHaveLength(2);
+    expect(out.maxDistanceMetres).toBeGreaterThan(20_000);
+    expect(out.spanHours).toBe(4);
+  });
+
+  it("ignores a machine parked off site with the engine off", () => {
+    const out = checkGeofence({
+      site,
+      radiusMetres: 1000,
+      readings: [
+        { latitude: 51.9, longitude: -0.12, recordedAt: "2026-08-03T22:00:00.000Z", engineRunning: 0 },
+      ],
+    });
+    expect(out.breaches).toHaveLength(0);
+    expect(out.reasons.join(" ")).toContain("engine running");
+  });
+});
+
+describe("reconcileFuel", () => {
+  it("refuses to compare when the feed reports no consumption", () => {
+    const out = reconcileFuel({
+      telematicsFuelUsedLitres: [null, null],
+      fills: [{ litres: 400, at: "2026-08-03T08:00:00.000Z" }],
+    });
+    expect(out.burnLitres).toBeNull();
+    expect(out.unexplained).toBe(false);
+    expect(out.reasons.join(" ")).toContain("gap in the feed, not evidence of a loss");
+  });
+
+  it("passes a fill that matches the burn inside tolerance", () => {
+    const out = reconcileFuel({
+      telematicsFuelUsedLitres: [180, 200],
+      fills: [{ litres: 400, at: "2026-08-03T08:00:00.000Z" }],
+    });
+    expect(out.unexplained).toBe(false);
+    expect(out.differenceLitres).toBe(20);
+  });
+
+  it("flags fills that materially outrun the burn", () => {
+    const out = reconcileFuel({
+      telematicsFuelUsedLitres: [100, 100],
+      fills: [
+        { litres: 300, at: "2026-08-03T08:00:00.000Z" },
+        { litres: 300, at: "2026-08-05T08:00:00.000Z" },
+      ],
+    });
+    expect(out.unexplained).toBe(true);
+    expect(out.differenceLitres).toBe(400);
+    expect(out.reasons.join(" ")).toContain("most stolen commodity");
+  });
+});
+
+describe("assessFaults", () => {
+  it("ignores dashboard-light severities", () => {
+    const out = assessFaults([{ code: "SPN-100", severity: "warning" }]);
+    expect(out.actionable).toHaveLength(0);
+    expect(out.stopWork).toBe(false);
+  });
+
+  it("raises a service for a severe fault", () => {
+    const out = assessFaults([{ code: "SPN-110", description: "Coolant temp", severity: "severe" }]);
+    expect(out.worst).toBe("severe");
+    expect(out.stopWork).toBe(false);
+    expect(out.reason).toContain("SPN-110");
+  });
+
+  it("stops the machine on a critical fault", () => {
+    const out = assessFaults([
+      { code: "SPN-110", severity: "severe" },
+      { code: "SPN-190", description: "Overspeed", severity: "critical" },
+    ]);
+    expect(out.worst).toBe("critical");
+    expect(out.stopWork).toBe(true);
+    expect(out.reason).toContain("stop it");
   });
 });

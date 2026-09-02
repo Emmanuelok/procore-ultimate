@@ -10,6 +10,8 @@ import {
   budgetLineItems,
   companyMemberships,
   costCodes,
+  ledgerEntries,
+  notifications,
   projectMemberships,
   projects,
   recordLinks,
@@ -283,6 +285,18 @@ describe("project deletion is recoverable", () => {
   });
 
   it("purges only what the substrate owns, and only for an owner", async () => {
+    // A notification deep-linking at the doomed project: leaving it behind
+    // produces an inbox item that can never be opened and a badge that can
+    // never be cleared (audit: project delete orphaned every child row).
+    await app.db.insert(notifications).values({
+      id: newId("ntf"),
+      companyId: owner.companyId,
+      userId: owner.userId,
+      projectId: doomed,
+      kind: "status_change",
+      title: "Something happened on the doomed project",
+    });
+
     const asMember = await app.inject({
       method: "DELETE",
       url: `/api/v1/recycle-bin/projects/${doomed}`,
@@ -297,8 +311,31 @@ describe("project deletion is recoverable", () => {
     });
     expect(purge.statusCode).toBe(200);
     expect(purge.json().purged).toBe(true);
+    expect(purge.json().removed.notifications).toBe(1);
     const rows = await app.db.select().from(projects).where(eq(projects.id, doomed));
     expect(rows).toHaveLength(0);
+    const left = await app.db
+      .select()
+      .from(notifications)
+      .where(eq(notifications.projectId, doomed));
+    expect(left).toHaveLength(0);
+
+    // The purge and its ledger entry are one transaction: a purge that
+    // committed without a ledger row would be the unledgered mutation the
+    // ledger exists to make impossible.
+    const trail = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(
+        and(
+          eq(ledgerEntries.companyId, owner.companyId),
+          eq(ledgerEntries.objectId, doomed),
+          eq(ledgerEntries.action, "delete"),
+        ),
+      );
+    expect(
+      trail.some((e) => (e.payload as { event?: string } | null)?.event === "purged"),
+    ).toBe(true);
   });
 });
 

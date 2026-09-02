@@ -786,7 +786,7 @@ describe("schedules (#736)", () => {
     );
   });
 
-  it("records a schedule, says plainly that nothing is delivered, and removes it", async () => {
+  it("records a schedule, states honestly whether it dispatches, and removes it", async () => {
     const report = await createReport(owner.headers, { name: "Scheduled report" });
     const id = report.json().id as string;
 
@@ -800,10 +800,16 @@ describe("schedules (#736)", () => {
     const body = created.json() as {
       id: string;
       nextRunAt: string;
-      delivery: { enabled: boolean; note: string };
+      delivery: { enabled: boolean; dispatches: boolean; provider: string; job: string; note: string };
     };
-    expect(body.delivery.enabled).toBe(false);
-    expect(body.delivery.note).toContain("no email is sent");
+    // Delivery is REAL now: a scheduler job executes due schedules. Whether
+    // anything leaves depends on EMAIL_PROVIDER, and the notice states which of
+    // the two is true rather than asserting either.
+    expect(body.delivery.enabled).toBe(true);
+    expect(body.delivery.job).toBe("analytics.report-delivery");
+    expect(body.delivery.dispatches).toBe(false);
+    expect(body.delivery.provider).toBe("none");
+    expect(body.delivery.note).toContain("NOT delivered");
     expect(new Date(body.nextRunAt).getUTCDay()).toBe(1);
     expect(new Date(body.nextRunAt).getTime()).toBeGreaterThan(Date.now());
 

@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { projects } from "@constructos/db";
+import { eq } from "drizzle-orm";
+import { companyMemberships, projects, users } from "@constructos/db";
 import type { BuiltApp } from "../../app.js";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
 import { newId } from "../../lib/ids.js";
@@ -19,14 +20,27 @@ describe("admin", () => {
       companyId: actor.companyId,
       name: "P1",
     });
-    // a second company member to assign things to
-    const invite = await built.app.inject({
-      method: "POST",
-      url: "/api/v1/company/users/invite",
-      headers: actor.headers,
-      payload: { email: `colleague-${Date.now()}@test.dev`, name: "Colleague", role: "member" },
+    /*
+     * A second company member to assign things to.
+     *
+     * This used to invite one and read `user.id` off the response. Inviting
+     * no longer creates a membership (it records an invitation the invitee
+     * must accept, and does not say whether the address is already known),
+     * so the fixture registers a real actor and adds the membership directly
+     * — which is what acceptance does.
+     */
+    const colleague = await registerActor(built.app, { companyName: "Colleague Home Co" });
+    colleagueId = colleague.userId;
+    await built.app.db
+      .update(users)
+      .set({ name: "Colleague" })
+      .where(eq(users.id, colleagueId));
+    await built.app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: actor.companyId,
+      userId: colleagueId,
+      role: "member",
     });
-    colleagueId = (invite.json() as { user: { id: string } }).user.id;
   });
 
   afterAll(async () => {
@@ -266,7 +280,10 @@ describe("admin", () => {
         headers: actor.headers,
         payload: { userId: "u_missing0000000000000", role: "auditor" },
       });
-      expect(badUser.statusCode).toBe(400);
+      // 403, not 400: an id that names nobody is not a malformed request, it
+      // is a grantee who is not a member of this company — the same refusal a
+      // real user from another tenant gets, and it is ledgered.
+      expect(badUser.statusCode).toBe(403);
     });
 
     it("filters out expired grants by default", async () => {

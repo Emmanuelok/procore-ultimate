@@ -49,6 +49,7 @@ import {
 import { COMPANY_ROLES } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
+import type { Db } from "../../lib/db.js";
 import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { revokeAllUserSessions } from "../account/sessions.js";
@@ -69,6 +70,16 @@ import { requireVerifiedEmail } from "../account/verification.js";
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
 /* ------------------------------------------------------------------ */
+
+/**
+ * How long a merge can be undone.
+ *
+ * After this the rows re-pointed by the merge cannot be told apart from rows
+ * edited since, so the undo refuses rather than guessing. Stated once and
+ * used by both the undo guard and the register, so the UI never offers an
+ * undo the API will refuse.
+ */
+const MERGE_UNDO_WINDOW_MS = 24 * 60 * 60_000;
 
 const vendorCreateSchema = z.object({
   name: z.string().min(1).max(300),
@@ -562,6 +573,17 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
      */
     const now = new Date().toISOString();
     const movements: Array<{ table: string; column: string; rows: number }> = [];
+    const mergeId = newId("vmrg");
+    /*
+     * The re-pointing, the journal row and BOTH ledger entries are one
+     * transaction.
+     *
+     * A merge that committed without its journal row could not be undone,
+     * and one that committed without its ledger entries would be an
+     * unledgered mutation across a dozen tables. `appendLedger` opens a
+     * nested transaction (a savepoint) when handed a transaction handle, and
+     * its per-company advisory lock is held to the outer commit.
+     */
     await app.db.transaction(async (tx) => {
       for (const entry of VENDOR_REFERENCE_TABLES) {
         const moved = await tx
@@ -577,33 +599,31 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
         .update(vendors)
         .set({ status: "merged", mergedIntoId: target.id, updatedAt: now })
         .where(and(eq(vendors.id, source.id), eq(vendors.companyId, req.companyId!)));
-    });
-
-    const mergeId = newId("vmrg");
-    await app.db.insert(vendorMerges).values({
-      id: mergeId,
-      companyId: req.companyId!,
-      sourceVendorId: source.id,
-      targetVendorId: target.id,
-      movements,
-      performedBy: req.user!.id,
-    });
-    await appendLedger(app.db, {
-      companyId: req.companyId!,
-      actorId: req.user!.id,
-      action: "state_change",
-      objectType: "vendor",
-      objectId: source.id,
-      payload: { status: "merged", mergedIntoId: target.id, mergeId, movements },
-      storePayload: true,
-    });
-    await appendLedger(app.db, {
-      companyId: req.companyId!,
-      actorId: req.user!.id,
-      action: "update",
-      objectType: "vendor",
-      objectId: target.id,
-      payload: { absorbedVendorId: source.id, mergeId },
+      await tx.insert(vendorMerges).values({
+        id: mergeId,
+        companyId: req.companyId!,
+        sourceVendorId: source.id,
+        targetVendorId: target.id,
+        movements,
+        performedBy: req.user!.id,
+      });
+      await appendLedger(tx as Db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "vendor",
+        objectId: source.id,
+        payload: { status: "merged", mergedIntoId: target.id, mergeId, movements },
+        storePayload: true,
+      });
+      await appendLedger(tx as Db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "vendor",
+        objectId: target.id,
+        payload: { absorbedVendorId: source.id, mergeId },
+      });
     });
     const merged = await getVendorOr404(req.companyId!, source.id, true);
     return { ...merged, mergeId, movements };
@@ -628,7 +648,7 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
     if (!merge) throw notFound("Merge not found");
     if (merge.undoneAt) throw conflict("This merge has already been undone");
     const ageMs = Date.now() - Date.parse(merge.createdAt);
-    if (ageMs > 24 * 60 * 60_000) {
+    if (ageMs > MERGE_UNDO_WINDOW_MS) {
       throw conflict(
         "A merge can only be undone within 24 hours; after that the re-pointed records cannot be told apart from later edits.",
       );
@@ -671,6 +691,13 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
     return { ok: true, mergeId, restored };
   });
 
+  /**
+   * The merge journal.
+   *
+   * Names, not ids: "vmrg_… moved 4 rows" is unreadable, and the register
+   * exists to be read. `undoDeadline` is stated rather than left for the
+   * caller to compute, so the UI never offers an undo the API will refuse.
+   */
   app.get("/vendor-merges", { preHandler: adminOnly }, async (req) => {
     const q = pageQuerySchema.parse(req.query);
     const where = eq(vendorMerges.companyId, req.companyId!);
@@ -682,7 +709,26 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
       .orderBy(desc(vendorMerges.createdAt))
       .limit(q.pageSize)
       .offset(pageOffset(q));
-    return paginate(items, Number(totalRow?.n ?? 0), q);
+    const ids = [
+      ...new Set(items.flatMap((m) => [m.sourceVendorId, m.targetVendorId])),
+    ];
+    const names = ids.length
+      ? await app.db
+          .select({ id: vendors.id, name: vendors.name })
+          .from(vendors)
+          .where(and(eq(vendors.companyId, req.companyId!), inArray(vendors.id, ids)))
+      : [];
+    const nameById = new Map(names.map((v) => [v.id, v.name]));
+    return paginate(
+      items.map((m) => ({
+        ...m,
+        sourceName: nameById.get(m.sourceVendorId) ?? m.sourceVendorId,
+        targetName: nameById.get(m.targetVendorId) ?? m.targetVendorId,
+        undoDeadline: new Date(Date.parse(m.createdAt) + MERGE_UNDO_WINDOW_MS).toISOString(),
+      })),
+      Number(totalRow?.n ?? 0),
+      q,
+    );
   });
 
   /* ---------------------------- Contacts --------------------------- */

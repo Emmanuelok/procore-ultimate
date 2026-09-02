@@ -504,7 +504,15 @@ describe("incidents — reportability and the obligation it creates", () => {
     expect(body.reportability.governingRuleId).toBe("riddor.fatality");
     expect(body.reportability.rules.find((r: { ruleId: string }) => r.ruleId === "riddor.fatality").citation)
       .toContain("reg. 6");
-    expect(body.notification.dueAt).toBe(body.reportDueAt);
+    // The per-regime duty carries the governing RULE's deadline; the column carries
+    // the driver's rendering of the same instant. Compare instants, not spellings.
+    expect(Date.parse(body.notification.dueAt as string)).toBe(
+      Date.parse(body.reportDueAt as string),
+    );
+    expect(body.notification.duties).toHaveLength(1);
+    expect(body.notification.duties[0].regime).toBe("riddor");
+    expect(body.notification.duties[0].state).toBe("outstanding");
+    expect(body.notification.allDischarged).toBe(false);
     expect(body.obligationId).toBeTruthy();
 
     const obl = await app.db
@@ -671,7 +679,9 @@ describe("the missed-notification signal", () => {
     await get(`/projects/${ukProject}/safety/incidents/${id}`);
     await get(`/projects/${ukProject}/safety/incidents?pageSize=5`);
 
-    const raised = await signalsWithKey("safety_notification_deadline_missed", id);
+    // The key carries the REGIME: an incident answerable to two authorities owes two
+    // duties, and one missed duty must be able to raise a finding while the other stands.
+    const raised = await signalsWithKey("safety_notification_deadline_missed", `${id}:riddor`);
     expect(raised).toHaveLength(1);
     expect(raised[0]?.severity).toBe("critical");
     expect(raised[0]?.explanation).toContain("separate from anything the investigation finds");
@@ -708,7 +718,7 @@ describe("the missed-notification signal", () => {
     // The sweep must not add a second signal for the same incident.
     await get(`/projects/${ukProject}/safety/incidents`);
     await get(`/projects/${ukProject}/safety/incidents/${id}`);
-    const raised = await signalsWithKey("safety_notification_deadline_missed", id);
+    const raised = await signalsWithKey("safety_notification_deadline_missed", `${id}:riddor`);
     expect(raised).toHaveLength(1);
     expect(raised[0]?.title).toContain("out of time");
 
@@ -740,7 +750,9 @@ describe("the missed-notification signal", () => {
     expect(notified.statusCode).toBe(200);
     expect(notified.json().notificationResult.late).toBe(false);
     expect(notified.json().notificationResult.obligationStatus).toBe("satisfied");
-    expect(await signalsWithKey("safety_notification_deadline_missed", id)).toHaveLength(0);
+    expect(
+      await signalsWithKey("safety_notification_deadline_missed", `${id}:riddor`),
+    ).toHaveLength(0);
   });
 });
 
@@ -856,7 +868,9 @@ describe("investigation lifecycle and segregation of duties", () => {
     );
     const res = await post(`/projects/${ukProject}/safety/incidents/${id}/close`, { note: "Done" });
     expect(res.statusCode).toBe(409);
-    expect(res.json().message).toContain("no notification has been recorded");
+    expect(res.json().message).toContain("statutory");
+    expect(res.json().message).toContain("undischarged");
+    expect(res.json().message).toContain("riddor");
   });
 });
 
@@ -1349,9 +1363,18 @@ describe("safety programme records", () => {
     expect(approved.statusCode).toBe(200);
     expect(approved.json().status).toBe("active");
 
-    const ack = await post(`/companies/current/safety/programme-records/${id}/acknowledge`, {
+    // A worker is not a platform user and cannot have pressed anything, so an
+    // unqualified method is refused (see the acknowledgement gate).
+    const weak = await post(`/companies/current/safety/programme-records/${id}/acknowledge`, {
       workerId,
       method: "on_device_signature",
+    });
+    expect(weak.statusCode).toBe(400);
+    expect(weak.json().message).toContain("carries");
+
+    const ack = await post(`/companies/current/safety/programme-records/${id}/acknowledge`, {
+      workerId,
+      method: "wet_signature",
     });
     expect(ack.statusCode).toBe(201);
     expect(ack.json().acknowledgementCount).toBe(1);
@@ -1395,7 +1418,10 @@ describe("safety programme records", () => {
     });
     const id = created.json().id as string;
     await post(`/companies/current/safety/programme-records/${id}/approve`, {}, second.headers);
-    await post(`/companies/current/safety/programme-records/${id}/acknowledge`, { workerId });
+    await post(`/companies/current/safety/programme-records/${id}/acknowledge`, {
+      workerId,
+      method: "wet_signature",
+    });
 
     const superseded = await post(
       `/companies/current/safety/programme-records/${id}/supersede`,
@@ -1434,7 +1460,8 @@ describe("statistics", () => {
     expect(body.exposure.hours).toBeNull();
     expect(body.exposure.source).toBeNull();
     expect(body.rates.every((r: { value: number | null }) => r.value === null)).toBe(true);
-    expect(body.rates[0].reasons.join(" ")).toContain("No timecards cover");
+    const anyRate = body.rates.find((r: { key: string }) => r.key === "ltifr");
+    expect(anyRate.reasons.join(" ")).toContain("No timecards cover");
     expect(body.honesty).toContain("misrepresentation");
     // the counts are real and are still reported
     expect(body.counts.lostTimeCases).toBe(1);
@@ -1471,9 +1498,18 @@ describe("statistics", () => {
     const ltifr = body.rates.find((r: { key: string }) => r.key === "ltifr");
     expect(ltifr.value).toBe(100);
     expect(ltifr.basis).toContain("1,000,000");
+    // TRIR and DART are OSHA constructions. This is a GB project assessed only under
+    // RIDDOR, so no incident on it carries a 29 CFR 1904 classification at all — and a
+    // TRIR of 0.00 read off an unasked question is a false statement on a
+    // prequalification questionnaire, not a low rate.
     const trir = body.rates.find((r: { key: string }) => r.key === "trir");
     expect(trir.basis).toContain("200,000");
-    expect(body.incomputable).toHaveLength(0);
+    expect(trir.value).toBeNull();
+    expect(trir.reasons.join(" ")).toContain("never assessed under 29 CFR 1904");
+    const dart = body.rates.find((r: { key: string }) => r.key === "dart");
+    expect(dart.value).toBeNull();
+    expect(body.counts.unassessedForOsha).toBeGreaterThan(0);
+    expect([...(body.incomputable as string[])].sort()).toEqual(["dart", "trir"]);
   });
 
   it("summarises the registers, the obligations and the signals this module owns", async () => {
@@ -1486,10 +1522,13 @@ describe("statistics", () => {
     expect(body.obligations.note).toContain("ADR 0012");
     expect(Object.keys(body.signals.byDetector).sort()).toEqual([
       "safety_corrective_action_overdue",
+      "safety_device_alarm_unanswered",
       "safety_investigation_overdue",
       "safety_notification_deadline_missed",
       "safety_programme_record_expired",
+      "safety_risk_index_elevated",
       "safety_statutory_inspection_overdue",
+      "safety_under_reporting_suspected",
     ]);
     expect(body.correctiveActions.awaitingEffectivenessCheck).toBeGreaterThanOrEqual(0);
   });

@@ -17,7 +17,19 @@ import {
   Td,
   Th,
 } from "../../ui";
+import { useAuth } from "../../lib/auth";
+import { Tabs } from "../../ui";
+import { IconSettings } from "../../ui/icons";
 import { formatDateTime, humanize } from "../format";
+import {
+  AuditTab,
+  DelegationTab,
+  ExportTab,
+  LegalHoldTab,
+  RecycleBinTab,
+  RetentionTab,
+  type Option,
+} from "./GovernanceTabs";
 
 interface ListResponse<T> {
   items: T[];
@@ -90,7 +102,16 @@ function defaultTools(): Record<string, string> {
   return Object.fromEntries(TOOLS.map((t) => [t, "none"]));
 }
 
-function TemplatesSection() {
+/**
+ * The template register.
+ *
+ * `onChanged` exists because of a real defect: this section kept its own list
+ * and reloaded it after a create, while MembershipsSection received the
+ * PARENT's `templates` prop — so a template created seconds earlier could not
+ * be assigned to a member without a full page reload. Every mutation here now
+ * tells the parent to refetch the shared list.
+ */
+function TemplatesSection({ onChanged }: { onChanged: () => void }) {
   const [items, setItems] = useState<Template[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
@@ -161,6 +182,7 @@ function TemplatesSection() {
       }
       setModalOpen(false);
       await load();
+      onChanged();
     } catch (err) {
       setFormError(errMsg(err, "Failed to save template"));
     } finally {
@@ -173,6 +195,7 @@ function TemplatesSection() {
     try {
       await api.del(`/api/v1/permission-templates/${t.id}`);
       await load();
+      onChanged();
     } catch (err) {
       setError(errMsg(err, "Failed to delete template"));
     }
@@ -754,10 +777,39 @@ function AuthEventsSection({ users }: { users: CompanyUser[] }) {
 
 /* ----------------------------------- Page ----------------------------------- */
 
+type AdminTab =
+  | "access"
+  | "audit"
+  | "retention"
+  | "holds"
+  | "delegation"
+  | "exports"
+  | "recycle"
+  | "security";
+
+/**
+ * The company administration workspace.
+ *
+ * Access (templates, memberships, assurance grants) is the original surface;
+ * everything else is the governance layer the platform always had in the API
+ * and never showed anyone: the ledger as an audit trail (#92), retention and
+ * legal hold (#46–#47), the data export bundle (#45), delegated
+ * administration (#27) and the recycle bin (#78).
+ */
 export default function AdminPage() {
+  const { company } = useAuth();
+  const isOwner = company?.role === "owner";
+  const [tab, setTab] = useState<AdminTab>("access");
   const [projects, setProjects] = useState<ProjectOption[]>([]);
   const [users, setUsers] = useState<CompanyUser[]>([]);
   const [templates, setTemplates] = useState<Template[]>([]);
+
+  const loadTemplates = useCallback(() => {
+    api
+      .get<ListResponse<Template>>("/api/v1/permission-templates?page=1&pageSize=100")
+      .then((res) => setTemplates(res.items))
+      .catch(() => setTemplates([]));
+  }, []);
 
   useEffect(() => {
     api
@@ -768,24 +820,51 @@ export default function AdminPage() {
       .get<ListResponse<CompanyUser>>("/api/v1/company/users?page=1&pageSize=100")
       .then((res) => setUsers(res.items))
       .catch(() => setUsers([]));
-    api
-      .get<ListResponse<Template>>("/api/v1/permission-templates?page=1&pageSize=100")
-      .then((res) => setTemplates(res.items))
-      .catch(() => setTemplates([]));
-  }, []);
+    loadTemplates();
+  }, [loadTemplates]);
+
+  const projectOptions: Option[] = projects.map((p) => ({ id: p.id, name: p.name }));
 
   return (
     <div>
       <PageHeader
         title="Admin"
-        subtitle="Permissions, memberships, assurance access and security"
+        icon={IconSettings}
+        subtitle="Permissions, memberships, assurance access, the audit trail, retention and legal hold, export and delegated administration"
       />
-      <div className="space-y-6">
-        <TemplatesSection />
-        <MembershipsSection projects={projects} users={users} templates={templates} />
-        <GrantsSection projects={projects} users={users} />
-        <AuthEventsSection users={users} />
+
+      <div className="mb-4">
+        <Tabs
+          items={[
+            { value: "access" as const, label: "Access" },
+            { value: "audit" as const, label: "Audit trail" },
+            { value: "retention" as const, label: "Retention" },
+            { value: "holds" as const, label: "Legal holds" },
+            { value: "delegation" as const, label: "Delegation" },
+            { value: "exports" as const, label: "Export" },
+            { value: "recycle" as const, label: "Recycle bin" },
+            { value: "security" as const, label: "Sign-in trail" },
+          ]}
+          value={tab}
+          onChange={setTab}
+          aria-label="Administration sections"
+        />
       </div>
+
+      {tab === "access" ? (
+        <div className="space-y-6">
+          <TemplatesSection onChanged={loadTemplates} />
+          <MembershipsSection projects={projects} users={users} templates={templates} />
+          <GrantsSection projects={projects} users={users} />
+        </div>
+      ) : null}
+      {tab === "audit" ? <AuditTab /> : null}
+      {tab === "retention" ? <RetentionTab /> : null}
+      {tab === "holds" ? <LegalHoldTab projects={projectOptions} /> : null}
+      {tab === "delegation" ? <DelegationTab users={users} projects={projectOptions} /> : null}
+      {tab === "exports" ? <ExportTab /> : null}
+      {tab === "recycle" ? <RecycleBinTab isOwner={isOwner} /> : null}
+      {tab === "security" ? <AuthEventsSection users={users} /> : null}
     </div>
   );
 }

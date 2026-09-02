@@ -19,6 +19,7 @@ import {
   ErrorAlert,
   Field,
   Input,
+  SegmentedControl,
   Select,
   Spinner,
 } from "../../ui";
@@ -107,6 +108,15 @@ export default function ImportWizard({
   const [projectId, setProjectId] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [newSourceName, setNewSourceName] = useState("");
+  /**
+   * insert  — a row whose externalId was already committed is a DUPLICATE and
+   *           is rejected. Right for a first migration.
+   * reconcile — that row is a RESTATEMENT: it is matched to the committed
+   *           record, the difference is computed field by field, and an
+   *           operator decides per row whether to apply it. Right for the
+   *           monthly re-export every operator actually has.
+   */
+  const [mode, setMode] = useState<"insert" | "reconcile">("insert");
 
   const dataset = useMemo(
     () => (datasets ?? []).find((d) => d.dataset === datasetCode) ?? null,
@@ -154,11 +164,23 @@ export default function ImportWizard({
     setBusy(true);
     setError(null);
     try {
+      /*
+       * FIELDS BEFORE THE FILE — not a style choice.
+       *
+       * @fastify/multipart only exposes a field once its bytes have been
+       * parsed, and busybody emits the file's end when it sees the terminating
+       * boundary. With the file first, the trailing field parts can land in a
+       * later TCP chunk, so on a multi-megabyte CSV the server read sourceId as
+       * undefined and answered "Request validation failed" — intermittently,
+       * and only on large files, which is the worst kind of bug to chase. Every
+       * other upload in this app puts its fields first; this one now does too.
+       */
       const form = new FormData();
-      form.append("file", file);
       form.append("sourceId", effectiveSourceId);
       form.append("dataset", dataset.dataset);
       if (projectId) form.append("projectId", projectId);
+      if (mode === "reconcile") form.append("mode", "reconcile");
+      form.append("file", file);
       const res = await api.upload<unknown>("/api/v1/ingestion/runs", form);
       const norm = normalizeCreateRunResponse(res);
       if (!norm) {
@@ -381,6 +403,25 @@ export default function ImportWizard({
                 </Select>
               </Field>
             ) : null}
+
+            <Field
+              label="Duplicate handling"
+              hint={
+                mode === "insert"
+                  ? "A row whose external id was already committed is rejected as a duplicate."
+                  : "A row whose external id was already committed is matched to it, and the difference is shown for a per-row decision at commit time."
+              }
+            >
+              <SegmentedControl<"insert" | "reconcile">
+                value={mode}
+                onChange={setMode}
+                aria-label="Duplicate handling"
+                options={[
+                  { value: "insert", label: "Reject duplicates" },
+                  { value: "reconcile", label: "Reconcile restatements" },
+                ]}
+              />
+            </Field>
 
             <Field label="CSV file" hint="Comma-separated with a header row. Quoted fields, escaped quotes and CRLF are handled; up to 20,000 data rows per run.">
               <input

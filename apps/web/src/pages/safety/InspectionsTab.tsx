@@ -37,7 +37,9 @@ import {
   INSPECTION_STATUS_TONE,
   LoadError,
   SectionHeading,
+  RegisterPager,
   count,
+  pageParams,
   dateTime,
   decimal,
   isoDate,
@@ -50,6 +52,8 @@ import {
 } from "./safetyShared";
 
 export interface InspectionFilters {
+  /** 1-based; the register is paged rather than silently truncated */
+  page: string;
   status: string;
   inspectionType: string;
   result: string;
@@ -57,7 +61,7 @@ export interface InspectionFilters {
   overdue: string;
 }
 
-export const EMPTY_INSPECTION_FILTERS: InspectionFilters = {
+export const EMPTY_INSPECTION_FILTERS: InspectionFilters = { page: "1",
   status: "",
   inspectionType: "",
   result: "",
@@ -448,6 +452,14 @@ export default function InspectionsTab({
             }}
             aria-label="Inspection register"
           />
+          <RegisterPager
+            page={filters.page}
+            loaded={rows.length}
+            total={inspections.data?.total ?? null}
+            noun="inspection"
+            loading={inspections.loading}
+            onPage={(page) => onFilters({ ...filters, page })}
+          />
         </>
       ) : (
         <TemplateList templates={templates} />
@@ -554,7 +566,7 @@ function TemplateList({ templates }: { templates: Resource<Paged<InspectionTempl
 }
 
 export function inspectionQueryString(filters: InspectionFilters): string {
-  const params = new URLSearchParams({ page: "1", pageSize: "200" });
+  const params = pageParams(filters.page);
   if (filters.status) params.set("status", filters.status);
   if (filters.inspectionType) params.set("inspectionType", filters.inspectionType);
   if (filters.result) params.set("result", filters.result);

@@ -18,6 +18,7 @@ import {
   valuations,
 } from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
+import { listSearchSources } from "../search/registry.js";
 import type { BuiltApp } from "../../app.js";
 import { newId } from "../../lib/ids.js";
 
@@ -1339,5 +1340,33 @@ describe("health inputs and sweeps", () => {
         and(eq(signals.companyId, owner.companyId), eq(signals.detector, "payment_overdue")),
       );
     expect(again.length).toBe(1);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Search coverage (cross-package contract §3.3)                       */
+/* ------------------------------------------------------------------ */
+
+describe("search registration", () => {
+  it("registers the variation register and the bills as searchable types", () => {
+    const types = listSearchSources().map((s) => s.type);
+    expect(types).toContain("variation");
+    expect(types).toContain("boq");
+    const variationSource = listSearchSources().find((s) => s.type === "variation")!;
+    // A subcontractor-template user without the commercial tool must not find
+    // variations in the palette, so the source declares the tool it needs.
+    expect(variationSource.tool).toBe("commercial");
+    expect(variationSource.scope).toBe("project");
+    expect(
+      variationSource.href({
+        id: "var_1",
+        projectId: "prj_1",
+        title: "Extra piling",
+        subtitle: null,
+        reference: null,
+        status: "agreed",
+        updatedAt: null,
+      }),
+    ).toBe("/projects/prj_1/commercial?tab=variations");
   });
 });

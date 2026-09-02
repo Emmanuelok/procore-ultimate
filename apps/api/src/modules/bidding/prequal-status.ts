@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNotNull } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, lte } from "drizzle-orm";
 import {
   bidInvitations,
   obligations,
@@ -103,22 +103,118 @@ export async function vendorPrequalStatus(
   vendorId: string,
   asOf: string = todayIso(),
 ): Promise<VendorPrequalStatus> {
-  const [vendorRow] = await db
-    .select({ name: vendors.name })
-    .from(vendors)
-    .where(and(eq(vendors.id, vendorId), eq(vendors.companyId, companyId)))
-    .limit(1);
+  const batch = await batchVendorPrequalStatus(db, companyId, [vendorId], asOf);
+  return (
+    batch.get(vendorId) ??
+    emptyStatus(vendorId, null)
+  );
+}
 
-  const rows = await db
+/**
+ * THE SAME ANSWER FOR MANY VENDORS, IN THREE QUERIES.
+ *
+ * `vendorPrequalStatus` ran four queries per vendor — vendor, submissions,
+ * financials, and the derived screening. The invitation list, the tabulation
+ * and the award list all called it once per row, so a package with 200
+ * invitations issued roughly 600 statements and grew linearly with the size
+ * of the supply chain. Everything those queries do is a filter and a sort,
+ * both of which happen perfectly well in memory over a bounded set of rows.
+ */
+export async function batchVendorPrequalStatus(
+  db: Db,
+  companyId: string,
+  vendorIds: readonly string[],
+  asOf: string = todayIso(),
+): Promise<Map<string, VendorPrequalStatus>> {
+  const unique = [...new Set(vendorIds.filter(Boolean))];
+  const out = new Map<string, VendorPrequalStatus>();
+  if (unique.length === 0) return out;
+
+  const vendorRows = await db
+    .select({ id: vendors.id, name: vendors.name })
+    .from(vendors)
+    .where(and(eq(vendors.companyId, companyId), inArray(vendors.id, unique)));
+  const names = new Map(vendorRows.map((v) => [v.id, v.name] as const));
+
+  const submissionRows = await db
     .select()
     .from(prequalificationSubmissions)
     .where(
       and(
         eq(prequalificationSubmissions.companyId, companyId),
-        eq(prequalificationSubmissions.vendorId, vendorId),
+        inArray(prequalificationSubmissions.vendorId, unique),
       ),
     )
     .orderBy(desc(prequalificationSubmissions.createdAt));
+  const byVendor = new Map<string, (typeof submissionRows)[number][]>();
+  for (const row of submissionRows) {
+    byVendor.set(row.vendorId, [...(byVendor.get(row.vendorId) ?? []), row]);
+  }
+
+  const financialRows = await db
+    .select()
+    .from(prequalificationFinancials)
+    .where(
+      and(
+        eq(prequalificationFinancials.companyId, companyId),
+        inArray(prequalificationFinancials.vendorId, unique),
+      ),
+    );
+  const financialsByVendor = new Map<string, (typeof financialRows)[number][]>();
+  for (const row of financialRows) {
+    financialsByVendor.set(row.vendorId, [...(financialsByVendor.get(row.vendorId) ?? []), row]);
+  }
+
+  for (const vendorId of unique) {
+    out.set(
+      vendorId,
+      computePrequalStatus(
+        vendorId,
+        names.get(vendorId) ?? null,
+        byVendor.get(vendorId) ?? [],
+        screeningFromRows(financialsByVendor.get(vendorId) ?? []),
+        asOf,
+      ),
+    );
+  }
+  return out;
+}
+
+function emptyStatus(vendorId: string, vendorName: string | null): VendorPrequalStatus {
+  return {
+    vendorId,
+    vendorName,
+    recommendedLimit: null,
+    submissionId: null,
+    reference: null,
+    questionnaireId: null,
+    status: null,
+    outcome: null,
+    state: "none",
+    validFrom: null,
+    expiresAt: null,
+    daysToExpiry: null,
+    singleProjectLimit: null,
+    aggregateLimit: null,
+    currency: null,
+    tradeScopeApproved: [],
+    conditions: null,
+    knockoutFailed: false,
+    knockoutReason: null,
+    note:
+      `${vendorName ?? "This vendor"} has never been prequalified: there is no ` +
+      "questionnaire submission of any kind on the record for them.",
+  };
+}
+
+export function computePrequalStatus(
+  vendorId: string,
+  vendorName: string | null,
+  rows: readonly (typeof prequalificationSubmissions.$inferSelect)[],
+  screening: RecommendedLimit | null,
+  asOf: string = todayIso(),
+): VendorPrequalStatus {
+  const vendorRow = vendorName === null ? undefined : { name: vendorName };
 
   const base = {
     vendorId,
@@ -126,33 +222,20 @@ export async function vendorPrequalStatus(
     recommendedLimit: null as RecommendedLimit | null,
   };
 
-  if (rows.length === 0) {
-    return {
-      ...base,
-      submissionId: null,
-      reference: null,
-      questionnaireId: null,
-      status: null,
-      outcome: null,
-      state: "none",
-      validFrom: null,
-      expiresAt: null,
-      daysToExpiry: null,
-      singleProjectLimit: null,
-      aggregateLimit: null,
-      currency: null,
-      tradeScopeApproved: [],
-      conditions: null,
-      knockoutFailed: false,
-      knockoutReason: null,
-      note:
-        `${vendorRow?.name ?? "This vendor"} has never been prequalified: there is no ` +
-        "questionnaire submission of any kind on the record for them.",
-    };
-  }
+  if (rows.length === 0) return emptyStatus(vendorId, vendorRow?.name ?? null);
 
-  const decided = rows.filter((r) => isApprovedOutcome(r.outcome) || r.outcome === "rejected");
-  const chosen = decided[0] ?? rows[0]!;
+  /*
+   * A SUPERSEDED APPROVAL IS NOT THE CURRENT ONE. Renewal creates a new
+   * submission carrying `supersedesId`; the old row keeps its outcome and its
+   * expiry forever, which is the point (what did we know about them in 2024?)
+   * but it must never be the row a gate reads.
+   */
+  const supersededIds = new Set(
+    rows.filter((r) => r.supersedesId && isApprovedOutcome(r.outcome)).map((r) => r.supersedesId!),
+  );
+  const current = rows.filter((r) => !supersededIds.has(r.id));
+  const decided = current.filter((r) => isApprovedOutcome(r.outcome) || r.outcome === "rejected");
+  const chosen = decided[0] ?? current[0] ?? rows[0]!;
   const days = daysUntil(chosen.expiresAt, asOf);
   const approved = isApprovedOutcome(chosen.outcome);
 
@@ -164,8 +247,6 @@ export async function vendorPrequalStatus(
   else if (chosen.status === "expired") state = "lapsed";
   else if (days !== null && days <= RENEWAL_WINDOW_DAYS) state = "expiring";
   else state = "approved";
-
-  const screening = await latestScreening(db, companyId, vendorId);
 
   const noteByState: Record<PrequalState, string> = {
     approved:
@@ -220,24 +301,38 @@ export async function vendorPrequalStatus(
   };
 }
 
-/** The most recent financial screening for a vendor, re-derived on read. */
-export async function latestScreening(
-  db: Db,
-  companyId: string,
-  vendorId: string,
-): Promise<RecommendedLimit | null> {
-  const rows = await db
-    .select()
-    .from(prequalificationFinancials)
-    .where(
-      and(
-        eq(prequalificationFinancials.companyId, companyId),
-        eq(prequalificationFinancials.vendorId, vendorId),
-      ),
-    )
-    .orderBy(desc(prequalificationFinancials.financialYearEnd))
-    .limit(1);
-  const row = rows[0];
+/**
+ * How strong the evidence behind a set of figures is. The unique key on the
+ * screening table is (vendor, year end, SOURCE), so audited accounts and a
+ * self-declared return for the same period sit side by side — and ordering by
+ * year end alone left it to Postgres which of them decided whether the
+ * provenance haircut applied. The effective limit could therefore change
+ * between two identical reads. Evidence quality is an ordering, and here it
+ * is.
+ */
+export const FINANCIAL_SOURCE_RANK: Record<string, number> = {
+  audited_accounts: 0,
+  filed_accounts: 1,
+  credit_agency: 2,
+  bank_reference: 3,
+  management_accounts: 4,
+  self_declared: 5,
+};
+
+const sourceRank = (source: string): number => FINANCIAL_SOURCE_RANK[source] ?? 9;
+
+/** The most recent, best-evidenced financial screening from a set of rows. */
+export function screeningFromRows(
+  rows: readonly (typeof prequalificationFinancials.$inferSelect)[],
+): RecommendedLimit | null {
+  const sorted = [...rows].sort((a, b) => {
+    const byYear = (b.financialYearEnd ?? "").localeCompare(a.financialYearEnd ?? "");
+    if (byYear !== 0) return byYear;
+    const bySource = sourceRank(a.source) - sourceRank(b.source);
+    if (bySource !== 0) return bySource;
+    return (b.verifiedAt ?? "").localeCompare(a.verifiedAt ?? "");
+  });
+  const row = sorted[0];
   if (!row) return null;
   const figures = {
     currency: row.currency,
@@ -258,6 +353,24 @@ export async function latestScreening(
     insolvencyEventCount: ((row.insolvencyEvents as unknown[]) ?? []).length,
   };
   return recommendSingleProjectLimit(figures, deriveRatios(figures));
+}
+
+/** The most recent financial screening for a vendor, re-derived on read. */
+export async function latestScreening(
+  db: Db,
+  companyId: string,
+  vendorId: string,
+): Promise<RecommendedLimit | null> {
+  const rows = await db
+    .select()
+    .from(prequalificationFinancials)
+    .where(
+      and(
+        eq(prequalificationFinancials.companyId, companyId),
+        eq(prequalificationFinancials.vendorId, vendorId),
+      ),
+    );
+  return screeningFromRows(rows);
 }
 
 /**
@@ -377,18 +490,57 @@ export function evaluatePrequalGate(
 /* The lazy sweep                                                      */
 /* ------------------------------------------------------------------ */
 
-/** Signal keys already raised for a detector in this company. */
-async function alreadySignalled(db: Db, companyId: string, detector: string): Promise<Set<string>> {
+/**
+ * Which of THESE submissions already carry a signal from this detector.
+ *
+ * The previous version loaded every signal the detector had ever raised in
+ * the company on every list read. The keys we care about are known before the
+ * query runs, so the fingerprint column answers it directly.
+ */
+async function alreadySignalledFor(
+  db: Db,
+  companyId: string,
+  detector: string,
+  keys: readonly string[],
+): Promise<Set<string>> {
+  if (keys.length === 0) return new Set();
   const rows = await db
-    .select({ refs: signals.evidenceRefs })
+    .select({ refs: signals.evidenceRefs, fingerprint: signals.fingerprint })
     .from(signals)
-    .where(and(eq(signals.companyId, companyId), eq(signals.detector, detector)));
-  const keys = new Set<string>();
+    .where(
+      and(
+        eq(signals.companyId, companyId),
+        eq(signals.detector, detector),
+        inArray(signals.fingerprint, keys.map((k) => `${detector}:${k}`)),
+      ),
+    );
+  const found = new Set<string>();
   for (const row of rows) {
     const refs = row.refs as { key?: unknown } | null;
-    if (typeof refs?.key === "string") keys.add(refs.key);
+    if (typeof refs?.key === "string") found.add(refs.key);
   }
-  return keys;
+  /*
+   * Signals raised before this detector started stamping a fingerprint carry
+   * their key only inside evidenceRefs. A bounded second pass over the
+   * unfingerprinted rows keeps those from being raised a second time without
+   * reintroducing the unbounded scan.
+   */
+  const legacy = await db
+    .select({ refs: signals.evidenceRefs })
+    .from(signals)
+    .where(
+      and(
+        eq(signals.companyId, companyId),
+        eq(signals.detector, detector),
+        isNull(signals.fingerprint),
+      ),
+    )
+    .limit(500);
+  for (const row of legacy) {
+    const refs = row.refs as { key?: unknown } | null;
+    if (typeof refs?.key === "string") found.add(refs.key);
+  }
+  return found;
 }
 
 /**
@@ -470,6 +622,20 @@ export async function sweepPrequalification(
     notes: [],
   };
 
+  /*
+   * BOUNDED BY THE INDEX, NOT BY THE TABLE.
+   *
+   * This ran on every list and detail read and selected EVERY live approval
+   * in the company, then loaded every prequalification_lapsed signal ever
+   * raised. Nothing outside the renewal window can change on any given day,
+   * so the query is bounded by (company_id, expires_at) — the index that
+   * exists for exactly this — and the signal lookup is narrowed to the rows
+   * that came back. The scheduled job `bidding.prequalification-expiry` is
+   * the primary driver; this read-path call is now cheap enough to keep as
+   * the belt to its braces.
+   */
+  const horizon = new Date(`${asOf}T00:00:00Z`);
+  horizon.setUTCDate(horizon.getUTCDate() + RENEWAL_WINDOW_DAYS);
   const live = await db
     .select()
     .from(prequalificationSubmissions)
@@ -478,14 +644,76 @@ export async function sweepPrequalification(
         eq(prequalificationSubmissions.companyId, companyId),
         inArray(prequalificationSubmissions.outcome, [...APPROVED_PREQUAL_OUTCOMES]),
         isNotNull(prequalificationSubmissions.expiresAt),
+        lte(prequalificationSubmissions.expiresAt, horizon.toISOString().slice(0, 10)),
       ),
     );
   if (live.length === 0) return result;
 
-  const seen = await alreadySignalled(db, companyId, "prequalification_lapsed");
+  /*
+   * A SUPERSEDED APPROVAL DOES NOT LAPSE — IT WAS REPLACED.
+   *
+   * After renew -> approve, the old approval still carried its own expiry
+   * date. The sweep expired it, breached its renewal obligation and raised a
+   * high-severity "Prequalification lapsed" signal, even though the renewal
+   * had been approved and the register correctly reported the vendor as
+   * approved. The register and the signals disagreed, which is worse than
+   * either being wrong on its own.
+   */
+  const supersedingRows = await db
+    .select({
+      id: prequalificationSubmissions.id,
+      supersedesId: prequalificationSubmissions.supersedesId,
+      outcome: prequalificationSubmissions.outcome,
+      reference: prequalificationSubmissions.reference,
+    })
+    .from(prequalificationSubmissions)
+    .where(
+      and(
+        eq(prequalificationSubmissions.companyId, companyId),
+        isNotNull(prequalificationSubmissions.supersedesId),
+      ),
+    );
+  const supersededBy = new Map<string, string>();
+  for (const row of supersedingRows) {
+    if (row.supersedesId && isApprovedOutcome(row.outcome)) {
+      supersededBy.set(row.supersedesId, row.reference);
+    }
+  }
+
+  const seen = await alreadySignalledFor(
+    db,
+    companyId,
+    "prequalification_lapsed",
+    live.map((r) => r.id),
+  );
   const now = new Date().toISOString();
 
   for (const row of live) {
+    const replacedBy = supersededBy.get(row.id);
+    if (replacedBy) {
+      /*
+       * Close the old approval quietly and satisfy its renewal obligation:
+       * the renewal is exactly the evidence that obligation asked for.
+       */
+      if (row.status !== "superseded" && row.status !== "expired") {
+        await db
+          .update(prequalificationSubmissions)
+          .set({ status: "expired", updatedAt: now })
+          .where(eq(prequalificationSubmissions.id, row.id));
+      }
+      if (row.obligationId) {
+        await db
+          .update(obligations)
+          .set({ status: "satisfied" })
+          .where(and(eq(obligations.id, row.obligationId), eq(obligations.status, "open")));
+      }
+      result.notes.push(
+        `${row.reference} expired on ${row.expiresAt} but was superseded by ${replacedBy}, which ` +
+          "is approved. No lapse was raised and its renewal obligation is satisfied — the " +
+          "renewal is the evidence that obligation asked for.",
+      );
+      continue;
+    }
     const days = daysUntil(row.expiresAt, asOf);
     if (days === null) continue;
 
@@ -546,6 +774,11 @@ export async function sweepPrequalification(
             expiresAt: row.expiresAt,
             obligationId: row.obligationId,
           },
+          fingerprint: `prequalification_lapsed:${row.id}`,
+          subjectType: "vendor",
+          subjectId: row.vendorId,
+          firstSeenAt: now,
+          lastSeenAt: now,
         });
         await db
           .update(prequalificationSubmissions)

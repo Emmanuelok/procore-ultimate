@@ -7,6 +7,9 @@
  *     CSV export and recorded (not dispatched) schedules
  *   · Dashboards — prebuilt role dashboards seeded from real definitions,
  *     executed widget-by-widget under the caller's own project reach
+ *   · Insights   — reference-class overrun forecasts (#753-758) with the
+ *     sample size and reasons behind every figure, and the report run history
+ *     (#752) showing whether a scheduled delivery actually left
  *
  * The dataset registry is company reference data, so it is loaded once here
  * and shared with the report builder that is driven by it.
@@ -16,12 +19,14 @@ import { useParams, useSearchParams } from "react-router-dom";
 import { api } from "../../lib/api";
 import { PageHeader } from "../../ui";
 import DashboardsTab from "./DashboardsTab";
+import InsightsTab from "./InsightsTab";
 import ReportsTab from "./ReportsTab";
 import { TabBar, errorMessage, type DatasetsResponse } from "./analyticsShared";
 
 const TABS = [
   { key: "reports", label: "Reports" },
   { key: "dashboards", label: "Dashboards" },
+  { key: "insights", label: "Insights & runs" },
 ];
 
 export default function AnalyticsPage() {
@@ -74,6 +79,7 @@ export default function AnalyticsPage() {
         />
       ) : null}
       {tab === "dashboards" ? <DashboardsTab projectId={projectId} /> : null}
+      {tab === "insights" ? <InsightsTab projectId={projectId} /> : null}
     </div>
   );
 }

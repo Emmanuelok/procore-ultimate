@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
-import { and, asc, count, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   apiTokens,
@@ -34,6 +34,7 @@ import {
 import {
   ALL_INGESTION_DATASETS,
   INGESTION_MODES,
+  INGESTION_RESOLUTIONS,
   meetsLevel,
   INGESTION_RUN_STATUSES,
   INGESTION_SOURCE_KINDS,
@@ -119,8 +120,46 @@ const recordsListQuery = pageQuerySchema.extend({
 });
 
 const mapSchema = z.object({
-  columnMap: z.record(z.string().min(1).max(100), z.string().min(1).max(200)),
+  columnMap: z.record(z.string().min(1).max(100), z.string().min(1).max(200)).optional(),
+  /** adopt a saved template instead of restating its map */
+  templateId: z.string().min(1).max(64).optional(),
+}).refine(
+  (b) => Boolean(b.columnMap) !== Boolean(b.templateId),
+  "supply exactly one of columnMap or templateId",
+);
+
+const programmeFieldsSchema = z.object({
+  sourceId: z.string().min(1).max(64),
+  projectId: z.string().min(1).max(64).optional(),
+  format: z.enum(["p6_xer", "msp_xml"]).optional(),
 });
+
+const templateListQuery = pageQuerySchema.extend({
+  dataset: z.enum(ALL_INGESTION_DATASETS).optional(),
+  sourceId: z.string().min(1).max(64).optional(),
+});
+
+const resolutionSchema = z.object({
+  resolution: z.enum(INGESTION_RESOLUTIONS),
+});
+
+/**
+ * The dataset fields a programme parser fills. Declared here rather than
+ * derived so the identity column map a programme run stores is explicit and
+ * shows in the UI exactly like a CSV run's map does.
+ */
+const PROGRAMME_FIELDS = [
+  "name",
+  "taskCode",
+  "wbsCode",
+  "durationDays",
+  "percentComplete",
+  "actualStart",
+  "actualFinish",
+  "constraintType",
+  "constraintDate",
+  "predecessors",
+] as const;
 
 const tokenCreateSchema = z.object({
   name: z.string().min(1).max(200),
@@ -1629,6 +1668,10 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
       sourceId: fieldVal("sourceId"),
       dataset: fieldVal("dataset"),
       projectId: fieldVal("projectId"),
+      // insert (the default) rejects a re-presented externalId as a duplicate;
+      // reconcile matches it and offers the difference for a decision, which is
+      // what a monthly re-export of the same register actually needs.
+      mode: fieldVal("mode"),
     });
     const source = await fetchSource(fields.sourceId, req.companyId!);
     if (source.isActive !== 1) throw badRequest("Ingestion source is deactivated");
@@ -1690,6 +1733,8 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
       fileName,
       fileSha256: saved.sha256,
       totalRows: dataRows.length,
+      mode: fields.mode ?? "insert",
+      parser: "csv",
       startedBy: req.user!.id,
     });
     await appendLedger(app.db, {
@@ -1705,6 +1750,7 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
         fileName,
         fileSha256: saved.sha256,
         totalRows: dataRows.length,
+        mode: fields.mode ?? "insert",
       },
       storePayload: true,
     });
@@ -1727,8 +1773,38 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
       throw badRequest("Run has no uploaded file to map (machine-push runs are mapped implicitly)");
     }
     const def = datasetDef(run.dataset)!;
+    /*
+     * A template is a saved map, so adopting one is the same operation with the
+     * map read from a row instead of the body — including the same validation,
+     * because a template written before a dataset changed must fail here rather
+     * than stage nonsense.
+     */
+    let columnMap: Record<string, string>;
+    let adoptedTemplateId: string | null = null;
+    if (body.templateId) {
+      const [tpl] = await app.db
+        .select()
+        .from(ingestionMappingTemplates)
+        .where(
+          and(
+            eq(ingestionMappingTemplates.id, body.templateId),
+            eq(ingestionMappingTemplates.companyId, req.companyId!),
+          ),
+        )
+        .limit(1);
+      if (!tpl) throw notFound("Mapping template not found");
+      if (tpl.dataset !== run.dataset) {
+        throw badRequest(
+          `Template "${tpl.name}" maps the ${tpl.dataset} dataset, but this run is ${run.dataset}`,
+        );
+      }
+      columnMap = tpl.columnMap;
+      adoptedTemplateId = tpl.id;
+    } else {
+      columnMap = body.columnMap!;
+    }
     const fieldKeys = new Set(def.fields.map((f) => f.key));
-    for (const key of Object.keys(body.columnMap)) {
+    for (const key of Object.keys(columnMap)) {
       if (!fieldKeys.has(key)) {
         throw badRequest(
           `Unknown target field "${key}" for dataset ${run.dataset} — see GET /ingestion/datasets`,
@@ -1736,7 +1812,7 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
       }
     }
     for (const f of def.fields) {
-      if (f.required && !(f.key in body.columnMap)) {
+      if (f.required && !(f.key in columnMap)) {
         throw badRequest(`Required field "${f.key}" is not mapped`);
       }
     }
@@ -1744,7 +1820,7 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
     const parsed = parseCsv((await readRunFile(run)).toString("utf8"));
     const header = (parsed[0] ?? []).map((h) => h.trim());
     const colIndex = new Map(header.map((h, i) => [h, i] as const));
-    for (const [field, col] of Object.entries(body.columnMap)) {
+    for (const [field, col] of Object.entries(columnMap)) {
       if (!colIndex.has(col)) {
         throw badRequest(`Field "${field}" is mapped to source column "${col}", which is not in the file header`);
       }
@@ -1755,7 +1831,7 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
     await app.db.delete(ingestedRecords).where(eq(ingestedRecords.runId, run.id));
     const inserts: (typeof ingestedRecords.$inferInsert)[] = dataRows.map((row, i) => {
       const payload: Record<string, unknown> = {};
-      for (const [field, col] of Object.entries(body.columnMap)) {
+      for (const [field, col] of Object.entries(columnMap)) {
         const v = row[colIndex.get(col)!] ?? "";
         if (v.trim() !== "") payload[field] = v;
       }
@@ -1775,7 +1851,7 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
     await app.db
       .update(ingestionRuns)
       .set({
-        columnMap: body.columnMap,
+        columnMap,
         status: "staging",
         stagedCount: inserts.length,
         rejectedCount: 0,
@@ -1794,9 +1870,29 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
       action: "update",
       objectType: "ingestion_run",
       objectId: run.id,
-      payload: { phase: "map", columnMap: body.columnMap, staged: inserts.length },
+      payload: {
+        phase: "map",
+        columnMap,
+        staged: inserts.length,
+        templateId: adoptedTemplateId,
+      },
     });
-    return { run: await fetchRun(run.id, req.companyId!), staged: inserts.length };
+    if (adoptedTemplateId) {
+      // The honest measure of whether a template is right is how many runs
+      // adopted it, so the counter is incremented where adoption happens.
+      await app.db
+        .update(ingestionMappingTemplates)
+        .set({
+          useCount: sql`${ingestionMappingTemplates.useCount} + 1`,
+          updatedAt: new Date().toISOString(),
+        })
+        .where(eq(ingestionMappingTemplates.id, adoptedTemplateId));
+    }
+    return {
+      run: await fetchRun(run.id, req.companyId!),
+      staged: inserts.length,
+      templateId: adoptedTemplateId,
+    };
   });
 
   app.post("/ingestion/runs/:runId/validate", { preHandler: adminGate }, async (req) => {
@@ -1824,8 +1920,35 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
     // statement that verifies it was committable, so a second request finds
     // nothing to claim and is told so instead of committing the rows again.
     const run = await claimRun(runId, req.companyId!, ["validated", "failed"], "committing");
-    const result = await runCommit(run, req.user!.id, req.user!.id);
-    return { run: await fetchRun(run.id, req.companyId!), ...result };
+    try {
+      const result = await runCommit(run, req.user!.id, req.user!.id);
+      return { run: await fetchRun(run.id, req.companyId!), ...result };
+    } catch (err) {
+      /*
+       * A REFUSED COMMIT MUST NOT STRAND THE RUN.
+       *
+       * runCommit's preconditions (no active schedule, locked budget, nothing
+       * staged) throw before anything is written, and its own catch marks the
+       * run `failed` when the transaction itself fails. So a run still sitting
+       * in `committing` here was refused before it started: the staged rows are
+       * exactly as validation left them, and the run goes back to `validated`
+       * so the operator can fix the precondition and try again. Without this
+       * the claim — which is what makes concurrent commits safe — would leave
+       * the run in a state no transition accepts.
+       */
+      const [current] = await app.db
+        .select({ status: ingestionRuns.status })
+        .from(ingestionRuns)
+        .where(eq(ingestionRuns.id, run.id))
+        .limit(1);
+      if (current?.status === "committing") {
+        await app.db
+          .update(ingestionRuns)
+          .set({ status: "validated", updatedAt: new Date().toISOString() })
+          .where(eq(ingestionRuns.id, run.id));
+      }
+      throw err;
+    }
   });
 
   app.post("/ingestion/runs/:runId/discard", { preHandler: adminGate }, async (req) => {
@@ -1896,6 +2019,405 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
       .offset(pageOffset(q));
     return paginate(items, Number(totalRow?.n ?? 0), q);
   });
+
+
+  /* ---------------------------------------------------------------- */
+  /* Programme import — P6 XER and MS Project XML (#349-350)           */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Upload a contractor programme.
+   *
+   * WHY IT IS A SEPARATE INLET. A CSV needs a mapping step because its columns
+   * are whatever the author typed; an XER and an MSP XML carry their own field
+   * names, so the mapping is known before the file arrives. The route therefore
+   * parses, stages and reports in one call — and everything downstream is
+   * identical: the same staging table, the same validation, the same explicit
+   * commit, the same ledger entry, the same CPM recompute the CSV path gained.
+   *
+   * The caveats the parser produces (calendars, resources, baselines) travel
+   * with the response and into the ledger, because a programme whose dates
+   * quietly disagree with the source is worse than one the reader knows to
+   * check.
+   */
+  app.post("/ingestion/runs/programme", { preHandler: adminGate }, async (req, reply) => {
+    if (!req.isMultipart()) {
+      throw badRequest(
+        "Expected multipart/form-data with a file (.xer or .xml) and fields sourceId, projectId",
+      );
+    }
+    const mp = await req.file();
+    if (!mp) throw badRequest("Expected a multipart file upload");
+    const buf = await mp.toBuffer();
+    const fieldVal = (name: string): string | undefined => {
+      const raw = (mp.fields as Record<string, unknown>)[name];
+      const f = Array.isArray(raw) ? raw[0] : raw;
+      const v = (f as { value?: unknown } | undefined)?.value;
+      return typeof v === "string" ? v : undefined;
+    };
+    const fields = programmeFieldsSchema.parse({
+      sourceId: fieldVal("sourceId"),
+      projectId: fieldVal("projectId"),
+      format: fieldVal("format"),
+    });
+    const source = await fetchSource(fields.sourceId, req.companyId!);
+    if (source.isActive !== 1) throw badRequest("Ingestion source is deactivated");
+    if (source.kind === "api_token") {
+      throw badRequest("api_token sources receive machine pushes, not programme uploads");
+    }
+    const projectId = fields.projectId ?? source.projectId ?? null;
+    if (!projectId) throw badRequest("A programme import requires a projectId");
+    await assertProjectInCompany(projectId, req.companyId!);
+
+    const fileName = mp.filename || "programme";
+    const text = buf.toString("utf8");
+    const format = fields.format ?? sniffProgramme(text, fileName);
+    if (!format) {
+      throw badRequest(
+        "Could not tell whether this file is a P6 XER or an MS Project XML. Pass format=p6_xer " +
+          "or format=msp_xml, or upload the file with its original extension. Note that a .mpp " +
+          "(the binary format) cannot be read — export it as XML from Microsoft Project first.",
+      );
+    }
+    let parsedProgramme: ProgrammeParseResult;
+    try {
+      parsedProgramme = parseProgramme(text, format);
+    } catch (err) {
+      throw badRequest(
+        `Could not parse this ${format === "p6_xer" ? "P6 XER" : "MS Project XML"} file: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    if (parsedProgramme.tasks.length === 0) {
+      throw badRequest(
+        "The file parsed but contains no activities. Export the programme with its activity " +
+          "table included (P6: the TASK table; MS Project: Tasks).",
+      );
+    }
+    if (parsedProgramme.tasks.length > MAX_ROWS_PER_RUN) {
+      throw badRequest(
+        `Programme has ${parsedProgramme.tasks.length} activities — the per-run cap is ${MAX_ROWS_PER_RUN}`,
+      );
+    }
+
+    const saved = await app.storage.saveBuffer(req.companyId!, buf);
+    const fileId = newId("fil");
+    await app.db.insert(files).values({
+      id: fileId,
+      companyId: req.companyId!,
+      projectId,
+      folderId: null,
+      name: fileName,
+      contentType: mp.mimetype || (format === "msp_xml" ? "application/xml" : "text/plain"),
+      sizeBytes: saved.sizeBytes,
+      sha256: saved.sha256,
+      storageKey: saved.storageKey,
+      metadata: { ingestion: true, programme: format },
+      uploadedBy: req.user!.id,
+    });
+
+    const runId = newId("irn");
+    // The map is the identity: the parser already speaks the dataset's own
+    // field names, which is exactly why a programme needs no mapping step.
+    const columnMap = Object.fromEntries(
+      PROGRAMME_FIELDS.map((f) => [f, f] as const),
+    ) as Record<string, string>;
+    await app.db.insert(ingestionRuns).values({
+      id: runId,
+      companyId: req.companyId!,
+      projectId,
+      sourceId: source.id,
+      dataset: "schedule_tasks",
+      status: "staging",
+      fileId,
+      fileName,
+      fileSha256: saved.sha256,
+      columnMap,
+      totalRows: parsedProgramme.tasks.length,
+      stagedCount: parsedProgramme.tasks.length,
+      parser: format,
+      progressNote: parsedProgramme.projectName
+        ? `Programme "${parsedProgramme.projectName}"`
+        : null,
+      startedBy: req.user!.id,
+    });
+
+    const inserts: (typeof ingestedRecords.$inferInsert)[] = parsedProgramme.tasks.map(
+      (task, i) => ({
+        id: newId("irc"),
+        runId,
+        companyId: req.companyId!,
+        rowNumber: i + 1,
+        externalId: task.externalId,
+        payload: {
+          name: task.name,
+          taskCode: task.taskCode,
+          ...(task.wbsCode ? { wbsCode: task.wbsCode } : {}),
+          durationDays: String(task.durationDays),
+          ...(task.percentComplete !== null
+            ? { percentComplete: String(task.percentComplete) }
+            : {}),
+          ...(task.actualStart ? { actualStart: task.actualStart } : {}),
+          ...(task.actualFinish ? { actualFinish: task.actualFinish } : {}),
+          ...(task.constraintType ? { constraintType: task.constraintType } : {}),
+          ...(task.constraintDate ? { constraintDate: task.constraintDate } : {}),
+          ...(task.predecessors ? { predecessors: task.predecessors } : {}),
+        },
+        status: "staged",
+      }),
+    );
+    for (let i = 0; i < inserts.length; i += CHUNK) {
+      await app.db.insert(ingestedRecords).values(inserts.slice(i, i + CHUNK));
+    }
+
+    await appendLedger(app.db, {
+      companyId: req.companyId!,
+      actorId: req.user!.id,
+      action: "create",
+      objectType: "ingestion_run",
+      objectId: runId,
+      projectId,
+      payload: {
+        phase: "programme_upload",
+        dataset: "schedule_tasks",
+        parser: format,
+        fileName,
+        fileSha256: saved.sha256,
+        activities: parsedProgramme.tasks.length,
+        danglingLinks: parsedProgramme.danglingLinks,
+        programmeName: parsedProgramme.projectName,
+        caveats: parsedProgramme.caveats,
+      },
+      storePayload: true,
+    });
+
+    return reply.status(201).send({
+      run: await fetchRun(runId, req.companyId!),
+      parser: format,
+      programmeName: parsedProgramme.projectName,
+      earliestDate: parsedProgramme.earliestDate,
+      activities: parsedProgramme.tasks.length,
+      danglingLinks: parsedProgramme.danglingLinks,
+      caveats: parsedProgramme.caveats,
+      preview: parsedProgramme.tasks.slice(0, PREVIEW_ROWS),
+      next:
+        "The activities are staged. Validate them (POST /ingestion/runs/{id}/validate) and then " +
+        "commit (POST /ingestion/runs/{id}/commit); the commit appends them to the project's " +
+        "active schedule, imports the logic links and recomputes the CPM.",
+    });
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Mapping templates                                                 */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * The mapping step is the slow part of every migration and it is identical
+   * every month. A template makes the second import of the same export a
+   * two-click operation, and — because the map is stored rather than retyped —
+   * makes it auditable: two runs claiming the same source can be shown to have
+   * interpreted its columns the same way.
+   */
+  app.get("/ingestion/mapping-templates", { preHandler: memberGate }, async (req) => {
+    const q = templateListQuery.parse(req.query);
+    const where = and(
+      eq(ingestionMappingTemplates.companyId, req.companyId!),
+      q.dataset ? eq(ingestionMappingTemplates.dataset, q.dataset) : undefined,
+      q.sourceId ? eq(ingestionMappingTemplates.sourceId, q.sourceId) : undefined,
+    );
+    const [totalRow] = await app.db
+      .select({ n: count() })
+      .from(ingestionMappingTemplates)
+      .where(where);
+    const items = await app.db
+      .select()
+      .from(ingestionMappingTemplates)
+      .where(where)
+      .orderBy(desc(ingestionMappingTemplates.useCount), asc(ingestionMappingTemplates.name))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    return paginate(items, Number(totalRow?.n ?? 0), q);
+  });
+
+  app.post("/ingestion/mapping-templates", { preHandler: adminGate }, async (req, reply) => {
+    const body = templateCreateSchema.parse(req.body);
+    const def = datasetDef(body.dataset);
+    if (!def) throw badRequest(`Unknown dataset "${body.dataset}"`);
+    const fieldKeys = new Set(def.fields.map((f) => f.key));
+    for (const key of Object.keys(body.columnMap)) {
+      if (!fieldKeys.has(key)) {
+        throw badRequest(
+          `Unknown target field "${key}" for dataset ${body.dataset} — see GET /ingestion/datasets`,
+        );
+      }
+    }
+    if (body.sourceId) await fetchSource(body.sourceId, req.companyId!);
+    const id = newId("imt");
+    await app.db.insert(ingestionMappingTemplates).values({
+      id,
+      companyId: req.companyId!,
+      sourceId: body.sourceId ?? null,
+      dataset: body.dataset,
+      name: body.name,
+      columnMap: body.columnMap,
+      createdBy: req.user!.id,
+    });
+    await appendLedger(app.db, {
+      companyId: req.companyId!,
+      actorId: req.user!.id,
+      action: "create",
+      objectType: "ingestion_mapping_template",
+      objectId: id,
+      payload: { name: body.name, dataset: body.dataset, fields: Object.keys(body.columnMap) },
+      storePayload: true,
+    });
+    const [created] = await app.db
+      .select()
+      .from(ingestionMappingTemplates)
+      .where(eq(ingestionMappingTemplates.id, id))
+      .limit(1);
+    return reply.status(201).send(created);
+  });
+
+  app.delete(
+    "/ingestion/mapping-templates/:templateId",
+    { preHandler: adminGate },
+    async (req, reply) => {
+      const { templateId } = req.params as { templateId: string };
+      const [row] = await app.db
+        .select()
+        .from(ingestionMappingTemplates)
+        .where(
+          and(
+            eq(ingestionMappingTemplates.id, templateId),
+            eq(ingestionMappingTemplates.companyId, req.companyId!),
+          ),
+        )
+        .limit(1);
+      if (!row) throw notFound("Mapping template not found");
+      await app.db
+        .delete(ingestionMappingTemplates)
+        .where(eq(ingestionMappingTemplates.id, templateId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "delete",
+        objectType: "ingestion_mapping_template",
+        objectId: templateId,
+        payload: { name: row.name, dataset: row.dataset },
+      });
+      return reply.status(204).send();
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Reconcile decisions                                               */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Decide what to do with a row that restates an already-committed record.
+   *
+   * In `insert` mode a re-presented externalId is a duplicate and is rejected;
+   * that is right for a first migration and wrong for the monthly re-export
+   * every operator actually has. In `reconcile` mode the row is matched, the
+   * difference is computed field by field, and an operator says per row whether
+   * the restatement should be applied. The decision is recorded on the staged
+   * row, so the commit is a faithful execution of choices somebody made rather
+   * than a policy buried in code.
+   */
+  app.post(
+    "/ingestion/runs/:runId/records/:recordId/resolution",
+    { preHandler: adminGate },
+    async (req) => {
+      const { runId, recordId } = req.params as { runId: string; recordId: string };
+      const body = resolutionSchema.parse(req.body);
+      const run = await fetchRun(runId, req.companyId!);
+      if (run.status === "committed" || run.status === "discarded") {
+        throw conflict(`Run is ${run.status} — its rows can no longer be re-decided`);
+      }
+      const [row] = await app.db
+        .select()
+        .from(ingestedRecords)
+        .where(
+          and(
+            eq(ingestedRecords.id, recordId),
+            eq(ingestedRecords.runId, run.id),
+            eq(ingestedRecords.companyId, req.companyId!),
+          ),
+        )
+        .limit(1);
+      if (!row) throw notFound("Staged record not found");
+      if (!row.matchedRecordId) {
+        throw badRequest(
+          "This row does not restate a committed record, so there is nothing to reconcile. " +
+            "Resolutions apply only to matched rows in a reconcile-mode run.",
+        );
+      }
+      await app.db
+        .update(ingestedRecords)
+        .set({ resolution: body.resolution })
+        .where(eq(ingestedRecords.id, recordId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "ingestion_run",
+        objectId: run.id,
+        payload: {
+          phase: "reconcile_decision",
+          recordId,
+          rowNumber: row.rowNumber,
+          matchedRecordId: row.matchedRecordId,
+          resolution: body.resolution,
+        },
+      });
+      const [after] = await app.db
+        .select()
+        .from(ingestedRecords)
+        .where(eq(ingestedRecords.id, recordId))
+        .limit(1);
+      return after;
+    },
+  );
+
+  /** Set the same decision on every matched row — the common case. */
+  app.post(
+    "/ingestion/runs/:runId/resolutions",
+    { preHandler: adminGate },
+    async (req) => {
+      const { runId } = req.params as { runId: string };
+      const body = resolutionSchema.parse(req.body);
+      const run = await fetchRun(runId, req.companyId!);
+      if (run.status === "committed" || run.status === "discarded") {
+        throw conflict(`Run is ${run.status} — its rows can no longer be re-decided`);
+      }
+      const updated = await app.db
+        .update(ingestedRecords)
+        .set({ resolution: body.resolution })
+        .where(
+          and(
+            eq(ingestedRecords.runId, run.id),
+            eq(ingestedRecords.companyId, req.companyId!),
+            isNotNull(ingestedRecords.matchedRecordId),
+          ),
+        )
+        .returning({ id: ingestedRecords.id });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "ingestion_run",
+        objectId: run.id,
+        payload: {
+          phase: "reconcile_decision_bulk",
+          resolution: body.resolution,
+          rows: updated.length,
+        },
+      });
+      return { resolution: body.resolution, rows: updated.length };
+    },
+  );
 
   /* ---------------------------------------------------------------- */
   /* API tokens — machine credentials for evidence streams             */

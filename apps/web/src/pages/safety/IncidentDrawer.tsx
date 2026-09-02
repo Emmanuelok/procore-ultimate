@@ -354,9 +354,7 @@ function RecordSection({
   const person: DescriptionItem[] = [
     {
       label: "Injured person",
-      value:
-        incident.injuredPersonName ??
-        (incident.workerId ? nameOf(users, incident.workerId) : EM_DASH),
+      value: incident.injuredPersonDisplayName ?? incident.injuredPersonName ?? EM_DASH,
       hint: incident.workerId
         ? "In the worker register — the same one that carries induction and site access."
         : "Not in any register; recorded by name only.",

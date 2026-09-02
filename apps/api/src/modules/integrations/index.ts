@@ -1,15 +1,26 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
-import { and, count, desc, eq, isNull, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, gt, gte, inArray, isNull, lte, or } from "drizzle-orm";
 import { z } from "zod";
 import {
+  developerSandboxes,
+  integrationExportProfiles,
+  invoiceLineItems,
+  invoices,
   oauthAccessTokens,
   oauthClients,
   projects,
+  vendors,
   webhookDeliveries,
   webhookEndpoints,
 } from "@constructos/db";
 import { sha256Hex } from "@constructos/ledger";
-import { OAUTH_GRANT_TYPES, WEBHOOK_DELIVERY_STATUSES } from "@constructos/shared";
+import {
+  ERP_EXPORT_FORMATS,
+  ERP_FEEDS,
+  OAUTH_GRANT_TYPES,
+  WEBHOOK_DELIVERY_STATUSES,
+  type ErpFeed,
+} from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { appendLedger, setLedgerEmitHook } from "../../lib/ledger.js";
 import { AppError, badRequest, conflict, notFound } from "../../lib/errors.js";
@@ -48,6 +59,19 @@ import {
   newClientIdValue,
   newClientSecretValue,
 } from "./machine-auth.js";
+import { checkWebhookUrl, policyFor, type SsrfPolicy } from "./ssrf.js";
+import {
+  applyFieldMap,
+  currenciesIn,
+  FEED_FIELDS,
+  identityFieldMap,
+  STARTER_PROFILES,
+  toCsv,
+  validateFieldMap,
+  type CanonicalRow,
+  type FieldMapEntry,
+} from "./erp.js";
+import { buildOpenApiDocument, parseRouteTree } from "./openapi.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -121,6 +145,62 @@ const clientPatchSchema = z
 
 const introspectSchema = z.object({ token: z.string().min(1).max(4096) });
 
+const rotateSecretSchema = z
+  .object({
+    /** how long BOTH secrets stay valid; 0 cuts over immediately */
+    graceMinutes: z.number().int().min(0).max(10_080).optional(),
+  })
+  .optional()
+  .default({});
+
+const replaySchema = z.object({
+  fromSeq: z.number().int().min(0),
+  toSeq: z.number().int().min(0).nullable().optional(),
+  limit: z.number().int().min(1).max(1_000).optional(),
+});
+
+const fieldMapEntrySchema = z
+  .object({
+    target: z.string().min(1).max(120),
+    source: z.string().min(1).max(120).optional(),
+    constant: z.string().max(200).optional(),
+  })
+  .strict();
+
+const profileCreateSchema = z.object({
+  name: z.string().min(1).max(200),
+  system: z.string().min(2).max(40),
+  feed: z.enum(ERP_FEEDS),
+  fieldMap: z.array(fieldMapEntrySchema).min(1).max(120).optional(),
+  format: z.enum(ERP_EXPORT_FORMATS).optional(),
+  notes: z.string().max(2000).nullable().optional(),
+  /** clone one of the built-in starters instead of writing the map by hand */
+  starter: z.string().min(2).max(60).optional(),
+});
+
+const profilePatchSchema = z
+  .object({
+    name: z.string().min(1).max(200).optional(),
+    fieldMap: z.array(fieldMapEntrySchema).min(1).max(120).optional(),
+    format: z.enum(ERP_EXPORT_FORMATS).optional(),
+    notes: z.string().max(2000).nullable().optional(),
+    active: z.boolean().optional(),
+  })
+  .refine((body) => Object.keys(body).length > 0, "no fields to update");
+
+const erpExportQuery = z.object({
+  feed: z.enum(ERP_FEEDS).optional(),
+  profileId: z.string().min(1).max(64).optional(),
+  format: z.enum(ERP_EXPORT_FORMATS).optional(),
+  /** ISO dates bounding the billing period end */
+  periodFrom: z.string().min(4).max(40).optional(),
+  periodTo: z.string().min(4).max(40).optional(),
+  status: z.string().min(2).max(40).optional(),
+  limit: z.coerce.number().int().min(1).max(5_000).optional(),
+});
+
+const sandboxSchema = z.object({ purpose: z.string().max(500).nullable().optional() });
+
 /* ------------------------------------------------------------------ */
 /* Module                                                              */
 /* ------------------------------------------------------------------ */
@@ -173,11 +253,103 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
   setLedgerEmitHook(app.db, async (event) => {
     await dispatcher.emit(event);
   });
+
+  /*
+   * EGRESS POLICY. Webhook targets are checked when they are configured and
+   * again immediately before every send. In production that means https only
+   * and a DNS resolution whose every answer must be a public address; in
+   * development and test the literal-address rules still apply but no name
+   * server is consulted, so a suite never depends on DNS and a developer can
+   * point a hook at a local tunnel. See ./ssrf.ts for what each rule refuses.
+   */
+  const ssrfPolicy: SsrfPolicy = policyFor({
+    NODE_ENV: app.appConfig.NODE_ENV,
+    ...(process.env["WEBHOOK_ALLOW_HOSTS"]
+      ? { WEBHOOK_ALLOW_HOSTS: process.env["WEBHOOK_ALLOW_HOSTS"] }
+      : {}),
+  });
+  dispatcher.setSsrfPolicy(ssrfPolicy);
+
+  /*
+   * SANDBOX LABELLING. The emit path runs inside the ledger append hook and
+   * may not add a query per event, so the sandbox set is cached and refreshed
+   * lazily. A tenant that becomes (or stops being) a sandbox is reflected
+   * immediately by the routes below, which invalidate the cache on write.
+   */
+  const sandboxCache = { at: 0, ids: new Set<string>() };
+  const SANDBOX_TTL_MS = 60_000;
+  async function refreshSandboxCache(force = false): Promise<Set<string>> {
+    if (!force && Date.now() - sandboxCache.at < SANDBOX_TTL_MS) return sandboxCache.ids;
+    const rows = await app.db
+      .select({ companyId: developerSandboxes.companyId })
+      .from(developerSandboxes)
+      .limit(5_000);
+    sandboxCache.ids = new Set(rows.map((r) => r.companyId));
+    sandboxCache.at = Date.now();
+    return sandboxCache.ids;
+  }
+  dispatcher.setSandboxCheck((companyId) => sandboxCache.ids.has(companyId));
+  void refreshSandboxCache(true).catch(() => {});
+
   dispatcher.start();
   app.addHook("onClose", async () => {
     dispatcher.stop();
     setLedgerEmitHook(app.db, null);
   });
+
+  /*
+   * RETENTION. The delivery log is per endpoint per ledger entry and nothing
+   * used to remove a row, so a busy tenant's table grew without bound. Settled
+   * rows are pruned on the platform scheduler rather than opportunistically on
+   * a page read, because a table that only shrinks when somebody opens the
+   * integrations screen is a table that never shrinks on the deployments that
+   * need it most.
+   */
+  app.scheduler.register({
+    name: "integrations.webhook-retention",
+    description:
+      "Prune settled webhook deliveries (delivered/skipped after WEBHOOK_RETENTION_DAYS, " +
+      "exhausted after WEBHOOK_RETENTION_EXHAUSTED_DAYS). Pending and failed rows are never " +
+      "pruned — they are still owed to a receiver.",
+    everyMs: 6 * 60 * 60_000,
+    runOnBoot: false,
+    run: async ({ now }) => dispatcher.prune(now),
+  });
+
+  /**
+   * Validate a webhook target against the egress policy, and refuse with the
+   * rule that rejected it. A refusal an operator cannot act on is a bug report
+   * waiting to happen, so the reason names the range or the rule by name.
+   */
+  async function assertDeliverable(url: string): Promise<string | null> {
+    const verdict = await checkWebhookUrl(url, ssrfPolicy);
+    if (!verdict.ok) {
+      throw badRequest(`Webhook target refused: ${verdict.reason}`, {
+        code: verdict.code,
+        guard: "webhook-egress",
+      });
+    }
+    return verdict.addresses[0] ?? null;
+  }
+
+  /**
+   * A signing secret that shares custody with the JWT secret is forgeable by
+   * anyone holding that secret. That is a documented trade-off in development;
+   * in production it is a defect, and the moment it would matter is the moment
+   * somebody creates an endpoint. So creation is refused there rather than
+   * quietly issuing a secret nobody should trust.
+   */
+  function assertSigningCustody(): void {
+    if (signingKey.sharedCustody && app.appConfig.NODE_ENV === "production") {
+      throw conflict(
+        "WEBHOOK_SIGNING_KEY is not set, so webhook secrets would be derived from AUTH_SECRET " +
+          "and anyone holding the JWT signing secret could forge a signature. Set " +
+          "WEBHOOK_SIGNING_KEY (32+ random bytes, held separately) before creating endpoints in " +
+          "production. Setting it later invalidates existing endpoint secrets, which is why this " +
+          "is refused now rather than after integrators have adopted them.",
+      );
+    }
+  }
 
   /**
    * OAuth2 token requests arrive form-encoded far more often than as JSON, and
@@ -311,6 +483,8 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
   app.post("/integrations/webhooks", { preHandler: adminGate }, async (req, reply) => {
     const body = endpointCreateSchema.parse(req.body);
     if (body.projectId) await assertProjectInCompany(body.projectId, req.companyId!);
+    assertSigningCustody();
+    const verifiedHost = await assertDeliverable(body.url);
 
     const id = newId("whe");
     // The secret is derived, not generated: HKDF(masterKey, salt=id) means the
@@ -326,6 +500,7 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
       projectId: body.projectId ?? null,
       isActive: body.active === false ? 0 : 1,
       secretFingerprint: fingerprint,
+      verifiedHost,
       createdBy: req.user!.id,
     });
     await appendLedger(app.db, {
@@ -397,6 +572,13 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
     const body = endpointPatchSchema.parse(req.body);
     const existing = await fetchEndpoint(endpointId, req.companyId!);
     if (body.projectId) await assertProjectInCompany(body.projectId, req.companyId!);
+    // A URL change is a new egress target: it is checked exactly as a new
+    // endpoint's is. Re-enabling re-checks the existing URL too, because the
+    // endpoint may have been disabled BY the guard.
+    let verifiedHost = existing.verifiedHost;
+    if (body.url !== undefined || body.active === true) {
+      verifiedHost = await assertDeliverable(body.url ?? existing.url);
+    }
 
     const reactivating = body.active === true && existing.isActive !== 1;
     await app.db
@@ -408,9 +590,18 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
         projectId: body.projectId === undefined ? existing.projectId : body.projectId,
         isActive:
           body.active === undefined ? existing.isActive : body.active ? 1 : 0,
+        verifiedHost,
         // Re-enabling is an explicit statement that the receiver is fixed, so
-        // it clears the consecutive-failure run and the disabled reason with it.
-        ...(reactivating ? { failureCount: 0, disabledReason: null } : {}),
+        // it clears the consecutive-failure run, the breaker and the disabled
+        // reason with it.
+        ...(reactivating
+          ? {
+              failureCount: 0,
+              disabledReason: null,
+              consecutiveErrors: 0,
+              circuitOpenUntil: null,
+            }
+          : {}),
         ...(body.active === false
           ? { disabledReason: `Disabled by ${req.user!.id} on ${new Date().toISOString()}` }
           : {}),
@@ -553,8 +744,23 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
     const opts = dispatcher.options;
     return {
       queue: await dispatcher.queueDepth(req.companyId!),
+      // Depth alone cannot tell "fifty events arrived this second" from "one
+      // event has been stuck for six hours", and only the second is an
+      // incident — so the lag is reported next to it.
+      lag: await dispatcher.queueLag(req.companyId!),
       emitter: dispatcher.getHealth(),
       signing: signingContract(),
+      egress: {
+        requireHttps: ssrfPolicy.requireHttps,
+        resolvesHostnames: ssrfPolicy.resolve !== null,
+        allowHosts: ssrfPolicy.allowHosts ?? [],
+        note:
+          "Every webhook target is checked when it is configured AND immediately before each " +
+          "send. Loopback, link-local (including cloud metadata), RFC 1918, carrier-grade NAT, " +
+          "unique-local, multicast and reserved ranges are refused, as are host names that only " +
+          "name something inside the deployment. A target that starts resolving privately is " +
+          "refused at send time and the endpoint is disabled.",
+      },
       delivery: {
         maxAttempts: opts.maxAttempts,
         backoffBaseMs: opts.backoffBaseMs,
@@ -563,9 +769,18 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
         responseBodyLimit: opts.responseBodyLimit,
         requestTimeoutMs: opts.requestTimeoutMs,
         dispatchIntervalMs: opts.intervalMs,
+        leaseMs: opts.leaseMs,
+        endpointConcurrency: opts.endpointConcurrency,
+        circuitErrorThreshold: opts.circuitErrorThreshold,
+        circuitOpenMs: opts.circuitOpenMs,
+        retentionDays: opts.retentionDays,
+        retentionExhaustedDays: opts.retentionExhaustedDays,
         mode:
           opts.intervalMs > 0
-            ? "in-process interval timer (no external scheduler)"
+            ? "in-process interval timer; rows are claimed with a lease so replicas share the " +
+              "queue instead of duplicating it, endpoints are attempted concurrently under a " +
+              "bounded pool, and a per-endpoint circuit breaker keeps one dead receiver from " +
+              "consuming the cycle"
             : "manual drain only (test mode)",
       },
       env: {
@@ -578,14 +793,192 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
         WEBHOOK_DISPATCH_INTERVAL_MS: opts.intervalMs,
         WEBHOOK_TIMEOUT_MS: opts.requestTimeoutMs,
         WEBHOOK_BATCH_SIZE: opts.batchSize,
+        WEBHOOK_LEASE_MS: opts.leaseMs,
+        WEBHOOK_ENDPOINT_CONCURRENCY: opts.endpointConcurrency,
+        WEBHOOK_CIRCUIT_ERRORS: opts.circuitErrorThreshold,
+        WEBHOOK_CIRCUIT_OPEN_MS: opts.circuitOpenMs,
+        WEBHOOK_RETENTION_DAYS: opts.retentionDays,
+        WEBHOOK_RETENTION_EXHAUSTED_DAYS: opts.retentionExhaustedDays,
+        WEBHOOK_ALLOW_HOSTS: (ssrfPolicy.allowHosts ?? []).join(",") || "(none)",
       },
     };
   });
 
-  /** The subscribable vocabulary, derived from this tenant's own ledger. */
+  /**
+   * The subscribable vocabulary, derived from this tenant's own ledger.
+   *
+   * The derivation is a GROUP BY over every ledger entry the company holds,
+   * which on a tenant with millions of entries is a multi-second scan — and
+   * the integrations page fetched it on mount for every member. It is cached
+   * per company for a short window: the catalogue describes which KINDS have
+   * been seen, and a kind that first appears thirty seconds later is not a
+   * fact anyone is waiting on.
+   */
+  const catalogueCache = new Map<string, { at: number; value: Awaited<ReturnType<typeof eventCatalogue>> }>();
+  const CATALOGUE_TTL_MS = 30_000;
+
   app.get("/integrations/events", { preHandler: memberGate }, async (req) => {
-    return eventCatalogue(app.db, req.companyId!);
+    const companyId = req.companyId!;
+    const cached = catalogueCache.get(companyId);
+    const now = Date.now();
+    if (cached && now - cached.at < CATALOGUE_TTL_MS) {
+      return { ...cached.value, cached: true, cacheTtlMs: CATALOGUE_TTL_MS };
+    }
+    const value = await eventCatalogue(app.db, companyId);
+    catalogueCache.set(companyId, { at: now, value });
+    // Bounded: a long-lived process serving many tenants must not accumulate a
+    // catalogue per tenant for ever.
+    if (catalogueCache.size > 200) {
+      const oldest = [...catalogueCache.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+      if (oldest) catalogueCache.delete(oldest[0]);
+    }
+    return { ...value, cached: false, cacheTtlMs: CATALOGUE_TTL_MS };
   });
+
+  /* ---------------------------------------------------------------- */
+  /* Secret rotation                                                   */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Rotate an endpoint's signing secret WITHOUT dropping a delivery.
+   *
+   * Before this, the only way to change a secret was to delete the endpoint
+   * and create another — which loses the delivery history and guarantees a gap.
+   * Rotation increments a version on the row (the secret is HKDF(masterKey,
+   * `id:vN`), so nothing secret is stored either way) and opens a grace window
+   * during which every delivery carries TWO valid signatures: the standard
+   * header signed with the secret the receiver already holds, and an alternate
+   * header signed with the new one. The receiver adopts the new secret by
+   * accepting either header; when the window closes the standard header
+   * carries the new secret alone.
+   */
+  app.post(
+    "/integrations/webhooks/:endpointId/rotate-secret",
+    { preHandler: adminGate },
+    async (req) => {
+      const { endpointId } = req.params as { endpointId: string };
+      const body = rotateSecretSchema.parse(req.body ?? {});
+      const existing = await fetchEndpoint(endpointId, req.companyId!);
+      const graceMinutes = body.graceMinutes ?? 60 * 24;
+      const now = new Date();
+      const nextVersion = existing.secretVersion + 1;
+      const graceUntil =
+        graceMinutes > 0
+          ? new Date(now.getTime() + graceMinutes * 60_000).toISOString()
+          : null;
+      const secret = dispatcher.secretFor(endpointId, nextVersion);
+      await app.db
+        .update(webhookEndpoints)
+        .set({
+          secretVersion: nextVersion,
+          previousSecretVersion: graceUntil ? existing.secretVersion : null,
+          secretGraceUntil: graceUntil,
+          secretFingerprint: secretFingerprint(secret),
+          updatedAt: now.toISOString(),
+        })
+        .where(eq(webhookEndpoints.id, endpointId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "webhook_endpoint",
+        objectId: endpointId,
+        payload: {
+          phase: "secret_rotation",
+          fromVersion: existing.secretVersion,
+          toVersion: nextVersion,
+          graceMinutes,
+          graceUntil,
+          secretFingerprint: secretFingerprint(secret),
+        },
+        storePayload: true,
+      });
+      return {
+        endpoint: viewEndpoint(await fetchEndpoint(endpointId, req.companyId!)),
+        secret,
+        secretVersion: nextVersion,
+        graceUntil,
+        secretWarning:
+          "This is the new signing secret and it is shown exactly once. Nothing is stored but " +
+          "its fingerprint.",
+        rotation: graceUntil
+          ? {
+              headers: {
+                current: "x-constructos-signature (old secret, until the grace window closes)",
+                next: "x-constructos-signature-alt (the new secret, valid now)",
+                version: "x-constructos-secret-version / x-constructos-secret-version-alt",
+              },
+              note:
+                `Until ${graceUntil} every delivery carries both signatures. Accept EITHER ` +
+                "header while you switch; after that instant the standard header carries the " +
+                "new secret alone and the alternate header stops being sent.",
+            }
+          : {
+              note:
+                "graceMinutes was 0, so the cutover is immediate: the very next delivery is " +
+                "signed with the new secret only. Any receiver still holding the old one will " +
+                "reject it.",
+            },
+      };
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Replay                                                            */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Re-derive deliveries from the ledger for one endpoint (#121).
+   *
+   * A receiver that was down past its retry budget, or an integrator adding a
+   * subscription to a platform that has been running for months, previously had
+   * no way to catch up: the queue only ever held what was emitted while the
+   * endpoint existed and was active. Replay reads the hash-chained ledger — the
+   * platform's own record of what happened — from a sequence number forward and
+   * enqueues exactly the entries the endpoint's subscription selects.
+   */
+  app.post(
+    "/integrations/webhooks/:endpointId/replay",
+    { preHandler: adminGate },
+    async (req) => {
+      const { endpointId } = req.params as { endpointId: string };
+      const body = replaySchema.parse(req.body ?? {});
+      const endpoint = await fetchEndpoint(endpointId, req.companyId!);
+      if (endpoint.isActive !== 1) {
+        throw conflict(
+          "Endpoint is disabled — re-enable it before replaying, or the replayed deliveries " +
+            "would be queued only to be skipped.",
+        );
+      }
+      const limit = body.limit ?? 200;
+      const outcome = await dispatcher.enqueueReplay(endpoint, {
+        fromSeq: body.fromSeq,
+        toSeq: body.toSeq ?? null,
+        limit,
+      });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "webhook_endpoint",
+        objectId: endpointId,
+        payload: { phase: "replay", ...body, ...outcome },
+        storePayload: true,
+      });
+      return {
+        ...outcome,
+        endpointId,
+        limit,
+        note:
+          "Replayed deliveries are ordinary deliveries with new ids, so a receiver that dedupes " +
+          "on x-constructos-delivery will process each event once per replay. `scanned` counts " +
+          "ledger entries read; `enqueued` counts those the subscription selected. Continue " +
+          `from fromSeq=${(outcome.lastSeq ?? body.fromSeq) + 1} to page through more. A ` +
+          "project-narrowed endpoint replays only entries whose stored payload names its " +
+          "project, because ledger_entries does not carry a project column.",
+      };
+    },
+  );
 
   /* ================================================================ */
   /* OAUTH2 — client management                                        */
@@ -1122,6 +1515,503 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
       });
     }
     return reply.status(200).header("cache-control", "no-store").send({ revoked: true });
+  });
+
+  /* ================================================================ */
+  /* ERP CONNECTOR FRAMEWORK (#130-133, #582)                          */
+  /* ================================================================ */
+
+  /**
+   * The canonical vocabulary an ERP profile maps FROM. Published so an
+   * integrator can build a profile without reading the source, and so the web
+   * profile builder has something real to offer instead of a free-text box.
+   */
+  app.get("/integrations/erp/catalogue", { preHandler: memberGate }, async () => ({
+    feeds: ERP_FEEDS.map((feed) => ({
+      feed,
+      fields: FEED_FIELDS[feed],
+    })),
+    formats: ERP_EXPORT_FORMATS,
+    starters: STARTER_PROFILES.map((p) => ({
+      key: p.key,
+      system: p.system,
+      feed: p.feed,
+      name: p.name,
+      notes: p.notes,
+      fieldMap: p.fieldMap,
+    })),
+    note:
+      "ConstructOS speaks ONE canonical shape per feed; a profile renames and reorders it into " +
+      "the columns a given ERP imports. A profile may hold a field back and may supply a " +
+      "constant; it can never invent a figure. The starters follow each product's published " +
+      "import template and are a starting point, not a certification — confirm the vendor and " +
+      "cost-code columns against the customer's own chart of accounts before the first import. " +
+      "Nothing here posts to an ERP: the output is a file, because a write-back integration " +
+      "needs credentials, idempotency and a partial-failure story the read path has to earn first.",
+  }));
+
+  async function fetchProfile(profileId: string, companyId: string) {
+    const [row] = await app.db
+      .select()
+      .from(integrationExportProfiles)
+      .where(
+        and(
+          eq(integrationExportProfiles.id, profileId),
+          eq(integrationExportProfiles.companyId, companyId),
+        ),
+      )
+      .limit(1);
+    if (!row) throw notFound("Export profile not found");
+    return row;
+  }
+
+  app.post("/integrations/erp/profiles", { preHandler: adminGate }, async (req, reply) => {
+    const body = profileCreateSchema.parse(req.body);
+    let fieldMap: FieldMapEntry[];
+    if (body.starter) {
+      const starter = STARTER_PROFILES.find((p) => p.key === body.starter);
+      if (!starter) {
+        throw badRequest(`Unknown starter "${body.starter}"`, {
+          allowed: STARTER_PROFILES.map((p) => p.key),
+        });
+      }
+      if (starter.feed !== body.feed) {
+        throw badRequest(
+          `Starter "${starter.key}" is for the ${starter.feed} feed, not ${body.feed}`,
+        );
+      }
+      fieldMap = starter.fieldMap;
+    } else {
+      fieldMap = (body.fieldMap ?? identityFieldMap(body.feed)) as FieldMapEntry[];
+    }
+    const problems = validateFieldMap(body.feed, fieldMap);
+    if (problems.length > 0) {
+      throw badRequest("Field map is not valid for this feed", { problems });
+    }
+    const id = newId("iep");
+    await app.db.insert(integrationExportProfiles).values({
+      id,
+      companyId: req.companyId!,
+      name: body.name,
+      system: body.system,
+      feed: body.feed,
+      fieldMap,
+      format: body.format ?? "csv",
+      notes: body.notes ?? null,
+      createdBy: req.user!.id,
+    });
+    await appendLedger(app.db, {
+      companyId: req.companyId!,
+      actorId: req.user!.id,
+      action: "create",
+      objectType: "integration_export_profile",
+      objectId: id,
+      payload: { name: body.name, system: body.system, feed: body.feed, columns: fieldMap.length },
+      storePayload: true,
+    });
+    return reply.status(201).send(await fetchProfile(id, req.companyId!));
+  });
+
+  app.get("/integrations/erp/profiles", { preHandler: memberGate }, async (req) => {
+    const q = pageQuerySchema.parse(req.query);
+    const where = eq(integrationExportProfiles.companyId, req.companyId!);
+    const [totalRow] = await app.db
+      .select({ n: count() })
+      .from(integrationExportProfiles)
+      .where(where);
+    const items = await app.db
+      .select()
+      .from(integrationExportProfiles)
+      .where(where)
+      .orderBy(desc(integrationExportProfiles.createdAt))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    return paginate(
+      items.map((r) => ({ ...r, isActive: r.isActive === 1 })),
+      Number(totalRow?.n ?? 0),
+      q,
+    );
+  });
+
+  app.patch("/integrations/erp/profiles/:profileId", { preHandler: adminGate }, async (req) => {
+    const { profileId } = req.params as { profileId: string };
+    const body = profilePatchSchema.parse(req.body);
+    const existing = await fetchProfile(profileId, req.companyId!);
+    const fieldMap = (body.fieldMap ?? existing.fieldMap) as FieldMapEntry[];
+    const problems = validateFieldMap(existing.feed, fieldMap);
+    if (problems.length > 0) {
+      throw badRequest("Field map is not valid for this feed", { problems });
+    }
+    await app.db
+      .update(integrationExportProfiles)
+      .set({
+        name: body.name ?? existing.name,
+        fieldMap,
+        format: body.format ?? existing.format,
+        notes: body.notes === undefined ? existing.notes : body.notes,
+        isActive: body.active === undefined ? existing.isActive : body.active ? 1 : 0,
+        updatedAt: new Date().toISOString(),
+      })
+      .where(eq(integrationExportProfiles.id, profileId));
+    await appendLedger(app.db, {
+      companyId: req.companyId!,
+      actorId: req.user!.id,
+      action: "update",
+      objectType: "integration_export_profile",
+      objectId: profileId,
+      payload: { changed: Object.keys(body) },
+    });
+    const after = await fetchProfile(profileId, req.companyId!);
+    return { ...after, isActive: after.isActive === 1 };
+  });
+
+  app.delete(
+    "/integrations/erp/profiles/:profileId",
+    { preHandler: adminGate },
+    async (req, reply) => {
+      const { profileId } = req.params as { profileId: string };
+      const existing = await fetchProfile(profileId, req.companyId!);
+      await app.db
+        .delete(integrationExportProfiles)
+        .where(eq(integrationExportProfiles.id, profileId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "delete",
+        objectType: "integration_export_profile",
+        objectId: profileId,
+        payload: { name: existing.name, system: existing.system, feed: existing.feed },
+      });
+      return reply.status(204).send();
+    },
+  );
+
+  /**
+   * Build the canonical rows for a feed on one project.
+   *
+   * Every figure comes from the invoice record itself; nothing is recomputed
+   * and nothing is converted. Amounts carry the invoice's own currency and the
+   * export header declares which currencies are present, because an ERP import
+   * that silently mixes them is worse than one that refuses.
+   */
+  async function canonicalRows(
+    companyId: string,
+    projectId: string,
+    feed: ErpFeed,
+    filters: { periodFrom?: string; periodTo?: string; status?: string; limit: number },
+  ): Promise<CanonicalRow[]> {
+    const clauses = [
+      eq(invoices.companyId, companyId),
+      eq(invoices.projectId, projectId),
+      filters.status ? eq(invoices.status, filters.status) : undefined,
+      filters.periodFrom ? gte(invoices.periodEnd, filters.periodFrom) : undefined,
+      filters.periodTo ? lte(invoices.periodEnd, filters.periodTo) : undefined,
+      feed === "payments" ? gt(invoices.amountPaid, 0) : undefined,
+    ].filter((c) => c !== undefined);
+
+    const invoiceRows = await app.db
+      .select()
+      .from(invoices)
+      .where(and(...clauses))
+      .orderBy(desc(invoices.billingDate), asc(invoices.number))
+      .limit(filters.limit);
+    if (invoiceRows.length === 0) return [];
+
+    const vendorIds = [
+      ...new Set(invoiceRows.map((i) => i.vendorId).filter((v): v is string => Boolean(v))),
+    ];
+    const vendorRows = vendorIds.length
+      ? await app.db
+          .select({
+            id: vendors.id,
+            name: vendors.name,
+            // The vendor's ERP code: registrationNumber is the identifier a
+            // finance system keys on more often than the tax id, and both are
+            // offered so a profile can pick either.
+            reference: vendors.registrationNumber,
+            taxId: vendors.taxId,
+          })
+          .from(vendors)
+          .where(and(eq(vendors.companyId, companyId), inArray(vendors.id, vendorIds)))
+      : [];
+    const vendorById = new Map(vendorRows.map((v) => [v.id, v]));
+    const [projectRow] = await app.db
+      .select({ name: projects.name })
+      .from(projects)
+      .where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)))
+      .limit(1);
+    const projectName = projectRow?.name ?? projectId;
+
+    if (feed === "job_cost") {
+      const invoiceById = new Map(invoiceRows.map((i) => [i.id, i]));
+      const lineRows = await app.db
+        .select()
+        .from(invoiceLineItems)
+        .where(
+          and(
+            eq(invoiceLineItems.companyId, companyId),
+            inArray(
+              invoiceLineItems.invoiceId,
+              invoiceRows.map((i) => i.id),
+            ),
+          ),
+        )
+        .orderBy(asc(invoiceLineItems.invoiceId), asc(invoiceLineItems.sortOrder));
+      return lineRows.map((line) => {
+        const inv = invoiceById.get(line.invoiceId);
+        return {
+          lineId: line.id,
+          invoiceId: line.invoiceId,
+          reference: inv?.reference ?? null,
+          projectId,
+          costCode: line.costCode ?? null,
+          costType: line.costType ?? null,
+          description: line.description,
+          currency: inv?.currency ?? null,
+          periodEnd: inv?.periodEnd ?? null,
+          quantity: line.quantity ?? null,
+          unitRate: line.unitRate ?? null,
+          thisPeriodWork: line.thisPeriodWork,
+          thisPeriodStoredMaterials: line.thisPeriodStoredMaterials,
+          retainageThisPeriod: line.retainageThisPeriod,
+          taxAmount: line.taxAmount,
+          amount: line.amount,
+        } satisfies CanonicalRow;
+      });
+    }
+
+    return invoiceRows.map((inv) => {
+      const vendor = inv.vendorId ? vendorById.get(inv.vendorId) : undefined;
+      const base = {
+        invoiceId: inv.id,
+        reference: inv.reference,
+        vendorInvoiceNumber: inv.invoiceNumber ?? null,
+        vendorId: inv.vendorId ?? null,
+        vendorName: vendor?.name ?? null,
+        vendorReference: vendor?.reference ?? vendor?.taxId ?? null,
+        projectId,
+        projectName,
+        status: inv.status,
+        currency: inv.currency,
+        billingDate: inv.billingDate ?? null,
+        periodStart: inv.periodStart ?? null,
+        periodEnd: inv.periodEnd ?? null,
+        dueDate: inv.dueDate ?? null,
+        subtotal: inv.subtotal,
+        taxAmount: inv.taxAmount,
+        retainage: inv.totalRetainage,
+        retainageReleased: inv.retainageReleased,
+        total: inv.total,
+        amountPaid: inv.amountPaid,
+        currentPaymentDue: inv.currentPaymentDue,
+        approvedAt: inv.approvedAt ?? null,
+        paidDate: inv.paidDate ?? null,
+      } satisfies CanonicalRow;
+      return base;
+    });
+  }
+
+  /**
+   * The AP/AR extract (#582). Gated on `invoicing` at read, not on
+   * `integrations`: this is a read of the invoice register through a different
+   * door, and a door is never allowed to be wider than the room it opens onto.
+   */
+  app.get(
+    "/projects/:projectId/integrations/erp/export",
+    {
+      preHandler: [app.authenticate, app.requireCompany, app.requireTool("invoicing", "read")],
+    },
+    async (req, reply) => {
+      const q = erpExportQuery.parse(req.query);
+      const profile = q.profileId ? await fetchProfile(q.profileId, req.companyId!) : null;
+      const feed = (profile?.feed ?? q.feed ?? "ap_invoices") as ErpFeed;
+      if (profile && q.feed && profile.feed !== q.feed) {
+        throw badRequest(
+          `Profile "${profile.name}" renders the ${profile.feed} feed, not ${q.feed}`,
+        );
+      }
+      const format = (q.format ?? profile?.format ?? "csv") as "csv" | "json";
+      const limit = q.limit ?? 1_000;
+      const rows = await canonicalRows(req.companyId!, req.projectId!, feed, {
+        ...(q.periodFrom ? { periodFrom: q.periodFrom } : {}),
+        ...(q.periodTo ? { periodTo: q.periodTo } : {}),
+        ...(q.status ? { status: q.status } : {}),
+        limit,
+      });
+      const entries = (profile?.fieldMap as FieldMapEntry[] | undefined) ?? identityFieldMap(feed);
+      const mapped = applyFieldMap(rows, entries);
+      const currencies = currenciesIn(rows);
+      const sandbox = await isSandbox(req.companyId!);
+
+      // An export leaving the platform is a ledgered access event, and the
+      // entry records what left: which feed, which profile, how many rows,
+      // which currencies and whether the extract was truncated.
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "access",
+        objectType: "integration_export_profile",
+        objectId: profile?.id ?? `builtin:${feed}`,
+        projectId: req.projectId!,
+        payload: {
+          feed,
+          format,
+          profileId: profile?.id ?? null,
+          system: profile?.system ?? "canonical",
+          rowCount: rows.length,
+          truncated: rows.length >= limit,
+          currencies,
+          periodFrom: q.periodFrom ?? null,
+          periodTo: q.periodTo ?? null,
+        },
+        storePayload: true,
+      });
+
+      const header = {
+        feed,
+        format,
+        generatedAt: new Date().toISOString(),
+        profile: profile
+          ? { id: profile.id, name: profile.name, system: profile.system, notes: profile.notes }
+          : { id: null, name: "Canonical (unmapped)", system: "constructos", notes: null },
+        projectId: req.projectId!,
+        rowCount: rows.length,
+        truncated: rows.length >= limit,
+        currencies,
+        sandbox,
+        caveats: [
+          ...(currencies.length > 1
+            ? [
+                `This extract contains ${currencies.length} currencies (${currencies.join(", ")}). ` +
+                  "Nothing has been converted or summed across them — split the file before " +
+                  "importing into a ledger that holds one currency per batch.",
+              ]
+            : []),
+          ...(rows.length >= limit
+            ? [`Truncated at ${limit} rows — narrow the period or raise limit to export the rest.`]
+            : []),
+          ...(sandbox ? ["SANDBOX TENANT — these figures are not a record of real trade."] : []),
+        ],
+      };
+
+      if (format === "json") {
+        return { ...header, columns: mapped.columns, rows: mapped.rows };
+      }
+      // The CSV carries the caveats as comment lines: a file that leaves the
+      // platform must state what it is even when nobody reads the response body.
+      const comments = [
+        `# ConstructOS ${feed} export — ${header.generatedAt}`,
+        `# profile: ${header.profile.name} (${header.profile.system})`,
+        `# currencies: ${currencies.length ? currencies.join(" ") : "(none)"}`,
+        ...header.caveats.map((c) => `# ${c.replace(/\n/g, " ")}`),
+      ].join("\n");
+      const safeName = `${feed}-${req.projectId!}`.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 80);
+      return reply
+        .type("text/csv; charset=utf-8")
+        .header("content-disposition", `attachment; filename="${safeName}.csv"`)
+        .header("x-export-rows", String(rows.length))
+        .header("x-export-truncated", String(header.truncated))
+        .send(`${comments}\n${toCsv(mapped.columns, mapped.rows)}`);
+    },
+  );
+
+  /* ================================================================ */
+  /* DEVELOPER SANDBOX TENANTS (#123)                                  */
+  /* ================================================================ */
+
+  /** Is this tenant marked as a developer sandbox? */
+  async function isSandbox(companyId: string): Promise<boolean> {
+    const ids = await refreshSandboxCache();
+    return ids.has(companyId);
+  }
+
+  app.get("/integrations/sandbox", { preHandler: memberGate }, async (req) => {
+    const [row] = await app.db
+      .select()
+      .from(developerSandboxes)
+      .where(eq(developerSandboxes.companyId, req.companyId!))
+      .limit(1);
+    return {
+      sandbox: Boolean(row),
+      record: row ?? null,
+      effects: [
+        "Exports carry a SANDBOX caveat in their header.",
+        "Webhook envelopes carry sandbox:true, so a receiver can refuse to act on them.",
+        "The tenant may not contribute samples to the cross-tenant benchmark pool.",
+      ],
+      note:
+        "A sandbox is a place to exercise the API without the consequence landing somewhere " +
+        "real. It is a LABEL, not a separate database: the same tables, the same gates, the same " +
+        "ledger. Marking a tenant that holds real projects as a sandbox would make its exports " +
+        "say something false about real trade, which is why the flag is ledgered both ways.",
+    };
+  });
+
+  app.post("/integrations/sandbox", { preHandler: adminGate }, async (req, reply) => {
+    const body = sandboxSchema.parse(req.body ?? {});
+    const existing = await isSandbox(req.companyId!);
+    if (existing) throw conflict("This tenant is already marked as a developer sandbox");
+    await app.db.insert(developerSandboxes).values({
+      companyId: req.companyId!,
+      purpose: body.purpose ?? null,
+      enabledBy: req.user!.id,
+    });
+    await appendLedger(app.db, {
+      companyId: req.companyId!,
+      actorId: req.user!.id,
+      action: "state_change",
+      objectType: "developer_sandbox",
+      objectId: req.companyId!,
+      payload: { sandbox: true, purpose: body.purpose ?? null },
+      storePayload: true,
+    });
+    await refreshSandboxCache(true);
+    return reply.status(201).send({ sandbox: true, purpose: body.purpose ?? null });
+  });
+
+  app.delete("/integrations/sandbox", { preHandler: adminGate }, async (req) => {
+    if (!(await isSandbox(req.companyId!))) {
+      throw notFound("This tenant is not marked as a developer sandbox");
+    }
+    await app.db
+      .delete(developerSandboxes)
+      .where(eq(developerSandboxes.companyId, req.companyId!));
+    await appendLedger(app.db, {
+      companyId: req.companyId!,
+      actorId: req.user!.id,
+      action: "state_change",
+      objectType: "developer_sandbox",
+      objectId: req.companyId!,
+      payload: { sandbox: false },
+      storePayload: true,
+    });
+    await refreshSandboxCache(true);
+    return { sandbox: false };
+  });
+
+  /* ================================================================ */
+  /* OPENAPI (#122)                                                    */
+  /* ================================================================ */
+
+  /**
+   * The machine-readable description of this API, generated from the live
+   * route table. Authenticated (it enumerates the platform's whole surface)
+   * but not company-scoped: it describes the API, not a tenant's data.
+   */
+  app.get("/openapi.json", { preHandler: [app.authenticate] }, async (req, reply) => {
+    const routes = parseRouteTree(app.printRoutes({ commonPrefix: false }));
+    const doc = buildOpenApiDocument({
+      title: "ConstructOS API",
+      version: "1",
+      prefix: "/api/v1",
+      serverUrl: `${req.protocol}://${req.hostname}`,
+      description:
+        "ConstructOS — construction delivery and owner-side assurance. Every consequential " +
+        "state change appends to a hash-chained ledger, and the webhook feed is a subscription " +
+        "to that ledger rather than to a hand-maintained event taxonomy.",
+      routes,
+    });
+    return reply.header("cache-control", "public, max-age=60").send(doc);
   });
 };
 

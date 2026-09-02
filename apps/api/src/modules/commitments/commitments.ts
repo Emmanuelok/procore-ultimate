@@ -560,6 +560,45 @@ export const commitmentRoutes: FastifyPluginAsync = async (app) => {
     return commitment;
   };
 
+  /**
+   * THE ONLY WAY A COMMITMENT'S STATUS MOVES.
+   *
+   * `transition` above reads and complains; it cannot stop two people pressing
+   * Approve at the same instant, because between its read and the write that
+   * follows there is a window. This does the check and the write in ONE
+   * statement — `UPDATE … WHERE id AND company_id AND status IN (from)` — and
+   * refuses when no row matched, so the second caller loses. Every lifecycle
+   * route runs it inside `db.transaction` alongside the budget sync it
+   * triggers, so a commitment is never half-approved with the budget
+   * unmoved (audit: commitments money transitions outside a transaction).
+   */
+  const moveStatus = async (
+    tx: Db,
+    commitmentId: string,
+    companyId: string,
+    from: readonly string[],
+    set: Record<string, unknown>,
+    verb: string,
+  ): Promise<void> => {
+    const moved = await tx
+      .update(commitments)
+      .set({ ...set, updatedAt: new Date().toISOString() })
+      .where(
+        and(
+          eq(commitments.id, commitmentId),
+          eq(commitments.companyId, companyId),
+          inArray(commitments.status, [...from]),
+        ),
+      )
+      .returning({ id: commitments.id });
+    if (moved.length === 0) {
+      throw conflict(
+        `This commitment moved while it was being ${verb} and is no longer in one of: ` +
+          `${from.join(", ")}. Reload it and try again.`,
+      );
+    }
+  };
+
   app.post(
     "/commitments/:commitmentId/out-for-bid",
     { preHandler: companyGate },
@@ -568,7 +607,16 @@ export const commitmentRoutes: FastifyPluginAsync = async (app) => {
       const commitment = await fetchCommitment(app.db, commitmentId, req.companyId!);
       await requireCommitmentsLevel(app, req, reply, commitment.projectId, "standard");
       await transition(commitmentId, req.companyId!, ["draft"], "sent out for bid");
-      await setStatus(commitmentId, "out_for_bid");
+      await app.db.transaction(async (tx) => {
+        await moveStatus(
+          tx,
+          commitmentId,
+          req.companyId!,
+          ["draft"],
+          { status: "out_for_bid" },
+          "sent out for bid",
+        );
+      });
       await ledger(app.db, req, "state_change", "commitment", commitmentId, {
         status: "out_for_bid",
       }, commitment.projectId);
@@ -587,7 +635,16 @@ export const commitmentRoutes: FastifyPluginAsync = async (app) => {
       "sent out for signature",
     );
     await assertHasSchedule(commitmentId);
-    await setStatus(commitmentId, "out_for_signature");
+    await app.db.transaction(async (tx) => {
+      await moveStatus(
+        tx,
+        commitmentId,
+        req.companyId!,
+        ["draft", "out_for_bid"],
+        { status: "out_for_signature" },
+        "sent out for signature",
+      );
+    });
     await ledger(app.db, req, "state_change", "commitment", commitmentId, {
       status: "out_for_signature",
     }, commitment.projectId);
@@ -627,14 +684,20 @@ export const commitmentRoutes: FastifyPluginAsync = async (app) => {
       );
     }
     const now = new Date().toISOString();
-    await app.db
-      .update(commitments)
-      .set({ status: "approved", approvedBy: req.user!.id, approvedAt: now, updatedAt: now })
-      .where(eq(commitments.id, commitmentId));
-    const budgetLines = await budgetLineIdsFor(app.db, commitmentId);
-    if (budgetLines.length > 0) {
-      await syncBudgetCommitted(app.db, req.companyId!, commitment.projectId, budgetLines);
-    }
+    await app.db.transaction(async (tx) => {
+      await moveStatus(
+        tx,
+        commitmentId,
+        req.companyId!,
+        ["draft", "out_for_bid", "out_for_signature"],
+        { status: "approved", approvedBy: req.user!.id, approvedAt: now },
+        "approved",
+      );
+      const budgetLines = await budgetLineIdsFor(tx, commitmentId);
+      if (budgetLines.length > 0) {
+        await syncBudgetCommitted(tx, req.companyId!, commitment.projectId, budgetLines);
+      }
+    });
     await ledger(app.db, req, "state_change", "commitment", commitmentId, {
       status: "approved",
       approvedBy: req.user!.id,
@@ -656,19 +719,31 @@ export const commitmentRoutes: FastifyPluginAsync = async (app) => {
     await requireCommitmentsLevel(app, req, reply, commitment.projectId, "standard");
     await transition(commitmentId, req.companyId!, ["approved"], "executed");
     if (commitment.executed === 1) throw conflict("This commitment is already executed");
-    const now = new Date().toISOString();
-    await app.db
-      .update(commitments)
-      .set({
-        executed: 1,
-        executedBy: req.user!.id,
-        executionDate: body.executionDate ?? todayIso(),
-        ...(body.signedContractReceivedDate !== undefined
-          ? { signedContractReceivedDate: body.signedContractReceivedDate }
-          : {}),
-        updatedAt: now,
-      })
-      .where(eq(commitments.id, commitmentId));
+    await app.db.transaction(async (tx) => {
+      const moved = await tx
+        .update(commitments)
+        .set({
+          executed: 1,
+          executedBy: req.user!.id,
+          executionDate: body.executionDate ?? todayIso(),
+          ...(body.signedContractReceivedDate !== undefined
+            ? { signedContractReceivedDate: body.signedContractReceivedDate }
+            : {}),
+          updatedAt: new Date().toISOString(),
+        })
+        .where(
+          and(
+            eq(commitments.id, commitmentId),
+            eq(commitments.companyId, req.companyId!),
+            eq(commitments.status, "approved"),
+            eq(commitments.executed, 0),
+          ),
+        )
+        .returning({ id: commitments.id });
+      if (moved.length === 0) {
+        throw conflict("This commitment moved while it was being executed. Reload it and try again.");
+      }
+    });
     await ledger(app.db, req, "state_change", "commitment", commitmentId, {
       executed: 1,
       executedBy: req.user!.id,
@@ -717,15 +792,20 @@ export const commitmentRoutes: FastifyPluginAsync = async (app) => {
       req.user!.id,
       body.overrideReason ?? null,
     );
-    const now = new Date().toISOString();
-    await app.db
-      .update(commitments)
-      .set({
-        status: "complete",
-        actualCompletionDate: body.actualCompletionDate ?? commitment.actualCompletionDate ?? todayIso(),
-        updatedAt: now,
-      })
-      .where(eq(commitments.id, commitmentId));
+    await app.db.transaction(async (tx) => {
+      await moveStatus(
+        tx,
+        commitmentId,
+        req.companyId!,
+        ["approved"],
+        {
+          status: "complete",
+          actualCompletionDate:
+            body.actualCompletionDate ?? commitment.actualCompletionDate ?? todayIso(),
+        },
+        "completed",
+      );
+    });
     await ledger(app.db, req, "state_change", "commitment", commitmentId, {
       status: "complete",
       closeoutStatus: closeout.status,
@@ -745,21 +825,25 @@ export const commitmentRoutes: FastifyPluginAsync = async (app) => {
       ["approved", "out_for_signature", "out_for_bid", "complete"],
       "terminated",
     );
-    const now = new Date().toISOString();
-    await app.db
-      .update(commitments)
-      .set({
-        status: "terminated",
-        terminationDate: body.terminationDate ?? todayIso(),
-        complianceHoldReason: body.reason,
-        paymentHold: 1,
-        updatedAt: now,
-      })
-      .where(eq(commitments.id, commitmentId));
-    const budgetLines = await budgetLineIdsFor(app.db, commitmentId);
-    if (budgetLines.length > 0) {
-      await syncBudgetCommitted(app.db, req.companyId!, commitment.projectId, budgetLines);
-    }
+    await app.db.transaction(async (tx) => {
+      await moveStatus(
+        tx,
+        commitmentId,
+        req.companyId!,
+        ["approved", "out_for_signature", "out_for_bid", "complete"],
+        {
+          status: "terminated",
+          terminationDate: body.terminationDate ?? todayIso(),
+          complianceHoldReason: body.reason,
+          paymentHold: 1,
+        },
+        "terminated",
+      );
+      const budgetLines = await budgetLineIdsFor(tx, commitmentId);
+      if (budgetLines.length > 0) {
+        await syncBudgetCommitted(tx, req.companyId!, commitment.projectId, budgetLines);
+      }
+    });
     await ledger(app.db, req, "state_change", "commitment", commitmentId, {
       status: "terminated",
       reason: body.reason,
@@ -784,15 +868,20 @@ export const commitmentRoutes: FastifyPluginAsync = async (app) => {
           "instead — voiding would erase a record that money moved against.",
       );
     }
-    const now = new Date().toISOString();
-    await app.db
-      .update(commitments)
-      .set({ status: "void", complianceHoldReason: body.reason, paymentHold: 1, updatedAt: now })
-      .where(eq(commitments.id, commitmentId));
-    const budgetLines = await budgetLineIdsFor(app.db, commitmentId);
-    if (budgetLines.length > 0) {
-      await syncBudgetCommitted(app.db, req.companyId!, commitment.projectId, budgetLines);
-    }
+    await app.db.transaction(async (tx) => {
+      await moveStatus(
+        tx,
+        commitmentId,
+        req.companyId!,
+        ["draft", "out_for_bid", "out_for_signature"],
+        { status: "void", complianceHoldReason: body.reason, paymentHold: 1 },
+        "voided",
+      );
+      const budgetLines = await budgetLineIdsFor(tx, commitmentId);
+      if (budgetLines.length > 0) {
+        await syncBudgetCommitted(tx, req.companyId!, commitment.projectId, budgetLines);
+      }
+    });
     await ledger(app.db, req, "state_change", "commitment", commitmentId, {
       status: "void",
       reason: body.reason,
@@ -898,13 +987,25 @@ export const commitmentRoutes: FastifyPluginAsync = async (app) => {
       );
     }
     const budgetLines = await budgetLineIdsFor(app.db, commitmentId);
-    await app.db
-      .delete(commitmentSovLines)
-      .where(eq(commitmentSovLines.commitmentId, commitmentId));
-    await app.db.delete(commitments).where(eq(commitments.id, commitmentId));
-    if (budgetLines.length > 0) {
-      await syncBudgetCommitted(app.db, req.companyId!, commitment.projectId, budgetLines);
-    }
+    await app.db.transaction(async (tx) => {
+      const gone = await tx
+        .delete(commitments)
+        .where(
+          and(
+            eq(commitments.id, commitmentId),
+            eq(commitments.companyId, req.companyId!),
+            eq(commitments.status, "draft"),
+          ),
+        )
+        .returning({ id: commitments.id });
+      if (gone.length === 0) {
+        throw conflict("This commitment moved while it was being deleted. Reload it and try again.");
+      }
+      await tx.delete(commitmentSovLines).where(eq(commitmentSovLines.commitmentId, commitmentId));
+      if (budgetLines.length > 0) {
+        await syncBudgetCommitted(tx, req.companyId!, commitment.projectId, budgetLines);
+      }
+    });
     await ledger(app.db, req, "delete", "commitment", commitmentId, {
       reference: commitment.reference,
     }, commitment.projectId);
@@ -914,13 +1015,6 @@ export const commitmentRoutes: FastifyPluginAsync = async (app) => {
   /* ---------------------------------------------------------------- */
   /* Helpers                                                           */
   /* ---------------------------------------------------------------- */
-
-  async function setStatus(commitmentId: string, status: string): Promise<void> {
-    await app.db
-      .update(commitments)
-      .set({ status, updatedAt: new Date().toISOString() })
-      .where(eq(commitments.id, commitmentId));
-  }
 
   async function assertHasSchedule(commitmentId: string): Promise<void> {
     const [row] = await app.db

@@ -19,8 +19,10 @@ import {
   CENT,
   currencySchema,
   detailSchema,
+  fetchInvitation,
   fetchPackage,
   fetchSubmission,
+  isInContention,
   isoDateSchema,
   isoTimestampSchema,
   justificationSchema,
@@ -32,6 +34,7 @@ import {
   requireBiddingLevel,
   round2,
   todayIso,
+  type BidInvitationRow,
   type BidPackageRow,
   type BidSubmissionRow,
 } from "./shared.js";
@@ -121,8 +124,23 @@ const submissionCreateSchema = z.object({
   sealedFileId: z.string().min(1).max(64).nullable().optional(),
   sealedSha256: z.string().regex(/^[0-9a-f]{64}$/, "expected a lowercase sha256 hex digest").nullable().optional(),
   lines: z.array(lineSchema).max(2000).optional(),
+  /** required when receivedAt is backdated by more than a week */
+  backdateReason: reasonSchema.optional(),
   detail: detailSchema.optional(),
 });
+
+/**
+ * A package can take bids only once it has been ISSUED. See the create route
+ * for why: the evaluation basis, and with it the seal, is frozen at issue.
+ */
+export const ISSUED_FOR_BIDS = [
+  "invitations_sent",
+  "open",
+  "closed",
+  "under_evaluation",
+  "levelled",
+  "partially_awarded",
+];
 
 const submissionsListQuery = pageQuerySchema.extend({
   status: z.enum(BID_SUBMISSION_STATUSES).optional(),
@@ -137,7 +155,28 @@ const lateAcceptSchema = z.object({
 const complianceSchema = z.object({
   complianceStatus: z.enum(BID_COMPLIANCE_STATUSES),
   note: z.string().max(8000).nullable().optional(),
+  /**
+   * The bidder's written explanation of an abnormally low price. Recording it
+   * is what unblocks an abnormally low tender for recommendation: public
+   * procurement everywhere requires the buyer to ASK before accepting one,
+   * and the asking is worthless if the answer is not on the record.
+   */
+  abnormalLowJustification: justificationSchema.nullable().optional(),
 });
+
+/**
+ * Statuses from which a clarification may be requested or answered. An
+ * awarded, unsuccessful or withdrawn bid is OUT, and a clarification must
+ * never quietly put it back in contention.
+ */
+const CLARIFIABLE_STATUSES = [
+  "received",
+  "opened",
+  "under_review",
+  "clarification_requested",
+  "clarified",
+  "shortlisted",
+];
 
 /* ------------------------------------------------------------------ */
 /* Arithmetic                                                          */
@@ -185,9 +224,16 @@ export function resolveSubmissionTotals(input: {
     const lineBase = sumOf((l) => !l.isAlternate);
     if (base === null) {
       base = lineBase;
+      /*
+       * COUNTS, NEVER AMOUNTS. This note is persisted on the submission and
+       * comes back on every read path; a figure written into it walks
+       * straight through the seal, because redaction nulls the money COLUMNS
+       * and cannot read prose. The rule is absolute: nothing in this module
+       * puts a price into a sentence that is stored.
+       */
       notes.push(
         `Base bid taken as the sum of the ${input.lines.filter((l) => !l.isAlternate).length} ` +
-          `non-alternate line(s): ${lineBase}.`,
+          "non-alternate priced line(s).",
       );
     } else if (Math.abs(base - lineBase) > CENT) {
       throw badRequest(
@@ -491,6 +537,24 @@ export const submissionRoutes: FastifyPluginAsync = async (app) => {
       if (pkg.status === "awarded" || pkg.status === "cancelled") {
         throw conflict(`A ${pkg.status} package cannot take new bids.`);
       }
+      /*
+       * A BID CANNOT ARRIVE BEFORE THE TENDER WENT OUT. Recording one against
+       * a draft package let the seal be switched off afterwards: the
+       * evaluation basis (isSealed, sealedUntil, requiresOpeningWitness) is
+       * frozen at ISSUE, so a package that never issued could take three
+       * sealed bids and then have its seal PATCHed away with no opening, no
+       * witness and no ledger entry. Refusing here closes that door at the
+       * only place it can be closed.
+       */
+      if (!ISSUED_FOR_BIDS.includes(pkg.status)) {
+        throw conflict(
+          `${pkg.reference} is at status "${pkg.status}" and has not been issued to bidders, so ` +
+            "there is nothing for a bid to be a response to. Approve and issue the package " +
+            "first: the evaluation basis — including whether bids are sealed and when the seal " +
+            "lifts — is frozen at issue, and a bid recorded before that freeze could have its " +
+            "seal removed afterwards without an opening, a witness or a record.",
+        );
+      }
       const vendor = await assertVendor(app.db, body.vendorId, companyId);
 
       if (pkg.isSealed === 1 && body.sealedFileId && !body.sealedSha256) {
@@ -501,15 +565,70 @@ export const submissionRoutes: FastifyPluginAsync = async (app) => {
         );
       }
 
+      /*
+       * The client-supplied invitation is resolved and CHECKED before it is
+       * touched. `body.invitationId` used to go straight into a WHERE clause
+       * with no company, package or vendor constraint, so a standard user in
+       * one company could flip an invitation belonging to another company to
+       * "submitted" and point it at their own bid. Ids travel — they appear
+       * in ledger payloads and webhook events — so an id is never authority.
+       */
+      let invitation: BidInvitationRow | null = null;
+      if (body.invitationId) {
+        invitation = await fetchInvitation(app.db, body.invitationId, companyId);
+        if (invitation.packageId !== packageId) {
+          throw badRequest(
+            "That invitation belongs to a different bid package. An invitation is the record of " +
+              "one vendor being asked to price one package; pointing it at a bid on another " +
+              "package would falsify both.",
+          );
+        }
+        if (invitation.vendorId !== body.vendorId) {
+          throw badRequest(
+            "That invitation was issued to a different vendor. A bid is recorded against the " +
+              "invitation of the company that submitted it, never against somebody else's.",
+          );
+        }
+      }
+
       const revisionRows = await app.db
-        .select({ revision: bidSubmissions.revision })
+        .select()
         .from(bidSubmissions)
         .where(
           and(eq(bidSubmissions.packageId, packageId), eq(bidSubmissions.vendorId, body.vendorId)),
         );
       const revision = revisionRows.reduce((max, r) => Math.max(max, r.revision + 1), 0);
 
-      const receivedAt = body.receivedAt ?? new Date().toISOString();
+      /*
+       * LATENESS IS MEASURED FROM A TIME SOMEBODY COULD HAVE FAKED. The
+       * receipt time decides whether a bid was late, so it is bounded: never
+       * in the future, and a backdate of more than a week needs a stated
+       * reason. Both the stated receipt and the server's own clock go into
+       * the ledger, so a discrepancy is visible afterwards even where it was
+       * permitted at the time.
+       */
+      const serverNow = new Date().toISOString();
+      const receivedAt = body.receivedAt ?? serverNow;
+      const receivedMs = Date.parse(receivedAt);
+      const serverMs = Date.parse(serverNow);
+      if (Number.isFinite(receivedMs) && receivedMs > serverMs + 60_000) {
+        throw badRequest(
+          `receivedAt (${receivedAt}) is in the future. A bid cannot have arrived before it ` +
+            "arrived, and a forward-dated receipt makes a late bid on time.",
+        );
+      }
+      if (
+        Number.isFinite(receivedMs) &&
+        serverMs - receivedMs > 7 * 86_400_000 &&
+        !body.backdateReason
+      ) {
+        throw badRequest(
+          `receivedAt (${receivedAt}) is more than seven days before now. Backdating a receipt ` +
+            "by that much changes whether the bid was late, so it needs a stated reason " +
+            "(backdateReason) that goes on the ledger next to the server's own clock.",
+          { control: "backdated_receipt", serverTime: serverNow },
+        );
+      }
       const lateness = computeLateness(pkg.bidDueAt, receivedAt);
 
       const lines = (body.lines ?? []).map((l, index) => ({
@@ -574,7 +693,13 @@ export const submissionRoutes: FastifyPluginAsync = async (app) => {
         sealedFileId: body.sealedFileId ?? null,
         sealedSha256: body.sealedSha256 ?? null,
         lineCount: lines.length,
-        detail: { ...(body.detail ?? {}), totalsNotes: totals.notes },
+        detail: {
+          ...(body.detail ?? {}),
+          totalsNotes: totals.notes,
+          statedReceiptAt: receivedAt,
+          serverReceiptAt: serverNow,
+          ...(body.backdateReason ? { backdateReason: body.backdateReason } : {}),
+        },
         createdBy: req.user!.id,
       });
 
@@ -608,11 +733,71 @@ export const submissionRoutes: FastifyPluginAsync = async (app) => {
         });
       }
 
-      if (body.invitationId) {
+      if (invitation) {
         await app.db
           .update(bidInvitations)
-          .set({ status: "submitted", submissionId: id, respondedAt: receivedAt, updatedAt: new Date().toISOString() })
-          .where(eq(bidInvitations.id, body.invitationId));
+          .set({
+            status: "submitted",
+            submissionId: id,
+            respondedAt: receivedAt,
+            updatedAt: new Date().toISOString(),
+          })
+          .where(
+            and(
+              eq(bidInvitations.id, invitation.id),
+              eq(bidInvitations.companyId, companyId),
+              eq(bidInvitations.packageId, packageId),
+              eq(bidInvitations.vendorId, body.vendorId),
+            ),
+          );
+      }
+
+      /*
+       * A REVISION SUPERSEDES ITS PREDECESSOR. Every earlier revision used to
+       * stay at "received", so R0 and R1 both counted as contenders: R0's
+       * unanswered scope rows blocked the levelling, both appeared in the
+       * award comparison, and the "lowest bid amount" recorded on an award
+       * could be a figure the bidder had already replaced. The earlier
+       * revision is withdrawn from contention and kept in full — what they
+       * priced before the addendum is a question somebody asks.
+       */
+      const superseded: string[] = [];
+      if (revision > 0) {
+        for (const prior of revisionRows) {
+          if (prior.id === id) continue;
+          if (!isInContention(prior.status)) continue;
+          await app.db
+            .update(bidSubmissions)
+            .set({
+              status: "withdrawn",
+              supersededById: id,
+              evaluationNote:
+                `Superseded by revision ${revision} (${reference}) received ${receivedAt}.`,
+              updatedAt: new Date().toISOString(),
+            })
+            .where(eq(bidSubmissions.id, prior.id));
+          superseded.push(prior.id);
+          await ledger(
+            app.db,
+            req,
+            "state_change",
+            "bid_submission",
+            prior.id,
+            {
+              projectId,
+              packageId,
+              event: "superseded_by_revision",
+              to: "withdrawn",
+              supersededBy: id,
+              supersededByReference: reference,
+              priorRevision: prior.revision,
+              newRevision: revision,
+              sealedSha256: prior.sealedSha256,
+            },
+            projectId,
+            true,
+          );
+        }
       }
       await recountSubmissions(app.db, packageId);
       if (pkg.status === "invitations_sent") {
@@ -640,6 +825,11 @@ export const submissionRoutes: FastifyPluginAsync = async (app) => {
           bidDueAt: pkg.bidDueAt,
           isLate: lateness.isLate,
           lateByMinutes: lateness.lateByMinutes,
+          statedReceiptAt: receivedAt,
+          serverReceiptAt: serverNow,
+          backdateReason: body.backdateReason ?? null,
+          supersededSubmissionIds: superseded,
+          invitationId: invitation?.id ?? null,
           sealed: pkg.isSealed === 1,
           sealedSha256: body.sealedSha256 ?? null,
           lineCount: lines.length,
@@ -659,6 +849,12 @@ export const submissionRoutes: FastifyPluginAsync = async (app) => {
         ...detail,
         totalsNotes: totals.notes,
         latenessNote: lateness.reason,
+        superseded,
+        supersededNote:
+          superseded.length > 0
+            ? `Revision ${revision} supersedes ${superseded.length} earlier revision(s), which ` +
+              "are withdrawn from contention and kept for the record."
+            : null,
       });
     },
   );
@@ -826,6 +1022,16 @@ export const submissionRoutes: FastifyPluginAsync = async (app) => {
         .set({
           complianceStatus: body.complianceStatus,
           nonComplianceNote: body.note ?? null,
+          detail: {
+            ...(submission.detail as Record<string, unknown>),
+            ...(body.abnormalLowJustification !== undefined
+              ? {
+                  abnormalLowJustification: body.abnormalLowJustification,
+                  abnormalLowJustificationBy: req.user!.id,
+                  abnormalLowJustificationAt: now,
+                }
+              : {}),
+          },
           evaluatedBy: req.user!.id,
           evaluatedAt: now,
           updatedAt: now,
@@ -836,6 +1042,7 @@ export const submissionRoutes: FastifyPluginAsync = async (app) => {
         packageId: submission.packageId,
         complianceStatus: body.complianceStatus,
         note: body.note ?? null,
+        abnormalLowJustification: body.abnormalLowJustification ?? null,
       }, submission.projectId, true);
       const fresh = await fetchSubmission(app.db, submission.id, req.companyId!);
       return submissionDetail(app.db, fresh, pkg);
@@ -854,6 +1061,16 @@ export const submissionRoutes: FastifyPluginAsync = async (app) => {
         .parse(req.body);
       const { submission, pkg } = await submissionContext(req);
       await requireBiddingLevel(app, req, reply, submission.projectId, "standard");
+      if (!CLARIFIABLE_STATUSES.includes(submission.status)) {
+        throw conflict(
+          `${submission.reference} is at status "${submission.status}" and cannot be clarified. ` +
+            "A clarification used to set the status to 'clarified' unconditionally, which put a " +
+            "withdrawn, superseded, unsuccessful or already-awarded bid back into contention: " +
+            "it re-entered the levelling blockers, the scoring and the award comparison, and an " +
+            "awarded bid lost its award status. Record the correspondence against the bid " +
+            "instead, or re-open it deliberately.",
+        );
+      }
       const now = new Date().toISOString();
       await app.db
         .update(bidSubmissions)
@@ -901,6 +1118,123 @@ export const submissionRoutes: FastifyPluginAsync = async (app) => {
       }, submission.projectId, true);
       const fresh = await fetchSubmission(app.db, submission.id, req.companyId!);
       return submissionDetail(app.db, fresh, pkg);
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Post-bid alternates (#166)                                        */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Accepting (or releasing) an alternate AFTER the bids are in.
+   *
+   * An unaccepted alternate is not in the compared price — that is what
+   * makes the comparison like-for-like. Accepting one therefore CHANGES the
+   * compared price, so it is a deliberate, ledgered act with the before and
+   * after recorded, it is refused once the package is awarded, and it voids
+   * any levelling that was completed on the old figure. Quietly folding an
+   * alternate into a total after the tabulation is how a bid that was second
+   * becomes first without anybody deciding that it should.
+   */
+  app.post(
+    "/bid-submissions/:submissionId/alternates/:label/accept",
+    { preHandler: companyGate },
+    async (req, reply) => {
+      const { label } = req.params as { label: string };
+      const body = z
+        .object({ accepted: z.boolean().default(true), reason: reasonSchema })
+        .parse(req.body ?? {});
+      const { submission, pkg } = await submissionContext(req);
+      await requireBiddingLevel(app, req, reply, submission.projectId, "standard");
+      if (pkg.status === "awarded" || pkg.status === "cancelled") {
+        throw conflict(
+          `${pkg.reference} is ${pkg.status}. An alternate accepted after the award changes the ` +
+            "contract sum without a change instruction — that belongs in the commitment, not " +
+            "in the bid.",
+        );
+      }
+      const seal = sealState(pkg);
+      if (seal.amountsWithheld) {
+        throw conflict(
+          `Accepting an alternate reads and rewrites a submitted amount. ${seal.note}`,
+        );
+      }
+      const alternates = (submission.alternates as {
+        label?: string;
+        description?: string | null;
+        amount?: number;
+        accepted?: boolean;
+      }[]) ?? [];
+      const match = alternates.find((a) => a.label === label);
+      if (!match) {
+        throw badRequest(
+          `${submission.reference} offered no alternate labelled "${label}". The alternates on ` +
+            `this bid are: ${alternates.map((a) => a.label).join(", ") || "none"}.`,
+        );
+      }
+      if ((match.accepted === true) === body.accepted) {
+        throw conflict(
+          `Alternate "${label}" is already ${body.accepted ? "accepted" : "not accepted"}.`,
+        );
+      }
+      const next = alternates.map((a) =>
+        a.label === label ? { ...a, accepted: body.accepted } : a,
+      );
+      const totals = resolveSubmissionTotals({
+        baseBidAmount: submission.baseBidAmount,
+        allowancesTotal: submission.allowancesTotal,
+        provisionalSumsTotal: submission.provisionalSumsTotal,
+        alternates: next.map((a) => ({
+          amount: typeof a.amount === "number" ? a.amount : 0,
+          accepted: a.accepted === true,
+        })),
+        lines: [],
+      });
+      const now = new Date().toISOString();
+      await app.db
+        .update(bidSubmissions)
+        .set({
+          alternates: next,
+          alternatesTotal: totals.alternatesTotal,
+          totalAmount: totals.totalAmount,
+          // The levelled figure was frozen against the OLD compared price.
+          normalisedAmount: null,
+          levellingCompletedAt: null,
+          detail: {
+            ...(submission.detail as Record<string, unknown>),
+            totalsNotes: totals.notes,
+          },
+          updatedAt: now,
+        })
+        .where(eq(bidSubmissions.id, submission.id));
+      await ledger(
+        app.db,
+        req,
+        "update",
+        "bid_submission",
+        submission.id,
+        {
+          projectId: submission.projectId,
+          packageId: submission.packageId,
+          event: body.accepted ? "alternate_accepted" : "alternate_released",
+          label,
+          reason: body.reason,
+          previousTotalAmount: submission.totalAmount,
+          newTotalAmount: totals.totalAmount,
+          currency: submission.currency,
+        },
+        submission.projectId,
+        true,
+      );
+      const fresh = await fetchSubmission(app.db, submission.id, req.companyId!);
+      return {
+        ...(await submissionDetail(app.db, fresh, pkg)),
+        note:
+          `Alternate "${label}" is now ${body.accepted ? "accepted" : "excluded"} and the ` +
+          "compared total has moved. Any levelling completed on the previous figure has been " +
+          "cleared: a frozen comparable amount that no longer describes the same scope is " +
+          "worse than none.",
+      };
     },
   );
 };

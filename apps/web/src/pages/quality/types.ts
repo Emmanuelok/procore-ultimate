@@ -876,6 +876,26 @@ export interface ReleaseChain {
   activityReleased?: boolean;
 }
 
+/** GET /projects/:projectId/surveillance — the legs held by somebody outside. */
+export interface SurveillanceRegister {
+  items: Array<
+    ReleaseLeg & {
+      activity: {
+        id: string;
+        activity: string;
+        activityCode: string | null;
+        interventionPoint: string;
+        plannedDate: string | null;
+        status: string;
+        itpId: string;
+      } | null;
+    }
+  >;
+  total: number;
+  awaitingAttendance: number;
+  notifiedAwaitingSignature: number;
+}
+
 /* ================================================================== */
 /* Concessions (#1091)                                                 */
 /* ================================================================== */

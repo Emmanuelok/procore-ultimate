@@ -33,7 +33,9 @@ import type { Tone } from "../../ui/tokens";
 import {
   LoadError,
   RECORD_STATUS_TONE,
+  RegisterPager,
   count,
+  pageParams,
   isoDate,
   labelize,
   nameOf,
@@ -43,12 +45,14 @@ import {
 } from "./safetyShared";
 
 export interface ProgrammeFilters {
+  /** 1-based; the register is paged rather than silently truncated */
+  page: string;
   recordKind: string;
   status: string;
   expiringWithinDays: string;
 }
 
-export const EMPTY_PROGRAMME_FILTERS: ProgrammeFilters = {
+export const EMPTY_PROGRAMME_FILTERS: ProgrammeFilters = { page: "1",
   recordKind: "",
   status: "",
   expiringWithinDays: "",
@@ -507,6 +511,15 @@ export default function ProgrammeTab({
         aria-label="Safety programme records"
       />
 
+      <RegisterPager
+        page={filters.page}
+        loaded={rows.length}
+        total={records.data?.total ?? null}
+        noun="programme record"
+        loading={records.loading}
+        onPage={(page) => onFilters({ ...filters, page })}
+      />
+
       <p className="text-2xs text-content-subtle">
         Renewals are bound to the platform's obligations register — the same one that carries
         contractual time bars and insurance notification periods. A breached obligation there is a
@@ -517,7 +530,7 @@ export default function ProgrammeTab({
 }
 
 export function programmeQueryString(filters: ProgrammeFilters): string {
-  const params = new URLSearchParams({ page: "1", pageSize: "200" });
+  const params = pageParams(filters.page);
   if (filters.recordKind) params.set("recordKind", filters.recordKind);
   if (filters.status) params.set("status", filters.status);
   if (filters.expiringWithinDays) params.set("expiringWithinDays", filters.expiringWithinDays);

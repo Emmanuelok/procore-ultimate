@@ -287,6 +287,25 @@ export function decideVote(
   else if (forShare + abstainShare === 0 && againstShare === 0) outcome = "deferred";
   else outcome = "rejected";
 
+  /* An outcome without its arithmetic is unusable: whoever reads the minute
+     has to be able to see WHY the vote fell where it did, in the deed's own
+     percentages, without recomputing it. */
+  if (!quorumMet) {
+    reasons.push(
+      `Not quorate: ${present}% of the shares were present and the venture requires ${quorumPercent}%. Nothing was decided, whichever way the votes fell.`,
+    );
+  } else if (outcome === "rejected") {
+    reasons.push(
+      `Not carried: ${forShare}% of the shares voted in favour and ${round2(thresholdPercent)}% was required (${againstShare}% against, ${abstainShare}% abstained).`,
+    );
+  } else if (outcome === "approved") {
+    reasons.push(
+      `Carried: ${forShare}% of the shares voted in favour against a ${round2(thresholdPercent)}% threshold, with ${present}% present.`,
+    );
+  } else {
+    reasons.push("No vote was cast, so the matter stands deferred.");
+  }
+
   return {
     sharePresentPercent: present,
     shareForPercent: forShare,

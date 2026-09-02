@@ -32,7 +32,9 @@ import type { Tone } from "../../ui/tokens";
 import {
   LoadError,
   TALK_STATUS_TONE,
+  RegisterPager,
   count,
+  pageParams,
   labelize,
   nameOf,
   type Paged,
@@ -41,13 +43,15 @@ import {
 } from "./safetyShared";
 
 export interface TalkFilters {
+  /** 1-based; the register is paged rather than silently truncated */
+  page: string;
   category: string;
   status: string;
   from: string;
   to: string;
 }
 
-export const EMPTY_TALK_FILTERS: TalkFilters = { category: "", status: "", from: "", to: "" };
+export const EMPTY_TALK_FILTERS: TalkFilters = { page: "1", category: "", status: "", from: "", to: "" };
 
 const CATEGORIES = [
   "ppe",
@@ -354,12 +358,21 @@ export default function TalksTab({
         }}
         aria-label="Toolbox talk register"
       />
+
+      <RegisterPager
+        page={filters.page}
+        loaded={rows.length}
+        total={talks.data?.total ?? null}
+        noun="toolbox talk"
+        loading={talks.loading}
+        onPage={(page) => onFilters({ ...filters, page })}
+      />
     </div>
   );
 }
 
 export function talkQueryString(filters: TalkFilters): string {
-  const params = new URLSearchParams({ page: "1", pageSize: "200" });
+  const params = pageParams(filters.page);
   if (filters.category) params.set("category", filters.category);
   if (filters.status) params.set("status", filters.status);
   if (filters.from) params.set("from", filters.from);
