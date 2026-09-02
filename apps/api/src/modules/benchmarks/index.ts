@@ -83,9 +83,13 @@ function viewSample(row: typeof benchmarkSamples.$inferSelect) {
     region: row.region,
     value: row.value,
     unit: row.unit,
+    currency: row.currency,
+    sizeBand: row.sizeBand,
+    procurementRoute: row.procurementRoute,
     source: row.source,
     dataYear: row.dataYear,
     methodology: row.methodology,
+    supersededAt: row.supersededAt,
     createdAt: row.createdAt,
   };
 }
@@ -97,8 +101,10 @@ function viewSnapshot(row: typeof projectMetricSnapshots.$inferSelect) {
     metric: row.metric,
     value: row.value,
     unit: row.unit,
+    currency: row.currency,
     inputs: row.inputs,
     contributedSampleId: row.contributedSampleId,
+    outlierSignalId: row.outlierSignalId,
     computedBy: row.computedBy,
     createdAt: row.createdAt,
   };
@@ -363,6 +369,14 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
         value: computation.value,
         unit: computation.unit,
         inputs: computation.inputs,
+        // A money-unit figure without its currency is not a figure. The
+        // computation reports the single currency it read, or null when the
+        // project holds none — a metric whose basis spanned two currencies
+        // never reaches here, it returns 422 above with the reason.
+        currency:
+          typeof computation.inputs["currency"] === "string"
+            ? (computation.inputs["currency"] as string)
+            : null,
         computedBy: req.user!.id,
       });
       await appendLedger(app.db, {
