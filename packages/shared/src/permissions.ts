@@ -40,9 +40,49 @@ export const TOOLS = [
   "commitments",
   "change_management",
   "invoicing",
+  "commercial",
+  "contracts",
+  "schedule",
+  "forensics",
+  "payments",
+  "risk",
+  "governance",
+  "finance",
+  "disputes",
+  "land",
+  "workforce",
+  "esg",
+  "jurisdiction",
+  "analytics",
+  "ingestion",
+  "benchmarks",
+  "insurance",
+  "learning",
+  "integrations",
   "assurance",
   "ai",
   "admin",
+  // Procore-parity domains (M19-M25). "specifications" and "meetings" above
+  // predate their modules and are filled in by the same work.
+  "safety",
+  "quality",
+  "equipment",
+  "timecards",
+  "bidding",
+  // Platform upgrade wave — the coherence layer and the Vol II domains that
+  // had no module: Q tax, T design, U supply chain, Z site operations and
+  // commercial structures, Vol I §1.2 estimating, §2.11–2.13 correspondence
+  // and forms, §5.1–5.2 resources, §7 portfolio.
+  "intelligence",
+  "automation",
+  "tax",
+  "supply_chain",
+  "design",
+  "estimating",
+  "correspondence",
+  "portfolio",
+  "site_ops",
+  "resources",
 ] as const;
 export type ToolKey = (typeof TOOLS)[number];
 

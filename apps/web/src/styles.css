@@ -1,4 +1,57 @@
+/* =============================================================================
+   ConstructOS Design System
+   -----------------------------------------------------------------------------
+   Layer order:
+     1. Raw palette          (--brand-*, --ink-*, --sig-*)  immutable ramps
+     2. Semantic tokens      (--ds-*)                        theme-dependent
+     3. Density tokens       (--ds-* sizes)                  density-dependent
+     4. @theme inline        maps --ds-* into Tailwind namespaces so utilities
+                             such as bg-surface / text-content-muted resolve at
+                             RUNTIME and therefore re-theme without a rebuild.
+   Never hardcode a hex value in a component. Always reach for a semantic
+   utility (bg-surface-raised, text-content-muted, border-border, ...).
+============================================================================= */
+
 @import "tailwindcss";
+
+/* -----------------------------------------------------------------------------
+   Variants
+   dark:      resolved theme is dark (explicit attribute OR system preference)
+   light:     resolved theme is light
+   compact:   density is compact
+   comfortable: density is comfortable
+----------------------------------------------------------------------------- */
+
+@custom-variant dark {
+  &:where([data-theme="dark"], [data-theme="dark"] *) {
+    @slot;
+  }
+  @media (prefers-color-scheme: dark) {
+    &:where(:root:not([data-theme="light"]), :root:not([data-theme="light"]) *) {
+      @slot;
+    }
+  }
+}
+
+@custom-variant light {
+  &:where([data-theme="light"], [data-theme="light"] *) {
+    @slot;
+  }
+  @media (prefers-color-scheme: light) {
+    &:where(:root:not([data-theme="dark"]), :root:not([data-theme="dark"]) *) {
+      @slot;
+    }
+  }
+}
+
+@custom-variant compact (&:where([data-density="compact"], [data-density="compact"] *));
+@custom-variant comfortable (&:where([data-density="comfortable"], [data-density="comfortable"] *));
+
+/* =============================================================================
+   1. RAW SCALES  —  static, identical in every theme.
+   Kept verbatim so the ~89k lines of existing pages using the brand and ink ramps
+   continue to render exactly as before.
+============================================================================= */
 
 @theme {
   --color-brand-50: #eef6ff;
@@ -12,6 +65,7 @@
   --color-brand-800: #183eb4;
   --color-brand-900: #19398d;
   --color-brand-950: #142456;
+
   --color-ink-50: #f6f7f9;
   --color-ink-100: #ebedf1;
   --color-ink-200: #d3d8e0;
@@ -23,22 +77,1025 @@
   --color-ink-800: #363f4f;
   --color-ink-900: #303744;
   --color-ink-950: #1a1e27;
+
+  /* --- Typography -------------------------------------------------------- */
+  --font-sans:
+    "InterVariable", "Inter", ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono:
+    ui-monospace, "SFMono-Regular", "SF Mono", "JetBrains Mono", Menlo,
+    Consolas, "Liberation Mono", monospace;
+
+  /* Existing sizes preserved 1:1; tracking tuned at display sizes only. */
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: 1rem;
+  --text-2xs--letter-spacing: 0.006em;
+
+  --text-xs: 0.75rem;
+  --text-xs--line-height: 1rem;
+  --text-xs--letter-spacing: 0.004em;
+
+  --text-sm: 0.875rem;
+  --text-sm--line-height: 1.25rem;
+
+  --text-base: 1rem;
+  --text-base--line-height: 1.5rem;
+
+  --text-lg: 1.125rem;
+  --text-lg--line-height: 1.75rem;
+  --text-lg--letter-spacing: -0.008em;
+
+  --text-xl: 1.25rem;
+  --text-xl--line-height: 1.75rem;
+  --text-xl--letter-spacing: -0.012em;
+
+  --text-2xl: 1.5rem;
+  --text-2xl--line-height: 2rem;
+  --text-2xl--letter-spacing: -0.016em;
+
+  --text-3xl: 1.875rem;
+  --text-3xl--line-height: 2.25rem;
+  --text-3xl--letter-spacing: -0.019em;
+
+  --text-4xl: 2.25rem;
+  --text-4xl--line-height: 2.5rem;
+  --text-4xl--letter-spacing: -0.021em;
+
+  /* Purpose-named steps for new work. */
+  --text-label: 0.6875rem;
+  --text-label--line-height: 1rem;
+  --text-label--letter-spacing: 0.06em;
+  --text-label--font-weight: 600;
+
+  --text-code: 0.8125rem;
+  --text-code--line-height: 1.25rem;
+
+  --text-display-xs: 1.375rem;
+  --text-display-xs--line-height: 1.75rem;
+  --text-display-xs--letter-spacing: -0.015em;
+  --text-display-xs--font-weight: 600;
+
+  --text-display-sm: 1.75rem;
+  --text-display-sm--line-height: 2.125rem;
+  --text-display-sm--letter-spacing: -0.02em;
+  --text-display-sm--font-weight: 600;
+
+  --text-display-md: 2.25rem;
+  --text-display-md--line-height: 2.625rem;
+  --text-display-md--letter-spacing: -0.024em;
+  --text-display-md--font-weight: 650;
+
+  --text-display-lg: 3rem;
+  --text-display-lg--line-height: 3.25rem;
+  --text-display-lg--letter-spacing: -0.028em;
+  --text-display-lg--font-weight: 680;
+
+  /* --- Radii -------------------------------------------------------------- */
+  --radius-xs: 0.25rem;
+  --radius-sm: 0.3125rem;
+  --radius-md: 0.4375rem;
+  --radius-lg: 0.625rem;
+  --radius-xl: 0.875rem;
+  --radius-2xl: 1.125rem;
+  --radius-3xl: 1.5rem;
+
+  /* --- Easing / duration -------------------------------------------------- */
+  /* Retunes every stock `transition-*` utility already used across the app. */
+  --default-transition-duration: 110ms;
+  --default-transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-emphasized: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-decelerate: cubic-bezier(0.05, 0.7, 0.1, 1);
+  --ease-accelerate: cubic-bezier(0.3, 0, 0.8, 0.15);
+  --ease-overshoot: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* --- Static layout rails ------------------------------------------------ */
+  --spacing-sidebar: 15rem;
+  --spacing-sidebar-collapsed: 3.5rem;
+  --spacing-rail: 3.5rem;
+  --spacing-topbar: 3.25rem;
+  --spacing-subbar: 2.75rem;
+  --spacing-drawer: 30rem;
+  --spacing-drawer-wide: 44rem;
+  --spacing-inspector: 20rem;
+  --spacing-content-max: 88rem;
+  --spacing-prose: 44rem;
+
+  /* --- Named animations --------------------------------------------------- */
+  --animate-shimmer: ds-shimmer 1.7s linear infinite;
+  --animate-fade-in: ds-fade-in 160ms var(--ease-standard) both;
+  --animate-slide-up: ds-slide-up 200ms var(--ease-emphasized) both;
+  --animate-scale-in: ds-scale-in 140ms var(--ease-emphasized) both;
+  --animate-indeterminate: ds-indeterminate 1.15s var(--ease-standard) infinite;
+  --animate-pulse-soft: ds-pulse-soft 2s var(--ease-standard) infinite;
+  --animate-spin-slow: ds-spin 2.4s linear infinite;
 }
 
-html,
-body,
-#root {
-  height: 100%;
+/* =============================================================================
+   2. SEMANTIC TOKENS — LIGHT (default)
+============================================================================= */
+
+:root {
+  color-scheme: light;
+
+  /* Surfaces ------------------------------------------------------------- */
+  --ds-surface: #f6f7fa;
+  --ds-surface-raised: #ffffff;
+  --ds-surface-sunken: #eceff4;
+  --ds-surface-overlay: #ffffff;
+  --ds-surface-hover: #f0f2f7;
+  --ds-surface-active: #e6eaf1;
+  --ds-surface-selected: #e8f0ff;
+  --ds-surface-inverse: #14171f;
+  --ds-surface-inverse-fg: #f6f7fa;
+  --ds-scrim: rgb(13 17 26 / 0.45);
+
+  /* Borders -------------------------------------------------------------- */
+  --ds-border: #e2e6ed;
+  --ds-border-subtle: #edf0f4;
+  --ds-border-strong: #c7cedb;
+  --ds-border-inverse: rgb(255 255 255 / 0.12);
+
+  /* Content -------------------------------------------------------------- */
+  --ds-content: #0f1420;
+  --ds-content-muted: #566075;
+  --ds-content-subtle: #6b7688;
+  --ds-content-disabled: #adb4c2;
+  --ds-content-inverse: #f6f7fa;
+  --ds-content-on-solid: #ffffff;
+
+  /* Accent --------------------------------------------------------------- */
+  --ds-accent: #1d60f1;
+  --ds-accent-hover: #164bde;
+  --ds-accent-active: #183eb4;
+  --ds-accent-fg: #ffffff;
+  --ds-accent-subtle: #e8f0ff;
+  --ds-accent-subtle-hover: #d9e7ff;
+  --ds-accent-subtle-fg: #164bde;
+  --ds-accent-border: #b9d1ff;
+  --ds-accent-text: #1a55d8;
+
+  /* Neutral status family ------------------------------------------------ */
+  --ds-neutral-subtle: #eceff4;
+  --ds-neutral-solid: #55607a;
+  --ds-neutral-fg: #3e495d;
+  --ds-neutral-border: #d8dee7;
+  --ds-neutral-on-solid: #ffffff;
+
+  /* Success -------------------------------------------------------------- */
+  --ds-success-subtle: #e4f7ee;
+  --ds-success-solid: #0f9d62;
+  --ds-success-fg: #06603b;
+  --ds-success-border: #a9e5cb;
+  --ds-success-on-solid: #04180f;
+
+  /* Warning -------------------------------------------------------------- */
+  --ds-warning-subtle: #fdf3e1;
+  --ds-warning-solid: #d97706;
+  --ds-warning-fg: #874905;
+  --ds-warning-border: #f4d6a4;
+  --ds-warning-on-solid: #1f1202;
+
+  /* Danger --------------------------------------------------------------- */
+  --ds-danger-subtle: #fdecec;
+  --ds-danger-solid: #dc2626;
+  --ds-danger-fg: #991b1b;
+  --ds-danger-border: #f6c4c4;
+  --ds-danger-on-solid: #ffffff;
+
+  /* Info ----------------------------------------------------------------- */
+  --ds-info-subtle: #e7f0ff;
+  --ds-info-solid: #2563eb;
+  --ds-info-fg: #1c46a8;
+  --ds-info-border: #bcd4ff;
+  --ds-info-on-solid: #ffffff;
+
+  /* Highlight (AI / insight / special) ----------------------------------- */
+  --ds-highlight-subtle: #f1eaff;
+  --ds-highlight-solid: #7c3aed;
+  --ds-highlight-fg: #5b21b6;
+  --ds-highlight-border: #d9c6fb;
+  --ds-highlight-on-solid: #ffffff;
+
+  /* Focus / selection / misc --------------------------------------------- */
+  --ds-focus-ring: #1d60f1;
+  --ds-focus-ring-offset: #ffffff;
+  --ds-selection-bg: #cfe0ff;
+  --ds-selection-fg: #0f1420;
+  --ds-scrollbar-thumb: rgb(15 20 32 / 0.20);
+  --ds-scrollbar-thumb-hover: rgb(15 20 32 / 0.34);
+  --ds-skeleton: #e6e9ef;
+  --ds-skeleton-sheen: rgb(255 255 255 / 0.72);
+  --ds-code-bg: #f2f4f8;
+  --ds-grid-line: rgb(15 20 32 / 0.06);
+
+  /* Data-visualisation ramp ---------------------------------------------- */
+  --ds-chart-1: #2f6bf0;
+  --ds-chart-2: #0f9d62;
+  --ds-chart-3: #d97706;
+  --ds-chart-4: #7c3aed;
+  --ds-chart-5: #dc2626;
+  --ds-chart-6: #0e8f9e;
+  --ds-chart-7: #c2410c;
+  --ds-chart-8: #64748b;
+  --ds-chart-grid: rgb(15 20 32 / 0.08);
+  --ds-chart-axis: #8b93a5;
+
+  /* Elevation ------------------------------------------------------------ */
+  --ds-shadow-e0: 0 1px 1px 0 rgb(13 17 26 / 0.04);
+  --ds-shadow-e1:
+    0 1px 2px 0 rgb(13 17 26 / 0.06), 0 1px 1px -1px rgb(13 17 26 / 0.04);
+  --ds-shadow-e2:
+    0 1px 3px 0 rgb(13 17 26 / 0.07), 0 4px 8px -3px rgb(13 17 26 / 0.06);
+  --ds-shadow-e3:
+    0 2px 6px -1px rgb(13 17 26 / 0.08), 0 12px 24px -6px rgb(13 17 26 / 0.10);
+  --ds-shadow-e4:
+    0 4px 12px -2px rgb(13 17 26 / 0.10), 0 24px 48px -12px rgb(13 17 26 / 0.16);
+  --ds-shadow-e5:
+    0 8px 20px -4px rgb(13 17 26 / 0.12), 0 40px 72px -20px rgb(13 17 26 / 0.24);
+
+  /* Motion --------------------------------------------------------------- */
+  --ds-duration-instant: 60ms;
+  --ds-duration-fast: 110ms;
+  --ds-duration-base: 170ms;
+  --ds-duration-slow: 260ms;
+  --ds-duration-slower: 380ms;
 }
 
-body {
-  @apply bg-ink-50 text-ink-900 antialiased;
-  font-family:
-    Inter,
-    ui-sans-serif,
-    system-ui,
-    -apple-system,
-    "Segoe UI",
-    Roboto,
-    sans-serif;
+/* =============================================================================
+   2b. SEMANTIC TOKENS — DARK
+   Applied when data-theme="dark" OR (system prefers dark AND not pinned light).
+============================================================================= */
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+
+    --ds-surface: #0a0c11;
+    --ds-surface-raised: #12151c;
+    --ds-surface-sunken: #06080b;
+    --ds-surface-overlay: #171b23;
+    --ds-surface-hover: #1a1e27;
+    --ds-surface-active: #222732;
+    --ds-surface-selected: #12203c;
+    --ds-surface-inverse: #f6f7fa;
+    --ds-surface-inverse-fg: #14171f;
+    --ds-scrim: rgb(0 0 0 / 0.66);
+
+    --ds-border: #232833;
+    --ds-border-subtle: #191d25;
+    --ds-border-strong: #363d4b;
+    --ds-border-inverse: rgb(13 17 26 / 0.12);
+
+    --ds-content: #e9ebf1;
+    --ds-content-muted: #98a1b3;
+    --ds-content-subtle: #767f94;
+    --ds-content-disabled: #4d5666;
+    --ds-content-inverse: #14171f;
+    --ds-content-on-solid: #ffffff;
+
+    --ds-accent: #3d6fe8;
+    --ds-accent-hover: #5285f5;
+    --ds-accent-active: #6b9aff;
+    --ds-accent-fg: #ffffff;
+    --ds-accent-subtle: #14213c;
+    --ds-accent-subtle-hover: #1a2b4d;
+    --ds-accent-subtle-fg: #9dbcff;
+    --ds-accent-border: #274073;
+    --ds-accent-text: #86adff;
+
+    --ds-neutral-subtle: #1b1f28;
+    --ds-neutral-solid: #3c4453;
+    --ds-neutral-fg: #a9b2c2;
+    --ds-neutral-border: #2c323e;
+    --ds-neutral-on-solid: #ffffff;
+
+    --ds-success-subtle: #0c2a1f;
+    --ds-success-solid: #1cae72;
+    --ds-success-fg: #5fd8a4;
+    --ds-success-border: #1c4a35;
+    --ds-success-on-solid: #04180f;
+
+    --ds-warning-subtle: #2b1f08;
+    --ds-warning-solid: #e0961f;
+    --ds-warning-fg: #f2b544;
+    --ds-warning-border: #4a3712;
+    --ds-warning-on-solid: #1f1202;
+
+    --ds-danger-subtle: #2c1316;
+    --ds-danger-solid: #d33232;
+    --ds-danger-fg: #ff8f8f;
+    --ds-danger-border: #4e2024;
+    --ds-danger-on-solid: #ffffff;
+
+    --ds-info-subtle: #0f1c33;
+    --ds-info-solid: #3062d6;
+    --ds-info-fg: #93b6ff;
+    --ds-info-border: #21376a;
+    --ds-info-on-solid: #ffffff;
+
+    --ds-highlight-subtle: #1d1330;
+    --ds-highlight-solid: #7546e6;
+    --ds-highlight-fg: #c4a5ff;
+    --ds-highlight-border: #392a5e;
+    --ds-highlight-on-solid: #ffffff;
+
+    --ds-focus-ring: #7ea6ff;
+    --ds-focus-ring-offset: #0a0c11;
+    --ds-selection-bg: #1f3a6b;
+    --ds-selection-fg: #eef2fb;
+    --ds-scrollbar-thumb: rgb(233 237 245 / 0.16);
+    --ds-scrollbar-thumb-hover: rgb(233 237 245 / 0.30);
+    --ds-skeleton: #1b202a;
+    --ds-skeleton-sheen: rgb(255 255 255 / 0.06);
+    --ds-code-bg: #14181f;
+    --ds-grid-line: rgb(233 237 245 / 0.07);
+
+    --ds-chart-1: #6d9bff;
+    --ds-chart-2: #3fd39a;
+    --ds-chart-3: #f0a93b;
+    --ds-chart-4: #a98bff;
+    --ds-chart-5: #ff7b7b;
+    --ds-chart-6: #3fd0dd;
+    --ds-chart-7: #ff9d5c;
+    --ds-chart-8: #9aa5ba;
+    --ds-chart-grid: rgb(233 237 245 / 0.08);
+    --ds-chart-axis: #6d778b;
+
+    --ds-shadow-e0: 0 1px 1px 0 rgb(0 0 0 / 0.4);
+    --ds-shadow-e1:
+      0 1px 2px 0 rgb(0 0 0 / 0.44), inset 0 1px 0 0 rgb(255 255 255 / 0.03);
+    --ds-shadow-e2:
+      0 2px 4px 0 rgb(0 0 0 / 0.48), 0 6px 14px -4px rgb(0 0 0 / 0.46),
+      inset 0 1px 0 0 rgb(255 255 255 / 0.04);
+    --ds-shadow-e3:
+      0 4px 10px -2px rgb(0 0 0 / 0.52), 0 16px 32px -8px rgb(0 0 0 / 0.55),
+      inset 0 1px 0 0 rgb(255 255 255 / 0.05);
+    --ds-shadow-e4:
+      0 8px 20px -4px rgb(0 0 0 / 0.58), 0 32px 64px -16px rgb(0 0 0 / 0.66),
+      inset 0 1px 0 0 rgb(255 255 255 / 0.06);
+    --ds-shadow-e5:
+      0 12px 28px -6px rgb(0 0 0 / 0.62), 0 48px 88px -24px rgb(0 0 0 / 0.74),
+      inset 0 1px 0 0 rgb(255 255 255 / 0.07);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --ds-surface: #0a0c11;
+  --ds-surface-raised: #12151c;
+  --ds-surface-sunken: #06080b;
+  --ds-surface-overlay: #171b23;
+  --ds-surface-hover: #1a1e27;
+  --ds-surface-active: #222732;
+  --ds-surface-selected: #12203c;
+  --ds-surface-inverse: #f6f7fa;
+  --ds-surface-inverse-fg: #14171f;
+  --ds-scrim: rgb(0 0 0 / 0.66);
+
+  --ds-border: #232833;
+  --ds-border-subtle: #191d25;
+  --ds-border-strong: #363d4b;
+  --ds-border-inverse: rgb(13 17 26 / 0.12);
+
+  --ds-content: #e9ebf1;
+  --ds-content-muted: #98a1b3;
+  --ds-content-subtle: #767f94;
+  --ds-content-disabled: #4d5666;
+  --ds-content-inverse: #14171f;
+  --ds-content-on-solid: #ffffff;
+
+  --ds-accent: #3d6fe8;
+  --ds-accent-hover: #5285f5;
+  --ds-accent-active: #6b9aff;
+  --ds-accent-fg: #ffffff;
+  --ds-accent-subtle: #14213c;
+  --ds-accent-subtle-hover: #1a2b4d;
+  --ds-accent-subtle-fg: #9dbcff;
+  --ds-accent-border: #274073;
+  --ds-accent-text: #86adff;
+
+  --ds-neutral-subtle: #1b1f28;
+  --ds-neutral-solid: #3c4453;
+  --ds-neutral-fg: #a9b2c2;
+  --ds-neutral-border: #2c323e;
+  --ds-neutral-on-solid: #ffffff;
+
+  --ds-success-subtle: #0c2a1f;
+  --ds-success-solid: #1cae72;
+  --ds-success-fg: #5fd8a4;
+  --ds-success-border: #1c4a35;
+  --ds-success-on-solid: #04180f;
+
+  --ds-warning-subtle: #2b1f08;
+  --ds-warning-solid: #e0961f;
+  --ds-warning-fg: #f2b544;
+  --ds-warning-border: #4a3712;
+  --ds-warning-on-solid: #1f1202;
+
+  --ds-danger-subtle: #2c1316;
+  --ds-danger-solid: #d33232;
+  --ds-danger-fg: #ff8f8f;
+  --ds-danger-border: #4e2024;
+  --ds-danger-on-solid: #ffffff;
+
+  --ds-info-subtle: #0f1c33;
+  --ds-info-solid: #3062d6;
+  --ds-info-fg: #93b6ff;
+  --ds-info-border: #21376a;
+  --ds-info-on-solid: #ffffff;
+
+  --ds-highlight-subtle: #1d1330;
+  --ds-highlight-solid: #7546e6;
+  --ds-highlight-fg: #c4a5ff;
+  --ds-highlight-border: #392a5e;
+  --ds-highlight-on-solid: #ffffff;
+
+  --ds-focus-ring: #7ea6ff;
+  --ds-focus-ring-offset: #0a0c11;
+  --ds-selection-bg: #1f3a6b;
+  --ds-selection-fg: #eef2fb;
+  --ds-scrollbar-thumb: rgb(233 237 245 / 0.16);
+  --ds-scrollbar-thumb-hover: rgb(233 237 245 / 0.30);
+  --ds-skeleton: #1b202a;
+  --ds-skeleton-sheen: rgb(255 255 255 / 0.06);
+  --ds-code-bg: #14181f;
+  --ds-grid-line: rgb(233 237 245 / 0.07);
+
+  --ds-chart-1: #6d9bff;
+  --ds-chart-2: #3fd39a;
+  --ds-chart-3: #f0a93b;
+  --ds-chart-4: #a98bff;
+  --ds-chart-5: #ff7b7b;
+  --ds-chart-6: #3fd0dd;
+  --ds-chart-7: #ff9d5c;
+  --ds-chart-8: #9aa5ba;
+  --ds-chart-grid: rgb(233 237 245 / 0.08);
+  --ds-chart-axis: #6d778b;
+
+  --ds-shadow-e0: 0 1px 1px 0 rgb(0 0 0 / 0.4);
+  --ds-shadow-e1:
+    0 1px 2px 0 rgb(0 0 0 / 0.44), inset 0 1px 0 0 rgb(255 255 255 / 0.03);
+  --ds-shadow-e2:
+    0 2px 4px 0 rgb(0 0 0 / 0.48), 0 6px 14px -4px rgb(0 0 0 / 0.46),
+    inset 0 1px 0 0 rgb(255 255 255 / 0.04);
+  --ds-shadow-e3:
+    0 4px 10px -2px rgb(0 0 0 / 0.52), 0 16px 32px -8px rgb(0 0 0 / 0.55),
+    inset 0 1px 0 0 rgb(255 255 255 / 0.05);
+  --ds-shadow-e4:
+    0 8px 20px -4px rgb(0 0 0 / 0.58), 0 32px 64px -16px rgb(0 0 0 / 0.66),
+    inset 0 1px 0 0 rgb(255 255 255 / 0.06);
+  --ds-shadow-e5:
+    0 12px 28px -6px rgb(0 0 0 / 0.62), 0 48px 88px -24px rgb(0 0 0 / 0.74),
+    inset 0 1px 0 0 rgb(255 255 255 / 0.07);
+}
+
+/* =============================================================================
+   3. DENSITY  —  data-density="comfortable" (default) | "compact"
+============================================================================= */
+
+:root,
+:root[data-density="comfortable"] {
+  --ds-control-h: 2.25rem;
+  --ds-control-h-sm: 1.75rem;
+  --ds-control-h-xs: 1.5rem;
+  --ds-control-h-lg: 2.625rem;
+  --ds-control-px: 0.75rem;
+  --ds-control-px-sm: 0.5rem;
+  --ds-control-gap: 0.4375rem;
+
+  --ds-row-h: 2.75rem;
+  --ds-row-h-sm: 2.25rem;
+  --ds-cell-px: 0.875rem;
+  --ds-cell-py: 0.625rem;
+
+  --ds-card-p: 1rem;
+  --ds-page-px: 1.5rem;
+  --ds-page-py: 1.25rem;
+  --ds-section-gap: 1.5rem;
+  --ds-stack: 0.75rem;
+  --ds-inline: 0.5rem;
+
+  --ds-font-body: 0.875rem;
+  --ds-line-body: 1.25rem;
+  --ds-font-meta: 0.75rem;
+  --ds-line-meta: 1rem;
+}
+
+:root[data-density="compact"] {
+  --ds-control-h: 1.9375rem;
+  --ds-control-h-sm: 1.625rem;
+  --ds-control-h-xs: 1.375rem;
+  --ds-control-h-lg: 2.25rem;
+  --ds-control-px: 0.625rem;
+  --ds-control-px-sm: 0.4375rem;
+  --ds-control-gap: 0.375rem;
+
+  --ds-row-h: 2.125rem;
+  --ds-row-h-sm: 1.875rem;
+  --ds-cell-px: 0.625rem;
+  --ds-cell-py: 0.3125rem;
+
+  --ds-card-p: 0.75rem;
+  --ds-page-px: 1rem;
+  --ds-page-py: 0.875rem;
+  --ds-section-gap: 1rem;
+  --ds-stack: 0.5rem;
+  --ds-inline: 0.375rem;
+
+  --ds-font-body: 0.8125rem;
+  --ds-line-body: 1.125rem;
+  --ds-font-meta: 0.6875rem;
+  --ds-line-meta: 0.9375rem;
+}
+
+/* =============================================================================
+   4. TAILWIND BRIDGE
+   `inline` keeps the var() reference in the generated rule, so every utility
+   below re-resolves live when data-theme / data-density flips.
+============================================================================= */
+
+@theme inline {
+  /* Surfaces */
+  --color-surface: var(--ds-surface);
+  --color-surface-raised: var(--ds-surface-raised);
+  --color-surface-sunken: var(--ds-surface-sunken);
+  --color-surface-overlay: var(--ds-surface-overlay);
+  --color-surface-hover: var(--ds-surface-hover);
+  --color-surface-active: var(--ds-surface-active);
+  --color-surface-selected: var(--ds-surface-selected);
+  --color-surface-inverse: var(--ds-surface-inverse);
+  --color-surface-inverse-fg: var(--ds-surface-inverse-fg);
+  --color-scrim: var(--ds-scrim);
+
+  /* Borders */
+  --color-border: var(--ds-border);
+  --color-border-subtle: var(--ds-border-subtle);
+  --color-border-strong: var(--ds-border-strong);
+  --color-border-inverse: var(--ds-border-inverse);
+
+  /* Content */
+  --color-content: var(--ds-content);
+  --color-content-muted: var(--ds-content-muted);
+  --color-content-subtle: var(--ds-content-subtle);
+  --color-content-disabled: var(--ds-content-disabled);
+  --color-content-inverse: var(--ds-content-inverse);
+  --color-content-on-solid: var(--ds-content-on-solid);
+
+  /* Accent */
+  --color-accent: var(--ds-accent);
+  --color-accent-hover: var(--ds-accent-hover);
+  --color-accent-active: var(--ds-accent-active);
+  --color-accent-fg: var(--ds-accent-fg);
+  --color-accent-subtle: var(--ds-accent-subtle);
+  --color-accent-subtle-hover: var(--ds-accent-subtle-hover);
+  --color-accent-subtle-fg: var(--ds-accent-subtle-fg);
+  --color-accent-border: var(--ds-accent-border);
+  --color-accent-text: var(--ds-accent-text);
+
+  /* Status families */
+  --color-neutral-subtle: var(--ds-neutral-subtle);
+  --color-neutral-solid: var(--ds-neutral-solid);
+  --color-neutral-fg: var(--ds-neutral-fg);
+  --color-neutral-border: var(--ds-neutral-border);
+  --color-neutral-on-solid: var(--ds-neutral-on-solid);
+
+  --color-success-subtle: var(--ds-success-subtle);
+  --color-success-solid: var(--ds-success-solid);
+  --color-success-fg: var(--ds-success-fg);
+  --color-success-border: var(--ds-success-border);
+  --color-success-on-solid: var(--ds-success-on-solid);
+
+  --color-warning-subtle: var(--ds-warning-subtle);
+  --color-warning-solid: var(--ds-warning-solid);
+  --color-warning-fg: var(--ds-warning-fg);
+  --color-warning-border: var(--ds-warning-border);
+  --color-warning-on-solid: var(--ds-warning-on-solid);
+
+  --color-danger-subtle: var(--ds-danger-subtle);
+  --color-danger-solid: var(--ds-danger-solid);
+  --color-danger-fg: var(--ds-danger-fg);
+  --color-danger-border: var(--ds-danger-border);
+  --color-danger-on-solid: var(--ds-danger-on-solid);
+
+  --color-info-subtle: var(--ds-info-subtle);
+  --color-info-solid: var(--ds-info-solid);
+  --color-info-fg: var(--ds-info-fg);
+  --color-info-border: var(--ds-info-border);
+  --color-info-on-solid: var(--ds-info-on-solid);
+
+  --color-highlight-subtle: var(--ds-highlight-subtle);
+  --color-highlight-solid: var(--ds-highlight-solid);
+  --color-highlight-fg: var(--ds-highlight-fg);
+  --color-highlight-border: var(--ds-highlight-border);
+  --color-highlight-on-solid: var(--ds-highlight-on-solid);
+
+  /* Utility colours */
+  --color-ring: var(--ds-focus-ring);
+  --color-ring-offset: var(--ds-focus-ring-offset);
+  --color-skeleton: var(--ds-skeleton);
+  --color-code-bg: var(--ds-code-bg);
+  --color-grid-line: var(--ds-grid-line);
+
+  /* Charts */
+  --color-chart-1: var(--ds-chart-1);
+  --color-chart-2: var(--ds-chart-2);
+  --color-chart-3: var(--ds-chart-3);
+  --color-chart-4: var(--ds-chart-4);
+  --color-chart-5: var(--ds-chart-5);
+  --color-chart-6: var(--ds-chart-6);
+  --color-chart-7: var(--ds-chart-7);
+  --color-chart-8: var(--ds-chart-8);
+  --color-chart-grid: var(--ds-chart-grid);
+  --color-chart-axis: var(--ds-chart-axis);
+
+  /* Elevation — remaps the stock shadow scale so legacy `shadow-sm` /
+     `shadow-xl` in existing pages become theme-aware for free. */
+  --shadow-2xs: var(--ds-shadow-e0);
+  --shadow-xs: var(--ds-shadow-e0);
+  --shadow-sm: var(--ds-shadow-e1);
+  --shadow-md: var(--ds-shadow-e2);
+  --shadow-lg: var(--ds-shadow-e3);
+  --shadow-xl: var(--ds-shadow-e4);
+  --shadow-2xl: var(--ds-shadow-e5);
+  --shadow-e0: var(--ds-shadow-e0);
+  --shadow-e1: var(--ds-shadow-e1);
+  --shadow-e2: var(--ds-shadow-e2);
+  --shadow-e3: var(--ds-shadow-e3);
+  --shadow-e4: var(--ds-shadow-e4);
+  --shadow-e5: var(--ds-shadow-e5);
+
+  /* Density-driven sizing (spacing namespace → p-*, h-*, w-*, gap-*, ...) */
+  --spacing-control: var(--ds-control-h);
+  --spacing-control-sm: var(--ds-control-h-sm);
+  --spacing-control-xs: var(--ds-control-h-xs);
+  --spacing-control-lg: var(--ds-control-h-lg);
+  --spacing-control-px: var(--ds-control-px);
+  --spacing-control-px-sm: var(--ds-control-px-sm);
+  --spacing-control-gap: var(--ds-control-gap);
+  --spacing-row: var(--ds-row-h);
+  --spacing-row-sm: var(--ds-row-h-sm);
+  --spacing-cell-x: var(--ds-cell-px);
+  --spacing-cell-y: var(--ds-cell-py);
+  --spacing-card: var(--ds-card-p);
+  --spacing-page-x: var(--ds-page-px);
+  --spacing-page-y: var(--ds-page-py);
+  --spacing-section: var(--ds-section-gap);
+  --spacing-stack: var(--ds-stack);
+  --spacing-inline: var(--ds-inline);
+
+  /* Density-driven type */
+  --text-body: var(--ds-font-body);
+  --text-body--line-height: var(--ds-line-body);
+  --text-meta: var(--ds-font-meta);
+  --text-meta--line-height: var(--ds-line-meta);
+}
+
+/* =============================================================================
+   5. BASE
+============================================================================= */
+
+@layer base {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--ds-scrollbar-thumb) transparent;
+  }
+
+  html {
+    height: 100%;
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+    font-feature-settings: "cv02" 1, "cv03" 1, "cv04" 1, "cv11" 1;
+  }
+
+  body {
+    height: 100%;
+    margin: 0;
+    background-color: var(--ds-surface);
+    color: var(--ds-content);
+    font-family: var(--font-sans);
+    font-size: var(--ds-font-body);
+    line-height: var(--ds-line-body);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    overscroll-behavior-y: none;
+  }
+
+  #root {
+    height: 100%;
+    isolation: isolate;
+  }
+
+  ::selection {
+    background-color: var(--ds-selection-bg);
+    color: var(--ds-selection-fg);
+  }
+
+  /* Outline only — never touch border-radius here, or a rounded-full control
+     would square off the moment it takes focus. Modern browsers already
+     follow the element's own radius. */
+  :focus-visible {
+    outline: 2px solid var(--ds-focus-ring);
+    outline-offset: 2px;
+  }
+
+  /* Never show the ring for pointer interaction. */
+  :focus:not(:focus-visible) {
+    outline: none;
+  }
+
+  [hidden] {
+    display: none !important;
+  }
+
+  hr {
+    border-color: var(--ds-border);
+  }
+
+  code,
+  kbd,
+  samp,
+  pre {
+    font-family: var(--font-mono);
+    font-feature-settings: normal;
+  }
+
+  /* Numeric columns should never jitter. */
+  .tabular,
+  [data-numeric] {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+
+  /* Sensible default motion for interactive chrome. Utilities still win. */
+  a,
+  button,
+  summary,
+  input,
+  select,
+  textarea,
+  [role="button"],
+  [role="tab"],
+  [role="option"],
+  [role="menuitem"] {
+    transition-property: color, background-color, border-color, outline-color,
+      text-decoration-color, box-shadow, opacity, transform;
+    transition-duration: var(--ds-duration-fast);
+    transition-timing-function: var(--ease-standard);
+  }
+
+  /* Native form controls inherit theme */
+  input,
+  select,
+  textarea,
+  button {
+    font: inherit;
+    color: inherit;
+  }
+
+  ::placeholder {
+    color: var(--ds-content-subtle);
+    opacity: 1;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background-color: var(--ds-scrollbar-thumb);
+    border: 2px solid transparent;
+    background-clip: content-box;
+    border-radius: 9999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: var(--ds-scrollbar-thumb-hover);
+  }
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+}
+
+/* =============================================================================
+   6. UTILITIES
+============================================================================= */
+
+@utility focus-ring {
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+  &:focus-visible {
+    outline-color: var(--ds-focus-ring);
+  }
+}
+
+/* Ring drawn inside the box — for controls that sit flush in a toolbar. */
+@utility focus-ring-inset {
+  &:focus-visible {
+    outline: none;
+    box-shadow: inset 0 0 0 2px var(--ds-focus-ring);
+  }
+}
+
+/* Named transition durations — Tailwind v4 has no --duration-* namespace,
+   so these are declared as real utilities. */
+@utility duration-instant {
+  transition-duration: var(--ds-duration-instant);
+}
+@utility duration-fast {
+  transition-duration: var(--ds-duration-fast);
+}
+@utility duration-base {
+  transition-duration: var(--ds-duration-base);
+}
+@utility duration-slow {
+  transition-duration: var(--ds-duration-slow);
+}
+@utility duration-slower {
+  transition-duration: var(--ds-duration-slower);
+}
+
+@utility no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* Hairline that stays 1 physical pixel on hidpi. */
+@utility hairline-b {
+  border-bottom: 1px solid var(--ds-border);
+}
+@utility hairline-t {
+  border-top: 1px solid var(--ds-border);
+}
+@utility hairline-r {
+  border-right: 1px solid var(--ds-border);
+}
+@utility hairline-l {
+  border-left: 1px solid var(--ds-border);
+}
+
+/* Skeleton shimmer — respects reduced motion via the global rule below. */
+@utility skeleton {
+  position: relative;
+  overflow: hidden;
+  background-color: var(--ds-skeleton);
+  border-radius: var(--radius-sm);
+  &::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background-image: linear-gradient(
+      90deg,
+      transparent,
+      var(--ds-skeleton-sheen),
+      transparent
+    );
+    animation: ds-shimmer 1.7s linear infinite;
+  }
+}
+
+/* Faint blueprint grid — for empty canvases / plan backdrops. */
+@utility grid-bg {
+  background-image:
+    linear-gradient(to right, var(--ds-grid-line) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--ds-grid-line) 1px, transparent 1px);
+  background-size: 16px 16px;
+}
+
+/* Top/bottom fade for scroll containers. */
+@utility mask-fade-y {
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 12px,
+    #000 calc(100% - 12px),
+    transparent 100%
+  );
+}
+
+@utility mask-fade-x {
+  mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 12px,
+    #000 calc(100% - 12px),
+    transparent 100%
+  );
+}
+
+/* Sticky table header that keeps its hairline while scrolling. */
+@utility sticky-head {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background-color: var(--ds-surface-raised);
+  box-shadow: inset 0 -1px 0 0 var(--ds-border);
+}
+
+@utility drag-none {
+  -webkit-user-drag: none;
+  user-select: none;
+}
+
+/* =============================================================================
+   7. KEYFRAMES
+============================================================================= */
+
+@keyframes ds-shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes ds-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes ds-slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes ds-scale-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes ds-indeterminate {
+  0% {
+    transform: translateX(-100%) scaleX(0.35);
+  }
+  50% {
+    transform: translateX(20%) scaleX(0.6);
+  }
+  100% {
+    transform: translateX(160%) scaleX(0.35);
+  }
+}
+
+@keyframes ds-pulse-soft {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+@keyframes ds-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* =============================================================================
+   8. REDUCED MOTION — last word, wins everything.
+============================================================================= */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .skeleton::after {
+    display: none;
+  }
+}
+
+/* Honour forced-colors / Windows high contrast. */
+@media (forced-colors: active) {
+  :focus-visible {
+    outline: 2px solid Highlight;
+  }
 }

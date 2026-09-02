@@ -14,3 +14,8 @@ data/
 uploads/
 .pglite/
 .vite/
+.ccr-ca.crt
+
+# Verifier scratch — live attack scripts, not part of the product
+apps/api/*-attack.mts
+apps/api/sso-takeover.mts

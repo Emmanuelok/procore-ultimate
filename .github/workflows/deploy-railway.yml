@@ -1,0 +1,89 @@
+name: Deploy to Railway
+
+# Why this exists
+# ---------------
+# Railway deploys are normally driven by its own GitHub integration: connect the
+# repo once in the Railway dashboard and every push to the tracked branch builds
+# automatically. That is still the simplest route and this workflow is not a
+# replacement for it.
+#
+# This is the fallback for two situations the integration does not cover:
+#   1. The repo is not connected in the dashboard (or was disconnected after the
+#      monorepo-split misconfiguration documented in docs/deployment.md §2.4).
+#   2. A deploy needs to be triggered deliberately rather than on every push —
+#      hence workflow_dispatch below.
+#
+# It is INERT until an operator adds a RAILWAY_TOKEN secret. Without it the job
+# does not fail the build, it skips with a message: a missing secret is a
+# configuration state, not a broken pipeline.
+#
+# Getting the token: Railway dashboard → project → Settings → Tokens → create a
+# project token, then add it at GitHub → repo Settings → Secrets and variables →
+# Actions → New repository secret, named RAILWAY_TOKEN. A project token is
+# scoped to one project; prefer it over an account token.
+
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: "Railway service name (leave blank for the project default)"
+        required: false
+        type: string
+  push:
+    branches:
+      - main
+      - claude/ai-saas-construction-platform-9bkv1v
+
+concurrency:
+  # One deploy at a time per branch. A superseded deploy is cancelled rather
+  # than racing the newer one to the same service.
+  group: railway-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Deploy only what already passed CI on this exact commit. Railway builds
+    # the image itself from the Dockerfile, so this job's own checkout is only
+    # needed for the railway CLI to have a project directory to upload.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for a deploy token
+        id: guard
+        run: |
+          if [ -z "${{ secrets.RAILWAY_TOKEN }}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Railway deploy skipped::No RAILWAY_TOKEN secret is set, so there is nothing to deploy to. Add one under Settings → Secrets and variables → Actions to enable this workflow. The build itself is unaffected."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install the Railway CLI
+        if: steps.guard.outputs.configured == 'true'
+        run: npm i -g @railway/cli
+
+      - name: Deploy
+        if: steps.guard.outputs.configured == 'true'
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          set -euo pipefail
+          SERVICE="${{ github.event.inputs.service }}"
+          # --ci makes the CLI stream build logs and exit non-zero on failure
+          # instead of detaching, so a failed deploy fails this job.
+          if [ -n "$SERVICE" ]; then
+            railway up --ci --service "$SERVICE"
+          else
+            railway up --ci
+          fi
+
+      - name: Report
+        if: steps.guard.outputs.configured == 'true'
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          echo "Deployed ${{ github.sha }}."
+          echo "Migrations 0000 onward apply automatically at container boot; the"
+          echo "release is live once /api/v1/health reports db: postgres."
+          railway status || true

@@ -1,0 +1,327 @@
+/**
+ * Shared plumbing for the BIM module: gates, record loaders, the ledger
+ * wrapper, the signal helper and the small pure helpers every route file
+ * needs.
+ *
+ * THE RULE THIS FILE EXISTS TO ENFORCE
+ *   An id-scoped route (`/bim/models/:modelId`, `/bim/issues/:issueId`, ...)
+ *   used to be gated on company membership alone, so a user on a template
+ *   with `bim: none` - or one who is not a member of the project at all -
+ *   could rename a model, publish a version (the ISO 19650 authorisation
+ *   step), or void a coordination issue by guessing an id. `requireToolFor`
+ *   resolves the record's project first and then runs the SAME `requireTool`
+ *   gate the project-scoped routes carry, so both paths enforce one rule.
+ */
+import { createHash } from "node:crypto";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { and, eq, ne } from "drizzle-orm";
+import { z } from "zod";
+import {
+  bimModelVersions,
+  bimModels,
+  clashTests,
+  coordinationIssues,
+  federationGroups,
+  realityCaptures,
+  signals,
+} from "@constructos/db";
+import type { BimDetector, PermissionLevel, SignalSeverity } from "@constructos/shared";
+import type { Db } from "../../lib/db.js";
+import { newId } from "../../lib/ids.js";
+import { appendLedger } from "../../lib/ledger.js";
+import { notFound } from "../../lib/errors.js";
+
+/* ------------------------------------------------------------------ */
+/* Wire formats                                                        */
+/* ------------------------------------------------------------------ */
+
+export const idSchema = z.string().min(1).max(64);
+
+export const isoDateSchema = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, "Expected an ISO date (YYYY-MM-DD)");
+
+export const isoTimestampSchema = z
+  .string()
+  .min(4)
+  .max(40)
+  .refine((v) => !Number.isNaN(Date.parse(v)), "Invalid timestamp");
+
+export const nowISO = (): string => new Date().toISOString();
+export const todayISO = (): string => new Date().toISOString().slice(0, 10);
+
+/** Deterministic content hash of an element's data - drives version diffs. */
+export function propertyHash(input: {
+  name: string | null;
+  ifcType: string;
+  typeName?: string | null;
+  classification?: string | null;
+  storey?: string | null;
+  properties: Record<string, unknown>;
+  bounds?: unknown;
+}): string {
+  const keys = Object.keys(input.properties).sort();
+  const flat = keys.map((k) => `${k}=${JSON.stringify(input.properties[k] ?? null)}`).join("|");
+  const payload = [
+    input.ifcType,
+    input.name ?? "",
+    input.typeName ?? "",
+    input.classification ?? "",
+    input.storey ?? "",
+    JSON.stringify(input.bounds ?? null),
+    flat,
+  ].join("|");
+  return createHash("sha256").update(payload).digest("hex").slice(0, 32);
+}
+
+/* ------------------------------------------------------------------ */
+/* Gates                                                               */
+/* ------------------------------------------------------------------ */
+
+export function buildBimGates(app: FastifyInstance) {
+  const tool = (level: PermissionLevel) => [
+    app.authenticate,
+    app.requireCompany,
+    app.requireTool("bim", level),
+  ];
+  return {
+    readGate: tool("read"),
+    standardGate: tool("standard"),
+    adminGate: tool("admin"),
+    /** company-level routes with no project in the path */
+    companyGate: [app.authenticate, app.requireCompany],
+    /**
+     * Enforce the bim tool level against a project resolved from a record.
+     * The project id is written into req.params so the same requireTool
+     * closure (project membership, template level, assurance read grants,
+     * owner/admin bypass) runs exactly as it does on a project-scoped route.
+     */
+    async requireToolFor(
+      req: FastifyRequest,
+      reply: FastifyReply,
+      projectId: string,
+      level: PermissionLevel,
+      toolKey: "bim" | "twin" = "bim",
+    ): Promise<void> {
+      (req.params as Record<string, string>)["projectId"] = projectId;
+      await app.requireTool(toolKey, level)(req, reply);
+    },
+  };
+}
+
+export type BimGates = ReturnType<typeof buildBimGates>;
+
+/* ------------------------------------------------------------------ */
+/* Record loaders (tenant-scoped)                                      */
+/* ------------------------------------------------------------------ */
+
+export function buildLoaders(app: FastifyInstance) {
+  async function getModel(modelId: string, companyId: string) {
+    const rows = await app.db
+      .select()
+      .from(bimModels)
+      .where(and(eq(bimModels.id, modelId), eq(bimModels.companyId, companyId)))
+      .limit(1);
+    if (!rows[0]) throw notFound("Model not found");
+    return rows[0];
+  }
+
+  async function getVersion(versionId: string, companyId: string) {
+    const rows = await app.db
+      .select({ version: bimModelVersions, model: bimModels })
+      .from(bimModelVersions)
+      .innerJoin(bimModels, eq(bimModels.id, bimModelVersions.modelId))
+      .where(and(eq(bimModelVersions.id, versionId), eq(bimModels.companyId, companyId)))
+      .limit(1);
+    if (!rows[0]) throw notFound("Model version not found");
+    return rows[0];
+  }
+
+  async function getIssue(issueId: string, companyId: string) {
+    const rows = await app.db
+      .select()
+      .from(coordinationIssues)
+      .where(and(eq(coordinationIssues.id, issueId), eq(coordinationIssues.companyId, companyId)))
+      .limit(1);
+    if (!rows[0]) throw notFound("Coordination issue not found");
+    return rows[0];
+  }
+
+  async function getFederation(groupId: string, companyId: string, projectId?: string) {
+    const conds = [eq(federationGroups.id, groupId), eq(federationGroups.companyId, companyId)];
+    if (projectId) conds.push(eq(federationGroups.projectId, projectId));
+    const rows = await app.db
+      .select()
+      .from(federationGroups)
+      .where(and(...conds))
+      .limit(1);
+    if (!rows[0]) throw notFound("Federation group not found");
+    return rows[0];
+  }
+
+  async function getClashTest(testId: string, companyId: string) {
+    const rows = await app.db
+      .select()
+      .from(clashTests)
+      .where(and(eq(clashTests.id, testId), eq(clashTests.companyId, companyId)))
+      .limit(1);
+    if (!rows[0]) throw notFound("Clash test not found");
+    return rows[0];
+  }
+
+  async function getCapture(captureId: string, companyId: string) {
+    const rows = await app.db
+      .select()
+      .from(realityCaptures)
+      .where(and(eq(realityCaptures.id, captureId), eq(realityCaptures.companyId, companyId)))
+      .limit(1);
+    if (!rows[0]) throw notFound("Reality capture not found");
+    return rows[0];
+  }
+
+  return { getModel, getVersion, getIssue, getFederation, getClashTest, getCapture };
+}
+
+export type BimLoaders = ReturnType<typeof buildLoaders>;
+
+/* ------------------------------------------------------------------ */
+/* Ledger + signals                                                    */
+/* ------------------------------------------------------------------ */
+
+export type BimObjectType =
+  | "bim_model"
+  | "bim_model_version"
+  | "bim_element_link"
+  | "bim_version_diff"
+  | "clash_test"
+  | "clash_result"
+  | "coordination_issue"
+  | "coordination_issue_comment"
+  | "federation_group"
+  | "federation_member"
+  | "reality_capture"
+  | "geofence"
+  | "signal"
+  | "rfi"
+  | "file";
+
+export async function ledger(
+  db: Db,
+  entry: {
+    companyId: string;
+    projectId?: string | null;
+    actorId: string | null;
+    action: "create" | "update" | "delete" | "state_change" | "access";
+    objectType: BimObjectType;
+    objectId: string;
+    payload?: unknown;
+    storePayload?: boolean;
+  },
+): Promise<void> {
+  await appendLedger(db, {
+    companyId: entry.companyId,
+    actorId: entry.actorId,
+    action: entry.action,
+    objectType: entry.objectType,
+    objectId: entry.objectId,
+    payload: entry.payload,
+    projectId: entry.projectId ?? undefined,
+    storePayload: entry.storePayload,
+  });
+}
+
+/**
+ * Close a signal whose condition no longer holds, so a resolved clash set or
+ * a fixed ingestion does not leave a permanent red mark on the register.
+ * Returns how many signals were closed.
+ */
+export async function closeSignal(
+  db: Db,
+  companyId: string,
+  detector: BimDetector,
+  key: string,
+  reason: string,
+): Promise<number> {
+  const at = nowISO();
+  const closed = await db
+    .update(signals)
+    .set({
+      disposition: "closed",
+      closedAt: at,
+      autoClosedAt: at,
+      reviewerNotes: reason,
+    })
+    .where(
+      and(
+        eq(signals.companyId, companyId),
+        eq(signals.detector, detector),
+        eq(signals.fingerprint, key),
+        ne(signals.disposition, "closed"),
+      ),
+    )
+    .returning({ id: signals.id });
+  return closed.length;
+}
+
+export interface SignalDraft {
+  detector: BimDetector;
+  severity: SignalSeverity;
+  confidence: number;
+  title: string;
+  explanation: string;
+  /** dedupe key - the same condition never raises a second signal */
+  key: string;
+  evidence?: Record<string, unknown>;
+  subjectType?: string;
+  subjectId?: string;
+}
+
+/** Raise a signal unless one with the same dedupe key already exists. */
+export async function raiseSignal(
+  db: Db,
+  companyId: string,
+  projectId: string | null,
+  actorId: string | null,
+  draft: SignalDraft,
+): Promise<string | null> {
+  const existing = await db
+    .select({ id: signals.id })
+    .from(signals)
+    .where(
+      and(
+        eq(signals.companyId, companyId),
+        eq(signals.detector, draft.detector),
+        eq(signals.fingerprint, draft.key),
+      ),
+    )
+    .limit(1);
+  if (existing[0]) return null;
+  const id = newId("sig");
+  const at = nowISO();
+  await db.insert(signals).values({
+    id,
+    companyId,
+    projectId,
+    detector: draft.detector,
+    severity: draft.severity,
+    confidence: draft.confidence,
+    title: draft.title,
+    explanation: draft.explanation,
+    evidenceRefs: { key: draft.key, ...(draft.evidence ?? {}) },
+    fingerprint: draft.key,
+    subjectType: draft.subjectType ?? null,
+    subjectId: draft.subjectId ?? null,
+    firstSeenAt: at,
+    lastSeenAt: at,
+  });
+  await ledger(db, {
+    companyId,
+    projectId,
+    actorId,
+    action: "create",
+    objectType: "signal",
+    objectId: id,
+    payload: { detector: draft.detector, severity: draft.severity, key: draft.key },
+  });
+  return id;
+}

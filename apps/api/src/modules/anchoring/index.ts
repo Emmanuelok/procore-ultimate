@@ -1,0 +1,2322 @@
+/**
+ * M1 — Ledger anchoring & escrow (spec Vol II Domain S #860-861, #864,
+ * #873-874; docs/roadmap.md "Structural holes" #2; docs/security.md §8.2
+ * gaps 2-3).
+ *
+ * THE HOLE THIS CLOSES. `ledger_entries` is a per-company hash chain: every
+ * entry's hash covers its content and its predecessor's hash, so an edit to
+ * entry k invalidates k…n and `GET /ledger/verify` reports the break. That is
+ * tamper-evidence against EDITS, and it is the whole of what the chain can do
+ * by itself. Two attacks walk straight through it, and both are available to
+ * whoever controls the database — which, on a self-hosted deployment, is the
+ * party whose record is under scrutiny:
+ *
+ *   TAIL TRUNCATION   Delete the last N entries. The remainder verifies
+ *                     perfectly. Nothing in the chain knows how long it was
+ *                     supposed to be.
+ *
+ *   WHOLESALE REWRITE Recompute every hash from genesis over a different
+ *                     history. The result verifies perfectly. Nothing inside
+ *                     the database can defeat an attacker who owns everything
+ *                     inside the database.
+ *
+ * A SEAL closes both: it commits to `entryCount` (so a shorter chain is
+ * arithmetic, not judgement) and to a Merkle root over every entry hash (so a
+ * different history is a different root), and it is SIGNED with an Ed25519 key
+ * whose private half is in the process environment and never in the database.
+ * Seals are chained to each other by `prevSealHash` and numbered contiguously
+ * from 1, so deleting the seal that would have noticed is itself noticed.
+ *
+ * ESCROW is what turns "we verified our own chain" into "a third party can
+ * verify it": a self-contained receipt — seal body, signature, public key,
+ * fingerprint, procedure in words — handed to a named counterparty, who can
+ * later present it back (POST /ledger/escrow/verify) or verify it entirely
+ * offline with `apps/api/src/scripts/verify-receipt.ts`.
+ *
+ * WHAT THIS STILL DOES NOT PROVE, stated here because a module like this is
+ * dangerous when it overstates itself:
+ *   • With no ANCHOR_SIGNING_KEY configured, the key is DERIVED FROM
+ *     AUTH_SECRET and is therefore held by the same operator as the
+ *     application. It defeats a database-only attacker; it does not defeat the
+ *     operator, who could re-derive and re-sign. Every response and every
+ *     receipt made under such a key says so (`derivedFromAuthSecret`).
+ *   • `sealedAt` is this application's clock until an RFC 3161 anchor
+ *     succeeds. This deployment has no timestamp authority configured, so
+ *     seals prove ORDER, not wall-clock time (§8.2 gap 3 is narrowed, not
+ *     closed).
+ *   • A seal proves the record has not changed since it was sealed. It says
+ *     nothing about whether the record was TRUE when written — that is the
+ *     reconciliation engine's job.
+ */
+import type { FastifyPluginAsync } from "fastify";
+import { and, asc, count, desc, eq, gt, sql } from "drizzle-orm";
+import { z } from "zod";
+import {
+  anchorSubmissions,
+  chainSeals,
+  chainWatermarks,
+  escrowReceipts,
+  ledgerEntries,
+  signals,
+} from "@constructos/db";
+import { ANCHOR_PROVIDERS, type AnchorProvider, type ChainVerdict } from "@constructos/shared";
+import {
+  buildSealBody,
+  canonicalize,
+  classifyChain,
+  hashPayload,
+  merkleRoot,
+  sealBodyHash,
+  sha256Hex,
+  signSealBody,
+  verifySealSignature,
+  type ChainClassification,
+  type SealBody,
+  type SealChainVerdict,
+  type SealRecord,
+  type SealedChainEntry,
+} from "@constructos/ledger";
+import { newId } from "../../lib/ids.js";
+import { appendLedger } from "../../lib/ledger.js";
+import { forEachCompany } from "../../lib/scheduler.js";
+import { AppError, badRequest, notFound } from "../../lib/errors.js";
+import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
+import {
+  anchorKeyState,
+  fingerprintTrusted,
+  trustAnchor,
+  type TrustAnchor,
+  listVisibleKeys,
+  registerPublicKey,
+  requireAnchorKey,
+  retireOtherKeys,
+  type AnchorKeyEnv,
+  type AnchorKeyRecord,
+} from "./keys.js";
+import {
+  PROVIDER_REQUIREMENTS,
+  submitAnchor,
+  upgradeOpenTimestamps,
+  type AnchorProviderEnv,
+} from "./providers.js";
+
+/**
+ * Compile-time proof that the ledger package's local verdict union and
+ * `CHAIN_VERDICTS` in @constructos/shared are the same set. The ledger package
+ * cannot import shared (it must stay usable by an offline verifier), so this
+ * assertion is the thing that stops the two drifting.
+ */
+type VerdictParity = [SealChainVerdict] extends [ChainVerdict]
+  ? [ChainVerdict] extends [SealChainVerdict]
+    ? true
+    : never
+  : never;
+const VERDICTS_MATCH: VerdictParity = true;
+
+/** Tracks apps/api/package.json; carried in every escrow receipt. */
+export const PLATFORM = { name: "ConstructOS", version: "0.1.0" } as const;
+
+export const RECEIPT_DOCUMENT_TYPE = "constructos.escrow-receipt";
+export const RECEIPT_DOCUMENT_VERSION = 1;
+
+/** Ledger objectType used for the module's own appends. */
+const SEAL_OBJECT = "chain_seal";
+
+/* ------------------------------------------------------------------ */
+/* Schemas                                                             */
+/* ------------------------------------------------------------------ */
+
+const sealCreateSchema = z.object({
+  /** seal even when nothing material changed since the last one */
+  force: z.boolean().optional(),
+  note: z.string().max(2000).optional(),
+});
+
+const anchorSchema = z.object({
+  provider: z.enum(ANCHOR_PROVIDERS),
+  counterpartyName: z.string().min(1).max(200).optional(),
+  counterpartyRef: z.string().min(1).max(200).optional(),
+  note: z.string().max(2000).optional(),
+});
+
+const anchorConfirmSchema = z.object({
+  externalRef: z.string().min(1).max(200),
+  acknowledgedBy: z.string().min(1).max(200).optional(),
+  note: z.string().max(2000).optional(),
+});
+
+const anchorsListQuery = pageQuerySchema.extend({
+  provider: z.enum(ANCHOR_PROVIDERS).optional(),
+  sealId: z.string().min(1).max(64).optional(),
+});
+
+const escrowIssueSchema = z.object({
+  recipientName: z.string().min(1).max(200),
+  recipientRef: z.string().min(1).max(200).nullable().optional(),
+  recipientUserId: z.string().min(1).max(64).nullable().optional(),
+  purpose: z.string().max(2000).nullable().optional(),
+});
+
+const receiptsListQuery = pageQuerySchema.extend({
+  sealId: z.string().min(1).max(64).optional(),
+});
+
+/** The receipt document as presented back for verification. */
+const receiptDocumentSchema = z.object({
+  documentType: z.literal(RECEIPT_DOCUMENT_TYPE),
+  version: z.number().int().min(1),
+  receiptId: z.string().min(1).max(64),
+  issuedAt: z.string().min(4),
+  issuer: z.object({
+    platform: z.string().min(1),
+    platformVersion: z.string().min(1),
+    companyId: z.string().min(1).max(64),
+  }),
+  seal: z.object({
+    sealId: z.string().min(1).max(64),
+    companyId: z.string().min(1).max(64),
+    sequence: z.number().int().min(1),
+    fromEntrySeq: z.number().int().min(1),
+    toEntrySeq: z.number().int().min(1),
+    entryCount: z.number().int().min(1),
+    headHash: z.string().length(64),
+    merkleRoot: z.string().length(64),
+    prevSealHash: z.string().length(64).nullable(),
+    sealedAt: z.string().min(4),
+    keyId: z.string().min(1).max(200),
+    algorithm: z.string().min(1).max(50),
+    bodyHash: z.string().length(64),
+    signature: z.string().min(1).max(400),
+  }),
+  key: z.object({
+    keyId: z.string().min(1).max(200),
+    algorithm: z.string().min(1).max(50),
+    publicKeyPem: z.string().min(1).max(4000),
+    fingerprint: z.string().length(64),
+    derivedFromAuthSecret: z.boolean(),
+    weakening: z.string().nullable(),
+  }),
+  receiptHash: z.string().length(64),
+});
+
+type ReceiptDocument = z.infer<typeof receiptDocumentSchema>;
+
+/* ------------------------------------------------------------------ */
+/* Row helpers                                                         */
+/* ------------------------------------------------------------------ */
+
+type SealRow = typeof chainSeals.$inferSelect;
+type AnchorRow = typeof anchorSubmissions.$inferSelect;
+
+/**
+ * Postgres and PGlite hand a `timestamptz` back as "2026-08-25 10:20:00.1+00",
+ * not as the ISO-8601 string that was written. The seal body is SIGNED, so the
+ * exact bytes matter: everything that reconstructs a body normalizes through
+ * here, and `buildSealBody` normalizes again as a backstop.
+ */
+function isoOf(value: string): string {
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? value : new Date(ms).toISOString();
+}
+
+/**
+ * Build a `SealRecord` from a stored row WITHOUT validating it. Validation is
+ * `classifyChain`'s job: a row with an impossible `entryCount` must produce a
+ * verdict, not a 500.
+ */
+function toSealRecord(row: SealRow): SealRecord {
+  return {
+    id: row.id,
+    companyId: row.companyId,
+    sequence: row.sequence,
+    fromEntrySeq: row.fromEntrySeq,
+    toEntrySeq: row.toEntrySeq,
+    entryCount: row.entryCount,
+    headHash: row.headHash,
+    merkleRoot: row.merkleRoot,
+    prevSealHash: row.prevSealHash,
+    sealedAt: isoOf(row.sealedAt),
+    keyId: row.keyId,
+    algorithm: row.algorithm,
+    bodyHash: row.bodyHash,
+    signature: row.signature,
+  };
+}
+
+function sealBodyOf(record: SealRecord): SealBody {
+  const { bodyHash, signature, id, ...body } = record;
+  void bodyHash;
+  void signature;
+  void id;
+  return body;
+}
+
+/**
+ * A key id beginning `ankd_` was derived from AUTH_SECRET (see keys.ts). The
+ * flag is recoverable from the id alone, which is what lets a seal made months
+ * ago still report the weakening that applied when it was made.
+ */
+function derivedKeyId(keyId: string): boolean {
+  return keyId.startsWith("ankd_");
+}
+
+const DERIVED_NOTE_FALLBACK =
+  "This seal was signed with a key derived from AUTH_SECRET, held by the same operator that " +
+  "runs this application: it proves integrity against a database-only attacker, not against " +
+  "the operator.";
+
+/* ------------------------------------------------------------------ */
+/* Module                                                              */
+/* ------------------------------------------------------------------ */
+
+export const anchoringModule: FastifyPluginAsync = async (app) => {
+  void VERDICTS_MATCH;
+
+  /**
+   * Reads are open to every company member. That deliberately includes users
+   * whose reach comes from an assurance grant (`requireAssuranceRole` resolves
+   * against `assurance_grants` for a user who is already a company member, so
+   * an auditor or integrity reviewer reaches these routes through
+   * `requireCompany`): the chain verdict is the endpoint an auditor lives on,
+   * and gating it behind owner/admin would put the record's custodian between
+   * the auditor and the record.
+   */
+  const memberGate = [app.authenticate, app.requireCompany];
+  const adminGate = [
+    app.authenticate,
+    app.requireCompany,
+    app.requireCompanyRole(["owner", "admin"]),
+  ];
+
+  /* ---------------------------------------------------------------- */
+  /* Environment                                                       */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Anchoring configuration is read from `process.env` at call time rather
+   * than from the boot-time config schema: the signing key is a secret this
+   * module must not copy into a shared, loggable config object, and reading it
+   * late means an operator can set it without a redeploy on platforms that
+   * support it.
+   */
+  function anchorEnv(): AnchorKeyEnv & AnchorProviderEnv {
+    return {
+      NODE_ENV: app.appConfig.NODE_ENV,
+      AUTH_SECRET: app.appConfig.AUTH_SECRET,
+      ANCHOR_SIGNING_KEY: process.env["ANCHOR_SIGNING_KEY"],
+      ANCHOR_TRUSTED_FINGERPRINTS: process.env["ANCHOR_TRUSTED_FINGERPRINTS"],
+      ANCHOR_TSA_URL: process.env["ANCHOR_TSA_URL"],
+      ANCHOR_OTS_CALENDAR_URL: process.env["ANCHOR_OTS_CALENDAR_URL"],
+    };
+  }
+
+  /** Heartbeat interval in hours; bounds how long a truncation can hide. */
+  function heartbeatHours(): number {
+    const raw = Number(process.env["ANCHOR_HEARTBEAT_HOURS"]);
+    return Number.isFinite(raw) && raw > 0 ? raw : 24;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Loading the chain and its seals                                   */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * The chain, WITHOUT payload snapshots, read in bounded pages.
+   *
+   * The chain covers `payloadHash`, never the snapshot the hash was taken
+   * over, so every link check, every entry-hash check and every Merkle root is
+   * answerable from the hash columns alone. Loading `payload` jsonb as well —
+   * which is what this used to do, on every seal list, every chain verdict,
+   * every per-seal verify and every escrow verification — made a monitoring
+   * read scale with the tenant's entire commercial history and could OOM the
+   * process from a single page view.
+   *
+   * The snapshot re-hash is not lost; it moved to `deepVerifyPayloads`, which
+   * runs on the scheduler in bounded batches and records its progress on the
+   * per-company watermark. That is the right place for it: it is the expensive
+   * check, and it is the one nobody should be able to trigger by opening a tab.
+   */
+  async function loadEntries(companyId: string): Promise<SealedChainEntry[]> {
+    const out: SealedChainEntry[] = [];
+    let cursor = 0;
+    const batchSize = 10_000;
+    for (;;) {
+      const rows = await app.db
+        .select({
+          seq: ledgerEntries.seq,
+          companyId: ledgerEntries.companyId,
+          actorId: ledgerEntries.actorId,
+          action: ledgerEntries.action,
+          objectType: ledgerEntries.objectType,
+          objectId: ledgerEntries.objectId,
+          payloadHash: ledgerEntries.payloadHash,
+          at: ledgerEntries.at,
+          prevHash: ledgerEntries.prevHash,
+          entryHash: ledgerEntries.entryHash,
+        })
+        .from(ledgerEntries)
+        .where(and(eq(ledgerEntries.companyId, companyId), gt(ledgerEntries.seq, cursor)))
+        .orderBy(asc(ledgerEntries.seq))
+        .limit(batchSize);
+      if (rows.length === 0) break;
+      for (const r of rows) {
+        out.push({
+          seq: Number(r.seq),
+          companyId: r.companyId,
+          actorId: r.actorId,
+          action: r.action,
+          objectType: r.objectType,
+          objectId: r.objectId,
+          payloadHash: r.payloadHash,
+          // Deliberately absent: `undefined` means "nothing is claimed about
+          // the snapshot", which is exactly true here (see deepVerifyPayloads).
+          at: isoOf(r.at),
+          prevHash: r.prevHash,
+          entryHash: r.entryHash,
+        });
+      }
+      cursor = Number(rows[rows.length - 1]!.seq);
+      if (rows.length < batchSize) break;
+    }
+    return out;
+  }
+
+  /**
+   * The expensive pass: re-hash stored payload SNAPSHOTS and compare.
+   *
+   * An insider who rewrites what an entry SAYS while leaving `payloadHash`
+   * alone is invisible to the chain and to every seal over it — the chain
+   * commits to the hash, not to the text. This is the only check that catches
+   * it, and it is bounded, resumable and scheduled rather than run on a read.
+   */
+  async function deepVerifyPayloads(
+    companyId: string,
+    fromSeq: number,
+    limit: number,
+  ): Promise<{ checked: number; lastSeq: number; mismatch: { seq: number; objectType: string; objectId: string } | null }> {
+    const rows = await app.db
+      .select({
+        seq: ledgerEntries.seq,
+        payload: ledgerEntries.payload,
+        payloadHash: ledgerEntries.payloadHash,
+        objectType: ledgerEntries.objectType,
+        objectId: ledgerEntries.objectId,
+      })
+      .from(ledgerEntries)
+      .where(and(eq(ledgerEntries.companyId, companyId), gt(ledgerEntries.seq, fromSeq)))
+      .orderBy(asc(ledgerEntries.seq))
+      .limit(limit);
+    let lastSeq = fromSeq;
+    for (const r of rows) {
+      lastSeq = Number(r.seq);
+      if (r.payload === null || r.payload === undefined) continue;
+      if (hashPayload(r.payload) !== r.payloadHash) {
+        return {
+          checked: rows.length,
+          lastSeq,
+          mismatch: { seq: lastSeq, objectType: r.objectType, objectId: r.objectId },
+        };
+      }
+    }
+    return { checked: rows.length, lastSeq, mismatch: null };
+  }
+
+  async function loadSeals(companyId: string): Promise<SealRow[]> {
+    return app.db
+      .select()
+      .from(chainSeals)
+      .where(eq(chainSeals.companyId, companyId))
+      .orderBy(asc(chainSeals.sequence));
+  }
+
+  async function fetchSeal(sealId: string, companyId: string): Promise<SealRow> {
+    const rows = await app.db
+      .select()
+      .from(chainSeals)
+      .where(and(eq(chainSeals.id, sealId), eq(chainSeals.companyId, companyId)))
+      .limit(1);
+    if (!rows[0]) throw notFound("Seal not found");
+    return rows[0];
+  }
+
+  /**
+   * Public keys available for signature checking, by keyId: everything on
+   * record plus the key this process currently holds (which may not be
+   * registered yet — a seal must be verifiable the instant it is made).
+   */
+  async function publicKeyMap(companyId: string): Promise<Record<string, string>> {
+    const anchor = trustAnchor(anchorEnv());
+    const map: Record<string, string> = {};
+    for (const row of await listVisibleKeys(app.db, companyId)) {
+      // With fingerprints pinned, a key registered in the database is only
+      // usable if the operator vouched for it out of band. This is what stops
+      // an attacker with write access from registering their own key and
+      // re-signing a rewritten chain under it — without the pin, that attack
+      // verifies clean, and no amount of checking inside the database finds it.
+      if (!fingerprintTrusted(anchor, row.fingerprint)) continue;
+      map[row.keyId] = row.publicKeyPem;
+    }
+    const state = anchorKeyState(anchorEnv());
+    // The process's own key is subject to the same pin: an operator who pins
+    // fingerprints and then runs with a key outside that set has a
+    // configuration error, and silently trusting it would defeat the pin.
+    if (state.available && fingerprintTrusted(anchor, state.record.fingerprint)) {
+      map[state.record.keyId] = state.record.publicKeyPem;
+    }
+    return map;
+  }
+
+  interface KeyInfo {
+    keyId: string;
+    algorithm: string;
+    fingerprint: string | null;
+    publicKeyPem: string | null;
+    derivedFromAuthSecret: boolean;
+    weakening: string | null;
+    /** false when no public key for this id is on record — nothing can be checked */
+    known: boolean;
+  }
+
+  async function keyInfoFor(keyId: string, companyId: string): Promise<KeyInfo> {
+    const derived = derivedKeyId(keyId);
+    const rows = await listVisibleKeys(app.db, companyId);
+    const row = rows.find((r) => r.keyId === keyId);
+    const state = anchorKeyState(anchorEnv());
+    const envRecord =
+      state.available && state.record.keyId === keyId ? state.record : null;
+    const pem = envRecord?.publicKeyPem ?? row?.publicKeyPem ?? null;
+    return {
+      keyId,
+      algorithm: envRecord?.algorithm ?? row?.algorithm ?? "ed25519",
+      fingerprint: envRecord?.fingerprint ?? row?.fingerprint ?? null,
+      publicKeyPem: pem,
+      derivedFromAuthSecret: derived,
+      weakening: derived ? (envRecord?.weakening ?? DERIVED_NOTE_FALLBACK) : null,
+      known: Boolean(pem),
+    };
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Views                                                             */
+  /* ---------------------------------------------------------------- */
+
+  function sealView(row: SealRow, key: KeyInfo) {
+    const record = toSealRecord(row);
+    return {
+      id: row.id,
+      companyId: row.companyId,
+      sequence: row.sequence,
+      fromEntrySeq: row.fromEntrySeq,
+      toEntrySeq: row.toEntrySeq,
+      entryCount: row.entryCount,
+      headHash: row.headHash,
+      merkleRoot: row.merkleRoot,
+      prevSealHash: row.prevSealHash,
+      bodyHash: row.bodyHash,
+      signature: row.signature,
+      keyId: row.keyId,
+      algorithm: row.algorithm,
+      sealedAt: isoOf(row.sealedAt),
+      isHeartbeat: row.isHeartbeat === 1,
+      sealedBy: row.sealedBy,
+      createdAt: row.createdAt,
+      /** the exact object that was signed — canonicalize this to reproduce the bytes */
+      body: sealBodyOf(record),
+      key,
+      derivedFromAuthSecret: key.derivedFromAuthSecret,
+      weakening: key.weakening,
+      timeCaveat:
+        "sealedAt is this application's clock. Until an RFC 3161 anchor succeeds, a seal " +
+        "proves ORDER (it came after the previous seal), not wall-clock time.",
+    };
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Signals — a broken chain is a critical finding                    */
+  /* ---------------------------------------------------------------- */
+
+  const VERDICT_DETECTOR: Record<Exclude<ChainVerdict, "intact" | "no_seals">, string> = {
+    tail_truncated: "ledger_truncation_detected",
+    seal_broken: "chain_seal_broken",
+    seal_forged: "chain_seal_forged",
+    // The three names above are the ones the design brief specifies. An
+    // altered entry inside a sealed range needs its own name or it would be
+    // the one broken-chain verdict that raises nothing at all.
+    entry_altered: "ledger_entry_altered",
+  };
+
+  const VERDICT_TITLE: Record<Exclude<ChainVerdict, "intact" | "no_seals">, string> = {
+    tail_truncated: "Ledger truncation detected — sealed entries are missing",
+    seal_broken: "Chain seal linkage broken — a seal has been removed or relinked",
+    seal_forged: "Chain seal does not verify — forged or altered after signing",
+    entry_altered: "Ledger entry altered inside a sealed range",
+  };
+
+  /**
+   * Raise a critical signal for a broken chain, once per distinct finding.
+   * Idempotency is keyed on verdict + the seal and entry it was localized to,
+   * so re-reading the verdict every minute does not manufacture a signal
+   * storm, while a NEW break (a different entry, a later seal) still fires.
+   * `projectId` is null: this is a tenant-level finding and `signals.projectId`
+   * is nullable for exactly that case.
+   */
+  async function raiseVerdictSignal(
+    companyId: string,
+    actorId: string | null,
+    result: ChainClassification,
+  ): Promise<string | null> {
+    if (result.verdict === "intact" || result.verdict === "no_seals") return null;
+    const detector = VERDICT_DETECTOR[result.verdict];
+    // The identity of a finding is what it is ABOUT, not what the chain
+    // happened to look like when it was read. An altered entry is identified
+    // by that entry; a truncation or a seal failure by the seal that caught it
+    // — the surviving head moves every time anything is appended, and keying
+    // on it would raise a fresh critical signal on every poll.
+    const fingerprint =
+      result.verdict === "entry_altered"
+        ? `entry_altered:entry:${result.failedEntrySeq ?? "-"}`
+        : `${result.verdict}:seal:${result.failedSealSequence ?? "-"}`;
+    const existing = await app.db
+      .select({ id: signals.id, refs: signals.evidenceRefs })
+      .from(signals)
+      .where(and(eq(signals.companyId, companyId), eq(signals.detector, detector)));
+    for (const row of existing) {
+      const refs = row.refs as { fingerprint?: string } | null;
+      if (refs?.fingerprint === fingerprint) return null;
+    }
+    const id = newId("sig");
+    await app.db.insert(signals).values({
+      id,
+      companyId,
+      projectId: null,
+      detector,
+      severity: "critical",
+      confidence: 1,
+      title: VERDICT_TITLE[result.verdict],
+      explanation:
+        `${result.reason} ` +
+        "This is a finding about the record itself, not about anything recorded in it: until " +
+        "it is explained, every figure this tenant can produce is unsupported by its own audit " +
+        "trail. Preserve a database backup now, before investigating.",
+      evidenceRefs: {
+        fingerprint,
+        verdict: result.verdict,
+        sealSequence: result.failedSealSequence,
+        entrySeq: result.failedEntrySeq,
+        suspectRange: result.suspectRange,
+        entryCount: result.entryCount,
+        sealedEntryCount: result.sealedEntryCount,
+      },
+    });
+    await appendLedger(app.db, {
+      companyId,
+      actorId,
+      action: "create",
+      objectType: "signal",
+      objectId: id,
+      payload: { detector, severity: "critical", verdict: result.verdict },
+    });
+    return id;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Classification                                                    */
+  /* ---------------------------------------------------------------- */
+
+  interface VerdictResult extends ChainClassification {
+    key: {
+      keyId: string | null;
+      derivedFromAuthSecret: boolean;
+      weakening: string | null;
+      /** the newest seal was signed under the key this process currently holds */
+      heldByProcess: boolean;
+    };
+    /**
+     * Key ids that seals were signed under which this process does NOT hold.
+     * Their public halves could only come from `signing_keys`, so their
+     * signatures are checkable but not attributable. See
+     * {@link FOREIGN_KEY_LIMITATION}.
+     */
+    keyIdsNotHeldByThisProcess: string[];
+    /**
+     * Where signature checking took its trust from. Unpinned, it came from a
+     * table inside the database being policed, and the verdict must be read
+     * with that bound — see {@link TrustAnchor}.
+     */
+    trustAnchor: TrustAnchor;
+    limitations: string[];
+  }
+
+  /**
+   * The one limit the signature check cannot state for itself.
+   *
+   * A seal's whole strength is that the private half of its key is outside the
+   * database. That only helps a verifier who knows which PUBLIC key to expect.
+   * `publicKeyMap` merges the keys on record in `signing_keys` — a table inside
+   * the very database the seal exists to police — so an attacker with database
+   * write access can register a key of their own, re-sign a rewritten chain
+   * under it, and every signature will verify. The process cannot tell that
+   * apart from a legitimate rotation, and must not pretend otherwise: what it
+   * CAN say is which key it holds itself, and that anything else came from the
+   * database. Everything under a key this process does not hold is checkable,
+   * not attributable.
+   */
+  function foreignKeyLimitation(keyIds: string[]): string {
+    return (
+      `Seal(s) here are signed under key id(s) ${keyIds.join(", ")}, which is not the key this ` +
+      "deployment holds. Their public halves came from `signing_keys`, a table inside the same " +
+      "database the seal exists to police, so those signatures prove the seal bodies are " +
+      "internally consistent — they do NOT prove who made them: anyone able to write to this " +
+      "database could have registered that key and re-signed a rewritten chain under it. Either " +
+      "the deployment's signing key was rotated, or this chain was re-sealed by something else. " +
+      "Compare the key fingerprint (GET /api/v1/ledger/keys) against an independently held copy " +
+      "before relying on this verdict."
+    );
+  }
+
+  /**
+   * The limits that apply to EVERY verdict this module produces. They are part
+   * of the result, not documentation: a verdict of "intact" carried without
+   * them would be read as more than it is.
+   */
+  function limitationsFor(
+    derived: boolean,
+    sealCount: number,
+    foreignKeyIds: string[] = [],
+  ): string[] {
+    const out: string[] = [];
+    if (derived) out.push(DERIVED_NOTE_FALLBACK);
+    // Where the verifier's trust comes from is the first thing a reader needs,
+    // because it bounds everything below it: unpinned, the whole signature
+    // check rests on a table the attacker can write to.
+    const anchor = trustAnchor(anchorEnv());
+    if (!anchor.pinned) out.push(anchor.note);
+    if (foreignKeyIds.length > 0) out.push(foreignKeyLimitation(foreignKeyIds));
+    out.push(
+      "sealedAt is this application's own clock; no timestamp authority is configured, so " +
+        "seals establish order, not wall-clock time.",
+    );
+    if (sealCount > 0) {
+      out.push(
+        "Entries appended since the newest seal are covered by the hash chain only: a " +
+          "truncation confined to them is not yet detectable. Heartbeat seals bound that window.",
+      );
+    }
+    out.push(
+      "A verified seal proves the record has not changed since it was sealed. It does not " +
+        "prove any record was true when written.",
+    );
+    return out;
+  }
+
+  /** The key id this process holds right now, or null when it holds none. */
+  function heldKeyId(): string | null {
+    const state = anchorKeyState(anchorEnv());
+    return state.available ? state.record.keyId : null;
+  }
+
+  /** Distinct seal key ids that are not the key this process holds. */
+  function foreignKeyIdsOf(seals: SealRecord[]): string[] {
+    const held = heldKeyId();
+    return [...new Set(seals.map((s) => s.keyId))].filter((id) => id !== held);
+  }
+
+  async function classifyCompany(companyId: string): Promise<VerdictResult> {
+    const [entries, sealRows, keys] = await Promise.all([
+      loadEntries(companyId),
+      loadSeals(companyId),
+      publicKeyMap(companyId),
+    ]);
+    const seals = sealRows.map(toSealRecord);
+    let result = classifyChain({ entries, seals, publicKeys: keys });
+    // classifyChain treats a key it has never seen as UNCHECKABLE, which is
+    // right when trust comes from the database: an unregistered key id is
+    // usually a rotation nobody wrote down. Under a pin it means the opposite.
+    // The operator has said which keys they will accept, so a seal signed
+    // under anything else is not merely unverified — it is a seal made by
+    // something the operator does not vouch for, which is what a forgery is.
+    const pin = trustAnchor(anchorEnv());
+    if (pin.pinned && result.unknownKeyIds.length > 0) {
+      result = {
+        ...result,
+        verdict: "seal_forged",
+        ok: false,
+        reason:
+          `Seal(s) are signed under key id(s) ${result.unknownKeyIds.join(", ")}, whose public ` +
+          "half is not among the fingerprints pinned in ANCHOR_TRUSTED_FINGERPRINTS. A key " +
+          "registered in the database cannot vouch for itself: under a pin, a seal signed by " +
+          "an unpinned key is treated as forged rather than as merely uncheckable.",
+      };
+    }
+    const latestKeyId = seals[seals.length - 1]?.keyId ?? null;
+    const derived = seals.some((s) => derivedKeyId(s.keyId));
+    const foreign = foreignKeyIdsOf(seals);
+    return {
+      ...result,
+      key: {
+        keyId: latestKeyId,
+        derivedFromAuthSecret: derived,
+        weakening: derived ? DERIVED_NOTE_FALLBACK : null,
+        heldByProcess: latestKeyId !== null && latestKeyId === heldKeyId(),
+      },
+      keyIdsNotHeldByThisProcess: foreign,
+      trustAnchor: trustAnchor(anchorEnv()),
+      limitations: limitationsFor(derived, seals.length, foreign),
+    };
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Sealing                                                           */
+  /* ---------------------------------------------------------------- */
+
+  interface SealOutcome {
+    seal: SealRow;
+    created: boolean;
+    /** an existing recent seal was returned because nothing material changed */
+    reused: boolean;
+    key: AnchorKeyRecord;
+    entriesSinceLastSeal: number;
+  }
+
+  /**
+   * Seal the company's chain as it stands.
+   *
+   * Idempotent-ish by design: if the previous seal is younger than the
+   * heartbeat interval and nothing MATERIAL has been appended since (the
+   * module's own `chain_seal` entries do not count — sealing appends one, and
+   * counting it would make every seal justify the next), the existing seal is
+   * returned instead of churning out a fresh signature over an identical head.
+   */
+  async function createSeal(
+    companyId: string,
+    actorId: string | null,
+    opts: { heartbeat?: boolean; force?: boolean; note?: string | undefined } = {},
+  ): Promise<SealOutcome> {
+    const key = requireAnchorKey(anchorEnv());
+    // Sealing under a key the operator has pinned against would produce seals
+    // that fail their own verification the moment they are read. Refuse loudly
+    // at the point of the mistake rather than quietly minting evidence nobody
+    // can use.
+    const anchor = trustAnchor(anchorEnv());
+    if (!fingerprintTrusted(anchor, key.record.fingerprint)) {
+      throw badRequest(
+        `Refusing to seal: this deployment's signing key (fingerprint ${key.record.fingerprint}) is ` +
+          "not among the fingerprints pinned in ANCHOR_TRUSTED_FINGERPRINTS. Seals made with " +
+          "it would be reported as forged by every verifier honouring that pin. Either add " +
+          "this fingerprint to the pin, or run with a key that is already in it.",
+      );
+    }
+    const entries = await loadEntries(companyId);
+    if (entries.length === 0) {
+      throw badRequest(
+        "There are no ledger entries to seal for this company. A seal commits to a chain; " +
+          "there is nothing here to commit to yet.",
+      );
+    }
+    /*
+     * SEQUENCE ALLOCATION IS A CRITICAL SECTION.
+     *
+     * `sequence` used to be computed as last + 1 with nothing holding the gap
+     * between the read and the insert, so two admins — or two overdue
+     * heartbeat sweeps from two browser tabs — both read N and both inserted
+     * N+1. One of them hit `chain_seals_company_sequence_idx` and surfaced as
+     * an unhandled 500, after the ledger append order had already been
+     * disturbed.
+     *
+     * The read-then-insert now runs inside ONE transaction holding a
+     * transaction-scoped advisory lock on the company, so the loser waits and
+     * then reads the winner's sequence. The unique index stays as the
+     * backstop, and a violation is mapped to a 409 rather than a 500. The
+     * ledger append and key registration happen AFTER the commit: an event
+     * must never be emitted for a seal that was rolled back.
+     */
+    type Allocation =
+      | { kind: "reused"; seal: SealRow }
+      | {
+          kind: "created";
+          id: string;
+          body: SealBody;
+          bodyHash: string;
+          sinceLast: number;
+        };
+
+    const allocation: Allocation = await app.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`seal:${companyId}`}))`);
+      const existing = await tx
+        .select()
+        .from(chainSeals)
+        .where(eq(chainSeals.companyId, companyId))
+        .orderBy(asc(chainSeals.sequence));
+      const last = existing[existing.length - 1];
+      const sinceLast = last
+        ? entries.filter((e) => e.seq > last.toEntrySeq && e.objectType !== SEAL_OBJECT).length
+        : entries.length;
+
+      if (last && !opts.force) {
+        const ageMs = Date.now() - Date.parse(isoOf(last.sealedAt));
+        if (sinceLast === 0 && ageMs < heartbeatHours() * 3_600_000) {
+          return { kind: "reused", seal: last };
+        }
+      }
+
+      const head = entries[entries.length - 1]!;
+      const sealedAt = new Date().toISOString();
+      const body = buildSealBody({
+        companyId,
+        sequence: (last?.sequence ?? 0) + 1,
+        // The seal commits to the WHOLE chain, so the range is the whole chain.
+        // What is new since the previous seal is `prevSeal.toEntrySeq + 1`.
+        fromEntrySeq: entries[0]!.seq,
+        toEntrySeq: head.seq,
+        entryCount: entries.length,
+        headHash: head.entryHash,
+        merkleRoot: merkleRoot(entries.map((e) => e.entryHash)),
+        prevSealHash: last?.bodyHash ?? null,
+        sealedAt,
+        keyId: key.record.keyId,
+      });
+      const bodyHash = sealBodyHash(body);
+      const signature = signSealBody(body, key.privateKey);
+      const id = newId("seal");
+      try {
+        await tx.insert(chainSeals).values({
+          id,
+          companyId,
+          sequence: body.sequence,
+          fromEntrySeq: body.fromEntrySeq,
+          toEntrySeq: body.toEntrySeq,
+          entryCount: body.entryCount,
+          headHash: body.headHash,
+          merkleRoot: body.merkleRoot,
+          prevSealHash: body.prevSealHash,
+          bodyHash,
+          signature,
+          keyId: body.keyId,
+          algorithm: body.algorithm,
+          sealedAt,
+          isHeartbeat: opts.heartbeat ? 1 : 0,
+          sealedBy: actorId,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (/unique|duplicate/i.test(message)) {
+          throw new AppError(
+            409,
+            "SealSequenceTaken",
+            `Another writer sealed this chain at sequence ${body.sequence} while this request ` +
+              "was in flight. Nothing was written twice; read the seal register and retry if a " +
+              "further seal is still wanted.",
+          );
+        }
+        throw err;
+      }
+      return { kind: "created", id, body, bodyHash, sinceLast };
+    });
+
+    if (allocation.kind === "reused") {
+      return {
+        seal: allocation.seal,
+        created: false,
+        reused: true,
+        key: key.record,
+        entriesSinceLastSeal: 0,
+      };
+    }
+    const { id, body, bodyHash, sinceLast } = allocation;
+
+    // Register the public half opportunistically: a seal nobody can verify
+    // because the key was never published is not much of a seal.
+    await registerPublicKey(app.db, key.record);
+
+    await appendLedger(app.db, {
+      companyId,
+      actorId,
+      action: "create",
+      objectType: SEAL_OBJECT,
+      objectId: id,
+      payload: {
+        sequence: body.sequence,
+        entryCount: body.entryCount,
+        headHash: body.headHash,
+        merkleRoot: body.merkleRoot,
+        prevSealHash: body.prevSealHash,
+        bodyHash,
+        keyId: body.keyId,
+        derivedFromAuthSecret: key.record.derivedFromAuthSecret,
+        isHeartbeat: opts.heartbeat === true,
+        note: opts.note ?? null,
+      },
+      storePayload: true,
+    });
+
+    const rows = await app.db.select().from(chainSeals).where(eq(chainSeals.id, id)).limit(1);
+    return {
+      seal: rows[0]!,
+      created: true,
+      reused: false,
+      key: key.record,
+      entriesSinceLastSeal: sinceLast,
+    };
+  }
+
+  /**
+   * HEARTBEAT SWEEP.
+   *
+   * A seal only bounds truncation up to the entries it covers. Without
+   * heartbeats, a tenant that seals once and then goes quiet leaves an
+   * unbounded tail that can be cut invisibly. A heartbeat seal re-commits to
+   * the head every `ANCHOR_HEARTBEAT_HOURS` (default 24) even when nothing
+   * changed, so the exposure window is one interval.
+   *
+   * THIS USED TO RUN ON READS — inside `GET /ledger/seals` and
+   * `GET /ledger/chain-verdict` — which made the documented guarantee false in
+   * practice: a tenant whose users never open the Ledger workspace had no
+   * bound at all, and the anchoring the guarantee depends on happened only
+   * when an admin clicked. It is now a scheduler job
+   * (`anchoring.heartbeat-seal`), and the read paths merely REPORT whether the
+   * heartbeat is overdue.
+   *
+   * Never throws: a sweep must not take the job down because sealing is
+   * unavailable (no key in production, for instance).
+   */
+  async function sweepHeartbeat(companyId: string, actorId: string | null): Promise<boolean> {
+    try {
+      const existing = await loadSeals(companyId);
+      const last = existing[existing.length - 1];
+      if (!last) return false; // never sealed: sealing is an explicit, ledgered act
+      const ageMs = Date.now() - Date.parse(isoOf(last.sealedAt));
+      if (ageMs < heartbeatHours() * 3_600_000) return false;
+      const outcome = await createSeal(companyId, actorId, { heartbeat: true, force: true });
+      return outcome.created;
+    } catch (err) {
+      app.log.warn({ err, companyId }, "heartbeat seal skipped");
+      return false;
+    }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Keys                                                              */
+  /* ---------------------------------------------------------------- */
+
+  app.get("/ledger/keys", { preHandler: memberGate }, async (req) => {
+    const rows = await listVisibleKeys(app.db, req.companyId!);
+    const state = anchorKeyState(anchorEnv());
+    return {
+      // Public halves only. The private key is never in this table and never
+      // in a response — see the module test that asserts it.
+      items: rows.map((r) => ({
+        id: r.id,
+        keyId: r.keyId,
+        algorithm: r.algorithm,
+        publicKeyPem: r.publicKeyPem,
+        fingerprint: r.fingerprint,
+        activeFrom: r.activeFrom,
+        retiredAt: r.retiredAt,
+        derivedFromAuthSecret: derivedKeyId(r.keyId),
+        weakening: derivedKeyId(r.keyId) ? DERIVED_NOTE_FALLBACK : null,
+      })),
+      current: state.available
+        ? {
+            keyId: state.record.keyId,
+            algorithm: state.record.algorithm,
+            publicKeyPem: state.record.publicKeyPem,
+            fingerprint: state.record.fingerprint,
+            source: state.record.source,
+            derivedFromAuthSecret: state.record.derivedFromAuthSecret,
+            weakening: state.record.weakening,
+            registered: rows.some((r) => r.keyId === state.record.keyId),
+          }
+        : null,
+      unavailable: state.available ? null : { reason: state.reason, remedy: state.remedy },
+    };
+  });
+
+  app.post("/ledger/keys/rotate", { preHandler: adminGate }, async (req) => {
+    const key = requireAnchorKey(anchorEnv());
+    const body = z.object({ retireOtherPlatformKeys: z.boolean().optional() }).parse(req.body ?? {});
+    const { row, created } = await registerPublicKey(app.db, key.record);
+    /*
+     * Signing keys are PLATFORM-WIDE by design (companyId null), but this
+     * route is gated per tenant. Retiring "every other key" therefore let one
+     * tenant's admin mark keys retired in every other tenant's register, with
+     * the retirement ledgered only into their own chain — companies B..N saw
+     * their key register change with no record of why.
+     *
+     * Registration stays (it is idempotent and only ever adds the key this
+     * process already holds). Retirement is now opt-in, refused unless the
+     * environment key is the only platform key or the caller asks explicitly,
+     * and it is ledgered into EVERY affected tenant's chain so nobody's
+     * register changes silently.
+     */
+    let retired = 0;
+    if (body.retireOtherPlatformKeys) {
+      const affected = await app.db
+        .selectDistinct({ companyId: chainSeals.companyId })
+        .from(chainSeals);
+      retired = await retireOtherKeys(app.db, key.record.keyId);
+      if (retired > 0) {
+        for (const c of affected) {
+          if (c.companyId === req.companyId!) continue;
+          await appendLedger(app.db, {
+            companyId: c.companyId,
+            actorId: null,
+            action: "state_change",
+            objectType: "signing_key",
+            objectId: row.id,
+            payload: {
+              platformKeyRotation: true,
+              keptKeyId: key.record.keyId,
+              retiredCount: retired,
+              requestedByCompanyId: req.companyId!,
+              note:
+                "A platform-wide signing key rotation retired other platform keys. Seals already " +
+                "made under a retired key still verify: verification looks keys up by keyId " +
+                "regardless of retirement.",
+            },
+            storePayload: true,
+          });
+        }
+      }
+    }
+    await appendLedger(app.db, {
+      companyId: req.companyId!,
+      actorId: req.user!.id,
+      action: created ? "create" : "access",
+      objectType: "signing_key",
+      objectId: row.id,
+      payload: {
+        keyId: key.record.keyId,
+        fingerprint: key.record.fingerprint,
+        source: key.record.source,
+        derivedFromAuthSecret: key.record.derivedFromAuthSecret,
+        retiredOthers: retired,
+      },
+      storePayload: true,
+    });
+    return {
+      key: {
+        id: row.id,
+        keyId: row.keyId,
+        algorithm: row.algorithm,
+        publicKeyPem: row.publicKeyPem,
+        fingerprint: row.fingerprint,
+        activeFrom: row.activeFrom,
+        source: key.record.source,
+        derivedFromAuthSecret: key.record.derivedFromAuthSecret,
+        weakening: key.record.weakening,
+      },
+      created,
+      retiredOtherKeys: retired,
+      note:
+        "Only the public half was written. Rotation does not invalidate earlier seals: they " +
+        "are verified against the key id they were made under, which stays on record. " +
+        (body.retireOtherPlatformKeys
+          ? "Other platform keys were retired, and the retirement was ledgered into every " +
+            "tenant chain it affects."
+          : "Other platform keys were NOT retired — signing keys are platform-wide, so " +
+            "retiring them from a per-tenant route would change other tenants' key registers. " +
+            "Pass {\"retireOtherPlatformKeys\":true} to do it deliberately."),
+    };
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Seals                                                             */
+  /* ---------------------------------------------------------------- */
+
+  app.post("/ledger/seals", { preHandler: adminGate }, async (req, reply) => {
+    const body = sealCreateSchema.parse(req.body ?? {});
+    const outcome = await createSeal(req.companyId!, req.user!.id, {
+      force: body.force,
+      note: body.note,
+    });
+    const key = await keyInfoFor(outcome.seal.keyId, req.companyId!);
+    const view = {
+      ...sealView(outcome.seal, key),
+      reused: outcome.reused,
+      entriesSinceLastSeal: outcome.entriesSinceLastSeal,
+      ...(outcome.reused
+        ? {
+            note:
+              "Nothing material has been appended since the last seal and it is still within " +
+              `the heartbeat interval (${heartbeatHours()}h), so the existing seal was ` +
+              "returned. Pass {\"force\":true} to seal anyway.",
+          }
+        : {}),
+    };
+    return reply.status(outcome.created ? 201 : 200).send(view);
+  });
+
+  app.get("/ledger/seals", { preHandler: memberGate }, async (req) => {
+    const q = pageQuerySchema.parse(req.query);
+    const where = eq(chainSeals.companyId, req.companyId!);
+    const [totalRow] = await app.db.select({ n: count() }).from(chainSeals).where(where);
+    const rows = await app.db
+      .select()
+      .from(chainSeals)
+      .where(where)
+      .orderBy(desc(chainSeals.sequence))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    const keyCache = new Map<string, KeyInfo>();
+    const items = [];
+    for (const row of rows) {
+      let key = keyCache.get(row.keyId);
+      if (!key) {
+        key = await keyInfoFor(row.keyId, req.companyId!);
+        keyCache.set(row.keyId, key);
+      }
+      items.push(sealView(row, key));
+    }
+    return paginate(items, Number(totalRow?.n ?? 0), q);
+  });
+
+  app.get("/ledger/seals/:sealId", { preHandler: memberGate }, async (req) => {
+    const { sealId } = req.params as { sealId: string };
+    const row = await fetchSeal(sealId, req.companyId!);
+    return sealView(row, await keyInfoFor(row.keyId, req.companyId!));
+  });
+
+  /**
+   * Re-verify ONE seal against the live chain: the signature, the stored body
+   * hash, and whether the entries the seal committed to are still present,
+   * unaltered and producing the sealed Merkle root.
+   */
+  app.get("/ledger/seals/:sealId/verify", { preHandler: memberGate }, async (req) => {
+    const { sealId } = req.params as { sealId: string };
+    const row = await fetchSeal(sealId, req.companyId!);
+    const record = toSealRecord(row);
+    const key = await keyInfoFor(row.keyId, req.companyId!);
+    const entries = await loadEntries(req.companyId!);
+
+    let body: SealBody | null = null;
+    let bodyError: string | null = null;
+    try {
+      body = buildSealBody(record);
+    } catch (err) {
+      bodyError = (err as Error).message;
+    }
+    const bodyHashMatches = body ? sealBodyHash(body) === row.bodyHash : false;
+    const signatureValid =
+      body && key.publicKeyPem
+        ? verifySealSignature(body, row.signature, key.publicKeyPem)
+        : false;
+
+    const prefix = entries.slice(0, row.entryCount);
+    const entriesPresent = entries.length >= row.entryCount;
+    const recomputedRoot = entriesPresent ? merkleRoot(prefix.map((e) => e.entryHash)) : null;
+    const headEntry = entriesPresent ? prefix[prefix.length - 1]! : null;
+
+    // The single-seal verdict is the whole-chain classification restricted to
+    // this seal, so one seal and the chain as a whole can never disagree.
+    //
+    // "Restricted to this seal" means the seal chain UP TO AND INCLUDING it,
+    // not the seal alone: `verifySealChain` requires sequences contiguous from
+    // 1, so classifying seal 3 by itself reported "seal_broken — a seal is
+    // missing" on a perfectly intact chain. A seal is also only as good as the
+    // seals it chains to, so its predecessors belong in its own verdict.
+    const sealChainToHere = (await loadSeals(req.companyId!))
+      .filter((s) => s.sequence <= row.sequence)
+      .map(toSealRecord);
+    const whole = classifyChain({
+      entries,
+      seals: sealChainToHere,
+      publicKeys: await publicKeyMap(req.companyId!),
+    });
+
+    return {
+      sealId: row.id,
+      sequence: row.sequence,
+      verdict: whole.verdict,
+      ok: whole.ok,
+      reason: whole.reason,
+      checks: {
+        bodyWellFormed: bodyError === null,
+        bodyError,
+        bodyHashMatches,
+        signatureValid,
+        signatureCheckable: key.known,
+        entriesPresent,
+        entryCountSealed: row.entryCount,
+        entryCountNow: entries.length,
+        merkleRootMatches: recomputedRoot === row.merkleRoot,
+        recomputedMerkleRoot: recomputedRoot,
+        headHashMatches: headEntry ? headEntry.entryHash === row.headHash : false,
+      },
+      key: {
+        keyId: key.keyId,
+        fingerprint: key.fingerprint,
+        derivedFromAuthSecret: key.derivedFromAuthSecret,
+        weakening: key.weakening,
+        heldByProcess: key.keyId === heldKeyId(),
+      },
+      limitations: limitationsFor(
+        key.derivedFromAuthSecret,
+        1,
+        foreignKeyIdsOf(sealChainToHere),
+      ),
+    };
+  });
+
+  /**
+   * THE AUDITOR'S ENDPOINT. The full classification of this company's chain
+   * against every seal it has.
+   *
+   * Deliberately does NOT append an `access` ledger entry, unlike
+   * `GET /ledger/verify` in the assurance module. A monitoring endpoint that
+   * mutates the object it monitors grows the chain in proportion to how
+   * closely it is watched, and would make the heartbeat sweep believe the
+   * chain is always changing. Escrow verification — a consequential act by a
+   * third party — is ledgered instead.
+   */
+  app.get("/ledger/chain-verdict", { preHandler: memberGate }, async (req) => {
+    const result = await classifyCompany(req.companyId!);
+    const signalId = await raiseVerdictSignal(req.companyId!, req.user!.id, result);
+    const seals = await loadSeals(req.companyId!);
+    const newest = seals[seals.length - 1];
+    return {
+      ...result,
+      companyId: req.companyId!,
+      heartbeat: {
+        intervalHours: heartbeatHours(),
+        newestSealAt: newest ? isoOf(newest.sealedAt) : null,
+        newestSealIsHeartbeat: newest ? newest.isHeartbeat === 1 : null,
+        overdue: newest
+          ? Date.now() - Date.parse(isoOf(newest.sealedAt)) >= heartbeatHours() * 3_600_000
+          : null,
+      },
+      signalRaised: signalId,
+    };
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Anchors                                                           */
+  /* ---------------------------------------------------------------- */
+
+  app.post("/ledger/seals/:sealId/anchor", { preHandler: adminGate }, async (req, reply) => {
+    const { sealId } = req.params as { sealId: string };
+    const body = anchorSchema.parse(req.body ?? {});
+    const seal = await fetchSeal(sealId, req.companyId!);
+    const key = await keyInfoFor(seal.keyId, req.companyId!);
+    const state = anchorKeyState(anchorEnv());
+    const keyRecord: AnchorKeyRecord = state.available
+      ? state.record
+      : {
+          keyId: key.keyId,
+          algorithm: "ed25519",
+          publicKeyPem: key.publicKeyPem ?? "",
+          fingerprint: key.fingerprint ?? "",
+          source: key.derivedFromAuthSecret ? "derived_from_auth_secret" : "env",
+          derivedFromAuthSecret: key.derivedFromAuthSecret,
+          weakening: key.weakening,
+        };
+
+    const attempt = await submitAnchor({
+      provider: body.provider,
+      bodyHash: seal.bodyHash,
+      sealId: seal.id,
+      sealSequence: seal.sequence,
+      signature: seal.signature,
+      key: keyRecord,
+      counterparty: body.counterpartyName
+        ? { name: body.counterpartyName, ref: body.counterpartyRef ?? null, note: body.note ?? null }
+        : undefined,
+      env: anchorEnv(),
+    });
+
+    const id = newId("anch");
+    await app.db.insert(anchorSubmissions).values({
+      id,
+      companyId: req.companyId!,
+      sealId: seal.id,
+      provider: attempt.provider,
+      status: attempt.status,
+      externalRef: attempt.externalRef,
+      proof: attempt.proof,
+      detail: attempt.detail,
+      confirmedAt: attempt.confirmedAt,
+    });
+    await appendLedger(app.db, {
+      companyId: req.companyId!,
+      actorId: req.user!.id,
+      action: "create",
+      objectType: "anchor_submission",
+      objectId: id,
+      payload: {
+        sealId: seal.id,
+        provider: attempt.provider,
+        status: attempt.status,
+        externalRef: attempt.externalRef,
+        detail: attempt.detail,
+      },
+      storePayload: true,
+    });
+
+    const rows = await app.db
+      .select()
+      .from(anchorSubmissions)
+      .where(eq(anchorSubmissions.id, id))
+      .limit(1);
+    return reply.status(201).send({
+      ...rows[0]!,
+      requirements: PROVIDER_REQUIREMENTS[attempt.provider],
+      reach: providerReach(attempt.provider, attempt.status, keyRecord.derivedFromAuthSecret),
+    });
+  });
+
+  /** One sentence per provider on how far the witness actually reaches. */
+  function providerReach(
+    provider: AnchorProvider,
+    status: string,
+    derived: boolean,
+  ): string {
+    if (status === "unavailable") {
+      return "Nothing was witnessed anywhere. This submission records the attempt and what is missing.";
+    }
+    switch (provider) {
+      case "local_signed":
+        return derived
+          ? "Witnessed by a key derived from AUTH_SECRET: outside the database, inside the operator."
+          : "Witnessed by a key held outside the database in this deployment's environment.";
+      case "rfc3161":
+        return "Witnessed by an external timestamp authority — an independent clock and an independent signature.";
+      case "opentimestamps":
+        return "Submitted to a public calendar; independently verifiable once it reaches the Bitcoin chain.";
+      case "counterparty":
+        return "Held by a named third party outside this database once they acknowledge the reference.";
+      default:
+        return "Unknown provider.";
+    }
+  }
+
+  /**
+   * Counterparty acknowledgement. This is what makes the counterparty provider
+   * real rather than aspirational: the third party returns a reference and the
+   * submission becomes `anchored` with their acknowledgement on record.
+   */
+  app.post("/ledger/anchors/:anchorId/confirm", { preHandler: adminGate }, async (req) => {
+    const { anchorId } = req.params as { anchorId: string };
+    const body = anchorConfirmSchema.parse(req.body ?? {});
+    const rows = await app.db
+      .select()
+      .from(anchorSubmissions)
+      .where(
+        and(eq(anchorSubmissions.id, anchorId), eq(anchorSubmissions.companyId, req.companyId!)),
+      )
+      .limit(1);
+    const row = rows[0];
+    if (!row) throw notFound("Anchor submission not found");
+    if (row.provider !== "counterparty") {
+      throw badRequest(
+        `Only counterparty anchors are confirmed by hand; ${row.provider} anchors are confirmed ` +
+          "by the provider's own response, and claiming otherwise would fabricate a proof.",
+      );
+    }
+    if (row.status === "anchored") {
+      throw badRequest("This anchor is already confirmed.");
+    }
+    const confirmedAt = new Date().toISOString();
+    const proof = {
+      ...(row.proof as Record<string, unknown>),
+      acknowledgement: {
+        externalRef: body.externalRef,
+        acknowledgedBy: body.acknowledgedBy ?? null,
+        note: body.note ?? null,
+        recordedAt: confirmedAt,
+        recordedBy: req.user!.id,
+      },
+    };
+    await app.db
+      .update(anchorSubmissions)
+      .set({ status: "anchored", externalRef: body.externalRef, proof, confirmedAt })
+      .where(eq(anchorSubmissions.id, anchorId));
+    await appendLedger(app.db, {
+      companyId: req.companyId!,
+      actorId: req.user!.id,
+      action: "state_change",
+      objectType: "anchor_submission",
+      objectId: anchorId,
+      payload: { status: "anchored", externalRef: body.externalRef },
+      storePayload: true,
+    });
+    const updated = await app.db
+      .select()
+      .from(anchorSubmissions)
+      .where(eq(anchorSubmissions.id, anchorId))
+      .limit(1);
+    return {
+      ...updated[0]!,
+      note:
+        "Recorded as acknowledged by this platform's operator. The counterparty's own copy of " +
+        "the escrow receipt, not this row, is what makes the anchor independent.",
+    };
+  });
+
+  app.get("/ledger/anchors", { preHandler: memberGate }, async (req) => {
+    const q = anchorsListQuery.parse(req.query);
+    const where = and(
+      eq(anchorSubmissions.companyId, req.companyId!),
+      q.provider ? eq(anchorSubmissions.provider, q.provider) : undefined,
+      q.sealId ? eq(anchorSubmissions.sealId, q.sealId) : undefined,
+    );
+    const [totalRow] = await app.db.select({ n: count() }).from(anchorSubmissions).where(where);
+    const rows = await app.db
+      .select()
+      .from(anchorSubmissions)
+      .where(where)
+      .orderBy(desc(anchorSubmissions.requestedAt))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    return {
+      ...paginate(
+        rows.map((r: AnchorRow) => ({
+          ...r,
+          requirements: PROVIDER_REQUIREMENTS[r.provider as AnchorProvider],
+        })),
+        Number(totalRow?.n ?? 0),
+        q,
+      ),
+      providers: PROVIDER_REQUIREMENTS,
+    };
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Escrow                                                            */
+  /* ---------------------------------------------------------------- */
+
+  const VERIFICATION_PROCEDURE = [
+    "1. Recompute the receipt hash: remove the `receiptHash` field, canonicalize the remaining " +
+      "document (RFC 8785-style: keys sorted, no insignificant whitespace) and take its sha256. " +
+      "It must equal `receiptHash`.",
+    "2. Canonicalize the `seal` object WITHOUT its `sealId`, `bodyHash` and `signature` fields " +
+      "— the remaining eleven fields, key-sorted, are the exact bytes that were signed — and " +
+      "take their sha256. It must equal `seal.bodyHash`.",
+    "3. Verify `seal.signature` (base64, Ed25519) over those same canonical bytes using " +
+      "`key.publicKeyPem`. Any Ed25519 implementation will do; `node apps/api/dist/scripts/" +
+      "verify-receipt.js receipt.json` performs steps 1-3 offline.",
+    "4. Compare `key.fingerprint` with the fingerprint published by the platform " +
+      "(GET /api/v1/ledger/keys) THROUGH A DIFFERENT CHANNEL than the one that gave you this " +
+      "receipt. A receipt that carries its own key proves internal consistency only: without " +
+      "an independent copy of the fingerprint, a whole receipt could have been manufactured.",
+    "5. To prove the live chain still contains what was sealed, present this document to " +
+      "POST /api/v1/ledger/escrow/verify. The chain must hold at least `seal.entryCount` " +
+      "entries, and the first `seal.entryCount` of them must reproduce `seal.merkleRoot` and " +
+      "end in `seal.headHash`.",
+  ];
+
+  const PROVES = [
+    "That at the moment of sealing, this company's ledger held exactly `entryCount` entries " +
+      "ending in `headHash`, and that they hash to `merkleRoot`.",
+    "That the seal was made by something holding the private key matching `key.publicKeyPem`.",
+    "That any later chain which is shorter than `entryCount`, or whose first `entryCount` " +
+      "entries do not reproduce `merkleRoot`, is not the chain that was sealed.",
+  ];
+
+  const DOES_NOT_PROVE = [
+    "That anything recorded in the ledger was TRUE. A seal covers integrity, not accuracy.",
+    "The wall-clock time of sealing. `sealedAt` is the application server's clock; only an " +
+      "RFC 3161 or blockchain anchor would fix it independently, and none is configured here.",
+    "Anything about entries appended AFTER this seal.",
+  ];
+
+  function receiptKeyBlock(key: KeyInfo) {
+    return {
+      keyId: key.keyId,
+      algorithm: key.algorithm,
+      publicKeyPem: key.publicKeyPem ?? "",
+      fingerprint: key.fingerprint ?? "",
+      derivedFromAuthSecret: key.derivedFromAuthSecret,
+      weakening: key.weakening,
+    };
+  }
+
+  /** Build the receipt document and its self-hash. */
+  function buildReceiptDocument(input: {
+    receiptId: string;
+    issuedAt: string;
+    companyId: string;
+    seal: SealRow;
+    key: KeyInfo;
+    recipient: { name: string; ref: string | null; userId: string | null; purpose: string | null };
+    issuedBy: string;
+  }): { document: Record<string, unknown>; receiptHash: string } {
+    const record = toSealRecord(input.seal);
+    const body = sealBodyOf(record);
+    const withoutHash = {
+      documentType: RECEIPT_DOCUMENT_TYPE,
+      version: RECEIPT_DOCUMENT_VERSION,
+      receiptId: input.receiptId,
+      issuedAt: input.issuedAt,
+      issuer: {
+        platform: PLATFORM.name,
+        platformVersion: PLATFORM.version,
+        companyId: input.companyId,
+        issuedByUserId: input.issuedBy,
+      },
+      recipient: {
+        name: input.recipient.name,
+        ref: input.recipient.ref,
+        userId: input.recipient.userId,
+        purpose: input.recipient.purpose,
+      },
+      seal: {
+        sealId: input.seal.id,
+        ...body,
+        bodyHash: input.seal.bodyHash,
+        signature: input.seal.signature,
+        isHeartbeat: input.seal.isHeartbeat === 1,
+      },
+      key: receiptKeyBlock(input.key),
+      verification: {
+        procedure: VERIFICATION_PROCEDURE,
+        offlineTool: "node verify-receipt.js receipt.json",
+        liveEndpoint: "POST /api/v1/ledger/escrow/verify",
+        proves: PROVES,
+        doesNotProve: input.key.derivedFromAuthSecret
+          ? [
+              ...DOES_NOT_PROVE,
+              "That the OPERATOR of this deployment did not produce it: this seal's key was " +
+                "derived from AUTH_SECRET, which the operator holds. It proves integrity " +
+                "against anyone with database access only.",
+            ]
+          : DOES_NOT_PROVE,
+      },
+    };
+    const receiptHash = sha256Hex(canonicalize(withoutHash));
+    return { document: { ...withoutHash, receiptHash }, receiptHash };
+  }
+
+  app.post("/ledger/seals/:sealId/escrow", { preHandler: adminGate }, async (req, reply) => {
+    const { sealId } = req.params as { sealId: string };
+    const body = escrowIssueSchema.parse(req.body ?? {});
+    const seal = await fetchSeal(sealId, req.companyId!);
+    const key = await keyInfoFor(seal.keyId, req.companyId!);
+    if (!key.publicKeyPem) {
+      throw new AppError(
+        503,
+        `No public key is on record for key id ${seal.keyId}, so a self-contained receipt ` +
+          "cannot be issued: the holder would have nothing to verify the signature with. " +
+          "Register the key with POST /api/v1/ledger/keys/rotate.",
+      );
+    }
+    const receiptId = newId("esc");
+    const issuedAt = new Date().toISOString();
+    const { document, receiptHash } = buildReceiptDocument({
+      receiptId,
+      issuedAt,
+      companyId: req.companyId!,
+      seal,
+      key,
+      recipient: {
+        name: body.recipientName,
+        ref: body.recipientRef ?? null,
+        userId: body.recipientUserId ?? null,
+        purpose: body.purpose ?? null,
+      },
+      issuedBy: req.user!.id,
+    });
+    await app.db.insert(escrowReceipts).values({
+      id: receiptId,
+      companyId: req.companyId!,
+      sealId: seal.id,
+      recipientName: body.recipientName,
+      recipientRef: body.recipientRef ?? null,
+      recipientUserId: body.recipientUserId ?? null,
+      receiptHash,
+      document,
+      purpose: body.purpose ?? null,
+      issuedBy: req.user!.id,
+      issuedAt,
+    });
+    await appendLedger(app.db, {
+      companyId: req.companyId!,
+      actorId: req.user!.id,
+      action: "create",
+      objectType: "escrow_receipt",
+      objectId: receiptId,
+      payload: {
+        sealId: seal.id,
+        sealSequence: seal.sequence,
+        recipientName: body.recipientName,
+        recipientRef: body.recipientRef ?? null,
+        receiptHash,
+        keyId: seal.keyId,
+        derivedFromAuthSecret: key.derivedFromAuthSecret,
+      },
+      storePayload: true,
+    });
+    return reply.status(201).send({
+      id: receiptId,
+      companyId: req.companyId!,
+      sealId: seal.id,
+      recipientName: body.recipientName,
+      recipientRef: body.recipientRef ?? null,
+      recipientUserId: body.recipientUserId ?? null,
+      purpose: body.purpose ?? null,
+      issuedAt,
+      receiptHash,
+      document,
+      downloadUrl: `/api/v1/ledger/escrow-receipts/${receiptId}/document`,
+      handover:
+        "Send the `document` object verbatim. It is self-contained: the holder needs nothing " +
+        "from this platform to check the signature, and needs only POST /ledger/escrow/verify " +
+        "to check the live chain still contains what was sealed.",
+    });
+  });
+
+  app.get("/ledger/escrow-receipts", { preHandler: memberGate }, async (req) => {
+    const q = receiptsListQuery.parse(req.query);
+    const where = and(
+      eq(escrowReceipts.companyId, req.companyId!),
+      q.sealId ? eq(escrowReceipts.sealId, q.sealId) : undefined,
+    );
+    const [totalRow] = await app.db.select({ n: count() }).from(escrowReceipts).where(where);
+    // The document blob is deliberately omitted from the list: it is fetched
+    // one at a time from the /document route, which is the thing handed over.
+    const items = await app.db
+      .select({
+        id: escrowReceipts.id,
+        companyId: escrowReceipts.companyId,
+        sealId: escrowReceipts.sealId,
+        recipientName: escrowReceipts.recipientName,
+        recipientRef: escrowReceipts.recipientRef,
+        recipientUserId: escrowReceipts.recipientUserId,
+        receiptHash: escrowReceipts.receiptHash,
+        purpose: escrowReceipts.purpose,
+        issuedBy: escrowReceipts.issuedBy,
+        issuedAt: escrowReceipts.issuedAt,
+        lastVerifiedAt: escrowReceipts.lastVerifiedAt,
+        lastVerdict: escrowReceipts.lastVerdict,
+      })
+      .from(escrowReceipts)
+      .where(where)
+      .orderBy(desc(escrowReceipts.issuedAt))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    return paginate(
+      items.map((r) => ({
+        ...r,
+        downloadUrl: `/api/v1/ledger/escrow-receipts/${r.id}/document`,
+      })),
+      Number(totalRow?.n ?? 0),
+      q,
+    );
+  });
+
+  /** The exact JSON handed over, as a download. */
+  app.get(
+    "/ledger/escrow-receipts/:receiptId/document",
+    { preHandler: memberGate },
+    async (req, reply) => {
+      const { receiptId } = req.params as { receiptId: string };
+      const rows = await app.db
+        .select()
+        .from(escrowReceipts)
+        .where(
+          and(eq(escrowReceipts.id, receiptId), eq(escrowReceipts.companyId, req.companyId!)),
+        )
+        .limit(1);
+      if (!rows[0]) throw notFound("Escrow receipt not found");
+      // Pretty-printed for a human reading it in an email attachment. Safe:
+      // receiptHash is over the CANONICAL form, which is whitespace-independent.
+      return reply
+        .header("content-type", "application/json; charset=utf-8")
+        .header(
+          "content-disposition",
+          `attachment; filename="constructos-escrow-receipt-${receiptId}.json"`,
+        )
+        .send(JSON.stringify(rows[0].document, null, 2));
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Escrow verification — a receipt presented back                    */
+  /* ---------------------------------------------------------------- */
+
+  app.post("/ledger/escrow/verify", { preHandler: memberGate }, async (req) => {
+    const raw = req.body as Record<string, unknown> | null | undefined;
+    if (!raw || typeof raw !== "object") {
+      throw badRequest("Send the escrow receipt document, or {\"document\": {…}}.");
+    }
+    const candidate = (
+      "document" in raw && raw["document"] && typeof raw["document"] === "object"
+        ? raw["document"]
+        : raw
+    ) as Record<string, unknown>;
+
+    const parsed = receiptDocumentSchema.safeParse(candidate);
+    if (!parsed.success) {
+      throw badRequest(
+        "This is not a ConstructOS escrow receipt document (or it is missing required fields). " +
+          "Nothing was verified.",
+        { issues: parsed.error.issues.slice(0, 10) },
+      );
+    }
+    const doc: ReceiptDocument = parsed.data;
+
+    /* 1. the document's own integrity ------------------------------ */
+    const { receiptHash: claimedHash, ...withoutHash } = candidate as Record<string, unknown> & {
+      receiptHash: string;
+    };
+    const recomputedReceiptHash = sha256Hex(canonicalize(withoutHash));
+    const receiptIntact = recomputedReceiptHash === claimedHash;
+
+    /* 2. the seal body and its signature --------------------------- */
+    const sealFields = doc.seal;
+    let body: SealBody | null = null;
+    let bodyError: string | null = null;
+    try {
+      body = buildSealBody({
+        companyId: sealFields.companyId,
+        sequence: sealFields.sequence,
+        fromEntrySeq: sealFields.fromEntrySeq,
+        toEntrySeq: sealFields.toEntrySeq,
+        entryCount: sealFields.entryCount,
+        headHash: sealFields.headHash,
+        merkleRoot: sealFields.merkleRoot,
+        prevSealHash: sealFields.prevSealHash,
+        sealedAt: sealFields.sealedAt,
+        keyId: sealFields.keyId,
+        algorithm: sealFields.algorithm,
+      });
+    } catch (err) {
+      bodyError = (err as Error).message;
+    }
+    const bodyHashMatches = body ? sealBodyHash(body) === sealFields.bodyHash : false;
+    const signatureValid = body
+      ? verifySealSignature(body, sealFields.signature, doc.key.publicKeyPem)
+      : false;
+
+    /* 3. is the key in the receipt a key we actually published? ---- */
+    const onRecord = await listVisibleKeys(app.db, req.companyId!);
+    const keyRow = onRecord.find((k) => k.keyId === doc.key.keyId);
+    const keyRecognized = Boolean(
+      keyRow &&
+        keyRow.fingerprint === doc.key.fingerprint &&
+        keyRow.publicKeyPem.trim() === doc.key.publicKeyPem.trim(),
+    );
+
+    /* 4. the live chain — only ever this tenant's own -------------- */
+    const sameCompany = doc.issuer.companyId === req.companyId! &&
+      sealFields.companyId === req.companyId!;
+    let chain: VerdictResult | null = null;
+    let sealOnRecord: SealRow | null = null;
+    let receiptOnRecord = false;
+    let prefixChecks: {
+      entriesNow: number;
+      entriesSealed: number;
+      entriesPresent: boolean;
+      merkleRootMatches: boolean;
+      headHashMatches: boolean;
+      recomputedMerkleRoot: string | null;
+    } | null = null;
+
+    if (sameCompany) {
+      const entries = await loadEntries(req.companyId!);
+      const prefix = entries.slice(0, sealFields.entryCount);
+      const entriesPresent = entries.length >= sealFields.entryCount;
+      const recomputedRoot = entriesPresent ? merkleRoot(prefix.map((e) => e.entryHash)) : null;
+      prefixChecks = {
+        entriesNow: entries.length,
+        entriesSealed: sealFields.entryCount,
+        entriesPresent,
+        merkleRootMatches: recomputedRoot === sealFields.merkleRoot,
+        headHashMatches: entriesPresent
+          ? prefix[prefix.length - 1]!.entryHash === sealFields.headHash
+          : false,
+        recomputedMerkleRoot: recomputedRoot,
+      };
+      chain = await classifyCompany(req.companyId!);
+      const sealRows = await app.db
+        .select()
+        .from(chainSeals)
+        .where(
+          and(eq(chainSeals.id, sealFields.sealId), eq(chainSeals.companyId, req.companyId!)),
+        )
+        .limit(1);
+      sealOnRecord = sealRows[0] ?? null;
+      const receiptRows = await app.db
+        .select({ id: escrowReceipts.id })
+        .from(escrowReceipts)
+        .where(
+          and(eq(escrowReceipts.id, doc.receiptId), eq(escrowReceipts.companyId, req.companyId!)),
+        )
+        .limit(1);
+      receiptOnRecord = Boolean(receiptRows[0]);
+    }
+
+    /* 5. the verdict ------------------------------------------------ */
+    let verdict: ChainVerdict;
+    let reason: string;
+    const scope: "live_chain" | "receipt_only" = sameCompany ? "live_chain" : "receipt_only";
+
+    if (!signatureValid) {
+      verdict = "seal_forged";
+      reason = body
+        ? "The signature in this receipt does not verify against the public key the receipt " +
+          "itself carries. The document has been altered after issue, or it was never issued " +
+          "by anything holding that key."
+        : `The seal body in this receipt is malformed (${bodyError ?? "unknown"}), so no ` +
+          "signature over it could be checked.";
+    } else if (!receiptIntact) {
+      verdict = "seal_forged";
+      reason =
+        "The seal signature verifies, but the receipt document around it has been altered: " +
+        `its recomputed hash is ${recomputedReceiptHash}, not the ${claimedHash} it claims. ` +
+        "Trust the seal fields, not the surrounding document.";
+    } else if (!sameCompany) {
+      verdict = "intact";
+      reason =
+        "The receipt is internally consistent and its signature verifies under the key it " +
+        "carries. It was issued for a different company than the one this request is scoped " +
+        "to, so the live chain was NOT consulted: nothing here says whether that chain still " +
+        "contains what was sealed. Present this receipt to the issuing tenant, or verify the " +
+        "key fingerprint out of band.";
+    } else if (prefixChecks && !prefixChecks.entriesPresent) {
+      verdict = "tail_truncated";
+      reason =
+        `This receipt was issued over ${sealFields.entryCount} entries; the live chain now ` +
+        `holds ${prefixChecks.entriesNow}. ${sealFields.entryCount - prefixChecks.entriesNow} ` +
+        "sealed entries are gone. The remaining chain still verifies internally, which is " +
+        "exactly why this receipt exists.";
+    } else if (prefixChecks && (!prefixChecks.merkleRootMatches || !prefixChecks.headHashMatches)) {
+      verdict = chain && chain.verdict !== "intact" ? chain.verdict : "entry_altered";
+      reason =
+        `This receipt commits the first ${sealFields.entryCount} entries to Merkle root ` +
+        `${sealFields.merkleRoot}; those entries now produce ` +
+        `${prefixChecks.recomputedMerkleRoot ?? "a different root"}. ` +
+        (chain ? chain.reason : "");
+    } else if (sameCompany && !sealOnRecord) {
+      /*
+       * THE SEAL IN THE HOLDER'S HAND IS NO LONGER IN THE REGISTER.
+       *
+       * This is the attack escrow exists to expose, and it used to report
+       * "intact": an insider deletes seal N and every seal after it, so the
+       * remaining seal chain is contiguous 1..N-1 and classifyChain is happy;
+       * the entries are untouched, so the prefix checks pass; and the holder
+       * of the receipt for seal N was told their chain was intact while the
+       * seal they hold had been erased from the record they were verifying
+       * against.
+       *
+       * A seal that a receipt names and the register does not contain is a
+       * broken seal chain, full stop.
+       */
+      verdict = "seal_broken";
+      reason =
+        `This receipt was issued over seal ${sealFields.sealId} (sequence ${sealFields.sequence}), ` +
+        "which is NOT in this tenant's seal register. The entries it commits to are still " +
+        "present, which is why every other check passes — but the seal itself has been removed. " +
+        "Removing the seal that would have noticed a truncation is the next move after " +
+        "truncating, and this receipt is the copy that survived it. Preserve a database backup " +
+        "now and treat the seal register as compromised until the deletion is explained.";
+    } else if (chain && chain.verdict !== "intact") {
+      // The sealed prefix is fine but the chain has some other problem
+      // (a later seal removed, a later entry altered): report it, do not
+      // let a good receipt vouch for a bad chain.
+      verdict = chain.verdict;
+      reason =
+        "The prefix this receipt commits to is present and unaltered, but the chain as a " +
+        `whole does not verify: ${chain.reason}`;
+    } else {
+      verdict = "intact";
+      reason =
+        `The signature verifies, the receipt is unaltered, and the live chain still holds all ` +
+        `${sealFields.entryCount} sealed entries, in order, producing the sealed Merkle root.`;
+    }
+
+    /* 6. record the presentation ------------------------------------ */
+    const verifiedAt = new Date().toISOString();
+    if (receiptOnRecord) {
+      await app.db
+        .update(escrowReceipts)
+        .set({ lastVerifiedAt: verifiedAt, lastVerdict: verdict })
+        .where(eq(escrowReceipts.id, doc.receiptId));
+    }
+    // Unlike the read-only verdict endpoint, presenting a receipt IS a
+    // consequential act — someone is asserting something about this record —
+    // so it goes in the ledger.
+    await appendLedger(app.db, {
+      companyId: req.companyId!,
+      actorId: req.user!.id,
+      action: "access",
+      objectType: "escrow_receipt",
+      objectId: doc.receiptId,
+      payload: {
+        verify: true,
+        verdict,
+        scope,
+        receiptOnRecord,
+        receiptHash: claimedHash,
+        signatureValid,
+        keyRecognized,
+      },
+      storePayload: true,
+    });
+    if (sameCompany && chain) {
+      await raiseVerdictSignal(req.companyId!, req.user!.id, {
+        ...chain,
+        verdict: verdict as SealChainVerdict,
+        // Localise the finding on the seal the RECEIPT names when that is what
+        // failed, so the fingerprint identifies the missing seal rather than
+        // whatever the chain happened to look like on this read.
+        ...(verdict === "seal_broken" && !sealOnRecord
+          ? { failedSealSequence: sealFields.sequence, reason }
+          : {}),
+      });
+    }
+
+    const derived = doc.key.derivedFromAuthSecret;
+    return {
+      verdict,
+      ok: verdict === "intact",
+      scope,
+      reason,
+      receipt: {
+        receiptId: doc.receiptId,
+        issuedAt: doc.issuedAt,
+        issuerCompanyId: doc.issuer.companyId,
+        sealId: sealFields.sealId,
+        sealSequence: sealFields.sequence,
+        /** issued by THIS tenant and still on record here */
+        onRecord: receiptOnRecord,
+        sealOnRecord: Boolean(sealOnRecord),
+        intact: receiptIntact,
+        recomputedReceiptHash,
+        bodyHashMatches,
+        signatureValid,
+        bodyError,
+      },
+      key: {
+        keyId: doc.key.keyId,
+        fingerprint: doc.key.fingerprint,
+        /** the receipt's key matches a key this platform has published */
+        recognized: keyRecognized,
+        /** …and is the key this process actually holds, not merely one on record */
+        heldByProcess: doc.key.keyId === heldKeyId(),
+        derivedFromAuthSecret: derived,
+        weakening: derived ? (doc.key.weakening ?? DERIVED_NOTE_FALLBACK) : null,
+      },
+      liveChain: sameCompany
+        ? { checked: true, ...prefixChecks, verdict: chain?.verdict ?? null }
+        : {
+            checked: false,
+            why:
+              "This receipt names a different company than the tenant context of this request. " +
+              "Reading another tenant's chain to answer a question about their receipt would " +
+              "be a tenant-isolation breach, so it was not read.",
+          },
+      limitations: [
+        ...limitationsFor(
+          derived,
+          sameCompany ? 1 : 0,
+          doc.key.keyId === heldKeyId() ? [] : [doc.key.keyId],
+        ),
+        keyRecognized
+          ? "The receipt's public key matches a key published by this platform."
+          : "The receipt's public key is NOT on this platform's key register. The signature " +
+            "checks out against the key the receipt carries, which proves internal consistency " +
+            "only — compare the fingerprint against an independently obtained copy before " +
+            "relying on it.",
+        ...(scope === "receipt_only"
+          ? ["The live chain was not consulted; this verdict covers the document only."]
+          : []),
+      ],
+      verifiedAt,
+    };
+  });
+  /* ---------------------------------------------------------------- */
+  /* Scheduled work — the guarantee, actually kept                     */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Seal every tenant on the heartbeat interval.
+   *
+   * This is what makes "ANCHOR_HEARTBEAT_HOURS bounds the exposure" true. It
+   * was previously a side effect of somebody opening the Ledger page, which
+   * meant a quiet tenant had NO bound: the tail could be cut for months and
+   * nothing would have committed to its length in between.
+   */
+  app.scheduler.register({
+    name: "anchoring.heartbeat-seal",
+    description:
+      "Seal every tenant's chain on the heartbeat interval so the window in which the tail can " +
+      "be cut invisibly stays bounded",
+    everyMs: 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db, log }) => {
+      let sealed = 0;
+      let overdue = 0;
+      const summary = await forEachCompany(db, async (companyId) => {
+        const created = await sweepHeartbeat(companyId, null);
+        if (created) sealed += 1;
+        const seals = await loadSeals(companyId);
+        const newest = seals[seals.length - 1];
+        if (!newest) return;
+        const ageHours = (Date.now() - Date.parse(isoOf(newest.sealedAt))) / 3_600_000;
+        if (ageHours < heartbeatHours() * 2) return;
+        overdue += 1;
+        // A heartbeat that cannot run (no key, refusal under a pin) is itself
+        // a finding: the guarantee is silently off, and silence is the failure
+        // mode this whole module exists to prevent.
+        const fingerprint = `heartbeat_overdue:seal:${newest.sequence}`;
+        const existing = await db
+          .select({ id: signals.id, refs: signals.evidenceRefs })
+          .from(signals)
+          .where(and(eq(signals.companyId, companyId), eq(signals.detector, "heartbeat_overdue")));
+        if (existing.some((r) => (r.refs as { fingerprint?: string } | null)?.fingerprint === fingerprint)) {
+          return;
+        }
+        const id = newId("sig");
+        await db.insert(signals).values({
+          id,
+          companyId,
+          projectId: null,
+          detector: "heartbeat_overdue",
+          severity: "high",
+          confidence: 1,
+          title: "Seal heartbeat overdue — the truncation window is no longer bounded",
+          explanation:
+            `The newest seal for this tenant is sequence ${newest.sequence}, written ` +
+            `${ageHours.toFixed(1)} hours ago; the heartbeat interval is ${heartbeatHours()} ` +
+            "hours. Sealing has been attempted and has not succeeded — most often because no " +
+            "ANCHOR_SIGNING_KEY is configured, or because the key in use is not among the " +
+            "pinned fingerprints. Until it resumes, entries appended since that seal are not " +
+            "committed to by anything outside this database.",
+          evidenceRefs: {
+            fingerprint,
+            newestSealSequence: newest.sequence,
+            newestSealAt: isoOf(newest.sealedAt),
+            ageHours,
+            intervalHours: heartbeatHours(),
+          },
+          fingerprint,
+          subjectType: "company",
+          subjectId: companyId,
+          firstSeenAt: new Date().toISOString(),
+          lastSeenAt: new Date().toISOString(),
+        });
+        await appendLedger(db, {
+          companyId,
+          actorId: null,
+          action: "create",
+          objectType: "signal",
+          objectId: id,
+          payload: { detector: "heartbeat_overdue", severity: "high" },
+        });
+        log.warn({ companyId, ageHours }, "seal heartbeat overdue");
+      });
+      return { ...summary, sealed, overdue };
+    },
+  });
+
+  /**
+   * Submit new seals to every configured external provider, and upgrade
+   * pending OpenTimestamps receipts once the calendar publishes.
+   *
+   * Without this, anchors existed only when an admin clicked, and every OTS
+   * receipt stayed `pending` forever — the provider was decorative.
+   */
+  app.scheduler.register({
+    name: "anchoring.submit-and-upgrade",
+    description:
+      "Submit unanchored seals to the configured RFC 3161 / OpenTimestamps providers and " +
+      "upgrade pending OTS receipts to anchored once the calendar publishes",
+    everyMs: 30 * 60_000,
+    runOnBoot: false,
+    run: async ({ db, log }) => {
+      const env = anchorEnv();
+      const configured: AnchorProvider[] = [];
+      if (env.ANCHOR_TSA_URL) configured.push("rfc3161");
+      if (env.ANCHOR_OTS_CALENDAR_URL) configured.push("opentimestamps");
+      let submitted = 0;
+      let upgraded = 0;
+
+      // 1. upgrade pending OTS receipts (runs even with nothing newly configured)
+      const pending = await db
+        .select()
+        .from(anchorSubmissions)
+        .where(
+          and(
+            eq(anchorSubmissions.provider, "opentimestamps"),
+            eq(anchorSubmissions.status, "pending"),
+          ),
+        )
+        .limit(200);
+      for (const row of pending) {
+        const proof = row.proof as { calendar?: string; digest?: string };
+        if (!proof.digest) continue;
+        const result = await upgradeOpenTimestamps({
+          bodyHash: proof.digest,
+          calendar: proof.calendar ?? "",
+          env,
+        });
+        if (!result.upgraded) continue;
+        await db
+          .update(anchorSubmissions)
+          .set({
+            status: result.status,
+            proof: { ...proof, ...(result.proof ?? {}) },
+            detail: result.detail,
+            confirmedAt: result.confirmedAt,
+          })
+          .where(eq(anchorSubmissions.id, row.id));
+        await appendLedger(db, {
+          companyId: row.companyId,
+          actorId: null,
+          action: "state_change",
+          objectType: "anchor_submission",
+          objectId: row.id,
+          payload: { status: result.status, upgraded: true, detail: result.detail },
+          storePayload: true,
+        });
+        upgraded += 1;
+      }
+
+      if (configured.length === 0) {
+        return {
+          submitted: 0,
+          upgraded,
+          skipped:
+            "No external anchor provider is configured (ANCHOR_TSA_URL / " +
+            "ANCHOR_OTS_CALENDAR_URL are unset), so seals are witnessed only by this " +
+            "deployment's own key.",
+        };
+      }
+
+      // 2. submit seals that have no submission for a configured provider
+      const summary = await forEachCompany(db, async (companyId) => {
+        const seals = await db
+          .select()
+          .from(chainSeals)
+          .where(eq(chainSeals.companyId, companyId))
+          .orderBy(desc(chainSeals.sequence))
+          .limit(5);
+        if (seals.length === 0) return;
+        const existing = await db
+          .select({ sealId: anchorSubmissions.sealId, provider: anchorSubmissions.provider })
+          .from(anchorSubmissions)
+          .where(eq(anchorSubmissions.companyId, companyId))
+          .limit(2000);
+        const have = new Set(existing.map((e) => `${e.sealId}|${e.provider}`));
+        const state = anchorKeyState(env);
+        if (!state.available) return;
+        for (const seal of seals) {
+          for (const provider of configured) {
+            if (have.has(`${seal.id}|${provider}`)) continue;
+            const attempt = await submitAnchor({
+              provider,
+              bodyHash: seal.bodyHash,
+              sealId: seal.id,
+              sealSequence: seal.sequence,
+              signature: seal.signature,
+              key: state.record,
+              env,
+            });
+            const id = newId("anch");
+            await db.insert(anchorSubmissions).values({
+              id,
+              companyId,
+              sealId: seal.id,
+              provider: attempt.provider,
+              status: attempt.status,
+              externalRef: attempt.externalRef,
+              proof: attempt.proof,
+              detail: attempt.detail,
+              confirmedAt: attempt.confirmedAt,
+            });
+            await appendLedger(db, {
+              companyId,
+              actorId: null,
+              action: "create",
+              objectType: "anchor_submission",
+              objectId: id,
+              payload: {
+                sealId: seal.id,
+                provider: attempt.provider,
+                status: attempt.status,
+                automatic: true,
+              },
+              storePayload: true,
+            });
+            submitted += 1;
+            log.info({ companyId, provider, status: attempt.status }, "anchor submitted");
+          }
+        }
+      });
+      return { ...summary, submitted, upgraded, providers: configured };
+    },
+  });
+
+  /**
+   * The deep pass: re-hash stored payload snapshots against `payloadHash`.
+   *
+   * Bounded (2,000 entries per company per run) and RESUMABLE from the
+   * per-company watermark, so a mature tenant is checked completely over a few
+   * runs instead of never — and never on a request path.
+   */
+  app.scheduler.register({
+    name: "anchoring.deep-verify",
+    description:
+      "Re-hash stored ledger payload snapshots in bounded batches; a snapshot that no longer " +
+      "hashes to its payloadHash is a content edit the chain itself cannot see",
+    everyMs: 60 * 60_000,
+    runOnBoot: false,
+    run: async ({ db }) => {
+      let checked = 0;
+      let mismatches = 0;
+      const summary = await forEachCompany(db, async (companyId) => {
+        const marks = await db
+          .select()
+          .from(chainWatermarks)
+          .where(eq(chainWatermarks.companyId, companyId))
+          .limit(1);
+        const mark = marks[0];
+        const from = mark?.deepVerifiedSeq ?? 0;
+        const result = await deepVerifyPayloads(companyId, from, 2000);
+        checked += result.checked;
+        if (result.mismatch) {
+          mismatches += 1;
+          await raiseVerdictSignal(companyId, null, {
+            verdict: "entry_altered",
+            ok: false,
+            entryCount: 0,
+            sealCount: 0,
+            latestSealSequence: null,
+            sealedEntryCount: null,
+            failedSealSequence: null,
+            failedEntrySeq: result.mismatch.seq,
+            suspectRange: null,
+            reason:
+              `Ledger entry seq ${result.mismatch.seq} stores a payload snapshot for ` +
+              `${result.mismatch.objectType} ${result.mismatch.objectId} that no longer hashes ` +
+              "to its recorded payloadHash. The chain covers the hash, not the snapshot, so " +
+              "every link still verifies: what was recorded has been rewritten in place.",
+            signaturesChecked: 0,
+            unknownKeyIds: [],
+            notes: [],
+          });
+        }
+        const values = {
+          deepVerifiedSeq: result.mismatch ? Math.max(from, result.mismatch.seq - 1) : result.lastSeq,
+          verifiedAt: new Date().toISOString(),
+        };
+        if (mark) {
+          await db.update(chainWatermarks).set(values).where(eq(chainWatermarks.id, mark.id));
+        } else {
+          await db
+            .insert(chainWatermarks)
+            .values({
+              id: newId("cwm"),
+              companyId,
+              lastVerifiedSeq: 0,
+              lastVerifiedHash: null,
+              verifiedCount: 0,
+              lastVerdict: "ok",
+              ...values,
+            })
+            .onConflictDoNothing();
+        }
+      });
+      return { ...summary, checked, mismatches };
+    },
+  });
+};

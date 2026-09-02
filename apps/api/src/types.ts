@@ -8,6 +8,7 @@ import type {
 import type { Config } from "./config.js";
 import type { Db } from "./lib/db.js";
 import type { StorageService } from "./lib/storage.js";
+import type { PlatformScheduler } from "./lib/scheduler.js";
 
 export type PreHandler = (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
 
@@ -16,6 +17,8 @@ declare module "fastify" {
     db: Db;
     storage: StorageService;
     appConfig: Config;
+    /** The platform job scheduler — modules register their sweeps here (lib/scheduler.ts). */
+    scheduler: PlatformScheduler;
     /** Verifies the Bearer token and populates req.user. */
     authenticate: PreHandler;
     /**

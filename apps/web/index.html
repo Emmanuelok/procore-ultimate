@@ -2,11 +2,109 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ConstructOS</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+
+    <title>ConstructOS — The project that can testify.</title>
+    <meta
+      name="description"
+      content="Link field reality to programme, cost, contract and evidence—then preserve the project record you may one day have to defend."
+    />
+    <meta name="application-name" content="ConstructOS" />
+    <meta name="robots" content="index, follow" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="format-detection" content="telephone=no" />
+    <link rel="canonical" href="https://constructos-production-7d87.up.railway.app/" />
+
+    <!-- Managed at runtime by the anti-flash script below and src/lib/theme.tsx.
+         Values must match THEME_COLOR in src/ui/tokens.ts. -->
+    <meta name="theme-color" content="#f6f7fa" />
+
+    <!-- Installable web app -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="ConstructOS" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="ConstructOS" />
+    <meta property="og:url" content="https://constructos-production-7d87.up.railway.app/" />
+    <meta property="og:title" content="ConstructOS — The project that can testify." />
+    <meta
+      property="og:description"
+      content="The evidence-native operating system for capital projects. Run the project, expose the risk and preserve the proof."
+    />
+    <meta
+      property="og:image"
+      content="https://constructos-production-7d87.up.railway.app/assets/landing/constructos-og-v1.jpg"
+    />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="ConstructOS — construction delivery connected to verifiable proof" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="ConstructOS — The project that can testify." />
+    <meta
+      name="twitter:description"
+      content="The evidence-native operating system for capital projects. Run the project, expose the risk and preserve the proof."
+    />
+    <meta
+      name="twitter:image"
+      content="https://constructos-production-7d87.up.railway.app/assets/landing/constructos-og-v1.jpg"
+    />
+
+    <link rel="preconnect" href="https://d2ol7oe51mr4n9.cloudfront.net" crossorigin />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..900&family=IBM+Plex+Mono:wght@400;500;600;700&family=Inter:ital,opsz,wght@0,14..32,400..800;1,14..32,400..800&display=swap"
+    />
+
+    <!-- Paint the correct canvas colour even before the app stylesheet parses,
+         and before JS runs at all (no-JS / system preference). -->
+    <style>
+      html {
+        background-color: #f6f7fa;
+      }
+      html[data-theme="dark"] {
+        background-color: #0a0c11;
+      }
+      html[data-theme="light"] {
+        background-color: #f6f7fa;
+      }
+      @media (prefers-color-scheme: dark) {
+        html:not([data-theme="light"]) {
+          background-color: #0a0c11;
+        }
+      }
+    </style>
+
+    <!--
+      Anti-flash theme bootstrap. Runs synchronously before first paint so the
+      resolved theme and density are already on <html> when the stylesheet is
+      applied. Keys and attribute names mirror src/ui/tokens.ts:
+        constructos:theme    → "light" | "dark" | "system"
+        constructos:density  → "comfortable" | "compact"
+    -->
+    <script src="/theme-bootstrap.js"></script>
   </head>
   <body>
     <div id="root"></div>
+    <noscript>
+      <div
+        style="
+          font:
+            500 14px/1.5 Inter,
+            system-ui,
+            sans-serif;
+          padding: 48px;
+          text-align: center;
+        "
+      >
+        ConstructOS needs JavaScript enabled.
+      </div>
+    </noscript>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

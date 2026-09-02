@@ -20,8 +20,12 @@ export type Db = PgDatabase<PgQueryResultHKT, typeof schema>;
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
+/** Arbitrary but stable: the advisory-lock key every replica agrees on for migrations. */
+const MIGRATION_LOCK_KEY = 7_290_331_017;
+
 /** Locate the committed drizzle migrations folder (packages/db/drizzle). */
-export function migrationsFolder(): string {
+export function migrationsFolder(override?: string): string {
+  if (override && existsSync(override)) return override;
   const candidates = [
     path.resolve(here, "../../../../packages/db/drizzle"),
     path.resolve(here, "../../../packages/db/drizzle"),
@@ -42,16 +46,32 @@ export interface DbHandle {
 }
 
 export async function createDb(cfg: Config): Promise<DbHandle> {
+  const folder = migrationsFolder(cfg.MIGRATIONS_DIR);
   if (cfg.DATABASE_URL) {
-    const client = postgres(cfg.DATABASE_URL, { max: 10 });
+    // Migrations run at boot in EVERY replica. Two replicas starting together
+    // would race the same DDL; a session-level advisory lock taken on a
+    // dedicated single connection (session locks belong to a connection, so
+    // it cannot come from the pool) serialises them — the second waits, then
+    // finds nothing left to apply.
+    const migrator = postgres(cfg.DATABASE_URL, { max: 1 });
+    try {
+      await migrator`select pg_advisory_lock(${MIGRATION_LOCK_KEY})`;
+      try {
+        await migratePostgres(drizzlePostgres(migrator, { schema }), { migrationsFolder: folder });
+      } finally {
+        await migrator`select pg_advisory_unlock(${MIGRATION_LOCK_KEY})`;
+      }
+    } finally {
+      await migrator.end();
+    }
+    const client = postgres(cfg.DATABASE_URL, { max: cfg.DATABASE_POOL_MAX });
     const db = drizzlePostgres(client, { schema });
-    await migratePostgres(db, { migrationsFolder: migrationsFolder() });
     return { db: db as unknown as Db, close: () => client.end() };
   }
   // Embedded fallback: in-memory for tests, persisted directory otherwise.
   const target = cfg.NODE_ENV === "test" ? undefined : cfg.PGLITE_DIR;
   const client = target ? new PGlite(target) : new PGlite();
   const db = drizzlePglite(client, { schema });
-  await migratePglite(db, { migrationsFolder: migrationsFolder() });
+  await migratePglite(db, { migrationsFolder: folder });
   return { db: db as unknown as Db, close: () => client.close() };
 }

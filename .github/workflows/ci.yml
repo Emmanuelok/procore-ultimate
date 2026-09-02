@@ -11,13 +11,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm typecheck
+      # Build first: apps/api resolves @constructos/{shared,ledger,db} through
+      # their dist/ output, which is gitignored. On a cold checkout typecheck
+      # would fail with TS2307 before build ever ran.
       - run: pnpm build
+      - run: pnpm typecheck
       - run: pnpm test
+      - run: pnpm --filter @constructos/api eval:retrodetect

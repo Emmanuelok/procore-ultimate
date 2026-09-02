@@ -75,13 +75,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     void reload();
   }, [reload]);
 
+  /**
+   * Password sign-in for callers that do not drive the multi-step flow.
+   *
+   * POST /auth/login answers 200 with NO tokens and `mfaRequired: true` when
+   * the account has a confirmed second factor (or a tenant policy demands
+   * one). Storing that body would write `undefined` into localStorage and
+   * leave the app "signed in" with no token, so this refuses instead and says
+   * where the flow lives. LoginPage drives the full three-step version
+   * (password → challenge → session) itself; nothing else should call this
+   * with an MFA account.
+   */
   const login = useCallback(
     async (email: string, password: string) => {
-      const res = await api.post<{ accessToken: string; refreshToken: string }>(
-        "/api/v1/auth/login",
-        { email, password },
-      );
-      tokenStore.set(res);
+      const res = await api.post<{
+        accessToken?: string;
+        refreshToken?: string;
+        mfaRequired?: boolean;
+      }>("/api/v1/auth/login", { email, password });
+      if (res.mfaRequired || !res.accessToken || !res.refreshToken) {
+        throw new Error(
+          "This account needs a second factor. Sign in from the sign-in screen, " +
+            "which carries the challenge step.",
+        );
+      }
+      tokenStore.set({ accessToken: res.accessToken, refreshToken: res.refreshToken });
       await reload();
     },
     [reload],
