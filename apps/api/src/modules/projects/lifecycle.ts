@@ -93,10 +93,19 @@ export function currencyChange(
   };
 }
 
-/** ISO date validation shared by the project date fields. */
+/**
+ * ISO date validation shared by the project date fields.
+ *
+ * `Date.parse` alone is not enough: V8 happily rolls "2026-02-30" over into
+ * 2 March, so a date that does not exist would be stored as a different one.
+ * The parsed components are compared back against the input.
+ */
 export function isIsoDate(value: string): boolean {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(value.slice(0, 10))) return false;
-  return !Number.isNaN(Date.parse(`${value.slice(0, 10)}T00:00:00Z`));
+  const iso = value.slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) return false;
+  const parsed = new Date(`${iso}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) return false;
+  return parsed.toISOString().slice(0, 10) === iso;
 }
 
 export type DateDecision = { ok: true } | { ok: false; reason: string };

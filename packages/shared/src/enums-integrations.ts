@@ -1,3 +1,5 @@
+import { INGESTION_DATASETS, type IngestionDataset } from "./enums.js";
+
 /**
  * Shared enums for the integrations area (platform upgrade wave).
  * Add new `as const` string unions and their types here; never edit
@@ -45,3 +47,21 @@ export type IngestionMode = (typeof INGESTION_MODES)[number];
 /** The operator's decision on a reconciled row. */
 export const INGESTION_RESOLUTIONS = ["insert", "update", "skip"] as const;
 export type IngestionResolution = (typeof INGESTION_RESOLUTIONS)[number];
+
+/**
+ * Datasets the migration wizard accepts BEYOND the ones enumerated in
+ * enums.ts. The platform-upgrade wave added modules whose first day needs a
+ * spreadsheet import, and the base vocabulary is frozen for the duration of the
+ * wave — so the registry reads the union of the two. The database column is
+ * plain text, so a member here is a first-class dataset in every respect:
+ * mappable, validatable, committable and token-scopable.
+ */
+export const EXTENDED_INGESTION_DATASETS = ["cost_codes", "budget_lines"] as const;
+export type ExtendedIngestionDataset = (typeof EXTENDED_INGESTION_DATASETS)[number];
+
+/** Every dataset an ingestion run may target. */
+export const ALL_INGESTION_DATASETS = [
+  ...INGESTION_DATASETS,
+  ...EXTENDED_INGESTION_DATASETS,
+] as const;
+export type AnyIngestionDataset = IngestionDataset | ExtendedIngestionDataset;

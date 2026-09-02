@@ -1,7 +1,13 @@
 /**
- * Events & Notices tab — the contract event register with the automatic
- * time-bar engine (#225-231): raising an event under a clause with a time bar
- * fixes the notice deadline, and serving the notice discharges the obligation.
+ * Events & Notices tab — the contract event register and the time-bar engine
+ * (#225-231).
+ *
+ * Raising an event under a clause fixes the notice deadline from the EFFECTIVE
+ * clause (the library merged with the contract's Particular Conditions),
+ * counted on the contract's calendar. Serving the notice discharges the
+ * obligation and starts whatever deadline the form chains after it. Late
+ * service is recorded as late — a barred event stays visibly barred rather
+ * than collapsing to a clean "notice served".
  */
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import { CONTRACT_EVENT_KINDS } from "@constructos/shared";
@@ -25,6 +31,7 @@ import { formatDate, formatDateTime, formatMoney, humanize } from "../format";
 import {
   addDaysIso,
   DeadlineBadge,
+  deadlineSourceLabel,
   DetailRow,
   eventLabel,
   eventStatusTone,
@@ -59,14 +66,27 @@ function CreateEventModal({
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [eventDate, setEventDate] = useState(todayIso());
+  const [awarenessDate, setAwarenessDate] = useState("");
+  const [manualBar, setManualBar] = useState("");
   const [costImpact, setCostImpact] = useState("");
   const [timeImpact, setTimeImpact] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const clause = clauses.find((c) => c.clauseRef === clauseRef);
+  // the bar runs from awareness where one is recorded, and the EFFECTIVE bar
+  // is the amended one when the Particular Conditions changed it
+  const barStart = awarenessDate || eventDate;
+  const effectiveBar = clause?.deleted
+    ? null
+    : (clause?.timeBarDays ?? (manualBar ? Number(manualBar) : null));
   const deadlinePreview =
-    clause?.timeBarDays && eventDate ? addDaysIso(eventDate, clause.timeBarDays) : null;
+    effectiveBar && barStart && Number.isFinite(effectiveBar)
+      ? addDaysIso(barStart, effectiveBar)
+      : null;
+  const amendedBar = Boolean(
+    clause?.amended && clause.libraryTimeBarDays != null && clause.timeBarDays !== clause.libraryTimeBarDays,
+  );
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -78,6 +98,8 @@ function CreateEventModal({
         title: title.trim(),
         eventDate,
       };
+      if (awarenessDate) payload["awarenessDate"] = awarenessDate;
+      if (manualBar && !clause?.timeBarDays) payload["timeBarDays"] = Number(manualBar);
       if (clauseRef) payload["clauseRef"] = clauseRef;
       if (description.trim()) payload["description"] = description.trim();
       const cost = costImpact.trim() === "" ? undefined : Number(costImpact);
@@ -121,7 +143,15 @@ function CreateEventModal({
               {clauses.map((c) => (
                 <option key={c.clauseRef} value={c.clauseRef}>
                   {c.clauseRef} · {c.title.slice(0, 60)}
-                  {c.timeBarDays ? ` (${c.timeBarDays}d bar)` : ""}
+                  {c.deleted
+                    ? " (deleted by PC)"
+                    : c.timeBarDays
+                      ? ` (${c.timeBarDays}d bar${
+                          c.libraryTimeBarDays != null && c.libraryTimeBarDays !== c.timeBarDays
+                            ? ", amended"
+                            : ""
+                        })`
+                      : ""}
                 </option>
               ))}
             </Select>
@@ -143,10 +173,12 @@ function CreateEventModal({
             label="Event date"
             hint={
               deadlinePreview
-                ? `Notice deadline: ${formatDate(deadlinePreview)}`
-                : clause
-                  ? "No day-counted bar for this clause."
-                  : undefined
+                ? `Notice deadline: ${formatDate(deadlinePreview)}${amendedBar ? " (amended by the Particular Conditions)" : ""}`
+                : clause?.deleted
+                  ? "This clause is deleted by the Particular Conditions — no bar applies."
+                  : clause
+                    ? "No day-counted bar for this clause."
+                    : undefined
             }
           >
             <Input
@@ -156,6 +188,28 @@ function CreateEventModal({
               onChange={(e) => setEventDate(e.target.value)}
             />
           </Field>
+          <Field
+            label="Awareness date"
+            hint="Most bars run from when the claiming party became aware, not from the event."
+          >
+            <Input
+              type="date"
+              value={awarenessDate}
+              onChange={(e) => setAwarenessDate(e.target.value)}
+            />
+          </Field>
+          {!clause?.timeBarDays ? (
+            <Field
+              label="Time bar (days)"
+              hint="For a bespoke form or an unlisted clause, state the bar so the engine can track it."
+            >
+              <Input
+                inputMode="numeric"
+                value={manualBar}
+                onChange={(e) => setManualBar(e.target.value)}
+              />
+            </Field>
+          ) : null}
           <Field label="Cost impact (est.)">
             <Input
               inputMode="decimal"
@@ -203,6 +257,9 @@ function EventDrawer({
 }) {
   const [method, setMethod] = useState<string>("email");
   const [reference, setReference] = useState("");
+  const [servedOn, setServedOn] = useState("");
+  const [evidenceRef, setEvidenceRef] = useState("");
+  const [lateReason, setLateReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lateBanner, setLateBanner] = useState<string | null>(null);
@@ -219,13 +276,21 @@ function EventDrawer({
     try {
       const payload: Record<string, unknown> = { method };
       if (reference.trim()) payload["reference"] = reference.trim();
-      const res = await api.post<ContractEventRow & { late?: boolean }>(
-        `${base}/serve-notice`,
-        payload,
-      );
+      if (servedOn) payload["servedAt"] = `${servedOn}T12:00:00Z`;
+      if (evidenceRef.trim()) payload["evidenceRef"] = evidenceRef.trim();
+      if (lateReason.trim()) payload["reason"] = lateReason.trim();
+      const res = await api.post<
+        ContractEventRow & { late?: boolean; chainedEvents?: Array<{ clauseRef: string }> }
+      >(`${base}/serve-notice`, payload);
       if (res?.late) {
         setLateBanner(
-          "Notice served after the time bar — the related entitlement may already be barred.",
+          "Notice served after the time bar — the event stays time-barred and the late service is recorded on the register.",
+        );
+      } else if ((res?.chainedEvents ?? []).length > 0) {
+        setLateBanner(
+          `Notice recorded. The next deadline under clause ${(res.chainedEvents ?? [])
+            .map((c) => c.clauseRef)
+            .join(", ")} has been opened automatically.`,
         );
       }
       onChanged();
@@ -269,8 +334,23 @@ function EventDrawer({
       ) : null}
       <div className="mb-4 divide-y divide-ink-100 rounded-md bg-ink-50 px-3 py-1">
         <DetailRow label="Event date">{formatDate(event.eventDate)}</DetailRow>
+        {event.awarenessDate ? (
+          <DetailRow label="Awareness date">{formatDate(event.awarenessDate)}</DetailRow>
+        ) : null}
         <DetailRow label="Notice deadline">
-          {event.noticeDeadline ? formatDate(event.noticeDeadline) : "—"}
+          {event.noticeDeadline ? (
+            <>
+              {formatDate(event.noticeDeadline)}
+              <span className="ml-2 text-xs text-ink-400">
+                {event.effectiveTimeBarDays != null
+                  ? `${event.effectiveTimeBarDays} ${event.calendarBasis === "working" ? "working" : "calendar"} days · `
+                  : ""}
+                {deadlineSourceLabel(event.deadlineSource)}
+              </span>
+            </>
+          ) : (
+            "—"
+          )}
         </DetailRow>
         <DetailRow label="Cost impact (est.)">
           {event.costImpactEstimate !== null
@@ -284,9 +364,49 @@ function EventDrawer({
           <DetailRow label="Notice served">
             {formatDateTime(event.noticeServedAt)} · {humanize(event.noticeMethod ?? "")}
             {event.noticeReference ? ` · ${event.noticeReference}` : ""}
+            {event.noticeServedLate ? (
+              <Badge tone="red" className="ml-2">
+                Served late
+              </Badge>
+            ) : null}
+            {event.deadlineAtService ? (
+              <span className="block text-xs text-ink-400">
+                Deadline at service: {formatDate(event.deadlineAtService)}
+              </span>
+            ) : null}
+            {event.lateReason ? (
+              <span className="block text-xs text-ink-500">Reason: {event.lateReason}</span>
+            ) : null}
+            {event.serviceEvidenceRef ? (
+              <span className="block text-xs text-ink-500">
+                Proof of service: {event.serviceEvidenceRef}
+              </span>
+            ) : null}
+          </DetailRow>
+        ) : null}
+        {event.chainStage ? (
+          <DetailRow label="Follows">
+            Chained from the preceding notice under clause {event.chainStage}
           </DetailRow>
         ) : null}
       </div>
+
+      {(event.chainedEvents ?? []).length > 0 ? (
+        <div className="mb-4 rounded-md bg-brand-50 p-3 ring-1 ring-brand-100">
+          <div className="text-xs font-semibold uppercase tracking-wide text-brand-700">
+            Deadlines this notice started
+          </div>
+          <ul className="mt-1 space-y-0.5 text-sm text-brand-900">
+            {(event.chainedEvents ?? []).map((c) => (
+              <li key={c.id}>
+                Clause {c.clauseRef} — due{" "}
+                {formatDate(c.deadline ?? c.noticeDeadline ?? null)}
+                {c.status ? ` (${humanize(c.status)})` : ""}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
 
       {canServe ? (
         <form onSubmit={serveNotice} className="mb-4 space-y-3 rounded-md border border-ink-100 p-3">
@@ -310,6 +430,22 @@ function EventDrawer({
                 onChange={(e) => setReference(e.target.value)}
                 placeholder="NT-005 / letter ref"
               />
+            </Field>
+            <Field
+              label="Date of service"
+              hint="Leave blank for now. Recording service more than a day in the past needs a reason and proof."
+            >
+              <Input type="date" value={servedOn} onChange={(e) => setServedOn(e.target.value)} />
+            </Field>
+            <Field label="Proof of service">
+              <Input
+                value={evidenceRef}
+                onChange={(e) => setEvidenceRef(e.target.value)}
+                placeholder="Recorded-delivery number, email message-id"
+              />
+            </Field>
+            <Field label="Reason for a backdated record" className="sm:col-span-2">
+              <Input value={lateReason} onChange={(e) => setLateReason(e.target.value)} />
             </Field>
           </div>
           <Button type="submit" size="sm" disabled={busy}>
@@ -480,14 +616,27 @@ export default function EventsTab({
                 <Td className="whitespace-nowrap">{formatDate(ev.eventDate)}</Td>
                 <Td className="whitespace-nowrap">
                   {ev.noticeDeadline ? (
-                    <span className="inline-flex items-center gap-1.5">
-                      <span className="text-xs text-ink-500">{formatDate(ev.noticeDeadline)}</span>
-                      {ev.status === "open" || ev.status === "time_barred" ? (
-                        <DeadlineBadge
-                          daysRemaining={ev.daysToDeadline ?? null}
-                          timeBarred={ev.status === "time_barred"}
-                        />
-                      ) : null}
+                    <span className="inline-flex flex-col gap-0.5">
+                      <span className="inline-flex items-center gap-1.5">
+                        <span className="text-xs text-ink-500">
+                          {formatDate(ev.noticeDeadline)}
+                        </span>
+                        {ev.status === "open" || ev.status === "time_barred" ? (
+                          <DeadlineBadge
+                            daysRemaining={ev.daysToDeadline ?? null}
+                            timeBarred={ev.status === "time_barred"}
+                          />
+                        ) : null}
+                      </span>
+                      <span
+                        className={
+                          ev.deadlineSource === "particular_condition"
+                            ? "text-[11px] font-medium text-violet-700"
+                            : "text-[11px] text-ink-400"
+                        }
+                      >
+                        {deadlineSourceLabel(ev.deadlineSource)}
+                      </span>
                     </span>
                   ) : (
                     <span className="text-xs text-ink-400">—</span>
@@ -495,6 +644,14 @@ export default function EventsTab({
                 </Td>
                 <Td>
                   <Badge tone={eventStatusTone(ev.status)}>{humanize(ev.status)}</Badge>
+                  {ev.noticeServedLate ? (
+                    <Badge tone="red" className="ml-1">
+                      Served late
+                    </Badge>
+                  ) : null}
+                  {ev.ceState ? (
+                    <span className="block text-[11px] text-ink-400">{humanize(ev.ceState)}</span>
+                  ) : null}
                 </Td>
               </tr>
             ))}

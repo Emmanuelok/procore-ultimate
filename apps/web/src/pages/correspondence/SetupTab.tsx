@@ -150,7 +150,7 @@ export default function SetupTab({
       <Card>
         <CardHeader
           title="Correspondence types"
-          description="What a letter IS in this tenant: its numbering, its response period, whether it is a contractual act, and the approvals it must pass."
+          subtitle="What a letter IS in this tenant: its numbering, its response period, whether it is a contractual act, and the approvals it must pass."
           actions={
             <div className="flex gap-2">
               <Button variant="ghost" loading={action.busy === "seed"} onClick={seed}>
@@ -198,7 +198,7 @@ export default function SetupTab({
       <Card>
         <CardHeader
           title="Action plan templates"
-          description="The library a plan is built from: required activities, evidence requirements and who must sign."
+          subtitle="The library a plan is built from: required activities, evidence requirements and who must sign."
           icon={IconWorkflow}
         />
         <CardBody>

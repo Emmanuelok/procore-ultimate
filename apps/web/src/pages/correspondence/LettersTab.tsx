@@ -43,7 +43,6 @@ import {
   corrApi,
   dateTime,
   days,
-  errorMessage,
   isoDate,
   letterTone,
   titleCase,
@@ -1036,5 +1035,3 @@ function LetterDrawer({
     </Drawer>
   );
 }
-
-export { errorMessage };

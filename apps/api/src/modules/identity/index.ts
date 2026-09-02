@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { z } from "zod";
 import {
   companies,
@@ -12,7 +12,7 @@ import { BUILTIN_PERMISSION_TEMPLATES, type AuthMethod } from "@constructos/shar
 import { sha256Hex } from "@constructos/ledger";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
-import { badRequest, conflict, unauthorized } from "../../lib/errors.js";
+import { badRequest, conflict, forbidden, unauthorized } from "../../lib/errors.js";
 import { isExpired } from "../../lib/time.js";
 import type { Db } from "../../lib/db.js";
 // Phase 8 — account lifecycle and session security. These four imports are the
@@ -35,6 +35,7 @@ import {
 import {
   issueUserSession,
   requestContext,
+  revokeAllUserSessions,
   revokeSessions,
   sessionIdForRefreshToken,
 } from "../account/sessions.js";
@@ -46,6 +47,9 @@ import { startEmailVerification } from "../account/verification.js";
 // identical request body) challenged correctly. Both routes now speak one
 // protocol and redeem at the same POST /auth/mfa/challenge.
 import { activeFactor, companiesRequiringMfa } from "../mfa/service.js";
+// Tenant "require SSO" policy. It lives in the SSO module and is enforced
+// here, at the password front door, because that is the door it is about.
+import { isPasswordLoginAllowedForUser } from "../sso/index.js";
 import { challengeEnvelope, mintChallengeToken } from "../mfa/challenge.js";
 
 // The length floor lives in the password policy (modules/account/password.ts),
@@ -138,14 +142,27 @@ export const identityModule: FastifyPluginAsync = async (app) => {
 
   async function createCompany(name: string, ownerId: string) {
     const companyId = newId("co");
-    let slug = slugify(name);
-    const existing = await app.db
-      .select({ id: companies.id })
-      .from(companies)
-      .where(eq(companies.slug, slug))
-      .limit(1);
-    if (existing[0]) slug = `${slug}-${newId().slice(0, 6)}`;
-    await app.db.insert(companies).values({ id: companyId, name, slug });
+    const base = slugify(name);
+    /*
+     * Check-then-insert races: two people registering "Acme" at the same
+     * moment both saw the slug free, and the loser's request died on the
+     * unique constraint as an unhandled 500 — after their user row had
+     * already been created. Retry on the constraint instead, with a random
+     * suffix, and give up with a clear error rather than looping.
+     */
+    let slug = base;
+    let inserted = false;
+    for (let attempt = 0; attempt < 5 && !inserted; attempt += 1) {
+      if (attempt > 0) slug = `${base}-${newId().slice(0, 6)}`;
+      try {
+        await app.db.insert(companies).values({ id: companyId, name, slug });
+        inserted = true;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (!/unique|duplicate/i.test(message)) throw err;
+      }
+    }
+    if (!inserted) throw conflict("Could not allocate a unique company slug; try a different name");
     await app.db.insert(companyMemberships).values({
       id: newId("cm"),
       companyId,
@@ -262,19 +279,62 @@ export const identityModule: FastifyPluginAsync = async (app) => {
       : await equalizeVerifyTiming(body.password, app.appConfig);
 
     const ctx = requestContext(req);
-    await recordLegacyAuthEvent(app.db, {
-      userId: user?.id ?? null,
-      email: body.email,
-      kind: ok ? "login_success" : "login_failure",
-      ip: ctx.ip,
-      userAgent: ctx.userAgent,
-    });
 
+    /*
+     * The legacy trail is written AFTER every refusal, not before.
+     *
+     * It used to record `kind: ok ? "login_success" : "login_failure"` at
+     * this point — before the isActive check and before the MFA branch — so
+     * `GET /company/auth-events` (the only trail an admin can see) showed a
+     * deactivated account presenting a correct password as a COMPLETED
+     * SIGN-IN, and showed a password-only success that was still awaiting a
+     * second factor the same way. An audit trail that reports refused
+     * sign-ins as successes is worse than no trail.
+     */
     if (!user || !ok || !user.isActive) {
+      const reason = !user ? "unknown_address" : !ok ? "invalid_password" : "account_inactive";
+      await recordLegacyAuthEvent(app.db, {
+        userId: user?.id ?? null,
+        email: body.email,
+        kind: reason === "account_inactive" ? "login_blocked_inactive" : "login_failure",
+        ip: ctx.ip,
+        userAgent: ctx.userAgent,
+      });
       await noteLoginFailure(app, req, {
         email: body.email,
         userId: user?.id ?? null,
-        reason: !user ? "unknown_address" : !ok ? "invalid_password" : "account_inactive",
+        reason,
+      });
+      throw unauthorized("Invalid credentials");
+    }
+
+    /*
+     * Tenant policy: a company that requires SSO (`allowPasswordLogin:
+     * false`) must not be reachable with a password.
+     *
+     * `isPasswordLoginAllowedForUser` has existed in the SSO module since it
+     * was written, with a comment asking the identity module to call it —
+     * and nothing did. The SPA merely hid the password form, so a direct POST
+     * with a valid password signed in, and `login_blocked_password_disabled`
+     * was never written anywhere. The refusal is the same uniform 401 as
+     * every other, with the real reason in the trail rather than the body.
+     */
+    if (!(await isPasswordLoginAllowedForUser(app.db, user.id))) {
+      await recordLegacyAuthEvent(app.db, {
+        userId: user.id,
+        email: body.email,
+        kind: "login_blocked_password_disabled",
+        ip: ctx.ip,
+        userAgent: ctx.userAgent,
+      });
+      await recordAuthEvent(app.db, {
+        kind: "login_failure",
+        outcome: "failure",
+        userId: user.id,
+        email: user.email,
+        ip: ctx.ip,
+        userAgent: ctx.userAgent,
+        reason: "A company this account belongs to requires single sign-on",
       });
       throw unauthorized("Invalid credentials");
     }
@@ -292,6 +352,13 @@ export const identityModule: FastifyPluginAsync = async (app) => {
         userId: user.id,
         scope: factor ? "verify" : "enrol",
         ttlMinutes: app.appConfig.MFA_CHALLENGE_TTL_MINUTES,
+      });
+      await recordLegacyAuthEvent(app.db, {
+        userId: user.id,
+        email: body.email,
+        kind: "login_challenge",
+        ip: ctx.ip,
+        userAgent: ctx.userAgent,
       });
       // The same trail POST /auth/mfa/login writes for the same event: the
       // password WAS correct, and the sign-in is pending a second factor.
@@ -333,6 +400,13 @@ export const identityModule: FastifyPluginAsync = async (app) => {
       .update(users)
       .set({ lastLoginAt: new Date().toISOString() })
       .where(eq(users.id, user.id));
+    await recordLegacyAuthEvent(app.db, {
+      userId: user.id,
+      email: body.email,
+      kind: "login_success",
+      ip: ctx.ip,
+      userAgent: ctx.userAgent,
+    });
     const completed = await completeLogin(app, req, { user, password: body.password });
     return {
       user: { id: user.id, email: user.email, name: user.name },
@@ -353,18 +427,78 @@ export const identityModule: FastifyPluginAsync = async (app) => {
       .limit(1);
     const token = rows[0];
     const now = new Date().toISOString();
+
+    /*
+     * A refresh token is single use. Presenting one that has ALREADY been
+     * spent is not a stale client, it is the signature of a stolen copy being
+     * replayed — the legitimate holder has the rotated token, so only an
+     * attacker still holds this one. The whole family is revoked and the
+     * trail records it; `token_reuse_detected` existed in the enum and was
+     * never written by anything before this.
+     */
+    if (token && token.revokedAt) {
+      await revokeAllUserSessions(app.db, token.userId, {
+        reason: "token_reuse_detected",
+        byUser: false,
+        actorId: null,
+        includeOrphanTokens: true,
+      });
+      await recordAuthEvent(app.db, {
+        kind: "refresh_failure",
+        outcome: "failure",
+        userId: token.userId,
+        reason: "Refresh token reuse detected; every session for this account was revoked",
+        ...requestContext(req),
+      });
+      throw unauthorized("Invalid refresh token");
+    }
+
     // Instant comparison, not string comparison — see lib/time.ts. Postgres
     // returns "2026-09-24 23:00:00+00" while `now` is "…T10:00:00.000Z", and a
     // space sorts before "T": on a token's expiry day every refresh was
     // rejected from midnight onwards, logging people out a day early.
-    if (!token || token.revokedAt || isExpired(token.expiresAt, Date.now())) {
+    if (!token || isExpired(token.expiresAt, Date.now())) {
       throw unauthorized("Invalid refresh token");
     }
-    // rotate: revoke old, issue new
-    await app.db
+    /*
+     * ROTATION IS A CLAIM, NOT AN UPDATE.
+     *
+     * The previous code read the row, checked `revokedAt` in memory, then
+     * updated unconditionally. Two concurrent refreshes with the same token —
+     * a client retry, or a stolen copy racing the owner — both passed, both
+     * minted new tokens and both repointed the same session; the loser's
+     * refresh token stayed valid but was no longer referenced by
+     * `auth_sessions.refresh_token_id`, so "sign this device out" could not
+     * revoke it. A replay of an already-rotated token got a plain 401 and the
+     * family survived: `token_reuse_detected` was in the enum and was never
+     * written by anything.
+     *
+     * A conditional UPDATE ... RETURNING makes the claim atomic. Zero rows
+     * back means somebody else already spent this token — which, for a
+     * single-use credential, is the definition of reuse. The whole family is
+     * revoked and the trail records it.
+     */
+    const claimed = await app.db
       .update(refreshTokens)
       .set({ revokedAt: now })
-      .where(eq(refreshTokens.id, token.id));
+      .where(and(eq(refreshTokens.id, token.id), isNull(refreshTokens.revokedAt)))
+      .returning({ id: refreshTokens.id });
+    if (!claimed[0]) {
+      await revokeAllUserSessions(app.db, token.userId, {
+        reason: "token_reuse_detected",
+        byUser: false,
+        actorId: null,
+        includeOrphanTokens: true,
+      });
+      await recordAuthEvent(app.db, {
+        kind: "refresh_failure",
+        outcome: "failure",
+        userId: token.userId,
+        reason: "Refresh token reuse detected; every session for this account was revoked",
+        ...requestContext(req),
+      });
+      throw unauthorized("Invalid refresh token");
+    }
     const userRows = await app.db
       .select()
       .from(users)
@@ -485,7 +619,9 @@ export const identityModule: FastifyPluginAsync = async (app) => {
           ),
         )
         .limit(1);
-      if (!member[0]) throw badRequest("Not a member of this company");
+      // 403, not 400: an authorisation refusal that answers "malformed
+      // request" makes every machine caller's error handling wrong.
+      if (!member[0]) throw forbidden("Not a member of this company");
       const rows = await app.db
         .select()
         .from(companies)

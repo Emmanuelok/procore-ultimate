@@ -22,7 +22,9 @@ export function registerCorrespondenceSearch(): void {
         companyId: correspondenceLetters.companyId,
         projectId: correspondenceLetters.projectId,
         title: correspondenceLetters.subject,
-        subtitle: correspondenceLetters.body,
+        // The type, not the body: a letter body can be 100k characters and a
+        // search hit is a one-line summary.
+        subtitle: correspondenceLetters.typeKey,
         reference: correspondenceLetters.reference,
         status: correspondenceLetters.status,
         updatedAt: correspondenceLetters.updatedAt,
@@ -51,7 +53,7 @@ export function registerCorrespondenceSearch(): void {
         companyId: transmittals.companyId,
         projectId: transmittals.projectId,
         title: transmittals.subject,
-        subtitle: transmittals.coverNote,
+        subtitle: transmittals.purpose,
         reference: transmittals.reference,
         status: transmittals.status,
         updatedAt: transmittals.updatedAt,

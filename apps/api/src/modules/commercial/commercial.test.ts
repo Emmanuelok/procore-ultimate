@@ -68,6 +68,9 @@ beforeAll(async () => {
     projectId: projA,
     name: "Main works contract",
     form: "fidic_red_1999",
+    // the bills raised against this contract are priced in GBP; a BoQ whose
+    // currency disagrees with its contract is now refused (#178)
+    currency: "GBP",
     createdBy: u1.userId,
   });
   sheetA = newId("sheet");

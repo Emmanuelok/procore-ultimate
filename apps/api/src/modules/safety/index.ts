@@ -1,7 +1,10 @@
+import { createHash } from "node:crypto";
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, gte, inArray, isNull, lte, or, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, inArray, isNull, lte, ne, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
+  files,
+  nonConformanceReports,
   obligations,
   projects,
   safetyCorrectiveActions,
@@ -10,6 +13,9 @@ import {
   safetyInspections,
   safetyObservations,
   safetyProgrammeRecords,
+  safetyRegulatoryReports,
+  safetyRiskSnapshots,
+  safetySensorEvents,
   signals,
   siteAccessRecords,
   timecards,
@@ -40,7 +46,10 @@ import {
   SAFETY_CATEGORIES,
   SAFETY_INSPECTION_TYPES,
   SAFETY_OBSERVATION_KINDS,
-  SAFETY_PROGRAMME_RECORD_KINDS,
+  SAFETY_RECORD_KINDS_ALL,
+  SAFETY_REGULATORY_FORMS,
+  SAFETY_SENSOR_EVENT_KINDS,
+  SAFETY_SENSOR_SOURCES,
   SAFETY_SEVERITIES,
   SHIFTS,
   type CorrectiveActionSource,
@@ -73,7 +82,44 @@ import {
   type IncidentFacts,
   type ReportabilityDetermination,
 } from "./reportability.js";
-import { computeSafetyRates, resolveExposureHours, type RateCounts } from "./rates.js";
+import { computeSafetyRates, resolveExposureHours, type ExposureHours, type RateCounts } from "./rates.js";
+import {
+  derivedRegulatorNotifiedAt,
+  missedNotificationKey,
+  notificationState,
+  type NotificationEntry,
+  type NotificationState,
+} from "./notifications.js";
+import {
+  buildOsha300,
+  buildOsha300A,
+  buildOsha301,
+  buildRiddorF2508,
+  canonicalJson,
+  emptyFormContext,
+  type FormContext,
+  type FormIncident,
+} from "./regulatory.js";
+import {
+  buildVendorScorecard,
+  type VendorScorecard,
+  type VendorScorecardInput,
+} from "./scorecard.js";
+import {
+  assessUnderReporting,
+  computeRiskIndex,
+  type RiskIndexInput,
+  type RiskIndexResult,
+} from "./riskindex.js";
+import {
+  assistOutputSchema,
+  buildAssistPrompt,
+  reconcileAssist,
+  type AssistContext,
+  type AssistRecordRef,
+} from "./assist.js";
+import { aiEnabled, runAgent } from "../ai/service.js";
+import { forEachCompany } from "../../lib/scheduler.js";
 
 /* ------------------------------------------------------------------ */
 /* Vocabularies local to this module                                   */
@@ -86,6 +132,9 @@ const SAFETY_DETECTORS = [
   "safety_statutory_inspection_overdue",
   "safety_programme_record_expired",
   "safety_investigation_overdue",
+  "safety_device_alarm_unanswered",
+  "safety_risk_index_elevated",
+  "safety_under_reporting_suspected",
 ] as const;
 
 /** Obligations created here carry this prefix so they can be counted back. */
@@ -93,6 +142,37 @@ const OBLIGATION_PREFIX = "safety";
 
 /** Programme record kinds whose expiry stops work rather than merely dating a file. */
 const CRITICAL_RECORD_KINDS = new Set(["permit_to_work", "competency_card", "temporary_works_design"]);
+
+/**
+ * Device alarm classes that are life-safety: somebody may be unconscious, and
+ * the only useful response time is measured in minutes. Everything else gets
+ * the shift-length clock.
+ */
+const LIFE_SAFETY_ALARMS = new Set([
+  "man_down",
+  "no_motion",
+  "fall_detected",
+  "sos",
+  "gas_alarm",
+  "check_in_missed",
+]);
+
+/** Response deadline for one alarm class, in minutes from receipt. */
+const ALARM_RESPONSE_MINUTES: Record<string, number> = {
+  man_down: 5,
+  sos: 5,
+  no_motion: 10,
+  fall_detected: 5,
+  gas_alarm: 5,
+  check_in_missed: 15,
+  impact: 60,
+  heat_stress: 30,
+  proximity_alert: 120,
+  exclusion_zone_breach: 60,
+  noise_exposure: 480,
+  device_offline: 480,
+  panic_test: 480,
+};
 
 /** Corrective action sources this module can validate the existence of. */
 const IN_MODULE_SOURCES: ReadonlySet<string> = new Set([
@@ -514,11 +594,28 @@ const acknowledgementSchema = z.object({
   userId: z.string().max(64).nullable().optional(),
   method: z.enum(ACKNOWLEDGEMENT_METHODS).optional(),
   acknowledgedAt: isoTimestamp.optional(),
+  /** required when recording on behalf of a worker — what was actually seen */
+  attestation: z.string().max(2000).optional(),
 });
+
+/**
+ * Acknowledgement methods that carry their own evidence: the person left a
+ * mark, or a device recorded them. `verbal_confirmed` and
+ * `on_device_signature` recorded BY SOMEBODY ELSE do not — they are one
+ * person's word that another person read something, which is exactly what an
+ * inspector discounts.
+ */
+const ATTESTABLE_METHODS: ReadonlySet<string> = new Set([
+  "wet_signature",
+  "biometric",
+  "qr_scan",
+  "badge_scan",
+  "supervisor_attested",
+]);
 
 const recordCreateSchema = z.object({
   projectId: z.string().max(64).nullable().optional(),
-  recordKind: z.enum(SAFETY_PROGRAMME_RECORD_KINDS),
+  recordKind: z.enum(SAFETY_RECORD_KINDS_ALL),
   title: z.string().min(1).max(300),
   description: z.string().max(8000).nullable().optional(),
   version: z.string().max(40).nullable().optional(),
@@ -543,7 +640,7 @@ const recordCreateSchema = z.object({
 const recordPatchSchema = recordCreateSchema.partial().omit({ recordKind: true, projectId: true });
 
 const recordListQuery = pageQuerySchema.extend({
-  recordKind: z.enum(SAFETY_PROGRAMME_RECORD_KINDS).optional(),
+  recordKind: z.enum(SAFETY_RECORD_KINDS_ALL).optional(),
   status: z.string().max(40).optional(),
   workerId: z.string().max(64).optional(),
   vendorId: z.string().max(64).optional(),
@@ -646,6 +743,27 @@ function factsFromIncident(row: IncidentRow): IncidentFacts {
 function storedDetermination(row: IncidentRow): ReportabilityDetermination | null {
   const d = row.detail["reportability"];
   return d && typeof d === "object" && !Array.isArray(d) ? (d as ReportabilityDetermination) : null;
+}
+
+/**
+ * The standing of every statutory notification duty on one incident.
+ *
+ * ONE function, used by the register, the drawer, the sweep and the close
+ * gate, so those four cannot disagree about whether a duty is live. It reads
+ * the stored determination where there is one and falls back to the stored
+ * regime list and deadline where there is not.
+ */
+function incidentNotificationState(row: IncidentRow, asOfISO: string): NotificationState {
+  return notificationState({
+    determination: storedDetermination(row),
+    storedRegimes: (row.reportableRegimes ?? []) as string[],
+    reportDueAt: row.reportDueAt,
+    notifications: ((row.notifications ?? []) as unknown[]).filter(
+      (n): n is NotificationEntry => !!n && typeof n === "object",
+    ),
+    isReportable: asBool(row.isReportable),
+    asOfISO,
+  });
 }
 
 /** Regimes recorded on the incident, for reassessment without re-supplying them. */
@@ -867,12 +985,31 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
   /* Signals                                                           */
   /* ---------------------------------------------------------------- */
 
-  /** Signal keys already raised for a detector in this company. */
-  async function alreadySignalled(companyId: string, detector: string): Promise<Set<string>> {
+  /**
+   * Signal keys already raised for a detector, bounded by project.
+   *
+   * The project bound is not an optimisation, it is a correctness property at
+   * scale: signals are never deleted, so a company-wide read of one detector
+   * grows monotonically for the life of the tenant and every sweep pays for
+   * every signal ever raised. Keys are unique per record, so restricting to
+   * the project being swept cannot miss a duplicate — a record belongs to one
+   * project.
+   */
+  async function alreadySignalled(
+    companyId: string,
+    detector: string,
+    projectId: string | null,
+  ): Promise<Set<string>> {
     const rows = await app.db
       .select({ refs: signals.evidenceRefs })
       .from(signals)
-      .where(and(eq(signals.companyId, companyId), eq(signals.detector, detector)));
+      .where(
+        and(
+          eq(signals.companyId, companyId),
+          eq(signals.detector, detector),
+          ...(projectId ? [eq(signals.projectId, projectId)] : []),
+        ),
+      );
     const keys = new Set<string>();
     for (const row of rows) {
       const refs = row.refs as { key?: unknown } | null;
@@ -963,6 +1100,56 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
           storePayload: true,
         });
       }
+    } else if (obligationId) {
+      /* The facts have changed and no notification is due any more — the lost
+       * time was corrected from nine days to five, or the regimes were
+       * narrowed. The incident's own columns are cleared below, but the
+       * obligation this assessment created is a row in a REGISTER OTHER
+       * PEOPLE READ: left open it shows a breached statutory duty against an
+       * incident the safety register says is not reportable, and the two
+       * screens then contradict each other in front of an auditor.
+       *
+       * It is withdrawn rather than deleted, and the reassessment that
+       * withdrew it is named in the ledger, because "this duty was raised and
+       * then found not to apply" is itself a fact somebody may need to
+       * defend. `obligationId` is deliberately KEPT on the incident so the
+       * withdrawn obligation stays reachable from it. */
+      const withdrawn = await app.db
+        .update(obligations)
+        .set({ status: "waived" })
+        .where(and(eq(obligations.id, obligationId), eq(obligations.status, "open")))
+        .returning({ id: obligations.id });
+      if (withdrawn.length > 0) {
+        await appendLedger(app.db, {
+          companyId: row.companyId,
+          projectId: row.projectId,
+          actorId,
+          action: "state_change",
+          objectType: "obligation",
+          objectId: obligationId,
+          payload: {
+            act: "withdraw",
+            from: "open",
+            to: "waived",
+            source: "safety_incident",
+            incidentId: row.id,
+            reference: row.reference,
+            reason: "reportability_reassessed_not_reportable",
+            note:
+              `Withdrawn on reassessment of incident ${row.reference}: on the facts now held no ` +
+              `statutory notification is due. ` +
+              (determination.reasons[0] ?? "") +
+              (determination.needsHumanReview
+                ? " The determination still carries open questions — if they resolve the other way " +
+                  "this obligation must be reinstated."
+                : ""),
+            regimes: determination.regimes,
+            assessedRegimes: determination.assessedRegimes,
+            needsHumanReview: determination.needsHumanReview,
+          },
+          storePayload: true,
+        });
+      }
     }
 
     const now = new Date().toISOString();
@@ -1012,21 +1199,26 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
   /* ---------------------------------------------------------------- */
 
   /**
-   * Five detectors, each keyed in `evidenceRefs.key` so a repeated read never
+   * Six detectors, each keyed in `evidenceRefs.key` so a repeated read never
    * raises the same finding twice:
    *
-   *   safety_notification_deadline_missed   key = incidentId
+   *   safety_notification_deadline_missed   key = incidentId:regime
    *   safety_investigation_overdue          key = incidentId
    *   safety_corrective_action_overdue      key = actionId
    *   safety_statutory_inspection_overdue   key = inspectionId
    *   safety_programme_record_expired       key = recordId
+   *   safety_device_alarm_unanswered        key = sensorEventId
+   *
+   * The notification key carries the REGIME because an incident answerable to
+   * two authorities owes two duties, and one missed duty must be able to raise
+   * a finding while the other is discharged.
    *
    * Status flips (an expired record → `expired`, a scheduled inspection past
    * its date → `overdue`) are a second, independent guard: the candidate
    * query selects on the pre-flip status, so a swept row leaves the set.
    *
-   * `projectId === null` sweeps company-wide, which is what the company-level
-   * programme-record routes need.
+   * `projectId === null` sweeps company-wide, which is what the scheduler and
+   * the company-level programme-record routes need.
    */
   async function sweepSafety(
     companyId: string,
@@ -1036,79 +1228,96 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     const asOf = todayISO();
     const nowISO = new Date().toISOString();
 
-    /* (1) statutory notification deadline passed without a notification */
+    /* (1) a statutory notification deadline passed, PER REGIME.
+     *
+     * The candidate set is every reportable incident that is not closed —
+     * NOT, as it once was, every incident with a null `regulator_notified_at`.
+     * That column is a derived summary of the per-regime entries and is only
+     * set once every duty is discharged; selecting on it hid the second duty
+     * of a dual-regime incident the moment the first was recorded. */
     const dueIncidents = await app.db
       .select()
       .from(safetyIncidents)
       .where(
-        projectId
-          ? and(
-              eq(safetyIncidents.companyId, companyId),
-              eq(safetyIncidents.projectId, projectId),
-              eq(safetyIncidents.isReportable, 1),
-              isNull(safetyIncidents.regulatorNotifiedAt),
-            )
-          : and(
-              eq(safetyIncidents.companyId, companyId),
-              eq(safetyIncidents.isReportable, 1),
-              isNull(safetyIncidents.regulatorNotifiedAt),
-            ),
+        and(
+          eq(safetyIncidents.companyId, companyId),
+          ...(projectId ? [eq(safetyIncidents.projectId, projectId)] : []),
+          eq(safetyIncidents.isReportable, 1),
+          ne(safetyIncidents.status, "void"),
+        ),
       );
-    const missed = dueIncidents.filter((i) => isNotificationMissed(i.reportDueAt, null, nowISO));
-    if (missed.length > 0) {
-      const seen = await alreadySignalled(companyId, "safety_notification_deadline_missed");
-      for (const inc of missed) {
+    const withMissedDuty: Array<{ row: IncidentRow; state: NotificationState }> = [];
+    for (const inc of dueIncidents) {
+      const state = incidentNotificationState(inc, nowISO);
+      if (state.duties.some((d) => d.state === "missed")) withMissedDuty.push({ row: inc, state });
+    }
+    if (withMissedDuty.length > 0) {
+      const seen = await alreadySignalled(companyId, "safety_notification_deadline_missed", projectId);
+      for (const { row: inc, state } of withMissedDuty) {
         if (inc.obligationId) {
           await app.db
             .update(obligations)
             .set({ status: "breached" })
             .where(and(eq(obligations.id, inc.obligationId), eq(obligations.status, "open")));
         }
-        if (seen.has(inc.id)) continue;
-        seen.add(inc.id);
-        const det = storedDetermination(inc);
-        const governing = det?.rules.find((r) => r.ruleId === det.governingRuleId) ?? null;
-        const sigId = newId("sig");
-        await app.db.insert(signals).values({
-          id: sigId,
-          companyId,
-          projectId: inc.projectId,
-          detector: "safety_notification_deadline_missed",
-          severity: "critical",
-          confidence: 1,
-          title: `Statutory notification deadline missed — ${inc.reference}: ${inc.title}`,
-          explanation:
-            `Incident ${inc.reference} was classified as reportable under ` +
-            `${(inc.reportableRegimes ?? []).join(", ") || "a statutory regime"} and the notification was due ` +
-            `by ${inc.reportDueAt}. No notification has been recorded and that deadline has passed. ` +
-            (governing
-              ? `The governing rule is ${governing.ruleId} — ${governing.citation} `
-              : "") +
-            `\n\nWhat this now means: failing to notify within the statutory period is itself an offence, ` +
-            `separate from anything the investigation finds about the accident. It is trivially provable ` +
-            `from this record and from the incident's own timestamps, it removes any argument that the ` +
-            `site's systems were under control, and it is the first thing an inspector establishes. ` +
-            (governing?.consequenceIfMissed ?? "") +
-            `\n\nNotify now — a late report is materially better than an absent one — record the ` +
-            `notification and its reference against this incident, and treat the delay itself as a ` +
-            `finding of the investigation.`,
-          evidenceRefs: {
-            key: inc.id,
-            incidentId: inc.id,
-            reference: inc.reference,
-            reportDueAt: inc.reportDueAt,
-            regimes: inc.reportableRegimes,
-            riddorCategory: inc.riddorCategory,
-            oshaCaseType: inc.oshaCaseType,
-            governingRuleId: det?.governingRuleId ?? null,
-            citation: governing?.citation ?? null,
-            obligationId: inc.obligationId,
-          },
-        });
-        await app.db
-          .update(safetyIncidents)
-          .set({ signalId: sigId, updatedAt: nowISO })
-          .where(eq(safetyIncidents.id, inc.id));
+        let lastSignalId: string | null = null;
+        for (const duty of state.duties) {
+          if (duty.state !== "missed") continue;
+          const key = missedNotificationKey(inc.id, duty.regime);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const sigId = newId("sig");
+          lastSignalId = sigId;
+          const others = state.duties.filter((d) => d.regime !== duty.regime);
+          await app.db.insert(signals).values({
+            id: sigId,
+            companyId,
+            projectId: inc.projectId,
+            detector: "safety_notification_deadline_missed",
+            severity: "critical",
+            confidence: 1,
+            title: `Statutory notification deadline missed (${duty.regime}) — ${inc.reference}: ${inc.title}`,
+            explanation:
+              `Incident ${inc.reference} is reportable under ${duty.regime} and the notification to ` +
+              `${duty.authority ?? "the enforcing authority"} was due by ${duty.dueAt}. No notification ` +
+              `under that regime has been recorded and the deadline has passed by ` +
+              `${duty.hoursLate ?? "an unknown number of"} hour(s). ` +
+              (duty.ruleId ? `The governing rule is ${duty.ruleId} — ${duty.citation}. ` : "") +
+              (others.length > 0
+                ? `\n\nThis incident is answerable under ${others.length + 1} regimes; the others stand ` +
+                  `as: ${others.map((o) => `${o.regime} — ${o.state.replace(/_/g, " ")}`).join("; ")}. ` +
+                  `Discharging one duty discharges nothing of the others.`
+                : "") +
+              `\n\nWhat this now means: failing to notify within the statutory period is itself an offence, ` +
+              `separate from anything the investigation finds about the accident. It is trivially provable ` +
+              `from this record and from the incident's own timestamps, it removes any argument that the ` +
+              `site's systems were under control, and it is the first thing an inspector establishes. ` +
+              (duty.consequenceIfMissed ?? "") +
+              `\n\nNotify now — a late report is materially better than an absent one — record the ` +
+              `notification and its reference against this incident, and treat the delay itself as a ` +
+              `finding of the investigation.`,
+            evidenceRefs: {
+              key,
+              incidentId: inc.id,
+              reference: inc.reference,
+              regime: duty.regime,
+              reportDueAt: duty.dueAt,
+              hoursLate: duty.hoursLate,
+              regimes: inc.reportableRegimes,
+              riddorCategory: inc.riddorCategory,
+              oshaCaseType: inc.oshaCaseType,
+              governingRuleId: duty.ruleId,
+              citation: duty.citation,
+              obligationId: inc.obligationId,
+            },
+          });
+        }
+        if (lastSignalId) {
+          await app.db
+            .update(safetyIncidents)
+            .set({ signalId: lastSignalId, updatedAt: nowISO })
+            .where(eq(safetyIncidents.id, inc.id));
+        }
       }
     }
 
@@ -1128,7 +1337,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       (i) => i.investigationDueDate != null && i.investigationDueDate < asOf,
     );
     if (lateInvestigations.length > 0) {
-      const seen = await alreadySignalled(companyId, "safety_investigation_overdue");
+      const seen = await alreadySignalled(companyId, "safety_investigation_overdue", projectId);
       for (const inc of lateInvestigations) {
         if (seen.has(inc.id)) continue;
         seen.add(inc.id);
@@ -1175,7 +1384,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       );
     const overdueActions = openActions.filter((a) => a.dueDate < asOf);
     if (overdueActions.length > 0) {
-      const seen = await alreadySignalled(companyId, "safety_corrective_action_overdue");
+      const seen = await alreadySignalled(companyId, "safety_corrective_action_overdue", projectId);
       for (const act of overdueActions) {
         if (seen.has(act.id)) continue;
         seen.add(act.id);
@@ -1234,7 +1443,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       (i) => i.nextDueDate != null && i.nextDueDate < asOf && i.status !== "void",
     );
     if (overdueStatutory.length > 0) {
-      const seen = await alreadySignalled(companyId, "safety_statutory_inspection_overdue");
+      const seen = await alreadySignalled(companyId, "safety_statutory_inspection_overdue", projectId);
       for (const insp of overdueStatutory) {
         if (seen.has(insp.id)) continue;
         seen.add(insp.id);
@@ -1316,7 +1525,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       );
     const expired = liveRecords.filter((r) => r.expiresAt != null && r.expiresAt < asOf);
     if (expired.length > 0) {
-      const seen = await alreadySignalled(companyId, "safety_programme_record_expired");
+      const seen = await alreadySignalled(companyId, "safety_programme_record_expired", projectId);
       for (const rec of expired) {
         await app.db
           .update(safetyProgrammeRecords)
@@ -1375,6 +1584,118 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
         });
       }
     }
+
+    /* (6) a life-safety device alarm nobody answered.
+     *
+     * A lone-worker device whose man-down alarm sits unacknowledged is not
+     * protecting the person wearing it, and the response TIME is the only
+     * thing the register can prove afterwards. The clock is set on ingest
+     * from the alarm class, so this sweep is a straight date comparison. */
+    const openAlarms = await app.db
+      .select()
+      .from(safetySensorEvents)
+      .where(
+        and(
+          eq(safetySensorEvents.companyId, companyId),
+          ...(projectId ? [eq(safetySensorEvents.projectId, projectId)] : []),
+          eq(safetySensorEvents.status, "open"),
+        ),
+      );
+    const unanswered = openAlarms.filter(
+      (a) => a.acknowledgeDueAt != null && Date.parse(a.acknowledgeDueAt) < Date.parse(nowISO),
+    );
+    if (unanswered.length > 0) {
+      const seen = await alreadySignalled(companyId, "safety_device_alarm_unanswered", projectId);
+      for (const alarm of unanswered) {
+        if (seen.has(alarm.id)) continue;
+        seen.add(alarm.id);
+        const lifeSafety = LIFE_SAFETY_ALARMS.has(alarm.kind);
+        const minutesLate = Math.round(
+          (Date.parse(nowISO) - Date.parse(alarm.acknowledgeDueAt!)) / 60_000,
+        );
+        const sigId = newId("sig");
+        await app.db.insert(signals).values({
+          id: sigId,
+          companyId,
+          projectId: alarm.projectId,
+          detector: "safety_device_alarm_unanswered",
+          severity: lifeSafety ? "critical" : "medium",
+          confidence: 1,
+          title: `${lifeSafety ? "Life-safety" : "Device"} alarm unanswered — ${alarm.reference}: ${alarm.kind.replace(/_/g, " ")}`,
+          explanation:
+            `A \`${alarm.kind.replace(/_/g, " ")}\` alarm was received from ` +
+            `${alarm.deviceId ?? "an unidentified device"} at ${alarm.occurredAt} and required ` +
+            `acknowledgement by ${alarm.acknowledgeDueAt}. Nobody has acknowledged it; it is ` +
+            `${minutesLate} minute(s) past that point.` +
+            (lifeSafety
+              ? `\n\nThis is a life-safety class: the device is asserting that the person wearing it ` +
+                `may be unconscious, immobile or in an atmosphere that will kill them. The only ` +
+                `acceptable response is somebody physically confirming otherwise. An alarm of this ` +
+                `class left unanswered converts a device that would have saved somebody into a record ` +
+                `that the site was told and did nothing — which is the worst possible evidential ` +
+                `position and the one the coroner reads out.`
+              : `\n\nAn unanswered alarm is a device the workforce will stop trusting. Either respond ` +
+                `to them or turn off the class that nobody is going to act on — a fleet generating ` +
+                `alarms into silence is worse than no fleet, because it looks like coverage.`) +
+            `\n\nAcknowledge it with what was actually found, or convert it to an incident or an ` +
+            `observation if something happened.`,
+          evidenceRefs: {
+            key: alarm.id,
+            sensorEventId: alarm.id,
+            reference: alarm.reference,
+            kind: alarm.kind,
+            deviceId: alarm.deviceId,
+            workerId: alarm.workerId,
+            occurredAt: alarm.occurredAt,
+            acknowledgeDueAt: alarm.acknowledgeDueAt,
+            minutesLate,
+          },
+        });
+        await app.db
+          .update(safetySensorEvents)
+          .set({ signalId: sigId, updatedAt: nowISO })
+          .where(eq(safetySensorEvents.id, alarm.id));
+      }
+    }
+  }
+
+  /**
+   * The read-path sweep, rate-limited per project.
+   *
+   * The sweep used to run on every list AND every detail GET, which meant
+   * opening one incident drawer cost five register-wide selects plus a scan of
+   * every signal the company had ever raised for a detector. It now runs on
+   * LIST reads only, at most once every few minutes per project, and the
+   * scheduler (`safety.sweeps`) owns the guarantee that it runs at all. The
+   * throttle is in memory and per process: a replica that has not swept
+   * recently will sweep, which is harmless because every detector is
+   * idempotent on its key.
+   */
+  const lastSweptAt = new Map<string, number>();
+  /** Off under test, where determinism beats latency and nothing is at scale. */
+  const SWEEP_THROTTLE_MS = app.appConfig.NODE_ENV === "test" ? 0 : 5 * 60_000;
+
+  async function sweepThrottled(
+    companyId: string,
+    projectId: string | null,
+    actorId: string,
+  ): Promise<boolean> {
+    const key = `${companyId}:${projectId ?? "*"}`;
+    const now = Date.now();
+    const last = lastSweptAt.get(key);
+    if (SWEEP_THROTTLE_MS > 0 && last !== undefined && now - last < SWEEP_THROTTLE_MS) return false;
+    // claim the slot BEFORE the await so two concurrent reads do not both sweep
+    lastSweptAt.set(key, now);
+    try {
+      await sweepSafety(companyId, projectId, actorId);
+      return true;
+    } catch (err) {
+      // a failed sweep must not fail the read it was riding on, and it must
+      // not poison the throttle either — clear the claim so the next read retries
+      lastSweptAt.delete(key);
+      app.log.error({ err, companyId, projectId }, "safety sweep failed on read path");
+      return false;
+    }
   }
 
   /* ---------------------------------------------------------------- */
@@ -1399,15 +1720,38 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     };
   }
 
-  function decorateIncident(i: IncidentRow, asOf: string) {
+  /**
+   * Names resolved for a batch of incidents. The register used to render the
+   * injured person through the COMPANY USER directory, so every incident whose
+   * injured person was a registered worker showed a raw `wrk_` id in the
+   * column an inspector reads first. Names come from the worker register
+   * itself, resolved once per response rather than per row.
+   */
+  async function resolveInjuredNames(
+    rows: readonly IncidentRow[],
+    companyId: string,
+  ): Promise<Map<string, string>> {
+    const ids = [...new Set(rows.map((r) => r.workerId).filter((id): id is string => !!id))];
+    if (ids.length === 0) return new Map();
+    const found = await app.db
+      .select({ id: workers.id, fullName: workers.fullName })
+      .from(workers)
+      .where(and(eq(workers.companyId, companyId), inArray(workers.id, ids)));
+    return new Map(found.map((w) => [w.id, w.fullName]));
+  }
+
+  function decorateIncident(i: IncidentRow, asOf: string, workerNames?: Map<string, string>) {
     const det = storedDetermination(i);
     const delay = computeReportingDelay(i.occurredAt, i.reportedAt);
     const nowISO = new Date().toISOString();
-    const missed = isNotificationMissed(i.reportDueAt, i.regulatorNotifiedAt, nowISO);
+    const notification = incidentNotificationState(i, nowISO);
+    const missed = notification.anyMissed;
     const hoursRemaining =
-      i.reportDueAt && !i.regulatorNotifiedAt
+      notification.duties.find((d) => d.state === "outstanding" && d.hoursRemaining !== null)
+        ?.hoursRemaining ??
+      (i.reportDueAt && !i.regulatorNotifiedAt
         ? Math.round(((Date.parse(i.reportDueAt) - Date.parse(nowISO)) / 3_600_000) * 10) / 10
-        : null;
+        : null);
     const investigationOverdue =
       i.investigationDueDate != null &&
       i.investigationDueDate < asOf &&
@@ -1426,12 +1770,16 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       isConfidential: asBool(i.isConfidential),
       reportingDelay: delay,
       reportability: det,
+      /** the injured person's name, resolved from the worker register */
+      injuredPersonDisplayName: i.workerId
+        ? (workerNames?.get(i.workerId) ?? null)
+        : i.injuredPersonName,
       notification: {
         required: asBool(i.isReportable),
         regimes: i.reportableRegimes ?? [],
         riddorCategory: i.riddorCategory,
         oshaCaseType: i.oshaCaseType,
-        dueAt: i.reportDueAt,
+        dueAt: notification.earliestDueAt ?? i.reportDueAt,
         notifiedAt: i.regulatorNotifiedAt,
         notifiedBy: i.regulatorNotifiedBy,
         reference: i.regulatorReference,
@@ -1441,6 +1789,12 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
         obligationId: i.obligationId,
         needsHumanReview: det?.needsHumanReview ?? null,
         openQuestions: det?.openQuestions ?? [],
+        /** one entry per regime — the whole duty, not a single flag */
+        duties: notification.duties,
+        outstandingRegimes: notification.outstanding,
+        missedRegimes: notification.missed,
+        allDischarged: notification.allDischarged,
+        reasons: notification.reasons,
       },
       investigation: {
         status: i.investigationStatus,
@@ -1543,7 +1897,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/safety/observations", { preHandler: readGate }, async (req) => {
     const q = observationListQuery.parse(req.query);
-    await sweepSafety(req.companyId!, req.projectId!, req.user!.id);
+    await sweepThrottled(req.companyId!, req.projectId!, req.user!.id);
     const asOf = todayISO();
     const filters = [
       eq(safetyObservations.companyId, req.companyId!),
@@ -1663,7 +2017,6 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     { preHandler: readGate },
     async (req) => {
       const { observationId } = req.params as { observationId: string };
-      await sweepSafety(req.companyId!, req.projectId!, req.user!.id);
       const row = await fetchObservation(observationId, req.companyId!, req.projectId!);
       const actions = await app.db
         .select()
@@ -2010,7 +2363,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/safety/incidents", { preHandler: readGate }, async (req) => {
     const q = incidentListQuery.parse(req.query);
-    await sweepSafety(req.companyId!, req.projectId!, req.user!.id);
+    await sweepThrottled(req.companyId!, req.projectId!, req.user!.id);
     const asOf = todayISO();
     const filters = [
       eq(safetyIncidents.companyId, req.companyId!),
@@ -2036,8 +2389,9 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       .limit(q.pageSize)
       .offset(pageOffset(q));
     const totalRows = await app.db.select({ n: count() }).from(safetyIncidents).where(where);
+    const names = await resolveInjuredNames(rows, req.companyId!);
     return paginate(
-      rows.map((r) => decorateIncident(r, asOf)),
+      rows.map((r) => decorateIncident(r, asOf, names)),
       Number(totalRows[0]?.n ?? 0),
       q,
     );
@@ -2201,7 +2555,6 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     { preHandler: readGate },
     async (req) => {
       const { incidentId } = req.params as { incidentId: string };
-      await sweepSafety(req.companyId!, req.projectId!, req.user!.id);
       const row = await fetchIncident(incidentId, req.companyId!, req.projectId!);
       const actions = await app.db
         .select()
@@ -2231,8 +2584,9 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
           ),
         );
       const asOf = todayISO();
+      const names = await resolveInjuredNames([row], req.companyId!);
       return {
-        ...decorateIncident(row, asOf),
+        ...decorateIncident(row, asOf, names),
         actions: actions.map((a) => decorateAction(a, asOf)),
         /** the briefings given BECAUSE of this incident — the loop closed */
         briefings: talks,
@@ -2447,10 +2801,17 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       if (Date.parse(notifiedAt) < Date.parse(row.occurredAt)) {
         throw badRequest(`notifiedAt ${notifiedAt} falls before the incident occurred.`);
       }
-      const late = isNotificationMissed(row.reportDueAt, notifiedAt, notifiedAt);
+      /* The deadline this notification is measured against is THIS REGIME'S,
+       * not the incident's earliest across all regimes. A RIDDOR F2508 filed
+       * on day 12 of a 15-day clock is in time even where an OSHA eight-hour
+       * duty on the same event was missed on the first day. */
+      const before = incidentNotificationState(row, notifiedAt);
+      const duty = before.duties.find((d) => d.regime === body.regime) ?? null;
+      const dutyDueAt = duty?.dueAt ?? row.reportDueAt;
+      const late = isNotificationMissed(dutyDueAt, notifiedAt, notifiedAt);
       const hoursLate =
-        late && row.reportDueAt
-          ? Math.round(((Date.parse(notifiedAt) - Date.parse(row.reportDueAt)) / 3_600_000) * 10) / 10
+        late && dutyDueAt
+          ? Math.round(((Date.parse(notifiedAt) - Date.parse(dutyDueAt)) / 3_600_000) * 10) / 10
           : null;
       const notifications = [
         ...existing,
@@ -2466,30 +2827,62 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
         },
       ];
       const now = new Date().toISOString();
+
+      /* `regulator_notified_at` is a DERIVED summary of the per-regime
+       * entries, and it is the single column the old code set on the first
+       * notification. That is what let the second duty of a dual-regime
+       * incident disappear: the sweep, the drawer and the close gate all read
+       * this column. It is now set only once EVERY notifiable regime has been
+       * notified, and it carries the last of those timestamps — the moment the
+       * incident's statutory duties were actually discharged. */
+      const after = notificationState({
+        determination: storedDetermination(row),
+        storedRegimes: (row.reportableRegimes ?? []) as string[],
+        reportDueAt: row.reportDueAt,
+        notifications: notifications as unknown as NotificationEntry[],
+        isReportable: asBool(row.isReportable),
+        asOfISO: now,
+      });
+      const derivedNotifiedAt = derivedRegulatorNotifiedAt(after);
+
       await app.db
         .update(safetyIncidents)
         .set({
           notifications,
-          regulatorNotifiedAt: row.regulatorNotifiedAt ?? notifiedAt,
-          regulatorNotifiedBy: row.regulatorNotifiedBy ?? req.user!.id,
+          regulatorNotifiedAt: derivedNotifiedAt,
+          regulatorNotifiedBy: derivedNotifiedAt ? (row.regulatorNotifiedBy ?? req.user!.id) : null,
           regulatorReference: body.reference ?? row.regulatorReference,
           regulatorNotificationFileId: body.fileId ?? row.regulatorNotificationFileId,
           updatedAt: now,
         })
         .where(eq(safetyIncidents.id, incidentId));
 
+      /* The obligation carries the whole incident's statutory duty, so it is
+       * satisfied only when every regime has been discharged — and breached
+       * the moment ANY duty was missed, whether or not this one was. */
       if (row.obligationId) {
-        await app.db
-          .update(obligations)
-          .set({ status: late ? "breached" : "satisfied" })
-          .where(and(eq(obligations.id, row.obligationId), eq(obligations.status, "open")));
+        const obligationStatus = after.anyMissed
+          ? "breached"
+          : after.allDischarged
+            ? "satisfied"
+            : null;
+        if (obligationStatus) {
+          await app.db
+            .update(obligations)
+            .set({ status: obligationStatus })
+            .where(and(eq(obligations.id, row.obligationId), eq(obligations.status, "open")));
+        }
       }
 
       if (late) {
         const det = storedDetermination(row);
         const governing = det?.rules.find((r) => r.ruleId === det.governingRuleId) ?? null;
-        const seen = await alreadySignalled(req.companyId!, "safety_notification_deadline_missed");
-        if (!seen.has(incidentId)) {
+        const seen = await alreadySignalled(
+          req.companyId!,
+          "safety_notification_deadline_missed",
+          req.projectId!,
+        );
+        if (!seen.has(missedNotificationKey(incidentId, body.regime))) {
           await app.db.insert(signals).values({
             id: newId("sig"),
             companyId: req.companyId!,
@@ -2497,10 +2890,10 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
             detector: "safety_notification_deadline_missed",
             severity: "critical",
             confidence: 1,
-            title: `Statutory notification made out of time — ${row.reference}: ${row.title}`,
+            title: `Statutory notification made out of time (${body.regime}) — ${row.reference}: ${row.title}`,
             explanation:
               `Incident ${row.reference} was notified under ${body.regime} at ${notifiedAt}, ` +
-              `${hoursLate} hour(s) after the statutory deadline of ${row.reportDueAt}` +
+              `${hoursLate} hour(s) after the statutory deadline of ${dutyDueAt}` +
               (governing ? ` set by ${governing.ruleId} (${governing.citation})` : "") +
               `.\n\nThe notification has been made, which is materially better than an absent one, but ` +
               `the lateness is now a fact on the record and it is independently actionable: reporting ` +
@@ -2512,15 +2905,15 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
               `because that account is the only mitigation available, and it is far more credible ` +
               `produced now than reconstructed later.`,
             evidenceRefs: {
-              key: incidentId,
+              key: missedNotificationKey(incidentId, body.regime),
               incidentId,
               reference: row.reference,
               regime: body.regime,
-              reportDueAt: row.reportDueAt,
+              reportDueAt: dutyDueAt,
               notifiedAt,
               hoursLate,
-              governingRuleId: det?.governingRuleId ?? null,
-              citation: governing?.citation ?? null,
+              governingRuleId: duty?.ruleId ?? det?.governingRuleId ?? null,
+              citation: duty?.citation ?? governing?.citation ?? null,
             },
           });
         }
@@ -2547,16 +2940,39 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       });
 
       const updated = await fetchIncident(incidentId, req.companyId!, req.projectId!);
+      const outstanding = after.duties.filter((d) => d.state === "outstanding");
       return {
         ...decorateIncident(updated, todayISO()),
         notificationResult: {
           regime: body.regime,
           notifiedAt,
-          dueAt: row.reportDueAt,
+          dueAt: dutyDueAt,
           late,
           hoursLate,
           obligationId: row.obligationId,
-          obligationStatus: row.obligationId ? (late ? "breached" : "satisfied") : null,
+          obligationStatus: row.obligationId
+            ? after.anyMissed
+              ? "breached"
+              : after.allDischarged
+                ? "satisfied"
+                : "open"
+            : null,
+          /** what is STILL owed after this notification — the whole point */
+          outstandingRegimes: outstanding.map((d) => ({
+            regime: d.regime,
+            dueAt: d.dueAt,
+            authority: d.authority,
+            citation: d.citation,
+            hoursRemaining: d.hoursRemaining,
+          })),
+          allDischarged: after.allDischarged,
+          note:
+            outstanding.length > 0
+              ? `This incident is answerable under more than one regime and ${outstanding.length} ` +
+                `duty/duties remain outstanding (${outstanding.map((d) => d.regime).join(", ")}). ` +
+                `Recording the ${body.regime} notification discharges nothing of them, and the ` +
+                `incident cannot be closed until they are answered.`
+              : null,
         },
       };
     },
@@ -2781,13 +3197,30 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
             `record that something happened and nothing was learned.`,
         );
       }
-      if (asBool(row.isReportable) && !row.regulatorNotifiedAt) {
-        throw conflict(
-          `Incident ${row.reference} is classified reportable under ` +
-            `${(row.reportableRegimes ?? []).join(", ") || "a statutory regime"} and no notification has ` +
-            `been recorded. Closing it would take a live statutory duty off the register. Notify and ` +
-            `record it, or reassess the classification if it is wrong.`,
+      /* Closure is gated on EVERY regime's duty, not on the single derived
+       * `regulator_notified_at` column. An incident assessed under both RIDDOR
+       * and OSHA whose F2508 was filed still owes the OSHA notification, and
+       * closing it would take that live duty off the register. */
+      if (asBool(row.isReportable)) {
+        const state = incidentNotificationState(row, new Date().toISOString());
+        const owed = state.duties.filter(
+          (d) => d.state === "outstanding" || d.state === "missed",
         );
+        if (owed.length > 0) {
+          throw conflict(
+            `Incident ${row.reference} is classified reportable and ${owed.length} statutory ` +
+              `notification duty/duties are undischarged: ` +
+              owed
+                .map(
+                  (d) =>
+                    `${d.regime} (${d.state === "missed" ? "deadline passed" : "due"} ${d.dueAt ?? "— no deadline recorded"}` +
+                    `${d.authority ? `, ${d.authority}` : ""})`,
+                )
+                .join("; ") +
+              `. Closing it would take a live statutory duty off the register. Notify each authority ` +
+              `and record it, or reassess the classification if it is wrong.`,
+          );
+        }
       }
       const liveActions = await app.db
         .select({ n: count() })
@@ -3004,7 +3437,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     { preHandler: readGate },
     async (req) => {
       const q = actionListQuery.parse(req.query);
-      await sweepSafety(req.companyId!, req.projectId!, req.user!.id);
+      await sweepThrottled(req.companyId!, req.projectId!, req.user!.id);
       const asOf = todayISO();
       const filters = [
         eq(safetyCorrectiveActions.companyId, req.companyId!),
@@ -3132,7 +3565,6 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     { preHandler: readGate },
     async (req) => {
       const { actionId } = req.params as { actionId: string };
-      await sweepSafety(req.companyId!, req.projectId!, req.user!.id);
       const row = await fetchAction(actionId, req.companyId!, req.projectId!);
       return decorateAction(row, todayISO());
     },
@@ -3781,7 +4213,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
         overdue: z.enum(["true", "false"]).optional(),
       })
       .parse(req.query);
-    await sweepSafety(req.companyId!, req.projectId!, req.user!.id);
+    await sweepThrottled(req.companyId!, req.projectId!, req.user!.id);
     const asOf = todayISO();
     const filters = [
       eq(safetyInspections.companyId, req.companyId!),
@@ -3886,7 +4318,6 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     { preHandler: readGate },
     async (req) => {
       const { inspectionId } = req.params as { inspectionId: string };
-      await sweepSafety(req.companyId!, req.projectId!, req.user!.id);
       const row = await fetchInspection(inspectionId, req.companyId!, req.projectId!);
       const template = row.templateId
         ? await fetchTemplate(row.templateId, req.companyId!).catch(() => null)
@@ -4646,13 +5077,13 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
 
   app.get("/companies/current/safety/programme-records", { preHandler: companyRead }, async (req) => {
     const q = recordListQuery.parse(req.query);
-    await sweepSafety(req.companyId!, null, req.user!.id);
+    await sweepThrottled(req.companyId!, null, req.user!.id);
     return listRecords(req.companyId!, null, q);
   });
 
   app.get("/projects/:projectId/safety/programme-records", { preHandler: readGate }, async (req) => {
     const q = recordListQuery.parse(req.query);
-    await sweepSafety(req.companyId!, req.projectId!, req.user!.id);
+    await sweepThrottled(req.companyId!, req.projectId!, req.user!.id);
     return listRecords(req.companyId!, req.projectId!, q);
   });
 
@@ -4744,7 +5175,6 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     { preHandler: companyRead },
     async (req) => {
       const { recordId } = req.params as { recordId: string };
-      await sweepSafety(req.companyId!, null, req.user!.id);
       return decorateRecord(await fetchRecord(recordId, req.companyId!), todayISO());
     },
   );
@@ -4877,17 +5307,69 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       if (body.workerId && row.projectId) {
         await assertWorker(body.workerId, req.companyId!, row.projectId);
       }
+
+      /* WHO MAY SAY THAT SOMEBODY READ THIS.
+       *
+       * An acknowledgement is the evidence an inspector relies on: it is the
+       * proof that the person doing the work had seen the method statement,
+       * the permit or the policy. This route once trusted `body.userId`
+       * outright, so any company member — a guest included — could record that
+       * any other named user had read and understood anything. That is the
+       * cheapest possible way to manufacture the one document that matters.
+       *
+       * Now: a caller may acknowledge for THEMSELVES; a company owner or admin
+       * may record for another user; and recording for a WORKER — who is not a
+       * platform user and cannot press the button — requires a method that
+       * carries its own evidence and a written attestation of what was
+       * actually witnessed. The on-behalf-of relationship is stored on the
+       * entry rather than left to be inferred from `recordedBy`. */
+      const isAdmin = req.companyRole === "owner" || req.companyRole === "admin";
+      const onBehalfOfUser = body.userId != null && body.userId !== req.user!.id;
+      if (onBehalfOfUser && !isAdmin) {
+        throw forbidden(
+          `You may only record your own acknowledgement of ${row.reference}. Recording that ` +
+            `${body.userId} has read and understood a policy, a RAMS or a permit is an assertion ` +
+            `about somebody else's knowledge, and it is the exact document relied on after an ` +
+            `incident — so it is limited to a company owner or admin, and it is stored as an ` +
+            `on-behalf-of entry naming who made it. Ask ${body.userId} to acknowledge it themselves.`,
+        );
+      }
+      if (body.workerId) {
+        const method = body.method ?? null;
+        if (!method || !ATTESTABLE_METHODS.has(method)) {
+          throw badRequest(
+            `Recording an acknowledgement for worker ${body.workerId} needs a method that carries ` +
+              `its own evidence — a wet signature, a biometric or badge capture, a QR scan, or an ` +
+              `explicit supervisor attestation. A worker is not a platform user and cannot have ` +
+              `pressed anything, so an unqualified entry here is one person's word that another ` +
+              `person read a document. Supplied: ${method ?? "no method"}.`,
+          );
+        }
+        if (method === "supervisor_attested" && !body.attestation) {
+          throw badRequest(
+            `A supervisor attestation needs \`attestation\`: what was actually witnessed — the ` +
+              `briefing given, the questions asked, the date and place. "Attested" with nothing ` +
+              `behind it is the weakest evidence in the file.`,
+          );
+        }
+      }
+
       const acks = [...(row.acknowledgements ?? [])] as Array<Record<string, unknown>>;
       const subject = body.workerId ?? body.userId ?? req.user!.id;
       if (acks.some((a) => (a["workerId"] ?? a["userId"]) === subject)) {
         throw conflict(`${subject} has already acknowledged ${row.reference}.`);
       }
+      const selfRecorded = !body.workerId && (!body.userId || body.userId === req.user!.id);
       acks.push({
         workerId: body.workerId ?? null,
         userId: body.workerId ? null : (body.userId ?? req.user!.id),
         acknowledgedAt: body.acknowledgedAt ?? new Date().toISOString(),
         method: body.method ?? "on_device_signature",
         recordedBy: req.user!.id,
+        /** false when somebody recorded this for somebody else */
+        selfRecorded,
+        recordedOnBehalf: selfRecorded ? null : { by: req.user!.id, role: req.companyRole ?? null },
+        attestation: body.attestation ?? null,
       });
       await app.db
         .update(safetyProgrammeRecords)
@@ -4909,6 +5391,9 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
           reference: row.reference,
           subject,
           method: body.method ?? "on_device_signature",
+          selfRecorded,
+          recordedBy: req.user!.id,
+          attestation: body.attestation ?? null,
           count: acks.length,
           required: row.requiredAcknowledgementCount,
         },
@@ -5022,7 +5507,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/safety/statistics", { preHandler: readGate }, async (req) => {
     const q = statisticsQuery.parse(req.query);
-    await sweepSafety(req.companyId!, req.projectId!, req.user!.id);
+    await sweepThrottled(req.companyId!, req.projectId!, req.user!.id);
     const to = q.to ?? todayISO();
     const from = q.from ?? addDaysISO(to, -365);
     if (from > to) throw badRequest(`from ${from} falls after to ${to}.`);
@@ -5166,7 +5651,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
   app.get("/projects/:projectId/safety/summary", { preHandler: readGate }, async (req) => {
     const companyId = req.companyId!;
     const projectId = req.projectId!;
-    await sweepSafety(companyId, projectId, req.user!.id);
+    await sweepThrottled(companyId, projectId, req.user!.id);
     const asOf = todayISO();
 
     const [obsByStatus, incByStatus, actByStatus, inspByStatus, talkByStatus, recByStatus] =

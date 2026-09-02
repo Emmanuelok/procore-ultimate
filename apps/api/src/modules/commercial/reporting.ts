@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, gte, inArray, lte, ne } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, lte, ne } from "drizzle-orm";
 import { z } from "zod";
 import {
   boqItems,

@@ -18,6 +18,7 @@ import {
   CONTRACT_STATUSES,
   NEC_OPTIONS,
   type ContractForm,
+  type NecOption,
 } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
@@ -565,7 +566,7 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
       obligationStatus,
       eventCounts,
       necBasis: contract.form.startsWith("nec")
-        ? necValuationBasis(contract.necOption as never)
+        ? necValuationBasis(contract.necOption as NecOption | null)
         : null,
     };
   });

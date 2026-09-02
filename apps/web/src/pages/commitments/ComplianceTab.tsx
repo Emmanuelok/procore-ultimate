@@ -8,16 +8,7 @@
  * with the certificate's actual expiry date and how many days ago it lapsed.
  */
 import { useState } from "react";
-import {
-  Alert,
-  Badge,
-  Button,
-  Card,
-  CardBody,
-  EmptyState,
-  ErrorAlert,
-  Spinner,
-} from "../../ui";
+import { Alert, Badge, Button, Card, CardBody, EmptyState, ErrorAlert, Spinner } from "../../ui";
 import {
   COMPLIANCE_LABEL,
   FindingList,
@@ -119,13 +110,20 @@ function UpcomingExpiries({
               <div className="flex flex-wrap items-center gap-2">
                 <Badge
                   size="xs"
-                  tone={it.daysUntilExpiry <= 7 ? "danger" : it.daysUntilExpiry <= 14 ? "warning" : "neutral"}
+                  tone={
+                    it.daysUntilExpiry <= 7
+                      ? "danger"
+                      : it.daysUntilExpiry <= 14
+                        ? "warning"
+                        : "neutral"
+                  }
                 >
                   {it.daysUntilExpiry}d
                 </Badge>
                 <span className="font-mono text-2xs">{it.reference}</span>
                 <span className="text-meta">
-                  {it.vendorName ?? "vendor"} — {it.coverage} {it.subjectType} expires {it.expiresOn}
+                  {it.vendorName ?? "vendor"} — {it.coverage} {it.subjectType} expires{" "}
+                  {it.expiresOn}
                 </span>
                 <span className="text-2xs text-content-subtle">
                   {money(it.unpaidBalance, it.currency)} still unpaid
@@ -191,9 +189,7 @@ export default function ComplianceTab({
       <Card>
         <CardBody className="space-y-3">
           <div className="flex flex-wrap items-center gap-2">
-            <span className="text-label uppercase text-content-subtle">
-              Assessed {data.asOf}
-            </span>
+            <span className="text-label uppercase text-content-subtle">Assessed {data.asOf}</span>
             <Button
               size="xs"
               variant={only === "all" ? "secondary" : "ghost"}
@@ -281,8 +277,7 @@ function EntryCard({
             </div>
             <p className="mt-0.5 text-2xs text-content-subtle">
               {entry.vendorName ?? "no vendor bound"} · {titleCase(entry.kind)} ·{" "}
-              {titleCase(entry.status)} ·{" "}
-              {money(entry.revisedCommitmentSum, entry.currency)}
+              {titleCase(entry.status)} · {money(entry.revisedCommitmentSum, entry.currency)}
             </p>
           </div>
           <Button size="xs" variant="secondary" onClick={() => onOpen(entry.commitmentId)}>
@@ -292,7 +287,10 @@ function EntryCard({
 
         {c.note ? <p className="text-meta text-content-muted">{c.note}</p> : null}
         <FindingList findings={c.blocking} heading="Blocking — payment refused" />
-        <FindingList findings={c.warnings} heading="Warnings — payment permitted, exposure recorded" />
+        <FindingList
+          findings={c.warnings}
+          heading="Warnings — payment permitted, exposure recorded"
+        />
         {c.findings.length === 0 ? (
           <p className="text-2xs text-content-subtle">
             {c.requirementsKnown

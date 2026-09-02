@@ -10,7 +10,7 @@
  * deadline the platform is keeping.
  */
 import type { FastifyInstance } from "fastify";
-import { and, eq, inArray, isNotNull, lt, ne } from "drizzle-orm";
+import { and, desc, eq, isNotNull, lt, ne } from "drizzle-orm";
 import {
   boqs,
   contracts,
@@ -124,9 +124,9 @@ export async function sweepRetentionDue(
       .select()
       .from(valuations)
       .where(and(eq(valuations.boqId, bill.id), ne(valuations.status, "draft")))
-      .orderBy(valuations.number)
-      .limit(500);
-    const current = latest[latest.length - 1];
+      .orderBy(desc(valuations.number))
+      .limit(1);
+    const current = latest[0];
     if (!current || current.retentionHeld <= 0.005) continue;
     checked += 1;
     const releasedRows = await db

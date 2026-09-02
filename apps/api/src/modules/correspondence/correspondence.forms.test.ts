@@ -197,6 +197,28 @@ describe("form templates", () => {
     expect(again.statusCode).toBe(409);
   });
 
+  it("does not empty the form when only its name is patched", async () => {
+    // Regression: `.partial()` keeps zod defaults, so a PATCH parsed through it
+    // would have reset `fields`, `logic` and `pdfFieldMap` to their defaults.
+    const before = await get(`/correspondence/form-templates/${templateId}`);
+    const fieldCount = before.json().fields.length as number;
+    const res = await patch(`/correspondence/form-templates/${templateId}`, {
+      name: "Plant room inspection (rev A)",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().name).toBe("Plant room inspection (rev A)");
+    expect(res.json().fields).toHaveLength(fieldCount);
+    expect(res.json().signatureRequired).toBe(1);
+    expect(Object.keys(res.json().pdfFieldMap)).toContain("Form.Area");
+    expect(res.json().version).toBe(before.json().version);
+  });
+
+  it("refuses a structural edit that would leave the form with no fields", async () => {
+    const res = await patch(`/correspondence/form-templates/${templateId}`, { fields: [] });
+    expect(res.statusCode).toBe(400);
+    expect(JSON.stringify(res.json())).toContain("at least one field");
+  });
+
   it("bumps the version when a published template's questions change", async () => {
     const res = await patch(`/correspondence/form-templates/${templateId}`, {
       fields: [...FIELDS, { key: "notes", label: "Notes", type: "textarea" }],
@@ -265,6 +287,20 @@ describe("assignment, completion and review (#460–#462)", () => {
     );
     expect(res.statusCode).toBe(400);
     expect(JSON.stringify(res.json())).toContain("not one of the offered options");
+  });
+
+  it("saves a draft answer and keeps the hidden branch out of the record", async () => {
+    const res = await patch(
+      `/projects/${projectId}/correspondence/form-responses/${responseId}`,
+      { values: { area: "Plant room L1", outcome: "pass" }, title: "Weekly walk" },
+      inspector.headers,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.json().title).toBe("Weekly walk");
+    expect(res.json().values.outcome).toBe("pass");
+    // the defect branch is closed again, so its answers are not on the record
+    expect(res.json().hiddenFields).toEqual(["defect", "severity"]);
+    expect(res.json().values.defect).toBeUndefined();
   });
 
   it("refuses to submit an incomplete form and an unsigned one", async () => {

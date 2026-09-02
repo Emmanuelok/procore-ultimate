@@ -59,6 +59,7 @@ import {
   keySchema,
   ledger,
   nowISO,
+  patchSchemaOf,
   patchSet,
   todayISO,
 } from "../shared.js";
@@ -286,9 +287,12 @@ export const formRoutes: FastifyPluginAsync = async (app) => {
 
   app.patch("/correspondence/form-templates/:templateId", { preHandler: companyAdminGate }, async (req) => {
     const { templateId } = req.params as { templateId: string };
-    const body = templateBodySchema
+    // `.partial()` KEEPS every `.default()`, so parsing a PATCH through it
+    // would reset `fields`, `logic` and `pdfFieldMap` to their defaults and
+    // silently empty the template. `patchSchemaOf` strips the defaults first:
+    // a PATCH body is only what the caller actually sent.
+    const body = patchSchemaOf(templateBodySchema)
       .omit({ key: true, projectId: true })
-      .partial()
       .parse(req.body);
     const companyId = req.companyId!;
     const [current] = await app.db
@@ -299,9 +303,12 @@ export const formRoutes: FastifyPluginAsync = async (app) => {
     if (!current) throw notFound("Form template not found");
     if (current.status === "archived") throw conflict("An archived template cannot be edited. Clone it instead.");
 
+    const structural = body.fields !== undefined || body.logic !== undefined;
     const fields = body.fields ? toFieldDefs(body.fields) : storedFields(current.fields);
     const logic = body.logic ? (body.logic as Record<string, FormLogicRule>) : storedLogic(current.logic);
-    if (fields.length > 0) {
+    // A structural edit is validated even when it empties the form — that is
+    // exactly the edit that must not be allowed to land silently.
+    if (structural || fields.length > 0) {
       const problems = validateTemplate(fields, logic);
       if (problems.length > 0) throw badRequest("This template has problems that must be fixed first.", { problems });
     }
@@ -321,7 +328,6 @@ export const formRoutes: FastifyPluginAsync = async (app) => {
     );
     // Editing a PUBLISHED template's questions is a new version, so responses
     // already captured keep the form they were actually asked.
-    const structural = body.fields !== undefined || body.logic !== undefined;
     if (structural && current.status === "published") set["version"] = current.version + 1;
 
     const [row] = await app.db

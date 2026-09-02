@@ -2,6 +2,7 @@ import type { FastifyPluginAsync } from "fastify";
 import { and, asc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import {
+  changeEvents,
   changeLineItems,
   changeOrderPackages,
   changeOrderRequests,
@@ -129,6 +130,69 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
     for (const r of rows) map.set(r.objectId, { at: r.at, toStatus: r.toStatus });
     return map;
   }
+
+  /**
+   * HEALTH INPUTS (plan §3.5) for the intelligence layer's `commercial`
+   * dimension. The chain leaks in the gaps — exposure identified and never
+   * priced, priced and never asked for, asked for and never executed — so the
+   * counts here are the gaps, not the totals. No money crosses a currency.
+   */
+  app.get("/projects/:projectId/changes/health-inputs", { preHandler: gates.read }, async (req) => {
+    const companyId = companyOf(req);
+    const projectId = projectOf(req);
+    const [events, pcos, cors, packages] = await Promise.all([
+      app.db
+        .select({ status: changeEvents.status })
+        .from(changeEvents)
+        .where(and(eq(changeEvents.companyId, companyId), eq(changeEvents.projectId, projectId))),
+      app.db
+        .select({ status: potentialChangeOrders.status, corId: potentialChangeOrders.changeOrderRequestId })
+        .from(potentialChangeOrders)
+        .where(
+          and(
+            eq(potentialChangeOrders.companyId, companyId),
+            eq(potentialChangeOrders.projectId, projectId),
+          ),
+        ),
+      app.db
+        .select({ status: changeOrderRequests.status })
+        .from(changeOrderRequests)
+        .where(
+          and(
+            eq(changeOrderRequests.companyId, companyId),
+            eq(changeOrderRequests.projectId, projectId),
+          ),
+        ),
+      app.db
+        .select({ status: changeOrderPackages.status })
+        .from(changeOrderPackages)
+        .where(
+          and(
+            eq(changeOrderPackages.companyId, companyId),
+            eq(changeOrderPackages.projectId, projectId),
+          ),
+        ),
+    ]);
+    const reasons: string[] = [];
+    if (events.length === 0 && pcos.length === 0) {
+      reasons.push("No change has been raised on this project, so the commercial dimension is unrated.");
+    }
+    return {
+      projectId,
+      asOf: todayIso(),
+      metrics: {
+        openChangeEvents: events.filter((e) => e.status === "open").length,
+        unpricedPcos: pcos.filter((p) => ["draft", "pending_quote"].includes(p.status)).length,
+        pricedNotRequested: pcos.filter((p) => p.status === "priced" && p.corId === null).length,
+        awaitingOwnerDecision: cors.filter((c) =>
+          ["submitted", "under_review", "negotiating"].includes(c.status),
+        ).length,
+        rejectedRequests: cors.filter((c) => c.status === "rejected").length,
+        approvedNotExecuted: packages.filter((p) => p.status === "approved").length,
+      },
+      reasons,
+    };
+  });
 
   app.get("/projects/:projectId/change-log/ageing", { preHandler: gates.read }, async (req) => {
     const q = z.object({ asOf: z.string().optional() }).parse(req.query ?? {});

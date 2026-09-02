@@ -80,8 +80,10 @@ export function validateFieldValue(def: FieldDefLike, value: unknown): FieldVali
         return { ok: false, reason: `"${def.label}" must be an ISO date (YYYY-MM-DD)` };
       }
       const iso = value.slice(0, 10);
-      const parsed = Date.parse(`${iso}T00:00:00Z`);
-      if (Number.isNaN(parsed)) {
+      const parsed = new Date(`${iso}T00:00:00Z`);
+      // Compare the components back: V8 rolls "2026-02-30" over into March,
+      // so a date that does not exist would silently become a different one.
+      if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== iso) {
         return { ok: false, reason: `"${def.label}" is not a real date` };
       }
       return { ok: true, value: iso };

@@ -39,7 +39,7 @@ import { pushNotifications } from "../../notifications/service.js";
 import { addDaysISO } from "../engines/dates.js";
 import { parseInboundEmail, routeInbound, type RoutingCandidate } from "../engines/email.js";
 import { assessLetter } from "../engines/tracking.js";
-import { toLetterInput } from "../service.js";
+import { syncTransmittal, toLetterInput } from "../service.js";
 import {
   allocateReference,
   assertContact,
@@ -613,6 +613,16 @@ export const letterRoutes: FastifyPluginAsync = async (app) => {
         objectId: recipientId,
         payload: { recordType: recipient.recordType, recordId: recipient.recordId, name: recipient.name },
       });
+      if (recipient.recordType === "transmittal") {
+        await syncTransmittal(
+          app.db,
+          companyId,
+          projectId,
+          recipient.recordId,
+          req.user!.id,
+          todayISO(),
+        );
+      }
       return { deleted: true };
     },
   );
@@ -707,6 +717,18 @@ export const letterRoutes: FastifyPluginAsync = async (app) => {
         objectId: recipientId,
         payload: { acknowledged: true, recordType: recipient.recordType, recordId: recipient.recordId },
       });
+      if (recipient.recordType === "transmittal") {
+        // Keep the parent's denormalised counters and derived status honest at
+        // once: the register scan reads them, and a sweep is up to an hour away.
+        await syncTransmittal(
+          app.db,
+          companyId,
+          projectId,
+          recipient.recordId,
+          req.user!.id,
+          todayISO(),
+        );
+      }
       if (recipient.recordType === "letter") {
         const [letter] = await app.db
           .select()

@@ -6,9 +6,12 @@ import { z } from "zod";
 import {
   contracts,
   obligations,
+  paymentAdjudications,
   paymentClaims,
   paymentResponses,
+  paymentSecurityAccounts,
   signals,
+  statutoryLiens,
   suspensionNotices,
   valuations,
 } from "@constructos/db";
@@ -26,7 +29,7 @@ import { addDaysISO, isoDateSchema, todayISO } from "../field/dates.js";
 import { pushNotifications } from "../notifications/service.js";
 import { computeTimeline, findRegime, REGIME_LIBRARY } from "./regimes.js";
 import { lienRoutes } from "./liens.js";
-import { securityAccountRoutes } from "./security.js";
+import { reconcileAccountRow, securityAccountRoutes } from "./security.js";
 import { adjudicationRoutes } from "./adjudication.js";
 import { supplyChainRoutes } from "./supplychain.js";
 
@@ -409,6 +412,91 @@ export const paymentsModule: FastifyPluginAsync = async (app) => {
    * days over paid claims, outstanding book and deemed exposure (deemed +
    * suspended — suspension does not extinguish the underlying liability).
    */
+  /**
+   * HEALTH INPUTS (plan §3.5) for the intelligence layer's `finance` and
+   * `risk` dimensions. Counts only: the claims, liens and trusts on a project
+   * may be denominated in several currencies and a single money total across
+   * them would be arithmetically meaningless. The sweep runs first so a
+   * deemed claim is counted as deemed rather than as merely served.
+   */
+  app.get("/projects/:projectId/payments/health-inputs", { preHandler: readGate }, async (req) => {
+    const companyId = req.companyId!;
+    const projectId = req.projectId!;
+    await sweepDeemed(companyId, projectId, req.user!.id);
+    const today = todayISO();
+    const [claims, liens, accounts, cases] = await Promise.all([
+      app.db
+        .select({ status: paymentClaims.status, responseDeadline: paymentClaims.responseDeadline })
+        .from(paymentClaims)
+        .where(and(eq(paymentClaims.companyId, companyId), eq(paymentClaims.projectId, projectId))),
+      app.db
+        .select({ status: statutoryLiens.status, deadlineAt: statutoryLiens.deadlineAt })
+        .from(statutoryLiens)
+        .where(
+          and(eq(statutoryLiens.companyId, companyId), eq(statutoryLiens.projectId, projectId)),
+        ),
+      app.db
+        .select()
+        .from(paymentSecurityAccounts)
+        .where(
+          and(
+            eq(paymentSecurityAccounts.companyId, companyId),
+            eq(paymentSecurityAccounts.projectId, projectId),
+          ),
+        ),
+      app.db
+        .select({ status: paymentAdjudications.status, decisionDueAt: paymentAdjudications.decisionDueAt })
+        .from(paymentAdjudications)
+        .where(
+          and(
+            eq(paymentAdjudications.companyId, companyId),
+            eq(paymentAdjudications.projectId, projectId),
+          ),
+        ),
+    ]);
+    let underfunded = 0;
+    for (const a of accounts.filter((x) => x.status === "active")) {
+      const rec = await reconcileAccountRow(app.db, a);
+      if (!rec.funded) underfunded += 1;
+    }
+    const reasons: string[] = [];
+    if (claims.length === 0 && liens.length === 0) {
+      reasons.push(
+        "No statutory payment claim or lien is on this project, so the statutory dimension is unrated.",
+      );
+    }
+    reasons.push(INDICATIVE_DISCLAIMER);
+    return {
+      projectId,
+      asOf: today,
+      metrics: {
+        paymentClaims: claims.length,
+        deemedClaims: claims.filter((c) => c.status === "deemed").length,
+        suspendedClaims: claims.filter((c) => c.status === "suspended").length,
+        responsesDueWithin7:
+          claims.filter(
+            (c) =>
+              c.status === "served" &&
+              c.responseDeadline !== null &&
+              c.responseDeadline >= today &&
+              c.responseDeadline <= addDaysISO(today, 7),
+          ).length,
+        openLiens: liens.filter((l) => ["noticed", "filed", "disputed"].includes(l.status)).length,
+        liensPastDeadline: liens.filter(
+          (l) =>
+            ["noticed", "filed", "disputed"].includes(l.status) &&
+            l.deadlineAt !== null &&
+            l.deadlineAt < today,
+        ).length,
+        underfundedSecurityAccounts: underfunded,
+        liveAdjudications: cases.filter((c) =>
+          ["notice", "referred", "responded"].includes(c.status),
+        ).length,
+      },
+      reasons,
+    };
+  });
+
   app.get("/projects/:projectId/payments/analytics", { preHandler: readGate }, async (req) => {
     await sweepDeemed(req.companyId!, req.projectId!, req.user!.id);
     const all = await app.db

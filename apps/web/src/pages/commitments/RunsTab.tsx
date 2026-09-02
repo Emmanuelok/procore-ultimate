@@ -108,7 +108,12 @@ export default function RunsTab({ projectId }: { projectId: string }) {
         api.get<{ items: RunRow[] }>(`${base}?page=1&pageSize=200`),
         api.get<{
           items: Candidate[];
-          byCurrency: Array<{ currency: string; count: number; amount: number; unapproved: number }>;
+          byCurrency: Array<{
+            currency: string;
+            count: number;
+            amount: number;
+            unapproved: number;
+          }>;
         }>(`${base}/candidates`),
       ]);
       setRuns(list.items);
@@ -126,7 +131,12 @@ export default function RunsTab({ projectId }: { projectId: string }) {
 
   return (
     <div className="space-y-4">
-      <Alert tone="info" variant="subtle" size="sm" title="One run, one currency, two pairs of hands">
+      <Alert
+        tone="info"
+        variant="subtle"
+        size="sm"
+        title="One run, one currency, two pairs of hands"
+      >
         A run gathers payments that are already scheduled and approved. Approving the run approves
         any member that is not yet approved — by somebody who did not schedule it — and issuing is a
         third act by a third person.
@@ -258,9 +268,7 @@ function BuildRun({
   const [selected, setSelected] = useState<Set<string>>(new Set());
 
   const inCurrency = candidates.filter((c) => c.currency === currency);
-  const total = inCurrency
-    .filter((c) => selected.has(c.id))
-    .reduce((s, c) => s + c.amount, 0);
+  const total = inCurrency.filter((c) => selected.has(c.id)).reduce((s, c) => s + c.amount, 0);
 
   function toggle(id: string) {
     setSelected((prev) => {
@@ -444,9 +452,7 @@ function RunDrawer({
     }
   }
 
-  const failure = data?.detail?.["failure"] as
-    | { reference: string; message: string }
-    | undefined;
+  const failure = data?.detail?.["failure"] as { reference: string; message: string } | undefined;
   const issuedIds = (data?.detail?.["issuedPaymentIds"] as string[] | undefined) ?? [];
 
   return (

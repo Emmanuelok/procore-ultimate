@@ -130,6 +130,16 @@ export interface RateCounts {
   nearMisses: number;
   /** cases whose classification is still open — they distort every rate */
   underAssessment: number;
+  /**
+   * Non-void incidents in the window that were never assessed under OSHA at
+   * all. This is NOT the same as `underAssessment`, and conflating them was a
+   * real defect: a GB project assessed only under RIDDOR carries
+   * `oshaCaseType: "under_assessment"` on every incident because the question
+   * was never asked, so counting recordable cases by OSHA case type returns
+   * zero — and TRIR 0.00 published from a register holding specified injuries
+   * reads, on a prequalification questionnaire, as a clean record.
+   */
+  unassessedForOsha: number;
 }
 
 export interface SafetyRate {
@@ -158,6 +168,8 @@ function rate(
   formula: string,
   note: string | null,
   extraReasons: string[] = [],
+  /** when set, the rate is refused whatever the denominator says */
+  suppressedReason: string | null = null,
 ): SafetyRate {
   const common = {
     key,
@@ -176,6 +188,9 @@ function rate(
     },
     note,
   };
+  if (suppressedReason) {
+    return { ...common, value: null, reasons: [suppressedReason, ...extraReasons] };
+  }
   if (exposure.hours == null || exposure.hours <= 0) {
     return { ...common, value: null, reasons: [...exposure.reasons, ...extraReasons] };
   }
@@ -232,6 +247,28 @@ export function computeSafetyRates(
     );
   }
 
+  /**
+   * TRIR and DART are OSHA constructions: their numerators are the 300 log's
+   * own case classifications. On a project where OSHA was never assessed those
+   * classifications do not exist, and counting them yields zero — a zero that
+   * reads as "no recordable cases" when the truth is "nobody asked". So both
+   * rates are refused with the reason, and the regime-neutral rates (lost-time
+   * frequency, severity, fatality) are published as normal because their
+   * numerators are facts about the injury rather than about a classification.
+   */
+  const oshaGap =
+    counts.unassessedForOsha > 0
+      ? `TRIR and DART are refused for this window. ${counts.unassessedForOsha} incident(s) here were ` +
+        `never assessed under 29 CFR 1904 — the project's regimes do not include \`osha\` — so they ` +
+        `carry no recordability classification at all. Counting recordable cases by OSHA case type ` +
+        `would return a figure derived only from the incidents that happened to be assessed, and a ` +
+        `TRIR of 0.00 on a register holding real injuries is not a low rate, it is a false statement ` +
+        `on a prequalification questionnaire. Assess the incidents under OSHA if the establishment is ` +
+        `subject to Part 1904; otherwise read the lost-time frequency rate below, which is ` +
+        `regime-neutral.`
+      : null;
+  if (oshaGap) caveats.push(oshaGap);
+
   const rates: SafetyRate[] = [
     rate(
       "trir",
@@ -242,6 +279,8 @@ export function computeSafetyRates(
       "recordable cases × 200,000 ÷ hours worked",
       "The rate a client's prequalification questionnaire asks for. Its numerator is the 300 log, " +
         "so it is only as honest as the recordability classification behind it.",
+      [],
+      oshaGap,
     ),
     rate(
       "dart",
@@ -252,6 +291,8 @@ export function computeSafetyRates(
       "(days-away + restricted/transfer cases) × 200,000 ÷ hours worked",
       "DART is the rate that resists the temptation TRIR creates — a case moved from days-away to " +
         "restricted duty leaves TRIR unchanged and leaves DART unchanged too.",
+      [],
+      oshaGap,
     ),
     rate(
       "ltifr",

@@ -1,22 +1,27 @@
 import { randomBytes } from "node:crypto";
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
-import { and, asc, count, desc, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   apiTokens,
   assertions,
+  budgetLineItems,
+  budgets,
   companies,
   contracts,
+  costCodes,
   evidence,
   files,
   fxRates,
   ingestedRecords,
+  ingestionMappingTemplates,
   ingestionRuns,
   ingestionSources,
   paymentCertificates,
   payrollEntries,
   projects,
   rfis,
+  scheduleDependencies,
   schedules,
   scheduleTasks,
   signals,
@@ -27,11 +32,14 @@ import {
   workers,
 } from "@constructos/db";
 import {
-  INGESTION_DATASETS,
+  ALL_INGESTION_DATASETS,
+  INGESTION_MODES,
+  meetsLevel,
   INGESTION_RUN_STATUSES,
   INGESTION_SOURCE_KINDS,
   STAGED_RECORD_STATUSES,
-  type IngestionDataset,
+  type AnyIngestionDataset,
+  type ToolKey,
 } from "@constructos/shared";
 import { hashPayload, sha256Hex } from "@constructos/ledger";
 import { newId } from "../../lib/ids.js";
@@ -41,6 +49,8 @@ import { nextRecordNumber } from "../../lib/numbering.js";
 import { badRequest, conflict, forbidden, notFound, unauthorized } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import type { Db } from "../../lib/db.js";
+import { computeCpm, type CpmDependencyInput, type CpmTaskInput } from "../../lib/cpm.js";
+import { reachOf } from "../analytics/authz.js";
 import { connectorPull } from "./connectors.js";
 import {
   coerceRow,
@@ -50,10 +60,12 @@ import {
   MAX_REPORT_ENTRIES,
   MAX_ROWS_PER_RUN,
   parseCsv,
+  parsePredecessorList,
   PREVIEW_ROWS,
   type DatasetDef,
   type RowIssue,
 } from "./datasets.js";
+import { parseProgramme, sniffProgramme, type ProgrammeParseResult } from "./programme.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -84,13 +96,22 @@ const sourcesListQuery = pageQuerySchema.extend({
 
 const runFieldsSchema = z.object({
   sourceId: z.string().min(1).max(64),
-  dataset: z.enum(INGESTION_DATASETS),
+  dataset: z.enum(ALL_INGESTION_DATASETS),
   projectId: z.string().min(1).max(64).optional(),
+  /** insert (default) rejects a re-presented externalId; reconcile diffs it */
+  mode: z.enum(INGESTION_MODES).optional(),
 });
 
 const runsListQuery = pageQuerySchema.extend({
-  dataset: z.enum(INGESTION_DATASETS).optional(),
+  dataset: z.enum(ALL_INGESTION_DATASETS).optional(),
   status: z.enum(INGESTION_RUN_STATUSES).optional(),
+});
+
+const templateCreateSchema = z.object({
+  name: z.string().min(1).max(200),
+  dataset: z.enum(ALL_INGESTION_DATASETS),
+  sourceId: z.string().min(1).max(64).nullable().optional(),
+  columnMap: z.record(z.string().min(1).max(100), z.string().min(1).max(200)),
 });
 
 const recordsListQuery = pageQuerySchema.extend({
@@ -103,7 +124,7 @@ const mapSchema = z.object({
 
 const tokenCreateSchema = z.object({
   name: z.string().min(1).max(200),
-  scopes: z.array(z.enum(INGESTION_DATASETS)).min(1).max(INGESTION_DATASETS.length),
+  scopes: z.array(z.enum(ALL_INGESTION_DATASETS)).min(1).max(ALL_INGESTION_DATASETS.length),
   expiresAt: isoTimestamp.nullable().optional(),
 });
 
@@ -165,6 +186,9 @@ interface CommitPrep {
   rfiNumbers: number[];
   activeScheduleId: string | null;
   taskSortBase: number;
+  /** the project's active budget, for the budget_lines writer */
+  activeBudgetId: string | null;
+  activeBudgetCurrency: string | null;
 }
 
 type RowOutcome = { recordId: string } | { skipped: string };
@@ -183,6 +207,31 @@ const CHUNK = 500;
  * for: an evidence stream (site access, payroll) authenticated by a hashed
  * bearer token scoped to datasets — a pathway the claimant does not share.
  */
+/**
+ * The tool that governs a dataset's STAGED rows.
+ *
+ * Staging is not a lesser copy of a record: a payroll run holds every worker's
+ * gross and net pay, a site-access run holds who was on site and when, and an
+ * evidence run holds whatever was attested. The committed rows are gated behind
+ * `requireTool("workforce", …)` and friends; the staging copy was readable by
+ * ANY company membership, guests included, through GET
+ * /ingestion/runs/:runId/records. It is the same data, so it takes the same
+ * gate — resolved per run against the run's own project.
+ */
+const DATASET_TOOL: Record<AnyIngestionDataset, ToolKey> = {
+  vendors: "directory",
+  cost_assertions: "assurance",
+  site_access: "workforce",
+  payroll: "workforce",
+  rfis: "rfis",
+  schedule_tasks: "schedule",
+  evidence: "assurance",
+  fx_rates: "finance",
+  telematics: "equipment",
+  cost_codes: "budget",
+  budget_lines: "budget",
+};
+
 export const ingestionModule: FastifyPluginAsync = async (app) => {
   const memberGate = [app.authenticate, app.requireCompany];
   const adminGate = [
@@ -213,6 +262,82 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
       .limit(1);
     if (!rows[0]) throw notFound("Ingestion run not found");
     return rows[0];
+  }
+
+  /**
+   * ATOMIC STATE TRANSITION.
+   *
+   * Every phase used to read the run, check its status and then write the new
+   * one in a separate statement. Two commits arriving together — a double
+   * click, two tabs, a retry after a slow response — both passed the check,
+   * both allocated RFI numbers and both inserted the real records: vendors
+   * twice, RFIs with two numbers each, payroll twice, and
+   * `committedRecordId` pointing at only one of the copies. The claim is a
+   * single conditional UPDATE: exactly one caller can win a transition.
+   */
+  async function claimRun(
+    runId: string,
+    companyId: string,
+    from: readonly string[],
+    to: string,
+  ): Promise<RunRow> {
+    const claimed = await app.db
+      .update(ingestionRuns)
+      .set({ status: to, updatedAt: new Date().toISOString() })
+      .where(
+        and(
+          eq(ingestionRuns.id, runId),
+          eq(ingestionRuns.companyId, companyId),
+          inArray(ingestionRuns.status, [...from]),
+        ),
+      )
+      .returning();
+    if (claimed[0]) return claimed[0];
+    // Nothing claimed: either the run is not ours (404) or it is in a state
+    // this transition does not accept (409), and the caller deserves to know
+    // which.
+    const current = await fetchRun(runId, companyId);
+    throw conflict(
+      `Run is ${current.status} — this step accepts ${from.join(" or ")}. ` +
+        (current.status === "committing"
+          ? "A commit is already running; wait for it to finish."
+          : ""),
+    );
+  }
+
+  /**
+   * Who may READ a run's staged rows. Staging holds the same data the committed
+   * records do — payroll, site access, evidence — so it takes the same
+   * authority: company owner/admin, or at least `read` on the dataset's tool
+   * for the run's project. A company membership alone is not enough, and a
+   * `guest` never qualifies.
+   */
+  async function assertRunReadable(req: FastifyRequest, run: RunRow): Promise<void> {
+    if (req.companyRole === "owner" || req.companyRole === "admin") return;
+    const tool = DATASET_TOOL[run.dataset as AnyIngestionDataset] ?? "admin";
+    if (!run.projectId) {
+      throw forbidden(
+        `This run is company-level ${run.dataset} data; only an owner or admin may read its ` +
+          "staged rows.",
+      );
+    }
+    const level = await reachOf(app.db, req).levelFor(run.projectId, tool);
+    if (!meetsLevel(level, "read")) {
+      throw forbidden(
+        `Reading staged ${run.dataset} rows requires read access to ${tool} on the run's project.`,
+      );
+    }
+  }
+
+  /** The runs this caller may see, as a project filter (null = unrestricted). */
+  async function readableRunFilter(req: FastifyRequest) {
+    if (req.companyRole === "owner" || req.companyRole === "admin") return undefined;
+    const any = await reachOf(app.db, req).anyReach();
+    if (any === null) return undefined;
+    if (any.length === 0) return sql`false`;
+    // Company-level runs (no projectId) carry directory or finance data with no
+    // project to resolve a level against, so they are admin-only.
+    return inArray(ingestionRuns.projectId, any);
   }
 
   async function fetchToken(tokenId: string, companyId: string): Promise<TokenRow> {
@@ -266,6 +391,68 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
    * commit takes only the clean rows, and the rejects stay behind as the
    * honest record of what the file actually contained.
    */
+  /**
+   * Field-by-field difference between the payload a record was committed from
+   * and the one now presented. Only fields whose value actually changed are
+   * returned, so an unchanged restatement diffs to `{}` and is reported as
+   * "nothing to reconcile" rather than offered as an update.
+   */
+  function diffPayloads(
+    before: Record<string, unknown>,
+    after: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+    for (const key of keys) {
+      if (key === "externalId") continue;
+      const a = before[key];
+      const b = after[key];
+      if (JSON.stringify(a ?? null) !== JSON.stringify(b ?? null)) {
+        out[key] = { from: a ?? null, to: b ?? null };
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Write the validation verdict for a whole batch.
+   *
+   * One UPDATE per staged row meant a 20,000-row file cost 20,000 round trips
+   * before it had committed anything at all. This writes them in chunks of 500
+   * through a VALUES join — the same statement shape, one network round trip
+   * per chunk.
+   */
+  async function applyRowUpdates(
+    updates: {
+      id: string;
+      status: string;
+      reason: string | null;
+      payload: Record<string, unknown>;
+      matchedRecordId: string | null;
+      diff: Record<string, unknown> | null;
+    }[],
+  ): Promise<void> {
+    for (let i = 0; i < updates.length; i += CHUNK) {
+      const batch = updates.slice(i, i + CHUNK);
+      const tuples = batch.map(
+        (u) =>
+          sql`(${u.id}, ${u.status}, ${u.reason}, ${JSON.stringify(u.payload)}::jsonb, ${u.matchedRecordId}, ${
+            u.diff === null ? null : JSON.stringify(u.diff)
+          }::jsonb)`,
+      );
+      await app.db.execute(sql`
+        update ingested_records as t
+        set status = v.status,
+            reason = v.reason,
+            payload = v.payload,
+            matched_record_id = v.matched_record_id,
+            diff = v.diff
+        from (values ${sql.join(tuples, sql`, `)}) as v(id, status, reason, payload, matched_record_id, diff)
+        where t.id = v.id
+      `);
+    }
+  }
+
   async function runValidation(run: RunRow, ledgerActorId: string | null) {
     const def = datasetDef(run.dataset)!;
     const rows = await app.db
@@ -300,9 +487,60 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
     let staged = 0;
     let rejected = 0;
 
+    /*
+     * RECONCILE MODE.
+     *
+     * `insert` rejects a row whose externalId an earlier run already
+     * committed — correct for a first migration and wrong for the monthly
+     * re-export every operator actually has. `reconcile` treats the match as a
+     * RESTATEMENT: the row keeps the id of the record it matches, carries the
+     * field-by-field difference, and the operator decides per row whether to
+     * apply it. Nothing is overwritten without that decision.
+     */
+    const reconciling = run.mode === "reconcile";
+    const matchByExternalId = new Map<string, { recordId: string; payload: Record<string, unknown> }>();
+    if (reconciling && externalIds.length > 0) {
+      const committedRows = await app.db
+        .select({
+          externalId: ingestedRecords.externalId,
+          committedRecordId: ingestedRecords.committedRecordId,
+          payload: ingestedRecords.payload,
+        })
+        .from(ingestedRecords)
+        .innerJoin(ingestionRuns, eq(ingestedRecords.runId, ingestionRuns.id))
+        .where(
+          and(
+            eq(ingestionRuns.companyId, run.companyId),
+            eq(ingestionRuns.dataset, run.dataset),
+            eq(ingestedRecords.status, "committed"),
+            inArray(ingestedRecords.externalId, externalIds),
+          ),
+        );
+      for (const r of committedRows) {
+        if (r.externalId && r.committedRecordId) {
+          matchByExternalId.set(r.externalId, {
+            recordId: r.committedRecordId,
+            payload: r.payload,
+          });
+        }
+      }
+    }
+
+    interface PendingUpdate {
+      id: string;
+      status: string;
+      reason: string | null;
+      payload: Record<string, unknown>;
+      matchedRecordId: string | null;
+      diff: Record<string, unknown> | null;
+    }
+    const pending: PendingUpdate[] = [];
+
     for (const rec of rows) {
       const { value, issues } = coerceRow(def, rec.payload);
       const extId = rec.externalId;
+      let matchedRecordId: string | null = null;
+      let diff: Record<string, unknown> | null = null;
       if (extId) {
         if (seenInRun.has(extId)) {
           issues.push({
@@ -314,11 +552,29 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
           seenInRun.add(extId);
         }
         if (committedDup.has(extId)) {
-          issues.push({
-            field: "externalId",
-            code: "duplicate_committed",
-            message: `externalId "${extId}" was already committed for dataset ${run.dataset}`,
-          });
+          const match = matchByExternalId.get(extId);
+          if (reconciling && match) {
+            matchedRecordId = match.recordId;
+            diff = diffPayloads(match.payload, value);
+            if (Object.keys(diff).length === 0) {
+              issues.push({
+                field: "externalId",
+                code: "duplicate_committed",
+                message:
+                  `externalId "${extId}" is already committed and identical — nothing to ` +
+                  "reconcile",
+              });
+            }
+          } else {
+            issues.push({
+              field: "externalId",
+              code: "duplicate_committed",
+              message: reconciling
+                ? `externalId "${extId}" was already committed but the record it created can no ` +
+                  "longer be found, so there is nothing to reconcile against"
+                : `externalId "${extId}" was already committed for dataset ${run.dataset}`,
+            });
+          }
           replayed.add(extId);
         }
       }
@@ -334,21 +590,30 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
             });
           }
         }
-        await app.db
-          .update(ingestedRecords)
-          .set({
-            status: "rejected",
-            reason: issues.map((i: RowIssue) => `${i.code}: ${i.message}`).join("; "),
-          })
-          .where(eq(ingestedRecords.id, rec.id));
+        pending.push({
+          id: rec.id,
+          status: "rejected",
+          reason: issues.map((i: RowIssue) => `${i.code}: ${i.message}`).join("; "),
+          payload: rec.payload,
+          matchedRecordId: null,
+          diff: null,
+        });
       } else {
         staged += 1;
-        await app.db
-          .update(ingestedRecords)
-          .set({ status: "staged", reason: null, payload: value })
-          .where(eq(ingestedRecords.id, rec.id));
+        pending.push({
+          id: rec.id,
+          status: "staged",
+          reason: matchedRecordId
+            ? `reconcile: restates committed record ${matchedRecordId}`
+            : null,
+          payload: value,
+          matchedRecordId,
+          diff,
+        });
       }
     }
+
+    await applyRowUpdates(pending);
 
     await app.db
       .update(ingestionRuns)
@@ -411,7 +676,7 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
 
   async function commitRows(
     db: Db,
-    dataset: IngestionDataset,
+    dataset: AnyIngestionDataset,
     ctx: CommitCtx,
     rows: StagedRow[],
     prep: CommitPrep,
@@ -642,10 +907,13 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
 
       case "schedule_tasks": {
         const outcomes: RowOutcome[] = [];
+        const idByCode = new Map<string, string>();
         const values: (typeof scheduleTasks.$inferInsert)[] = rows.map((r, i) => {
           const p = r.payload;
           const id = newId("tsk");
           outcomes.push({ recordId: id });
+          const code = str(p, "taskCode");
+          if (code) idByCode.set(code, id);
           return {
             id,
             scheduleId: prep.activeScheduleId!,
@@ -653,6 +921,8 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
             name: str(p, "name")!,
             wbsCode: str(p, "wbsCode") ?? null,
             durationDays: (p["durationDays"] as number | undefined) ?? 1,
+            constraintType: str(p, "constraintType") ?? null,
+            constraintDate: str(p, "constraintDate") ?? null,
             percentComplete: num(p, "percentComplete") ?? 0,
             actualStart: str(p, "actualStart") ?? null,
             actualFinish: str(p, "actualFinish") ?? null,
@@ -661,6 +931,51 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
         });
         for (let i = 0; i < values.length; i += CHUNK) {
           await db.insert(scheduleTasks).values(values.slice(i, i + CHUNK));
+        }
+
+        /*
+         * THE LOGIC IS THE SCHEDULE.
+         *
+         * Importing activities without their relationships produces a list of
+         * unscheduled rows: no critical path, no float, no as-planned finish —
+         * and the forensics module silently reasons over the stale header. So
+         * predecessors are resolved here, against task codes in THIS run and
+         * against codes already on the schedule, and anything that cannot be
+         * resolved is reported rather than dropped in silence.
+         */
+        const existing = await db
+          .select({ id: scheduleTasks.id, wbsCode: scheduleTasks.wbsCode, name: scheduleTasks.name })
+          .from(scheduleTasks)
+          .where(eq(scheduleTasks.scheduleId, prep.activeScheduleId!));
+        for (const t of existing) {
+          if (t.wbsCode && !idByCode.has(t.wbsCode)) idByCode.set(t.wbsCode, t.id);
+        }
+        const deps: (typeof scheduleDependencies.$inferInsert)[] = [];
+        const seenDeps = new Set<string>();
+        for (let i = 0; i < rows.length; i += 1) {
+          const raw = str(rows[i]!.payload, "predecessors");
+          const successorId = (outcomes[i] as { recordId: string }).recordId;
+          if (!raw) continue;
+          for (const link of parsePredecessorList(raw).links) {
+            const predecessorId = idByCode.get(link.taskCode);
+            if (!predecessorId || predecessorId === successorId) continue;
+            const key = `${predecessorId}|${successorId}|${link.type}`;
+            if (seenDeps.has(key)) continue;
+            seenDeps.add(key);
+            deps.push({
+              id: newId("dep"),
+              scheduleId: prep.activeScheduleId!,
+              predecessorId,
+              successorId,
+              depType: link.type,
+              lagDays: link.lagDays,
+            });
+          }
+        }
+        for (let i = 0; i < deps.length; i += CHUNK) {
+          // A link this schedule already holds is not an error: the unique
+          // index on (predecessor, successor, type) settles it.
+          await db.insert(scheduleDependencies).values(deps.slice(i, i + CHUNK)).onConflictDoNothing();
         }
         return outcomes;
       }
@@ -695,6 +1010,116 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
         });
         for (let i = 0; i < values.length; i += CHUNK) {
           await db.insert(evidence).values(values.slice(i, i + CHUNK));
+        }
+        return outcomes;
+      }
+
+      case "cost_codes": {
+        const outcomes: RowOutcome[] = [];
+        const scope = ctx.projectId ?? null;
+        const wanted = rows.map((r) => str(r.payload, "code")!.trim());
+        const existing = await db
+          .select({ id: costCodes.id, code: costCodes.code })
+          .from(costCodes)
+          .where(
+            and(
+              eq(costCodes.companyId, ctx.companyId),
+              scope ? eq(costCodes.projectId, scope) : isNull(costCodes.projectId),
+              inArray(costCodes.code, [...new Set(wanted)]),
+            ),
+          );
+        const have = new Map(existing.map((e) => [e.code, e.id]));
+        const seen = new Set<string>();
+        const values: (typeof costCodes.$inferInsert)[] = [];
+        const parentByCode = new Map<string, string>();
+        for (const r of rows) {
+          const p = r.payload;
+          const code = str(p, "code")!.trim();
+          if (have.has(code)) {
+            outcomes.push({
+              skipped: `cost code "${code}" already exists in this list — left as it is`,
+            });
+            continue;
+          }
+          if (seen.has(code)) {
+            outcomes.push({ skipped: `cost code "${code}" appears more than once in this run` });
+            continue;
+          }
+          seen.add(code);
+          const id = newId("csc");
+          outcomes.push({ recordId: id });
+          const parent = str(p, "parentCode");
+          if (parent) parentByCode.set(code, parent.trim());
+          values.push({
+            id,
+            companyId: ctx.companyId,
+            projectId: scope,
+            code,
+            title: str(p, "title")!,
+            division: str(p, "division") ?? null,
+            costType: str(p, "costType") ?? null,
+            parentId: null,
+          });
+        }
+        for (let i = 0; i < values.length; i += CHUNK) {
+          await db.insert(costCodes).values(values.slice(i, i + CHUNK));
+        }
+        // Parents are resolved in a second pass because a child may appear
+        // before its parent in the file; an unresolvable parent leaves the code
+        // at the top level rather than failing the row.
+        if (parentByCode.size > 0) {
+          const idByCode = new Map([
+            ...have,
+            ...values.map((v) => [v.code, v.id] as const),
+          ]);
+          for (const [code, parentCode] of parentByCode) {
+            const childId = idByCode.get(code);
+            const parentId = idByCode.get(parentCode);
+            if (childId && parentId && childId !== parentId) {
+              await db.update(costCodes).set({ parentId }).where(eq(costCodes.id, childId));
+            }
+          }
+        }
+        return outcomes;
+      }
+
+      case "budget_lines": {
+        const outcomes: RowOutcome[] = [];
+        const codes = [...new Set(rows.map((r) => str(r.payload, "costCode")!.trim()))];
+        const codeRows = await db
+          .select({ id: costCodes.id, code: costCodes.code })
+          .from(costCodes)
+          .where(
+            and(eq(costCodes.companyId, ctx.companyId), inArray(costCodes.code, codes)),
+          );
+        const codeIdByCode = new Map(codeRows.map((c) => [c.code, c.id]));
+        const values: (typeof budgetLineItems.$inferInsert)[] = [];
+        for (const r of rows) {
+          const p = r.payload;
+          const id = newId("bli");
+          outcomes.push({ recordId: id });
+          const amount = num(p, "originalBudget") ?? 0;
+          const code = str(p, "costCode")!.trim();
+          values.push({
+            id,
+            budgetId: prep.activeBudgetId!,
+            companyId: ctx.companyId,
+            projectId: ctx.projectId!,
+            costCodeId: codeIdByCode.get(code) ?? null,
+            costCode: code,
+            costType: str(p, "costType") ?? "other",
+            subJob: str(p, "subJob") ?? null,
+            description: str(p, "description")!,
+            unit: str(p, "unit") ?? null,
+            quantity: num(p, "quantity") ?? null,
+            unitRate: num(p, "unitRate") ?? null,
+            originalBudget: amount,
+            revisedBudget: amount,
+            createdBy: ctx.actorId,
+          });
+        }
+        for (let i = 0; i < values.length; i += CHUNK) {
+          await db.insert(budgetLineItems).values(values.slice(i, i + CHUNK));
         }
         return outcomes;
       }
@@ -771,6 +1196,124 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
   }
 
   /**
+   * Recompute the schedule an import just landed in, using the same engine the
+   * schedule module uses (lib/cpm.ts). Wrapped rather than reimplemented: the
+   * arithmetic lives in one place and this is a caller of it.
+   *
+   * A cycle in the imported logic does NOT fail the commit — the tasks are real
+   * and the operator must be able to see and fix them — it is reported so the
+   * schedule module's own compute route shows the same cycle.
+   */
+  async function recomputeAfterImport(scheduleId: string) {
+    const [schedule] = await app.db
+      .select()
+      .from(schedules)
+      .where(eq(schedules.id, scheduleId))
+      .limit(1);
+    if (!schedule) return { recomputed: false, reason: "schedule not found" };
+    const tasks = await app.db
+      .select()
+      .from(scheduleTasks)
+      .where(eq(scheduleTasks.scheduleId, scheduleId));
+    const deps = await app.db
+      .select()
+      .from(scheduleDependencies)
+      .where(eq(scheduleDependencies.scheduleId, scheduleId));
+    const cpmTasks: CpmTaskInput[] = tasks.map((t) => ({
+      id: t.id,
+      duration: t.durationDays,
+      constraintType: (t.constraintType as CpmTaskInput["constraintType"]) ?? null,
+      constraintDate: t.constraintDate,
+      actualStart: t.actualStart,
+      actualFinish: t.actualFinish,
+    }));
+    const cpmDeps: CpmDependencyInput[] = deps.map((d) => ({
+      predecessorId: d.predecessorId,
+      successorId: d.successorId,
+      type: d.depType as CpmDependencyInput["type"],
+      lagDays: d.lagDays,
+    }));
+    const result = computeCpm(cpmTasks, cpmDeps, { projectStart: schedule.projectStart });
+    const now = new Date().toISOString();
+    if (!result.ok) {
+      return {
+        recomputed: false,
+        reason: "the imported logic contains a cycle",
+        cycle: result.cycle.slice(0, 20),
+        tasks: tasks.length,
+        dependencies: deps.length,
+      };
+    }
+    for (const t of tasks) {
+      const r = result.tasks.get(t.id);
+      if (!r) continue;
+      const critical = r.isCritical ? 1 : 0;
+      if (
+        t.startDate !== r.startDate ||
+        t.finishDate !== r.finishDate ||
+        t.totalFloat !== r.totalFloat ||
+        t.isCritical !== critical
+      ) {
+        await app.db
+          .update(scheduleTasks)
+          .set({
+            startDate: r.startDate,
+            finishDate: r.finishDate,
+            totalFloat: r.totalFloat,
+            isCritical: critical,
+            updatedAt: now,
+          })
+          .where(eq(scheduleTasks.id, t.id));
+      }
+    }
+    await app.db
+      .update(schedules)
+      .set({
+        computedFinish: tasks.length > 0 ? result.projectFinishDate : null,
+        computedDurationDays: tasks.length > 0 ? result.projectDurationDays : 0,
+        lastComputedAt: now,
+        updatedAt: now,
+      })
+      .where(eq(schedules.id, scheduleId));
+    return {
+      recomputed: true,
+      tasks: tasks.length,
+      dependencies: deps.length,
+      projectFinishDate: result.projectFinishDate,
+      criticalCount: result.criticalIds.length,
+    };
+  }
+
+  /**
+   * Re-derive a budget's materialised totals from its lines after an import.
+   * Only the two totals an import can move are recomputed; every other rollup
+   * on the header is owned by the budget module and left alone.
+   */
+  async function recomputeBudgetTotals(budgetId: string) {
+    const [row] = await app.db
+      .select({
+        original: sql<number>`coalesce(sum(${budgetLineItems.originalBudget}), 0)`,
+        revised: sql<number>`coalesce(sum(${budgetLineItems.revisedBudget}), 0)`,
+        lines: count(),
+      })
+      .from(budgetLineItems)
+      .where(eq(budgetLineItems.budgetId, budgetId));
+    await app.db
+      .update(budgets)
+      .set({
+        originalBudgetTotal: Number(row?.original ?? 0),
+        revisedBudgetTotal: Number(row?.revised ?? 0),
+        updatedAt: new Date().toISOString(),
+      })
+      .where(eq(budgets.id, budgetId));
+    return {
+      recomputed: true,
+      lines: Number(row?.lines ?? 0),
+      originalBudgetTotal: Number(row?.original ?? 0),
+    };
+  }
+
+  /**
    * Commit a validated run: the real records, the per-row provenance updates
    * and the run's final state are written in ONE transaction, so a failure
    * leaves nothing half-committed (the run is marked `failed` and can be
@@ -799,11 +1342,44 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
 
     // Preconditions & pre-allocation (all BEFORE the run leaves `validated`,
     // so a refused commit leaves the run exactly as it was).
-    const prep: CommitPrep = { rfiNumbers: [], activeScheduleId: null, taskSortBase: 0 };
+    const prep: CommitPrep = {
+      rfiNumbers: [],
+      activeScheduleId: null,
+      taskSortBase: 0,
+      activeBudgetId: null,
+      activeBudgetCurrency: null,
+    };
     if (run.dataset === "rfis") {
       for (let i = 0; i < rows.length; i += 1) {
         prep.rfiNumbers.push(await nextRecordNumber(app.db, run.projectId!, "rfi"));
       }
+    }
+    if (run.dataset === "budget_lines") {
+      const [budget] = await app.db
+        .select({ id: budgets.id, currency: budgets.currency, lockedAt: budgets.lockedAt })
+        .from(budgets)
+        .where(
+          and(
+            eq(budgets.companyId, run.companyId),
+            eq(budgets.projectId, run.projectId!),
+            eq(budgets.isActive, 1),
+          ),
+        )
+        .limit(1);
+      if (!budget) {
+        throw badRequest(
+          "Project has no active budget — create one in the budget tool before committing " +
+            "budget_lines",
+        );
+      }
+      if (budget.lockedAt) {
+        throw conflict(
+          "The active budget is locked, so lines may only move through an approved budget " +
+            "change. Unlock it, or raise the change, before importing lines.",
+        );
+      }
+      prep.activeBudgetId = budget.id;
+      prep.activeBudgetCurrency = budget.currency;
     }
     if (run.dataset === "schedule_tasks") {
       const sch = await app.db
@@ -829,12 +1405,6 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
         .where(eq(scheduleTasks.scheduleId, sch[0].id));
       prep.taskSortBase = Number(maxRow[0]?.m ?? -1) + 1;
     }
-
-    const now = new Date().toISOString();
-    await app.db
-      .update(ingestionRuns)
-      .set({ status: "committing", updatedAt: now })
-      .where(eq(ingestionRuns.id, run.id));
 
     const ctx: CommitCtx = {
       companyId: run.companyId,
@@ -891,6 +1461,23 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
       throw err;
     }
 
+    /*
+     * A COMMIT THAT LEAVES THE TARGET STALE IS NOT A COMMIT.
+     *
+     * Imported tasks used to land with null dates on a schedule whose header
+     * still carried the old computed finish, so the Gantt showed "unscheduled"
+     * rows and the overview strip and forensics read a finish date the
+     * schedule no longer had. Recomputing here — with the same CPM engine the
+     * schedule module uses — is what makes the import an actual programme.
+     */
+    let followUp: Record<string, unknown> = {};
+    if (run.dataset === "schedule_tasks" && prep.activeScheduleId) {
+      followUp = { schedule: await recomputeAfterImport(prep.activeScheduleId) };
+    }
+    if (run.dataset === "budget_lines" && prep.activeBudgetId) {
+      followUp = { budget: await recomputeBudgetTotals(prep.activeBudgetId) };
+    }
+
     await appendLedger(app.db, {
       companyId: run.companyId,
       actorId: ledgerActorId,
@@ -908,11 +1495,12 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
         committed,
         skipped,
         rejected: run.rejectedCount,
+        ...followUp,
       },
       storePayload: true,
     });
 
-    return { committed, skipped };
+    return { committed, skipped, ...followUp };
   }
 
   /* ---------------------------------------------------------------- */
@@ -1131,10 +1719,10 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
   app.post("/ingestion/runs/:runId/map", { preHandler: adminGate }, async (req) => {
     const { runId } = req.params as { runId: string };
     const body = mapSchema.parse(req.body);
-    const run = await fetchRun(runId, req.companyId!);
-    if (run.status !== "staging" && run.status !== "validated") {
-      throw conflict(`Run is ${run.status} — mapping is only possible before commit`);
-    }
+    // `failed` is accepted: a commit that failed on the data must be fixable by
+    // re-mapping it, and the only alternative was to discard the run and
+    // re-upload the whole file.
+    const run = await claimRun(runId, req.companyId!, ["staging", "validated", "failed"], "staging");
     if (!run.fileId) {
       throw badRequest("Run has no uploaded file to map (machine-push runs are mapped implicitly)");
     }
@@ -1194,6 +1782,9 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
         committedCount: 0,
         skippedCount: 0,
         report: [],
+        // Re-mapping a failed run starts it again: the old failure describes a
+        // mapping that no longer exists.
+        error: null,
         updatedAt: new Date().toISOString(),
       })
       .where(eq(ingestionRuns.id, run.id));
@@ -1210,10 +1801,12 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
 
   app.post("/ingestion/runs/:runId/validate", { preHandler: adminGate }, async (req) => {
     const { runId } = req.params as { runId: string };
-    const run = await fetchRun(runId, req.companyId!);
-    if (run.status !== "staging" && run.status !== "validated") {
-      throw conflict(`Run is ${run.status} — validation applies before commit`);
-    }
+    const run = await claimRun(
+      runId,
+      req.companyId!,
+      ["staging", "validated", "failed"],
+      "staging",
+    );
     const [{ n } = { n: 0 }] = await app.db
       .select({ n: count() })
       .from(ingestedRecords)
@@ -1227,10 +1820,10 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
 
   app.post("/ingestion/runs/:runId/commit", { preHandler: adminGate }, async (req) => {
     const { runId } = req.params as { runId: string };
-    const run = await fetchRun(runId, req.companyId!);
-    if (run.status !== "validated" && run.status !== "failed") {
-      throw conflict(`Run is ${run.status} — commit requires a validated run`);
-    }
+    // The claim IS the check: the run moves to `committing` in the same
+    // statement that verifies it was committable, so a second request finds
+    // nothing to claim and is told so instead of committing the rows again.
+    const run = await claimRun(runId, req.companyId!, ["validated", "failed"], "committing");
     const result = await runCommit(run, req.user!.id, req.user!.id);
     return { run: await fetchRun(run.id, req.companyId!), ...result };
   });
@@ -1261,6 +1854,7 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
     const q = runsListQuery.parse(req.query);
     const where = and(
       eq(ingestionRuns.companyId, req.companyId!),
+      await readableRunFilter(req),
       q.dataset ? eq(ingestionRuns.dataset, q.dataset) : undefined,
       q.status ? eq(ingestionRuns.status, q.status) : undefined,
     );
@@ -1277,13 +1871,17 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
 
   app.get("/ingestion/runs/:runId", { preHandler: memberGate }, async (req) => {
     const { runId } = req.params as { runId: string };
-    return fetchRun(runId, req.companyId!);
+    const run = await fetchRun(runId, req.companyId!);
+    await assertRunReadable(req, run);
+    return run;
   });
 
   app.get("/ingestion/runs/:runId/records", { preHandler: memberGate }, async (req) => {
     const { runId } = req.params as { runId: string };
     const q = recordsListQuery.parse(req.query);
     const run = await fetchRun(runId, req.companyId!);
+    // The staged payload IS the record: same gate as the committed rows.
+    await assertRunReadable(req, run);
     const where = and(
       eq(ingestedRecords.runId, run.id),
       q.status ? eq(ingestedRecords.status, q.status) : undefined,
@@ -1385,7 +1983,9 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
     const { dataset } = req.params as { dataset: string };
     const def = datasetDef(dataset);
     if (!def) {
-      throw badRequest(`Unknown dataset "${dataset}" — one of: ${INGESTION_DATASETS.join(", ")}`);
+      throw badRequest(
+        `Unknown dataset "${dataset}" — one of: ${ALL_INGESTION_DATASETS.join(", ")}`,
+      );
     }
     const header = req.headers.authorization;
     if (!header?.startsWith("Bearer ")) throw unauthorized("Missing bearer token");

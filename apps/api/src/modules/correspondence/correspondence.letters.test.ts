@@ -181,6 +181,26 @@ describe("correspondence types (#440, #445)", () => {
     expect(removed.json()).toMatchObject({ deleted: false, deactivated: true, letterCount: 1 });
   });
 
+  it("reads and edits a single type, and keeps its response rule coherent", async () => {
+    const detail = await get(`/correspondence/types/${noticeTypeId}`);
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().key).toBe("notice");
+    expect(detail.json()).toHaveProperty("letterCount");
+
+    const edited = await patch(`/correspondence/types/${noticeTypeId}`, { responseDays: 10 });
+    expect(edited.statusCode).toBe(200);
+    expect(edited.json().responseDays).toBe(10);
+
+    const incoherent = await patch(`/correspondence/types/${noticeTypeId}`, { responseDays: null });
+    expect(incoherent.statusCode).toBe(400);
+    expect(incoherent.json().message).toContain("response period");
+
+    // put it back so the rest of the file's expectations still hold
+    await patch(`/correspondence/types/${noticeTypeId}`, { responseDays: 7 });
+    const missing = await get("/correspondence/types/ctp_nope");
+    expect(missing.statusCode).toBe(404);
+  });
+
   it("is invisible to another tenant", async () => {
     const res = await app.inject({
       method: "GET",
@@ -232,6 +252,47 @@ describe("letters (#441, #444, #446)", () => {
     // the contact's name and address were taken from the directory, not typed
     expect(body.recipients[0].name).toBe("Ana Silva");
     expect(body.recipients[0].email).toBe("ana@steelwork.example");
+  });
+
+  it("edits a draft, adds a recipient and removes one that has not acknowledged", async () => {
+    const draft = await post(`/projects/${projectId}/correspondence/letters`, {
+      typeId: letterTypeId,
+      subject: "Draft that will be edited",
+      recipients: [{ partyType: "external", name: "First recipient", email: "first@x.example" }],
+    });
+    const id = draft.json().id as string;
+
+    const edited = await patch(`/projects/${projectId}/correspondence/letters/${id}`, {
+      subject: "Edited before issue",
+      body: "Added a body.",
+      priority: "high",
+    });
+    expect(edited.statusCode).toBe(200);
+    expect(edited.json().subject).toBe("Edited before issue");
+    expect(edited.json().priority).toBe("high");
+
+    const added = await post(`/projects/${projectId}/correspondence/letters/${id}/recipients`, {
+      partyType: "user",
+      partyId: approver.userId,
+      kind: "cc",
+    });
+    expect(added.statusCode).toBe(201);
+    expect(added.json().name).toBeTruthy();
+
+    const removed = await del(`/projects/${projectId}/correspondence/recipients/${added.json().id}`);
+    expect(removed.statusCode).toBe(200);
+    expect(removed.json().deleted).toBe(true);
+
+    const after = await get(`/projects/${projectId}/correspondence/letters/${id}`);
+    expect(after.json().recipients).toHaveLength(1);
+
+    // once issued the distribution list is frozen
+    await post(`/projects/${projectId}/correspondence/letters/${id}/issue`, {});
+    const late = await post(`/projects/${projectId}/correspondence/letters/${id}/recipients`, {
+      partyType: "external",
+      name: "Too late",
+    });
+    expect(late.statusCode).toBe(409);
   });
 
   it("ledgers the creation", async () => {

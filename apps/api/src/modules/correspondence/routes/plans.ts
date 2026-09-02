@@ -981,7 +981,16 @@ export const planRoutes: FastifyPluginAsync = async (app) => {
           })
           .where(eq(actionPlanActivities.id, activityId));
       } else {
-        const signedCount = activity.signoffCount + 1;
+        // Recount from the register rather than incrementing a value read
+        // before the write: two people signing at once must not both believe
+        // they were the second signature.
+        const [{ n = 0 } = { n: 0 }] = await app.db
+          .select({ n: sql<number>`count(*)::int` })
+          .from(actionPlanSignoffs)
+          .where(
+            and(eq(actionPlanSignoffs.activityId, activityId), eq(actionPlanSignoffs.status, "signed")),
+          );
+        const signedCount = Number(n);
         const complete = signoffsSatisfied({
           signoffRequiredCount: activity.signoffRequiredCount,
           signoffCount: signedCount,

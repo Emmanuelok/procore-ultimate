@@ -91,7 +91,13 @@ export default function BackchargesTab({
         mono: true,
         sticky: "start",
       },
-      { id: "title", header: "What is being recovered", accessor: "title", type: "text", width: 280 },
+      {
+        id: "title",
+        header: "What is being recovered",
+        accessor: "title",
+        type: "text",
+        width: 280,
+      },
       {
         id: "reasonCode",
         header: "Reason",

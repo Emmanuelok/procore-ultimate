@@ -53,10 +53,13 @@ export class IfcEngine {
   private meshes: THREE.Mesh[] = [];
   private materialCache = new Map<string, THREE.MeshLambertMaterial>();
   private highlightMaterial: THREE.MeshLambertMaterial;
+  private twinMaterial: THREE.MeshLambertMaterial;
   private bbox = new THREE.Box3();
 
   private selectedExpressID: number | null = null;
   private selectedOriginals = new Map<THREE.Mesh, THREE.Material | THREE.Material[]>();
+  /** meshes tinted because their element is bound to a digital-twin asset */
+  private tintedOriginals = new Map<THREE.Mesh, THREE.Material | THREE.Material[]>();
   private hiddenTypes = new Set<string>();
   private isolatedExpressID: number | null = null;
 
@@ -121,6 +124,14 @@ export class IfcEngine {
       color: 0xf59e0b,
       emissive: 0x92400e,
       emissiveIntensity: 0.55,
+      side: THREE.DoubleSide,
+    });
+    // twin-linked elements: green, so "this is already an asset" is visible
+    // in the model rather than only in a list
+    this.twinMaterial = new THREE.MeshLambertMaterial({
+      color: 0x10b981,
+      emissive: 0x065f46,
+      emissiveIntensity: 0.35,
       side: THREE.DoubleSide,
     });
 
@@ -376,6 +387,11 @@ export class IfcEngine {
     this.selectedExpressID = null;
   }
 
+  /** Is anything currently tinted as a twin asset? */
+  hasTint(): boolean {
+    return this.tintedOriginals.size > 0;
+  }
+
   getSelectedExpressID(): number | null {
     return this.selectedExpressID;
   }
@@ -386,7 +402,16 @@ export class IfcEngine {
    * Returns the picked element, or null when the GUID has no geometry.
    */
   selectByGlobalId(globalId: string): PickedElement | null {
-    if (!this.api || this.modelID < 0) return null;
+    const expressID = this.lookupExpressID(globalId);
+    if (expressID === undefined) return null;
+    this.selectExpressID(expressID);
+    this.focusExpressID(expressID);
+    return this.describeElement(expressID);
+  }
+
+  /** Build (once) and read the lazy GlobalId -> expressID index. */
+  private lookupExpressID(globalId: string): number | undefined {
+    if (!this.api || this.modelID < 0) return undefined;
     if (!this.globalIdIndex) {
       this.globalIdIndex = new Map();
       const uniqueIds = new Set<number>();
@@ -404,11 +429,34 @@ export class IfcEngine {
         }
       }
     }
-    const expressID = this.globalIdIndex.get(globalId);
-    if (expressID === undefined) return null;
-    this.selectExpressID(expressID);
-    this.focusExpressID(expressID);
-    return this.describeElement(expressID);
+    return this.globalIdIndex.get(globalId);
+  }
+
+  /**
+   * Tint every element bound to a digital-twin asset (spec Domain L #658).
+   * Returns how many of the supplied GlobalIds were found in the geometry, so
+   * the page can say "42 of 60 linked assets are in this model" instead of
+   * implying the rest do not exist.
+   */
+  tintByGlobalIds(globalIds: readonly string[]): number {
+    this.clearTint();
+    const ids = new Set<number>();
+    for (const globalId of globalIds) {
+      const expressID = this.lookupExpressID(globalId);
+      if (expressID !== undefined) ids.add(expressID);
+    }
+    for (const mesh of this.meshes) {
+      if (!ids.has(Number(mesh.userData["expressID"]))) continue;
+      if (this.selectedOriginals.has(mesh)) continue; // selection wins
+      this.tintedOriginals.set(mesh, mesh.material);
+      mesh.material = this.twinMaterial;
+    }
+    return ids.size;
+  }
+
+  clearTint(): void {
+    for (const [mesh, material] of this.tintedOriginals) mesh.material = material;
+    this.tintedOriginals.clear();
   }
 
   /** Move the orbit target onto an element without changing camera distance much. */
@@ -498,6 +546,7 @@ export class IfcEngine {
     for (const mesh of this.meshes) mesh.geometry.dispose();
     for (const material of this.materialCache.values()) material.dispose();
     this.highlightMaterial.dispose();
+    this.twinMaterial.dispose();
     this.meshes = [];
     this.materialCache.clear();
     try {

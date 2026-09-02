@@ -134,7 +134,7 @@ export function compareVendors(a: VendorLike, b: VendorLike): DuplicatePair | nu
     score += 0.55;
     reasons.push("identical name once legal form is stripped");
   } else if (nameScore >= 0.6) {
-    score += 0.3 * nameScore;
+    score += 0.35 * nameScore;
     reasons.push(`similar name (${Math.round(nameScore * 100)}% token overlap)`);
   }
 

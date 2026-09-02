@@ -208,8 +208,9 @@ describe("particular conditions", () => {
     const ev = res.json() as { noticeDeadline: string; calendarBasis: string };
     expect(ev.calendarBasis).toBe("working");
     // 10 working days from Fri 18 Dec 2026, skipping weekends and the two
-    // recorded holidays, lands on Fri 8 Jan 2027 (calendar days would be 28 Dec).
-    expect(ev.noticeDeadline).toBe("2027-01-06");
+    // recorded holidays, lands on Tue 5 Jan 2027 — a calendar count would have
+    // said 28 Dec, which is one of the holidays.
+    expect(ev.noticeDeadline).toBe("2027-01-05");
   });
 
   it("lets a bespoke contract state its own bar", async () => {

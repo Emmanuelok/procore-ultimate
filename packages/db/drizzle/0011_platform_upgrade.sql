@@ -1700,6 +1700,98 @@ CREATE TABLE "spec_revision_notices" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
+CREATE TABLE "safety_regulatory_reports" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text,
+	"number" integer NOT NULL,
+	"reference" text NOT NULL,
+	"form" text NOT NULL,
+	"status" text DEFAULT 'generated' NOT NULL,
+	"period_year" integer,
+	"period_from" text,
+	"period_to" text,
+	"incident_id" text,
+	"payload" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"sha256" text NOT NULL,
+	"file_id" text,
+	"row_count" integer DEFAULT 0 NOT NULL,
+	"caveats" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"certified_by" text,
+	"certified_at" timestamp with time zone,
+	"certifier_title" text,
+	"submitted_at" timestamp with time zone,
+	"submitted_by" text,
+	"submission_reference" text,
+	"supersedes_id" text,
+	"superseded_by_id" text,
+	"detail" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"generated_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "safety_risk_snapshots" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"computed_at" timestamp with time zone NOT NULL,
+	"as_of_date" text NOT NULL,
+	"window_from" text NOT NULL,
+	"window_to" text NOT NULL,
+	"score" double precision,
+	"band" text DEFAULT 'unrated' NOT NULL,
+	"components" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"reasons" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"coverage" double precision,
+	"signal_id" text,
+	"detail" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "safety_sensor_events" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"number" integer NOT NULL,
+	"reference" text NOT NULL,
+	"source" text DEFAULT 'wearable' NOT NULL,
+	"kind" text NOT NULL,
+	"severity" text DEFAULT 'high' NOT NULL,
+	"device_id" text,
+	"device_model" text,
+	"worker_id" text,
+	"reported_person_name" text,
+	"vendor_id" text,
+	"occurred_at" timestamp with time zone NOT NULL,
+	"received_at" timestamp with time zone NOT NULL,
+	"location_id" text,
+	"location_text" text,
+	"latitude" double precision,
+	"longitude" double precision,
+	"measurement_value" double precision,
+	"measurement_unit" text,
+	"threshold_value" double precision,
+	"raw_payload" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"status" text DEFAULT 'open' NOT NULL,
+	"acknowledge_due_at" timestamp with time zone,
+	"acknowledged_at" timestamp with time zone,
+	"acknowledged_by" text,
+	"response_seconds" double precision,
+	"response_note" text,
+	"resolved_at" timestamp with time zone,
+	"resolved_by" text,
+	"outcome" text,
+	"incident_id" text,
+	"observation_id" text,
+	"signal_id" text,
+	"external_id" text,
+	"detail" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"created_by" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
 CREATE TABLE "calibrated_instruments" (
 	"id" text PRIMARY KEY NOT NULL,
 	"company_id" text NOT NULL,
@@ -4327,6 +4419,527 @@ CREATE TABLE "transmittals" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
+CREATE TABLE "audit_rights_executions" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text,
+	"verification_id" text,
+	"reference" text NOT NULL,
+	"subject_type" text DEFAULT 'commitment' NOT NULL,
+	"subject_id" text,
+	"subject_name" text NOT NULL,
+	"contract_reference" text,
+	"clause" text,
+	"scope" text NOT NULL,
+	"auditor_name" text,
+	"auditor_user_id" text,
+	"notice_date" text NOT NULL,
+	"notice_days" integer,
+	"scheduled_date" text,
+	"access_granted_at" timestamp with time zone,
+	"records_requested" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"obstruction_note" text,
+	"status" text DEFAULT 'notified' NOT NULL,
+	"completed_at" timestamp with time zone,
+	"outcome" text,
+	"obligation_id" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "call_off_orders" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"number" integer NOT NULL,
+	"reference" text NOT NULL,
+	"title" text NOT NULL,
+	"scope" text,
+	"route" text DEFAULT 'direct_award' NOT NULL,
+	"framework_id" text,
+	"lot_id" text,
+	"mini_competition_id" text,
+	"term_contract_id" text,
+	"vendor_id" text,
+	"supplier_name" text NOT NULL,
+	"currency" text NOT NULL,
+	"order_value" double precision DEFAULT 0 NOT NULL,
+	"certified_value" double precision DEFAULT 0 NOT NULL,
+	"lines" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"commitment_id" text,
+	"status" text DEFAULT 'draft' NOT NULL,
+	"issued_at" text,
+	"required_by" text,
+	"completed_at" text,
+	"justification" text,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "defined_cost_items" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"verification_id" text NOT NULL,
+	"component" text NOT NULL,
+	"contract_heading" text,
+	"description" text NOT NULL,
+	"currency" text NOT NULL,
+	"claimed_amount" double precision DEFAULT 0 NOT NULL,
+	"verified_amount" double precision DEFAULT 0 NOT NULL,
+	"verdict" text DEFAULT 'pending' NOT NULL,
+	"evidence_ref" text,
+	"evidence_id" text,
+	"source_type" text,
+	"source_id" text,
+	"verifier_note" text,
+	"verified_by" text,
+	"verified_at" timestamp with time zone,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "disallowed_costs" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"number" integer NOT NULL,
+	"verification_id" text,
+	"defined_cost_item_id" text,
+	"description" text NOT NULL,
+	"category" text NOT NULL,
+	"ground_clause" text,
+	"currency" text NOT NULL,
+	"amount" double precision DEFAULT 0 NOT NULL,
+	"deducted_amount" double precision DEFAULT 0 NOT NULL,
+	"status" text DEFAULT 'raised' NOT NULL,
+	"raised_by" text NOT NULL,
+	"raised_at" text NOT NULL,
+	"response_due_at" text,
+	"contractor_response" text,
+	"responded_at" timestamp with time zone,
+	"resolved_by" text,
+	"resolved_at" timestamp with time zone,
+	"resolution_note" text,
+	"obligation_id" text,
+	"deduction_ref_type" text,
+	"deduction_ref_id" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "framework_agreements" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"portfolio_id" text,
+	"reference" text NOT NULL,
+	"title" text NOT NULL,
+	"description" text,
+	"contracting_authority" text,
+	"start_date" text,
+	"end_date" text,
+	"extension_to_date" text,
+	"currency" text NOT NULL,
+	"maximum_value" double precision,
+	"award_mode" text DEFAULT 'mini_competition' NOT NULL,
+	"direct_award_threshold" double precision,
+	"status" text DEFAULT 'draft' NOT NULL,
+	"rules_reference" text,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "framework_lots" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"framework_id" text NOT NULL,
+	"lot_number" text NOT NULL,
+	"title" text NOT NULL,
+	"description" text,
+	"currency" text NOT NULL,
+	"ceiling_value" double precision,
+	"award_mode" text,
+	"status" text DEFAULT 'live' NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "framework_mini_competitions" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"framework_id" text NOT NULL,
+	"lot_id" text,
+	"project_id" text,
+	"reference" text NOT NULL,
+	"title" text NOT NULL,
+	"scope" text,
+	"currency" text NOT NULL,
+	"estimated_value" double precision,
+	"invited_supplier_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"evaluation_criteria" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"responses" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"issued_at" text,
+	"responses_due_at" text,
+	"status" text DEFAULT 'draft' NOT NULL,
+	"awarded_supplier_id" text,
+	"awarded_supplier_name" text,
+	"award_value" double precision,
+	"awarded_at" timestamp with time zone,
+	"awarded_by" text,
+	"decision_note" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "framework_suppliers" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"framework_id" text NOT NULL,
+	"lot_id" text,
+	"vendor_id" text,
+	"supplier_name" text NOT NULL,
+	"rank" integer,
+	"status" text DEFAULT 'appointed' NOT NULL,
+	"appointed_at" text,
+	"suspended_reason" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "joint_ventures" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text,
+	"name" text NOT NULL,
+	"structure" text DEFAULT 'joint_venture' NOT NULL,
+	"currency" text NOT NULL,
+	"formation_date" text,
+	"end_date" text,
+	"deed_reference" text,
+	"registered_number" text,
+	"jurisdiction" text,
+	"quorum_percent" double precision,
+	"reserved_matter_threshold_percent" double precision,
+	"status" text DEFAULT 'forming' NOT NULL,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "jv_decisions" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"jv_id" text NOT NULL,
+	"reference" text,
+	"decision_type" text DEFAULT 'ordinary' NOT NULL,
+	"meeting_date" text NOT NULL,
+	"subject" text NOT NULL,
+	"narrative" text,
+	"deed_clause" text,
+	"votes" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"share_present_percent" double precision,
+	"share_for_percent" double precision,
+	"quorum_met" integer DEFAULT 0 NOT NULL,
+	"threshold_met" integer DEFAULT 0 NOT NULL,
+	"outcome" text DEFAULT 'deferred' NOT NULL,
+	"obligation_id" text,
+	"recorded_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "jv_partners" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"jv_id" text NOT NULL,
+	"name" text NOT NULL,
+	"entity_id" text,
+	"vendor_id" text,
+	"role" text DEFAULT 'partner' NOT NULL,
+	"share_percent" double precision DEFAULT 0 NOT NULL,
+	"committed_capital" double precision,
+	"liability_basis" text DEFAULT 'joint_and_several' NOT NULL,
+	"is_self" integer DEFAULT 0 NOT NULL,
+	"board_seats" integer,
+	"status" text DEFAULT 'active' NOT NULL,
+	"joined_at" text,
+	"left_at" text,
+	"notes" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "jv_transactions" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"jv_id" text NOT NULL,
+	"partner_id" text NOT NULL,
+	"kind" text NOT NULL,
+	"currency" text NOT NULL,
+	"amount" double precision DEFAULT 0 NOT NULL,
+	"due_date" text,
+	"settled_date" text,
+	"status" text DEFAULT 'planned' NOT NULL,
+	"reference" text,
+	"obligation_id" text,
+	"description" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "open_book_verifications" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"number" integer NOT NULL,
+	"reference" text NOT NULL,
+	"title" text NOT NULL,
+	"target_cost_id" text,
+	"period_start" text,
+	"period_end" text,
+	"currency" text NOT NULL,
+	"claimed_amount" double precision DEFAULT 0 NOT NULL,
+	"verified_amount" double precision DEFAULT 0 NOT NULL,
+	"queried_amount" double precision DEFAULT 0 NOT NULL,
+	"disallowed_amount" double precision DEFAULT 0 NOT NULL,
+	"pending_amount" double precision DEFAULT 0 NOT NULL,
+	"totals_calculated_at" timestamp with time zone,
+	"audit_rights_clause" text,
+	"component_mapping" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"methodology" text,
+	"sampling" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"verifier_id" text,
+	"verifier_name" text,
+	"planned_at" text,
+	"status" text DEFAULT 'planned' NOT NULL,
+	"reported_at" timestamp with time zone,
+	"findings" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "pain_gain_calculations" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"target_cost_id" text NOT NULL,
+	"basis" text DEFAULT 'forecast' NOT NULL,
+	"currency" text NOT NULL,
+	"adjusted_target" double precision DEFAULT 0 NOT NULL,
+	"outturn_cost" double precision DEFAULT 0 NOT NULL,
+	"variance" double precision DEFAULT 0 NOT NULL,
+	"contractor_share" double precision DEFAULT 0 NOT NULL,
+	"client_share" double precision DEFAULT 0 NOT NULL,
+	"detail" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"computed_by" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "portfolio_allocations" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"funding_source_id" text,
+	"appropriation_id" text,
+	"fiscal_year" text,
+	"currency" text NOT NULL,
+	"amount" double precision DEFAULT 0 NOT NULL,
+	"drawn_amount" double precision DEFAULT 0 NOT NULL,
+	"expenditure_class" text DEFAULT 'capital' NOT NULL,
+	"status" text DEFAULT 'planned' NOT NULL,
+	"whole_life_cost" double precision,
+	"approved_by" text,
+	"approved_at" timestamp with time zone,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "portfolio_appropriations" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"portfolio_id" text,
+	"funding_source_id" text,
+	"fiscal_year" text NOT NULL,
+	"period_start" text,
+	"period_end" text,
+	"name" text NOT NULL,
+	"currency" text NOT NULL,
+	"appropriated_amount" double precision DEFAULT 0 NOT NULL,
+	"carried_forward_in" double precision DEFAULT 0 NOT NULL,
+	"carried_forward_out" double precision DEFAULT 0 NOT NULL,
+	"virement_net" double precision DEFAULT 0 NOT NULL,
+	"expenditure_class" text DEFAULT 'capital' NOT NULL,
+	"carry_forward_policy" text DEFAULT 'request' NOT NULL,
+	"status" text DEFAULT 'draft' NOT NULL,
+	"carried_forward_from_id" text,
+	"approved_by" text,
+	"approved_at" timestamp with time zone,
+	"closed_at" timestamp with time zone,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "portfolio_envelopes" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"portfolio_id" text,
+	"name" text NOT NULL,
+	"fiscal_year" text NOT NULL,
+	"currency" text NOT NULL,
+	"envelope_amount" double precision DEFAULT 0 NOT NULL,
+	"basis" text,
+	"expenditure_class" text DEFAULT 'capital' NOT NULL,
+	"status" text DEFAULT 'draft' NOT NULL,
+	"superseded_by_id" text,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "portfolio_funding_sources" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"portfolio_id" text,
+	"reference" text,
+	"name" text NOT NULL,
+	"kind" text NOT NULL,
+	"provider" text,
+	"currency" text NOT NULL,
+	"amount" double precision DEFAULT 0 NOT NULL,
+	"available_from" text,
+	"available_to" text,
+	"status" text DEFAULT 'proposed' NOT NULL,
+	"expenditure_class" text DEFAULT 'capital' NOT NULL,
+	"conditions" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "portfolio_scores" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"model_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"scores" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"rationale" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"notes" text,
+	"scored_by" text NOT NULL,
+	"scored_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "portfolio_scoring_models" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"portfolio_id" text,
+	"name" text NOT NULL,
+	"description" text,
+	"criteria" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"normalisation" text DEFAULT 'fixed_scale' NOT NULL,
+	"status" text DEFAULT 'draft' NOT NULL,
+	"version" integer DEFAULT 1 NOT NULL,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "portfolio_virements" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"from_appropriation_id" text NOT NULL,
+	"to_appropriation_id" text NOT NULL,
+	"currency" text NOT NULL,
+	"amount" double precision DEFAULT 0 NOT NULL,
+	"reason" text NOT NULL,
+	"status" text DEFAULT 'proposed' NOT NULL,
+	"requested_by" text NOT NULL,
+	"decided_by" text,
+	"decided_at" timestamp with time zone,
+	"decision_note" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "schedule_of_rates_items" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"term_contract_id" text NOT NULL,
+	"code" text NOT NULL,
+	"description" text NOT NULL,
+	"category" text,
+	"unit" text NOT NULL,
+	"currency" text NOT NULL,
+	"rate" double precision DEFAULT 0 NOT NULL,
+	"active" integer DEFAULT 1 NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "target_cost_contracts" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"name" text NOT NULL,
+	"contract_reference" text,
+	"is_alliance" integer DEFAULT 0 NOT NULL,
+	"currency" text NOT NULL,
+	"base_target_cost" double precision DEFAULT 0 NOT NULL,
+	"target_adjustments" double precision DEFAULT 0 NOT NULL,
+	"actual_defined_cost" double precision DEFAULT 0 NOT NULL,
+	"forecast_defined_cost" double precision,
+	"fee_percent" double precision DEFAULT 0 NOT NULL,
+	"mechanism" text DEFAULT 'banded_share' NOT NULL,
+	"share_bands" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"pain_cap" double precision,
+	"gain_cap" double precision,
+	"participants" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"status" text DEFAULT 'draft' NOT NULL,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "term_contracts" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"portfolio_id" text,
+	"reference" text NOT NULL,
+	"title" text NOT NULL,
+	"vendor_id" text,
+	"supplier_name" text NOT NULL,
+	"currency" text NOT NULL,
+	"start_date" text,
+	"end_date" text,
+	"maximum_value" double precision,
+	"adjustment_percent" double precision DEFAULT 0 NOT NULL,
+	"adjustment_basis" text DEFAULT 'none' NOT NULL,
+	"index_reference" text,
+	"price_base_date" text,
+	"status" text DEFAULT 'draft' NOT NULL,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
 CREATE TABLE "agent_actions" (
 	"id" text PRIMARY KEY NOT NULL,
 	"company_id" text NOT NULL,
@@ -4887,6 +5500,19 @@ CREATE INDEX "vendor_portal_tokens_vendor_idx" ON "vendor_portal_tokens" USING b
 CREATE INDEX "spec_revision_notices_project_idx" ON "spec_revision_notices" USING btree ("project_id","created_at");--> statement-breakpoint
 CREATE INDEX "spec_revision_notices_section_idx" ON "spec_revision_notices" USING btree ("section_id");--> statement-breakpoint
 CREATE INDEX "spec_revision_notices_ack_idx" ON "spec_revision_notices" USING btree ("project_id","acknowledged_at");--> statement-breakpoint
+CREATE UNIQUE INDEX "safety_regulatory_reports_uq" ON "safety_regulatory_reports" USING btree ("company_id","number");--> statement-breakpoint
+CREATE INDEX "safety_regulatory_reports_project_idx" ON "safety_regulatory_reports" USING btree ("project_id","form");--> statement-breakpoint
+CREATE INDEX "safety_regulatory_reports_incident_idx" ON "safety_regulatory_reports" USING btree ("incident_id");--> statement-breakpoint
+CREATE INDEX "safety_regulatory_reports_period_idx" ON "safety_regulatory_reports" USING btree ("company_id","form","period_year");--> statement-breakpoint
+CREATE UNIQUE INDEX "safety_risk_snapshots_uq" ON "safety_risk_snapshots" USING btree ("project_id","as_of_date");--> statement-breakpoint
+CREATE INDEX "safety_risk_snapshots_project_idx" ON "safety_risk_snapshots" USING btree ("project_id","computed_at");--> statement-breakpoint
+CREATE INDEX "safety_risk_snapshots_company_idx" ON "safety_risk_snapshots" USING btree ("company_id","as_of_date");--> statement-breakpoint
+CREATE UNIQUE INDEX "safety_sensor_events_uq" ON "safety_sensor_events" USING btree ("project_id","number");--> statement-breakpoint
+CREATE UNIQUE INDEX "safety_sensor_events_external_uq" ON "safety_sensor_events" USING btree ("company_id","external_id");--> statement-breakpoint
+CREATE INDEX "safety_sensor_events_project_idx" ON "safety_sensor_events" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "safety_sensor_events_occurred_idx" ON "safety_sensor_events" USING btree ("project_id","occurred_at");--> statement-breakpoint
+CREATE INDEX "safety_sensor_events_worker_idx" ON "safety_sensor_events" USING btree ("worker_id");--> statement-breakpoint
+CREATE INDEX "safety_sensor_events_due_idx" ON "safety_sensor_events" USING btree ("company_id","status","acknowledge_due_at");--> statement-breakpoint
 CREATE UNIQUE INDEX "calibrated_instruments_uq" ON "calibrated_instruments" USING btree ("project_id","number");--> statement-breakpoint
 CREATE UNIQUE INDEX "calibrated_instruments_serial_uq" ON "calibrated_instruments" USING btree ("project_id","serial_number");--> statement-breakpoint
 CREATE INDEX "calibrated_instruments_project_idx" ON "calibrated_instruments" USING btree ("project_id","status");--> statement-breakpoint
@@ -5208,6 +5834,76 @@ CREATE UNIQUE INDEX "transmittals_ref_uq" ON "transmittals" USING btree ("projec
 CREATE INDEX "transmittals_project_idx" ON "transmittals" USING btree ("project_id","status");--> statement-breakpoint
 CREATE INDEX "transmittals_company_idx" ON "transmittals" USING btree ("company_id");--> statement-breakpoint
 CREATE INDEX "transmittals_ack_due_idx" ON "transmittals" USING btree ("status","ack_due_date");--> statement-breakpoint
+CREATE INDEX "audit_rights_executions_company_idx" ON "audit_rights_executions" USING btree ("company_id","status");--> statement-breakpoint
+CREATE INDEX "audit_rights_executions_project_idx" ON "audit_rights_executions" USING btree ("company_id","project_id");--> statement-breakpoint
+CREATE INDEX "audit_rights_executions_subject_idx" ON "audit_rights_executions" USING btree ("company_id","subject_type","subject_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "call_off_orders_uq" ON "call_off_orders" USING btree ("project_id","number");--> statement-breakpoint
+CREATE INDEX "call_off_orders_project_idx" ON "call_off_orders" USING btree ("company_id","project_id","status");--> statement-breakpoint
+CREATE INDEX "call_off_orders_framework_idx" ON "call_off_orders" USING btree ("company_id","framework_id");--> statement-breakpoint
+CREATE INDEX "call_off_orders_lot_idx" ON "call_off_orders" USING btree ("lot_id");--> statement-breakpoint
+CREATE INDEX "call_off_orders_term_idx" ON "call_off_orders" USING btree ("company_id","term_contract_id");--> statement-breakpoint
+CREATE INDEX "call_off_orders_vendor_idx" ON "call_off_orders" USING btree ("company_id","vendor_id");--> statement-breakpoint
+CREATE INDEX "defined_cost_items_verification_idx" ON "defined_cost_items" USING btree ("company_id","verification_id","verdict");--> statement-breakpoint
+CREATE INDEX "defined_cost_items_project_idx" ON "defined_cost_items" USING btree ("company_id","project_id");--> statement-breakpoint
+CREATE INDEX "defined_cost_items_component_idx" ON "defined_cost_items" USING btree ("company_id","verification_id","component");--> statement-breakpoint
+CREATE UNIQUE INDEX "disallowed_costs_uq" ON "disallowed_costs" USING btree ("project_id","number");--> statement-breakpoint
+CREATE INDEX "disallowed_costs_project_idx" ON "disallowed_costs" USING btree ("company_id","project_id","status");--> statement-breakpoint
+CREATE INDEX "disallowed_costs_verification_idx" ON "disallowed_costs" USING btree ("verification_id");--> statement-breakpoint
+CREATE INDEX "disallowed_costs_response_idx" ON "disallowed_costs" USING btree ("company_id","status","response_due_at");--> statement-breakpoint
+CREATE UNIQUE INDEX "framework_agreements_uq" ON "framework_agreements" USING btree ("company_id","reference");--> statement-breakpoint
+CREATE INDEX "framework_agreements_company_idx" ON "framework_agreements" USING btree ("company_id","status");--> statement-breakpoint
+CREATE INDEX "framework_agreements_end_idx" ON "framework_agreements" USING btree ("company_id","status","end_date");--> statement-breakpoint
+CREATE UNIQUE INDEX "framework_lots_uq" ON "framework_lots" USING btree ("framework_id","lot_number");--> statement-breakpoint
+CREATE INDEX "framework_lots_company_idx" ON "framework_lots" USING btree ("company_id","framework_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "framework_mini_competitions_uq" ON "framework_mini_competitions" USING btree ("company_id","reference");--> statement-breakpoint
+CREATE INDEX "framework_mini_competitions_framework_idx" ON "framework_mini_competitions" USING btree ("company_id","framework_id","status");--> statement-breakpoint
+CREATE INDEX "framework_mini_competitions_project_idx" ON "framework_mini_competitions" USING btree ("company_id","project_id");--> statement-breakpoint
+CREATE INDEX "framework_mini_competitions_due_idx" ON "framework_mini_competitions" USING btree ("company_id","status","responses_due_at");--> statement-breakpoint
+CREATE INDEX "framework_suppliers_framework_idx" ON "framework_suppliers" USING btree ("company_id","framework_id","status");--> statement-breakpoint
+CREATE INDEX "framework_suppliers_lot_idx" ON "framework_suppliers" USING btree ("lot_id");--> statement-breakpoint
+CREATE INDEX "framework_suppliers_vendor_idx" ON "framework_suppliers" USING btree ("company_id","vendor_id");--> statement-breakpoint
+CREATE INDEX "joint_ventures_company_idx" ON "joint_ventures" USING btree ("company_id","status");--> statement-breakpoint
+CREATE INDEX "joint_ventures_project_idx" ON "joint_ventures" USING btree ("company_id","project_id");--> statement-breakpoint
+CREATE INDEX "jv_decisions_jv_idx" ON "jv_decisions" USING btree ("company_id","jv_id","meeting_date");--> statement-breakpoint
+CREATE INDEX "jv_decisions_outcome_idx" ON "jv_decisions" USING btree ("company_id","outcome");--> statement-breakpoint
+CREATE INDEX "jv_partners_jv_idx" ON "jv_partners" USING btree ("company_id","jv_id");--> statement-breakpoint
+CREATE INDEX "jv_partners_entity_idx" ON "jv_partners" USING btree ("company_id","entity_id");--> statement-breakpoint
+CREATE INDEX "jv_transactions_jv_idx" ON "jv_transactions" USING btree ("company_id","jv_id","status");--> statement-breakpoint
+CREATE INDEX "jv_transactions_partner_idx" ON "jv_transactions" USING btree ("partner_id");--> statement-breakpoint
+CREATE INDEX "jv_transactions_due_idx" ON "jv_transactions" USING btree ("company_id","status","due_date");--> statement-breakpoint
+CREATE UNIQUE INDEX "open_book_verifications_uq" ON "open_book_verifications" USING btree ("project_id","number");--> statement-breakpoint
+CREATE INDEX "open_book_verifications_project_idx" ON "open_book_verifications" USING btree ("company_id","project_id","status");--> statement-breakpoint
+CREATE INDEX "open_book_verifications_planned_idx" ON "open_book_verifications" USING btree ("company_id","status","planned_at");--> statement-breakpoint
+CREATE INDEX "pain_gain_calculations_target_idx" ON "pain_gain_calculations" USING btree ("company_id","target_cost_id");--> statement-breakpoint
+CREATE INDEX "pain_gain_calculations_project_idx" ON "pain_gain_calculations" USING btree ("company_id","project_id");--> statement-breakpoint
+CREATE INDEX "portfolio_allocations_company_idx" ON "portfolio_allocations" USING btree ("company_id","status");--> statement-breakpoint
+CREATE INDEX "portfolio_allocations_project_idx" ON "portfolio_allocations" USING btree ("company_id","project_id");--> statement-breakpoint
+CREATE INDEX "portfolio_allocations_source_idx" ON "portfolio_allocations" USING btree ("company_id","funding_source_id");--> statement-breakpoint
+CREATE INDEX "portfolio_allocations_appropriation_idx" ON "portfolio_allocations" USING btree ("appropriation_id");--> statement-breakpoint
+CREATE INDEX "portfolio_allocations_year_idx" ON "portfolio_allocations" USING btree ("company_id","fiscal_year");--> statement-breakpoint
+CREATE INDEX "portfolio_appropriations_company_idx" ON "portfolio_appropriations" USING btree ("company_id","fiscal_year","status");--> statement-breakpoint
+CREATE INDEX "portfolio_appropriations_source_idx" ON "portfolio_appropriations" USING btree ("company_id","funding_source_id");--> statement-breakpoint
+CREATE INDEX "portfolio_appropriations_portfolio_idx" ON "portfolio_appropriations" USING btree ("company_id","portfolio_id");--> statement-breakpoint
+CREATE INDEX "portfolio_appropriations_carry_idx" ON "portfolio_appropriations" USING btree ("carried_forward_from_id");--> statement-breakpoint
+CREATE INDEX "portfolio_envelopes_company_idx" ON "portfolio_envelopes" USING btree ("company_id","fiscal_year","status");--> statement-breakpoint
+CREATE INDEX "portfolio_envelopes_portfolio_idx" ON "portfolio_envelopes" USING btree ("company_id","portfolio_id");--> statement-breakpoint
+CREATE INDEX "portfolio_funding_sources_company_idx" ON "portfolio_funding_sources" USING btree ("company_id","status");--> statement-breakpoint
+CREATE INDEX "portfolio_funding_sources_portfolio_idx" ON "portfolio_funding_sources" USING btree ("company_id","portfolio_id");--> statement-breakpoint
+CREATE INDEX "portfolio_funding_sources_currency_idx" ON "portfolio_funding_sources" USING btree ("company_id","currency");--> statement-breakpoint
+CREATE UNIQUE INDEX "portfolio_scores_uq" ON "portfolio_scores" USING btree ("model_id","project_id");--> statement-breakpoint
+CREATE INDEX "portfolio_scores_company_idx" ON "portfolio_scores" USING btree ("company_id","model_id");--> statement-breakpoint
+CREATE INDEX "portfolio_scores_project_idx" ON "portfolio_scores" USING btree ("company_id","project_id");--> statement-breakpoint
+CREATE INDEX "portfolio_scoring_models_company_idx" ON "portfolio_scoring_models" USING btree ("company_id","status");--> statement-breakpoint
+CREATE INDEX "portfolio_scoring_models_portfolio_idx" ON "portfolio_scoring_models" USING btree ("company_id","portfolio_id");--> statement-breakpoint
+CREATE INDEX "portfolio_virements_company_idx" ON "portfolio_virements" USING btree ("company_id","status");--> statement-breakpoint
+CREATE INDEX "portfolio_virements_from_idx" ON "portfolio_virements" USING btree ("from_appropriation_id");--> statement-breakpoint
+CREATE INDEX "portfolio_virements_to_idx" ON "portfolio_virements" USING btree ("to_appropriation_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "schedule_of_rates_items_uq" ON "schedule_of_rates_items" USING btree ("term_contract_id","code");--> statement-breakpoint
+CREATE INDEX "schedule_of_rates_items_contract_idx" ON "schedule_of_rates_items" USING btree ("company_id","term_contract_id","active");--> statement-breakpoint
+CREATE INDEX "target_cost_contracts_project_idx" ON "target_cost_contracts" USING btree ("company_id","project_id","status");--> statement-breakpoint
+CREATE UNIQUE INDEX "term_contracts_uq" ON "term_contracts" USING btree ("company_id","reference");--> statement-breakpoint
+CREATE INDEX "term_contracts_company_idx" ON "term_contracts" USING btree ("company_id","status");--> statement-breakpoint
+CREATE INDEX "term_contracts_vendor_idx" ON "term_contracts" USING btree ("company_id","vendor_id");--> statement-breakpoint
 CREATE INDEX "agent_actions_company_idx" ON "agent_actions" USING btree ("company_id","status");--> statement-breakpoint
 CREATE INDEX "agent_actions_project_idx" ON "agent_actions" USING btree ("project_id");--> statement-breakpoint
 CREATE INDEX "agent_actions_target_idx" ON "agent_actions" USING btree ("target_type","target_id");--> statement-breakpoint

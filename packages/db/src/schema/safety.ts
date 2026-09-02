@@ -599,3 +599,184 @@ export const safetyProgrammeRecords = pgTable(
     index("safety_programme_records_vendor_idx").on(t.vendorId),
   ],
 );
+
+/* ================================================================== */
+/* PLATFORM UPGRADE WAVE — regulatory outputs, devices, risk index     */
+/* ================================================================== */
+
+/**
+ * A generated statutory artefact: an OSHA 300 log, a 300A annual summary, a
+ * 301 incident report, a RIDDOR F2508 prefill.
+ *
+ * WHY IT IS STORED RATHER THAN RENDERED ON DEMAND. The 300A is posted on a
+ * wall for three months and signed by a company executive; the F2508 is what
+ * was actually said to the authority. Both are assertions made ON A DATE from
+ * the records as they stood THEN. Regenerating them later from a register
+ * that has since been corrected produces a different document with the same
+ * name, which is precisely the thing an inspector is entitled to ask about.
+ * So the payload is frozen, hashed, and written to the file store; a
+ * correction is a NEW artefact that supersedes this one.
+ */
+export const safetyRegulatoryReports = pgTable(
+  "safety_regulatory_reports",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    /** null for a company-level roll-up; normally the project the log covers */
+    projectId: text("project_id"),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    form: text("form").notNull(), // SafetyRegulatoryForm
+    status: text("status").default("generated").notNull(), // SafetyRegulatoryReportStatus
+    /** establishment/annual forms carry a year; per-incident forms do not */
+    periodYear: integer("period_year"),
+    periodFrom: text("period_from"),
+    periodTo: text("period_to"),
+    /** set for the per-incident forms (301, F2508) */
+    incidentId: text("incident_id"),
+    /** the frozen document, exactly as generated */
+    payload: jsonb("payload").$type<Record<string, unknown>>().default({}).notNull(),
+    /** sha256 of the canonical JSON — the artefact's identity */
+    sha256: text("sha256").notNull(),
+    /** the stored file carrying the same bytes */
+    fileId: text("file_id"),
+    /** rows in the log / cases summarised, so a list renders without the payload */
+    rowCount: integer("row_count").default(0).notNull(),
+    /** everything the generator could NOT establish, quoted to the reader */
+    caveats: jsonb("caveats").$type<string[]>().default([]).notNull(),
+    /** the executive certification on a 300A, when one has been given */
+    certifiedBy: text("certified_by"),
+    certifiedAt: timestamp("certified_at", { withTimezone: true, mode: "string" }),
+    certifierTitle: text("certifier_title"),
+    submittedAt: timestamp("submitted_at", { withTimezone: true, mode: "string" }),
+    submittedBy: text("submitted_by"),
+    submissionReference: text("submission_reference"),
+    supersedesId: text("supersedes_id"),
+    supersededById: text("superseded_by_id"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    generatedBy: text("generated_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("safety_regulatory_reports_uq").on(t.companyId, t.number),
+    index("safety_regulatory_reports_project_idx").on(t.projectId, t.form),
+    index("safety_regulatory_reports_incident_idx").on(t.incidentId),
+    index("safety_regulatory_reports_period_idx").on(t.companyId, t.form, t.periodYear),
+  ],
+);
+
+/**
+ * An alarm from a wearable, a lone-worker device, a gas detector or a
+ * proximity tag.
+ *
+ * These are NOT incidents and must never be filed as them. A man-down alarm
+ * is an accelerometer reading; the question it poses is "did somebody go and
+ * look, and how long did that take". So the register's own duty is the
+ * response clock: `acknowledgeDueAt` is computed from the alarm class on
+ * ingest, and an unacknowledged life-safety alarm past that point is a signal
+ * in its own right. Conversion to an incident or an observation is explicit
+ * and recorded, which keeps the two populations honest — a site whose alarms
+ * all become incidents is over-converting, and one where none do is ignoring
+ * its devices.
+ */
+export const safetySensorEvents = pgTable(
+  "safety_sensor_events",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    source: text("source").default("wearable").notNull(), // SafetySensorSource
+    kind: text("kind").notNull(), // SafetySensorEventKind
+    severity: text("severity").default("high").notNull(), // SafetySeverity
+    /** the device's own identifier, as the fleet console shows it */
+    deviceId: text("device_id"),
+    deviceModel: text("device_model"),
+    /** workforce.workers.id when the device is assigned to a registered worker */
+    workerId: text("worker_id"),
+    /** the name the device reported, when the worker is not in the register */
+    reportedPersonName: text("reported_person_name"),
+    vendorId: text("vendor_id"),
+    occurredAt: timestamp("occurred_at", { withTimezone: true, mode: "string" }).notNull(),
+    receivedAt: timestamp("received_at", { withTimezone: true, mode: "string" }).notNull(),
+    locationId: text("location_id"),
+    locationText: text("location_text"),
+    latitude: doublePrecision("latitude"),
+    longitude: doublePrecision("longitude"),
+    /** the reading that tripped the alarm, with its unit (ppm, dB(A), g) */
+    measurementValue: doublePrecision("measurement_value"),
+    measurementUnit: text("measurement_unit"),
+    thresholdValue: doublePrecision("threshold_value"),
+    /** the whole device payload, kept verbatim for forensic replay */
+    rawPayload: jsonb("raw_payload").$type<Record<string, unknown>>().default({}).notNull(),
+    status: text("status").default("open").notNull(), // SafetySensorEventStatus
+    /** the response clock — a life-safety alarm has a very short one */
+    acknowledgeDueAt: timestamp("acknowledge_due_at", { withTimezone: true, mode: "string" }),
+    acknowledgedAt: timestamp("acknowledged_at", { withTimezone: true, mode: "string" }),
+    acknowledgedBy: text("acknowledged_by"),
+    responseSeconds: doublePrecision("response_seconds"),
+    responseNote: text("response_note"),
+    resolvedAt: timestamp("resolved_at", { withTimezone: true, mode: "string" }),
+    resolvedBy: text("resolved_by"),
+    outcome: text("outcome"),
+    /** explicit conversion, never implicit */
+    incidentId: text("incident_id"),
+    observationId: text("observation_id"),
+    signalId: text("signal_id"),
+    /** idempotency for a device that retries — unique per company */
+    externalId: text("external_id"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by"),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("safety_sensor_events_uq").on(t.projectId, t.number),
+    uniqueIndex("safety_sensor_events_external_uq").on(t.companyId, t.externalId),
+    index("safety_sensor_events_project_idx").on(t.projectId, t.status),
+    index("safety_sensor_events_occurred_idx").on(t.projectId, t.occurredAt),
+    index("safety_sensor_events_worker_idx").on(t.workerId),
+    index("safety_sensor_events_due_idx").on(t.companyId, t.status, t.acknowledgeDueAt),
+  ],
+);
+
+/**
+ * A dated reading of the predictive safety risk index.
+ *
+ * Stored rather than computed on demand because the only useful thing about a
+ * leading indicator is its TREND: an index of 62 means nothing, an index that
+ * has moved 38 → 62 in three weeks is a conversation. Each snapshot keeps its
+ * components and the inputs behind them, so a reader can see WHICH indicator
+ * moved rather than being handed a number to trust.
+ */
+export const safetyRiskSnapshots = pgTable(
+  "safety_risk_snapshots",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    computedAt: timestamp("computed_at", { withTimezone: true, mode: "string" }).notNull(),
+    asOfDate: text("as_of_date").notNull(),
+    windowFrom: text("window_from").notNull(),
+    windowTo: text("window_to").notNull(),
+    /** 0-100, higher = more exposed; null when too little could be computed */
+    score: doublePrecision("score"),
+    band: text("band").default("unrated").notNull(), // SafetyRiskBand
+    /** [{ key, value, weight, contribution, basis, inputs, reasons }] */
+    components: jsonb("components").$type<unknown[]>().default([]).notNull(),
+    /** components that could not be computed and why */
+    reasons: jsonb("reasons").$type<string[]>().default([]).notNull(),
+    /** how much of the index's weight was actually available */
+    coverage: doublePrecision("coverage"),
+    signalId: text("signal_id"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    uniqueIndex("safety_risk_snapshots_uq").on(t.projectId, t.asOfDate),
+    index("safety_risk_snapshots_project_idx").on(t.projectId, t.computedAt),
+    index("safety_risk_snapshots_company_idx").on(t.companyId, t.asOfDate),
+  ],
+);

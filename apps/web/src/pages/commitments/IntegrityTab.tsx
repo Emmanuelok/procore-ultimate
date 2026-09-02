@@ -177,10 +177,7 @@ export default function IntegrityTab({
           values, for all {report.commitmentCount} commitment(s) on this project.
         </Alert>
       ) : (
-        <Alert
-          tone="danger"
-          title={`${report.failingCount} commitment(s) do not reconcile`}
-        >
+        <Alert tone="danger" title={`${report.failingCount} commitment(s) do not reconcile`}>
           Each failing check is printed below with both sides and the variance. A commitment whose
           register and schedule disagree is a commitment whose sum nobody can defend.
         </Alert>
@@ -317,7 +314,12 @@ export default function IntegrityTab({
             ))
           )}
           {byCode && byCode.notes.length > 0 ? (
-            <Alert tone="info" size="sm" variant="subtle" title="What these figures do and do not say">
+            <Alert
+              tone="info"
+              size="sm"
+              variant="subtle"
+              title="What these figures do and do not say"
+            >
               <ul className="list-disc pl-4">
                 {byCode.notes.map((n) => (
                   <li key={n}>{n}</li>

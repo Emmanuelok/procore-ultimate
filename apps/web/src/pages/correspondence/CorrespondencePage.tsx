@@ -21,7 +21,7 @@
  */
 import { useCallback, useState } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
-import { Badge, PageHeader, Stat, Tabs } from "../../ui";
+import { Alert, Badge, Card, CardBody, PageHeader, Stat, Tabs } from "../../ui";
 import { IconMail } from "../../ui/icons";
 import ActionPlansTab from "./ActionPlansTab";
 import FormsTab from "./FormsTab";
@@ -29,7 +29,19 @@ import InboundTab from "./InboundTab";
 import LettersTab from "./LettersTab";
 import SetupTab from "./SetupTab";
 import TransmittalsTab from "./TransmittalsTab";
-import { ReasonList, count, days, pct, titleCase, useSummary } from "./correspondenceShared";
+import {
+  DETECTOR_LABEL,
+  ReasonList,
+  count,
+  dateTime,
+  days,
+  pct,
+  severityTone,
+  titleCase,
+  useResource,
+  useSummary,
+  type CorrespondenceSignal,
+} from "./correspondenceShared";
 
 type TabKey = "letters" | "transmittals" | "plans" | "forms" | "inbound" | "setup";
 
@@ -178,6 +190,8 @@ export default function CorrespondencePage() {
         <ReasonList reasons={s.reasons} className="mb-4" />
       ) : null}
 
+      <SignalsPanel projectId={projectId} />
+
       {tab === "letters" ? <LettersTab projectId={projectId} onChanged={summary.reload} /> : null}
       {tab === "transmittals" ? (
         <TransmittalsTab projectId={projectId} onChanged={summary.reload} />
@@ -188,5 +202,54 @@ export default function CorrespondencePage() {
       {tab === "setup" ? <SetupTab projectId={projectId} onChanged={summary.reload} /> : null}
       <span className="sr-only">{titleCase(tab)}</span>
     </div>
+  );
+}
+
+/**
+ * What the sweeps found. Only rendered when there is something to say — an
+ * empty panel about an empty problem is noise.
+ */
+function SignalsPanel({ projectId }: { projectId: string }) {
+  const signals = useResource<{ items: CorrespondenceSignal[]; total: number }>(
+    `/api/v1/projects/${projectId}/correspondence/signals?openOnly=true&limit=25`,
+  );
+  if (signals.error) {
+    return (
+      <Alert tone="danger" size="sm" className="mb-4">
+        Correspondence signals could not be loaded: {signals.error}
+      </Alert>
+    );
+  }
+  const items = signals.data?.items ?? [];
+  if (items.length === 0) return null;
+  return (
+    <Card className="mb-4">
+      <CardBody className="space-y-2">
+        <div className="flex items-center justify-between">
+          <span className="text-meta font-semibold text-content">
+            What the deadline sweeps found ({count(items.length)})
+          </span>
+          <span className="text-2xs text-content-subtle">
+            Raised once per condition; re-running a sweep never duplicates one.
+          </span>
+        </div>
+        <ul className="divide-y divide-border">
+          {items.map((signal) => (
+            <li key={signal.id} className="flex items-start justify-between gap-3 py-2">
+              <div className="min-w-0">
+                <div className="truncate text-meta text-content">{signal.title}</div>
+                <div className="text-2xs text-content-subtle">{signal.explanation}</div>
+              </div>
+              <div className="flex shrink-0 flex-col items-end gap-1">
+                <Badge tone={severityTone(signal.severity)} size="xs" dot>
+                  {DETECTOR_LABEL[signal.detector] ?? titleCase(signal.detector)}
+                </Badge>
+                <span className="text-2xs text-content-subtle">{dateTime(signal.createdAt)}</span>
+              </div>
+            </li>
+          ))}
+        </ul>
+      </CardBody>
+    </Card>
   );
 }

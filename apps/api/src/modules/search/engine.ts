@@ -64,7 +64,9 @@ export function scoreCandidate(input: ScoreInput, terms: SearchTerm[], nowMs = D
   let score = 0;
   let matched = 0;
 
-  if (reference && (reference === joined || terms.some((t) => reference === t))) score += 50;
+  // An exact reference match is the strongest single signal there is: if
+  // someone typed "RFI-0042", they want RFI-0042 and nothing else.
+  if (reference && (reference === joined || terms.some((t) => reference === t))) score += 70;
   else if (reference && terms.some((t) => reference.includes(t))) score += 18;
 
   if (title.startsWith(joined)) score += 30;

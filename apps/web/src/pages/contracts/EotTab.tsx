@@ -34,6 +34,20 @@ import {
   type ListResponse,
 } from "./contractsShared";
 
+/** SCL Delay and Disruption Protocol methods, in the order it lists them. */
+const DELAY_METHODS = [
+  "time_impact_analysis",
+  "as_planned_impacted",
+  "collapsed_as_built",
+  "as_planned_versus_as_built",
+  "time_slice_windows",
+  "impacted_as_planned_windows",
+] as const;
+
+const CONCURRENCY_FINDINGS = ["none", "true_concurrency", "sequential", "pacing"] as const;
+
+const FLOAT_OWNERS = ["project", "contractor", "employer", "shared"] as const;
+
 const INDEPENDENCE_MESSAGE =
   "Determination independence: an EOT claim cannot be assessed by the user who raised it — a different contract administrator must make the assessment.";
 
@@ -190,6 +204,10 @@ function ClaimDrawer({
   const [daysAwarded, setDaysAwarded] = useState(
     claim.daysAwarded !== null ? String(claim.daysAwarded) : String(claim.daysClaimed),
   );
+  const [method, setMethod] = useState<string>("time_impact_analysis");
+  const [concurrency, setConcurrency] = useState<string>("none");
+  const [floatOwnership, setFloatOwnership] = useState<string>("project");
+  const [reasons, setReasons] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [independenceBlocked, setIndependenceBlocked] = useState(false);
@@ -270,21 +288,69 @@ function ClaimDrawer({
         <div className="space-y-3 rounded-md border border-ink-100 p-3">
           <h3 className="text-sm font-semibold text-ink-900">Assess</h3>
           <p className="text-xs text-ink-400">
-            The assessor must be independent of the person who raised the claim.
+            The assessor must be independent of the person who raised the claim, and the assessment
+            must name the delay-analysis method it used — an award with no stated method cannot be
+            defended.
           </p>
-          <div className="flex items-end gap-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
             <Field label="Days awarded">
               <Input
                 inputMode="numeric"
-                className="w-28"
                 value={daysAwarded}
                 onChange={(e) => setDaysAwarded(e.target.value)}
               />
             </Field>
+            <Field label="Method (SCL protocol)">
+              <Select value={method} onChange={(e) => setMethod(e.target.value)}>
+                {DELAY_METHODS.map((m) => (
+                  <option key={m} value={m}>
+                    {humanize(m)}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Concurrency">
+              <Select value={concurrency} onChange={(e) => setConcurrency(e.target.value)}>
+                {CONCURRENCY_FINDINGS.map((c) => (
+                  <option key={c} value={c}>
+                    {humanize(c)}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Float ownership">
+              <Select value={floatOwnership} onChange={(e) => setFloatOwnership(e.target.value)}>
+                {FLOAT_OWNERS.map((f) => (
+                  <option key={f} value={f}>
+                    {humanize(f)}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          </div>
+          <Field label="Reasons">
+            <Textarea
+              rows={3}
+              value={reasons}
+              onChange={(e) => setReasons(e.target.value)}
+              placeholder="Which events drove planned Completion, and why the award is what it is."
+            />
+          </Field>
+          <div className="flex justify-end">
             <Button
               size="sm"
               disabled={busy || !awardValid}
-              onClick={() => void setStatus("assessed", { daysAwarded: awarded })}
+              onClick={() =>
+                void setStatus("assessed", {
+                  daysAwarded: awarded,
+                  assessment: {
+                    method,
+                    concurrency,
+                    floatOwnership,
+                    ...(reasons.trim() ? { reasons: reasons.trim() } : {}),
+                  },
+                })
+              }
             >
               Record assessment
             </Button>

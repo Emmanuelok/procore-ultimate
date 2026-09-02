@@ -14,13 +14,14 @@ import {
   PROGRAMME_REJECTION_REASONS,
   SCC_COMPONENTS,
   type CeState,
+  type NecOption,
 } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
-import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { isoDateSchema, todayISO } from "../field/dates.js";
+import { machineAuth } from "../integrations/machine-auth.js";
 import { canTransition, computeQuotation, deemedAcceptance, NEC_CLOCKS, necValuationBasis } from "./ce.js";
 import { addDaysOnCalendar } from "./timebar.js";
 
@@ -86,6 +87,17 @@ export const ceRoutes: FastifyPluginAsync = async (app) => {
     app.authenticate,
     app.requireCompany,
     app.requireTool("contracts", "standard"),
+  ];
+  /**
+   * A quotation is addressed by its own id, so the project — and therefore the
+   * tool check — is resolved inside the handler. The marker is what tells the
+   * onRoute hook the route IS tool-gated; without it every machine caller is
+   * refused with "not tool-scoped" before the handler ever runs.
+   */
+  const quotationGate = [
+    app.authenticate,
+    app.requireCompany,
+    machineAuth.markToolGate(async () => {}, "contracts", "standard"),
   ];
 
   async function fetchContract(contractId: string, companyId: string, projectId: string) {
@@ -189,7 +201,7 @@ export const ceRoutes: FastifyPluginAsync = async (app) => {
         },
       });
       const updated = await fetchCeEvent(eventId, contractId, req.companyId!, req.projectId!);
-      return { ...updated, necBasis: necValuationBasis(contract.necOption as never) };
+      return { ...updated, necBasis: necValuationBasis(contract.necOption as NecOption | null) };
     },
   );
 
@@ -350,7 +362,7 @@ export const ceRoutes: FastifyPluginAsync = async (app) => {
   );
 
   /** The Project Manager's reply (62.3). A different actor from the submitter. */
-  app.post("/ce-quotations/:quotationId/reply", { preHandler: [app.authenticate, app.requireCompany] }, async (req, reply) => {
+  app.post("/ce-quotations/:quotationId/reply", { preHandler: quotationGate }, async (req, reply) => {
     const { quotationId } = req.params as { quotationId: string };
     const body = replySchema.parse(req.body);
     const rows = await app.db
@@ -644,7 +656,7 @@ export const ceRoutes: FastifyPluginAsync = async (app) => {
       return {
         applicable: true as const,
         necOption: contract.necOption,
-        ...necValuationBasis(contract.necOption as never),
+        ...necValuationBasis(contract.necOption as NecOption | null),
         currency: contract.currency,
         implementedCompensationEvents: implemented.length,
         implementedValue: Math.round(implemented.reduce((s, q) => s + q.total, 0) * 100) / 100,

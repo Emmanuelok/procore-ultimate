@@ -12,7 +12,6 @@ import {
   boqs,
   companyMemberships,
   contracts,
-  paymentCertificates,
   projectMemberships,
   projects,
   signals,
@@ -342,7 +341,7 @@ describe("valuation sequence and retention", () => {
       await inject("POST", `/api/v1/valuations/${id}/submit`, memberHeaders);
       return id;
     };
-    const v1 = await mk(isoDaysFromToday(-30), 20);
+    await mk(isoDaysFromToday(-30), 20);
     // The create guard already refuses a second open application, so the
     // certify guard is exercised by inserting VAL-2 directly — the shape a
     // migration or an integration would produce.
@@ -367,7 +366,6 @@ describe("valuation sequence and retention", () => {
     expect(res.json().message).toContain("must be certified first");
     // clean up so later sequence checks are not blocked
     await built.app.db.delete(valuations).where(eq(valuations.id, v2));
-    void v1;
   });
 
   it("withdraws a certificate, restoring the application, and records payment", async () => {
@@ -1341,6 +1339,5 @@ describe("health inputs and sweeps", () => {
         and(eq(signals.companyId, owner.companyId), eq(signals.detector, "payment_overdue")),
       );
     expect(again.length).toBe(1);
-    void paymentCertificates;
   });
 });

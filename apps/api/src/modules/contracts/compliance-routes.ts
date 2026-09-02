@@ -9,7 +9,11 @@ import {
   insurancePolicies,
   obligations,
 } from "@constructos/db";
-import { CONTRACT_COMPLIANCE_KINDS, type ContractForm } from "@constructos/shared";
+import {
+  CONTRACT_COMPLIANCE_KINDS,
+  type ContractComplianceKind,
+  type ContractForm,
+} from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, notFound } from "../../lib/errors.js";
@@ -139,7 +143,7 @@ export const complianceRoutes: FastifyPluginAsync = async (app) => {
       const evidence = await loadEvidence(companyId, check.evidenceType, check.evidenceId);
       const verdict = evaluateCompliance({
         requirement: check.requirement,
-        kind: check.kind as never,
+        kind: check.kind as ContractComplianceKind,
         requiredAmount: check.requiredAmount,
         currency: check.currency,
         requiredUntil: check.requiredUntil,
@@ -400,7 +404,7 @@ export const complianceRoutes: FastifyPluginAsync = async (app) => {
         }
         const verdict = evaluateCompliance({
           requirement: check.requirement,
-          kind: check.kind as never,
+          kind: check.kind as ContractComplianceKind,
           requiredAmount: check.requiredAmount,
           currency: check.currency,
           requiredUntil: check.requiredUntil,

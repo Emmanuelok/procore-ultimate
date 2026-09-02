@@ -11,7 +11,14 @@ import {
   valuations,
   variations,
 } from "@constructos/db";
-import { BOQ_ITEM_TYPES, BOQ_LEVELS, BOQ_METHODS, BOQ_STATUSES } from "@constructos/shared";
+import {
+  BOQ_ITEM_TYPES,
+  BOQ_LEVELS,
+  BOQ_METHODS,
+  BOQ_STATUSES,
+  type BoqMethod,
+  type BoqStatus,
+} from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, conflict, notFound } from "../../lib/errors.js";
@@ -395,7 +402,7 @@ export const boqRoutes: FastifyPluginAsync = async (app) => {
     let statusChanged = false;
     if (body.status !== undefined && body.status !== boq.status) {
       // forward-only lifecycle: draft → issued → agreed (#115)
-      if (BOQ_STATUSES.indexOf(body.status) < BOQ_STATUSES.indexOf(boq.status as never)) {
+      if (BOQ_STATUSES.indexOf(body.status) < BOQ_STATUSES.indexOf(boq.status as BoqStatus)) {
         throw badRequest("BoQ status can only move forward (draft → issued → agreed)");
       }
       set["status"] = body.status;
@@ -542,7 +549,7 @@ export const boqRoutes: FastifyPluginAsync = async (app) => {
       amount: r.amount,
       itemType: r.itemType,
     }));
-    return validateBoq(boq.method as never, input);
+    return validateBoq(boq.method as BoqMethod, input);
   });
 
   /* ---------------------------------------------------------------- */

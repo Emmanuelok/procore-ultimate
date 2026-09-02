@@ -99,6 +99,8 @@ export default function ModelViewerPage() {
   const [elementsError, setElementsError] = useState<string | null>(null);
 
   const [assetMap, setAssetMap] = useState<Record<string, TwinElementLink>>({});
+  const [tinted, setTinted] = useState(false);
+  const [tintNote, setTintNote] = useState<string | null>(null);
   const [assets, setAssets] = useState<TwinAssetOption[]>([]);
   const [assetOpen, setAssetOpen] = useState(false);
   const [assetForm, setAssetForm] = useState({ tagCode: "", name: "", existingAssetId: "" });
@@ -329,6 +331,34 @@ export default function ModelViewerPage() {
     setIsolated(false);
   }
 
+  /**
+   * Colour every element that is already bound to a twin asset. The count of
+   * matches is reported: a GlobalId with no geometry in this container is not
+   * silently ignored.
+   */
+  function onToggleTwinTint() {
+    const engine = engineRef.current;
+    if (!engine) return;
+    try {
+      if (tinted) {
+        engine.clearTint();
+        setTinted(false);
+        setTintNote(null);
+        return;
+      }
+      const globalIds = Object.keys(assetMap);
+      const matched = engine.tintByGlobalIds(globalIds);
+      setTinted(true);
+      setTintNote(
+        globalIds.length === 0
+          ? "No asset on this project is bound to model geometry yet."
+          : `${matched} of ${globalIds.length} linked assets are in this container.`,
+      );
+    } catch {
+      setTintNote("The viewer could not colour the linked assets.");
+    }
+  }
+
   function onToggleSection() {
     const engine = engineRef.current;
     if (!engine) return;
@@ -493,6 +523,15 @@ export default function ModelViewerPage() {
           )}
           <Button
             size="sm"
+            variant={tinted ? "primary" : "secondary"}
+            disabled={viewerState !== "ready"}
+            title="Colour the elements already bound to a digital-twin asset"
+            onClick={onToggleTwinTint}
+          >
+            Twin assets
+          </Button>
+          <Button
+            size="sm"
             variant="secondary"
             disabled={viewerState !== "ready" || !picked || picked.expressID < 0}
             onClick={onIsolate}
@@ -516,6 +555,15 @@ export default function ModelViewerPage() {
           </Button>
         </div>
       </div>
+
+      {tintNote && (
+        <div className="mb-3 flex items-center justify-between rounded-md bg-ink-50 px-3 py-2 text-xs text-ink-600 ring-1 ring-ink-100">
+          <span>{tintNote}</span>
+          <button type="button" className="underline" onClick={() => setTintNote(null)}>
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {issueDone && (
         <div className="mb-3 flex items-center justify-between rounded-md bg-emerald-50 px-3 py-2 text-sm text-emerald-800 ring-1 ring-emerald-100">

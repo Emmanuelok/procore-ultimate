@@ -397,6 +397,62 @@ describe("action plans (#452–#456)", () => {
     expect(res.json().rows).toHaveLength(3);
   });
 
+  it("edits the plan, adds an ad-hoc activity and reassigns one", async () => {
+    const plan = await post(`/projects/${projectId}/correspondence/action-plans`, {
+      title: "Editable plan",
+      activities: [{ title: "First", signoffParties: [{ partyType: "user", label: "PM" }] }],
+    });
+    const id = plan.json().id as string;
+
+    const edited = await patch(`/projects/${projectId}/correspondence/action-plans/${id}`, {
+      title: "Editable plan (revised)",
+      dueDate: addDaysISO(today, 21),
+    });
+    expect(edited.statusCode).toBe(200);
+    expect(edited.json().title).toBe("Editable plan (revised)");
+    expect(edited.json().dueDate).toBe(addDaysISO(today, 21));
+
+    const added = await post(
+      `/projects/${projectId}/correspondence/action-plans/${id}/activities`,
+      {
+        title: "Added after the fact",
+        evidenceRequired: true,
+        evidenceRequirement: "The completed check sheet.",
+        signoffParties: [{ partyType: "user", label: "QA" }],
+        dueDate: addDaysISO(today, 2),
+      },
+    );
+    expect(added.statusCode).toBe(201);
+    expect(added.json().seq).toBe(2);
+    expect(added.json().signoffRequiredCount).toBe(1);
+
+    const reassigned = await patch(
+      `/projects/${projectId}/correspondence/activities/${added.json().id}`,
+      { assigneeId: engineer.userId, description: "Do it before the pour." },
+    );
+    expect(reassigned.statusCode).toBe(200);
+    expect(reassigned.json().assigneeId).toBe(engineer.userId);
+
+    const rejectedAssignee = await patch(
+      `/projects/${projectId}/correspondence/activities/${added.json().id}`,
+      { assigneeId: stranger.userId },
+    );
+    expect(rejectedAssignee.statusCode).toBe(400);
+    expect(rejectedAssignee.json().message).toContain("not a member of this company");
+
+    const cancelled = await post(
+      `/projects/${projectId}/correspondence/action-plans/${id}/cancel`,
+      { reason: "Superseded by a revised method statement." },
+    );
+    expect(cancelled.statusCode).toBe(200);
+    expect(cancelled.json().status).toBe("cancelled");
+    const again = await post(
+      `/projects/${projectId}/correspondence/action-plans/${id}/cancel`,
+      { reason: "again" },
+    );
+    expect(again.statusCode).toBe(409);
+  });
+
   it("refuses to edit an activity that has been signed off", async () => {
     const res = await patch(
       `/projects/${projectId}/correspondence/activities/${activityIds[0]}`,

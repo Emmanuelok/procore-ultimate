@@ -38,10 +38,23 @@ const listQuerySchema = pageQuerySchema.extend({
   projectId: z.string().max(100).optional(),
 });
 
+const KIND_SET = new Set<string>(NOTIFICATION_KINDS);
+
 const preferencesSchema = z.object({
   defaultChannel: z.enum(NOTIFICATION_CHANNELS).optional(),
   digest: z.enum(NOTIFICATION_DIGESTS).optional(),
-  kinds: z.record(z.enum(NOTIFICATION_KINDS), z.enum(NOTIFICATION_CHANNELS)).optional(),
+  /*
+   * A partial map, not an exhaustive one: `z.record(z.enum(...), ...)` in zod
+   * v4 demands every key of the enum, which would force a client to send all
+   * 27 notification kinds to change one. Keys are checked below instead.
+   */
+  kinds: z
+    .record(z.string().max(50), z.enum(NOTIFICATION_CHANNELS))
+    .refine(
+      (map) => Object.keys(map).every((k) => KIND_SET.has(k)),
+      "kinds may only name notification kinds the platform raises",
+    )
+    .optional(),
   mutedProjectIds: z.array(z.string().min(1).max(100)).max(500).optional(),
   mutedTools: z.array(z.enum(TOOLS)).max(TOOLS.length).optional(),
 });

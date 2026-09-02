@@ -274,15 +274,17 @@ describe("transmittals (#442)", () => {
     expect(partial.json().position.percent).toBe(50);
     expect(partial.json().position.outstandingNames).toHaveLength(1);
 
-    // The engine's derived status lands on the record via the sweep/sync path.
-    await post(`/projects/${projectId}/correspondence/sweeps/run`, {});
+    // Regression: the parent's denormalised counters and derived status must
+    // move with the acknowledgement itself, not an hour later when a sweep
+    // happens to run — the register scan reads those columns.
     const afterPartial = (
       await app.db.select().from(transmittals).where(eq(transmittals.id, transmittalId))
     )[0];
     expect(afterPartial?.status).toBe("partially_acknowledged");
+    expect(afterPartial?.acknowledgedCount).toBe(1);
+    expect(afterPartial?.ackRequiredCount).toBe(2);
 
     await post(`/projects/${projectId}/correspondence/recipients/${required[1].id}/acknowledge`, {});
-    await post(`/projects/${projectId}/correspondence/sweeps/run`, {});
     const complete = (
       await app.db.select().from(transmittals).where(eq(transmittals.id, transmittalId))
     )[0];
@@ -290,6 +292,32 @@ describe("transmittals (#442)", () => {
     expect(complete?.acknowledgedCount).toBe(2);
     // the acknowledgement obligation is settled the moment everyone answers
     expect(complete?.obligationId).toBeNull();
+  });
+
+  it("adds a recipient after issue and counts them straight away", async () => {
+    const before = (
+      await app.db.select().from(transmittals).where(eq(transmittals.id, transmittalId))
+    )[0];
+    const res = await post(
+      `/projects/${projectId}/correspondence/transmittals/${transmittalId}/recipients`,
+      { partyType: "external", name: "Late addition", acknowledgementRequired: true },
+    );
+    expect(res.statusCode).toBe(201);
+    expect(res.json().deliveryStatus).toBe("sent");
+    const after = (
+      await app.db.select().from(transmittals).where(eq(transmittals.id, transmittalId))
+    )[0];
+    expect(after?.ackRequiredCount).toBe((before?.ackRequiredCount ?? 0) + 1);
+    expect(after?.status).toBe("partially_acknowledged");
+
+    // removing an unacknowledged recipient puts the position back
+    const removed = await del(`/projects/${projectId}/correspondence/recipients/${res.json().id}`);
+    expect(removed.statusCode).toBe(200);
+    const restored = (
+      await app.db.select().from(transmittals).where(eq(transmittals.id, transmittalId))
+    )[0];
+    expect(restored?.ackRequiredCount).toBe(before?.ackRequiredCount ?? 0);
+    expect(restored?.status).toBe("acknowledged");
   });
 
   it("reports the acknowledgement rate as null when nobody was asked", async () => {

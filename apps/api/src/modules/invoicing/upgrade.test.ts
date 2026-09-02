@@ -524,7 +524,9 @@ describe("the invoice pay route enforces the register's controls", () => {
     expect(second.headers["idempotent-replayed"]).toBe("true");
     expect(second.json().payment.id).toBe(first.json().payment.id);
 
-    const inv = (await built.app.db.select().from(invoices).where(eq(invoices.id, invId)).limit(1))[0]!;
+    const inv = (
+      await built.app.db.select().from(invoices).where(eq(invoices.id, invId)).limit(1)
+    )[0]!;
     expect(inv.amountPaid).toBeCloseTo(3600, 2);
   });
 

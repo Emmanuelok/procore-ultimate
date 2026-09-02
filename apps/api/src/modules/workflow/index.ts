@@ -1719,6 +1719,9 @@ export const workflowModule: FastifyPluginAsync = async (app) => {
             toVersion: tpl.version,
             position: instance.currentPosition,
           },
+          // Stored, not just hashed: "which version of the approval chain was
+          // this record actually judged against" is a question a dispute asks.
+          storePayload: true,
           projectId: instance.projectId,
         });
         const fresh = await fetchInstance(instance.id, instance.companyId);
