@@ -150,6 +150,24 @@ export type Config = z.infer<typeof envSchema>;
 export function loadConfig(overrides: Partial<Record<string, string>> = {}): Config {
   const cfg = envSchema.parse({ ...process.env, ...overrides });
   if (cfg.NODE_ENV === "production") {
+    /*
+     * Two categories, deliberately separated.
+     *
+     * REFUSALS are for a hole that makes the deployment unsafe to run at all:
+     * a guessable signing secret, or a storage driver that was explicitly
+     * chosen and then not configured. Nothing else earns a refusal.
+     *
+     * WARNINGS are for a deployment that will run correctly but in a reduced
+     * shape the operator should know about — the embedded database, the
+     * local-disk driver, a mail base URL still pointing at localhost. An
+     * earlier version of this file threw on those too, and that mistake took
+     * a live deployment down: a service running with a mounted volume (the
+     * documented local-driver topology) could no longer boot at all, and the
+     * platform healthcheck failed with no clue why. A configuration smell
+     * must never be a bigger outage than the problem it warns about. The
+     * warnings are logged at boot and reported by /api/v1/health/ready, so
+     * they are loud without being fatal.
+     */
     const problems: string[] = [];
     const placeholderSecrets = [
       "dev-only-secret-change-me-in-prod",
@@ -166,27 +184,6 @@ export function loadConfig(overrides: Partial<Record<string, string>> = {}): Con
         "AUTH_SECRET is too weak for production (need >= 32 characters of real entropy; openssl rand -hex 32).",
       );
     }
-    if (!cfg.DATABASE_URL && !cfg.ALLOW_EMBEDDED_DB) {
-      problems.push(
-        "DATABASE_URL is not set. Production would run on an embedded in-container database that is " +
-          "wiped on redeploy. Set DATABASE_URL, or set ALLOW_EMBEDDED_DB=true to accept that explicitly.",
-      );
-    }
-    if (cfg.STORAGE_DRIVER === "local" && !cfg.ALLOW_LOCAL_STORAGE) {
-      problems.push(
-        "STORAGE_DRIVER=local in production needs a mounted volume and a single replica. Use STORAGE_DRIVER=s3, " +
-          "or set ALLOW_LOCAL_STORAGE=true to accept that explicitly.",
-      );
-    }
-    if (/^https?:\/\/(localhost|127\.0\.0\.1)/i.test(cfg.APP_BASE_URL)) {
-      problems.push(
-        "APP_BASE_URL points at localhost, so every link in every email (verification, reset, invitation) would too. " +
-          "Set it to the public origin of the web app.",
-      );
-    }
-    if (problems.length > 0) {
-      throw new Error(`Refusing to start in production:\n - ${problems.join("\n - ")}`);
-    }
     if (cfg.STORAGE_DRIVER === "s3") {
       const missing = (
         [
@@ -199,10 +196,14 @@ export function loadConfig(overrides: Partial<Record<string, string>> = {}): Con
         .filter(([, v]) => !v)
         .map(([k]) => k);
       if (missing.length > 0) {
-        throw new Error(`STORAGE_DRIVER=s3 requires: ${missing.join(", ")}`);
+        problems.push(`STORAGE_DRIVER=s3 requires: ${missing.join(", ")}`);
       }
     }
+    if (problems.length > 0) {
+      throw new Error(`Refusing to start in production:\n - ${problems.join("\n - ")}`);
+    }
   }
+
   // A half-configured mail provider is worse than none: the no-op transport is
   // honest about recording rather than sending, whereas a provider with no key
   // fails per-message, in the background, on the one message that mattered.
@@ -225,6 +226,51 @@ export function loadConfig(overrides: Partial<Record<string, string>> = {}): Con
     }
   }
   return cfg;
+}
+
+/**
+ * Configuration smells worth saying out loud in production: everything that
+ * makes the deployment smaller than it looks, without making it unsafe. These
+ * are logged at boot and reported by /api/v1/health/ready. They are never
+ * fatal — see the note in loadConfig.
+ */
+export function productionWarnings(cfg: Config): string[] {
+  if (cfg.NODE_ENV !== "production") return [];
+  const warnings: string[] = [];
+  if (!cfg.DATABASE_URL) {
+    warnings.push(
+      "DATABASE_URL is not set, so this instance is running on the embedded in-container database. " +
+        "It is wiped on every redeploy and cannot be shared between replicas. Set DATABASE_URL to a real Postgres.",
+    );
+  }
+  if (cfg.STORAGE_DRIVER === "local") {
+    warnings.push(
+      "STORAGE_DRIVER=local stores uploaded evidence on the container filesystem. It needs a mounted volume " +
+        "and a single replica (on Railway also RAILWAY_RUN_UID=0). STORAGE_DRIVER=s3 is the recommended production driver.",
+    );
+  }
+  if (/^https?:\/\/(localhost|127\.0\.0\.1)/i.test(cfg.APP_BASE_URL)) {
+    warnings.push(
+      `APP_BASE_URL is ${cfg.APP_BASE_URL}, so every link in every message (verification, reset, invitation) ` +
+        "points at localhost. Set it to the public origin of the web app.",
+    );
+  }
+  if (cfg.EMAIL_PROVIDER === "none") {
+    warnings.push(
+      "EMAIL_PROVIDER is unset, so no verification, reset or invitation message is dispatched. " +
+        "Each one is recorded and reported as not dispatched.",
+    );
+  }
+  if (!process.env["ANCHOR_SIGNING_KEY"]) {
+    warnings.push(
+      "ANCHOR_SIGNING_KEY is not set, so ledger seals are signed with a key derived from AUTH_SECRET. " +
+        "They then prove integrity against a database-only attacker, not against the operator.",
+    );
+  }
+  if (!cfg.ANTHROPIC_API_KEY) {
+    warnings.push("ANTHROPIC_API_KEY is not set, so every AI endpoint reports itself disabled (503).");
+  }
+  return warnings;
 }
 
 export const config = loadConfig();
