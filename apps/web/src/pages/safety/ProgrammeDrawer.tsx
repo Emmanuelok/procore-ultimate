@@ -134,7 +134,12 @@ export default function ProgrammeDrawer({
             : undefined,
         },
         { label: "Review due", value: isoDate(record.reviewDueDate) },
-        { label: "Regulatory reference", value: record.regulatoryReference ?? EM_DASH, span: 2 },
+        { label: "Regulatory reference", value: record.regulatoryReference ?? EM_DASH },
+        {
+          label: "Permit-to-work",
+          value: record.sitePermitId ?? EM_DASH,
+          hint: "The live authorisation in site operations. This record is the document it was issued against.",
+        },
         {
           label: "Approved",
           value: record.approvedAt

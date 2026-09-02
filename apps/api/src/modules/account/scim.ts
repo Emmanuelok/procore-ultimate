@@ -1,6 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { and, asc, eq, ilike, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import {
   authSessions,
@@ -395,12 +395,12 @@ export function registerScimRoutes(app: FastifyInstance): void {
   async function scimAuth(req: FastifyRequest, reply: FastifyReply): Promise<ScimPrincipal | null> {
     const header = req.headers.authorization;
     if (typeof header !== "string" || !header.startsWith("Bearer ")) {
-      await scimError(reply, 401, "A SCIM bearer token is required.");
+      void scimError(reply, 401, "A SCIM bearer token is required.");
       return null;
     }
     const principal = await resolveScimToken(app.db, header.slice(7));
     if (!principal) {
-      await scimError(reply, 401, "This SCIM token is not valid, has been revoked, or has expired.");
+      void scimError(reply, 401, "This SCIM token is not valid, has been revoked, or has expired.");
       return null;
     }
     // Usage is recorded so an operator can answer "is this token still in
@@ -442,7 +442,7 @@ export function registerScimRoutes(app: FastifyInstance): void {
       .where(
         and(
           eq(companyMemberships.companyId, companyId),
-          filter?.email ? ilike(users.email, filter.email) : undefined,
+          filter?.email ? eq(users.email, filter.email) : undefined,
         ),
       )
       .orderBy(asc(users.email));

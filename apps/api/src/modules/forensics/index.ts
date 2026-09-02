@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, inArray, isNotNull } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, inArray, isNotNull, lte, ne, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   boqItems,
@@ -8,25 +8,85 @@ import {
   contracts,
   dailyLogs,
   delayEvents,
+  disruptionAnalyses,
   evidence,
+  forensicAnalyses,
   forensicClaims,
+  projectFloatRules,
+  quantumCalculations,
   rfis,
   scheduleBaselines,
+  scheduleCalendars,
   scheduleDependencies,
   scheduleTasks,
   schedules,
+  timecards,
   variations,
 } from "@constructos/db";
-import { CLAIM_KINDS, CLAIM_STATUSES, DELAY_CAUSES, DELAY_EVENT_STATUSES } from "@constructos/shared";
+import {
+  AACE_MIP_CODES,
+  CLAIM_KINDS,
+  CLAIM_STATUSES,
+  CONCURRENCY_RULES,
+  CULPABLE_PARTIES,
+  DELAY_CAUSES,
+  DELAY_EVENT_STATUSES,
+  DISRUPTION_METHODS,
+  FLOAT_OWNERSHIP_RULES,
+  FORENSIC_METHODS,
+  INTEREST_BASES,
+  QUANTUM_METHODS,
+  type ConcurrencyRule,
+  type FloatOwnershipRule,
+} from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { isoDateSchema } from "../field/dates.js";
-import { dayFromIso, type CpmDependencyInput, type CpmTaskInput } from "../../lib/cpm.js";
+import {
+  computeCpm2,
+  dayFromIso,
+  type CalendarSpec,
+  type Cpm2DependencyInput,
+  type Cpm2TaskInput,
+} from "../schedule/cpm2.js";
 import { runFragnetTia } from "./tia.js";
 import { computeProlongation } from "./prolongation.js";
+import {
+  collapsedAsBuilt,
+  impactedAsPlanned,
+  recommendMethods,
+  retrospectiveLongestPath,
+  windowsAnalysis,
+  type ForensicEvent,
+  type ForensicNetwork,
+  type WindowInput,
+} from "./methods.js";
+import { DEFAULT_FLOAT_RULES, analyseConcurrency, type FloatRules } from "./concurrency.js";
+import {
+  computeProvision,
+  eichleay,
+  emden,
+  financeCharge,
+  hudson,
+  lossOfProfit,
+  siteOverhead,
+} from "./quantum.js";
+import {
+  earnedValueDisruption,
+  industryCurve,
+  measuredMile,
+  suggestBaselineWindow,
+  type ProductivityPoint,
+} from "./disruption.js";
+import {
+  buildScottSchedule,
+  scoreClaimSufficiency,
+  type ChainLimbInput,
+  type EventSufficiencyInput,
+} from "./sufficiency.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -43,11 +103,14 @@ const delayEventCreateSchema = z.object({
   cause: z.enum(DELAY_CAUSES),
   excusable: z.boolean(),
   compensable: z.boolean(),
+  party: z.enum(CULPABLE_PARTIES).optional(),
   taskId: z.string().min(1).nullable().optional(),
   scheduleId: z.string().min(1).nullable().optional(),
   startDate: isoDateSchema,
   durationDays: z.number().int().min(1).max(10000),
   contractEventId: z.string().min(1).nullable().optional(),
+  noticeDueDate: isoDateSchema.nullable().optional(),
+  pacingOfEventId: z.string().min(1).nullable().optional(),
   evidenceIds: z.array(z.string().min(1)).max(200).optional(),
 });
 
@@ -56,11 +119,30 @@ const delayEventPatchSchema = delayEventCreateSchema.partial();
 const delayEventListQuery = pageQuerySchema.extend({
   cause: z.enum(DELAY_CAUSES).optional(),
   status: z.enum(DELAY_EVENT_STATUSES).optional(),
+  party: z.enum(CULPABLE_PARTIES).optional(),
   excusable: boolQuery,
   compensable: boolQuery,
+  includeWithdrawn: boolQuery,
 });
 
-const delayEventStatusSchema = z.object({ status: z.enum(DELAY_EVENT_STATUSES) });
+const delayEventStatusSchema = z.object({
+  status: z.enum(DELAY_EVENT_STATUSES),
+  reason: z.string().max(2000).optional(),
+});
+
+/**
+ * Delay event lifecycle. Before this, any status could become any other:
+ * a withdrawn event could be quietly reopened, and withdrawn events kept
+ * feeding claims, windows and chronology as though they were live.
+ */
+const DELAY_EVENT_TRANSITIONS: Record<string, string[]> = {
+  open: ["assessed", "withdrawn", "closed"],
+  assessed: ["closed", "withdrawn"],
+  closed: ["open"],
+  withdrawn: ["open"],
+};
+/** Terminal states whose reversal has to be justified in the ledger. */
+const DELAY_EVENT_REOPEN_FROM = new Set(["closed", "withdrawn"]);
 
 const chainSchema = z.object({
   cause: z.string().max(20000).optional(),
@@ -81,6 +163,7 @@ const claimCreateSchema = z.object({
   kind: z.enum(CLAIM_KINDS),
   contractId: z.string().min(1).nullable().optional(),
   clauseRef: z.string().min(1).max(40).nullable().optional(),
+  currency: z.string().length(3).optional(),
   delayEventIds: z.array(z.string().min(1)).max(200).optional(),
   chain: chainSchema.optional(),
   daysClaimed: z.number().int().min(0).max(10000).nullable().optional(),
@@ -90,30 +173,57 @@ const claimCreateSchema = z.object({
 
 const claimPatchSchema = claimCreateSchema.omit({ kind: true }).partial();
 
+const claimValuationSchema = z.object({
+  quantumBest: z.number().min(0).nullable().optional(),
+  quantumLikely: z.number().min(0).nullable().optional(),
+  quantumWorst: z.number().min(0).nullable().optional(),
+  successProbability: z.number().min(0).max(1).nullable().optional(),
+});
+
 const claimListQuery = pageQuerySchema.extend({
   kind: z.enum(CLAIM_KINDS).optional(),
   status: z.enum(CLAIM_STATUSES).optional(),
 });
 
 const claimStatusSchema = z.object({
-  status: z.enum(["submitted", "assessed", "agreed", "rejected", "withdrawn"]),
+  status: z.enum(["submitted", "assessed", "agreed", "rejected", "withdrawn", "draft"]),
   daysAssessed: z.number().int().min(0).max(10000).optional(),
   amountAssessed: z.number().min(0).optional(),
+  reason: z.string().max(2000).optional(),
 });
 
-/** draft → submitted → assessed → agreed | rejected; withdrawn pre-agreement. */
+/**
+ * draft → submitted → assessed → agreed | rejected; withdrawn pre-agreement.
+ * `draft` from submitted/assessed is the explicit REVISE transition: it clears
+ * the assessment, so a changed claim can never carry an assessment that never
+ * considered the changed figures.
+ */
 const CLAIM_TRANSITIONS: Record<string, string[]> = {
   draft: ["submitted", "withdrawn"],
-  submitted: ["assessed", "withdrawn"],
-  assessed: ["agreed", "rejected", "withdrawn"],
+  submitted: ["assessed", "withdrawn", "draft"],
+  assessed: ["agreed", "rejected", "withdrawn", "draft"],
   agreed: [],
   rejected: [],
   withdrawn: [],
 };
 
+/** Fields frozen once a claim leaves draft — the case that gets assessed. */
+const FROZEN_AFTER_DRAFT = [
+  "title",
+  "chain",
+  "delayEventIds",
+  "daysClaimed",
+  "amountClaimed",
+  "prolongation",
+  "contractId",
+  "clauseRef",
+  "currency",
+] as const;
+
 const prolongationBodySchema = z.object({
   compensableDays: z.number().int().min(0).max(10000),
   prelimsRatePerDay: z.number().positive().optional(),
+  boqId: z.string().min(1).optional(),
 });
 
 const analysisQuerySchema = z.object({
@@ -123,6 +233,97 @@ const analysisQuerySchema = z.object({
 
 const windowsQuerySchema = analysisQuerySchema.extend({
   boundaries: z.string().min(1),
+  statuses: z.string().min(1).optional(),
+});
+
+const runAnalysisSchema = z.object({
+  method: z.enum(FORENSIC_METHODS),
+  title: z.string().min(1).max(300),
+  scheduleId: z.string().min(1).optional(),
+  baselineId: z.string().min(1).optional(),
+  claimId: z.string().min(1).nullable().optional(),
+  eventIds: z.array(z.string().min(1)).max(200).optional(),
+  party: z.enum(CULPABLE_PARTIES).optional(),
+  boundaries: z.array(isoDateSchema).max(60).optional(),
+  mipCode: z.enum(AACE_MIP_CODES).optional(),
+  sclReference: z.string().max(300).optional(),
+  rationale: z.string().max(5000).optional(),
+});
+
+const floatRulesSchema = z.object({
+  ownership: z.enum(FLOAT_OWNERSHIP_RULES),
+  concurrencyRule: z.enum(CONCURRENCY_RULES),
+  concurrencyThresholdDays: z.number().int().min(0).max(90).optional(),
+  pacingThresholdDays: z.number().int().min(0).max(90).optional(),
+  basis: z.string().max(2000).nullable().optional(),
+});
+
+const methodSelectionSchema = z.object({
+  perspective: z.enum(["prospective", "retrospective"]),
+  updatesAvailable: z.boolean(),
+  baselineAvailable: z.boolean(),
+  asBuiltComplete: z.boolean(),
+  concurrencyInIssue: z.boolean(),
+});
+
+const quantumSchema = z.object({
+  method: z.enum(QUANTUM_METHODS),
+  claimId: z.string().min(1).nullable().optional(),
+  currency: z.string().length(3).optional(),
+  delayDays: z.number().min(0).max(10000).optional(),
+  contractId: z.string().min(1).nullable().optional(),
+  contractSum: z.number().min(0).nullable().optional(),
+  contractPeriodDays: z.number().int().min(1).nullable().optional(),
+  hoProfitPercent: z.number().min(0).max(100).nullable().optional(),
+  actualOverheadPercent: z.number().min(0).max(100).nullable().optional(),
+  accountsPeriod: z.string().max(60).nullable().optional(),
+  contractBillings: z.number().min(0).nullable().optional(),
+  totalBillings: z.number().min(0).nullable().optional(),
+  totalOverhead: z.number().min(0).nullable().optional(),
+  performanceDays: z.number().int().min(1).nullable().optional(),
+  prelimsTimeTotal: z.number().min(0).nullable().optional(),
+  programmeDays: z.number().int().min(1).nullable().optional(),
+  ratePerDay: z.number().min(0).nullable().optional(),
+  fixedPrelimsAttributable: z.number().min(0).nullable().optional(),
+  principal: z.number().min(0).nullable().optional(),
+  annualRatePercent: z.number().min(0).max(100).nullable().optional(),
+  days: z.number().int().min(0).max(20000).optional(),
+  basis: z.enum(INTEREST_BASES).optional(),
+  rateSource: z.string().max(200).nullable().optional(),
+  marginPercent: z.number().min(0).max(100).nullable().optional(),
+  displacedTurnover: z.number().min(0).nullable().optional(),
+  evidenceOfLostOpportunity: z.string().max(2000).nullable().optional(),
+});
+
+const productivityQuerySchema = z.object({
+  trade: z.string().max(100).optional(),
+  unit: z.string().max(30).optional(),
+  quantityMatch: z.string().max(200).optional(),
+  from: isoDateSchema.optional(),
+  to: isoDateSchema.optional(),
+});
+
+const disruptionSchema = z.object({
+  method: z.enum(DISRUPTION_METHODS),
+  title: z.string().min(1).max(300),
+  claimId: z.string().min(1).nullable().optional(),
+  trade: z.string().max(100).nullable().optional(),
+  unit: z.string().max(30).optional(),
+  quantityMatch: z.string().max(200).optional(),
+  currency: z.string().length(3).optional(),
+  hourlyRate: z.number().min(0).nullable().optional(),
+  baselineFrom: isoDateSchema.optional(),
+  baselineTo: isoDateSchema.optional(),
+  impactedFrom: isoDateSchema.optional(),
+  impactedTo: isoDateSchema.optional(),
+  scheduleId: z.string().min(1).optional(),
+  baseHours: z.number().min(0).nullable().optional(),
+  changePercent: z.number().min(0).max(500).nullable().optional(),
+  factors: z
+    .array(z.object({ key: z.string().min(1).max(60), severity: z.enum(["minor", "average", "severe"]) }))
+    .max(20)
+    .optional(),
+  justification: z.string().max(5000).optional(),
 });
 
 interface BaselineTaskSnapshot {
@@ -142,15 +343,46 @@ const maxIso = (dates: (string | null | undefined)[]): string | null => {
   return max;
 };
 
+const minIso = (dates: (string | null | undefined)[]): string | null => {
+  let min: string | null = null;
+  for (const d of dates) if (d && (min === null || d < min)) min = d;
+  return min;
+};
+
+const DAY_MS = 86_400_000;
+const addDaysIso = (iso: string, n: number): string =>
+  new Date(Date.parse(`${iso}T00:00:00Z`) + n * DAY_MS).toISOString().slice(0, 10);
+/** Monday of the ISO week containing `iso`. */
+const weekStartIso = (iso: string): string => {
+  const d = new Date(`${iso}T00:00:00Z`);
+  const dow = (d.getUTCDay() + 6) % 7; // 0 = Monday
+  return addDaysIso(iso, -dow);
+};
+
+/** Statuses whose events are excluded from aggregation unless asked for. */
+const EXCLUDED_EVENT_STATUSES = ["withdrawn"] as const;
+
 /**
- * Delay & disruption forensics — spec Vol II Domain D / M9 (#265-320
- * foundation subset): delay event register with entitlement classification
- * (#265-268), per-event Time Impact Analysis by fragnet insertion (#272),
- * as-planned vs as-built comparison against a captured baseline (#269),
- * windows attribution of delay events (#273, honestly scoped), a prolongation
- * calculator seeded from time-related preliminaries (#299-301), and a claims
- * workspace enforcing the cause-effect-entitlement-quantum chain with
- * chronology auto-assembly from platform records (#304-320).
+ * Delay & disruption forensics — spec Vol II Domain D / M9 (#265-320).
+ *
+ * The delay event register with entitlement and culpable-party classification
+ * (#265-268); per-event Time Impact Analysis by fragnet insertion (#272); the
+ * full method suite — impacted as-planned, collapsed as-built, windows/time
+ * slice and retrospective longest path (#270-277) — each recorded with its
+ * AACE 29R-03 MIP code, SCL Protocol reference, inputs and rationale so the
+ * run is reproducible; concurrency, pacing and float-ownership assessment
+ * against the project's recorded doctrine (#278-281); quantum engines for
+ * prolongation, head-office overhead, finance charges and loss of profit
+ * (#299-303); disruption quantification by measured mile, earned value and
+ * industry curves (#290-293); the claims workspace with a frozen
+ * cause-effect-entitlement-quantum chain (#304-320), record sufficiency
+ * scoring, claim-scoped chronology, Scott Schedule generation and portfolio
+ * claim exposure.
+ *
+ * Deliberately NOT here: the AI narrative drafter (WP-AGENTS owns agents; this
+ * module exposes the records it would cite), and any automatic acceptance of
+ * a claim — every determination is a human transition with segregation of
+ * duties enforced.
  */
 export const forensicsModule: FastifyPluginAsync = async (app) => {
   const readGate = [app.authenticate, app.requireCompany, app.requireTool("forensics", "read")];
@@ -159,6 +391,7 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
     app.requireCompany,
     app.requireTool("forensics", "standard"),
   ];
+  const adminGate = [app.authenticate, app.requireCompany, app.requireTool("forensics", "admin")];
 
   /* ---------------------------------------------------------------- */
   /* Shared fetch / validation helpers                                 */
@@ -366,7 +599,7 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
   async function loadCpmInputs(
     scheduleId: string,
     projectId: string,
-  ): Promise<{ tasks: CpmTaskInput[]; deps: CpmDependencyInput[] }> {
+  ): Promise<{ tasks: Cpm2TaskInput[]; deps: Cpm2DependencyInput[] }> {
     const taskRows = await app.db
       .select()
       .from(scheduleTasks)
@@ -379,17 +612,157 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
       tasks: taskRows.map((t) => ({
         id: t.id,
         duration: t.durationDays,
-        constraintType: (t.constraintType ?? null) as CpmTaskInput["constraintType"],
+        remainingDuration: t.remainingDurationDays,
+        percentComplete: t.percentComplete,
+        constraintType: (t.constraintType ?? null) as Cpm2TaskInput["constraintType"],
         constraintDate: t.constraintDate,
         actualStart: t.actualStart,
         actualFinish: t.actualFinish,
+        calendarId: t.calendarId,
+        taskType: t.taskType,
       })),
       deps: depRows.map((d) => ({
         predecessorId: d.predecessorId,
         successorId: d.successorId,
-        type: d.depType as CpmDependencyInput["type"],
+        type: d.depType as Cpm2DependencyInput["type"],
         lagDays: d.lagDays,
       })),
+    };
+  }
+
+  async function loadCalendarSpecs(
+    companyId: string,
+    projectId: string,
+    scheduleId: string,
+  ): Promise<{ specs: CalendarSpec[]; defaultId: string | null }> {
+    const rows = await app.db
+      .select()
+      .from(scheduleCalendars)
+      .where(
+        and(
+          eq(scheduleCalendars.companyId, companyId),
+          eq(scheduleCalendars.projectId, projectId),
+          or(eq(scheduleCalendars.scheduleId, scheduleId), sql`${scheduleCalendars.scheduleId} is null`)!,
+        ),
+      );
+    return {
+      specs: rows.map((c) => ({
+        id: c.id,
+        workdays: Array.isArray(c.workdays) && c.workdays.length === 7 ? c.workdays : [0, 1, 1, 1, 1, 1, 0],
+        holidays: c.holidays ?? [],
+        exceptions: c.exceptions ?? [],
+        hoursPerDay: c.hoursPerDay,
+      })),
+      defaultId: rows.find((c) => c.isDefault === 1)?.id ?? null,
+    };
+  }
+
+  /** The as-built (current) network of a schedule. */
+  async function asBuiltNetwork(
+    companyId: string,
+    projectId: string,
+    schedule: { id: string; projectStart: string; dataDate: string | null; defaultCalendarId: string | null },
+  ): Promise<ForensicNetwork> {
+    const { tasks, deps } = await loadCpmInputs(schedule.id, projectId);
+    const { specs, defaultId } = await loadCalendarSpecs(companyId, projectId, schedule.id);
+    return {
+      tasks,
+      deps,
+      projectStart: schedule.projectStart,
+      dataDate: schedule.dataDate,
+      calendars: specs,
+      defaultCalendarId: schedule.defaultCalendarId ?? defaultId,
+    };
+  }
+
+  /**
+   * The as-planned network reconstructed from a baseline: baseline durations,
+   * no actuals, no data date, and the schedule's CURRENT logic — a baseline
+   * snapshot stores dates, not relationships, so the logic has to come from
+   * somewhere and the analysis record says which.
+   */
+  async function baselineNetwork(
+    companyId: string,
+    projectId: string,
+    schedule: { id: string; projectStart: string; defaultCalendarId: string | null },
+    baseline: { snapshot: unknown[] | null; projectStart: string },
+  ): Promise<ForensicNetwork> {
+    const { tasks, deps } = await loadCpmInputs(schedule.id, projectId);
+    const { specs, defaultId } = await loadCalendarSpecs(companyId, projectId, schedule.id);
+    const snapshot = (baseline.snapshot ?? []) as BaselineTaskSnapshot[];
+    const byId = new Map(snapshot.map((s) => [s.taskId, s] as const));
+    const asPlanned: Cpm2TaskInput[] = tasks
+      .filter((t) => byId.has(t.id))
+      .map((t) => ({
+        ...t,
+        duration: byId.get(t.id)?.durationDays ?? t.duration,
+        remainingDuration: null,
+        percentComplete: 0,
+        actualStart: null,
+        actualFinish: null,
+      }));
+    const ids = new Set(asPlanned.map((t) => t.id));
+    return {
+      tasks: asPlanned,
+      deps: deps.filter((d) => ids.has(d.predecessorId) && ids.has(d.successorId)),
+      projectStart: baseline.projectStart,
+      dataDate: null,
+      calendars: specs,
+      defaultCalendarId: schedule.defaultCalendarId ?? defaultId,
+    };
+  }
+
+  /** Delay events shaped for the engines. */
+  function toForensicEvents(rows: Awaited<ReturnType<typeof listEventRows>>): ForensicEvent[] {
+    return rows.map((e) => ({
+      id: e.id,
+      number: e.number,
+      title: e.title,
+      startDate: e.startDate,
+      durationDays: e.durationDays,
+      struckTaskId: e.taskId,
+      party: e.party,
+      excusable: e.excusable === 1,
+      compensable: e.compensable === 1,
+    }));
+  }
+
+  async function listEventRows(
+    companyId: string,
+    projectId: string,
+    options: { ids?: string[]; includeWithdrawn?: boolean; scheduleId?: string } = {},
+  ) {
+    const clauses = [eq(delayEvents.companyId, companyId), eq(delayEvents.projectId, projectId)];
+    if (options.ids && options.ids.length > 0) clauses.push(inArray(delayEvents.id, options.ids));
+    if (!options.includeWithdrawn) {
+      for (const s of EXCLUDED_EVENT_STATUSES) clauses.push(ne(delayEvents.status, s));
+    }
+    if (options.scheduleId) clauses.push(eq(delayEvents.scheduleId, options.scheduleId));
+    return app.db
+      .select()
+      .from(delayEvents)
+      .where(and(...clauses))
+      .orderBy(asc(delayEvents.startDate), asc(delayEvents.number))
+      .limit(1000);
+  }
+
+  /** Project float doctrine, defaulted and explained when never configured. */
+  async function loadFloatRules(companyId: string, projectId: string): Promise<FloatRules & { configured: boolean }> {
+    const [row] = await app.db
+      .select()
+      .from(projectFloatRules)
+      .where(
+        and(eq(projectFloatRules.companyId, companyId), eq(projectFloatRules.projectId, projectId)),
+      )
+      .limit(1);
+    if (!row) return { ...DEFAULT_FLOAT_RULES, configured: false };
+    return {
+      ownership: row.ownership as FloatOwnershipRule,
+      concurrencyRule: row.concurrencyRule as ConcurrencyRule,
+      concurrencyThresholdDays: row.concurrencyThresholdDays,
+      pacingThresholdDays: row.pacingThresholdDays,
+      basis: row.basis,
+      configured: true,
     };
   }
 
@@ -413,6 +786,9 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
     if (body.contractEventId) {
       await validateContractEventId(body.contractEventId, req.companyId!, req.projectId!);
     }
+    if (body.pacingOfEventId) {
+      await fetchDelayEvent(body.pacingOfEventId, req.companyId!, req.projectId!);
+    }
     const evidenceIds = await validateEvidenceIds(
       body.evidenceIds ?? [],
       req.companyId!,
@@ -430,12 +806,15 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
       cause: body.cause,
       excusable: body.excusable ? 1 : 0,
       compensable: body.compensable ? 1 : 0,
+      party: body.party ?? (body.compensable ? "owner" : "neither"),
       status: "open",
       taskId,
       scheduleId,
       startDate: body.startDate,
       durationDays: body.durationDays,
       contractEventId: body.contractEventId ?? null,
+      noticeDueDate: body.noticeDueDate ?? null,
+      pacingOfEventId: body.pacingOfEventId ?? null,
       evidenceIds,
       raisedBy: req.user!.id,
     });
@@ -445,12 +824,14 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
       action: "create",
       objectType: "delay_event",
       objectId: id,
+      projectId: req.projectId!,
       payload: {
         number,
         title: body.title,
         cause: body.cause,
         excusable: body.excusable,
         compensable: body.compensable,
+        party: body.party ?? (body.compensable ? "owner" : "neither"),
         startDate: body.startDate,
         durationDays: body.durationDays,
         taskId,
@@ -472,6 +853,7 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
     ];
     if (q.cause) clauses.push(eq(delayEvents.cause, q.cause));
     if (q.status) clauses.push(eq(delayEvents.status, q.status));
+    if (q.party) clauses.push(eq(delayEvents.party, q.party));
     if (q.excusable !== undefined) clauses.push(eq(delayEvents.excusable, q.excusable ? 1 : 0));
     if (q.compensable !== undefined) {
       clauses.push(eq(delayEvents.compensable, q.compensable ? 1 : 0));
@@ -488,6 +870,53 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
     return paginate(items, Number(totalRow?.n ?? 0), q);
   });
 
+  /**
+   * Is a cached TIA still describing the programme it was computed against?
+   *
+   * The result used to be cleared only when the EVENT changed. Editing task
+   * durations, adding logic or capturing actuals left every event's cached
+   * `completionDeltaDays` untouched, and windows and the claims drawer
+   * presented those stale figures as current. The result is now stamped with
+   * the schedule's `lastComputedAt`; a mismatch makes it stale, and stale is
+   * reported rather than shown.
+   */
+  function tiaStaleness(
+    tiaResult: Record<string, unknown> | null,
+    scheduleLastComputedAt: string | null,
+  ): { stale: boolean; deltaDays: number | null; computedAt: string | null; reason: string | null } {
+    if (!tiaResult) return { stale: false, deltaDays: null, computedAt: null, reason: null };
+    const delta =
+      typeof tiaResult["completionDeltaDays"] === "number"
+        ? (tiaResult["completionDeltaDays"] as number)
+        : null;
+    const computedAt = typeof tiaResult["computedAt"] === "string" ? (tiaResult["computedAt"] as string) : null;
+    const against =
+      typeof tiaResult["scheduleComputedAt"] === "string"
+        ? (tiaResult["scheduleComputedAt"] as string)
+        : null;
+    if (scheduleLastComputedAt && against !== scheduleLastComputedAt) {
+      return {
+        stale: true,
+        deltaDays: null,
+        computedAt,
+        reason: against
+          ? "the schedule has been recomputed since this analysis ran"
+          : "this analysis predates schedule-version stamping",
+      };
+    }
+    return { stale: false, deltaDays: delta, computedAt, reason: null };
+  }
+
+  async function scheduleComputedAt(scheduleId: string | null): Promise<string | null> {
+    if (!scheduleId) return null;
+    const [row] = await app.db
+      .select({ lastComputedAt: schedules.lastComputedAt })
+      .from(schedules)
+      .where(eq(schedules.id, scheduleId))
+      .limit(1);
+    return row?.lastComputedAt ?? null;
+  }
+
   app.get("/projects/:projectId/delay-events/:eventId", { preHandler: readGate }, async (req) => {
     const { eventId } = req.params as { eventId: string };
     const ev = await fetchDelayEvent(eventId, req.companyId!, req.projectId!);
@@ -502,13 +931,14 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
       task = t ?? null;
     }
 
-    let contractEvent: { id: string; number: number; title: string } | null = null;
+    let contractEvent: { id: string; number: number; title: string; noticeServedAt: string | null } | null = null;
     if (ev.contractEventId) {
       const [ce] = await app.db
         .select({
           id: contractEvents.id,
           number: contractEvents.number,
           title: contractEvents.title,
+          noticeServedAt: contractEvents.noticeServedAt,
         })
         .from(contractEvents)
         .where(
@@ -538,13 +968,17 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
             )
         : [];
 
-    return { ...ev, task, contractEvent, evidence: evidenceRows };
+    const tia = tiaStaleness(ev.tiaResult, await scheduleComputedAt(ev.scheduleId));
+    return { ...ev, task, contractEvent, evidence: evidenceRows, tia };
   });
 
   app.patch("/projects/:projectId/delay-events/:eventId", { preHandler: standardGate }, async (req) => {
     const { eventId } = req.params as { eventId: string };
     const body = delayEventPatchSchema.parse(req.body);
     const ev = await fetchDelayEvent(eventId, req.companyId!, req.projectId!);
+    if (ev.status === "withdrawn" || ev.status === "closed") {
+      throw badRequest(`A ${ev.status} delay event cannot be edited — reopen it first`);
+    }
 
     const nextExcusable = body.excusable !== undefined ? body.excusable : ev.excusable === 1;
     const nextCompensable = body.compensable !== undefined ? body.compensable : ev.compensable === 1;
@@ -558,11 +992,20 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
     if (body.cause !== undefined) set["cause"] = body.cause;
     if (body.excusable !== undefined) set["excusable"] = body.excusable ? 1 : 0;
     if (body.compensable !== undefined) set["compensable"] = body.compensable ? 1 : 0;
+    if (body.party !== undefined) set["party"] = body.party;
     if (body.startDate !== undefined) set["startDate"] = body.startDate;
     if (body.durationDays !== undefined) set["durationDays"] = body.durationDays;
+    if (body.noticeDueDate !== undefined) set["noticeDueDate"] = body.noticeDueDate;
     if (body.startDate !== undefined || body.durationDays !== undefined) {
       // the modelled delay changed — a previously computed TIA is stale
       set["tiaResult"] = null;
+    }
+    if (body.pacingOfEventId !== undefined) {
+      if (body.pacingOfEventId) {
+        if (body.pacingOfEventId === eventId) throw badRequest("An event cannot pace itself");
+        await fetchDelayEvent(body.pacingOfEventId, req.companyId!, req.projectId!);
+      }
+      set["pacingOfEventId"] = body.pacingOfEventId;
     }
 
     if (body.taskId !== undefined || body.scheduleId !== undefined) {
@@ -598,6 +1041,7 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
       action: "update",
       objectType: "delay_event",
       objectId: eventId,
+      projectId: req.projectId!,
       payload: { changed: Object.keys(body) },
     });
     return fetchDelayEvent(eventId, req.companyId!, req.projectId!);
@@ -613,9 +1057,28 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
       if (ev.status === body.status) {
         throw badRequest(`Delay event is already ${body.status}`);
       }
+      const allowed = DELAY_EVENT_TRANSITIONS[ev.status] ?? [];
+      if (!allowed.includes(body.status)) {
+        throw badRequest(
+          `Cannot move a ${ev.status} delay event to ${body.status}` +
+            (allowed.length > 0 ? ` — allowed: ${allowed.join(", ")}` : " — this state is terminal"),
+        );
+      }
+      // Withdrawal removes the event from every downstream aggregation, and
+      // reopening one puts it back: both need a recorded reason.
+      if (body.status === "withdrawn" && !body.reason) {
+        throw badRequest("A reason is required to withdraw a delay event");
+      }
+      if (DELAY_EVENT_REOPEN_FROM.has(ev.status) && !body.reason) {
+        throw badRequest(`A reason is required to reopen a ${ev.status} delay event`);
+      }
       await app.db
         .update(delayEvents)
-        .set({ status: body.status, updatedAt: new Date().toISOString() })
+        .set({
+          status: body.status,
+          statusReason: body.reason ?? null,
+          updatedAt: new Date().toISOString(),
+        })
         .where(eq(delayEvents.id, eventId));
       await appendLedger(app.db, {
         companyId: req.companyId!,
@@ -623,7 +1086,8 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
         action: "state_change",
         objectType: "delay_event",
         objectId: eventId,
-        payload: { from: ev.status, to: body.status },
+        projectId: req.projectId!,
+        payload: { from: ev.status, to: body.status, reason: body.reason ?? null },
       });
       return fetchDelayEvent(eventId, req.companyId!, req.projectId!);
     },
@@ -650,7 +1114,14 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
         throw badRequest("The delay event's task no longer exists in its schedule");
       }
       const result = runFragnetTia({
-        tasks,
+        tasks: tasks.map((t) => ({
+          id: t.id,
+          duration: t.duration,
+          constraintType: t.constraintType ?? null,
+          constraintDate: t.constraintDate ?? null,
+          actualStart: t.actualStart ?? null,
+          actualFinish: t.actualFinish ?? null,
+        })),
         deps,
         projectStart: schedule.projectStart,
         struckTaskId: ev.taskId,
@@ -667,6 +1138,9 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
         beforeFinish: result.beforeFinish,
         afterFinish: result.afterFinish,
         computedAt: new Date().toISOString(),
+        // Stamp the schedule version this ran against so a later recompute
+        // makes the cached figure detectably stale instead of quietly wrong.
+        scheduleComputedAt: schedule.lastComputedAt,
       };
       await app.db
         .update(delayEvents)
@@ -678,6 +1152,7 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
         action: "update",
         objectType: "delay_event",
         objectId: eventId,
+        projectId: req.projectId!,
         payload: { tia: tiaResult, scheduleId: ev.scheduleId, taskId: ev.taskId },
       });
       return { eventId, scheduleId: ev.scheduleId, taskId: ev.taskId, ...tiaResult };
@@ -763,560 +1238,3 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
       };
     },
   );
-
-  /* ---------------------------------------------------------------- */
-  /* Windows analysis (#273 — honestly scoped)                         */
-  /* ---------------------------------------------------------------- */
-
-  app.get("/projects/:projectId/forensics/windows", { preHandler: readGate }, async (req) => {
-    const q = windowsQuerySchema.parse(req.query);
-    const schedule = await resolveSchedule(req.companyId!, req.projectId!, q.scheduleId);
-    const baseline = await resolveBaseline(schedule.id, req.projectId!, q.baselineId);
-
-    const boundaryList = [
-      ...new Set(
-        q.boundaries
-          .split(",")
-          .map((b) => b.trim())
-          .filter((b) => b.length > 0),
-      ),
-    ].sort();
-    if (boundaryList.length === 0) {
-      throw badRequest("boundaries must contain at least one ISO date (comma-separated)");
-    }
-    for (const b of boundaryList) {
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(b)) {
-        throw badRequest(`Invalid window boundary "${b}" — expected ISO dates (YYYY-MM-DD)`);
-      }
-    }
-
-    const events = await app.db
-      .select()
-      .from(delayEvents)
-      .where(
-        and(eq(delayEvents.companyId, req.companyId!), eq(delayEvents.projectId, req.projectId!)),
-      )
-      .orderBy(asc(delayEvents.startDate), asc(delayEvents.number));
-
-    const starts = [schedule.projectStart, ...boundaryList];
-    const windows = starts.map((start, i) => ({
-      start,
-      /** null = open-ended final window */
-      end: boundaryList[i] ?? null,
-      events: [] as {
-        id: string;
-        number: number;
-        title: string;
-        cause: string;
-        excusable: boolean;
-        compensable: boolean;
-        status: string;
-        startDate: string;
-        durationDays: number;
-        tiaDeltaDays: number | null;
-      }[],
-      totals: {
-        events: 0,
-        excusableDays: 0,
-        compensableDays: 0,
-        nonExcusableDays: 0,
-        tiaDeltaDays: 0,
-      },
-    }));
-
-    let unattributed = 0;
-    for (const ev of events) {
-      const w = windows.find(
-        (win) => ev.startDate >= win.start && (win.end === null || ev.startDate < win.end),
-      );
-      if (!w) {
-        unattributed += 1;
-        continue;
-      }
-      const tiaDelta =
-        ev.tiaResult && typeof ev.tiaResult["completionDeltaDays"] === "number"
-          ? (ev.tiaResult["completionDeltaDays"] as number)
-          : null;
-      w.events.push({
-        id: ev.id,
-        number: ev.number,
-        title: ev.title,
-        cause: ev.cause,
-        excusable: ev.excusable === 1,
-        compensable: ev.compensable === 1,
-        status: ev.status,
-        startDate: ev.startDate,
-        durationDays: ev.durationDays,
-        tiaDeltaDays: tiaDelta,
-      });
-      w.totals.events += 1;
-      if (ev.compensable === 1) w.totals.compensableDays += ev.durationDays;
-      else if (ev.excusable === 1) w.totals.excusableDays += ev.durationDays;
-      else w.totals.nonExcusableDays += ev.durationDays;
-      if (tiaDelta !== null) w.totals.tiaDeltaDays += tiaDelta;
-    }
-
-    return {
-      scheduleId: schedule.id,
-      scheduleName: schedule.name,
-      baselineId: baseline?.id ?? null,
-      projectStart: schedule.projectStart,
-      boundaries: boundaryList,
-      method:
-        "delay events attributed to windows by start date; movement quantified by per-event " +
-        "TIA against the current programme — not a full retrospective windows TIA",
-      unattributedEvents: unattributed,
-      windows,
-    };
-  });
-
-  /* ---------------------------------------------------------------- */
-  /* Prolongation calculator (#299-301 seed)                           */
-  /* ---------------------------------------------------------------- */
-
-  app.post(
-    "/projects/:projectId/forensics/prolongation",
-    { preHandler: standardGate },
-    async (req) => {
-      const body = prolongationBodySchema.parse(req.body);
-
-      let prelimsTimeTotal: number | null = null;
-      let scheduleDurationDays: number | null = null;
-      let scheduleId: string | null = null;
-      if (body.prelimsRatePerDay === undefined) {
-        const projectBoqs = await app.db
-          .select({ id: boqs.id })
-          .from(boqs)
-          .where(and(eq(boqs.companyId, req.companyId!), eq(boqs.projectId, req.projectId!)));
-        if (projectBoqs.length > 0) {
-          const items = await app.db
-            .select({ amount: boqItems.amount, quantity: boqItems.quantity, rate: boqItems.rate })
-            .from(boqItems)
-            .where(
-              and(
-                inArray(
-                  boqItems.boqId,
-                  projectBoqs.map((b) => b.id),
-                ),
-                eq(boqItems.itemType, "prelims_time"),
-              ),
-            );
-          const total = items.reduce((sum, it) => {
-            const amount = it.amount ?? (it.quantity != null && it.rate != null ? it.quantity * it.rate : 0);
-            return sum + amount;
-          }, 0);
-          prelimsTimeTotal = total > 0 ? total : null;
-        }
-        const [active] = await app.db
-          .select()
-          .from(schedules)
-          .where(
-            and(
-              eq(schedules.companyId, req.companyId!),
-              eq(schedules.projectId, req.projectId!),
-              eq(schedules.isActive, 1),
-            ),
-          )
-          .orderBy(desc(schedules.createdAt))
-          .limit(1);
-        if (active) {
-          scheduleId = active.id;
-          if (active.computedDurationDays != null && active.computedDurationDays > 0) {
-            scheduleDurationDays = active.computedDurationDays;
-          } else {
-            // fall back to the persisted task dates when the roll-up is stale
-            const rows = await app.db
-              .select({ finishDate: scheduleTasks.finishDate })
-              .from(scheduleTasks)
-              .where(eq(scheduleTasks.scheduleId, active.id));
-            const maxFinish = maxIso(rows.map((r) => r.finishDate));
-            if (maxFinish) {
-              scheduleDurationDays = dayFromIso(maxFinish, active.projectStart) + 1;
-            }
-          }
-        }
-      }
-
-      const result = computeProlongation({
-        compensableDays: body.compensableDays,
-        prelimsRatePerDay: body.prelimsRatePerDay ?? null,
-        prelimsTimeTotal,
-        scheduleDurationDays,
-      });
-      if (!result.ok) throw badRequest(result.reason);
-      return {
-        compensableDays: result.compensableDays,
-        prelimsRatePerDay: result.prelimsRatePerDay,
-        amount: result.amount,
-        derivation: result.derivation,
-        sources:
-          body.prelimsRatePerDay !== undefined
-            ? null
-            : { prelimsTimeTotal, scheduleDurationDays, scheduleId },
-      };
-    },
-  );
-
-  /* ---------------------------------------------------------------- */
-  /* Claims workspace (#304-320)                                       */
-  /* ---------------------------------------------------------------- */
-
-  async function validateDelayEventIds(
-    ids: string[],
-    companyId: string,
-    projectId: string,
-  ): Promise<string[]> {
-    const unique = [...new Set(ids)];
-    if (unique.length === 0) return [];
-    const rows = await app.db
-      .select({ id: delayEvents.id })
-      .from(delayEvents)
-      .where(
-        and(
-          inArray(delayEvents.id, unique),
-          eq(delayEvents.companyId, companyId),
-          eq(delayEvents.projectId, projectId),
-        ),
-      );
-    if (rows.length !== unique.length) {
-      throw badRequest("One or more delayEventIds do not reference delay events in this project");
-    }
-    return unique;
-  }
-
-  app.post("/projects/:projectId/claims", { preHandler: standardGate }, async (req, reply) => {
-    const body = claimCreateSchema.parse(req.body);
-    if (body.contractId) {
-      const [c] = await app.db
-        .select({ id: contracts.id })
-        .from(contracts)
-        .where(
-          and(
-            eq(contracts.id, body.contractId),
-            eq(contracts.companyId, req.companyId!),
-            eq(contracts.projectId, req.projectId!),
-          ),
-        )
-        .limit(1);
-      if (!c) throw badRequest("contractId does not reference a contract in this project");
-    }
-    const delayEventIds = await validateDelayEventIds(
-      body.delayEventIds ?? [],
-      req.companyId!,
-      req.projectId!,
-    );
-    const number = await nextRecordNumber(app.db, req.projectId!, "claim");
-    const id = newId("clm");
-    await app.db.insert(forensicClaims).values({
-      id,
-      companyId: req.companyId!,
-      projectId: req.projectId!,
-      number,
-      title: body.title,
-      kind: body.kind,
-      status: "draft",
-      contractId: body.contractId ?? null,
-      clauseRef: body.clauseRef ?? null,
-      delayEventIds,
-      chain: body.chain ?? {},
-      daysClaimed: body.daysClaimed ?? null,
-      amountClaimed: body.amountClaimed ?? null,
-      prolongation: body.prolongation ?? null,
-      createdBy: req.user!.id,
-    });
-    await appendLedger(app.db, {
-      companyId: req.companyId!,
-      actorId: req.user!.id,
-      action: "create",
-      objectType: "forensic_claim",
-      objectId: id,
-      payload: {
-        number,
-        title: body.title,
-        kind: body.kind,
-        delayEventIds,
-        daysClaimed: body.daysClaimed ?? null,
-        amountClaimed: body.amountClaimed ?? null,
-      },
-      storePayload: true,
-    });
-    const created = await fetchClaim(id, req.companyId!, req.projectId!);
-    return reply.status(201).send(created);
-  });
-
-  app.get("/projects/:projectId/claims", { preHandler: readGate }, async (req) => {
-    const q = claimListQuery.parse(req.query);
-    const clauses = [
-      eq(forensicClaims.companyId, req.companyId!),
-      eq(forensicClaims.projectId, req.projectId!),
-    ];
-    if (q.kind) clauses.push(eq(forensicClaims.kind, q.kind));
-    if (q.status) clauses.push(eq(forensicClaims.status, q.status));
-    const where = and(...clauses);
-    const [totalRow] = await app.db.select({ n: count() }).from(forensicClaims).where(where);
-    const items = await app.db
-      .select()
-      .from(forensicClaims)
-      .where(where)
-      .orderBy(desc(forensicClaims.number))
-      .limit(q.pageSize)
-      .offset(pageOffset(q));
-    return paginate(items, Number(totalRow?.n ?? 0), q);
-  });
-
-  app.get("/projects/:projectId/claims/:claimId", { preHandler: readGate }, async (req) => {
-    const { claimId } = req.params as { claimId: string };
-    const claim = await fetchClaim(claimId, req.companyId!, req.projectId!);
-    const ids = claim.delayEventIds ?? [];
-    const events =
-      ids.length > 0
-        ? await app.db
-            .select({
-              id: delayEvents.id,
-              number: delayEvents.number,
-              title: delayEvents.title,
-              cause: delayEvents.cause,
-              excusable: delayEvents.excusable,
-              compensable: delayEvents.compensable,
-              status: delayEvents.status,
-              startDate: delayEvents.startDate,
-              durationDays: delayEvents.durationDays,
-              tiaResult: delayEvents.tiaResult,
-            })
-            .from(delayEvents)
-            .where(
-              and(inArray(delayEvents.id, ids), eq(delayEvents.projectId, req.projectId!)),
-            )
-            .orderBy(asc(delayEvents.number))
-        : [];
-    return { ...claim, delayEvents: events };
-  });
-
-  app.patch("/projects/:projectId/claims/:claimId", { preHandler: standardGate }, async (req) => {
-    const { claimId } = req.params as { claimId: string };
-    const body = claimPatchSchema.parse(req.body);
-    const claim = await fetchClaim(claimId, req.companyId!, req.projectId!);
-    if (["agreed", "rejected", "withdrawn"].includes(claim.status)) {
-      throw badRequest(`A ${claim.status} claim cannot be edited`);
-    }
-    // The cause-effect-entitlement-quantum chain and the supporting event set
-    // (#305) are frozen once the claim leaves draft — the submitted narrative
-    // is the narrative that gets assessed.
-    if ((body.chain !== undefined || body.delayEventIds !== undefined) && claim.status !== "draft") {
-      throw badRequest("chain and delayEventIds may only be changed while the claim is draft");
-    }
-    const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
-    if (body.title !== undefined) set["title"] = body.title;
-    if (body.clauseRef !== undefined) set["clauseRef"] = body.clauseRef;
-    if (body.chain !== undefined) set["chain"] = body.chain;
-    if (body.daysClaimed !== undefined) set["daysClaimed"] = body.daysClaimed;
-    if (body.amountClaimed !== undefined) set["amountClaimed"] = body.amountClaimed;
-    if (body.prolongation !== undefined) set["prolongation"] = body.prolongation;
-    if (body.contractId !== undefined) {
-      if (body.contractId) {
-        const [c] = await app.db
-          .select({ id: contracts.id })
-          .from(contracts)
-          .where(
-            and(
-              eq(contracts.id, body.contractId),
-              eq(contracts.companyId, req.companyId!),
-              eq(contracts.projectId, req.projectId!),
-            ),
-          )
-          .limit(1);
-        if (!c) throw badRequest("contractId does not reference a contract in this project");
-      }
-      set["contractId"] = body.contractId;
-    }
-    if (body.delayEventIds !== undefined) {
-      set["delayEventIds"] = await validateDelayEventIds(
-        body.delayEventIds,
-        req.companyId!,
-        req.projectId!,
-      );
-    }
-    await app.db.update(forensicClaims).set(set).where(eq(forensicClaims.id, claimId));
-    await appendLedger(app.db, {
-      companyId: req.companyId!,
-      actorId: req.user!.id,
-      action: "update",
-      objectType: "forensic_claim",
-      objectId: claimId,
-      payload: { changed: Object.keys(body) },
-    });
-    return fetchClaim(claimId, req.companyId!, req.projectId!);
-  });
-
-  app.post(
-    "/projects/:projectId/claims/:claimId/status",
-    { preHandler: standardGate },
-    async (req) => {
-      const { claimId } = req.params as { claimId: string };
-      const body = claimStatusSchema.parse(req.body);
-      const claim = await fetchClaim(claimId, req.companyId!, req.projectId!);
-      const allowed = CLAIM_TRANSITIONS[claim.status] ?? [];
-      if (!allowed.includes(body.status)) {
-        throw badRequest(`Cannot transition a ${claim.status} claim to ${body.status}`);
-      }
-      const now = new Date().toISOString();
-      const set: Record<string, unknown> = { status: body.status, updatedAt: now };
-      if (body.status === "assessed") {
-        // Determination independence (#310): the assessor must not be the
-        // party who prepared the claim.
-        if (req.user!.id === claim.createdBy) {
-          throw forbidden("A claim cannot be assessed by the user who created it");
-        }
-        if (body.daysAssessed !== undefined) set["daysAssessed"] = body.daysAssessed;
-        if (body.amountAssessed !== undefined) set["amountAssessed"] = body.amountAssessed;
-        set["assessedBy"] = req.user!.id;
-      }
-      await app.db.update(forensicClaims).set(set).where(eq(forensicClaims.id, claimId));
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: req.user!.id,
-        action: "state_change",
-        objectType: "forensic_claim",
-        objectId: claimId,
-        payload: {
-          from: claim.status,
-          to: body.status,
-          daysAssessed: body.status === "assessed" ? (body.daysAssessed ?? null) : claim.daysAssessed,
-          amountAssessed:
-            body.status === "assessed" ? (body.amountAssessed ?? null) : claim.amountAssessed,
-        },
-      });
-      return fetchClaim(claimId, req.companyId!, req.projectId!);
-    },
-  );
-
-  /* ---------------------------------------------------------------- */
-  /* Chronology auto-assembly (#318)                                   */
-  /* ---------------------------------------------------------------- */
-
-  app.post(
-    "/projects/:projectId/claims/:claimId/chronology",
-    { preHandler: standardGate },
-    async (req) => {
-      const { claimId } = req.params as { claimId: string };
-      const claim = await fetchClaim(claimId, req.companyId!, req.projectId!);
-      const companyId = req.companyId!;
-      const projectId = req.projectId!;
-      const entries: { date: string; source: string; ref: string; title: string }[] = [];
-
-      const dEvents = await app.db
-        .select()
-        .from(delayEvents)
-        .where(and(eq(delayEvents.companyId, companyId), eq(delayEvents.projectId, projectId)));
-      for (const ev of dEvents) {
-        entries.push({
-          date: ev.startDate,
-          source: "delay_event",
-          ref: `DE-${ev.number}`,
-          title: ev.title,
-        });
-      }
-
-      const cEvents = await app.db
-        .select()
-        .from(contractEvents)
-        .where(
-          and(eq(contractEvents.companyId, companyId), eq(contractEvents.projectId, projectId)),
-        );
-      for (const ev of cEvents) {
-        entries.push({
-          date: ev.eventDate,
-          source: "contract_event",
-          ref: `CE-${ev.number}`,
-          title: ev.title,
-        });
-        if (ev.noticeServedAt) {
-          entries.push({
-            date: ev.noticeServedAt.slice(0, 10),
-            source: "contract_event",
-            ref: `CE-${ev.number}`,
-            title: `Notice served — ${ev.title}`,
-          });
-        }
-      }
-
-      const rfiRows = await app.db
-        .select()
-        .from(rfis)
-        .where(and(eq(rfis.companyId, companyId), eq(rfis.projectId, projectId)));
-      for (const r of rfiRows) {
-        entries.push({
-          date: r.createdAt.slice(0, 10),
-          source: "rfi",
-          ref: `RFI-${r.number}`,
-          title: `RFI raised — ${r.subject}`,
-        });
-        if (r.respondedAt) {
-          entries.push({
-            date: r.respondedAt.slice(0, 10),
-            source: "rfi",
-            ref: `RFI-${r.number}`,
-            title: `RFI answered — ${r.subject}`,
-          });
-        }
-      }
-
-      const logRows = await app.db
-        .select()
-        .from(dailyLogs)
-        .where(and(eq(dailyLogs.companyId, companyId), eq(dailyLogs.projectId, projectId)));
-      for (const log of logRows) {
-        const delays = (log.sections ?? {})["delays"];
-        if (Array.isArray(delays) && delays.length > 0) {
-          entries.push({
-            date: log.logDate,
-            source: "daily_log",
-            ref: `LOG-${log.logDate}`,
-            title: `Daily log records ${delays.length} delay ${delays.length === 1 ? "entry" : "entries"}`,
-          });
-        }
-      }
-
-      const varRows = await app.db
-        .select()
-        .from(variations)
-        .where(
-          and(
-            eq(variations.companyId, companyId),
-            eq(variations.projectId, projectId),
-            isNotNull(variations.instructedAt),
-          ),
-        );
-      for (const v of varRows) {
-        entries.push({
-          date: v.instructedAt!,
-          source: "variation",
-          ref: `VO-${v.number}`,
-          title: `Variation instructed — ${v.title}`,
-        });
-      }
-
-      entries.sort(
-        (a, b) =>
-          a.date.localeCompare(b.date) ||
-          a.source.localeCompare(b.source) ||
-          a.ref.localeCompare(b.ref),
-      );
-
-      const chronologyAt = new Date().toISOString();
-      await app.db
-        .update(forensicClaims)
-        .set({ chronology: entries, chronologyAt, updatedAt: chronologyAt })
-        .where(eq(forensicClaims.id, claimId));
-      await appendLedger(app.db, {
-        companyId,
-        actorId: req.user!.id,
-        action: "update",
-        objectType: "forensic_claim",
-        objectId: claimId,
-        payload: { chronologyAt, entryCount: entries.length },
-      });
-      return { claimId: claim.id, chronologyAt, count: entries.length, items: entries };
-    },
-  );
-};

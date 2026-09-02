@@ -21,6 +21,9 @@
  *                into the platform-wide occurrence log                  #1084
  *   progress     claimed-versus-observed progress as Assertion + Evidence +
  *                Reconciliation, refusing self-verified claims     #995–1003
+ *   plan         an equirectangular site plan drawn from the project's OWN
+ *                points — zones, control, boreholes, services, strikes,
+ *                located gate reads — with no external tiles       #471–478
  *   summary      workspace summary, health inputs, this module's signals
  *
  * What it deliberately does not do: keep a second labour register (workforce),
@@ -36,6 +39,7 @@ import { accessRoutes } from "./routes/access.js";
 import { captureRoutes } from "./routes/capture.js";
 import { environmentalRoutes } from "./routes/events.js";
 import { groundRoutes } from "./routes/ground.js";
+import { mapRoutes } from "./routes/map.js";
 import { permitRoutes } from "./routes/permits.js";
 import { progressRoutes } from "./routes/progress.js";
 import { summaryRoutes } from "./routes/summary.js";
@@ -50,6 +54,7 @@ export const siteModule: FastifyPluginAsync = async (app) => {
   await app.register(surveyRoutes);
   await app.register(groundRoutes);
   await app.register(environmentalRoutes);
+  await app.register(mapRoutes);
   await app.register(progressRoutes);
   await app.register(summaryRoutes);
   registerSiteJobs(app);

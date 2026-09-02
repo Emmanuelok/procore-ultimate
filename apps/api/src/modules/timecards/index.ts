@@ -4,6 +4,7 @@ import { timecardRoutes } from "./cards.js";
 import { batchRoutes } from "./batches.js";
 import { reconcileRoutes } from "./reconcile.js";
 import { tmTicketRoutes } from "./tickets.js";
+import { timecardReportRoutes } from "./reports.js";
 
 /**
  * TIMECARDS, CREWS & T&M TICKETS (M24) — tool key `timecards`.
@@ -74,4 +75,5 @@ export const timecardsModule: FastifyPluginAsync = async (app) => {
   await app.register(batchRoutes);
   await app.register(reconcileRoutes);
   await app.register(tmTicketRoutes);
+  await app.register(timecardReportRoutes);
 };

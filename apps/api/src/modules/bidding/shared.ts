@@ -327,7 +327,15 @@ export type BiddingObjectType =
   | "prequalification_question"
   | "prequalification_submission"
   | "prequalification_response"
-  | "prequalification_financial";
+  | "prequalification_financial"
+  /* platform upgrade wave */
+  | "bid_opportunity"
+  | "bid_question"
+  | "bid_meeting"
+  | "bid_bond"
+  | "bid_document_access"
+  | "tender_cost"
+  | "award_delegation";
 
 /** Ledger append with the module's object-type vocabulary pre-bound. */
 export async function ledger(

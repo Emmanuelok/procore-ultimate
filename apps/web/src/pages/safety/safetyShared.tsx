@@ -602,6 +602,8 @@ export interface ProgrammeRecord {
   reviewOverdue: boolean;
   acknowledgementShortfall: number | null;
   isCriticalKind: boolean;
+  /** the live permit-to-work in site operations this document authorises */
+  sitePermitId?: string | null;
   /**
    * Who has confirmed they read it, and — the field that matters after an
    * incident — whether they confirmed it themselves or somebody recorded it

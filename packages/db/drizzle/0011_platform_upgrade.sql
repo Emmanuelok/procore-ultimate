@@ -2815,7 +2815,7 @@ CREATE TABLE "bid_bonds" (
 	"vendor_id" text NOT NULL,
 	"invitation_id" text,
 	"submission_id" text,
-	"bond_type" text DEFAULT 'bid_bond' NOT NULL,
+	"bond_type" text DEFAULT 'bid' NOT NULL,
 	"status" text DEFAULT 'required' NOT NULL,
 	"required_percent" double precision,
 	"required_amount" double precision,
@@ -6222,6 +6222,226 @@ CREATE TABLE "site_weather_observations" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
+CREATE TABLE "resource_assignments" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"number" integer NOT NULL,
+	"reference" text NOT NULL,
+	"resource_type_id" text,
+	"subject_kind" text NOT NULL,
+	"crew_id" text,
+	"worker_id" text,
+	"equipment_id" text,
+	"subject_label" text NOT NULL,
+	"schedule_task_id" text,
+	"schedule_id" text,
+	"location_id" text,
+	"from_date" text NOT NULL,
+	"to_date" text NOT NULL,
+	"shift" text DEFAULT 'day' NOT NULL,
+	"hours_per_day" double precision,
+	"allocation_percent" double precision DEFAULT 100 NOT NULL,
+	"planned_hours" double precision,
+	"status" text DEFAULT 'planned' NOT NULL,
+	"confirmed_by" text,
+	"confirmed_at" timestamp with time zone,
+	"completed_at" timestamp with time zone,
+	"cancelled_reason" text,
+	"notes" text,
+	"detail" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "resource_availability" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"resource_type_id" text NOT NULL,
+	"week_start" text NOT NULL,
+	"available_hours" double precision DEFAULT 0 NOT NULL,
+	"available_headcount" double precision,
+	"source" text DEFAULT 'manual' NOT NULL,
+	"vendor_id" text,
+	"commitment_id" text,
+	"note" text,
+	"detail" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "resource_demands" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"plan_id" text NOT NULL,
+	"resource_type_id" text NOT NULL,
+	"week_start" text NOT NULL,
+	"demand_hours" double precision DEFAULT 0 NOT NULL,
+	"headcount" double precision,
+	"source" text DEFAULT 'manual' NOT NULL,
+	"source_task_id" text,
+	"source_schedule_id" text,
+	"basis" text,
+	"location_id" text,
+	"crew_id" text,
+	"detail" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "resource_forecasts" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"resource_type_id" text,
+	"as_of_date" text NOT NULL,
+	"method" text DEFAULT 'productivity_factor' NOT NULL,
+	"budget_hours" double precision,
+	"actual_hours" double precision DEFAULT 0 NOT NULL,
+	"earned_hours" double precision,
+	"productivity_factor" double precision,
+	"percent_complete" double precision,
+	"remaining_hours" double precision,
+	"forecast_hours_at_completion" double precision,
+	"variance_hours" double precision,
+	"confidence" text,
+	"basis" text,
+	"reasons" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"inputs" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"created_by" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "resource_plans" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"number" integer NOT NULL,
+	"reference" text NOT NULL,
+	"name" text NOT NULL,
+	"description" text,
+	"plan_kind" text DEFAULT 'current' NOT NULL,
+	"status" text DEFAULT 'draft' NOT NULL,
+	"schedule_id" text,
+	"period_start" text,
+	"period_end" text,
+	"week_starts_on" integer DEFAULT 1 NOT NULL,
+	"source" text DEFAULT 'manual' NOT NULL,
+	"version" integer DEFAULT 1 NOT NULL,
+	"supersedes_plan_id" text,
+	"derived_at" timestamp with time zone,
+	"derived_task_count" integer DEFAULT 0 NOT NULL,
+	"skipped_task_count" integer DEFAULT 0 NOT NULL,
+	"demand_row_count" integer DEFAULT 0 NOT NULL,
+	"total_demand_hours" double precision DEFAULT 0 NOT NULL,
+	"peak_headcount" double precision,
+	"peak_week_start" text,
+	"activated_by" text,
+	"activated_at" timestamp with time zone,
+	"detail" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "resource_productivity_snapshots" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"period_start" text NOT NULL,
+	"period_end" text NOT NULL,
+	"week_start" text,
+	"scope" text DEFAULT 'project' NOT NULL,
+	"scope_id" text,
+	"scope_label" text,
+	"actual_hours" double precision DEFAULT 0 NOT NULL,
+	"earned_hours" double precision,
+	"productivity_factor" double precision,
+	"installed_quantity" double precision,
+	"unit" text,
+	"achieved_unit_rate" double precision,
+	"planned_unit_rate" double precision,
+	"lines_measured" integer DEFAULT 0 NOT NULL,
+	"lines_unmeasurable" integer DEFAULT 0 NOT NULL,
+	"reasons" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"basis" text,
+	"captured_by" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "resource_skills" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"code" text NOT NULL,
+	"name" text NOT NULL,
+	"description" text,
+	"category" text DEFAULT 'skill' NOT NULL,
+	"trade" text,
+	"issuing_body" text,
+	"validity_months" integer,
+	"requires_evidence" integer DEFAULT 0 NOT NULL,
+	"is_mandatory" integer DEFAULT 0 NOT NULL,
+	"status" text DEFAULT 'active' NOT NULL,
+	"detail" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "resource_types" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text,
+	"code" text NOT NULL,
+	"name" text NOT NULL,
+	"description" text,
+	"kind" text DEFAULT 'labour' NOT NULL,
+	"trade" text,
+	"equipment_category" text,
+	"unit" text DEFAULT 'hours' NOT NULL,
+	"standard_hours_per_day" double precision,
+	"working_days_per_week" double precision,
+	"default_hourly_cost" double precision,
+	"currency" text DEFAULT 'USD' NOT NULL,
+	"required_skill_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"maps_to_trade" text,
+	"status" text DEFAULT 'active' NOT NULL,
+	"detail" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "worker_skills" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"worker_id" text NOT NULL,
+	"skill_id" text NOT NULL,
+	"level" text DEFAULT 'competent' NOT NULL,
+	"status" text DEFAULT 'claimed' NOT NULL,
+	"certificate_ref" text,
+	"issuing_body" text,
+	"issued_at" text,
+	"expires_at" text,
+	"verified_by" text,
+	"verified_at" timestamp with time zone,
+	"rejected_reason" text,
+	"evidence_file_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"source" text DEFAULT 'manual' NOT NULL,
+	"expiry_notified_at" timestamp with time zone,
+	"expiry_notified_for_date" text,
+	"notes" text,
+	"detail" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
 CREATE TABLE "agent_actions" (
 	"id" text PRIMARY KEY NOT NULL,
 	"company_id" text NOT NULL,
@@ -7394,6 +7614,38 @@ CREATE INDEX "site_weather_baselines_project_idx" ON "site_weather_baselines" US
 CREATE UNIQUE INDEX "site_weather_obs_uq" ON "site_weather_observations" USING btree ("project_id","observed_on","source");--> statement-breakpoint
 CREATE INDEX "site_weather_obs_project_idx" ON "site_weather_observations" USING btree ("project_id","observed_on");--> statement-breakpoint
 CREATE INDEX "site_weather_obs_company_idx" ON "site_weather_observations" USING btree ("company_id","observed_on");--> statement-breakpoint
+CREATE UNIQUE INDEX "resource_assignments_uq" ON "resource_assignments" USING btree ("project_id","number");--> statement-breakpoint
+CREATE INDEX "resource_assignments_project_idx" ON "resource_assignments" USING btree ("project_id","status","from_date");--> statement-breakpoint
+CREATE INDEX "resource_assignments_window_idx" ON "resource_assignments" USING btree ("project_id","from_date","to_date");--> statement-breakpoint
+CREATE INDEX "resource_assignments_crew_idx" ON "resource_assignments" USING btree ("crew_id","from_date");--> statement-breakpoint
+CREATE INDEX "resource_assignments_worker_idx" ON "resource_assignments" USING btree ("worker_id","from_date");--> statement-breakpoint
+CREATE INDEX "resource_assignments_equipment_idx" ON "resource_assignments" USING btree ("equipment_id","from_date");--> statement-breakpoint
+CREATE INDEX "resource_assignments_task_idx" ON "resource_assignments" USING btree ("schedule_task_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "resource_availability_uq" ON "resource_availability" USING btree ("project_id","resource_type_id","week_start");--> statement-breakpoint
+CREATE INDEX "resource_availability_project_idx" ON "resource_availability" USING btree ("project_id","week_start");--> statement-breakpoint
+CREATE INDEX "resource_availability_type_idx" ON "resource_availability" USING btree ("resource_type_id","week_start");--> statement-breakpoint
+CREATE INDEX "resource_demands_plan_idx" ON "resource_demands" USING btree ("plan_id","week_start");--> statement-breakpoint
+CREATE INDEX "resource_demands_type_idx" ON "resource_demands" USING btree ("plan_id","resource_type_id","week_start");--> statement-breakpoint
+CREATE INDEX "resource_demands_project_idx" ON "resource_demands" USING btree ("project_id","week_start");--> statement-breakpoint
+CREATE INDEX "resource_demands_task_idx" ON "resource_demands" USING btree ("source_task_id");--> statement-breakpoint
+CREATE INDEX "resource_forecasts_project_idx" ON "resource_forecasts" USING btree ("project_id","as_of_date");--> statement-breakpoint
+CREATE INDEX "resource_forecasts_type_idx" ON "resource_forecasts" USING btree ("project_id","resource_type_id","as_of_date");--> statement-breakpoint
+CREATE UNIQUE INDEX "resource_plans_uq" ON "resource_plans" USING btree ("project_id","number");--> statement-breakpoint
+CREATE INDEX "resource_plans_project_idx" ON "resource_plans" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "resource_plans_company_idx" ON "resource_plans" USING btree ("company_id","status");--> statement-breakpoint
+CREATE INDEX "resource_plans_kind_idx" ON "resource_plans" USING btree ("project_id","plan_kind","status");--> statement-breakpoint
+CREATE INDEX "resource_prod_snapshots_project_idx" ON "resource_productivity_snapshots" USING btree ("project_id","period_end");--> statement-breakpoint
+CREATE INDEX "resource_prod_snapshots_scope_idx" ON "resource_productivity_snapshots" USING btree ("project_id","scope","scope_id","period_end");--> statement-breakpoint
+CREATE INDEX "resource_prod_snapshots_week_idx" ON "resource_productivity_snapshots" USING btree ("project_id","week_start");--> statement-breakpoint
+CREATE UNIQUE INDEX "resource_skills_uq" ON "resource_skills" USING btree ("company_id","code");--> statement-breakpoint
+CREATE INDEX "resource_skills_company_idx" ON "resource_skills" USING btree ("company_id","category","status");--> statement-breakpoint
+CREATE UNIQUE INDEX "resource_types_uq" ON "resource_types" USING btree ("company_id","code");--> statement-breakpoint
+CREATE INDEX "resource_types_company_idx" ON "resource_types" USING btree ("company_id","kind","status");--> statement-breakpoint
+CREATE INDEX "resource_types_project_idx" ON "resource_types" USING btree ("project_id","status");--> statement-breakpoint
+CREATE UNIQUE INDEX "worker_skills_uq" ON "worker_skills" USING btree ("worker_id","skill_id");--> statement-breakpoint
+CREATE INDEX "worker_skills_project_idx" ON "worker_skills" USING btree ("project_id","skill_id");--> statement-breakpoint
+CREATE INDEX "worker_skills_expiry_idx" ON "worker_skills" USING btree ("company_id","expires_at");--> statement-breakpoint
+CREATE INDEX "worker_skills_worker_idx" ON "worker_skills" USING btree ("project_id","worker_id");--> statement-breakpoint
 CREATE INDEX "agent_actions_company_idx" ON "agent_actions" USING btree ("company_id","status");--> statement-breakpoint
 CREATE INDEX "agent_actions_project_idx" ON "agent_actions" USING btree ("project_id");--> statement-breakpoint
 CREATE INDEX "agent_actions_target_idx" ON "agent_actions" USING btree ("target_type","target_id");--> statement-breakpoint

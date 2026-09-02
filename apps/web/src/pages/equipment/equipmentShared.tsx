@@ -372,8 +372,14 @@ export interface DayVariance {
   telematicsReasons?: string[];
   varianceHours: number | null;
   ratio: number | null;
+  /**
+   * `ok` is the API's word for "the two streams agree" (telematics.ts
+   * VarianceClassification). The web used to call it "comparable", so every
+   * agreeing day rendered a blank badge and the classification filter offered
+   * a value that matched nothing.
+   */
   classification:
-    | "comparable"
+    | "ok"
     | "unsupported_hours"
     | "under_reported"
     | "no_manual_record"
@@ -711,7 +717,7 @@ export const DISCREPANCY_LABEL: Record<string, string> = {
 };
 
 export const VARIANCE_CLASS_LABEL: Record<DayVariance["classification"], string> = {
-  comparable: "Comparable",
+  ok: "Comparable",
   unsupported_hours: "Unsupported hours",
   under_reported: "Under-reported",
   no_manual_record: "No plant sheet",

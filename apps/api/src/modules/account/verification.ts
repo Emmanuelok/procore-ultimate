@@ -211,6 +211,8 @@ export interface VerificationConsumed {
   userId: string;
   email: string;
   purpose: string;
+  /** true when this consumption actually moved `users.email` */
+  emailChanged: boolean;
 }
 
 /**
@@ -254,7 +256,61 @@ export async function consumeVerificationToken(
     userAgent: ctx.userAgent,
     metadata: { purpose: row.purpose },
   });
-  return { userId: row.userId, email: row.email, purpose: row.purpose };
+
+  /*
+   * `email_change` — the half that was missing.
+   *
+   * `EMAIL_VERIFICATION_PURPOSES` has carried this value since the table was
+   * written, and the web page told the user "the address change on this
+   * account is now in force" while this function only marked the row consumed.
+   * Nothing minted such a token, so nothing broke; the moment one existed the
+   * UI would have asserted a change that never happened. POST /account/email
+   * now mints them, so this applies them.
+   *
+   * The uniqueness re-check is NOT redundant with the one in that route: an
+   * address is free when the change is requested and can be taken before the
+   * link is opened. Losing that race must not fail with a database constraint
+   * — the token is already spent, and the user is entitled to be told why.
+   */
+  let emailChanged = false;
+  if (row.purpose === "email_change") {
+    const [taken] = await app.db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.email, row.email))
+      .limit(1);
+    if (taken && taken.id !== row.userId) {
+      throw badRequest(
+        "Another account claimed that address while this link was waiting to be opened. " +
+          "The address on this account is unchanged; request the change again with a different address.",
+      );
+    }
+    if (!taken) {
+      const [before] = await app.db
+        .select({ email: users.email })
+        .from(users)
+        .where(eq(users.id, row.userId))
+        .limit(1);
+      await app.db
+        .update(users)
+        .set({ email: row.email, updatedAt: new Date(nowMs).toISOString() })
+        .where(eq(users.id, row.userId));
+      emailChanged = true;
+      await recordAuthEvent(app.db, {
+        kind: "email_changed",
+        userId: row.userId,
+        email: row.email,
+        ip: ctx.ip,
+        userAgent: ctx.userAgent,
+        reason: `Address changed from ${before?.email ?? "(unknown)"} to ${row.email}`,
+        metadata: { previousEmail: before?.email ?? null },
+      });
+      // Every other device keeps working — the credential did not change — but
+      // the account holder is told, in the trail they can read, that the
+      // recovery channel moved.
+    }
+  }
+  return { userId: row.userId, email: row.email, purpose: row.purpose, emailChanged };
 }
 
 /**

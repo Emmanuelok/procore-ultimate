@@ -1104,7 +1104,7 @@ export const bidBonds = pgTable(
     vendorId: text("vendor_id").notNull(),
     invitationId: text("invitation_id"),
     submissionId: text("submission_id"),
-    bondType: text("bond_type").default("bid_bond").notNull(), // BondType
+    bondType: text("bond_type").default("bid").notNull(), // BondType
     status: text("status").default("required").notNull(), // BidBondStatus
     /** the required security, as a percent of the bid or an absolute amount */
     requiredPercent: doublePrecision("required_percent"),

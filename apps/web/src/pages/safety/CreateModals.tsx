@@ -723,6 +723,7 @@ export function NewProgrammeRecordModal({
   const [vendorId, setVendorId] = useState("");
   const [regulatoryReference, setRegulatoryReference] = useState("");
   const [requiredAcknowledgementCount, setRequiredAcknowledgementCount] = useState("");
+  const [sitePermitId, setSitePermitId] = useState("");
   const [description, setDescription] = useState("");
 
   useEffect(() => {
@@ -731,6 +732,7 @@ export function NewProgrammeRecordModal({
       setExpiresAt("");
       setDescription("");
       setRequiredAcknowledgementCount("");
+      setSitePermitId("");
       mutation.clear();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -777,6 +779,7 @@ export function NewProgrammeRecordModal({
                     ...(requiredAcknowledgementCount
                       ? { requiredAcknowledgementCount: Number(requiredAcknowledgementCount) }
                       : {}),
+                    ...(sitePermitId.trim() ? { sitePermitId: sitePermitId.trim() } : {}),
                   },
                 );
                 onCreated(created.id);
@@ -881,13 +884,25 @@ export function NewProgrammeRecordModal({
           </Field>
         </div>
 
-        <Field label="Regulatory reference">
-          <Input
-            value={regulatoryReference}
-            placeholder="CDM 2015 reg. 15"
-            onChange={(e) => setRegulatoryReference(e.target.value)}
-          />
-        </Field>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Regulatory reference">
+            <Input
+              value={regulatoryReference}
+              placeholder="CDM 2015 reg. 15"
+              onChange={(e) => setRegulatoryReference(e.target.value)}
+            />
+          </Field>
+          <Field
+            label="Permit-to-work id"
+            hint="The live authorisation in site operations this document was issued against. A record is the DOCUMENT; the site permit is the entry, the exit and the exclusion zone. A link to a permit that does not exist is refused."
+          >
+            <Input
+              value={sitePermitId}
+              placeholder="sper_…"
+              onChange={(e) => setSitePermitId(e.target.value)}
+            />
+          </Field>
+        </div>
 
         <Field label="Description">
           <Textarea rows={3} value={description} onChange={(e) => setDescription(e.target.value)} />

@@ -1280,6 +1280,54 @@ describe("programme record acknowledgements", () => {
     expect((onBehalf?.["recordedOnBehalf"] as { by: string }).by).toBe(owner.userId);
   });
 
+  it("refuses a link to a permit-to-work that is not in the site register", async () => {
+    const res = await post(`/companies/current/safety/programme-records`, {
+      recordKind: "permit_to_work",
+      title: "Hot work permit — level 4 core",
+      projectId: gbProject,
+      expiresAt: days(2),
+      sitePermitId: "sper_does_not_exist",
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("site permit register");
+  });
+
+  it("insists a drug or alcohol test record names the person and why it was done", async () => {
+    const bare = await post(`/companies/current/safety/programme-records`, {
+      recordKind: "drug_alcohol_test",
+      title: "Post-incident screen",
+      projectId: gbProject,
+    });
+    expect(bare.statusCode).toBe(400);
+    expect(bare.json().message).toContain("drugAlcoholResult");
+
+    const anonymous = await post(`/companies/current/safety/programme-records`, {
+      recordKind: "drug_alcohol_test",
+      title: "Post-incident screen",
+      projectId: gbProject,
+      drugAlcoholResult: "non_negative_pending_confirmation",
+      drugAlcoholReason: "post_incident",
+    });
+    expect(anonymous.statusCode).toBe(400);
+    expect(anonymous.json().message).toContain("name the worker");
+
+    const ok = await post(`/companies/current/safety/programme-records`, {
+      recordKind: "drug_alcohol_test",
+      title: "Post-incident screen",
+      projectId: gbProject,
+      workerId,
+      drugAlcoholResult: "non_negative_pending_confirmation",
+      drugAlcoholReason: "post_incident",
+    });
+    expect(ok.statusCode).toBe(201);
+    expect(
+      (ok.json().detail as { drugAlcohol: { result: string; reason: string } }).drugAlcohol,
+    ).toMatchObject({
+      result: "non_negative_pending_confirmation",
+      reason: "post_incident",
+    });
+  });
+
   it("needs a method carrying its own evidence to record for a worker", async () => {
     const weak = await post(
       `/companies/current/safety/programme-records/${recordId}/acknowledge`,
@@ -1770,9 +1818,10 @@ describe("vendor safety scorecard", () => {
     expect(trir.reasons.length).toBeGreaterThan(0);
   });
 
-  it("rolls up across the company and says when nothing is known", async () => {
+  it("rolls up across the company for an admin and says when nothing is known", async () => {
     const res = await get(`/companies/current/safety/vendor-scorecard?vendorId=${vendorId}`);
     expect(res.statusCode).toBe(200);
+    expect(res.json().scope.all).toBe(true);
     expect(res.json().scorecards.length).toBe(1);
     expect(res.json().note).toContain("prequalification");
 
@@ -1782,6 +1831,30 @@ describe("vendor safety scorecard", () => {
     );
     expect(empty.json().scorecards).toEqual([]);
     expect(empty.json().reasons.join(" ")).toContain("nothing to read");
+  });
+
+  it("scopes the roll-up to the projects an ordinary member is actually on", async () => {
+    const res = await get(
+      `/companies/current/safety/vendor-scorecard?vendorId=${vendorId}`,
+      member.headers,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.json().scope.all).toBe(false);
+    expect(res.json().scope.projects).toBe(3);
+    expect(res.json().note).toContain("Scoped to the 3 project(s)");
+    // one scorecard per project the member is on — never a company total they
+    // have no right to read
+    expect(res.json().scorecards.length).toBe(3);
+    for (const card of res.json().scorecards as Array<{ projectId: string | null }>) {
+      expect(card.projectId).not.toBeNull();
+    }
+  });
+
+  it("keeps another company out of the roll-up entirely", async () => {
+    const res = await get(`/companies/current/safety/vendor-scorecard`, stranger.headers);
+    expect(res.statusCode).toBe(200);
+    // a different company's context resolves to its OWN (empty) registers
+    expect(res.json().scorecards).toEqual([]);
   });
 
   it("publishes the observed record onto the vendor's live prequalification submission", async () => {
@@ -1805,6 +1878,13 @@ describe("vendor safety scorecard", () => {
       status: "assessed",
       createdBy: owner.userId,
     });
+
+    const refused = await post(
+      `/companies/current/safety/vendor-scorecard/publish`,
+      { vendorId },
+      member.headers,
+    );
+    expect(refused.statusCode).toBe(403);
 
     const res = await post(`/companies/current/safety/vendor-scorecard/publish`, {
       vendorId,

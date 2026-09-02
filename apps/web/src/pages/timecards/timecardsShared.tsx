@@ -597,6 +597,18 @@ export interface TicketRecord {
   isSigned: boolean;
 }
 
+/**
+ * The register row. `total` is the priced-SO-FAR subtotal, which is why
+ * `totalsAreComplete` travels with it: a ticket with unpriced labour hours
+ * has no total, and rendering the column as though it did contradicts the
+ * drawer, which says so.
+ */
+export interface TicketListRow extends TicketRecord {
+  unpricedLineCount: number;
+  totalsAreComplete: boolean;
+  totalNote: string | null;
+}
+
 export interface TicketDetail extends TicketRecord {
   lines: TicketLine[];
   totals: TmTotals;
@@ -1772,8 +1784,8 @@ export function useReconciliation(
 export function useTickets(
   projectId: string | undefined,
   enabled: boolean,
-): Loadable<ListResponse<TicketRecord>> {
-  return useResource<ListResponse<TicketRecord>>(
+): Loadable<ListResponse<TicketListRow>> {
+  return useResource<ListResponse<TicketListRow>>(
     enabled && projectId ? `/api/v1/projects/${projectId}/tm-tickets?page=1&pageSize=200` : null,
   );
 }

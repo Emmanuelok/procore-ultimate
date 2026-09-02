@@ -630,7 +630,14 @@ export const batchRoutes: FastifyPluginAsync = async (app) => {
         throw selfApprovalRefusal(
           "timecard batch",
           batch.reference,
-          { isSelfApproval: true, role: "created_by" },
+          {
+            isSelfApproval: true,
+            role: "created_by",
+            message:
+              `${ownCards.length} card(s) in this batch were raised or submitted by the approver ` +
+              `(${ownCards.map((c) => c.reference).slice(0, 8).join(", ")}). Approving the batch ` +
+              "would approve the approver's own claimed hours.",
+          },
           approvalId,
         );
       }

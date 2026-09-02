@@ -622,7 +622,7 @@ function dayTone(classification: DayVariance["classification"]): Tone | undefine
       return "danger";
     case "under_reported":
       return "info";
-    case "comparable":
+    case "ok":
       return "success";
     default:
       return "neutral";

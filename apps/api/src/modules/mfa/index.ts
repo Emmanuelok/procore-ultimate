@@ -6,7 +6,16 @@ import { companies, companyMemberships, userMfa, users } from "@constructos/db";
 import { AppError, badRequest, conflict, unauthorized } from "../../lib/errors.js";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
-import { equalizeVerifyTiming } from "../account/password.js";
+import { equalizeVerifyTiming, verifyPassword } from "../account/password.js";
+import {
+  completeLogin,
+  guardLoginAttempt,
+  guardLoginIpAllowlist,
+  loginPolicyFor,
+  noteLoginFailure,
+} from "../account/login.js";
+import { recordLegacyAuthEvent } from "../account/events.js";
+import { isPasswordLoginAllowedForUser } from "../sso/index.js";
 import {
   challengeEnvelope,
   mintChallengeToken,
@@ -537,40 +546,108 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
   /* Login and challenge                                               */
   /* ---------------------------------------------------------------- */
 
+  /**
+   * MFA-aware password sign-in — the route the SPA actually calls.
+   *
+   * ------------------------------------------------------------------------
+   * WHAT WAS WRONG HERE, and why the fix is this shape
+   * ------------------------------------------------------------------------
+   * This handler used to run `bcrypt.compare` and record a `login_failure`
+   * row, and nothing else. It never called `guardLoginAttempt` or
+   * `noteLoginFailure` (modules/account/login.ts), so an attacker could guess
+   * passwords against one address indefinitely: no account lockout, no per-IP
+   * lockout, no doubling delay, no `account_locked` event. Only the per-IP
+   * network limiter applied, and that one is per-replica and off under test.
+   * Meanwhile `POST /auth/login` — the route nobody's browser used — had every
+   * one of those defences. The lockout engine was real and unreachable.
+   *
+   * It also skipped `completeLogin`, so a sign-in through the SPA got no
+   * transparent bcrypt rehash, no new-device message and no `isNewDevice`
+   * metadata in the trail. Three features that existed and never ran.
+   *
+   * So this route now runs exactly the same gauntlet as identity's
+   * `/auth/login`, in the same order, and calls the same helpers:
+   *
+   *   1. the tenant's resolved policy (lockout thresholds come from it, #25)
+   *   2. guardLoginAttempt  — refuse a locked address BEFORE the compare
+   *   3. the password, with `equalizeVerifyTiming` for an unknown address
+   *   4. noteLoginFailure   — count it, arm the lock, pay the delay
+   *   5. the tenant SSO policy (`allowPasswordLogin`)
+   *   6. the tenant IP allowlist (#24)
+   *   7. the MFA branch — challenge, never a session
+   *   8. completeLogin      — rehash, session row, trail, new-device message
+   */
   app.post("/auth/mfa/login", authLimited, async (req) => {
     const body = loginSchema.parse(req.body);
     const context = requestContext(req);
+    const policy = await loginPolicyFor(app, body.email);
+    // BEFORE the password is looked at, and identical for an address with an
+    // account and one without: the counter is keyed on what was typed.
+    await guardLoginAttempt(app, req, body.email, Date.now(), policy);
+
     const rows = await app.db.select().from(users).where(eq(users.email, body.email)).limit(1);
     const user = rows[0];
     // Always run a comparison, even when there is no account: an early return
     // makes the response time an account-enumeration oracle.
     const ok = user
-      ? await bcrypt.compare(body.password, user.passwordHash)
+      ? await verifyPassword(body.password, user.passwordHash)
       : await equalizeVerifyTiming(body.password, cfg);
-    if (!user || !ok) {
+    if (!user || !ok || !user.isActive) {
+      const reason = !user
+        ? "No account with this address"
+        : !ok
+          ? "Password did not match"
+          : "Account is deactivated";
       await recordSecurityEvent(app.db, {
-        kind: "login_failure",
-        outcome: "failure",
+        kind: user && ok ? "login_blocked_inactive" : "login_failure",
+        outcome: user && ok ? "blocked" : "failure",
         userId: user?.id ?? null,
         email: body.email,
         ip: context.ip,
         userAgent: context.userAgent,
-        reason: user ? "Password did not match" : "No account with this address",
+        reason,
       });
+      await recordLegacyAuthEvent(app.db, {
+        userId: user?.id ?? null,
+        email: body.email,
+        kind: user && ok ? "login_blocked_inactive" : "login_failure",
+        ip: context.ip,
+        userAgent: context.userAgent,
+      });
+      // The lock, the doubling delay and the `account_locked` row. This single
+      // call is the difference between a rate limit and a lockout.
+      await noteLoginFailure(
+        app,
+        req,
+        {
+          email: body.email,
+          userId: user?.id ?? null,
+          reason: !user ? "unknown_address" : !ok ? "invalid_password" : "account_inactive",
+          overrides: policy,
+        },
+      );
       throw unauthorized("Invalid credentials");
     }
-    if (!user.isActive) {
+
+    // Tenant policy: a company that requires SSO must not be reachable with a
+    // password here either. The same uniform 401, with the real reason in the
+    // trail rather than in the body.
+    if (!(await isPasswordLoginAllowedForUser(app.db, user.id))) {
       await recordSecurityEvent(app.db, {
-        kind: "login_blocked_inactive",
+        kind: "login_blocked_password_disabled",
         outcome: "blocked",
         userId: user.id,
         email: user.email,
         ip: context.ip,
         userAgent: context.userAgent,
-        reason: "Account is deactivated",
+        reason: "A company this account belongs to requires single sign-on",
       });
       throw unauthorized("Invalid credentials");
     }
+
+    // #24 — the tenant IP allowlist. After the password, so it is not an
+    // enumeration oracle, and before any token exists.
+    await guardLoginIpAllowlist(app, req, user);
 
     const factor = await activeFactor(app.db, user.id);
     const requiredBy = await companiesRequiringMfa(app.db, user.id);
@@ -614,33 +691,34 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
       };
     }
 
-    const session = await issueSession(app, {
-      user: { id: user.id, email: user.email },
-      authMethod: "password",
-      mfaSatisfied: false,
-      ip: context.ip,
-      userAgent: context.userAgent,
-    });
     await app.db
       .update(users)
       .set({ lastLoginAt: new Date().toISOString() })
       .where(eq(users.id, user.id));
-    await recordSecurityEvent(app.db, {
-      kind: "login_success",
+    await recordLegacyAuthEvent(app.db, {
       userId: user.id,
       email: user.email,
-      sessionId: session.sessionId,
+      kind: "login_success",
       ip: context.ip,
       userAgent: context.userAgent,
-      reason: "Password only — no second factor enrolled and none required",
+    });
+    // completeLogin, not a bare issueSession: the transparent rehash to the
+    // current bcrypt cost, the `login_success` trail row with `newDevice`, and
+    // the "someone signed in from a new device" message all live in there, and
+    // this route silently did without all three.
+    const completed = await completeLogin(app, req, {
+      user,
+      password: body.password,
+      policy,
     });
     return {
       mfaRequired: false,
       user: { id: user.id, email: user.email, name: user.name },
-      accessToken: session.accessToken,
-      refreshToken: session.refreshToken,
-      expiresIn: session.expiresIn,
-      sessionId: session.sessionId,
+      accessToken: completed.accessToken,
+      refreshToken: completed.refreshToken,
+      expiresIn: completed.expiresIn,
+      sessionId: completed.sessionId,
+      session: completed.session,
     };
   });
 

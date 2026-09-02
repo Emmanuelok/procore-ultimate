@@ -150,7 +150,15 @@ const signSchema = z.object({
   signedByContactId: idSchema.nullable().optional(),
   signedByUserId: idSchema.nullable().optional(),
   signatureMethod: z.enum(SIGNATURE_METHODS).optional(),
-  signedAt: z.string().min(1).max(40).optional(),
+  signedAt: z
+    .string()
+    .min(4)
+    .max(40)
+    // Written straight into a timestamptz column: "yesterday" passed
+    // validation and then produced an opaque 500 from Postgres.
+    .refine((v) => !Number.isNaN(Date.parse(v)), "signedAt must be a real timestamp")
+    .transform((v) => new Date(v).toISOString())
+    .optional(),
   signatureFileId: idSchema.nullable().optional(),
   signatureLatitude: z.number().min(-90).max(90).nullable().optional(),
   signatureLongitude: z.number().min(-180).max(180).nullable().optional(),
@@ -437,9 +445,56 @@ export const tmTicketRoutes: FastifyPluginAsync = async (app) => {
       .orderBy(desc(tmTickets.ticketDate), desc(tmTickets.number))
       .limit(q.pageSize)
       .offset(pageOffset(q));
+    /*
+     * THE REGISTER MUST NOT PRESENT A PARTIAL TOTAL AS THE TOTAL.
+     *
+     * `tm_tickets.total` is the priced-so-far subtotal; completeness lives in
+     * the detail view's `totals`. The list rendered the raw column, so a
+     * "to be agreed" ticket with 40 unpriced labour hours showed 0.00 as its
+     * total while the drawer said the total could not be stated.
+     */
+    const lineRows =
+      rows.length > 0
+        ? await app.db
+            .select({
+              ticketId: tmTicketLines.ticketId,
+              amount: tmTicketLines.amount,
+              rate: tmTicketLines.rate,
+              hours: tmTicketLines.hours,
+              quantity: tmTicketLines.quantity,
+            })
+            .from(tmTicketLines)
+            .where(
+              inArray(
+                tmTicketLines.ticketId,
+                rows.map((r) => r.id),
+              ),
+            )
+        : [];
+    const unpricedByTicket = new Map<string, number>();
+    for (const line of lineRows) {
+      const priced =
+        line.amount !== null && line.amount !== 0
+          ? true
+          : line.rate !== null && (line.hours !== null || line.quantity !== null);
+      if (priced) continue;
+      unpricedByTicket.set(line.ticketId, (unpricedByTicket.get(line.ticketId) ?? 0) + 1);
+    }
     const items = rows.map((t) => {
       const signature = signatureEvidence(t);
-      return { ...t, signature, isSigned: signature.isSigned };
+      const unpricedLineCount = unpricedByTicket.get(t.id) ?? 0;
+      return {
+        ...t,
+        signature,
+        isSigned: signature.isSigned,
+        unpricedLineCount,
+        totalsAreComplete: unpricedLineCount === 0,
+        totalNote:
+          unpricedLineCount > 0
+            ? `${unpricedLineCount} line(s) on this ticket carry no rate, so the ticket total ` +
+              "cannot be stated. The figure held is what has been priced so far."
+            : null,
+      };
     });
     return paginate(items, Number(totalRow?.n ?? 0), q);
   });
@@ -627,9 +682,30 @@ export const tmTicketRoutes: FastifyPluginAsync = async (app) => {
             costCodeId: alloc.costCodeId,
             budgetLineItemId: alloc.budgetLineItemId,
             hours: alloc.totalHours,
-            rate: alloc.hourlyRate,
+            /*
+             * NOT alloc.hourlyRate. That is the worker's internal PAY rate —
+             * the number the cost report is built on. Copying it onto a
+             * client-signed daywork ticket exposes internal wage rates, omits
+             * burden and any agreed daywork uplift, and under-claims while
+             * presenting as a complete total. The billing rate comes from the
+             * agreed schedule of rates (#599); until one is applied the line
+             * is deliberately unpriced and the ticket says its total cannot
+             * be stated.
+             */
+            rate: null,
             unit: "hour",
             currency: alloc.currency,
+            detail: {
+              costRate: alloc.hourlyRate,
+              costAmount:
+                alloc.hourlyRate === null
+                  ? null
+                  : round2(alloc.hourlyRate * alloc.totalHours),
+              rateNote:
+                "sourced from the timecard: the cost rate is carried for margin reporting, and " +
+                "the BILLING rate has to come from the agreed schedule of rates before this line " +
+                "can be claimed",
+            },
           });
         }
       }
@@ -962,6 +1038,18 @@ export const tmTicketRoutes: FastifyPluginAsync = async (app) => {
         markupPercent: ticket.markupPercent,
       });
 
+      /*
+       * THE PCO PRECONDITION IS CHECKED BEFORE ANYTHING IS WRITTEN.
+       *
+       * The change event used to be inserted first and the "this ticket has
+       * unpriced lines" refusal thrown afterwards — so every retry left
+       * another orphan CE-nnn row behind and the ticket was never stamped.
+       * Check it here; the fallback below still promotes to the change event
+       * and STAMPS the ticket, so the entitlement is preserved.
+       */
+      const pcoUnpriced =
+        body.target === "potential_change_order" && totals.total.value === null;
+
       // Attach to an existing change event, or raise one.
       let eventId: string;
       let eventReference: string;
@@ -1043,15 +1131,7 @@ export const tmTicketRoutes: FastifyPluginAsync = async (app) => {
 
       let pcoId: string | null = null;
       let pcoReference: string | null = null;
-      if (body.target === "potential_change_order") {
-        if (totals.total.value === null) {
-          throw conflict(
-            `${ticket.reference} cannot become a potential change order: ${totals.total.reasons.join(" ")} ` +
-              "A PCO is a cost position, and this ticket does not have one yet. It has been " +
-              `promoted to change event ${eventReference} instead, which preserves the entitlement ` +
-              "while the rates are agreed — price the lines, then raise the PCO.",
-          );
-        }
+      if (body.target === "potential_change_order" && !pcoUnpriced) {
         if (body.vendorId) await requireVendor(app.db, body.vendorId, companyId);
         const number = await nextRecordNumber(app.db, projectId, "potential_change_order");
         pcoId = newId("pco");
@@ -1193,6 +1273,22 @@ export const tmTicketRoutes: FastifyPluginAsync = async (app) => {
         potentialChangeOrder: pcoId ? { id: pcoId, reference: pcoReference } : null,
         incorporatedChangeOrderId: incorporatedId,
         total: totals.total,
+        /*
+         * The PCO was asked for and could not be made, so the ticket was
+         * promoted to the change event instead AND STAMPED. Previously this
+         * path threw after inserting the event, leaving an orphan CE row and
+         * an unstamped ticket that produced another one on every retry.
+         */
+        pcoRefused: pcoUnpriced
+          ? {
+              reason: totals.total.reasons,
+              message:
+                `${ticket.reference} could not become a potential change order: a PCO is a cost ` +
+                `position and this ticket does not have one yet. It is on the change chain as ` +
+                `${eventReference}, which preserves the entitlement while the rates are agreed. ` +
+                "Price the lines, then raise the PCO from the change event.",
+            }
+          : null,
         note:
           `${ticket.reference} is now on the change chain as ${eventReference}` +
           (pcoReference ? ` → ${pcoReference}` : "") +
@@ -1224,6 +1320,44 @@ export const tmTicketRoutes: FastifyPluginAsync = async (app) => {
     }
   }
 
+  /**
+   * Clear the "billed on ticket X" stamps this ticket's lines put on the
+   * timecard allocations and equipment utilisation rows they were sourced
+   * from. Called before a line-set replacement and on void.
+   */
+  async function releaseSourceRows(ticketId: string): Promise<{ allocations: number; utilisation: number }> {
+    const existing = await loadLines(ticketId);
+    const allocationIds = existing
+      .map((l) => l.timecardAllocationId)
+      .filter((v): v is string => !!v);
+    const utilisationIds = existing
+      .map((l) => (l.detail as { equipmentUtilisationId?: string } | null)?.equipmentUtilisationId)
+      .filter((v): v is string => !!v);
+    if (allocationIds.length > 0) {
+      await app.db
+        .update(timecardAllocations)
+        .set({ tmTicketId: null })
+        .where(
+          and(
+            inArray(timecardAllocations.id, allocationIds),
+            eq(timecardAllocations.tmTicketId, ticketId),
+          ),
+        );
+    }
+    if (utilisationIds.length > 0) {
+      await app.db
+        .update(equipmentUtilisation)
+        .set({ tmTicketId: null })
+        .where(
+          and(
+            inArray(equipmentUtilisation.id, utilisationIds),
+            eq(equipmentUtilisation.tmTicketId, ticketId),
+          ),
+        );
+    }
+    return { allocations: allocationIds.length, utilisation: utilisationIds.length };
+  }
+
   async function writeLines(
     companyId: string,
     projectId: string,
@@ -1250,6 +1384,17 @@ export const tmTicketRoutes: FastifyPluginAsync = async (app) => {
       }
     }
     if (replace) {
+      /*
+       * RELEASE THE SOURCE ROWS THE OLD LINES CLAIMED.
+       *
+       * `lines/source` stamps `tmTicketId` on the timecard allocation and the
+       * equipment utilisation row it billed, so an hour cannot be billed
+       * twice. Replacing the line set deleted the lines and left those stamps
+       * behind: the source rows stayed "already billed on ticket X" for ever
+       * and were refused on every other ticket, even though X no longer
+       * billed them.
+       */
+      await releaseSourceRows(ticketId);
       await app.db.delete(tmTicketLines).where(eq(tmTicketLines.ticketId, ticketId));
     }
     await insertLines(companyId, projectId, ticketId, currency, lines, replace ? 0 : undefined);

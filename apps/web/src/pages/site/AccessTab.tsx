@@ -27,7 +27,6 @@ import {
   minutesLabel,
   num,
   optionList,
-  relativeToNow,
   useAction,
   useResource,
   type GateEventRow,
@@ -292,7 +291,7 @@ function InductionsPanel({ base, lookups, onChanged }: { base: string; lookups: 
           filterRow
           exportFileName="site-inductions"
           searchPlaceholder="Search by name…"
-          rowActions={({ row }) =>
+          rowActions={(row) =>
             row.status === "revoked" ? null : (
               <Button size="xs" variant="ghost" onClick={() => void revoke(row)}>
                 Revoke
@@ -528,7 +527,7 @@ function PassesPanel({ base, lookups, onChanged }: { base: string; lookups: Site
           exportFileName="site-passes"
           searchPlaceholder="Search by badge or name…"
           rowTone={(row) => (row.inductionId === null && row.status === "active" ? "danger" : undefined)}
-          rowActions={({ row }) => (
+          rowActions={(row) => (
             <span className="flex gap-1">
               {row.status === "active" ? (
                 <Button size="xs" variant="ghost" onClick={() => void transition(row, "suspend")}>

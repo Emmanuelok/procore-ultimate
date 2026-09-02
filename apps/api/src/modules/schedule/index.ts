@@ -1,8 +1,9 @@
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   budgetLineItems,
+  budgets,
   companyMemberships,
   delayEvents,
   locations,
@@ -25,7 +26,6 @@ import {
   SCHEDULE_RESOURCE_TYPES,
   SCHEDULE_TASK_TYPES,
   TASK_CONSTRAINT_TYPES,
-  type ConstraintLogStatus,
   type DependencyType,
   type TaskConstraintType,
 } from "@constructos/shared";
@@ -2002,3 +2002,1011 @@ export const scheduleModule: FastifyPluginAsync = async (app) => {
       return reply.status(204).send();
     },
   );
+
+  /* ---------------------------------------------------------------- */
+  /* Lookahead constraints log (#359)                                  */
+  /* ---------------------------------------------------------------- */
+
+  app.get("/projects/:projectId/schedule-constraints", { preHandler: readGate }, async (req) => {
+    const q = pageQuerySchema
+      .extend({
+        scheduleId: z.string().min(1).optional(),
+        status: z.enum(CONSTRAINT_LOG_STATUSES).optional(),
+        category: z.enum(CONSTRAINT_LOG_CATEGORIES).optional(),
+        openOnly: z.enum(["true", "false"]).optional(),
+      })
+      .parse(req.query);
+    const clauses = [
+      eq(scheduleConstraints.companyId, req.companyId!),
+      eq(scheduleConstraints.projectId, req.projectId!),
+    ];
+    if (q.scheduleId) clauses.push(eq(scheduleConstraints.scheduleId, q.scheduleId));
+    if (q.status) clauses.push(eq(scheduleConstraints.status, q.status));
+    if (q.category) clauses.push(eq(scheduleConstraints.category, q.category));
+    if (q.openOnly === "true") {
+      clauses.push(ne(scheduleConstraints.status, "cleared"), ne(scheduleConstraints.status, "void"));
+    }
+    const where = and(...clauses);
+    const [totalRow] = await app.db.select({ n: count() }).from(scheduleConstraints).where(where);
+    const items = await app.db
+      .select()
+      .from(scheduleConstraints)
+      .where(where)
+      .orderBy(desc(scheduleConstraints.number))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    return paginate(items, Number(totalRow?.n ?? 0), q);
+  });
+
+  app.post("/projects/:projectId/schedule-constraints", { preHandler: standardGate }, async (req, reply) => {
+    const body = constraintCreateSchema.parse(req.body);
+    const schedule = await fetchSchedule(body.scheduleId, req.companyId!, req.projectId!);
+    if (body.taskId) {
+      const { task } = await fetchTask(body.taskId, req.companyId!, req.projectId!);
+      if (task.scheduleId !== schedule.id) {
+        throw badRequest("taskId does not belong to the given schedule");
+      }
+    }
+    if (body.ownerId) await validateResponsibleId(body.ownerId, req.companyId!);
+    const number = await nextRecordNumber(app.db, req.projectId!, "schedule_constraint");
+    const id = newId("scn");
+    await app.db.insert(scheduleConstraints).values({
+      id,
+      companyId: req.companyId!,
+      projectId: req.projectId!,
+      scheduleId: schedule.id,
+      taskId: body.taskId ?? null,
+      number,
+      description: body.description,
+      category: body.category,
+      ownerId: body.ownerId ?? null,
+      needByDate: body.needByDate ?? null,
+      raisedBy: req.user!.id,
+    });
+    await appendLedger(app.db, {
+      companyId: req.companyId!,
+      actorId: req.user!.id,
+      action: "create",
+      objectType: "schedule_constraint",
+      objectId: id,
+      projectId: req.projectId!,
+      payload: { number, description: body.description, category: body.category, needByDate: body.needByDate ?? null },
+    });
+    const [created] = await app.db
+      .select()
+      .from(scheduleConstraints)
+      .where(eq(scheduleConstraints.id, id))
+      .limit(1);
+    return reply.status(201).send(created);
+  });
+
+  app.patch(
+    "/projects/:projectId/schedule-constraints/:constraintId",
+    { preHandler: standardGate },
+    async (req) => {
+      const { constraintId } = req.params as { constraintId: string };
+      const body = constraintPatchSchema.parse(req.body);
+      const [row] = await app.db
+        .select()
+        .from(scheduleConstraints)
+        .where(
+          and(
+            eq(scheduleConstraints.id, constraintId),
+            eq(scheduleConstraints.companyId, req.companyId!),
+            eq(scheduleConstraints.projectId, req.projectId!),
+          ),
+        )
+        .limit(1);
+      if (!row) throw notFound("Schedule constraint not found");
+      if (body.ownerId) await validateResponsibleId(body.ownerId, req.companyId!);
+      if (body.status && body.status !== row.status) {
+        const allowed = CONSTRAINT_TRANSITIONS[row.status] ?? [];
+        if (!allowed.includes(body.status)) {
+          throw badRequest(`Cannot move a ${row.status} constraint to ${body.status}`);
+        }
+      }
+      const now = new Date().toISOString();
+      const set: Record<string, unknown> = { updatedAt: now };
+      for (const [k, v] of Object.entries(body)) if (v !== undefined) set[k] = v;
+      if (body.status === "cleared") {
+        set["clearedAt"] = now;
+        set["clearedBy"] = req.user!.id;
+      }
+      if (body.status === "open" && row.status === "cleared") {
+        set["clearedAt"] = null;
+        set["clearedBy"] = null;
+        set["escalatedAt"] = null;
+      }
+      // A moved need-by date is a new promise: let the sweep escalate again.
+      if (body.needByDate !== undefined && body.needByDate !== row.needByDate) {
+        set["escalatedAt"] = null;
+      }
+      await app.db.update(scheduleConstraints).set(set).where(eq(scheduleConstraints.id, constraintId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: body.status && body.status !== row.status ? "state_change" : "update",
+        objectType: "schedule_constraint",
+        objectId: constraintId,
+        projectId: req.projectId!,
+        payload: { changed: Object.keys(body), from: row.status, to: body.status ?? row.status },
+      });
+      const [updated] = await app.db
+        .select()
+        .from(scheduleConstraints)
+        .where(eq(scheduleConstraints.id, constraintId))
+        .limit(1);
+      return updated;
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Update narratives                                                 */
+  /* ---------------------------------------------------------------- */
+
+  app.get(
+    "/projects/:projectId/schedules/:scheduleId/narratives",
+    { preHandler: readGate },
+    async (req) => {
+      const { scheduleId } = req.params as { scheduleId: string };
+      await fetchSchedule(scheduleId, req.companyId!, req.projectId!);
+      const rows = await app.db
+        .select()
+        .from(scheduleNarratives)
+        .where(eq(scheduleNarratives.scheduleId, scheduleId))
+        .orderBy(desc(scheduleNarratives.createdAt))
+        .limit(100);
+      return { items: rows, total: rows.length };
+    },
+  );
+
+  app.post(
+    "/projects/:projectId/schedules/:scheduleId/narratives",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { scheduleId } = req.params as { scheduleId: string };
+      const body = narrativeCreateSchema.parse(req.body);
+      const schedule = await fetchSchedule(scheduleId, req.companyId!, req.projectId!);
+      const tasks = await listTasks(scheduleId);
+      const id = newId("nar");
+      // Freeze the figures the narrative is written against, so a later
+      // recompute cannot make the prose describe a programme that never was.
+      const metrics = {
+        computedFinish: schedule.computedFinish,
+        computedDurationDays: schedule.computedDurationDays,
+        dataDate: schedule.dataDate,
+        taskCount: tasks.length,
+        criticalCount: tasks.filter((t) => t.isCritical === 1).length,
+        completeCount: tasks.filter((t) => t.actualFinish !== null).length,
+        capturedAt: new Date().toISOString(),
+      };
+      await app.db.insert(scheduleNarratives).values({
+        id,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        scheduleId,
+        title: body.title,
+        periodStart: body.periodStart ?? null,
+        periodEnd: body.periodEnd ?? null,
+        dataDate: body.dataDate ?? schedule.dataDate,
+        body: body.body,
+        metrics,
+        authorId: req.user!.id,
+      });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "schedule_narrative",
+        objectId: id,
+        projectId: req.projectId!,
+        payload: { scheduleId, title: body.title, metrics },
+      });
+      const [created] = await app.db
+        .select()
+        .from(scheduleNarratives)
+        .where(eq(scheduleNarratives.id, id))
+        .limit(1);
+      return reply.status(201).send(created);
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Import (#349-350) — P6 XER and MS Project XML                      */
+  /* ---------------------------------------------------------------- */
+
+  const ALLOWED_IMPORT_MIME = new Set([
+    "text/xml",
+    "application/xml",
+    "text/plain",
+    "application/octet-stream",
+    "application/x-msproject",
+    "",
+  ]);
+
+  /** Decide the format from the declared field, the filename, then the bytes. */
+  function sniffFormat(declared: string | undefined, fileName: string, text: string): "xer" | "mspdi" {
+    if (declared === "xer" || declared === "mspdi") return declared;
+    const lower = fileName.toLowerCase();
+    if (lower.endsWith(".xer")) return "xer";
+    if (lower.endsWith(".xml")) return "mspdi";
+    const head = text.slice(0, 4000);
+    if (head.includes("ERMHDR") || /(^|\n)%T\t/.test(head)) return "xer";
+    if (head.includes("<Project")) return "mspdi";
+    throw badRequest("Could not tell whether this is a P6 XER or an MS Project XML file — pass format explicitly");
+  }
+
+  /** Persist a parsed programme as a new schedule (optionally a revision). */
+  async function materialiseImport(
+    parsed: ParsedSchedule,
+    ctx: {
+      companyId: string;
+      projectId: string;
+      userId: string;
+      name: string;
+      target: Awaited<ReturnType<typeof fetchSchedule>> | null;
+    },
+  ): Promise<{ scheduleId: string; calendars: number; tasks: number; dependencies: number; resources: number }> {
+    const scheduleId = newId("sch");
+    const calendarIdByExternal = new Map<string, string>();
+    const taskIdByExternal = new Map<string, string>();
+
+    await app.db.transaction(async (tx) => {
+      for (const c of parsed.calendars) {
+        const id = newId("cal");
+        calendarIdByExternal.set(c.externalId, id);
+        await tx.insert(scheduleCalendars).values({
+          id,
+          companyId: ctx.companyId,
+          projectId: ctx.projectId,
+          scheduleId,
+          name: c.name,
+          externalId: c.externalId,
+          workdays: c.workdays,
+          holidays: c.holidays,
+          exceptions: c.exceptions,
+          hoursPerDay: c.hoursPerDay,
+          isDefault: c.isDefault ? 1 : 0,
+        });
+      }
+      const defaultCalendarId =
+        parsed.calendars.find((c) => c.isDefault)?.externalId ?? parsed.calendars[0]?.externalId ?? null;
+
+      await tx.insert(schedules).values({
+        id: scheduleId,
+        companyId: ctx.companyId,
+        projectId: ctx.projectId,
+        name: ctx.name,
+        projectStart: parsed.projectStart,
+        dataDate: parsed.dataDate,
+        source: parsed.format,
+        revision: ctx.target ? ctx.target.revision + 1 : 1,
+        parentScheduleId: ctx.target ? (ctx.target.parentScheduleId ?? ctx.target.id) : null,
+        defaultCalendarId: defaultCalendarId ? (calendarIdByExternal.get(defaultCalendarId) ?? null) : null,
+        externalRef: parsed.externalRef,
+        isActive: 0,
+        createdBy: ctx.userId,
+      });
+
+      for (const t of parsed.tasks) {
+        const id = newId("tsk");
+        taskIdByExternal.set(t.externalId, id);
+        await tx.insert(scheduleTasks).values({
+          id,
+          scheduleId,
+          projectId: ctx.projectId,
+          name: t.name.slice(0, 300),
+          wbsCode: t.wbsCode?.slice(0, 60) ?? null,
+          wbsPath: t.wbsPath?.slice(0, 300) ?? null,
+          durationDays: t.durationDays,
+          remainingDurationDays: t.remainingDurationDays,
+          taskType: t.taskType,
+          calendarId: t.calendarExternalId ? (calendarIdByExternal.get(t.calendarExternalId) ?? null) : null,
+          externalId: t.externalId,
+          constraintType: t.constraintType,
+          constraintDate: t.constraintDate,
+          actualStart: t.actualStart,
+          actualFinish: t.actualFinish,
+          percentComplete: t.percentComplete,
+          isKeyMilestone: t.taskType === "start_milestone" || t.taskType === "finish_milestone" ? 1 : 0,
+          sortOrder: t.sortOrder,
+        });
+      }
+
+      for (const d of parsed.dependencies) {
+        const predecessorId = taskIdByExternal.get(d.predecessorExternalId);
+        const successorId = taskIdByExternal.get(d.successorExternalId);
+        if (!predecessorId || !successorId || predecessorId === successorId) continue;
+        await tx
+          .insert(scheduleDependencies)
+          .values({
+            id: newId("dep"),
+            scheduleId,
+            predecessorId,
+            successorId,
+            depType: d.depType,
+            lagDays: d.lagDays,
+          })
+          .onConflictDoNothing();
+      }
+
+      for (const r of parsed.resources) {
+        const taskId = taskIdByExternal.get(r.taskExternalId);
+        if (!taskId) continue;
+        await tx.insert(scheduleTaskResources).values({
+          id: newId("res"),
+          companyId: ctx.companyId,
+          projectId: ctx.projectId,
+          scheduleId,
+          taskId,
+          name: r.name.slice(0, 200),
+          resourceType: r.resourceType,
+          externalId: r.externalId,
+          unit: r.unit,
+          budgetedUnits: r.budgetedUnits,
+          actualUnits: r.actualUnits,
+          remainingUnits: r.remainingUnits,
+          unitRate: r.unitRate,
+          budgetedCost: r.budgetedCost,
+          actualCost: r.actualCost,
+        });
+      }
+    });
+
+    return {
+      scheduleId,
+      calendars: parsed.calendars.length,
+      tasks: parsed.tasks.length,
+      dependencies: parsed.dependencies.length,
+      resources: parsed.resources.length,
+    };
+  }
+
+  app.post("/projects/:projectId/schedules/import", { preHandler: standardGate }, async (req, reply) => {
+    if (!req.isMultipart()) {
+      throw badRequest("Expected multipart/form-data with a file (and optional fields format, name, targetScheduleId, dryRun)");
+    }
+    const mp = await req.file();
+    if (!mp) throw badRequest("Expected a multipart file upload");
+    if (!ALLOWED_IMPORT_MIME.has(mp.mimetype ?? "")) {
+      throw badRequest(`Unsupported content type "${mp.mimetype}" — upload a P6 .xer or an MS Project .xml file`);
+    }
+    const buf = await mp.toBuffer();
+    if (buf.byteLength === 0) throw badRequest("The uploaded file is empty");
+    if (buf.byteLength > MAX_IMPORT_BYTES) {
+      throw badRequest(`The file is ${Math.round(buf.byteLength / 1_048_576)} MiB — the limit is ${MAX_IMPORT_BYTES / 1_048_576} MiB`);
+    }
+    const fieldVal = (name: string): string | undefined => {
+      const raw = (mp.fields as Record<string, unknown>)[name];
+      const f = Array.isArray(raw) ? raw[0] : raw;
+      const v = (f as { value?: unknown } | undefined)?.value;
+      return typeof v === "string" && v.length > 0 ? v : undefined;
+    };
+    const text = buf.toString("utf8");
+    const fileName = mp.filename ?? "upload";
+    const format = sniffFormat(fieldVal("format"), fileName, text);
+    const dryRun = fieldVal("dryRun") === "true";
+    const targetScheduleId = fieldVal("targetScheduleId");
+    const target = targetScheduleId
+      ? await fetchSchedule(targetScheduleId, req.companyId!, req.projectId!)
+      : null;
+
+    let parsed: ParsedSchedule;
+    try {
+      parsed = format === "xer" ? parseXer(text) : parseMspdi(text);
+    } catch (err) {
+      throw badRequest(err instanceof Error ? err.message : "The file could not be parsed");
+    }
+    if (parsed.tasks.length === 0) {
+      throw badRequest("The file contains no activities — nothing to import");
+    }
+
+    const name = fieldVal("name") ?? parsed.projectName ?? fileName.replace(/\.[^.]+$/, "");
+
+    /* ---- diff against the target revision, before or after writing ---- */
+    const targetTasks = target ? await listTasks(target.id) : [];
+    const targetDeps = target ? await listDependencies(target.id) : [];
+    const parsedAsDiff: DiffTask[] = parsed.tasks.map((t) => ({
+      id: t.externalId,
+      externalId: t.externalId,
+      name: t.name,
+      wbsCode: t.wbsCode,
+      durationDays: t.durationDays,
+      startDate: t.plannedStart,
+      finishDate: t.plannedFinish,
+      percentComplete: t.percentComplete,
+    }));
+    const targetAsDiff: DiffTask[] = targetTasks.map((t) => ({
+      id: t.id,
+      externalId: t.externalId,
+      name: t.name,
+      wbsCode: t.wbsCode,
+      durationDays: t.durationDays,
+      startDate: t.startDate,
+      finishDate: t.finishDate,
+      percentComplete: t.percentComplete,
+      isCritical: t.isCritical === 1,
+      totalFloat: t.totalFloat,
+    }));
+    const externalKeyed = new Map(parsed.tasks.map((t) => [t.externalId, t.externalId] as const));
+    const diff = target
+      ? diffRevisions(
+          { tasks: targetAsDiff, dependencies: targetDeps },
+          {
+            tasks: parsedAsDiff,
+            dependencies: parsed.dependencies
+              .filter(
+                (d) =>
+                  externalKeyed.has(d.predecessorExternalId) && externalKeyed.has(d.successorExternalId),
+              )
+              .map((d) => ({
+                predecessorId: d.predecessorExternalId,
+                successorId: d.successorExternalId,
+                depType: d.depType,
+                lagDays: d.lagDays,
+              })),
+          },
+        )
+      : null;
+
+    if (dryRun) {
+      return {
+        dryRun: true,
+        format,
+        fileName,
+        byteSize: buf.byteLength,
+        name,
+        projectStart: parsed.projectStart,
+        dataDate: parsed.dataDate,
+        stats: {
+          tasks: parsed.tasks.length,
+          dependencies: parsed.dependencies.length,
+          calendars: parsed.calendars.length,
+          resources: parsed.resources.length,
+        },
+        warnings: parsed.warnings,
+        targetScheduleId: target?.id ?? null,
+        diff,
+      };
+    }
+
+    const created = await materialiseImport(parsed, {
+      companyId: req.companyId!,
+      projectId: req.projectId!,
+      userId: req.user!.id,
+      name,
+      target,
+    });
+    const summary = await recomputeSchedule({ id: created.scheduleId });
+
+    const importId = newId("imp");
+    await app.db.insert(scheduleImports).values({
+      id: importId,
+      companyId: req.companyId!,
+      projectId: req.projectId!,
+      scheduleId: created.scheduleId,
+      targetScheduleId: target?.id ?? null,
+      format,
+      fileName: fileName.slice(0, 300),
+      byteSize: buf.byteLength,
+      stats: {
+        tasks: created.tasks,
+        dependencies: created.dependencies,
+        calendars: created.calendars,
+        resources: created.resources,
+      },
+      diff: diff ? (diff as unknown as Record<string, unknown>) : null,
+      warnings: parsed.warnings,
+      importedBy: req.user!.id,
+    });
+    await appendLedger(app.db, {
+      companyId: req.companyId!,
+      actorId: req.user!.id,
+      action: "create",
+      objectType: "schedule_import",
+      objectId: importId,
+      projectId: req.projectId!,
+      payload: {
+        format,
+        fileName,
+        scheduleId: created.scheduleId,
+        targetScheduleId: target?.id ?? null,
+        tasks: created.tasks,
+        dependencies: created.dependencies,
+        warnings: parsed.warnings.length,
+      },
+    });
+
+    const schedule = await fetchSchedule(created.scheduleId, req.companyId!, req.projectId!);
+    return reply.status(201).send({
+      importId,
+      schedule,
+      stats: { ...created, computed: summary },
+      warnings: parsed.warnings,
+      diff,
+    });
+  });
+
+  app.get("/projects/:projectId/schedule-imports", { preHandler: readGate }, async (req) => {
+    const q = pageQuerySchema.parse(req.query);
+    const where = and(
+      eq(scheduleImports.companyId, req.companyId!),
+      eq(scheduleImports.projectId, req.projectId!),
+    );
+    const [totalRow] = await app.db.select({ n: count() }).from(scheduleImports).where(where);
+    const items = await app.db
+      .select()
+      .from(scheduleImports)
+      .where(where)
+      .orderBy(desc(scheduleImports.createdAt))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    return paginate(items, Number(totalRow?.n ?? 0), q);
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Export (#350)                                                      */
+  /* ---------------------------------------------------------------- */
+
+  app.get(
+    "/projects/:projectId/schedules/:scheduleId/export",
+    { preHandler: readGate },
+    async (req, reply) => {
+      const { scheduleId } = req.params as { scheduleId: string };
+      const q = z.object({ format: z.enum(SCHEDULE_FILE_FORMATS).default("mspdi") }).parse(req.query);
+      if (q.format !== "mspdi") {
+        throw badRequest("Only MS Project XML (mspdi) export is supported — P6 XER export is not implemented");
+      }
+      const schedule = await fetchSchedule(scheduleId, req.companyId!, req.projectId!);
+      const tasks = await listTasks(scheduleId);
+      const deps = await listDependencies(scheduleId);
+      const calendarRows = await loadCalendars(req.companyId!, req.projectId!, scheduleId);
+      const hoursPerDay =
+        calendarRows.find((c) => c.id === schedule.defaultCalendarId)?.hoursPerDay ??
+        calendarRows.find((c) => c.isDefault === 1)?.hoursPerDay ??
+        8;
+      const xml = exportMspdi({
+        name: schedule.name,
+        projectStart: schedule.projectStart,
+        dataDate: schedule.dataDate,
+        hoursPerDay,
+        tasks: tasks.map((t) => ({
+          id: t.id,
+          name: t.name,
+          wbsCode: t.wbsCode,
+          durationDays: t.durationDays,
+          startDate: t.startDate,
+          finishDate: t.finishDate,
+          actualStart: t.actualStart,
+          actualFinish: t.actualFinish,
+          percentComplete: t.percentComplete,
+          taskType: t.taskType,
+          totalFloat: t.totalFloat,
+          isCritical: t.isCritical === 1,
+          sortOrder: t.sortOrder,
+        })),
+        dependencies: deps.map((d) => ({
+          predecessorId: d.predecessorId,
+          successorId: d.successorId,
+          depType: d.depType,
+          lagDays: d.lagDays,
+        })),
+      });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "access",
+        objectType: "schedule",
+        objectId: scheduleId,
+        projectId: req.projectId!,
+        payload: { exported: "mspdi", taskCount: tasks.length },
+      });
+      const safeName = schedule.name.replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 80) || "schedule";
+      return reply
+        .header("content-type", "application/xml; charset=utf-8")
+        .header("content-disposition", `attachment; filename="${safeName}.xml"`)
+        .send(xml);
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Earned value (#363-369)                                           */
+  /* ---------------------------------------------------------------- */
+
+  app.get(
+    "/projects/:projectId/schedules/:scheduleId/earned-value",
+    { preHandler: readGate },
+    async (req) => {
+      const { scheduleId } = req.params as { scheduleId: string };
+      const q = earnedValueQuerySchema.parse(req.query);
+      const schedule = await fetchSchedule(scheduleId, req.companyId!, req.projectId!);
+      const tasks = await listTasks(scheduleId);
+      const dataDate = q.dataDate ?? schedule.dataDate ?? todayISO();
+      const reasons: string[] = [];
+
+      /* ---- planned dates: a baseline when there is one ---- */
+      const baselineWhere = q.baselineId
+        ? and(
+            eq(scheduleBaselines.id, q.baselineId),
+            eq(scheduleBaselines.scheduleId, scheduleId),
+            eq(scheduleBaselines.projectId, req.projectId!),
+          )
+        : and(
+            eq(scheduleBaselines.scheduleId, scheduleId),
+            eq(scheduleBaselines.projectId, req.projectId!),
+          );
+      const [baseline] = await app.db
+        .select()
+        .from(scheduleBaselines)
+        .where(baselineWhere)
+        .orderBy(asc(scheduleBaselines.capturedAt), asc(scheduleBaselines.id))
+        .limit(1);
+      if (q.baselineId && !baseline) throw notFound("Schedule baseline not found");
+      const plannedById = new Map<string, { startDate: string | null; finishDate: string | null }>();
+      if (baseline) {
+        for (const s of (baseline.snapshot ?? []) as BaselineTaskRow[]) {
+          plannedById.set(s.taskId, { startDate: s.startDate, finishDate: s.finishDate });
+        }
+      } else {
+        reasons.push("No baseline exists — planned value is measured against the current programme dates, not an as-planned position");
+      }
+
+      /* ---- cost basis ---- */
+      const resources = await app.db
+        .select()
+        .from(scheduleTaskResources)
+        .where(eq(scheduleTaskResources.scheduleId, scheduleId));
+      const resourceBudget = new Map<string, number>();
+      const resourceActual = new Map<string, number>();
+      for (const r of resources) {
+        resourceBudget.set(r.taskId, (resourceBudget.get(r.taskId) ?? 0) + r.budgetedCost);
+        resourceActual.set(r.taskId, (resourceActual.get(r.taskId) ?? 0) + r.actualCost);
+      }
+
+      const lineIds = [...new Set(tasks.map((t) => t.budgetLineItemId).filter((x): x is string => x !== null))];
+      const lines =
+        lineIds.length > 0
+          ? await app.db
+              .select()
+              .from(budgetLineItems)
+              .where(
+                and(
+                  inArray(budgetLineItems.id, lineIds),
+                  eq(budgetLineItems.companyId, req.companyId!),
+                  eq(budgetLineItems.projectId, req.projectId!),
+                ),
+              )
+          : [];
+      const lineById = new Map(lines.map((l) => [l.id, l] as const));
+      const tasksPerLine = new Map<string, number>();
+      for (const t of tasks) {
+        if (!t.budgetLineItemId) continue;
+        tasksPerLine.set(t.budgetLineItemId, (tasksPerLine.get(t.budgetLineItemId) ?? 0) + 1);
+      }
+      const sharedLines = [...tasksPerLine.entries()].filter(([, n]) => n > 1);
+      if (sharedLines.length > 0) {
+        reasons.push(
+          `${sharedLines.length} budget line(s) are mapped to more than one activity — their budget and cost are split equally across those activities`,
+        );
+      }
+
+      /* ---- currency: the project's active budget decides, never a guess ---- */
+      const [activeBudget] = await app.db
+        .select({ currency: budgets.currency })
+        .from(budgets)
+        .where(
+          and(
+            eq(budgets.companyId, req.companyId!),
+            eq(budgets.projectId, req.projectId!),
+            eq(budgets.isActive, 1),
+          ),
+        )
+        .limit(1);
+      const currency = q.currency ?? activeBudget?.currency ?? "USD";
+      if (!q.currency && !activeBudget) {
+        reasons.push("No active budget was found — figures are reported in USD by default; pass ?currency= to override");
+      }
+
+      const activities: EvActivity[] = tasks
+        .filter((t) => t.taskType !== "wbs_summary")
+        .map((t) => {
+          const planned = plannedById.get(t.id) ?? { startDate: t.startDate, finishDate: t.finishDate };
+          const line = t.budgetLineItemId ? lineById.get(t.budgetLineItemId) : undefined;
+          const share = t.budgetLineItemId ? (tasksPerLine.get(t.budgetLineItemId) ?? 1) : 1;
+          const bac =
+            t.budgetedCost ??
+            (resourceBudget.has(t.id) ? resourceBudget.get(t.id)! : undefined) ??
+            (line ? line.revisedBudget / share : null);
+          const actualCost =
+            (resourceActual.has(t.id) ? resourceActual.get(t.id)! : undefined) ??
+            (line ? line.jobToDateCosts / share : null);
+          return {
+            id: t.id,
+            name: t.name,
+            bac: bac ?? null,
+            actualCost,
+            percentComplete: t.percentComplete,
+            plannedStart: planned.startDate,
+            plannedFinish: planned.finishDate,
+            durationDays: t.durationDays,
+            isCritical: t.isCritical === 1,
+          };
+        });
+
+      const result = computeEarnedValue({ dataDate, currency, activities });
+      return {
+        scheduleId,
+        scheduleName: schedule.name,
+        baselineId: baseline?.id ?? null,
+        baselineName: baseline?.name ?? null,
+        basis: baseline ? "baseline dates" : "current programme dates",
+        ...result,
+        reasons: [...reasons, ...result.reasons],
+      };
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Milestones & calendar view (#362)                                  */
+  /* ---------------------------------------------------------------- */
+
+  app.get(
+    "/projects/:projectId/schedules/:scheduleId/milestones",
+    { preHandler: readGate },
+    async (req) => {
+      const { scheduleId } = req.params as { scheduleId: string };
+      const schedule = await fetchSchedule(scheduleId, req.companyId!, req.projectId!);
+      const tasks = await listTasks(scheduleId);
+      const milestones = tasks.filter(
+        (t) =>
+          t.isKeyMilestone === 1 ||
+          t.taskType === "start_milestone" ||
+          t.taskType === "finish_milestone" ||
+          t.durationDays === 0,
+      );
+      const items = milestones.map((t) => {
+        const forecast = t.actualFinish ?? t.finishDate;
+        const slipDays =
+          t.contractualDate && forecast ? diffDays(forecast, t.contractualDate) : null;
+        return {
+          id: t.id,
+          name: t.name,
+          wbsCode: t.wbsCode,
+          isKeyMilestone: t.isKeyMilestone === 1,
+          contractualDate: t.contractualDate,
+          forecastDate: forecast,
+          actualFinish: t.actualFinish,
+          slipDays,
+          status:
+            t.actualFinish !== null
+              ? "achieved"
+              : slipDays === null
+                ? "untracked"
+                : slipDays > 0
+                  ? "late"
+                  : "on_track",
+          totalFloat: t.totalFloat,
+          isCritical: t.isCritical === 1,
+          responsibleId: t.responsibleId,
+          slipAlertedDays: t.slipAlertedDays,
+        };
+      });
+      return {
+        scheduleId,
+        scheduleName: schedule.name,
+        items,
+        total: items.length,
+        untracked: items.filter((m) => m.status === "untracked").length,
+        late: items.filter((m) => m.status === "late").length,
+      };
+    },
+  );
+
+  /** Run the milestone-slip sweep on demand (the scheduler runs it hourly). */
+  app.post(
+    "/projects/:projectId/schedules/:scheduleId/milestone-sweep",
+    { preHandler: standardGate },
+    async (req) => {
+      const { scheduleId } = req.params as { scheduleId: string };
+      await fetchSchedule(scheduleId, req.companyId!, req.projectId!);
+      return sweepMilestoneSlips(app.db, req.companyId!, new Date(), {
+        projectId: req.projectId!,
+        scheduleId,
+      });
+    },
+  );
+
+  /**
+   * Calendar view data (#352): activities and milestones bucketed by day for
+   * the requested window, plus the non-working days of the governing calendar
+   * so the client can shade them without re-deriving the week.
+   */
+  app.get(
+    "/projects/:projectId/schedules/:scheduleId/calendar-view",
+    { preHandler: readGate },
+    async (req) => {
+      const { scheduleId } = req.params as { scheduleId: string };
+      const q = calendarViewQuerySchema.parse(req.query);
+      const schedule = await fetchSchedule(scheduleId, req.companyId!, req.projectId!);
+      const from = q.from ?? schedule.dataDate ?? todayISO();
+      const to = q.to ?? addDaysISO(from, 42);
+      if (to <= from) throw badRequest("to must be after from");
+      if (dayFromIso(to, from) > 400) throw badRequest("The calendar window may not exceed 400 days");
+
+      const tasks = await listTasks(scheduleId);
+      const calendarRows = await loadCalendars(req.companyId!, req.projectId!, scheduleId);
+      const governing =
+        calendarRows.find((c) => c.id === schedule.defaultCalendarId) ??
+        calendarRows.find((c) => c.isDefault === 1) ??
+        null;
+      const holidays = new Set(governing?.holidays ?? []);
+      const exceptions = new Set(governing?.exceptions ?? []);
+      const workdays = governing?.workdays ?? [1, 1, 1, 1, 1, 1, 1];
+
+      const days: {
+        date: string;
+        working: boolean;
+        starting: { id: string; name: string; isCritical: boolean }[];
+        finishing: { id: string; name: string; isCritical: boolean; isMilestone: boolean }[];
+        inProgress: number;
+      }[] = [];
+      const spanDays = dayFromIso(to, from);
+      for (let i = 0; i < spanDays; i += 1) {
+        const date = addDaysISO(from, i);
+        const dow = new Date(`${date}T00:00:00Z`).getUTCDay();
+        const working = exceptions.has(date) || (!holidays.has(date) && workdays[dow] === 1);
+        const starting = tasks
+          .filter((t) => (t.actualStart ?? t.startDate) === date)
+          .map((t) => ({ id: t.id, name: t.name, isCritical: t.isCritical === 1 }));
+        const finishing = tasks
+          .filter((t) => (t.actualFinish ?? t.finishDate) === date)
+          .map((t) => ({
+            id: t.id,
+            name: t.name,
+            isCritical: t.isCritical === 1,
+            isMilestone: t.durationDays === 0 || t.isKeyMilestone === 1,
+          }));
+        const inProgress = tasks.filter((t) => {
+          const s = t.actualStart ?? t.startDate;
+          const f = t.actualFinish ?? t.finishDate;
+          return s !== null && f !== null && s <= date && f >= date;
+        }).length;
+        days.push({ date, working, starting, finishing, inProgress });
+      }
+      return {
+        scheduleId,
+        from,
+        to,
+        calendarId: governing?.id ?? null,
+        calendarName: governing?.name ?? null,
+        days,
+      };
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Health inputs (contract 3.5)                                      */
+  /* ---------------------------------------------------------------- */
+
+  app.get("/projects/:projectId/schedule/health-inputs", { preHandler: readGate }, async (req) => {
+    const reasons: string[] = [];
+    const [active] = await app.db
+      .select()
+      .from(schedules)
+      .where(
+        and(
+          eq(schedules.companyId, req.companyId!),
+          eq(schedules.projectId, req.projectId!),
+          eq(schedules.isActive, 1),
+        ),
+      )
+      .orderBy(desc(schedules.createdAt))
+      .limit(1);
+    if (!active) {
+      return {
+        metrics: {
+          scheduleQualityScore: null,
+          criticalTaskCount: null,
+          negativeFloatTaskCount: null,
+          milestoneSlipMaxDays: null,
+          milestonesLate: null,
+          completionMovementDays: null,
+          openConstraints: null,
+          overdueConstraints: null,
+          percentComplete: null,
+        },
+        reasons: ["The project has no active schedule"],
+      };
+    }
+
+    const tasks = await listTasks(active.id);
+    const { report } = await buildQualityReport(req.companyId!, req.projectId!, active.id);
+    const constraints = await countOpenConstraints(app.db, req.companyId!, req.projectId!, new Date());
+    const untracked = await untrackedMilestones(app.db, active.id);
+    if (untracked > 0) {
+      reasons.push(`${untracked} key milestone(s) carry no contractual date and cannot be tracked for slip`);
+    }
+
+    const [baseline] = await app.db
+      .select()
+      .from(scheduleBaselines)
+      .where(eq(scheduleBaselines.scheduleId, active.id))
+      .orderBy(asc(scheduleBaselines.capturedAt))
+      .limit(1);
+    const completionMovementDays =
+      baseline?.computedFinish && active.computedFinish
+        ? diffDays(active.computedFinish, baseline.computedFinish)
+        : null;
+    if (completionMovementDays === null) {
+      reasons.push("No baseline has been captured — completion movement is not available");
+    }
+
+    const milestoneSlips = tasks
+      .filter((t) => t.isKeyMilestone === 1 && t.contractualDate)
+      .map((t) => {
+        const forecast = t.actualFinish ?? t.finishDate;
+        return forecast ? diffDays(forecast, t.contractualDate!) : null;
+      })
+      .filter((n): n is number => n !== null);
+
+    const durationTotal = tasks.reduce((sum, t) => sum + Math.max(t.durationDays, 0), 0);
+    const earned = tasks.reduce(
+      (sum, t) => sum + (Math.max(t.durationDays, 0) * t.percentComplete) / 100,
+      0,
+    );
+
+    return {
+      scheduleId: active.id,
+      scheduleName: active.name,
+      metrics: {
+        scheduleQualityScore: report.score,
+        criticalTaskCount: tasks.filter((t) => t.isCritical === 1).length,
+        negativeFloatTaskCount: tasks.filter((t) => t.totalFloat !== null && t.totalFloat < 0).length,
+        milestoneSlipMaxDays: milestoneSlips.length > 0 ? Math.max(...milestoneSlips) : null,
+        milestonesLate: milestoneSlips.filter((d) => d > 0).length,
+        completionMovementDays,
+        openConstraints: constraints.open,
+        overdueConstraints: constraints.overdue,
+        percentComplete: durationTotal > 0 ? Math.round((earned / durationTotal) * 1000) / 10 : null,
+      },
+      reasons,
+    };
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Scheduler jobs (§6.1 — no sweep may depend on a page being open)  */
+  /* ---------------------------------------------------------------- */
+
+  app.scheduler.register({
+    name: "schedule.milestone-slip",
+    description:
+      "Compare key milestones against their contractual dates and raise a signal when a slip appears or grows",
+    everyMs: 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db, now }) => {
+      let slipped = 0;
+      let alerted = 0;
+      const result = await forEachCompany(db, async (companyId) => {
+        const summary = await sweepMilestoneSlips(db, companyId, now);
+        slipped += summary.slipped;
+        alerted += summary.alerted;
+      });
+      return { ...result, slipped, alerted };
+    },
+  });
+
+  app.scheduler.register({
+    name: "schedule.constraints",
+    description: "Escalate lookahead constraints that are past their need-by date and still open",
+    everyMs: 6 * 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db, now }) => {
+      let escalated = 0;
+      const result = await forEachCompany(db, async (companyId) => {
+        const summary = await sweepConstraints(db, companyId, now);
+        escalated += summary.escalated;
+      });
+      return { ...result, escalated };
+    },
+  });
+};

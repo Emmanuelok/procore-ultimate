@@ -9,6 +9,7 @@ import {
   nonConformanceReports,
   obligations,
   prequalificationSubmissions,
+  projectMemberships,
   projects,
   safetyCorrectiveActions,
   safetyIncidents,
@@ -20,6 +21,7 @@ import {
   safetyRiskSnapshots,
   safetySensorEvents,
   signals,
+  sitePermits,
   siteAccessRecords,
   timecards,
   toolboxTalkAttendees,
@@ -30,6 +32,8 @@ import {
 import {
   ACKNOWLEDGEMENT_METHODS,
   ACTION_EFFECTIVENESS_VERDICTS,
+  DRUG_ALCOHOL_TEST_REASONS,
+  DRUG_ALCOHOL_TEST_RESULTS,
   BODY_PARTS,
   CHECKLIST_ITEM_TYPES,
   CORRECTIVE_ACTION_KINDS,
@@ -52,6 +56,7 @@ import {
   SAFETY_RECORD_KINDS_ALL,
   SAFETY_REGULATORY_FORMS,
   SAFETY_SENSOR_EVENT_KINDS,
+  SAFETY_REGULATORY_REPORT_STATUSES,
   SAFETY_SENSOR_SOURCES,
   SAFETY_SEVERITIES,
   SHIFTS,
@@ -637,6 +642,25 @@ const recordCreateSchema = z.object({
   regulatoryReference: z.string().max(500).nullable().optional(),
   categories: z.array(z.enum(SAFETY_CATEGORIES)).max(20).optional(),
   requiredAcknowledgementCount: z.number().int().min(0).max(10000).nullable().optional(),
+  /**
+   * A drug or alcohol test is a programme record with two facts an appeal
+   * turns on: WHY it was carried out and WHAT it found. They are validated
+   * rather than left to a free-form detail blob, because a test result whose
+   * reason nobody recorded is the one an employment tribunal discounts, and a
+   * "positive" with no confirmation stage recorded is the one that gets a
+   * dismissal overturned.
+   */
+  drugAlcoholResult: z.enum(DRUG_ALCOHOL_TEST_RESULTS).optional(),
+  drugAlcoholReason: z.enum(DRUG_ALCOHOL_TEST_REASONS).optional(),
+  /**
+   * The live permit-to-work this document belongs to (`site_permits`, owned by
+   * the site-operations module). A safety programme record is the DOCUMENT — a
+   * hot-work permit form, a confined-space RAMS; the site permit is the live
+   * authorisation with entries, exits and an exclusion zone. They are two
+   * different objects and the register that binds them is the one an inspector
+   * follows: "show me the document this permit was issued against".
+   */
+  sitePermitId: z.string().max(64).nullable().optional(),
   detail: z.record(z.string(), z.unknown()).optional(),
 });
 
@@ -834,15 +858,59 @@ const PRIORITY_TO_SIGNAL_SEVERITY: Record<string, string> = {
  * dashboard, as a missed clause-notice. A missed deadline, an overdue
  * corrective action, an overdue statutory re-inspection, an expired permit
  * and an uninvestigated incident are **Signals** raised by an idempotent lazy
- * sweep on list and detail reads: never a cron, because the read is the
- * moment the answer has to be true, and `evidenceRefs.key` is what stops the
- * same finding being raised twice.
+ * sweep on list reads AND by scheduled jobs, and `evidenceRefs.key` is what
+ * stops the same finding being raised twice.
  *
  * The one thing it does build is `reportability.ts` — a code-resident,
  * unit-tested rules file for RIDDOR 2013 and 29 CFR Part 1904, each rule
  * carrying its citation, its clock start and its deadline, and each capable
  * of returning "I cannot tell you" rather than a guess. That file is the
  * module. Everything else is a register around it.
+ *
+ * ---------------------------------------------------------------------------
+ * PLATFORM UPGRADE WAVE — what this file gained, and the defects it removed
+ *
+ * ONE DUTY PER REGIME (`notifications.ts`). An incident can be answerable to
+ * two authorities at once, on two clocks, on two forms. The register used to
+ * carry a single `regulator_notified_at`; filing the F2508 stamped it and the
+ * OSHA eight-hour duty stopped being tracked — the sweep skipped it, the
+ * drawer said "notified", and the incident could be closed with a live
+ * statutory duty undischarged. Every consumer now reads one shared
+ * per-regime state.
+ *
+ * STATUTORY FORMS (`regulatory.ts`, spec #652). OSHA 300 / 300A / 301 and a
+ * RIDDOR F2508 prefill, generated from the determination, frozen, hashed and
+ * stored — because a 300A is an assertion made ON A DATE from records as they
+ * stood then, and a field the platform cannot establish is null with its
+ * reason beside it rather than a zero on a legal document.
+ *
+ * LEADING INDICATORS (`riskindex.ts`). A predictive index built only from
+ * things a site can change this week, withheld below 40% coverage rather than
+ * published thin; and an under-reporting read that states what would REFUTE
+ * each finding, because under-reporting is the one safety failure that makes
+ * every other number on the project look better.
+ *
+ * SUPPLIER RECORD (`scorecard.ts`, #646/#661/#1100). What a subcontractor's
+ * record on your sites shows, as against what their questionnaire says about
+ * themselves — with rates computed on the supplier's OWN hours or not at all.
+ *
+ * DEVICE ALARMS (#1070–1073). Wearables and lone-worker devices, kept
+ * deliberately OUT of the incident register: a man-down alarm is an
+ * accelerometer reading, and what this register owns is the response clock.
+ *
+ * THE ASSISTANT (`assist.ts`). A reader, not an investigator: it assembles
+ * the records around an incident and cites the id behind every suggestion,
+ * dropping any citation that was not in the prompt. Nothing it returns is
+ * written until a human accepts it, and acceptance is a separate ledgered act
+ * carrying the run id.
+ *
+ * AND THE SWEEPS MOVED. They used to run on every list AND every detail read,
+ * each loading every signal the company had ever raised for a detector. They
+ * now run on list reads only, throttled per project, bounded to the project
+ * being swept — and the guarantee that they run at all belongs to the
+ * scheduler (`safety.sweeps`, `safety.risk-index`, `safety.under-reporting`),
+ * because a module whose product is "the statutory deadline passed and here
+ * is the record" cannot depend on a browser tab to notice the deadline.
  */
 export const safetyModule: FastifyPluginAsync = async (app) => {
   const readGate = [app.authenticate, app.requireCompany, app.requireTool("safety", "read")];
@@ -853,6 +921,12 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     app.authenticate,
     app.requireCompany,
     app.requireCompanyRole(["owner", "admin", "member"]),
+  ];
+  /** Writing a supplier's observed safety record onto their prequalification. */
+  const companyAdmin = [
+    app.authenticate,
+    app.requireCompany,
+    app.requireCompanyRole(["owner", "admin"]),
   ];
 
   /* ---------------------------------------------------------------- */
@@ -961,6 +1035,31 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       .limit(1);
     if (!rows[0]) throw notFound("Programme record not found");
     return rows[0];
+  }
+
+  /**
+   * The projects a company-level read may aggregate over.
+   *
+   * A company-scoped route that rolls up project data must not show a member
+   * the projects they are not on: the safety record of a job somebody has no
+   * part in is not theirs to read, and a vendor scorecard is the most
+   * consequential roll-up here because it is what a bid evaluation relies on.
+   * Owners and admins see the whole company, which is what makes the roll-up
+   * useful to the people who act on it.
+   */
+  async function visibleProjectIds(
+    companyId: string,
+    userId: string,
+    role: string | null | undefined,
+  ): Promise<{ all: boolean; ids: string[] }> {
+    if (role === "owner" || role === "admin") return { all: true, ids: [] };
+    const rows = await app.db
+      .select({ projectId: projectMemberships.projectId })
+      .from(projectMemberships)
+      .where(
+        and(eq(projectMemberships.companyId, companyId), eq(projectMemberships.userId, userId)),
+      );
+    return { all: false, ids: [...new Set(rows.map((r) => r.projectId))] };
   }
 
   async function projectCountry(projectId: string, companyId: string): Promise<string | null> {
@@ -1886,6 +1985,11 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
           ? Math.max(0, r.requiredAcknowledgementCount - r.acknowledgementCount)
           : null,
       isCriticalKind: CRITICAL_RECORD_KINDS.has(r.recordKind),
+      /** the live permit-to-work in site operations this document authorises */
+      sitePermitId:
+        typeof (r.detail as Record<string, unknown>)["sitePermitId"] === "string"
+          ? ((r.detail as Record<string, unknown>)["sitePermitId"] as string)
+          : null,
     };
   }
 
@@ -5243,6 +5347,47 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
             `the sweep and will be relied on indefinitely.`,
         );
       }
+      /* A drug or alcohol test is the one programme record whose CONTENT is a
+       * determination about a named person, and the two facts an appeal turns
+       * on are why the test was carried out and what it found. A result with
+       * no recorded reason is the one a tribunal discounts. */
+      if (body.sitePermitId) {
+        const permit = await app.db
+          .select({ id: sitePermits.id, reference: sitePermits.reference })
+          .from(sitePermits)
+          .where(
+            and(
+              eq(sitePermits.id, body.sitePermitId),
+              eq(sitePermits.companyId, req.companyId!),
+              ...(body.projectId ? [eq(sitePermits.projectId, body.projectId)] : []),
+            ),
+          )
+          .limit(1);
+        if (!permit[0]) {
+          throw badRequest(
+            `Permit-to-work ${body.sitePermitId} is not in this project's site permit register. ` +
+              `The live authorisation lives in site operations; this record is the document it was ` +
+              `issued against, and a link to a permit that does not exist is worse than no link.`,
+          );
+        }
+      }
+      if (body.recordKind === "drug_alcohol_test") {
+        if (!body.drugAlcoholResult || !body.drugAlcoholReason) {
+          throw badRequest(
+            "A drug or alcohol test record needs `drugAlcoholResult` and `drugAlcoholReason`. Both " +
+              "are the facts an appeal turns on: a result with no recorded reason for testing is " +
+              "the one an employment tribunal discounts, and a bare `positive` with no confirmation " +
+              "stage recorded is the one that gets a dismissal overturned. Use " +
+              "`non_negative_pending_confirmation` where the screening test is all that has been done.",
+          );
+        }
+        if (!body.workerId) {
+          throw badRequest(
+            "A drug or alcohol test record must name the worker it concerns — a personal result " +
+              "filed against nobody is a record that cannot be produced, challenged or deleted.",
+          );
+        }
+      }
       const seq = await nextRecordNumber(app.db, req.companyId!, "safety_programme_record");
       const reference = body.reference ?? `SPR-${pad(seq)}`;
       const reviewDueDate =
@@ -5276,7 +5421,19 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
         regulatoryReference: body.regulatoryReference ?? null,
         categories: body.categories ?? [],
         requiredAcknowledgementCount: body.requiredAcknowledgementCount ?? null,
-        detail: body.detail ?? {},
+        detail: {
+          ...(body.detail ?? {}),
+          ...(body.drugAlcoholResult
+            ? {
+                drugAlcohol: {
+                  result: body.drugAlcoholResult,
+                  reason: body.drugAlcoholReason,
+                  recordedBy: req.user!.id,
+                },
+              }
+            : {}),
+          ...(body.sitePermitId ? { sitePermitId: body.sitePermitId } : {}),
+        },
         createdBy: req.user!.id,
       });
       await appendLedger(app.db, {
@@ -6624,7 +6781,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
 
   const regulatoryListQuery = pageQuerySchema.extend({
     form: z.enum(SAFETY_REGULATORY_FORMS).optional(),
-    status: z.string().max(30).optional(),
+    status: z.enum(SAFETY_REGULATORY_REPORT_STATUSES).optional(),
     year: z.coerce.number().int().min(1970).max(2200).optional(),
     incidentId: z.string().max(64).optional(),
   });
@@ -7716,16 +7873,52 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       const from = q.from ?? addDaysISO(to, -365);
       if (from > to) throw badRequest(`from ${from} falls after to ${to}.`);
       if (q.vendorId) await assertVendor(q.vendorId, req.companyId!);
-      const result = await scorecardsFor(req.companyId!, null, from, to, q.vendorId ?? null);
+
+      /* A member sees the supplier's record on the projects they are on; an
+       * owner or admin sees the company. Rolling somebody else's project into
+       * a member's view would leak that project's safety record through a
+       * supplier page. */
+      const scope = await visibleProjectIds(req.companyId!, req.user!.id, req.companyRole);
+      if (!scope.all && scope.ids.length === 0) {
+        return {
+          companyId: req.companyId!,
+          from,
+          to,
+          scope: { all: false, projects: 0 },
+          scorecards: [],
+          reasons: [
+            "You are not a member of any project in this company, so there is no supplier record " +
+              "you may read. An owner or admin sees the whole company roll-up.",
+          ],
+          note: "Scoped to the projects you are a member of.",
+        };
+      }
+
+      const perProject = scope.all
+        ? [await scorecardsFor(req.companyId!, null, from, to, q.vendorId ?? null)]
+        : await Promise.all(
+            scope.ids.map((projectId) =>
+              scorecardsFor(req.companyId!, projectId, from, to, q.vendorId ?? null),
+            ),
+          );
+      const scorecards = perProject.flatMap((r) => r.scorecards);
+      const reasons = [...new Set(perProject.flatMap((r) => r.reasons))];
+      scorecards.sort((a, b) => (a.score ?? 101) - (b.score ?? 101));
+
       return {
         companyId: req.companyId!,
         from,
         to,
-        ...result,
+        scope: { all: scope.all, projects: scope.all ? null : scope.ids.length },
+        scorecards,
+        reasons,
         note:
-          "The company roll-up reads every project's registers. It is the figure a prequalification " +
-          "team should hold beside the questionnaire answers — one is what the supplier says about " +
-          "itself, the other is what its record on your sites actually shows.",
+          (scope.all
+            ? "The company roll-up reads every project's registers. "
+            : `Scoped to the ${scope.ids.length} project(s) you are a member of — one scorecard per project, not a company total. `) +
+          "It is the figure a prequalification team should hold beside the questionnaire answers — " +
+          "one is what the supplier says about itself, the other is what its record on your sites " +
+          "actually shows.",
       };
     },
   );
@@ -7742,7 +7935,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
    */
   app.post(
     "/companies/current/safety/vendor-scorecard/publish",
-    { preHandler: companyWrite },
+    { preHandler: companyAdmin },
     async (req) => {
       const body = z
         .object({
@@ -8285,12 +8478,61 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
    * EVIDENCE, never as a finding: the honest answer to most of these is "the
    * site really was that quiet", so every finding carries what would refute it.
    */
+  /**
+   * The company's per-project incident counts and exposure for one window.
+   *
+   * Computed ONCE per company rather than once per project: the peer read is
+   * identical for every project in the company, and recomputing it inside a
+   * per-project loop turns a daily sweep of fifty projects into two and a half
+   * thousand queries for the same answer.
+   */
+  async function companyPeerCounts(
+    companyId: string,
+    from: string,
+    to: string,
+  ): Promise<Array<{ projectId: string; incidents: number; exposureHours: number | null }>> {
+    const projectRows = await app.db
+      .select({ id: projects.id })
+      .from(projects)
+      .where(eq(projects.companyId, companyId));
+    const counted = await app.db
+      .select({ projectId: safetyIncidents.projectId, n: count() })
+      .from(safetyIncidents)
+      .where(
+        and(
+          eq(safetyIncidents.companyId, companyId),
+          gte(safetyIncidents.occurredAt, `${from}T00:00:00Z`),
+          lte(safetyIncidents.occurredAt, `${to}T23:59:59Z`),
+          ne(safetyIncidents.status, "void"),
+        ),
+      )
+      .groupBy(safetyIncidents.projectId);
+    const byProject = new Map(counted.map((r) => [r.projectId, Number(r.n)]));
+    const out: Array<{ projectId: string; incidents: number; exposureHours: number | null }> = [];
+    /* Bounded: the exposure read is per project and there is one query per
+     * project that HAS a safety record, not per project in the company. */
+    for (const row of projectRows.slice(0, 200)) {
+      /* The exposure is read for EVERY project, including the ones with no
+       * incidents at all — those are precisely the ones the silent-register
+       * finding turns on, and skipping them as an optimisation would make the
+       * detector blind to the case it exists for. */
+      const exposure = await exposureForWindow(companyId, row.id, from, to);
+      out.push({
+        projectId: row.id,
+        incidents: byProject.get(row.id) ?? 0,
+        exposureHours: exposure.hours,
+      });
+    }
+    return out;
+  }
+
   async function collectUnderReporting(
     companyId: string,
     projectId: string,
     projectName: string,
     from: string,
     to: string,
+    precomputedPeers?: Array<{ projectId: string; incidents: number; exposureHours: number | null }>,
   ) {
     const rows = await app.db
       .select()
@@ -8320,31 +8562,8 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     /* The peer read: the company's other projects over the same window. A
      * project quiet on its own is ambiguous; a project quiet while its
      * siblings are not is a question. */
-    const peerProjects = await app.db
-      .select({ id: projects.id })
-      .from(projects)
-      .where(and(eq(projects.companyId, companyId), ne(projects.id, projectId)));
-    const peers: Array<{ projectId: string; incidents: number; exposureHours: number | null }> = [];
-    for (const peer of peerProjects.slice(0, 50)) {
-      const n = await app.db
-        .select({ n: count() })
-        .from(safetyIncidents)
-        .where(
-          and(
-            eq(safetyIncidents.companyId, companyId),
-            eq(safetyIncidents.projectId, peer.id),
-            gte(safetyIncidents.occurredAt, `${from}T00:00:00Z`),
-            lte(safetyIncidents.occurredAt, `${to}T23:59:59Z`),
-            ne(safetyIncidents.status, "void"),
-          ),
-        );
-      const peerExposure = await exposureForWindow(companyId, peer.id, from, to);
-      peers.push({
-        projectId: peer.id,
-        incidents: Number(n[0]?.n ?? 0),
-        exposureHours: peerExposure.hours,
-      });
-    }
+    const allPeers = precomputedPeers ?? (await companyPeerCounts(companyId, from, to));
+    const peers = allPeers.filter((p) => p.projectId !== projectId);
 
     return assessUnderReporting({
       projectId,
@@ -9002,6 +9221,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       let raised = 0;
       const outcome = await forEachCompany(app.db, async (companyId) => {
         const projectIds = await projectsWithSafetyRecords(companyId);
+        const peers = await companyPeerCounts(companyId, from, to);
         const names = new Map<string, string>();
         if (projectIds.length > 0) {
           const rows = await app.db
@@ -9017,6 +9237,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
             names.get(projectId) ?? projectId,
             from,
             to,
+            peers,
           );
           if (result.findings.length === 0) continue;
           const seen = await alreadySignalled(

@@ -196,7 +196,7 @@ export default function ReferenceClassesTab() {
                   .filter((m) => GROWTH_METRICS.includes(m.key))
                   .map((m) => (
                     <option key={m.key} value={m.key}>
-                      {m.label}
+                      {m.name}
                     </option>
                   ))}
                 {metrics === null
