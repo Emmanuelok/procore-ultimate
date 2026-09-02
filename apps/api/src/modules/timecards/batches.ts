@@ -365,7 +365,41 @@ export const batchRoutes: FastifyPluginAsync = async (app) => {
       .orderBy(desc(timecardBatches.periodEnd), desc(timecardBatches.number))
       .limit(q.pageSize)
       .offset(pageOffset(q));
-    return paginate(rows, Number(totalRow?.n ?? 0), q);
+
+    // Why the cost is unknown, on the LIST — the register and the detail view
+    // used to disagree, because the detail recomputed and the list showed a
+    // materialised 0.
+    const uncosted =
+      rows.length > 0
+        ? await app.db
+            .select({ batchId: timecards.batchId, n: count() })
+            .from(timecards)
+            .where(
+              and(
+                inArray(
+                  timecards.batchId,
+                  rows.map((r) => r.id),
+                ),
+                isNull(timecards.totalCost),
+              ),
+            )
+            .groupBy(timecards.batchId)
+        : [];
+    const uncostedByBatch = new Map(uncosted.map((u) => [u.batchId, Number(u.n)]));
+    return paginate(
+      rows.map((r) => ({
+        ...r,
+        uncostedCardCount: uncostedByBatch.get(r.id) ?? 0,
+        totalCostIsKnown: r.totalCost !== null,
+        costNote:
+          r.totalCost === null
+            ? `${uncostedByBatch.get(r.id) ?? 0} card(s) in this week carry hours the platform ` +
+              "holds no rate for, so the week's cost is unknown rather than the sum of the rest"
+            : null,
+      })),
+      Number(totalRow?.n ?? 0),
+      q,
+    );
   });
 
   app.get(

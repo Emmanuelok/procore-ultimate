@@ -268,6 +268,17 @@ export function resolveHours(
     if (total <= 0) {
       throw badRequest("A timecard with no hours on it is not a timecard. Supply hours.");
     }
+    // Each bucket is capped at 24 by the schema, and 24+24+24 passed. The
+    // classified paths cap the worked day; the explicit path did not, so a
+    // 72-hour day could be entered, costed and allocated.
+    if (total > 24) {
+      throw badRequest(
+        `${total} hours were supplied for a single day (${regular} plain + ${overtime} overtime + ` +
+          `${doubleTime} double time + ${premium} premium). A day holds 24 hours. If this is a ` +
+          "double shift spanning midnight, raise it as two cards on the two dates, which is also " +
+          "how the site-access stream will have recorded it.",
+      );
+    }
     return {
       split: {
         regularHours: regular,

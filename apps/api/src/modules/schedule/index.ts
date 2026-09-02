@@ -1678,3 +1678,327 @@ export const scheduleModule: FastifyPluginAsync = async (app) => {
       };
     },
   );
+
+  /* ---------------------------------------------------------------- */
+  /* Calendars                                                         */
+  /* ---------------------------------------------------------------- */
+
+  app.get("/projects/:projectId/schedule-calendars", { preHandler: readGate }, async (req) => {
+    const rows = await app.db
+      .select()
+      .from(scheduleCalendars)
+      .where(
+        and(
+          eq(scheduleCalendars.companyId, req.companyId!),
+          eq(scheduleCalendars.projectId, req.projectId!),
+        ),
+      )
+      .orderBy(desc(scheduleCalendars.isDefault), asc(scheduleCalendars.name));
+    return { items: rows, total: rows.length };
+  });
+
+  app.post("/projects/:projectId/schedule-calendars", { preHandler: standardGate }, async (req, reply) => {
+    const body = calendarCreateSchema.parse(req.body);
+    if (body.scheduleId) await fetchSchedule(body.scheduleId, req.companyId!, req.projectId!);
+    if (body.workdays && body.workdays.every((d) => d === 0)) {
+      throw badRequest("A calendar must have at least one working day");
+    }
+    const id = newId("cal");
+    const now = new Date().toISOString();
+    await app.db.transaction(async (tx) => {
+      if (body.isDefault) {
+        await tx
+          .update(scheduleCalendars)
+          .set({ isDefault: 0, updatedAt: now })
+          .where(
+            and(
+              eq(scheduleCalendars.companyId, req.companyId!),
+              eq(scheduleCalendars.projectId, req.projectId!),
+            ),
+          );
+      }
+      await tx.insert(scheduleCalendars).values({
+        id,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        scheduleId: body.scheduleId ?? null,
+        name: body.name,
+        workdays: body.workdays ?? [0, 1, 1, 1, 1, 1, 0],
+        holidays: body.holidays ?? [],
+        exceptions: body.exceptions ?? [],
+        hoursPerDay: body.hoursPerDay ?? 8,
+        isDefault: body.isDefault ? 1 : 0,
+      });
+    });
+    await appendLedger(app.db, {
+      companyId: req.companyId!,
+      actorId: req.user!.id,
+      action: "create",
+      objectType: "schedule_calendar",
+      objectId: id,
+      projectId: req.projectId!,
+      payload: { name: body.name, isDefault: Boolean(body.isDefault) },
+    });
+    const [created] = await app.db
+      .select()
+      .from(scheduleCalendars)
+      .where(eq(scheduleCalendars.id, id))
+      .limit(1);
+    return reply.status(201).send(created);
+  });
+
+  async function fetchCalendar(calendarId: string, companyId: string, projectId: string) {
+    const [row] = await app.db
+      .select()
+      .from(scheduleCalendars)
+      .where(
+        and(
+          eq(scheduleCalendars.id, calendarId),
+          eq(scheduleCalendars.companyId, companyId),
+          eq(scheduleCalendars.projectId, projectId),
+        ),
+      )
+      .limit(1);
+    if (!row) throw notFound("Schedule calendar not found");
+    return row;
+  }
+
+  app.patch(
+    "/projects/:projectId/schedule-calendars/:calendarId",
+    { preHandler: standardGate },
+    async (req) => {
+      const { calendarId } = req.params as { calendarId: string };
+      const body = calendarPatchSchema.parse(req.body);
+      const cal = await fetchCalendar(calendarId, req.companyId!, req.projectId!);
+      if (body.workdays && body.workdays.every((d) => d === 0)) {
+        throw badRequest("A calendar must have at least one working day");
+      }
+      const now = new Date().toISOString();
+      const set: Record<string, unknown> = { updatedAt: now };
+      if (body.name !== undefined) set["name"] = body.name;
+      if (body.workdays !== undefined) set["workdays"] = body.workdays;
+      if (body.holidays !== undefined) set["holidays"] = body.holidays;
+      if (body.exceptions !== undefined) set["exceptions"] = body.exceptions;
+      if (body.hoursPerDay !== undefined) set["hoursPerDay"] = body.hoursPerDay;
+      if (body.isDefault !== undefined) set["isDefault"] = body.isDefault ? 1 : 0;
+      await app.db.transaction(async (tx) => {
+        if (body.isDefault) {
+          await tx
+            .update(scheduleCalendars)
+            .set({ isDefault: 0, updatedAt: now })
+            .where(
+              and(
+                eq(scheduleCalendars.companyId, req.companyId!),
+                eq(scheduleCalendars.projectId, req.projectId!),
+              ),
+            );
+        }
+        await tx.update(scheduleCalendars).set(set).where(eq(scheduleCalendars.id, calendarId));
+      });
+      // Working-week changes move every date on every schedule that uses it.
+      const affected = await app.db
+        .select({ id: schedules.id })
+        .from(schedules)
+        .where(
+          and(
+            eq(schedules.companyId, req.companyId!),
+            eq(schedules.projectId, req.projectId!),
+            cal.scheduleId ? eq(schedules.id, cal.scheduleId) : sql`true`,
+          ),
+        );
+      for (const s of affected) await recomputeSchedule({ id: s.id });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "schedule_calendar",
+        objectId: calendarId,
+        projectId: req.projectId!,
+        payload: { changed: Object.keys(body), recomputedSchedules: affected.length },
+      });
+      return fetchCalendar(calendarId, req.companyId!, req.projectId!);
+    },
+  );
+
+  app.delete(
+    "/projects/:projectId/schedule-calendars/:calendarId",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { calendarId } = req.params as { calendarId: string };
+      const cal = await fetchCalendar(calendarId, req.companyId!, req.projectId!);
+      const [used] = await app.db
+        .select({ n: count() })
+        .from(scheduleTasks)
+        .where(
+          and(eq(scheduleTasks.projectId, req.projectId!), eq(scheduleTasks.calendarId, calendarId)),
+        );
+      if (Number(used?.n ?? 0) > 0) {
+        throw conflict(`${used?.n} activit${Number(used?.n) === 1 ? "y uses" : "ies use"} this calendar — reassign them first`);
+      }
+      await app.db.delete(scheduleCalendars).where(eq(scheduleCalendars.id, calendarId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "delete",
+        objectType: "schedule_calendar",
+        objectId: calendarId,
+        projectId: req.projectId!,
+        payload: { name: cal.name },
+      });
+      return reply.status(204).send();
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Resource-loaded activities (#370)                                 */
+  /* ---------------------------------------------------------------- */
+
+  app.get(
+    "/projects/:projectId/schedules/:scheduleId/resources",
+    { preHandler: readGate },
+    async (req) => {
+      const { scheduleId } = req.params as { scheduleId: string };
+      await fetchSchedule(scheduleId, req.companyId!, req.projectId!);
+      const rows = await app.db
+        .select()
+        .from(scheduleTaskResources)
+        .where(eq(scheduleTaskResources.scheduleId, scheduleId))
+        .orderBy(asc(scheduleTaskResources.name));
+      const byType = new Map<string, { budgetedUnits: number; actualUnits: number; budgetedCost: number; actualCost: number }>();
+      for (const r of rows) {
+        const agg = byType.get(r.resourceType) ?? {
+          budgetedUnits: 0,
+          actualUnits: 0,
+          budgetedCost: 0,
+          actualCost: 0,
+        };
+        agg.budgetedUnits += r.budgetedUnits;
+        agg.actualUnits += r.actualUnits;
+        agg.budgetedCost += r.budgetedCost;
+        agg.actualCost += r.actualCost;
+        byType.set(r.resourceType, agg);
+      }
+      return {
+        items: rows,
+        total: rows.length,
+        byType: [...byType.entries()].map(([resourceType, agg]) => ({ resourceType, ...agg })),
+      };
+    },
+  );
+
+  app.post(
+    "/projects/:projectId/schedule-tasks/:taskId/resources",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { taskId } = req.params as { taskId: string };
+      const body = resourceCreateSchema.parse(req.body);
+      const { task, schedule } = await fetchTask(taskId, req.companyId!, req.projectId!);
+      const id = newId("res");
+      const budgetedCost =
+        body.budgetedCost ?? (body.unitRate != null ? body.unitRate * body.budgetedUnits : 0);
+      const actualCost =
+        body.actualCost ?? (body.unitRate != null ? body.unitRate * body.actualUnits : 0);
+      await app.db.insert(scheduleTaskResources).values({
+        id,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        scheduleId: schedule.id,
+        taskId: task.id,
+        name: body.name,
+        resourceType: body.resourceType,
+        unit: body.unit ?? null,
+        budgetedUnits: body.budgetedUnits,
+        actualUnits: body.actualUnits,
+        remainingUnits: body.remainingUnits ?? null,
+        unitRate: body.unitRate ?? null,
+        budgetedCost,
+        actualCost,
+      });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "schedule_task_resource",
+        objectId: id,
+        projectId: req.projectId!,
+        payload: { taskId, name: body.name, resourceType: body.resourceType, budgetedCost },
+      });
+      const [created] = await app.db
+        .select()
+        .from(scheduleTaskResources)
+        .where(eq(scheduleTaskResources.id, id))
+        .limit(1);
+      return reply.status(201).send(created);
+    },
+  );
+
+  app.patch(
+    "/projects/:projectId/schedule-task-resources/:resourceId",
+    { preHandler: standardGate },
+    async (req) => {
+      const { resourceId } = req.params as { resourceId: string };
+      const body = resourcePatchSchema.parse(req.body);
+      const [row] = await app.db
+        .select()
+        .from(scheduleTaskResources)
+        .where(
+          and(
+            eq(scheduleTaskResources.id, resourceId),
+            eq(scheduleTaskResources.companyId, req.companyId!),
+            eq(scheduleTaskResources.projectId, req.projectId!),
+          ),
+        )
+        .limit(1);
+      if (!row) throw notFound("Schedule resource not found");
+      await fetchSchedule(row.scheduleId, req.companyId!, req.projectId!);
+      const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
+      for (const [k, v] of Object.entries(body)) if (v !== undefined) set[k] = v;
+      await app.db.update(scheduleTaskResources).set(set).where(eq(scheduleTaskResources.id, resourceId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "schedule_task_resource",
+        objectId: resourceId,
+        projectId: req.projectId!,
+        payload: { changed: Object.keys(body) },
+      });
+      const [updated] = await app.db
+        .select()
+        .from(scheduleTaskResources)
+        .where(eq(scheduleTaskResources.id, resourceId))
+        .limit(1);
+      return updated;
+    },
+  );
+
+  app.delete(
+    "/projects/:projectId/schedule-task-resources/:resourceId",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { resourceId } = req.params as { resourceId: string };
+      const [row] = await app.db
+        .select()
+        .from(scheduleTaskResources)
+        .where(
+          and(
+            eq(scheduleTaskResources.id, resourceId),
+            eq(scheduleTaskResources.companyId, req.companyId!),
+            eq(scheduleTaskResources.projectId, req.projectId!),
+          ),
+        )
+        .limit(1);
+      if (!row) throw notFound("Schedule resource not found");
+      await app.db.delete(scheduleTaskResources).where(eq(scheduleTaskResources.id, resourceId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "delete",
+        objectType: "schedule_task_resource",
+        objectId: resourceId,
+        projectId: req.projectId!,
+        payload: { taskId: row.taskId, name: row.name },
+      });
+      return reply.status(204).send();
+    },
+  );
