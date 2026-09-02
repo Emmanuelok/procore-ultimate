@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
-import { budgetLineItems, commitmentSovLines } from "@constructos/db";
+import { budgetLineItems, commitmentChanges, commitmentSovLines } from "@constructos/db";
 import { COST_TYPES, SOV_BILLING_METHODS } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { badRequest, conflict, notFound } from "../../lib/errors.js";
@@ -370,18 +370,23 @@ export const sovRoutes: FastifyPluginAsync = async (app) => {
       );
     }
 
+    /*
+     * Replacing a schedule is a delete-then-insert of every line; a bad line
+     * halfway through must leave the OLD schedule in place, not half of the
+     * new one. One transaction, or nothing.
+     */
     const previousBudgetLines = await budgetLineIdsFor(app.db, commitmentId);
-    await app.db
-      .delete(commitmentSovLines)
-      .where(eq(commitmentSovLines.commitmentId, commitmentId));
-    const ctx = await sovContext(app.db, req.companyId!, commitment.projectId, commitment);
-    for (const line of body.lines) await insertSovLine(ctx, line);
-    await recomputeCommitmentTotals(app.db, commitmentId);
-    const nowBudgetLines = await budgetLineIdsFor(app.db, commitmentId);
-    const touched = [...new Set([...previousBudgetLines, ...nowBudgetLines])];
-    if (touched.length > 0) {
-      await syncBudgetCommitted(app.db, req.companyId!, commitment.projectId, touched);
-    }
+    await app.db.transaction(async (tx) => {
+      await tx.delete(commitmentSovLines).where(eq(commitmentSovLines.commitmentId, commitmentId));
+      const ctx = await sovContext(tx, req.companyId!, commitment.projectId, commitment);
+      for (const line of body.lines) await insertSovLine(ctx, line);
+      await recomputeCommitmentTotals(tx, commitmentId);
+      const nowBudgetLines = await budgetLineIdsFor(tx, commitmentId);
+      const touched = [...new Set([...previousBudgetLines, ...nowBudgetLines])];
+      if (touched.length > 0) {
+        await syncBudgetCommitted(tx, req.companyId!, commitment.projectId, touched);
+      }
+    });
     await ledger(app.db, req, "update", "commitment", commitmentId, {
       sovReplaced: true,
       lineCount: body.lines.length,
@@ -541,13 +546,45 @@ export const sovRoutes: FastifyPluginAsync = async (app) => {
     if (line.totalCompletedAndStored !== 0) {
       throw conflict("This line has been billed against and cannot be deleted");
     }
-    await app.db.delete(commitmentSovLines).where(eq(commitmentSovLines.id, lineId));
-    await recomputeCommitmentTotals(app.db, commitment.id);
-    if (line.budgetLineItemId) {
-      await syncBudgetCommitted(app.db, req.companyId!, commitment.projectId, [
-        line.budgetLineItemId,
-      ]);
+    /*
+     * A live change order allocated to this line would lose its share at
+     * approval if the line vanished underneath it. Refuse, naming the change
+     * orders, rather than letting the register and the schedule drift apart.
+     */
+    const referencing = (
+      await app.db
+        .select({ reference: commitmentChanges.reference, lines: commitmentChanges.lines, status: commitmentChanges.status })
+        .from(commitmentChanges)
+        .where(
+          and(
+            eq(commitmentChanges.commitmentId, commitment.id),
+            inArray(commitmentChanges.status, [
+              "draft",
+              "pending_pricing",
+              "pending_in_house_review",
+              "pending_owner_approval",
+              "revise_and_resubmit",
+            ]),
+          ),
+        )
+    ).filter((c) =>
+      (c.lines as Array<Record<string, unknown>>).some((l) => l["sovLineId"] === lineId),
+    );
+    if (referencing.length > 0) {
+      throw conflict(
+        `Change order(s) ${referencing.map((c) => c.reference).join(", ")} allocate value to this ` +
+          "line. Re-allocate or void them before deleting the line, or their share would never " +
+          "reach the schedule of values.",
+        { changeOrders: referencing.map((c) => c.reference) },
+      );
     }
+    await app.db.transaction(async (tx) => {
+      await tx.delete(commitmentSovLines).where(eq(commitmentSovLines.id, lineId));
+      await recomputeCommitmentTotals(tx, commitment.id);
+      if (line.budgetLineItemId) {
+        await syncBudgetCommitted(tx, req.companyId!, commitment.projectId, [line.budgetLineItemId]);
+      }
+    });
     await ledger(app.db, req, "delete", "commitment_sov_line", lineId, {
       commitmentId: commitment.id,
       lineNumber: line.lineNumber,

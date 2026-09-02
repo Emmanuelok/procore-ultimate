@@ -1,20 +1,22 @@
 import type { FastifyPluginAsync } from "fastify";
-import { and, count, desc, eq, inArray } from "drizzle-orm";
+import { and, count, desc, eq } from "drizzle-orm";
 import { z } from "zod";
-import { commitmentChanges, commitmentSovLines } from "@constructos/db";
+import {
+  backcharges,
+  changeOrderPackages,
+  commitmentChanges,
+  potentialChangeOrders,
+} from "@constructos/db";
 import { CHANGE_ORDER_STATUSES, CHANGE_REASONS, COST_TYPES } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
 import { badRequest, conflict, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
-import { assertAllocationSums, deriveSovLine, type ChangeLineAllocation } from "./arithmetic.js";
+import { applyChangeAllocation, missingSovLineIds } from "./allocation.js";
+import { assertAllocationSums, type ChangeLineAllocation } from "./arithmetic.js";
 import { commitmentDetail } from "./commitments.js";
-import {
-  budgetLineIdsFor,
-  recomputeCommitmentTotals,
-  syncBudgetCommitted,
-} from "./rollups.js";
-import { insertSovLine, sovContext } from "./sov.js";
+import { withIdempotency } from "./idempotency.js";
+import { budgetLineIdsFor, recomputeCommitmentTotals, syncBudgetCommitted } from "./rollups.js";
 import {
   assertSegregation,
   changeReference,
@@ -84,7 +86,16 @@ const rejectSchema = z.object({
   reason: z.string().min(1).max(4000),
 });
 
-const executeChangeSchema = z.object({
+/**
+ * Optimistic concurrency on the transitions that move money: the client sends
+ * back the `updatedAt` it read, and a change order that moved since is refused
+ * rather than approved on stale figures.
+ */
+const concurrencySchema = z.object({
+  expectedUpdatedAt: z.string().min(4).optional(),
+});
+
+const executeChangeSchema = concurrencySchema.extend({
   executedDate: isoDateSchema.optional(),
   signedChangeOrderReceivedDate: isoDateSchema.nullable().optional(),
 });
@@ -103,6 +114,11 @@ const executeChangeSchema = z.object({
  * does. Executing it afterwards records the signed paperwork; it does not
  * move a number a second time, because a change order counted twice is the
  * classic way a commitment sum and a schedule of values stop agreeing.
+ *
+ * Every write that touches more than one row runs inside ONE transaction
+ * (plan §6.2): the allocation, the status flip and the budget sync land
+ * together or not at all, and a retry cannot re-apply an allocation that
+ * already landed because the status check inside the transaction refuses it.
  *
  * Draft change orders sit in `draftChangeSum` and pending ones in
  * `pendingChangeSum` — both outside the commitment sum, both visible, because
@@ -125,6 +141,61 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
     return row;
   }
 
+  function assertFresh(change: { updatedAt: string }, expected: string | undefined): void {
+    if (expected !== undefined && expected !== change.updatedAt) {
+      throw conflict(
+        "This change order has changed since you read it. Reload it and look at the current " +
+          "figures before approving — an approval on stale numbers is not an approval.",
+      );
+    }
+  }
+
+  /**
+   * The chain ids a CCO may carry must belong to THIS project (and tenant).
+   * They were stored unvalidated before, and the change log joins on them —
+   * a cross-tenant package id created a dangling reference in reconciliation.
+   */
+  async function assertChainLinks(
+    commitment: CommitmentRow,
+    body: { potentialChangeOrderId?: string | null; changeOrderPackageId?: string | null },
+  ): Promise<void> {
+    if (body.potentialChangeOrderId) {
+      const rows = await app.db
+        .select({ id: potentialChangeOrders.id })
+        .from(potentialChangeOrders)
+        .where(
+          and(
+            eq(potentialChangeOrders.id, body.potentialChangeOrderId),
+            eq(potentialChangeOrders.companyId, commitment.companyId),
+            eq(potentialChangeOrders.projectId, commitment.projectId),
+          ),
+        )
+        .limit(1);
+      if (!rows[0]) {
+        throw badRequest("potentialChangeOrderId does not reference a PCO on this project");
+      }
+    }
+    if (body.changeOrderPackageId) {
+      const rows = await app.db
+        .select({ id: changeOrderPackages.id, commitmentId: changeOrderPackages.commitmentId })
+        .from(changeOrderPackages)
+        .where(
+          and(
+            eq(changeOrderPackages.id, body.changeOrderPackageId),
+            eq(changeOrderPackages.companyId, commitment.companyId),
+            eq(changeOrderPackages.projectId, commitment.projectId),
+          ),
+        )
+        .limit(1);
+      if (!rows[0]) {
+        throw badRequest("changeOrderPackageId does not reference a change order package on this project");
+      }
+      if (rows[0].commitmentId && rows[0].commitmentId !== commitment.id) {
+        throw badRequest("changeOrderPackageId references a package against a different commitment");
+      }
+    }
+  }
+
   /** Validate the allocation against the commitment's own schedule of values. */
   async function resolveAllocation(
     commitment: CommitmentRow,
@@ -139,26 +210,11 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
       amount: round2(l.amount),
       budgetLineItemId: l.budgetLineItemId ?? null,
     }));
-    const sovIds = allocation
-      .map((l) => l.sovLineId)
-      .filter((id): id is string => typeof id === "string");
-    if (sovIds.length > 0) {
-      const rows = await app.db
-        .select({ id: commitmentSovLines.id })
-        .from(commitmentSovLines)
-        .where(
-          and(
-            eq(commitmentSovLines.commitmentId, commitment.id),
-            inArray(commitmentSovLines.id, sovIds),
-          ),
-        );
-      const found = new Set(rows.map((r) => r.id));
-      const missing = sovIds.filter((id) => !found.has(id));
-      if (missing.length > 0) {
-        throw badRequest(
-          `sovLineId ${missing.join(", ")} does not belong to this commitment's schedule of values`,
-        );
-      }
+    const missing = await missingSovLineIds(app.db, commitment.id, allocation);
+    if (missing.length > 0) {
+      throw badRequest(
+        `sovLineId ${missing.join(", ")} does not belong to this commitment's schedule of values`,
+      );
     }
     /* amount omitted means "the allocation is the amount" */
     const resolvedAmount =
@@ -187,6 +243,7 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
     if (body.amount === undefined && (!body.lines || body.lines.length === 0)) {
       throw badRequest("A change order needs either an amount or a line allocation");
     }
+    await assertChainLinks(commitment, body);
     const { amount, allocation } = await resolveAllocation(commitment, body.amount, body.lines);
 
     const number = await nextRecordNumber(
@@ -291,6 +348,7 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
       );
     }
     const commitment = await fetchCommitment(app.db, change.commitmentId, req.companyId!);
+    await assertChainLinks(commitment, body);
     const wantsAllocation = body.lines !== undefined || body.amount !== undefined;
     let amount = change.amount;
     let allocation = (change.lines ?? []) as ChangeLineAllocation[];
@@ -381,75 +439,130 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
    * APPROVAL — the transition that moves money.
    *
    * The approver may be neither the author nor the submitter (ADR 0004). The
-   * allocation is then written onto the schedule of values, which is what
-   * makes the new commitment sum derivable rather than asserted, and the
-   * budget lines the schedule points at are re-synced so committed cost on
-   * the budget follows the same second.
+   * allocation is re-resolved against the schedule of values AS IT IS NOW —
+   * a line deleted since the change order was drafted is a refusal, not a
+   * silently dropped share — and then written onto the schedule, which is
+   * what makes the new commitment sum derivable rather than asserted. The
+   * budget lines the schedule points at are re-synced in the same
+   * transaction, so committed cost on the budget moves the same instant.
    */
   app.post(
     "/commitment-changes/:changeId/approve",
     { preHandler: companyGate },
     async (req, reply) => {
       const { changeId } = req.params as { changeId: string };
+      const body = concurrencySchema.parse(req.body ?? {});
       const change = await fetchChange(changeId, req.companyId!);
       await requireCommitmentsLevel(app, req, reply, change.projectId, "standard");
-      if (change.status !== "pending_in_house_review" && change.status !== "pending_owner_approval") {
-        throw conflict(
-          `A change order in status "${change.status}" cannot be approved. Submit it for ` +
-            "review first — approval without review is not an approval.",
+      return withIdempotency(app.db, req, reply, "commitment-change.approve", async () => {
+        if (change.status !== "pending_in_house_review" && change.status !== "pending_owner_approval") {
+          throw conflict(
+            `A change order in status "${change.status}" cannot be approved. Submit it for ` +
+              "review first — approval without review is not an approval.",
+          );
+        }
+        assertFresh(change, body.expectedUpdatedAt);
+        assertSegregation(
+          req.user!.id,
+          { createdBy: change.createdBy, submittedBy: change.submittedBy },
+          "change order",
         );
-      }
-      assertSegregation(
-        req.user!.id,
-        { createdBy: change.createdBy, submittedBy: change.submittedBy },
-        "change order",
-      );
-      const commitment = await fetchCommitment(app.db, change.commitmentId, req.companyId!);
-      if (commitment.status === "void" || commitment.status === "terminated") {
-        throw conflict(
-          `This commitment is ${commitment.status}; its change orders can no longer be approved`,
-        );
-      }
-      const allocation = (change.lines ?? []) as ChangeLineAllocation[];
-      if (allocation.length === 0) {
-        throw badRequest(
-          "This change order has no line allocation, so approving it could not post the value " +
-            "to a cost code or to the schedule of values. Allocate it before approving it.",
-        );
-      }
-      const sums = assertAllocationSums(change.amount, allocation);
-      if (!sums.ok) throw badRequest(sums.message);
+        const commitment = await fetchCommitment(app.db, change.commitmentId, req.companyId!);
+        if (commitment.status === "void" || commitment.status === "terminated") {
+          throw conflict(
+            `This commitment is ${commitment.status}; its change orders can no longer be approved`,
+          );
+        }
+        const allocation = (change.lines ?? []) as ChangeLineAllocation[];
+        if (allocation.length === 0) {
+          throw badRequest(
+            "This change order has no line allocation, so approving it could not post the value " +
+              "to a cost code or to the schedule of values. Allocate it before approving it.",
+          );
+        }
+        const sums = assertAllocationSums(change.amount, allocation);
+        if (!sums.ok) throw badRequest(sums.message);
+        const missing = await missingSovLineIds(app.db, commitment.id, allocation);
+        if (missing.length > 0) {
+          throw badRequest(
+            `This change order allocates value to schedule line(s) ${missing.join(", ")} that no ` +
+              "longer exist. Re-allocate it before approving — otherwise that share of the " +
+              "amount would never reach the schedule of values and the register would disagree " +
+              "with the sum.",
+            { missingSovLineIds: missing },
+          );
+        }
 
-      const budgetLinesBefore = await budgetLineIdsFor(app.db, commitment.id);
-      await applyAllocation(commitment, change.number, allocation, change.changeOrderPackageId);
-      const totals = await recomputeCommitmentTotals(app.db, commitment.id);
+        const backchargeId =
+          typeof (change.detail as Record<string, unknown>)["backchargeId"] === "string"
+            ? ((change.detail as Record<string, unknown>)["backchargeId"] as string)
+            : null;
+        const now = new Date().toISOString();
+        const outcome = await app.db.transaction(async (tx) => {
+          /*
+           * The status is re-checked INSIDE the transaction with the row locked:
+           * two approvers clicking at once must not both apply the allocation.
+           */
+          const locked = await tx
+            .select({ status: commitmentChanges.status })
+            .from(commitmentChanges)
+            .where(eq(commitmentChanges.id, changeId))
+            .for("update");
+          const current = locked[0]?.status;
+          if (current !== "pending_in_house_review" && current !== "pending_owner_approval") {
+            throw conflict(
+              `This change order is now "${current}" — somebody else moved it first. Nothing ` +
+                "was applied twice.",
+            );
+          }
+          const budgetLinesBefore = await budgetLineIdsFor(tx, commitment.id);
+          const applied = await applyChangeAllocation(
+            tx,
+            commitment,
+            change.number,
+            allocation,
+            { changeOrderPackageId: change.changeOrderPackageId },
+          );
+          await tx
+            .update(commitmentChanges)
+            .set({
+              status: "approved",
+              approvedBy: req.user!.id,
+              approvedAt: now,
+              updatedAt: now,
+            })
+            .where(eq(commitmentChanges.id, changeId));
+          const totals = await recomputeCommitmentTotals(tx, commitment.id);
+          await tx
+            .update(commitmentChanges)
+            .set({ revisedCommitmentSum: totals.revisedCommitmentSum })
+            .where(eq(commitmentChanges.id, changeId));
+          const budgetLinesAfter = await budgetLineIdsFor(tx, commitment.id);
+          const touched = [...new Set([...budgetLinesBefore, ...budgetLinesAfter])];
+          if (touched.length > 0) {
+            await syncBudgetCommitted(tx, req.companyId!, commitment.projectId, touched);
+          }
+          if (backchargeId) {
+            /* the recovery is now inside the commitment sum — the backcharge is settled */
+            await tx
+              .update(backcharges)
+              .set({ status: "settled", settledAt: now, settledBy: req.user!.id, updatedAt: now })
+              .where(and(eq(backcharges.id, backchargeId), eq(backcharges.status, "issued")));
+          }
+          return { totals, applied };
+        });
 
-      const now = new Date().toISOString();
-      await app.db
-        .update(commitmentChanges)
-        .set({
+        await ledger(app.db, req, "state_change", "commitment_change", changeId, {
           status: "approved",
           approvedBy: req.user!.id,
-          approvedAt: now,
-          revisedCommitmentSum: totals.revisedCommitmentSum,
-          updatedAt: now,
-        })
-        .where(eq(commitmentChanges.id, changeId));
-      /* recompute again: the change has moved from pending into approved */
-      await recomputeCommitmentTotals(app.db, commitment.id);
-
-      const budgetLinesAfter = await budgetLineIdsFor(app.db, commitment.id);
-      const touched = [...new Set([...budgetLinesBefore, ...budgetLinesAfter])];
-      if (touched.length > 0) {
-        await syncBudgetCommitted(app.db, req.companyId!, commitment.projectId, touched);
-      }
-      await ledger(app.db, req, "state_change", "commitment_change", changeId, {
-        status: "approved",
-        approvedBy: req.user!.id,
-        amount: change.amount,
-        revisedCommitmentSum: totals.revisedCommitmentSum,
-      }, change.projectId);
-      return fetchChange(changeId, req.companyId!);
+          amount: change.amount,
+          revisedCommitmentSum: outcome.totals.revisedCommitmentSum,
+          appendedSovLineIds: outcome.applied.appendedSovLineIds,
+          updatedSovLineIds: outcome.applied.updatedSovLineIds,
+          backchargeId,
+        }, change.projectId);
+        return fetchChange(changeId, req.companyId!);
+      });
     },
   );
 
@@ -529,37 +642,44 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
       const body = executeChangeSchema.parse(req.body ?? {});
       const change = await fetchChange(changeId, req.companyId!);
       await requireCommitmentsLevel(app, req, reply, change.projectId, "standard");
-      if (change.status !== "approved") {
-        throw conflict(
-          `A change order in status "${change.status}" cannot be executed. Only an approved ` +
-            "change order can be executed.",
-        );
-      }
-      const now = new Date().toISOString();
-      await app.db
-        .update(commitmentChanges)
-        .set({
+      return withIdempotency(app.db, req, reply, "commitment-change.execute", async () => {
+        if (change.status !== "approved") {
+          throw conflict(
+            `A change order in status "${change.status}" cannot be executed. Only an approved ` +
+              "change order can be executed.",
+          );
+        }
+        assertFresh(change, body.expectedUpdatedAt);
+        const now = new Date().toISOString();
+        const updated = await app.db
+          .update(commitmentChanges)
+          .set({
+            status: "executed",
+            executedBy: req.user!.id,
+            executedDate: body.executedDate ?? todayIso(),
+            ...(body.signedChangeOrderReceivedDate !== undefined
+              ? { signedChangeOrderReceivedDate: body.signedChangeOrderReceivedDate }
+              : {}),
+            updatedAt: now,
+          })
+          .where(and(eq(commitmentChanges.id, changeId), eq(commitmentChanges.status, "approved")))
+          .returning({ id: commitmentChanges.id });
+        if (updated.length === 0) {
+          throw conflict("This change order was executed by somebody else a moment ago.");
+        }
+        await recomputeCommitmentTotals(app.db, change.commitmentId);
+        await ledger(app.db, req, "state_change", "commitment_change", changeId, {
           status: "executed",
           executedBy: req.user!.id,
-          executedDate: body.executedDate ?? todayIso(),
-          ...(body.signedChangeOrderReceivedDate !== undefined
-            ? { signedChangeOrderReceivedDate: body.signedChangeOrderReceivedDate }
-            : {}),
-          updatedAt: now,
-        })
-        .where(eq(commitmentChanges.id, changeId));
-      await recomputeCommitmentTotals(app.db, change.commitmentId);
-      await ledger(app.db, req, "state_change", "commitment_change", changeId, {
-        status: "executed",
-        executedBy: req.user!.id,
-      }, change.projectId);
-      return fetchChange(changeId, req.companyId!);
+        }, change.projectId);
+        return fetchChange(changeId, req.companyId!);
+      });
     },
   );
 
   app.post("/commitment-changes/:changeId/void", { preHandler: companyGate }, async (req, reply) => {
     const { changeId } = req.params as { changeId: string };
-    const body = rejectSchema.parse(req.body);
+    const body = rejectSchema.merge(concurrencySchema).parse(req.body);
     const change = await fetchChange(changeId, req.companyId!);
     await requireCommitmentsLevel(app, req, reply, change.projectId, "standard");
     if (isCommittedChange(change.status)) {
@@ -570,12 +690,26 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
       );
     }
     if (change.status === "void") throw conflict("This change order is already void");
+    assertFresh(change, body.expectedUpdatedAt);
     const now = new Date().toISOString();
-    await app.db
-      .update(commitmentChanges)
-      .set({ status: "void", rejectionReason: body.reason, updatedAt: now })
-      .where(eq(commitmentChanges.id, changeId));
-    await recomputeCommitmentTotals(app.db, change.commitmentId);
+    const backchargeId =
+      typeof (change.detail as Record<string, unknown>)["backchargeId"] === "string"
+        ? ((change.detail as Record<string, unknown>)["backchargeId"] as string)
+        : null;
+    await app.db.transaction(async (tx) => {
+      await tx
+        .update(commitmentChanges)
+        .set({ status: "void", rejectionReason: body.reason, updatedAt: now })
+        .where(eq(commitmentChanges.id, changeId));
+      await recomputeCommitmentTotals(tx, change.commitmentId);
+      if (backchargeId) {
+        /* the negative change order is gone; the backcharge goes back to draft */
+        await tx
+          .update(backcharges)
+          .set({ status: "draft", commitmentChangeId: null, updatedAt: now })
+          .where(and(eq(backcharges.id, backchargeId), eq(backcharges.status, "issued")));
+      }
+    });
     await ledger(app.db, req, "state_change", "commitment_change", changeId, {
       status: "void",
       reason: body.reason,
@@ -611,122 +745,4 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
       return commitmentDetail(app.db, change.commitmentId, req.companyId!);
     },
   );
-
-  /* ---------------------------------------------------------------- */
-  /* Allocation                                                        */
-  /* ---------------------------------------------------------------- */
-
-  /**
-   * Write an approved change order's allocation onto the schedule of values.
-   *
-   * Existing lines take the value on `changeOrderValue`, leaving
-   * `scheduledValue` — the original contract figure — untouched forever. New
-   * scope appends a line carrying `isChangeOrderLine = 1` and the package id,
-   * numbered `CO-<change number>.<n>` so the continuation sheet reads in the
-   * order the change orders landed.
-   */
-  async function applyAllocation(
-    commitment: CommitmentRow,
-    changeNumber: number,
-    allocation: readonly ChangeLineAllocation[],
-    changeOrderPackageId: string | null,
-  ): Promise<void> {
-    const byExisting = new Map<string, number>();
-    const appended: ChangeLineAllocation[] = [];
-    for (const line of allocation) {
-      if (line.sovLineId) {
-        byExisting.set(line.sovLineId, (byExisting.get(line.sovLineId) ?? 0) + line.amount);
-      } else {
-        appended.push(line);
-      }
-    }
-
-    if (byExisting.size > 0) {
-      const rows = await app.db
-        .select()
-        .from(commitmentSovLines)
-        .where(inArray(commitmentSovLines.id, [...byExisting.keys()]));
-      for (const row of rows) {
-        const delta = byExisting.get(row.id) ?? 0;
-        const changeOrderValue = round2(row.changeOrderValue + delta);
-        const derived = deriveSovLine({
-          scheduledValue: row.scheduledValue,
-          changeOrderValue,
-          previousBilled: row.previousBilled,
-          previousStoredMaterials: row.previousStoredMaterials,
-          thisPeriodWork: row.thisPeriodWork,
-          thisPeriodStoredMaterials: row.thisPeriodStoredMaterials,
-          materialsPresentlyStored: row.materialsPresentlyStored,
-          retainagePercent: row.retainagePercent,
-          retainageReleased: row.retainageReleased,
-        });
-        await app.db
-          .update(commitmentSovLines)
-          .set({
-            changeOrderValue,
-            revisedScheduledValue: derived.revisedScheduledValue,
-            totalCompletedAndStored: derived.totalCompletedAndStored,
-            percentComplete: derived.percentComplete,
-            balanceToFinish: derived.balanceToFinish,
-            retainageHeld: derived.retainageHeld,
-            updatedAt: new Date().toISOString(),
-          })
-          .where(eq(commitmentSovLines.id, row.id));
-      }
-    }
-
-    if (appended.length > 0) {
-      const ctx = await sovContext(
-        app.db,
-        commitment.companyId,
-        commitment.projectId,
-        commitment,
-      );
-      let n = 0;
-      for (const line of appended) {
-        n += 1;
-        const id = await insertSovLine(
-          ctx,
-          {
-            lineNumber: `CO-${String(changeNumber).padStart(3, "0")}.${n}`,
-            description: line.description,
-            costCode: line.costCode,
-            ...(line.costType
-              ? { costType: line.costType as (typeof COST_TYPES)[number] }
-              : {}),
-            budgetLineItemId: line.budgetLineItemId,
-            scheduledValue: 0,
-            retainagePercent: commitment.defaultRetainagePercent,
-          },
-          { isChangeOrderLine: true, changeOrderPackageId },
-        );
-        /*
-         * A change-order line's whole value is change-order value; its
-         * scheduled value stays 0, which is what keeps originalCommitmentSum
-         * equal to the original subcontract however many changes land.
-         */
-        const derived = deriveSovLine({
-          scheduledValue: 0,
-          changeOrderValue: line.amount,
-          previousBilled: 0,
-          previousStoredMaterials: 0,
-          thisPeriodWork: 0,
-          thisPeriodStoredMaterials: 0,
-          materialsPresentlyStored: 0,
-          retainagePercent: commitment.defaultRetainagePercent,
-          retainageReleased: 0,
-        });
-        await app.db
-          .update(commitmentSovLines)
-          .set({
-            changeOrderValue: line.amount,
-            revisedScheduledValue: derived.revisedScheduledValue,
-            balanceToFinish: derived.balanceToFinish,
-            percentComplete: derived.percentComplete,
-            retainageHeld: derived.retainageHeld,
-          })
-          .where(eq(commitmentSovLines.id, id));
-      }
-    }
-  }
 };

@@ -46,6 +46,35 @@ import {
  * committed total negated — it is unknown, and it says so.
  */
 
+/**
+ * Purchase-order tax, line by line. A PO's SOV lines carry their own
+ * `taxable` flag and `taxPercent`; tax is Σ over TAXABLE lines of
+ * revisedScheduledValue × (line rate, else the header rate). A PO with one
+ * taxable and three non-taxable lines is taxed on one line, not four. Where no
+ * line carries a flag at all the header decides, as it did before.
+ */
+export function purchaseOrderTax(
+  commitment: { kind: string; taxable: number; taxPercent: number | null; taxAmount: number | null },
+  lines: ReadonlyArray<{ taxable: number; taxPercent: number | null; revisedScheduledValue: number }>,
+): number | null {
+  if (commitment.kind !== "purchase_order") return null;
+  const flagged = lines.filter((l) => l.taxable === 1);
+  if (flagged.length > 0) {
+    return round2(
+      flagged.reduce(
+        (s, l) => s + ((l.taxPercent ?? commitment.taxPercent ?? 0) / 100) * l.revisedScheduledValue,
+        0,
+      ),
+    );
+  }
+  if (commitment.taxable === 1 && commitment.taxPercent !== null) {
+    return round2(
+      (commitment.taxPercent / 100) * lines.reduce((s, l) => s + l.revisedScheduledValue, 0),
+    );
+  }
+  return commitment.taxAmount;
+}
+
 /* ------------------------------------------------------------------ */
 /* Recompute — the write path for a commitment's materialized totals   */
 /* ------------------------------------------------------------------ */
@@ -111,14 +140,7 @@ export async function recomputeCommitmentTotals(
    * with everything else rather than typed on a form and left behind when a
    * change order moves the sum. Subcontracts carry no tax column value at all.
    */
-  const taxAmount =
-    commitment.kind === "purchase_order" &&
-    commitment.taxable === 1 &&
-    commitment.taxPercent !== null
-      ? round2((commitment.taxPercent / 100) * totals.revisedCommitmentSum)
-      : commitment.kind === "purchase_order"
-        ? commitment.taxAmount
-        : null;
+  const taxAmount = purchaseOrderTax(commitment, lines);
   await db
     .update(commitments)
     .set({
@@ -166,6 +188,65 @@ export async function reconcile(
     totalInvoiced: c.totalInvoiced,
     totalPaid: c.totalPaid,
     balanceToFinish: c.balanceToFinish,
+  });
+}
+
+/**
+ * Every identity on every commitment of a project, in three queries rather
+ * than three per commitment. The reconcile report loads this on every open.
+ */
+export async function reconcileProject(
+  db: Db,
+  companyId: string,
+  projectId: string,
+): Promise<
+  Array<{
+    commitment: typeof commitments.$inferSelect;
+    checks: ReconciliationCheck[];
+    reconciles: boolean;
+  }>
+> {
+  const [rows, lines, changes] = await Promise.all([
+    db
+      .select()
+      .from(commitments)
+      .where(and(eq(commitments.companyId, companyId), eq(commitments.projectId, projectId))),
+    db
+      .select()
+      .from(commitmentSovLines)
+      .where(and(eq(commitmentSovLines.companyId, companyId), eq(commitmentSovLines.projectId, projectId))),
+    db
+      .select({
+        commitmentId: commitmentChanges.commitmentId,
+        status: commitmentChanges.status,
+        amount: commitmentChanges.amount,
+      })
+      .from(commitmentChanges)
+      .where(and(eq(commitmentChanges.companyId, companyId), eq(commitmentChanges.projectId, projectId))),
+  ]);
+  const linesBy = new Map<string, typeof lines>();
+  for (const l of lines) {
+    const list = linesBy.get(l.commitmentId) ?? [];
+    list.push(l);
+    linesBy.set(l.commitmentId, list);
+  }
+  const committedBy = new Map<string, number>();
+  for (const ch of changes) {
+    if (!isCommittedChange(ch.status)) continue;
+    committedBy.set(ch.commitmentId, round2((committedBy.get(ch.commitmentId) ?? 0) + ch.amount));
+  }
+  return rows.map((c) => {
+    const r = reconcileCommitment({
+      originalCommitmentSum: c.originalCommitmentSum,
+      approvedChangeSum: c.approvedChangeSum,
+      revisedCommitmentSum: c.revisedCommitmentSum,
+      lines: linesBy.get(c.id) ?? [],
+      committedChangeAmount: committedBy.get(c.id) ?? 0,
+      totalInvoiced: c.totalInvoiced,
+      totalPaid: c.totalPaid,
+      balanceToFinish: c.balanceToFinish,
+    });
+    return { commitment: c, checks: r.checks, reconciles: r.reconciles };
   });
 }
 
@@ -232,8 +313,17 @@ export async function syncBudgetCommitted(
     .where(inArray(budgets.id, budgetIds));
   const budgetCurrency = new Map(budgetRows.map((b) => [b.id, b.currency.toUpperCase()]));
 
+  const scopeIds = scope.map((l) => l.id);
+  /*
+   * Read only the SOV lines that point at the budget lines in scope. Before
+   * this filter every write re-read the whole project's schedule; on a project
+   * with two hundred subcontracts that was the slowest statement on the buy
+   * side and it ran on every SOV keystroke.
+   */
   const rows = await db
     .select({
+      sovLineId: commitmentSovLines.id,
+      commitmentId: commitmentSovLines.commitmentId,
       budgetLineItemId: commitmentSovLines.budgetLineItemId,
       revisedScheduledValue: commitmentSovLines.revisedScheduledValue,
       status: commitments.status,
@@ -245,8 +335,40 @@ export async function syncBudgetCommitted(
       and(
         eq(commitmentSovLines.companyId, companyId),
         eq(commitmentSovLines.projectId, projectId),
+        inArray(commitmentSovLines.budgetLineItemId, scopeIds),
       ),
     );
+  /*
+   * Priced-but-unapproved change orders are exposure too (#526): a pending or
+   * draft CCO allocated to a budget line lands in `pendingCommitments`, which
+   * is what the schema promises that column holds. Allocation lines name a
+   * budget line directly, or an existing SOV line whose budget line is known.
+   */
+  const commitmentIds = [...new Set(rows.map((r) => r.commitmentId))];
+  const sovBudget = new Map(rows.map((r) => [r.sovLineId, r.budgetLineItemId]));
+  const pendingChangeRows =
+    commitmentIds.length > 0
+      ? await db
+          .select({
+            commitmentId: commitmentChanges.commitmentId,
+            status: commitmentChanges.status,
+            lines: commitmentChanges.lines,
+          })
+          .from(commitmentChanges)
+          .where(
+            and(
+              inArray(commitmentChanges.commitmentId, commitmentIds),
+              inArray(commitmentChanges.status, [
+                "draft",
+                "pending_pricing",
+                "pending_in_house_review",
+                "pending_owner_approval",
+                "revise_and_resubmit",
+              ]),
+            ),
+          )
+      : [];
+  const commitmentMeta = new Map(rows.map((r) => [r.commitmentId, { status: r.status, currency: r.currency }]));
 
   const committed = new Map<string, Map<string, number>>();
   const pending = new Map<string, Map<string, number>>();
@@ -269,6 +391,19 @@ export async function syncBudgetCommitted(
       bump(committed, r.budgetLineItemId, currency, r.revisedScheduledValue);
     } else if (isPendingCommitment(r.status)) {
       bump(pending, r.budgetLineItemId, currency, r.revisedScheduledValue);
+    }
+  }
+  for (const change of pendingChangeRows) {
+    const meta = commitmentMeta.get(change.commitmentId);
+    if (!meta || (DEAD_COMMITMENT_STATUSES as readonly string[]).includes(meta.status)) continue;
+    const currency = meta.currency.toUpperCase();
+    for (const raw of change.lines as Array<Record<string, unknown>>) {
+      const amount = typeof raw["amount"] === "number" ? raw["amount"] : 0;
+      const direct = typeof raw["budgetLineItemId"] === "string" ? raw["budgetLineItemId"] : null;
+      const viaSov = typeof raw["sovLineId"] === "string" ? sovBudget.get(raw["sovLineId"]) ?? null : null;
+      const target = direct ?? viaSov;
+      if (!target || !scopeIds.includes(target)) continue;
+      bump(pending, target, currency, amount);
     }
   }
 
