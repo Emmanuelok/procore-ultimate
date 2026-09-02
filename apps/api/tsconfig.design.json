@@ -1,0 +1,22 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "src",
+    "types": [
+      "node"
+    ],
+    "declaration": false,
+    "declarationMap": false
+  },
+  "include": [
+    "src/modules/design/**/*.ts",
+    "src/types.ts",
+    "src/modules/account/sessions.ts",
+    "src/modules/mfa/step-up.ts",
+    "src/modules/integrations/machine-auth.ts"
+  ],
+  "exclude": [
+    "src/modules/design/**/*.test.ts"
+  ]
+}

@@ -260,8 +260,19 @@ export const rfiRoutes: FastifyPluginAsync = async (app) => {
   /* Analytics — #321 ball in court, #322 ageing & cycle time          */
   /* ---------------------------------------------------------------- */
 
+  /**
+   * Analytics and ageing are register-wide reads, so they honour the same
+   * private-draft visibility as the list: a subcontractor drafting privately
+   * must not have the subject line surfaced in someone else's backlog report.
+   */
+  async function analyticsScope(req: FastifyRequest): Promise<SQL> {
+    const clauses: SQL[] = [eq(rfis.companyId, req.companyId!), eq(rfis.projectId, req.projectId!)];
+    if (!(await isRfiAdmin(req))) clauses.push(visibilityClause(req.user!.id));
+    return and(...clauses)!;
+  }
+
   app.get("/projects/:projectId/rfis/analytics", { preHandler: readGate }, async (req) => {
-    const scope = and(eq(rfis.companyId, req.companyId!), eq(rfis.projectId, req.projectId!));
+    const scope = await analyticsScope(req);
     const byStatusRows = await app.db
       .select({ status: rfis.status, n: count() })
       .from(rfis)
@@ -327,7 +338,7 @@ export const rfiRoutes: FastifyPluginAsync = async (app) => {
         ballInCourtId: rfis.ballInCourtId,
       })
       .from(rfis)
-      .where(and(eq(rfis.companyId, req.companyId!), eq(rfis.projectId, req.projectId!), eq(rfis.status, "open")))
+      .where(and(await analyticsScope(req), eq(rfis.status, "open")))
       .orderBy(asc(rfis.number))
       .limit(5000);
     const ageOf = (r: (typeof rows)[number]) => ageInDays(r.issuedAt ?? r.createdAt, today);

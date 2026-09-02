@@ -9,7 +9,7 @@
  * The header carries the compliance state because that is the fact most likely
  * to stop somebody's day, and it carries it with the finding's own words.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "../../lib/api";
 import {
   Alert,
@@ -18,12 +18,19 @@ import {
   Card,
   CardBody,
   Drawer,
+  Field,
+  Input,
+  Modal,
   Spinner,
   Tabs,
+  Textarea,
   useConfirm,
 } from "../../ui";
 import { DescriptionList, type DescriptionItem } from "../../ui/data";
+import BackchargesPanel from "./BackchargesPanel";
 import ChangesPanel from "./ChangesPanel";
+import CloseoutPanel from "./CloseoutPanel";
+import DocumentsPanel from "./DocumentsPanel";
 import PaymentsPanel from "./PaymentsPanel";
 import SovPanel from "./SovPanel";
 import {
@@ -48,7 +55,15 @@ import {
 } from "./shared";
 import type { BuyoutRow } from "./types";
 
-type Panel = "overview" | "sov" | "changes" | "payments" | "compliance";
+type Panel =
+  | "overview"
+  | "sov"
+  | "changes"
+  | "payments"
+  | "compliance"
+  | "backcharges"
+  | "closeout"
+  | "documents";
 
 export default function CommitmentDrawer({
   commitmentId,
@@ -62,6 +77,7 @@ export default function CommitmentDrawer({
   onMutated: () => void;
 }) {
   const [panel, setPanel] = useState<Panel>("overview");
+  const [editingHeader, setEditingHeader] = useState(false);
   const detail = useCommitmentDetail(commitmentId);
   const sov = useSov(commitmentId);
   const changes = useChanges(commitmentId);
@@ -101,6 +117,9 @@ export default function CommitmentDrawer({
         count: data ? data.compliance.blocking.length + data.compliance.warnings.length : undefined,
         tone: data ? complianceTone(data.compliance.status) : undefined,
       },
+      { value: "backcharges" as const, label: "Backcharges" },
+      { value: "closeout" as const, label: "Closeout" },
+      { value: "documents" as const, label: "Contract documents" },
     ],
     [data],
   );
@@ -212,6 +231,25 @@ export default function CommitmentDrawer({
             executed={commitment.executed === 1}
             paymentHold={commitment.paymentHold === 1}
             busy={busy}
+            onEdit={() => setEditingHeader(true)}
+            onOutForBid={() => lifecycle("out-for-bid", "out-for-bid")}
+            onDelete={async () => {
+              const ok = await confirm({
+                title: `Delete ${commitment.reference}?`,
+                description:
+                  "A draft commitment with nothing against it can be deleted outright. Anything further along is voided or terminated instead, so the record survives.",
+                destructive: true,
+                confirmLabel: "Delete the draft",
+              });
+              if (!ok) return;
+              const done = await run("delete", () =>
+                api.del(`/api/v1/commitments/${commitment.id}`),
+              );
+              if (done !== null) {
+                onMutated();
+                onClose();
+              }
+            }}
             onSubmit={() => lifecycle("submit", "submit")}
             onApprove={() => lifecycle("approve", "approve")}
             onExecute={() => lifecycle("execute", "execute")}
@@ -279,6 +317,16 @@ export default function CommitmentDrawer({
             }}
           />
 
+          <EditHeader
+            open={editingHeader}
+            commitment={commitment}
+            onClose={() => setEditingHeader(false)}
+            onSaved={() => {
+              setEditingHeader(false);
+              reloadAll();
+            }}
+          />
+
           <Tabs items={tabs} value={panel} onChange={setPanel} size="sm" />
 
           {panel === "overview" ? (
@@ -305,8 +353,14 @@ export default function CommitmentDrawer({
               payments={payments}
               onChanged={reloadAll}
             />
-          ) : (
+          ) : panel === "compliance" ? (
             <CompliancePosition result={data.compliance} />
+          ) : panel === "backcharges" ? (
+            <BackchargesPanel commitment={commitment} onChanged={reloadAll} />
+          ) : panel === "closeout" ? (
+            <CloseoutPanel commitment={commitment} onChanged={reloadAll} />
+          ) : (
+            <DocumentsPanel commitment={commitment} onChanged={reloadAll} />
           )}
         </div>
       ) : null}
@@ -319,6 +373,9 @@ function LifecycleBar({
   executed,
   paymentHold,
   busy,
+  onEdit,
+  onOutForBid,
+  onDelete,
   onSubmit,
   onApprove,
   onExecute,
@@ -332,6 +389,9 @@ function LifecycleBar({
   executed: boolean;
   paymentHold: boolean;
   busy: string | null;
+  onEdit: () => void;
+  onOutForBid: () => void;
+  onDelete: () => void;
   onSubmit: () => void;
   onApprove: () => void;
   onExecute: () => void;
@@ -345,6 +405,16 @@ function LifecycleBar({
   const dead = status === "void" || status === "terminated";
   return (
     <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-surface-raised/50 px-3 py-2">
+      {!dead ? (
+        <Button size="xs" variant="secondary" onClick={onEdit} disabled={working}>
+          Edit header
+        </Button>
+      ) : null}
+      {status === "draft" ? (
+        <Button size="xs" variant="secondary" onClick={onOutForBid} disabled={working}>
+          Send out for bid
+        </Button>
+      ) : null}
       {status === "draft" || status === "out_for_bid" ? (
         <Button size="xs" variant="secondary" onClick={onSubmit} disabled={working}>
           Send out for signature
@@ -382,6 +452,11 @@ function LifecycleBar({
           Void
         </Button>
       ) : null}
+      {status === "draft" ? (
+        <Button size="xs" variant="danger" onClick={onDelete} disabled={working}>
+          Delete draft
+        </Button>
+      ) : null}
       {!dead ? (
         <Button size="xs" variant="danger" onClick={onTerminate} disabled={working}>
           Terminate
@@ -393,6 +468,104 @@ function LifecycleBar({
         </span>
       ) : null}
     </div>
+  );
+}
+
+/**
+ * The header a subcontract carries beside its money: title, scope, terms,
+ * dates and retainage. The API refuses currency and vendor changes once the
+ * commitment carries value, and refuses everything once it is void or
+ * terminated — the refusal is shown verbatim rather than pre-empted here.
+ */
+function EditHeader({
+  open,
+  commitment,
+  onClose,
+  onSaved,
+}: {
+  open: boolean;
+  commitment: NonNullable<ReturnType<typeof useCommitmentDetail>["data"]>["commitment"];
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [title, setTitle] = useState(commitment.title);
+  const [scope, setScope] = useState(commitment.scopeOfWork ?? "");
+  const [terms, setTerms] = useState(
+    commitment.paymentTermsDays === null ? "" : String(commitment.paymentTermsDays),
+  );
+  const [retainage, setRetainage] = useState(String(commitment.defaultRetainagePercent));
+  const [start, setStart] = useState(commitment.startDate ?? "");
+  const [end, setEnd] = useState(commitment.estimatedCompletionDate ?? "");
+
+  useEffect(() => {
+    if (!open) return;
+    setTitle(commitment.title);
+    setScope(commitment.scopeOfWork ?? "");
+    setTerms(commitment.paymentTermsDays === null ? "" : String(commitment.paymentTermsDays));
+    setRetainage(String(commitment.defaultRetainagePercent));
+    setStart(commitment.startDate ?? "");
+    setEnd(commitment.estimatedCompletionDate ?? "");
+  }, [open, commitment]);
+
+  async function save() {
+    const body: Record<string, unknown> = {
+      title: title.trim(),
+      scopeOfWork: scope.trim() || null,
+      paymentTermsDays: terms.trim() === "" ? null : Number(terms),
+      defaultRetainagePercent: Number(retainage) || 0,
+      startDate: start.trim() || null,
+      estimatedCompletionDate: end.trim() || null,
+    };
+    const ok = await run("patch", () => api.patch(`/api/v1/commitments/${commitment.id}`, body));
+    if (ok !== null) onSaved();
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={`Edit ${commitment.reference}`}
+      size="lg"
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button disabled={!title.trim() || busy !== null} onClick={() => void save()}>
+            Save the header
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        <RefusalPanel refusal={refusal} onDismiss={clear} title="This edit was refused" />
+        <Field label="Title" required>
+          <Input value={title} onChange={(e) => setTitle(e.target.value)} />
+        </Field>
+        <Field label="Scope of work">
+          <Textarea rows={4} value={scope} onChange={(e) => setScope(e.target.value)} />
+        </Field>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Payment terms (days)">
+            <Input value={terms} inputMode="numeric" onChange={(e) => setTerms(e.target.value)} />
+          </Field>
+          <Field label="Default retainage %">
+            <Input
+              value={retainage}
+              inputMode="decimal"
+              onChange={(e) => setRetainage(e.target.value)}
+            />
+          </Field>
+          <Field label="Start date">
+            <Input type="date" value={start} onChange={(e) => setStart(e.target.value)} />
+          </Field>
+          <Field label="Estimated completion">
+            <Input type="date" value={end} onChange={(e) => setEnd(e.target.value)} />
+          </Field>
+        </div>
+      </div>
+    </Modal>
   );
 }
 

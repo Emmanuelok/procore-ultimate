@@ -308,6 +308,40 @@ describe("files: multi-upload, metadata search, copy, preview, references, recyc
     const res = await patch(`/api/v1/projects/${projectId}/folders/${a}`, owner.headers, { name: "Beta" });
     expect(res.statusCode).toBe(409);
   });
+
+  it("REGRESSION: a folder name containing a SQL LIKE wildcard does not repath its neighbours", async () => {
+    // "/A_B" as a LIKE prefix also matches "/AxB": the descendant repath must
+    // be a literal prefix test, not `like(path, '<oldPath>/%')`.
+    const wild = await mkFolder("A_B");
+    const wildChild = await mkFolder("inside", wild);
+    const neighbour = await mkFolder("AxB");
+    const neighbourChild = await mkFolder("untouched", neighbour);
+    const renamed = await patch(`/api/v1/projects/${projectId}/folders/${wild}`, owner.headers, { name: "Renamed" });
+    expect(renamed.statusCode).toBe(200);
+    const tree = (await get(`/api/v1/projects/${projectId}/folders`, owner.headers)).json();
+    const flat = new Map<string, string>();
+    const walk = (nodes: Array<{ id: string; path: string; children?: unknown[] }>) => {
+      for (const n of nodes) {
+        flat.set(n.id, n.path);
+        walk((n.children ?? []) as Array<{ id: string; path: string; children?: unknown[] }>);
+      }
+    };
+    walk(tree.items as Array<{ id: string; path: string; children?: unknown[] }>);
+    expect(flat.get(wildChild)).toBe("/Renamed/inside");
+    expect(flat.get(neighbour)).toBe("/AxB");
+    expect(flat.get(neighbourChild)).toBe("/AxB/untouched");
+  });
+
+  it("REGRESSION: inline preview cannot execute uploaded script (nosniff + sandboxed CSP)", async () => {
+    const htmlId = await upload(folderId, "evil.html", "<script>alert(1)</script>", "text/html");
+    const preview = await get(`/api/v1/files/${htmlId}/preview`, owner.headers);
+    expect(preview.statusCode).toBe(200);
+    expect(preview.headers["x-content-type-options"]).toBe("nosniff");
+    expect(String(preview.headers["content-security-policy"])).toMatch(/sandbox/);
+    const download = await get(`/api/v1/files/${htmlId}/download`, owner.headers);
+    expect(download.headers["content-disposition"]).toMatch(/^attachment/);
+    expect(download.headers["x-content-type-options"]).toBe("nosniff");
+  });
 });
 
 describe("e-mail-to-folder ingestion (#300)", () => {

@@ -18,6 +18,36 @@ export interface SignalDraft {
   title: string;
   explanation: string;
   evidenceRefs: unknown;
+  /**
+   * Deterministic identity of the FINDING — the same condition observed twice
+   * must produce the same fingerprint, and two different conditions from the
+   * same detector must not. Without it every re-run manufactures a duplicate
+   * signal, which is the false-positive fatigue Vol III §6 warns about and
+   * which silently corrupts every precision figure computed from the register.
+   *
+   * Convention: `<what it is about>` in stable, sorted form. The persistence
+   * layer prefixes the detector name, so a fingerprint need only be unique
+   * within its own detector.
+   */
+  fingerprint: string;
+  /** the object the finding is ABOUT, for scoring and deep links */
+  subjectType?: string;
+  subjectId?: string;
+  /** typed links written to `signal_evidence` */
+  links?: Array<{ objectType: string; objectId: string; role?: string }>;
+}
+
+/** Sort + join, so a fingerprint never depends on row order. */
+export function fingerprintOf(...parts: Array<string | number | null | undefined>): string {
+  return parts
+    .filter((p): p is string | number => p !== null && p !== undefined && p !== "")
+    .map(String)
+    .join("|");
+}
+
+/** Ids in a stable order — the usual fingerprint ingredient. */
+export function sortedIds(ids: string[]): string {
+  return [...new Set(ids)].sort().join(",");
 }
 
 /* ------------------------------------------------------------------ */
@@ -85,6 +115,11 @@ export function benfordFirstDigit(values: number[]): BenfordResult {
           `(threshold: >20 medium, >30 high). Digit histogram 1..9: [${histogram.join(", ")}]. ` +
           `Fabricated or manipulated value populations tend to flatten the first-digit curve.`,
         evidenceRefs: { chiSquare, n, histogram },
+        // The population, not the moment: re-running over the same n values
+        // is the same finding. n changes when the population does.
+        fingerprint: fingerprintOf("n", n, "bucket", Math.round(chiSquare / 5) * 5),
+        subjectType: "assertion_population",
+        subjectId: `n=${n}`,
       }
     : null;
   return { skipped: false, n, chiSquare, histogram, draft };
@@ -145,6 +180,10 @@ export function duplicateAssertions(rows: AssertionRow[]): SignalDraft[] {
         `${first.unit ? " " + first.unit : ""} ${clustered.length} times within 30 days ` +
         `(${clustered.map((r) => r.id).join(", ")}). Possible double claim.`,
       evidenceRefs: { assertionIds: clustered.map((r) => r.id) },
+      fingerprint: sortedIds(clustered.map((r) => r.id)),
+      subjectType: "user",
+      subjectId: first.claimantId,
+      links: clustered.map((r) => ({ objectType: "assertion", objectId: r.id })),
     });
   }
   return drafts;
@@ -176,6 +215,9 @@ export function roundNumberClustering(values: number[]): SignalDraft | null {
       `by ${divisor}. Genuine measured quantities rarely round this cleanly; estimated or ` +
       `fabricated figures do.`,
     evidenceRefs: { share, divisor, roundCount: round.length, n: usable.length },
+    fingerprint: fingerprintOf("n", usable.length, "divisor", divisor, "round", round.length),
+    subjectType: "assertion_population",
+    subjectId: `n=${usable.length}`,
   };
 }
 
@@ -220,6 +262,10 @@ export function approvalVelocity(steps: StepRow[]): SignalDraft[] {
         `after assignment (steps ${fast.map((s) => s.id).join(", ")}). Approval this fast is ` +
         `not compatible with substantive review (spec A#37).`,
       evidenceRefs: { assigneeId, stepIds: fast.map((s) => s.id) },
+      fingerprint: fingerprintOf(assigneeId, sortedIds(fast.map((s) => s.id))),
+      subjectType: "user",
+      subjectId: assigneeId,
+      links: fast.map((s) => ({ objectType: "workflow_step", objectId: s.id })),
     });
   }
   return drafts;
@@ -269,6 +315,13 @@ export function segregationOfDuties(
         `and also approved ${own.length} of its steps (${own.map((s) => s.id).join(", ")}). ` +
         `Segregation of duties violated (spec A#40).`,
       evidenceRefs: { instanceId: inst.id, startedBy: inst.startedBy, stepIds: own.map((s) => s.id) },
+      fingerprint: fingerprintOf(inst.id, sortedIds(own.map((s) => s.id))),
+      subjectType: "user",
+      subjectId: inst.startedBy,
+      links: [
+        { objectType: "workflow_instance", objectId: inst.id, role: "subject" },
+        ...own.map((s) => ({ objectType: "workflow_step", objectId: s.id })),
+      ],
     });
   }
   return drafts;
@@ -309,6 +362,10 @@ export function contradictedClaimant(rows: ClaimantReconciliationRow[]): SignalD
         `(${list.map((r) => r.reconciliationId).join(", ")}). A pattern of contradicted ` +
         `claims indicates over-certification (spec A#66).`,
       evidenceRefs: { claimantId, reconciliationIds: list.map((r) => r.reconciliationId) },
+      fingerprint: fingerprintOf(claimantId, sortedIds(list.map((r) => r.reconciliationId))),
+      subjectType: "user",
+      subjectId: claimantId,
+      links: list.map((r) => ({ objectType: "reconciliation", objectId: r.reconciliationId })),
     });
   }
   return drafts;

@@ -290,7 +290,7 @@ export async function sweepLongLead(
       ),
     );
   const ctx = await loadLongLeadContext(db, projectId, rows);
-  const seen = await alreadySignalled(db, companyId, ["supply_long_lead_late", "supply_long_lead_at_risk"]);
+  const seen = await alreadySignalled(db, companyId, ["supply_long_lead_late", "supply_long_lead_at_risk"], projectId);
   const byRisk: Record<string, number> = {};
   let signalsRaised = 0;
   for (const row of rows) {
@@ -420,7 +420,7 @@ export async function sweepJit(
   today: string,
 ): Promise<{ conflicts: JitConflict[]; raised: number }> {
   const conflicts = await computeJitConflicts(db, companyId, projectId, today);
-  const seen = await alreadySignalled(db, companyId, ["supply_jit_conflict"]);
+  const seen = await alreadySignalled(db, companyId, ["supply_jit_conflict"], projectId);
   let raised = 0;
   for (const c of conflicts) {
     if (c.severity === "low" || seen.has(c.key)) continue;
@@ -569,7 +569,7 @@ export async function runSupplierRisk(
     "supply_country_concentration",
     "supply_financial_distress",
     "supply_sanctions",
-  ]);
+  ], projectId);
   let raised = 0;
   let snapshotsWritten = 0;
   let unchanged = 0;
@@ -723,7 +723,7 @@ export async function sweepDeliveryNoShows(
       ),
     )
     .limit(500);
-  const seen = await alreadySignalled(db, companyId, ["supply_delivery_no_show"]);
+  const seen = await alreadySignalled(db, companyId, ["supply_delivery_no_show"], projectId ?? null);
   let marked = 0;
   let raised = 0;
   for (const slot of rows) {

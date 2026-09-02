@@ -314,11 +314,17 @@ function PcoDrawer({
               <Button size="sm" variant="danger" onClick={() => setRejecting(true)}>
                 Reject
               </Button>
+            ) : null}
+            {pco && ["draft", "pending_quote", "priced", "submitted", "rejected"].includes(pco.status) ? (
               <Button
                 size="sm"
                 variant="ghost"
                 onClick={() => {
-                  if (window.confirm(`Void ${pco?.reference ?? "this PCO"}? A PCO inside a live owner request or a package is refused by the API.`)) {
+                  if (
+                    window.confirm(
+                      `Void ${pco.reference}? A PCO inside a live owner request or a package is refused by the API.`,
+                    )
+                  ) {
                     void act("void", {}, "Voided.");
                   }
                 }}

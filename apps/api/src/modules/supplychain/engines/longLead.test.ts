@@ -113,6 +113,37 @@ describe("assessLongLead", () => {
     expect(assessLongLead({ ...watch, taskIsCritical: true }, "2026-10-01").riskLevel).toBe("at_risk");
   });
 
+  /*
+   * Regression: an item that is ON SITE cannot be "at risk of arriving late".
+   * The float rule used to fire on a delivered item with two days between
+   * arrival and need, which raised an at_risk signal and chased the owner
+   * about something already in the compound.
+   */
+  it("stops assessing risk once the item has actually arrived", () => {
+    const thinFloat = base({ status: "arrived", actualOrderDate: "2026-09-20", actualArrivalDate: "2026-11-29" });
+    const r = assessLongLead(thinFloat, "2026-11-30");
+    expect(r.riskLevel).toBe("on_track");
+    expect(r.floatDays).toBe(2);
+    expect(r.reasons[0]).toMatch(/Arrived 2026-11-29/);
+
+    // an unchased, ship-date-missed item that has nonetheless landed is still on track
+    const messyButLanded = base({
+      status: "arrived",
+      actualOrderDate: "2026-09-20",
+      plannedShipDate: "2026-10-01",
+      actualArrivalDate: "2026-11-30",
+      lastExpeditedAt: null,
+    });
+    expect(assessLongLead(messyButLanded, "2026-11-30").riskLevel).toBe("on_track");
+  });
+
+  it("still calls an item that arrived after it was needed late", () => {
+    const r = assessLongLead(base({ status: "arrived", actualOrderDate: "2026-09-20", actualArrivalDate: "2026-12-09" }), "2026-12-10");
+    expect(r.riskLevel).toBe("late");
+    expect(r.floatDays).toBe(-8);
+    expect(r.reasons[0]).toMatch(/Arrived 8 day\(s\) after the required-on-site date/);
+  });
+
   it("closes cleanly once installed", () => {
     const r = assessLongLead(base({ status: "installed", actualArrivalDate: "2026-11-01" }), "2027-01-01");
     expect(r.riskLevel).toBe("on_track");

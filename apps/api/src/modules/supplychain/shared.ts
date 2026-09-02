@@ -139,16 +139,29 @@ export interface SupplySignalDraft {
   evidence: Record<string, unknown>;
 }
 
-/** Dedupe keys already raised for a detector in this company (open or closed). */
+/**
+ * Dedupe keys already raised for a detector (open or closed). Every key this
+ * module mints names a record inside one project, so a per-project sweep
+ * passes `projectId` and reads only that project's signals rather than the
+ * whole company's history on every pass.
+ */
 export async function alreadySignalled(
   db: Db,
   companyId: string,
   detectors: readonly SupplyChainDetector[],
+  projectId?: string | null,
 ): Promise<Set<string>> {
   const rows = await db
     .select({ refs: signals.evidenceRefs })
     .from(signals)
-    .where(and(eq(signals.companyId, companyId), inArray(signals.detector, [...detectors])));
+    .where(
+      and(
+        eq(signals.companyId, companyId),
+        projectId ? eq(signals.projectId, projectId) : undefined,
+        inArray(signals.detector, [...detectors]),
+      ),
+    )
+    .limit(20_000);
   const keys = new Set<string>();
   for (const row of rows) {
     const refs = row.refs as { key?: unknown } | null;

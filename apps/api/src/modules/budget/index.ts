@@ -6,8 +6,14 @@ import {
   budgetContingencyLinks,
   budgetForecasts,
   budgetLineItems,
+  budgetPostings,
+  budgetReconciliations,
   budgetSnapshots,
+  budgetViews,
   budgets,
+  bidAwards,
+  bidPackages,
+  bidSubmissionLines,
   changeLineItems,
   changeOrderPackages,
   commitmentSovLines,
@@ -17,6 +23,7 @@ import {
   invoiceLineItems,
   primeContractChanges,
   primeContractSovLines,
+  timecardAllocations,
   wbsSegments,
 } from "@constructos/db";
 import {
@@ -182,6 +189,29 @@ const csvImportSchema = z.object({
   /** parse + validate and report, writing nothing */
   dryRun: z.boolean().optional(),
   mode: z.enum(["create", "upsert"]).optional(),
+});
+
+/**
+ * Estimate → budget (#480). The estimate of record for a package of work is
+ * the priced submission that was AWARDED; its lines already carry cost codes
+ * and money, so the budget is built from the instrument that will be
+ * contracted rather than from a number typed twice.
+ */
+const AWARDED_STATUSES: readonly string[] = [
+  "approved",
+  "letter_of_intent",
+  "contract_issued",
+  "executed",
+];
+
+const fromEstimateSchema = z.object({
+  packageId: idRef,
+  dryRun: z.boolean().optional(),
+  mode: z.enum(["create", "upsert"]).optional(),
+  /** cost type for lines whose cost code does not name one */
+  defaultCostType: z.enum(COST_TYPES).optional(),
+  /** include the bidder's alternates (excluded by default: they are options) */
+  includeAlternates: z.boolean().optional(),
 });
 
 /** ERP import (#481): a GL export mapped through the company's GL → cost-code map. */
@@ -903,6 +933,12 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
       await tx.delete(budgetContingencyLinks).where(eq(budgetContingencyLinks.budgetId, budgetId));
       await tx.delete(budgetForecasts).where(eq(budgetForecasts.budgetId, budgetId));
       await tx.delete(budgetChanges).where(eq(budgetChanges.budgetId, budgetId));
+      // the upgrade-wave children go with it: a posting, a reconciliation or
+      // a saved view pointing at a budget that no longer exists is exactly
+      // the orphan this route refuses to create elsewhere
+      await tx.delete(budgetPostings).where(eq(budgetPostings.budgetId, budgetId));
+      await tx.delete(budgetReconciliations).where(eq(budgetReconciliations.budgetId, budgetId));
+      await tx.delete(budgetViews).where(eq(budgetViews.budgetId, budgetId));
       await tx.delete(budgetLineItems).where(eq(budgetLineItems.budgetId, budgetId));
       await tx.delete(budgets).where(eq(budgets.id, budgetId));
     });
@@ -1328,7 +1364,7 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
   async function assertLinesUnreferenced(lineIds: readonly string[], what: string): Promise<void> {
     if (lineIds.length === 0) return;
     const ids = [...lineIds];
-    const [csov, psov, ivl, chl] = await Promise.all([
+    const [csov, psov, ivl, chl, tca] = await Promise.all([
       app.db
         .select({ id: commitmentSovLines.id, lineNumber: commitmentSovLines.lineNumber, parent: commitmentSovLines.commitmentId })
         .from(commitmentSovLines)
@@ -1345,12 +1381,19 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
         .select({ id: changeLineItems.id, lineNumber: changeLineItems.id, parent: changeLineItems.parentId })
         .from(changeLineItems)
         .where(inArray(changeLineItems.budgetLineItemId, ids)),
+      // Labour hours posted to this line are cost that would simply vanish
+      // from every report if the line went with them.
+      app.db
+        .select({ id: timecardAllocations.id, parent: timecardAllocations.timecardId })
+        .from(timecardAllocations)
+        .where(inArray(timecardAllocations.budgetLineItemId, ids)),
     ]);
     const references = [
       ...csov.map((r) => ({ table: "commitment_sov_lines", id: r.id, parentId: r.parent })),
       ...psov.map((r) => ({ table: "prime_contract_sov_lines", id: r.id, parentId: r.parent })),
       ...ivl.map((r) => ({ table: "invoice_line_items", id: r.id, parentId: r.parent })),
       ...chl.map((r) => ({ table: "change_line_items", id: r.id, parentId: r.parent })),
+      ...tca.map((r) => ({ table: "timecard_allocations", id: r.id, parentId: r.parent })),
     ];
     if (references.length > 0) {
       const byTable = new Map<string, number>();
@@ -1392,6 +1435,7 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
     await app.db.transaction(async (tx) => {
       await tx.delete(budgetContingencyLinks).where(eq(budgetContingencyLinks.budgetLineItemId, lineId));
       await tx.delete(budgetForecasts).where(eq(budgetForecasts.lineItemId, lineId));
+      await tx.delete(budgetPostings).where(eq(budgetPostings.budgetLineItemId, lineId));
       await tx.delete(budgetLineItems).where(eq(budgetLineItems.id, lineId));
     });
     await recomputeBudgetTotals(app.db, line.budgetId);
@@ -1526,6 +1570,16 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
               subJob: has("subJob") ? (item.values.subJob ?? null) : clash.subJob,
               lineKind: has("lineKind") ? (item.values.lineKind ?? clash.lineKind) : clash.lineKind,
               notes: has("notes") ? (item.values.notes ?? null) : clash.notes,
+              // detail MERGES: an import refreshes its own provenance without
+              // dropping keys other modules put on the line.
+              ...(has("detail")
+                ? {
+                    detail: {
+                      ...((clash.detail as Record<string, unknown> | null) ?? {}),
+                      ...((item.values.detail as Record<string, unknown> | null) ?? {}),
+                    },
+                  }
+                : {}),
               updatedAt: nowIso(),
               ...derived.set,
             })
@@ -1746,6 +1800,295 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
       unknownColumns: unknown,
       ...result,
     });
+  });
+
+  /**
+   * Build (or top up) the budget from the AWARDED submission for a bid
+   * package (#480). The award is the estimate of record: its lines already
+   * carry cost codes, quantities and rates, so the budget inherits the
+   * priced document rather than a figure retyped from it, and every line it
+   * writes carries the provenance of the package and submission it came
+   * from. Excluded scope and (by default) alternates are left out — a price
+   * the bidder said is not in their number is not a budget.
+   */
+  app.post("/budgets/:budgetId/lines/from-estimate", { preHandler: companyGate }, async (req, reply) => {
+    const { budgetId } = req.params as { budgetId: string };
+    const body = fromEstimateSchema.parse(req.body);
+    const budget = await fetchBudget(budgetId, req.companyId!);
+    await requireBudgetLevel(req, reply, budget.projectId, "standard");
+    await assertPlanEditable(budget);
+
+    const pkgRows = await app.db
+      .select({
+        id: bidPackages.id,
+        reference: bidPackages.reference,
+        title: bidPackages.title,
+        currency: bidPackages.currency,
+      })
+      .from(bidPackages)
+      .where(
+        and(
+          eq(bidPackages.id, body.packageId),
+          eq(bidPackages.companyId, budget.companyId),
+          eq(bidPackages.projectId, budget.projectId),
+        ),
+      )
+      .limit(1);
+    const pkg = pkgRows[0];
+    if (!pkg) throw notFound("Bid package not found on this project");
+
+    const awardRows = await app.db
+      .select()
+      .from(bidAwards)
+      .where(and(eq(bidAwards.packageId, pkg.id), eq(bidAwards.companyId, budget.companyId)))
+      .orderBy(desc(bidAwards.number));
+    const award = awardRows.find((a) => AWARDED_STATUSES.includes(a.status));
+    if (!award) {
+      throw conflict(
+        `Package ${pkg.reference} has no approved award. A budget is built from the priced ` +
+          "submission that was actually awarded — recommend and approve the award first" +
+          (awardRows[0] ? ` (the latest award is ${awardRows[0].status}).` : "."),
+      );
+    }
+    if (award.currency.toUpperCase() !== budget.currency.toUpperCase()) {
+      throw conflict(
+        `Award ${award.reference} is priced in ${award.currency} and budget ${budget.reference} ` +
+          `is kept in ${budget.currency}. Money is never converted silently.`,
+      );
+    }
+
+    const lines = await app.db
+      .select()
+      .from(bidSubmissionLines)
+      .where(
+        and(
+          eq(bidSubmissionLines.submissionId, award.submissionId),
+          eq(bidSubmissionLines.companyId, budget.companyId),
+        ),
+      )
+      .orderBy(asc(bidSubmissionLines.position));
+
+    const codeIndex = await loadCostCodes(budget.companyId, budget.projectId);
+    const issues: ImportIssue[] = [];
+    const skipped: Array<{ description: string; amount: number | null; reason: string }> = [];
+    /** aggregated by cost code × cost type — one budget line per coordinate */
+    const buckets = new Map<
+      string,
+      { costCodeId: string; description: string; amount: number; quantity: number | null; unit: string | null; unitRate: number | null; sources: string[]; lineKind: "standard" | "allowance" }
+    >();
+    lines.forEach((l, i) => {
+      const position = i + 1;
+      if (l.isExcluded === 1) {
+        skipped.push({ description: l.description, amount: l.amount, reason: "the bidder excluded this scope from their price" });
+        return;
+      }
+      if (l.isAlternate === 1 && body.includeAlternates !== true) {
+        skipped.push({ description: l.description, amount: l.amount, reason: `alternate${l.alternateLabel ? ` "${l.alternateLabel}"` : ""} — not part of the base price` });
+        return;
+      }
+      if (!l.costCodeId) {
+        issues.push({ row: position, field: "costCodeId", message: `"${l.description}" carries no cost code, so it has nowhere to land on the budget.` });
+        return;
+      }
+      const code = codeIndex.byId.get(l.costCodeId);
+      if (!code || (code.projectId !== null && code.projectId !== budget.projectId)) {
+        issues.push({ row: position, field: "costCodeId", message: `"${l.description}" points at a cost code this project does not carry.` });
+        return;
+      }
+      const amount = l.amount ?? (l.quantity !== null && l.unitRate !== null ? round2(l.quantity * l.unitRate) : null);
+      if (amount === null) {
+        issues.push({ row: position, field: "amount", message: `"${l.description}" has neither an amount nor quantity × rate.` });
+        return;
+      }
+      const costType: CostType = body.defaultCostType ?? (code.costType as CostType | null) ?? "other";
+      const key = `${code.code} ${costType}`;
+      const existing = buckets.get(key);
+      if (existing) {
+        existing.amount = round2(existing.amount + amount);
+        existing.sources.push(l.id);
+        // an aggregate of several priced rows has no single quantity or rate
+        existing.quantity = null;
+        existing.unitRate = null;
+        existing.unit = null;
+        if (l.isAllowance === 1) existing.lineKind = "allowance";
+        return;
+      }
+      buckets.set(key, {
+        costCodeId: code.id,
+        description: l.description,
+        amount: round2(amount),
+        quantity: l.quantity ?? null,
+        unit: l.unit ?? null,
+        unitRate: l.unitRate ?? null,
+        sources: [l.id],
+        lineKind: l.isAllowance === 1 ? "allowance" : "standard",
+      });
+    });
+
+    const prepared: PreparedForWrite[] = [];
+    const preview: unknown[] = [];
+    let rowNumber = 0;
+    for (const b of buckets.values()) {
+      rowNumber += 1;
+      const consistent = b.quantity !== null && b.unitRate !== null && nearlyEqual(round2(b.quantity * b.unitRate), b.amount);
+      const draft = {
+        costCodeId: b.costCodeId,
+        description: b.description,
+        lineKind: b.lineKind,
+        ...(consistent
+          ? { quantity: b.quantity as number, unitRate: b.unitRate as number, ...(b.unit ? { unit: b.unit } : {}) }
+          : { originalBudget: b.amount }),
+        detail: {
+          provenance: {
+            sourceType: "bid_package",
+            sourceId: pkg.id,
+            packageReference: pkg.reference,
+            awardId: award.id,
+            awardReference: award.reference,
+            submissionId: award.submissionId,
+            vendorId: award.vendorId,
+            submissionLineIds: b.sources,
+            importedAt: nowIso(),
+          },
+        },
+      };
+      const parsed = lineCreateSchema.safeParse(draft);
+      if (!parsed.success) {
+        for (const issue of parsed.error.issues) {
+          issues.push({ row: rowNumber, field: issue.path.join(".") || null, message: issue.message });
+        }
+        continue;
+      }
+      try {
+        const p = prepareLine(budget, parsed.data, req.user!.id, codeIndex);
+        prepared.push({ rowNumber, values: p.values, provided: p.provided });
+        preview.push({
+          row: rowNumber,
+          costCode: p.values.costCode,
+          costType: p.values.costType,
+          description: p.values.description,
+          originalBudget: p.values.originalBudget,
+          sourceLines: b.sources.length,
+        });
+      } catch (err) {
+        issues.push({ row: rowNumber, field: null, message: err instanceof Error ? err.message : "Invalid line" });
+      }
+    }
+
+    const source = {
+      packageId: pkg.id,
+      packageReference: pkg.reference,
+      packageTitle: pkg.title,
+      awardId: award.id,
+      awardReference: award.reference,
+      awardStatus: award.status,
+      awardAmount: award.awardAmount,
+      vendorId: award.vendorId,
+      currency: award.currency,
+      submissionLines: lines.length,
+    };
+    const totalOriginalBudget = round2(prepared.reduce((sum, p) => sum + (p.values.originalBudget ?? 0), 0));
+    // The award amount and the sum of its priced lines can legitimately
+    // differ (markups priced at the summary level); say so rather than
+    // pretending the budget equals the award.
+    const reconciliation = nearlyEqual(totalOriginalBudget, award.awardAmount)
+      ? { ok: true as const, reasons: [] as string[] }
+      : {
+          ok: false as const,
+          reasons: [
+            `The priced lines that landed total ${totalOriginalBudget.toFixed(2)} ${budget.currency}, ` +
+              `while award ${award.reference} is ${award.awardAmount.toFixed(2)} — the difference is ` +
+              "scope that was excluded, an alternate, an unmapped line, or pricing held at the summary level.",
+          ],
+        };
+
+    if (body.dryRun) {
+      return { dryRun: true, budgetId, source, readyLines: prepared.length, issues, skipped, preview, totalOriginalBudget, reconciliation };
+    }
+    if (issues.length > 0) {
+      throw badRequest(
+        `${issues.length} award line(s) cannot land on this budget; nothing was written. Map them ` +
+          "to a cost code the project carries, or re-run with dryRun to review.",
+        { issues },
+      );
+    }
+    if (prepared.length === 0) {
+      throw badRequest(
+        `Award ${award.reference} carries no priced line that can become a budget line` +
+          (skipped.length > 0 ? ` — ${skipped.length} line(s) were excluded or alternates.` : "."),
+        { skipped },
+      );
+    }
+    const result = await writeLines(budget, prepared, body.mode ?? "create", req.user!.id);
+    if (result.issues.length > 0) {
+      throw badRequest("One or more lines were rejected; nothing was written.", { issues: result.issues });
+    }
+    await recomputeBudgetTotals(app.db, budgetId);
+    await ledger(req, "create", "budget_line_item", budgetId, {
+      projectId: budget.projectId,
+      budgetId,
+      source,
+      created: result.created,
+      updated: result.updated,
+      totalOriginalBudget,
+    });
+    return reply.status(201).send({ dryRun: false, budgetId, source, skipped, totalOriginalBudget, reconciliation, ...result });
+  });
+
+  /**
+   * The estimates of record this budget could be built from: every bid
+   * package on the project whose award has been approved. Gated on `budget`
+   * rather than `bidding` — a cost manager may build a budget from an award
+   * without holding the tender register's own permissions, and the payload
+   * carries only what the import needs.
+   */
+  app.get("/budgets/:budgetId/estimate-sources", { preHandler: companyGate }, async (req, reply) => {
+    const { budgetId } = req.params as { budgetId: string };
+    const budget = await fetchBudget(budgetId, req.companyId!);
+    await requireBudgetLevel(req, reply, budget.projectId, "read");
+    const rows = await app.db
+      .select({
+        packageId: bidPackages.id,
+        packageReference: bidPackages.reference,
+        packageTitle: bidPackages.title,
+        packageStatus: bidPackages.status,
+        awardId: bidAwards.id,
+        awardReference: bidAwards.reference,
+        awardStatus: bidAwards.status,
+        awardAmount: bidAwards.awardAmount,
+        currency: bidAwards.currency,
+        vendorId: bidAwards.vendorId,
+        submissionId: bidAwards.submissionId,
+        awardedAt: bidAwards.approvedAt,
+      })
+      .from(bidAwards)
+      .innerJoin(bidPackages, eq(bidPackages.id, bidAwards.packageId))
+      .where(
+        and(
+          eq(bidAwards.companyId, budget.companyId),
+          eq(bidAwards.projectId, budget.projectId),
+          inArray(bidAwards.status, [...AWARDED_STATUSES]),
+        ),
+      )
+      .orderBy(desc(bidAwards.number));
+    const items = rows.map((r) => ({
+      ...r,
+      /** an award in another currency cannot fund this budget */
+      importable: r.currency.toUpperCase() === budget.currency.toUpperCase(),
+      reason:
+        r.currency.toUpperCase() === budget.currency.toUpperCase()
+          ? null
+          : `Priced in ${r.currency}; this budget is kept in ${budget.currency}.`,
+    }));
+    return {
+      budgetId,
+      currency: budget.currency,
+      items,
+      reasons:
+        items.length === 0
+          ? ["No bid package on this project has an approved award yet, so there is no priced document to build a budget from."]
+          : [],
+    };
   });
 
   /* ---------------------------------------------------------------- */

@@ -33,7 +33,6 @@ import {
   fileIdsSchema,
   idSchema,
   isoDateSchema,
-  isoTimestampSchema,
   ledger,
   loadTask,
   nowISO,
@@ -633,6 +632,4 @@ export const offsiteRoutes: FastifyPluginAsync = async (app) => {
     return row;
   });
 
-  // Silence the unused-import guard for the timestamp schema used by siblings.
-  void isoTimestampSchema;
 };

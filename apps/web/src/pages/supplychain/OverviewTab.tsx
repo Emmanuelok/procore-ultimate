@@ -5,7 +5,7 @@
  */
 import { useState } from "react";
 import { toast } from "sonner";
-import { Badge, Button, Card, CardBody, EmptyState, Skeleton, Stat } from "../../ui";
+import { Alert, Badge, Button, Card, CardBody, EmptyState, Skeleton, Stat } from "../../ui";
 import { IconRefresh, IconZap } from "../../ui/icons";
 import { api } from "../../lib/api";
 import {
@@ -62,6 +62,11 @@ export default function OverviewTab({ projectId, summary, onOpenTab }: { project
     <div className="space-y-4">
       {action.refusal ? <RefusalNotice refusal={action.refusal} onDismiss={action.clear} /> : null}
       {summary.error ? <LoadError message={summary.error} onRetry={summary.reload} title="The summary could not be loaded" /> : null}
+      {s?.truncated && s.truncated.length > 0 ? (
+        <Alert tone="warning" title="These figures are a lower bound">
+          <ReasonList reasons={s.truncated} />
+        </Alert>
+      ) : null}
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
         <Card>

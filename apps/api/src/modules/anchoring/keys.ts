@@ -367,14 +367,32 @@ export async function registerPublicKey(
     .limit(1);
   if (existing[0]) return { row: existing[0], created: false };
   const id = newId("skey");
-  await db.insert(signingKeys).values({
-    id,
-    companyId: null,
-    keyId: record.keyId,
-    algorithm: record.algorithm,
-    publicKeyPem: record.publicKeyPem,
-    fingerprint: record.fingerprint,
-  });
+  // ON CONFLICT DO NOTHING closes the select-then-insert race on
+  // `signing_keys_key_id_idx`. The first seal of a deployment registers the
+  // key opportunistically, so two concurrent first seals both read "absent"
+  // and both insert — one of them used to surface as an unhandled unique
+  // violation (a 500) on an operation that had, in fact, succeeded.
+  const inserted = await db
+    .insert(signingKeys)
+    .values({
+      id,
+      companyId: null,
+      keyId: record.keyId,
+      algorithm: record.algorithm,
+      publicKeyPem: record.publicKeyPem,
+      fingerprint: record.fingerprint,
+    })
+    .onConflictDoNothing({ target: signingKeys.keyId })
+    .returning({ id: signingKeys.id });
+  if (inserted.length === 0) {
+    // The other writer won. Their row is the row.
+    const raced = await db
+      .select()
+      .from(signingKeys)
+      .where(eq(signingKeys.keyId, record.keyId))
+      .limit(1);
+    if (raced[0]) return { row: raced[0], created: false };
+  }
   const rows = await db.select().from(signingKeys).where(eq(signingKeys.id, id)).limit(1);
   return { row: rows[0]!, created: true };
 }

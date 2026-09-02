@@ -826,7 +826,10 @@ function DeleteLine({
   async function submit() {
     if (!line) return;
     const done = await run("delete-line", () =>
-      api.del(`/api/v1/prime-contracts/${contract.id}/sov/lines/${line.id}`, absorbId ? { absorbIntoLineId: absorbId } : {}),
+      api.del(
+        `/api/v1/prime-contracts/${contract.id}/sov/lines/${line.id}` +
+          (absorbId ? `?absorbIntoLineId=${encodeURIComponent(absorbId)}` : ""),
+      ),
     );
     if (done !== null) {
       setAbsorbId("");

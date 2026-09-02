@@ -551,6 +551,8 @@ export interface JitResponse {
 
 export interface Summary {
   asOf: string;
+  /** registers the roll-up had to cap; empty when every figure is the whole truth */
+  truncated?: string[];
   map: { nodes: number; links: number; tiers: number; countries: number; soleSourceLinks: number; byRiskLevel: Record<string, number>; lastRiskRunAt: string | null };
   longLead: {
     total: number;

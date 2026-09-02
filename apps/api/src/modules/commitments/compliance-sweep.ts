@@ -67,9 +67,14 @@ export interface UpcomingExpiry {
 const daysBetween = (fromIso: string, toIso: string): number =>
   Math.round((Date.parse(`${toIso}T00:00:00Z`) - Date.parse(`${fromIso}T00:00:00Z`)) / 86_400_000);
 
+/**
+ * The TIGHTEST line the expiry has crossed: six days out is a 7-day notice,
+ * not a 30-day one. (EXPIRY_LINES runs widest-first, so this walks it back.)
+ */
 function lineFor(days: number): number | null {
-  for (const line of EXPIRY_LINES) if (days <= line) return line;
-  return null;
+  let hit: number | null = null;
+  for (const line of EXPIRY_LINES) if (days <= line) hit = line;
+  return hit;
 }
 
 function renewalText(vendorName: string | null, coverage: string, expiresOn: string, reference: string): string {

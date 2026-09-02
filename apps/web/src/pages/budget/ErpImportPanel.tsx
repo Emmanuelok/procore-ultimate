@@ -146,7 +146,7 @@ export default function ErpImportPanel({
               disabled={frozen}
               label={`Drop a ${dialect?.label ?? "GL"} export`}
               hint={dialect ? `Expected headers: ${dialect.template}` : "Recognised headers depend on the ERP system chosen."}
-              onFilesAccepted={(files: File[]) => {
+              onAccepted={(files: File[]) => {
                 const file = files[0];
                 if (!file) return;
                 setFileName(file.name);

@@ -537,7 +537,7 @@ describe("drawing set pipeline", () => {
     });
 
     it("renumbering a confirmed sheet is an admin act; a title edit does not clear review silently", async () => {
-      const standard = await addMember("field_engineer");
+      const standard = await addMember("project_manager"); // drawings: standard
       const renumber = await built.app.inject({ method: "PATCH", url: `/api/v1/sheets/${sheetA101.id}`, payload: { number: "A-102" }, headers: standard.headers });
       expect(renumber.statusCode).toBe(403);
       const retitle = await built.app.inject({ method: "PATCH", url: `/api/v1/sheets/${sheetA101.id}`, payload: { title: "FLOOR PLAN LEVEL 1" }, headers: standard.headers });

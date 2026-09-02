@@ -113,6 +113,11 @@ export function sendRanged(
     .header("cache-control", "private, max-age=3600")
     .header("x-content-sha256", obj.sha256)
     .header("content-type", obj.contentType)
+    // Stored bytes are attacker-controlled: never let a browser sniff a
+    // different type, and neuter scripting in anything rendered inline
+    // (an uploaded .svg or .html is otherwise stored XSS on the API origin).
+    .header("x-content-type-options", "nosniff")
+    .header("content-security-policy", "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox")
     .header("content-disposition", dispositionValue(disposition, obj.filename));
 
   if (req.headers["if-none-match"] === etag) {

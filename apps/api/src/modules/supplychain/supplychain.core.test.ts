@@ -366,6 +366,63 @@ describe("long-lead register", () => {
     expect(list.json().total).toBe(1);
   });
 
+  /*
+   * Regression: a delivered item is not "at risk of arriving late". The float
+   * rule used to fire on an item already on site whose arrival was only a
+   * couple of days ahead of need, painting the register red and chasing the
+   * expediting owner about something in the compound.
+   */
+  it("clears the risk once the item is on site, even with thin float", async () => {
+    const created = await post(`/projects/${projectId}/supply-chain/long-lead`, {
+      name: "Switchgear",
+      leadTimeDays: 10,
+      requiredOnSite: addDaysISO(today, 2),
+    });
+    expect(created.statusCode).toBe(201);
+    const id = created.json().id as string;
+    expect(created.json().riskLevel).toBe("late");
+
+    for (const milestone of ["ordered", "production_started", "shipped"]) {
+      expect((await post(`/projects/${projectId}/supply-chain/long-lead/${id}/milestones`, { milestone, at: today })).statusCode).toBe(200);
+    }
+    const arrived = await post(`/projects/${projectId}/supply-chain/long-lead/${id}/milestones`, { milestone: "arrived", at: today });
+    expect(arrived.statusCode).toBe(200);
+    expect(arrived.json().status).toBe("arrived");
+    expect(arrived.json().riskLevel).toBe("on_track");
+    expect(arrived.json().floatDays).toBe(2);
+    expect(arrived.json().assessment.reasons[0]).toMatch(/Arrived/);
+
+    const stored = await get(`/projects/${projectId}/supply-chain/long-lead/${id}`);
+    expect(stored.json().riskLevel).toBe("on_track");
+    const atRisk = await get(`/projects/${projectId}/supply-chain/long-lead?riskLevel=at_risk`);
+    expect((atRisk.json().items as Array<{ id: string }>).some((i) => i.id === id)).toBe(false);
+  });
+
+  /*
+   * Two people chasing the same order must both be counted. The count used to
+   * be read into JS and written back, which loses a write when the two
+   * handlers interleave on a real connection pool; it is incremented in SQL
+   * now. (The embedded test database serialises requests, so this test
+   * covers the endpoint rather than reproducing the race.)
+   */
+  it("counts every expediting contact when two are logged together", async () => {
+    const created = await post(`/projects/${projectId}/supply-chain/long-lead`, {
+      name: "Transformer",
+      leadTimeDays: 40,
+      requiredOnSite: addDaysISO(today, 200),
+    });
+    const id = created.json().id as string;
+    const [a, b] = await Promise.all([
+      post(`/projects/${projectId}/supply-chain/long-lead/${id}/expedite`, { action: "call", note: "Chased the mill" }),
+      post(`/projects/${projectId}/supply-chain/long-lead/${id}/expedite`, { action: "email", note: "Chased the agent" }),
+    ]);
+    expect(a.statusCode).toBe(201);
+    expect(b.statusCode).toBe(201);
+    const detail = await get(`/projects/${projectId}/supply-chain/long-lead/${id}`);
+    expect(detail.json().expeditingCount).toBe(2);
+    expect(detail.json().expeditingLog).toHaveLength(2);
+  });
+
   it("refuses references outside the project and other tenants", async () => {
     expect((await post(`/projects/${projectId}/supply-chain/long-lead`, { name: "x", scheduleTaskId: "tsk_nope" })).statusCode).toBe(400);
     expect((await post(`/projects/${projectId}/supply-chain/long-lead`, { name: "x", materialItemId: "mat_nope" })).statusCode).toBe(400);

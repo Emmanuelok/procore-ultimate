@@ -163,8 +163,8 @@ export default function LogisticsTab({ projectId, lookups, onChanged }: { projec
           <CardBody>
             <SectionHeading title="Supplier performance" hint="On-time delivery by supplier node and by haulier over the window (#730)." />
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-              <PerfList title="By supplier" rows={ot.bySupplier.map((r) => ({ key: r.key, label: r.name, ...r }))} />
-              <PerfList title="By haulier" rows={ot.byHaulier.map((r) => ({ key: r.key, label: r.key, ...r }))} />
+              <PerfList title="By supplier" rows={ot.bySupplier.map((r) => ({ ...r, label: r.name }))} />
+              <PerfList title="By haulier" rows={ot.byHaulier.map((r) => ({ ...r, label: r.key }))} />
             </div>
           </CardBody>
         </Card>

@@ -15,9 +15,10 @@
  */
 import { useState } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
-import { Alert, PageHeader, Tabs } from "../../ui";
+import { Alert, Button, PageHeader, Tabs } from "../../ui";
 import BuyoutTab from "./BuyoutTab";
 import CommitmentDrawer from "./CommitmentDrawer";
+import CreateCommitmentModal from "./CreateCommitmentModal";
 import ComplianceTab from "./ComplianceTab";
 import RegisterTab from "./RegisterTab";
 import {
@@ -46,6 +47,7 @@ export default function CommitmentsPage() {
   });
   const [filters, setFilters] = useState<RegisterFilters>(EMPTY_FILTERS);
   const [openId, setOpenId] = useState<string | null>(() => searchParams.get("commitment"));
+  const [creating, setCreating] = useState(false);
 
   const register = useCommitmentRegister(projectId, filters);
   const compliance = useComplianceReport(projectId);
@@ -98,6 +100,9 @@ export default function CommitmentsPage() {
             </span>
           ) : null
         }
+        actions={
+          <Button onClick={() => setCreating(true)}>Raise a commitment</Button>
+        }
         tabs={
           <Tabs
             items={TABS.map((t) => ({
@@ -130,6 +135,18 @@ export default function CommitmentsPage() {
       ) : (
         <BuyoutTab log={buyout} />
       )}
+
+      <CreateCommitmentModal
+        open={creating}
+        projectId={projectId}
+        vendors={vendors.data?.items ?? []}
+        onClose={() => setCreating(false)}
+        onCreated={(id) => {
+          setCreating(false);
+          refreshProjectLevel();
+          open(id);
+        }}
+      />
 
       <CommitmentDrawer
         commitmentId={openId}

@@ -77,7 +77,7 @@ export default function ReceivablesTab({ contract, receivables, onOpenApplicatio
         showFooter
         gridLines
         savedViews={false}
-        onRowClick={(row) => onOpenApplication(row.applicationId)}
+        onRowClick={({ row }) => onOpenApplication(row.applicationId)}
         exportFileName={`receivables-${contract.reference}`}
         empty={{ title: "Nothing certified yet", description: "Receivables begin when an application is certified; until then there is nothing the owner owes." }}
         aria-label={`Receivables ageing for ${contract.reference}`}

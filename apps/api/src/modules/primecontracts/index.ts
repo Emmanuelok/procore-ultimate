@@ -250,6 +250,17 @@ const changeListQuery = pageQuerySchema.extend({
 });
 
 const rejectSchema = z.object({ reason: z.string().min(1).max(2000) });
+/**
+ * A prime change order review has two adverse outcomes: send it back to be
+ * corrected (`revise_and_resubmit`, the author may edit and resubmit) or
+ * refuse it outright (`rejected`, terminal until it is voided). Without the
+ * first, a rejected change order would be a dead end: an approved or
+ * rejected change cannot be edited, submitted or executed.
+ */
+const changeRejectSchema = z.object({
+  reason: z.string().min(1).max(2000),
+  outcome: z.enum(["rejected", "revise_and_resubmit"]).default("rejected"),
+});
 const voidSchema = z.object({ reason: z.string().min(1).max(2000) });
 
 const changeApproveSchema = z.object({
@@ -1724,7 +1735,12 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
         primeContractId: string;
         lineId: string;
       };
-      const body = sovLineDeleteSchema.parse(req.body ?? {});
+      // The browser's fetch wrapper cannot carry a body on DELETE, so the
+      // absorb target may arrive as a query parameter instead.
+      const body = sovLineDeleteSchema.parse({
+        ...(sovLineDeleteSchema.parse(req.query ?? {})),
+        ...(req.body ?? {}),
+      });
       const contract = await fetchContract(primeContractId, req.companyId!);
       await requireLevel(req, reply, contract.projectId, "standard");
       const existing = await loadSov(contract.id);
@@ -2111,12 +2127,15 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
         primeContractId: string;
         changeId: string;
       };
-      const body = rejectSchema.parse(req.body);
+      const body = changeRejectSchema.parse(req.body);
       const contract = await fetchContract(primeContractId, req.companyId!);
       await requireLevel(req, reply, contract.projectId, "admin");
       const change = await fetchChange(contract, changeId);
       if (change.status === "executed") {
         throw conflict(`${change.reference} is executed and cannot be rejected`);
+      }
+      if (change.status === "void") {
+        throw conflict(`${change.reference} is void — there is nothing left to reject.`);
       }
       const actor = req.user!.id;
       if (actor === change.createdBy || actor === change.submittedBy) {
@@ -2129,7 +2148,7 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
       await app.db
         .update(primeContractChanges)
         .set({
-          status: "rejected",
+          status: body.outcome,
           rejectedBy: actor,
           rejectedAt: now,
           rejectionReason: body.reason,
@@ -2144,7 +2163,58 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
         action: "state_change",
         objectType: "prime_contract_change",
         objectId: change.id,
-        payload: { from: change.status, to: "rejected", reason: body.reason },
+        payload: { from: change.status, to: body.outcome, reason: body.reason },
+        storePayload: true,
+      });
+      return fetchChange(contract, change.id);
+    },
+  );
+
+  /**
+   * Void a change order that will never be executed. A rejected or
+   * withdrawn PCCO otherwise has no exit: it cannot be edited, submitted or
+   * executed, so without this it sits on the register forever pretending to
+   * be live exposure. An executed change is part of the contract sum and is
+   * reversed by a further change order, never voided.
+   */
+  app.post(
+    "/prime-contracts/:primeContractId/changes/:changeId/void",
+    { preHandler: companyGate },
+    async (req, reply) => {
+      const { primeContractId, changeId } = req.params as {
+        primeContractId: string;
+        changeId: string;
+      };
+      const body = voidSchema.parse(req.body);
+      const contract = await fetchContract(primeContractId, req.companyId!);
+      await requireLevel(req, reply, contract.projectId, "admin");
+      const change = await fetchChange(contract, changeId);
+      if (change.status === "executed") {
+        throw conflict(
+          `${change.reference} is executed and forms part of the contract sum — reverse it with ` +
+            "a further change order; a signed instrument is not voided.",
+        );
+      }
+      if (change.status === "void") {
+        throw conflict(`${change.reference} is already void.`);
+      }
+      const now = nowIso();
+      await app.db
+        .update(primeContractChanges)
+        .set({ status: "void", rejectionReason: body.reason, updatedAt: now })
+        .where(
+          and(eq(primeContractChanges.id, change.id), ne(primeContractChanges.status, "executed")),
+        );
+      await recalcContract(contract.id, req.companyId!);
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        projectId: contract.projectId,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "prime_contract_change",
+        objectId: change.id,
+        payload: { from: change.status, to: "void", reason: body.reason, amount: change.amount },
+        storePayload: true,
       });
       return fetchChange(contract, change.id);
     },

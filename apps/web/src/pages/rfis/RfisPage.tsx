@@ -33,6 +33,7 @@ import {
 } from "../../ui";
 import { DataTable, type DataColumns } from "../../ui/data";
 import { IconRfi } from "../../ui/icons";
+import EscalationsPanel from "./EscalationsPanel";
 import { formatDate, humanize } from "../format";
 import {
   AGEING_BUCKETS,
@@ -46,6 +47,7 @@ import {
   todayIso,
   useCompanyUsers,
   useFieldResource,
+  useMe,
   type AgeingReport,
   type ListResponse,
 } from "./fieldShared";
@@ -79,12 +81,13 @@ interface RfiAnalytics {
   impacts: { costYes: number; scheduleYes: number; tbd: number };
 }
 
-type TabKey = "register" | "ageing" | "court" | "inbound";
+type TabKey = "register" | "ageing" | "court" | "inbound" | "escalations";
 const TABS: Array<{ value: TabKey; label: string }> = [
   { value: "register", label: "Register" },
   { value: "ageing", label: "Ageing" },
   { value: "court", label: "Ball in court" },
   { value: "inbound", label: "Inbound email" },
+  { value: "escalations", label: "Escalations & settings" },
 ];
 const PAGE_SIZE = 25;
 
@@ -106,6 +109,7 @@ export default function RfisPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const base = `/api/v1/projects/${projectId}/rfis`;
   const { users, nameOf } = useCompanyUsers();
+  const me = useMe();
 
   const [tab, setTab] = useState<TabKey>(() => {
     const t = searchParams.get("tab");
@@ -342,6 +346,8 @@ export default function RfisPage() {
       ) : null}
 
       {tab === "inbound" ? <InboundPanel base={base} onDone={(id) => navigate(`/projects/${projectId}/rfis/${id}`)} /> : null}
+
+      {tab === "escalations" ? <EscalationsPanel projectId={projectId} isAdmin={me.isCompanyAdmin} users={users} nameOf={nameOf} /> : null}
 
       <Modal open={createOpen} title="New RFI" onClose={() => setCreateOpen(false)} wide>
         <ErrorAlert message={createError} />

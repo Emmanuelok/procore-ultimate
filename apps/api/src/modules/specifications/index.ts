@@ -18,6 +18,7 @@ import {
 } from "drizzle-orm";
 import { z } from "zod";
 import {
+  assuranceGrants,
   bidPackages,
   commitments,
   drawingSheets,
@@ -31,6 +32,7 @@ import {
   specSectionRevisions,
   specSections,
   specSubmittalRequirements,
+  projectMemberships,
   submittals,
   users,
 } from "@constructos/db";
@@ -53,6 +55,7 @@ import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { forEachCompany } from "../../lib/scheduler.js";
 import type { Db } from "../../lib/db.js";
+import { isExpired } from "../../lib/time.js";
 import { addDaysISO, isoDateSchema } from "../field/dates.js";
 import { nextRevisionLabel } from "../drawings/detectors.js";
 import { extractPdfPages, streamToBuffer } from "../drawings/pdf.js";
@@ -345,6 +348,29 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
     app.requireTool("specifications", "admin"),
   ];
   const companyRead = [app.authenticate, app.requireCompany];
+
+  /**
+   * Plan §6.3: a company-level list over project data is limited to the
+   * projects the caller can see. `null` means "every project in the company"
+   * (owner/admin, or a company-wide assurance grant).
+   */
+  async function visibleProjectIds(req: FastifyRequest): Promise<string[] | null> {
+    if (req.companyRole === "owner" || req.companyRole === "admin") return null;
+    const nowMs = Date.now();
+    const grants = await app.db
+      .select({ projectId: assuranceGrants.projectId, expiresAt: assuranceGrants.expiresAt })
+      .from(assuranceGrants)
+      .where(and(eq(assuranceGrants.companyId, req.companyId!), eq(assuranceGrants.userId, req.user!.id)));
+    const live = grants.filter((g) => !isExpired(g.expiresAt, nowMs));
+    if (live.some((g) => g.projectId === null)) return null;
+    const ids = new Set<string>(live.map((g) => g.projectId).filter((p): p is string => typeof p === "string"));
+    const memberships = await app.db
+      .select({ projectId: projectMemberships.projectId })
+      .from(projectMemberships)
+      .where(and(eq(projectMemberships.companyId, req.companyId!), eq(projectMemberships.userId, req.user!.id)));
+    for (const m of memberships) ids.add(m.projectId);
+    return [...ids];
+  }
 
   /* ---------------------------------------------------------------- */
   /* Fetchers                                                          */
@@ -3002,8 +3028,11 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
         projectId: z.string().max(64).optional(),
       })
       .parse(req.query);
+    const visible = await visibleProjectIds(req);
+    if (visible !== null && visible.length === 0) return paginate([], 0, q);
     const where = and(
       eq(specSections.companyId, req.companyId!),
+      visible === null ? undefined : inArray(specSections.projectId, visible),
       q.code ? eq(specSections.normalisedCode, normaliseSectionCode(q.code)) : undefined,
       q.search ? ilike(specSections.title, `%${q.search}%`) : undefined,
       q.projectId ? eq(specSections.projectId, q.projectId) : undefined,

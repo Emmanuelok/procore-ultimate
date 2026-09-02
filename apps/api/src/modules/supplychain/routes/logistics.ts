@@ -12,7 +12,7 @@
  * `delivered`. The slot never edits those registers in any other way.
  */
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
-import { and, asc, count, desc, eq, gte, ilike, inArray, lte, or } from "drizzle-orm";
+import { and, asc, count, eq, gte, ilike, inArray, lte, or } from "drizzle-orm";
 import { z } from "zod";
 import { deliverySlots, longLeadItems, materialDeliveries, offsiteUnits, siteGates, supplyChainNodes } from "@constructos/db";
 import {
@@ -571,5 +571,4 @@ export const logisticsRoutes: FastifyPluginAsync = async (app) => {
     return sweepDeliveryNoShows(app.db, req.companyId!, new Date(), projectId);
   });
 
-  void desc;
 };

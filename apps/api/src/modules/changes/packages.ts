@@ -19,7 +19,7 @@ import {
 } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
-import { badRequest, conflict } from "../../lib/errors.js";
+import { AppError, badRequest, conflict } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { checkIdentity, round2 } from "./arithmetic.js";
 import { executeCommitmentPackage, executePrimePackage } from "./execute.js";
@@ -216,10 +216,12 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
         }))
         .filter((v) => v.skipped.length > 0);
       if (violations.length > 0) {
-        throw conflict(
+        throw new AppError(
+          409,
           `This project runs ${config.definition.label.toLowerCase()} change management (${config.stages.join(" → ")}). ` +
             violations.map((v) => `${v.reference} skipped: ${v.skipped.join(", ")}`).join("; ") +
             ". Complete the missing stage before packaging.",
+          { control: "change_tier", tier: config.tier, stages: config.stages, members: violations },
         );
       }
     }

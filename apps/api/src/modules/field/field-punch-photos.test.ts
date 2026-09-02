@@ -7,14 +7,17 @@ import { and, eq } from "drizzle-orm";
 import {
   changeEvents,
   companyMemberships,
+  contacts,
   files,
   ledgerEntries,
   locations,
   notifications,
   projectMemberships,
   projects,
+  punchItems,
   safetyIncidents,
   signals,
+  users,
   vendors,
 } from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
@@ -212,6 +215,31 @@ describe("Punch list", () => {
     expect(overdue.json().items.every((i: { daysOverdue: number }) => i.daysOverdue > 0)).toBe(true);
   });
 
+  it("distributes to the vendor's own people on create and on reassignment (#410)", async () => {
+    // The subcontractor is reachable as a vendor contact with a login.
+    const subEmail = (await built.app.db.select({ email: users.email }).from(users).where(eq(users.id, sub.userId)))[0]!.email;
+    await built.app.db.insert(contacts).values({ id: newId("con"), companyId: owner.companyId, vendorId, name: "Sparks foreman", email: subEmail });
+
+    const created = await inject("POST", api("/punch"), H(owner), { title: "Vendor distribution check", vendorId });
+    expect(created.statusCode).toBe(201);
+    const id = created.json().id as string;
+    const notified = await built.app.db
+      .select()
+      .from(notifications)
+      .where(and(eq(notifications.userId, sub.userId), eq(notifications.recordId, id)));
+    expect(notified).toHaveLength(1);
+
+    const other = await inject("POST", api("/punch"), H(owner), { title: "Reassigned later" });
+    const otherId = other.json().id as string;
+    expect((await inject("PATCH", api(`/punch/${otherId}`), H(owner), { vendorId })).statusCode).toBe(200);
+    const reassigned = await built.app.db
+      .select()
+      .from(notifications)
+      .where(and(eq(notifications.userId, sub.userId), eq(notifications.recordId, otherId)));
+    expect(reassigned).toHaveLength(1);
+    expect(reassigned[0]!.title).toContain("assigned to your company");
+  });
+
   it("is tenant-scoped", async () => {
     const S = { authorization: `Bearer ${stranger.accessToken}`, "x-company-id": stranger.companyId };
     const first = (await inject("GET", api("/punch"), H(owner))).json().items[0];
@@ -288,6 +316,22 @@ describe("Observations", () => {
     const S = { authorization: `Bearer ${stranger.accessToken}`, "x-company-id": stranger.companyId };
     expect((await inject("GET", api(`/observations/${id}`), S)).statusCode).toBe(403);
   });
+
+  it("converts exactly once when two requests race", async () => {
+    const o = await inject("POST", api("/observations"), H(engineer), { title: "Double-click hazard", observationType: "safety", assigneeId: sub.userId, verifierId: pm.userId });
+    const id = o.json().id as string;
+    const [first, second] = await Promise.all([
+      inject("POST", api(`/observations/${id}/convert`), H(engineer), { target: "punch_item" }),
+      inject("POST", api(`/observations/${id}/convert`), H(engineer), { target: "punch_item" }),
+    ]);
+    const codes = [first!.statusCode, second!.statusCode].sort();
+    expect(codes[0]).toBe(201);
+    expect([400, 409]).toContain(codes[1]);
+    const items = await built.app.db.select().from(punchItems).where(eq(punchItems.observationId, id));
+    expect(items).toHaveLength(1);
+    const detail = await inject("GET", api(`/observations/${id}`), H(engineer));
+    expect(detail.json().convertedToId).toBe(items[0]!.id);
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -334,6 +378,16 @@ describe("Photos", () => {
     // EXIF date 20+ days before the upload: the integrity hook flags date drift.
     const drift = await built.app.db.select().from(signals).where(and(eq(signals.companyId, owner.companyId), eq(signals.detector, "field_photo_date_drift")));
     expect(drift).toHaveLength(1);
+  });
+
+  it("refuses a photo over the size cap without buffering it", async () => {
+    // 51 MB of JPEG: past the 50 MB photo cap, so the request must be rejected
+    // by size, not accepted and then choked on.
+    const head = jpegWithExif();
+    const oversize = Buffer.concat([head, Buffer.alloc(51 * 1024 * 1024 - head.length, 0x20)]);
+    const res = await upload(owner, {}, oversize, "huge.jpg");
+    expect(res.statusCode).toBe(413);
+    expect(res.json().message).toContain("MB limit");
   });
 
   it("gates record-level PATCH/DELETE by the photo's project tool level", async () => {

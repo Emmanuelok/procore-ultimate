@@ -29,7 +29,6 @@ import {
   inArray,
   isNotNull,
   isNull,
-  like,
   lt,
   lte,
   ne,
@@ -159,11 +158,6 @@ const PREVIEWABLE = /^(application\/pdf|image\/(png|jpeg|gif|webp|svg\+xml|bmp)|
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
-
-function rowsOf<T>(result: unknown): T[] {
-  const r = result as { rows?: T[] } | T[];
-  return Array.isArray(r) ? r : (r.rows ?? []);
-}
 
 function fieldValue(fields: unknown, key: string): string | undefined {
   const f = (fields as Record<string, unknown>)?.[key];
@@ -519,16 +513,12 @@ export const documentsModule: FastifyPluginAsync = async (app) => {
         })
         .where(eq(folders.id, folderId));
       if (newPath !== oldPath) {
-        const descendants = await tx
-          .select({ id: folders.id, path: folders.path })
-          .from(folders)
-          .where(
-            and(
-              eq(folders.projectId, projectId),
-              like(folders.path, `${oldPath}/%`),
-              ne(folders.id, folderId),
-            ),
-          );
+        // Prefix-match in memory: a folder name may legitimately contain the
+        // SQL LIKE wildcards `%` and `_`, and `like(path, '<oldPath>/%')`
+        // would then repath unrelated subtrees.
+        const descendants = rows.filter(
+          (f) => f.id !== folderId && f.path.startsWith(`${oldPath}/`),
+        );
         for (const d of descendants) {
           await tx
             .update(folders)
@@ -1590,7 +1580,4 @@ export const documentsModule: FastifyPluginAsync = async (app) => {
       return { ...summary, notified };
     },
   });
-
-  // Keep the raw-rows helper referenced for drivers that return { rows }.
-  void rowsOf;
 };

@@ -75,6 +75,8 @@ export default function SectionDrawer({
 }) {
   const [panel, setPanel] = useState<Panel>("revisions");
   const [refOpen, setRefOpen] = useState(false);
+  const [withdrawOpen, setWithdrawOpen] = useState(false);
+  const [withdrawReason, setWithdrawReason] = useState("");
   const detail = useSpecSection(projectId, sectionId, version);
   const { busy, refusal, clear, run } = useAction();
   const { confirm, dialog } = useConfirm();
@@ -97,6 +99,41 @@ export default function SectionDrawer({
     if (!ok) return;
     const done = await run(`accept:${revision.id}`, () =>
       api.post(`/api/v1/projects/${projectId}/spec-revisions/${revision.id}/accept`, {}),
+    );
+    if (done !== null) reload();
+  }
+
+  /**
+   * A section that is not in the current issue has not been "deleted": it has
+   * been WITHDRAWN, by a person, for a stated reason. Coverage stops counting
+   * it, the record keeps it, and any requirement still open on it is reported
+   * rather than swept away.
+   */
+  async function withdraw() {
+    if (!sectionId || withdrawReason.trim().length === 0) return;
+    const done = await run("withdraw", () =>
+      api.post<{ note?: string }>(
+        `/api/v1/projects/${projectId}/spec-sections/${sectionId}/withdraw`,
+        { reason: withdrawReason.trim() },
+      ),
+    );
+    if (done !== null) {
+      setWithdrawOpen(false);
+      setWithdrawReason("");
+      reload();
+    }
+  }
+
+  async function reinstate() {
+    const ok = await confirm({
+      title: "Put this section back in force?",
+      description:
+        "Reinstating says the section is part of the current issue after all. Coverage counts it again from now on; the withdrawal and its reason stay on the ledger.",
+      confirmLabel: "Reinstate",
+    });
+    if (!ok || !sectionId) return;
+    const done = await run("reinstate", () =>
+      api.post(`/api/v1/projects/${projectId}/spec-sections/${sectionId}/reinstate`, {}),
     );
     if (done !== null) reload();
   }
@@ -169,9 +206,27 @@ export default function SectionDrawer({
       }
       headerActions={
         section ? (
-          <Badge tone={SECTION_STATUS_TONE[section.status] ?? "neutral"} dot>
-            {titleCase(section.status)}
-          </Badge>
+          <span className="flex items-center gap-2">
+            <Badge tone={SECTION_STATUS_TONE[section.status] ?? "neutral"} dot>
+              {titleCase(section.status)}
+            </Badge>
+            {section.status === "withdrawn" ? (
+              <Button size="xs" variant="ghost" loading={busy === "reinstate"} onClick={() => void reinstate()}>
+                Reinstate
+              </Button>
+            ) : (
+              <Button
+                size="xs"
+                variant="ghost"
+                onClick={() => {
+                  setWithdrawReason("");
+                  setWithdrawOpen(true);
+                }}
+              >
+                Withdraw
+              </Button>
+            )}
+          </span>
         ) : null
       }
     >
@@ -246,6 +301,54 @@ export default function SectionDrawer({
             />
           )}
 
+          {section.status === "withdrawn" && section.withdrawnReason ? (
+            <Alert tone="warning" variant="subtle" size="sm" title="This section is withdrawn">
+              <p className="whitespace-pre-wrap">{section.withdrawnReason}</p>
+              <p className="mt-1 text-2xs text-content-muted">
+                Withdrawn {isoDate(section.withdrawnAt ?? null)}. Coverage no longer counts it; the
+                text and every requirement ever read from it stay on the record.
+              </p>
+            </Alert>
+          ) : null}
+
+          <Modal
+            open={withdrawOpen}
+            onClose={() => setWithdrawOpen(false)}
+            title={`Withdraw section ${section.code}?`}
+            description="Use this when the section is absent from the current issue. Coverage stops counting it, so the register is not measured against a section the project no longer builds to."
+            size="md"
+            footer={
+              <>
+                <Button variant="ghost" size="sm" onClick={() => setWithdrawOpen(false)}>
+                  Cancel
+                </Button>
+                <Button
+                  size="sm"
+                  variant="danger"
+                  loading={busy === "withdraw"}
+                  disabled={withdrawReason.trim().length === 0}
+                  onClick={() => void withdraw()}
+                >
+                  Withdraw the section
+                </Button>
+              </>
+            }
+          >
+            <Field
+              label="Why is it withdrawn?"
+              required
+              hint="Name the issue it is absent from. A withdrawal with no reason is indistinguishable from a mistake."
+            >
+              <Textarea
+                value={withdrawReason}
+                onChange={(e) => setWithdrawReason(e.target.value)}
+                rows={3}
+                maxLength={2000}
+                placeholder="Not present in Issue C (2026-03-14); the work moved into 03 35 00."
+              />
+            </Field>
+          </Modal>
+
           <AddReferenceModal
             open={refOpen}
             projectId={projectId}
@@ -289,7 +392,7 @@ function overviewItems(section: {
       hint: section.currentRevision
         ? `Issued ${isoDate(section.currentRevision.issuedDate)}${
             section.currentRevision.pageStart !== null
-              ? ` · pages ${section.currentRevision.pageStart + 1}–${(section.currentRevision.pageEnd ?? section.currentRevision.pageStart) + 1} of the book`
+              ? ` · pages ${section.currentRevision.pageStart}–${section.currentRevision.pageEnd ?? section.currentRevision.pageStart} of the book`
               : ""
           }`
         : "No revision has ever been loaded for this section.",
@@ -371,7 +474,7 @@ function RevisionsPanel({
                 <dd className="text-content">
                   {r.pageStart === null
                     ? EM_DASH
-                    : `${r.pageStart + 1}–${(r.pageEnd ?? r.pageStart) + 1}`}
+                    : `${r.pageStart}–${r.pageEnd ?? r.pageStart}`}
                 </dd>
                 <dt className="text-content-subtle">Content hash</dt>
                 <dd className="font-mono text-content">

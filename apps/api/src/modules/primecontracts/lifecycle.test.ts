@@ -161,7 +161,9 @@ describe("contract list, links and void", () => {
     await built.app.db.insert(primeContractSovLines).values({ id: newId("sov"), companyId: owner.companyId, projectId: proj, primeContractId: contractId, lineNumber: "CO-X", description: "CO scope", scheduledValue: 0, revisedScheduledValue: 0, isChangeOrderLine: 1 });
     const refreshed = await call("GET", `/prime-contracts/${contractId}/sov`);
     const co = refreshed.json<{ lines: Array<{ id: string; lineNumber: string }> }>().lines.find((l) => l.lineNumber === "CO-X")!;
-    const del = await call("DELETE", `/prime-contracts/${contractId}/sov/lines/${idOf("04")}`, { payload: { absorbIntoLineId: co.id } });
+    // the browser cannot put a body on DELETE, so the absorb target is also
+    // accepted as a query parameter — the guard has to hold on both paths
+    const del = await call("DELETE", `/prime-contracts/${contractId}/sov/lines/${idOf("04")}?absorbIntoLineId=${co.id}`);
     expect(del.statusCode).toBe(400);
     expect(del.json<{ message: string }>().message).toMatch(/appended by a change order/);
     await built.app.db.delete(primeContractSovLines).where(eq(primeContractSovLines.id, co.id));
@@ -393,6 +395,44 @@ describe("prime change orders fund the budget", () => {
     expect(body.executed.amount).toBe(40_000);
     expect(body.executed.shareOfOriginal).toBeCloseTo(40_000 / 1_025_000, 4);
     expect(body.cycleTimeDays.samples).toBe(2);
+  });
+
+  it("sends a change back for correction, then voids one that will never be executed", async () => {
+    const created = await call("POST", `/prime-contracts/${contractId}/changes`, { payload: { title: "Mispriced", amount: 5_000, lines: [{ sovLineId: idOf("01"), description: "Slab trim", amount: 5_000 }] } });
+    expect(created.statusCode).toBe(201);
+    const id = created.json<{ id: string }>().id;
+    await call("POST", `/prime-contracts/${contractId}/changes/${id}/submit`, { payload: {} });
+    // Sent back: the author may edit and resubmit — without this outcome a
+    // reviewer's only adverse verdict is a dead end.
+    const back = await call("POST", `/prime-contracts/${contractId}/changes/${id}/reject`, { payload: { reason: "Rate is wrong", outcome: "revise_and_resubmit" }, headers: certifierHeaders });
+    expect(back.statusCode).toBe(200);
+    expect(back.json<{ status: string }>().status).toBe("revise_and_resubmit");
+    const edited = await call("PATCH", `/prime-contracts/${contractId}/changes/${id}`, { payload: { amount: 6_000, lines: [{ sovLineId: idOf("01"), description: "Slab trim", amount: 6_000 }] } });
+    expect(edited.statusCode).toBe(200);
+    expect(edited.json<{ amount: number }>().amount).toBe(6_000);
+    await call("POST", `/prime-contracts/${contractId}/changes/${id}/submit`, { payload: {} });
+    const rejected = await call("POST", `/prime-contracts/${contractId}/changes/${id}/reject`, { payload: { reason: "Not proceeding" }, headers: certifierHeaders });
+    expect(rejected.json<{ status: string }>().status).toBe("rejected");
+    // A rejected change order cannot be edited or resubmitted — void is its
+    // only exit, and it must leave the exposure figures at zero.
+    expect((await call("PATCH", `/prime-contracts/${contractId}/changes/${id}`, { payload: { amount: 1 } })).statusCode).toBe(409);
+    expect((await call("POST", `/prime-contracts/${contractId}/changes/${id}/submit`, { payload: {} })).statusCode).toBe(409);
+    const readOnly = await call("POST", `/prime-contracts/${contractId}/changes/${id}/void`, { payload: { reason: "no" }, headers: readerHeaders });
+    expect(readOnly.statusCode).toBe(403);
+    const noReason = await call("POST", `/prime-contracts/${contractId}/changes/${id}/void`, { payload: {} });
+    expect(noReason.statusCode).toBe(400);
+    const voided = await call("POST", `/prime-contracts/${contractId}/changes/${id}/void`, { payload: { reason: "Withdrawn by the owner" }, headers: certifierHeaders });
+    expect(voided.statusCode).toBe(200);
+    expect(voided.json<{ status: string }>().status).toBe("void");
+    expect((await call("POST", `/prime-contracts/${contractId}/changes/${id}/void`, { payload: { reason: "again" }, headers: certifierHeaders })).statusCode).toBe(409);
+    const ledger = await built.app.db.select().from(ledgerEntries).where(eq(ledgerEntries.objectId, id));
+    expect(ledger.some((e) => e.action === "state_change")).toBe(true);
+    // the executed change order is a signed instrument: it is reversed, never voided
+    const executedVoid = await call("POST", `/prime-contracts/${contractId}/changes/${changeId}/void`, { payload: { reason: "no" }, headers: certifierHeaders });
+    expect(executedVoid.statusCode).toBe(409);
+    expect(executedVoid.json<{ message: string }>().message).toMatch(/reverse it with a further change order/);
+    const outsiderVoid = await call("POST", `/prime-contracts/${contractId}/changes/${id}/void`, { payload: { reason: "x" }, headers: outsider.headers });
+    expect(outsiderVoid.statusCode).toBe(404);
   });
 });
 

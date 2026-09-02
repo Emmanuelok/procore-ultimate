@@ -26,7 +26,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { FastifyInstance } from "fastify";
 import { eq } from "drizzle-orm";
-import { paymentClaims } from "@constructos/db";
+import { entities, entityRelationships, invoices, paymentClaims, vendors } from "@constructos/db";
 import { buildTestApp, registerActor } from "../test/helpers.js";
 import { addDaysISO, todayISO } from "../modules/field/dates.js";
 
@@ -197,7 +197,74 @@ const GROUND_TRUTH: PlantedScheme[] = [
     scope: "project",
     plant: plantExpiredPermit,
   },
+  /* ----- Platform upgrade wave (Domain A payables + network + certification) ----- */
+  {
+    id: "ghost_vendor_identity",
+    name: "Ghost vendor (supplier email is a project contact's email)",
+    specRef: "Domain A #53-54",
+    expectedDetector: "vendor_person_identity_collision",
+    scope: "company",
+    plant: plantGhostVendor,
+  },
+  {
+    id: "sequential_invoices",
+    name: "Sole-customer shell (four consecutive supplier invoice numbers)",
+    specRef: "Domain A #55",
+    expectedDetector: "sequential_invoice_numbers",
+    scope: "company",
+    plant: plantSequentialInvoices,
+  },
+  {
+    id: "duplicate_payment",
+    name: "Duplicate settlement (same supplier, same amount, same number, 2 days apart)",
+    specRef: "Domain A #60",
+    expectedDetector: "duplicate_payment",
+    scope: "company",
+    plant: plantDuplicatePayment,
+  },
+  {
+    id: "undeclared_conflict",
+    name: "Undeclared conflict (approver is a director of the supplier they approve)",
+    specRef: "Domain A #45-47",
+    expectedDetector: "undeclared_conflict",
+    scope: "company",
+    plant: plantUndeclaredConflict,
+  },
+  {
+    id: "sanctioned_entity",
+    name: "Designated party (entity name matches a screening-list designation)",
+    specRef: "Domain A #10, #42-43",
+    expectedDetector: "entity_screening_hit",
+    scope: "company",
+    plant: plantSanctionedEntity,
+  },
+  {
+    id: "backdated_records",
+    name: "Backdated entries (assertions dated weeks before they were written)",
+    specRef: "Domain A #104",
+    expectedDetector: "backdated_record",
+    scope: "project",
+    plant: plantBackdatedRecords,
+  },
+  {
+    id: "certified_above_evidenced",
+    name: "Over-certification (92% claimed against 48% observed by reality capture)",
+    specRef: "Domain A #65-71 (typed reconciliation)",
+    expectedDetector: "certified_above_evidenced",
+    scope: "project",
+    plant: plantOverCertifiedProgress,
+  },
 ];
+
+/** The one ghost supplier every payables scheme is planted against. */
+const GHOST_VENDOR = {
+  name: "Osprey Site Solutions Ltd",
+  email: "accounts@osprey-site.example",
+  registrationNumber: "13998210",
+} as const;
+
+/** Its id, filled in by plantGhostVendor and reused by the later plants. */
+let ghostVendorId = "";
 
 /**
  * The single payroll/reconciliation window shared by schemes 12-14 and by the
@@ -742,6 +809,177 @@ async function plantExpiredPermit(): Promise<void> {
 }
 
 /* ------------------------------------------------------------------ */
+/* Domain A payables, network and certification schemes                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The ghost supplier: a company whose registered email is the same address as
+ * a person the organisation already pays. The vendor and contact registers are
+ * written through the API; only `entityId` (which links a vendor to its
+ * assurance-layer entity, for the conflict walk) is set directly, because the
+ * directory module owns that column and offers no route for it.
+ */
+async function plantGhostVendor(): Promise<void> {
+  const created = (await post(ctx.ownerA, "/vendors", {
+    name: GHOST_VENDOR.name,
+    tradeCodes: ["groundworks"],
+    country: "GB",
+    registrationNumber: GHOST_VENDOR.registrationNumber,
+    email: GHOST_VENDOR.email,
+  })) as unknown as { id: string };
+  ghostVendorId = created.id;
+
+  // A project contact using the very same mailbox.
+  await post(ctx.ownerA, "/contacts", {
+    name: "R. Vance",
+    email: GHOST_VENDOR.email,
+    company: "Riverside JV",
+  });
+}
+
+/** Six invoices from the ghost supplier, four of them consecutively numbered. */
+async function plantSequentialInvoices(): Promise<void> {
+  const amounts = [12_340.5, 9_878.25, 15_002.9, 7_455.6];
+  for (const [i, total] of amounts.entries()) {
+    await insertGhostInvoice({
+      number: 8_100 + i,
+      reference: `GV-INV-${8_100 + i}`,
+      invoiceNumber: `OSP-${1_001 + i}`,
+      total,
+      billingDate: addDaysISO(todayISO(), -(40 - i * 5)),
+    });
+  }
+}
+
+/** The same amount, the same supplier number, two days apart. */
+async function plantDuplicatePayment(): Promise<void> {
+  for (const [i, billingDate] of [
+    addDaysISO(todayISO(), -12),
+    addDaysISO(todayISO(), -10),
+  ].entries()) {
+    await insertGhostInvoice({
+      number: 8_200 + i,
+      reference: `GV-INV-${8_200 + i}`,
+      invoiceNumber: "OSP-2010",
+      total: 8_412.75,
+      billingDate,
+    });
+  }
+}
+
+/**
+ * Invoices are written directly rather than through the invoicing API: an
+ * invoice there requires a commitment, a schedule of values and a billing
+ * period, none of which this scheme is about. The columns the payables
+ * detectors read — supplier, number, amount, dates, approver — are all set,
+ * which is what makes the plant faithful.
+ */
+async function insertGhostInvoice(input: {
+  number: number;
+  reference: string;
+  invoiceNumber: string;
+  total: number;
+  billingDate: string;
+}): Promise<void> {
+  await ctx.app.db.insert(invoices).values({
+    id: `inv_gv_${input.number}`,
+    companyId: ctx.companyId,
+    projectId: ctx.plantedProjectId,
+    kind: "subcontractor_invoice",
+    number: input.number,
+    reference: input.reference,
+    vendorId: ghostVendorId,
+    invoiceNumber: input.invoiceNumber,
+    currency: "GBP",
+    total: input.total,
+    subtotal: input.total,
+    billingDate: input.billingDate,
+    status: "approved",
+    approvedBy: ctx.ownerA.userId,
+    approvedAt: `${input.billingDate}T10:30:00.000Z`,
+    createdBy: ctx.ownerA.userId,
+  });
+}
+
+/**
+ * The approver of every one of the ghost supplier's invoices is also a
+ * director of it, and has declared nothing. Mirroring a user into the entity
+ * graph (`identifiers.user_id`) is what gives the walk a starting node.
+ */
+async function plantUndeclaredConflict(): Promise<void> {
+  const person = (await post(ctx.ownerA, "/entities", {
+    kind: "person",
+    name: "A. Kestrel",
+    jurisdiction: "GB",
+    identifiers: { user_id: ctx.ownerA.userId },
+  })) as unknown as { id: string };
+  const company = (await post(ctx.ownerA, "/entities", {
+    kind: "company",
+    name: GHOST_VENDOR.name,
+    jurisdiction: "GB",
+    identifiers: { company_number: GHOST_VENDOR.registrationNumber },
+  })) as unknown as { id: string };
+  await post(ctx.ownerA, `/entities/${person.id}/relationships`, {
+    toEntityId: company.id,
+    kind: "director_of",
+    source: "Companies House filing",
+    confidence: 1,
+  });
+  // Link the vendor record to its entity so the conflict walk can join the
+  // approval (which names a vendor) to the graph (which names entities).
+  await ctx.app.db
+    .update(vendors)
+    .set({ entityId: company.id })
+    .where(eq(vendors.id, ghostVendorId));
+}
+
+/** An entity whose name matches a designation on a screening list snapshot. */
+async function plantSanctionedEntity(): Promise<void> {
+  await post(ctx.ownerA, "/entities", {
+    kind: "company",
+    name: "Ironvale Construction Services Limited",
+    jurisdiction: "GB",
+    identifiers: { company_number: "10222118" },
+  });
+}
+
+/** Four assertions dated weeks before the moment they were written. */
+async function plantBackdatedRecords(): Promise<void> {
+  for (const daysAgo of [45, 38, 31, 24]) {
+    await postAssertion(ctx.ownerA, ctx.plantedProjectId, {
+      kind: "quantity",
+      value: 410 + daysAgo,
+      unit: "m3",
+      basis: `late-entered dayworks sheet, week ${daysAgo}`,
+      assertedAt: `${addDaysISO(todayISO(), -daysAgo)}T08:00:00Z`,
+    });
+  }
+}
+
+/**
+ * 92% claimed; independent reality capture inside the same window observed
+ * 48%. The typed reconciler (progress_vs_capture) is what turns that into a
+ * finding, and it only counts because the capture came from someone other than
+ * the claimant.
+ */
+async function plantOverCertifiedProgress(): Promise<void> {
+  await postAssertion(ctx.ownerA, ctx.plantedProjectId, {
+    kind: "progress_percent",
+    value: 92,
+    unit: "%",
+    basis: "interim application 7 — superstructure",
+  });
+  for (const observed of [47, 48, 49]) {
+    await post(ctx.memberB, `/projects/${ctx.plantedProjectId}/evidence`, {
+      kind: "reality_capture",
+      source: "monthly drone photogrammetry, independent surveyor",
+      independenceScore: 0.85,
+      metadata: { observedPercent: observed },
+    });
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Clean control — innocent data on a second project                   */
 /* ------------------------------------------------------------------ */
 
@@ -1102,11 +1340,50 @@ async function runDetectorsAndSweeps(): Promise<void> {
     const label = projectId === ctx.plantedProjectId ? "planted" : "clean";
     console.log(`detectors/run (${label}): ${JSON.stringify(run["perDetector"])}`);
   }
+  // Typed auto-reconciliation over every unreconciled assertion, on BOTH
+  // projects: the pass that tests a claim against the whole evidence pool
+  // rather than against whatever the claimant chose to attach.
+  for (const projectId of [ctx.plantedProjectId, ctx.cleanProjectId]) {
+    const auto = await post(ctx.ownerA, `/projects/${projectId}/reconciliations/auto`, {});
+    const label = projectId === ctx.plantedProjectId ? "planted" : "clean";
+    console.log(
+      `reconciliations/auto (${label}): ${String(auto["created"])} reconciliation(s), ` +
+        `${String(auto["signalsCreated"])} signal(s)`,
+    );
+  }
   // Entity graph scan (tenant-wide).
   const scan = await post(r, "/entities/scan");
   console.log(
     `entities/scan: ${String(scan["entitiesScanned"])} entities, ` +
       `${String(scan["signalsCreated"])} signal(s)`,
+  );
+  // Screening every entity against the configured list snapshots. This
+  // deployment ships fixtures, and every result names the snapshot it used.
+  const screened = await post(ctx.ownerA, "/entities/screen", {});
+  console.log(
+    `entities/screen: ${String(screened["screened"])} entity/entities, ` +
+      `${String(screened["withMatches"])} with matches`,
+  );
+  /*
+   * The company-scoped detector programme, run with an EXPLICIT detector list.
+   *
+   * The harness measures precision, so it must not run detectors it has
+   * planted nothing for: an unplanted detector firing on incidental harness
+   * data would be scored as a false positive and would say nothing about the
+   * detector's real precision. The full company suite is exercised by the
+   * module's own tests; here we score the schemes we planted.
+   */
+  const company = await post(ctx.ownerA, "/detectors/run", {
+    detectors: [
+      "vendor_person_identity_collision",
+      "sequential_invoice_numbers",
+      "duplicate_payment",
+      "undeclared_conflict",
+    ],
+  });
+  console.log(
+    `detectors/run (company): ${JSON.stringify(company["perDetector"])} ` +
+      `skipped=${JSON.stringify(company["skipped"])}`,
   );
   // The M17 payroll reconciliation is an operational (standard-level) route,
   // not a read: an assurance grant is read-only by design, so the reviewer

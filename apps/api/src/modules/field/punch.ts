@@ -32,6 +32,7 @@ import {
   assertVendor,
   hasToolAdmin,
   isCompanyAdmin,
+  vendorProjectUserIds,
 } from "./access.js";
 import { ageInDays, bucketise, daysOverdue } from "./ageingEngine.js";
 import {
@@ -234,7 +235,8 @@ export const punchRoutes: FastifyPluginAsync = async (app) => {
     const id = newId("pun");
     await app.db.insert(punchItems).values(toInsert(req, body, number, id));
     await ledgerItem("create", id, req, { number, title: body.title, vendorId: body.vendorId ?? null, locationId: body.locationId ?? null });
-    await notify(req, { id, number, title: body.title }, [body.assigneeId ?? "", ...(body.distribution ?? [])], "assignment");
+    const vendorPeople = await vendorProjectUserIds(app.db, req.companyId!, req.projectId!, body.vendorId);
+    await notify(req, { id, number, title: body.title }, [body.assigneeId ?? "", ...(body.distribution ?? []), ...vendorPeople], "assignment");
     return reply.status(201).send(decorate(await fetchItem(id, req), todayISO()));
   });
 
@@ -249,20 +251,24 @@ export const punchRoutes: FastifyPluginAsync = async (app) => {
       await assertProjectLocation(app.db, req.companyId!, req.projectId!, locationId);
     }
     for (const m of merged) checkVerifierNotAssignee(m);
-    const created: Array<{ id: string; number: number; title: string; assigneeId: string | null; distribution: string[] }> = [];
+    const created: Array<{ id: string; number: number; title: string; assigneeId: string | null; distribution: string[]; vendorId: string | null }> = [];
     await app.db.transaction(async (tx) => {
       for (const m of merged) {
         const number = await nextRecordNumber(tx, req.projectId!, "punch");
         const id = newId("pun");
         await tx.insert(punchItems).values(toInsert(req, m, number, id));
-        created.push({ id, number, title: m.title, assigneeId: m.assigneeId ?? null, distribution: m.distribution ?? [] });
+        created.push({ id, number, title: m.title, assigneeId: m.assigneeId ?? null, distribution: m.distribution ?? [], vendorId: m.vendorId ?? null });
       }
     });
     for (const c of created) {
       await ledgerItem("create", c.id, req, { number: c.number, title: c.title, bulk: true, batchSize: created.length });
     }
+    const vendorPeople = new Map<string, string[]>();
+    for (const vendorId of new Set(merged.map((m) => m.vendorId).filter((v): v is string => Boolean(v)))) {
+      vendorPeople.set(vendorId, await vendorProjectUserIds(app.db, req.companyId!, req.projectId!, vendorId));
+    }
     const targets = created.flatMap((c) =>
-      [c.assigneeId ?? "", ...c.distribution]
+      [c.assigneeId ?? "", ...c.distribution, ...(c.vendorId ? (vendorPeople.get(c.vendorId) ?? []) : [])]
         .filter((u) => u && u !== req.user!.id)
         .map((userId) => ({
           companyId: req.companyId!,
@@ -412,18 +418,26 @@ export const punchRoutes: FastifyPluginAsync = async (app) => {
     });
     for (const id of created) await ledgerItem("create", id, req, { templateId: template.id, title: template.title });
     const rows = await app.db.select().from(punchItems).where(inArray(punchItems.id, created)).orderBy(asc(punchItems.number));
-    if (body.assigneeId && body.assigneeId !== req.user!.id) {
+    const recipients = [
+      ...new Set([
+        ...(body.assigneeId ? [body.assigneeId] : []),
+        ...(await vendorProjectUserIds(app.db, req.companyId!, req.projectId!, body.vendorId)),
+      ]),
+    ].filter((id) => id !== req.user!.id);
+    if (recipients.length > 0) {
       await pushNotifications(
         app.db,
-        rows.map((r) => ({
-          companyId: req.companyId!,
-          userId: body.assigneeId!,
-          projectId: req.projectId!,
-          kind: "assignment" as const,
-          title: `${label(r.number)} assigned to you: ${r.title}`,
-          recordType: "punch_item",
-          recordId: r.id,
-        })),
+        rows.flatMap((r) =>
+          recipients.map((userId) => ({
+            companyId: req.companyId!,
+            userId,
+            projectId: req.projectId!,
+            kind: "assignment" as const,
+            title: `${label(r.number)} assigned to you: ${r.title}`,
+            recordType: "punch_item",
+            recordId: r.id,
+          })),
+        ),
       );
     }
     const today = todayISO();
@@ -665,6 +679,10 @@ export const punchRoutes: FastifyPluginAsync = async (app) => {
     if (body.assigneeId && body.assigneeId !== item.assigneeId) await notify(req, item, [body.assigneeId], "assignment");
     if (body.verifierId && body.verifierId !== item.verifierId) {
       await notify(req, item, [body.verifierId], "assignment", `${label(item.number)} names you as verifier: ${item.title}`);
+    }
+    if (body.vendorId && body.vendorId !== item.vendorId) {
+      const people = await vendorProjectUserIds(app.db, req.companyId!, req.projectId!, body.vendorId);
+      await notify(req, item, people, "assignment", `${label(item.number)} is now assigned to your company: ${item.title}`);
     }
     return decorate(await fetchItem(itemId, req), todayISO());
   });

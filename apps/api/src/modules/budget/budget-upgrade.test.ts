@@ -13,6 +13,10 @@ import {
   budgetLineItems,
   budgetPostings,
   budgetReconciliations,
+  bidAwards,
+  bidPackages,
+  bidSubmissionLines,
+  bidSubmissions,
   changeOrderPackages,
   commitmentPayments,
   commitmentSovLines,
@@ -31,6 +35,7 @@ import {
   scheduleTasks,
   schedules,
   signals,
+  timecardAllocations,
 } from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
 import type { BuiltApp } from "../../app.js";
@@ -498,6 +503,43 @@ describe("line guards", () => {
     expect(res.json().details.references.length).toBeGreaterThan(0);
   });
 
+  it("refuses to delete a line that labour hours were posted to", async () => {
+    const fresh = await inject("POST", `/api/v1/projects/${proj}/budgets`, u1.headers, { name: "Labour refs", currency: "USD" });
+    const freshId = fresh.json().id as string;
+    const line = await inject("POST", `/api/v1/budgets/${freshId}/lines`, u1.headers, { costCodeId: ccElec, description: "Electrical labour", originalBudget: 10_000 });
+    const lineId = line.json().id as string;
+    const gone = await inject("DELETE", `/api/v1/budget-lines/${lineId}`, u1.headers);
+    expect(gone.statusCode).toBe(200);
+    const kept = await inject("POST", `/api/v1/budgets/${freshId}/lines`, u1.headers, { costCodeId: ccElec, description: "Electrical labour", originalBudget: 10_000 });
+    const keptId = kept.json().id as string;
+    const timecardId = newId("tc");
+    await built.app.db.insert(timecardAllocations).values({
+      id: newId("tca"),
+      companyId: u1.companyId,
+      projectId: proj,
+      timecardId,
+      budgetLineItemId: keptId,
+      costCodeId: ccElec,
+      costCode: "16100",
+      totalHours: 8,
+      cost: 480,
+      currency: "USD",
+    });
+    const refused = await inject("DELETE", `/api/v1/budget-lines/${keptId}`, u1.headers);
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json().message).toMatch(/timecard_allocations/);
+    // deleting the whole budget takes its postings, reconciliations and views
+    // with it rather than leaving them pointing at nothing
+    await built.app.db.delete(timecardAllocations).where(eq(timecardAllocations.budgetLineItemId, keptId));
+    await inject("POST", `/api/v1/budgets/${freshId}/views`, u1.headers, { name: "Doomed view", calculatedFields: [] });
+    await inject("POST", `/api/v1/budgets/${freshId}/reconcile`, u1.headers);
+    expect((await built.app.db.select().from(budgetReconciliations).where(eq(budgetReconciliations.budgetId, freshId))).length).toBe(1);
+    const dropped = await inject("DELETE", `/api/v1/budgets/${freshId}`, u1.headers);
+    expect(dropped.statusCode).toBe(200);
+    expect(await built.app.db.select().from(budgetPostings).where(eq(budgetPostings.budgetId, freshId))).toHaveLength(0);
+    expect(await built.app.db.select().from(budgetReconciliations).where(eq(budgetReconciliations.budgetId, freshId))).toHaveLength(0);
+  });
+
   it("upserts a CSV that carries only a quantity without zeroing the budget, and keeps qty × rate true", async () => {
     const measured = await inject("POST", `/api/v1/budgets/${budgetId}/lines`, u1.headers, { costCode: "03310", costType: "labour", description: "Rebar fixing", quantity: 100, unitRate: 50, unit: "t" });
     expect(measured.statusCode, measured.body).toBe(201);
@@ -712,6 +754,185 @@ describe("ERP import through the GL map (#481)", () => {
     expect((concrete.detail as { provenance: { rows: unknown[] } }).provenance.rows).toHaveLength(1);
     const del = await inject("DELETE", `/api/v1/gl-cost-code-maps/${mapId}?projectId=${proj}`, u1.headers);
     expect(del.statusCode).toBe(200);
+  });
+});
+
+describe("estimate to budget from the awarded submission (#480)", () => {
+  let packageId: string;
+  let submissionId: string;
+  let awardId: string;
+  const vendorId = newId("ven");
+
+  const seed = async () => {
+    packageId = newId("bpk");
+    submissionId = newId("bsub");
+    awardId = newId("bawd");
+    await built.app.db.insert(bidPackages).values({
+      id: packageId,
+      companyId: u1.companyId,
+      projectId: proj,
+      number: 1,
+      reference: "BP-001",
+      title: "Concrete frame",
+      currency: "USD",
+      status: "awarded",
+      createdBy: u1.userId,
+    });
+    await built.app.db.insert(bidSubmissions).values({
+      id: submissionId,
+      companyId: u1.companyId,
+      projectId: proj,
+      packageId,
+      vendorId,
+      reference: "SUB-001",
+      status: "submitted",
+      baseBidAmount: 300_000,
+      currency: "USD",
+      createdBy: u1.userId,
+    });
+    await built.app.db.insert(bidSubmissionLines).values([
+      // two priced rows on the same cost code — they aggregate onto one budget line
+      { id: newId("bsl"), companyId: u1.companyId, projectId: proj, submissionId, packageId, vendorId, position: 1, description: "Slab pour", quantity: 1_000, unitRate: 150, amount: 150_000, currency: "USD", costCodeId: ccCip },
+      { id: newId("bsl"), companyId: u1.companyId, projectId: proj, submissionId, packageId, vendorId, position: 2, description: "Column pour", amount: 50_000, currency: "USD", costCodeId: ccCip },
+      { id: newId("bsl"), companyId: u1.companyId, projectId: proj, submissionId, packageId, vendorId, position: 3, description: "Rebar supply", quantity: 200, unit: "t", unitRate: 400, amount: 80_000, currency: "USD", costCodeId: ccRebar },
+      // excluded scope is not a budget
+      { id: newId("bsl"), companyId: u1.companyId, projectId: proj, submissionId, packageId, vendorId, position: 4, description: "Dewatering", amount: 30_000, currency: "USD", costCodeId: ccCip, isExcluded: 1 },
+      // an alternate is an option, not the base price
+      { id: newId("bsl"), companyId: u1.companyId, projectId: proj, submissionId, packageId, vendorId, position: 5, description: "Polished finish", amount: 20_000, currency: "USD", costCodeId: ccCip, isAlternate: 1, alternateLabel: "ALT-1" },
+    ]);
+    await built.app.db.insert(bidAwards).values({
+      id: awardId,
+      companyId: u1.companyId,
+      projectId: proj,
+      packageId,
+      submissionId,
+      vendorId,
+      number: 1,
+      reference: "AWD-001",
+      awardAmount: 280_000,
+      currency: "USD",
+      status: "recommended",
+      recommendedBy: u1.userId,
+      createdBy: u1.userId,
+    });
+  };
+
+  it("refuses until an award is approved, and refuses a currency mismatch", async () => {
+    await seed();
+    const fresh = await inject("POST", `/api/v1/projects/${proj}/budgets`, u1.headers, { name: "From award", currency: "USD" });
+    const freshId = fresh.json().id as string;
+    const early = await inject("POST", `/api/v1/budgets/${freshId}/lines/from-estimate`, u1.headers, { packageId });
+    expect(early.statusCode).toBe(409);
+    expect(early.json().message).toMatch(/no approved award/);
+    await built.app.db.update(bidAwards).set({ status: "approved", currency: "EUR" }).where(eq(bidAwards.id, awardId));
+    const wrongCurrency = await inject("POST", `/api/v1/budgets/${freshId}/lines/from-estimate`, u1.headers, { packageId });
+    expect(wrongCurrency.statusCode).toBe(409);
+    expect(wrongCurrency.json().message).toMatch(/never converted silently/);
+    await built.app.db.update(bidAwards).set({ currency: "USD" }).where(eq(bidAwards.id, awardId));
+    const missing = await inject("POST", `/api/v1/budgets/${freshId}/lines/from-estimate`, u1.headers, { packageId: newId("bpk") });
+    expect(missing.statusCode).toBe(404);
+  });
+
+  it("dry-runs the award: excluded scope and alternates are named, the shortfall against the award is explained", async () => {
+    const fresh = await inject("POST", `/api/v1/projects/${proj}/budgets`, u1.headers, { name: "Award dry run", currency: "USD" });
+    const freshId = fresh.json().id as string;
+    const dry = await inject("POST", `/api/v1/budgets/${freshId}/lines/from-estimate`, u1.headers, { packageId, dryRun: true });
+    expect(dry.statusCode).toBe(200);
+    const body = dry.json();
+    expect(body.dryRun).toBe(true);
+    expect(body.source.awardReference).toBe("AWD-001");
+    // 150,000 + 50,000 on 03300, 80,000 on 03310 → two lines, 280,000
+    expect(body.readyLines).toBe(2);
+    expect(body.totalOriginalBudget).toBe(280_000);
+    expect(body.reconciliation.ok).toBe(true);
+    expect(body.issues).toEqual([]);
+    expect(body.skipped.map((s: { description: string }) => s.description).sort()).toEqual(["Dewatering", "Polished finish"]);
+    // nothing was written
+    const lines = await built.app.db.select().from(budgetLineItems).where(eq(budgetLineItems.budgetId, freshId));
+    expect(lines).toHaveLength(0);
+  });
+
+  it("writes the lines with the award's provenance, aggregating rows that share a cost code", async () => {
+    const fresh = await inject("POST", `/api/v1/projects/${proj}/budgets`, u1.headers, { name: "Award budget", currency: "USD" });
+    const freshId = fresh.json().id as string;
+    const res = await inject("POST", `/api/v1/budgets/${freshId}/lines/from-estimate`, u1.headers, { packageId });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().created).toBe(2);
+    const lines = await built.app.db.select().from(budgetLineItems).where(eq(budgetLineItems.budgetId, freshId));
+    const concrete = lines.find((l) => l.costCode === "03300")!;
+    // two priced rows aggregated: no single quantity or rate survives
+    expect(concrete.originalBudget).toBe(200_000);
+    expect(concrete.quantity).toBeNull();
+    const prov = (concrete.detail as { provenance: { sourceType: string; sourceId: string; awardReference: string; submissionLineIds: string[] } }).provenance;
+    expect(prov.sourceType).toBe("bid_package");
+    expect(prov.sourceId).toBe(packageId);
+    expect(prov.awardReference).toBe("AWD-001");
+    expect(prov.submissionLineIds).toHaveLength(2);
+    // a single measured row keeps quantity × rate, and the identity holds
+    const rebar = lines.find((l) => l.costCode === "03310")!;
+    expect(rebar.quantity).toBe(200);
+    expect(rebar.unitRate).toBe(400);
+    expect(rebar.originalBudget).toBe(80_000);
+    expect(rebar.unit).toBe("t");
+    const ledger = await built.app.db.select().from(ledgerEntries).where(eq(ledgerEntries.objectId, freshId));
+    expect(ledger.some((e) => e.action === "create")).toBe(true);
+    // a second run into the same budget collides unless it is an upsert
+    const again = await inject("POST", `/api/v1/budgets/${freshId}/lines/from-estimate`, u1.headers, { packageId });
+    expect(again.statusCode).toBe(400);
+    // a key another module put on the line survives the upsert; the
+    // provenance it does own is refreshed rather than dropped
+    await built.app.db.update(budgetLineItems).set({ detail: { ...(concrete.detail as Record<string, unknown>), notedBy: "commercial" } }).where(eq(budgetLineItems.id, concrete.id));
+    const upsert = await inject("POST", `/api/v1/budgets/${freshId}/lines/from-estimate`, u1.headers, { packageId, mode: "upsert" });
+    expect(upsert.statusCode).toBe(201);
+    expect(upsert.json().updated).toBe(2);
+    const reread = (await built.app.db.select().from(budgetLineItems).where(eq(budgetLineItems.id, concrete.id)))[0]!;
+    const detail = reread.detail as { notedBy?: string; provenance?: { awardReference: string } };
+    expect(detail.notedBy).toBe("commercial");
+    expect(detail.provenance?.awardReference).toBe("AWD-001");
+    expect(reread.originalBudget).toBe(200_000);
+  });
+
+  it("names the lines that cannot land and writes nothing", async () => {
+    const orphan = newId("bsl");
+    await built.app.db.insert(bidSubmissionLines).values({ id: orphan, companyId: u1.companyId, projectId: proj, submissionId, packageId, vendorId, position: 6, description: "Unmapped scope", amount: 12_000, currency: "USD" });
+    const fresh = await inject("POST", `/api/v1/projects/${proj}/budgets`, u1.headers, { name: "Award refusal", currency: "USD" });
+    const freshId = fresh.json().id as string;
+    const res = await inject("POST", `/api/v1/budgets/${freshId}/lines/from-estimate`, u1.headers, { packageId });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().details.issues[0].message).toMatch(/carries no cost code/);
+    expect(await built.app.db.select().from(budgetLineItems).where(eq(budgetLineItems.budgetId, freshId))).toHaveLength(0);
+    // the dry run still reports, and the shortfall against the award is stated
+    const dry = await inject("POST", `/api/v1/budgets/${freshId}/lines/from-estimate`, u1.headers, { packageId, dryRun: true });
+    expect(dry.json().issues).toHaveLength(1);
+    expect(dry.json().reconciliation.ok).toBe(true);
+    await built.app.db.delete(bidSubmissionLines).where(eq(bidSubmissionLines.id, orphan));
+  });
+
+  it("lists the awards this budget could be built from, and says why one cannot be", async () => {
+    const fresh = await inject("POST", `/api/v1/projects/${proj}/budgets`, u1.headers, { name: "Award sources", currency: "USD" });
+    const freshId = fresh.json().id as string;
+    const res = await inject("GET", `/api/v1/budgets/${freshId}/estimate-sources`, u1.headers);
+    expect(res.statusCode).toBe(200);
+    const items = res.json().items as Array<{ packageId: string; awardReference: string; importable: boolean; reason: string | null }>;
+    const mine = items.find((i) => i.packageId === packageId)!;
+    expect(mine.awardReference).toBe("AWD-001");
+    expect(mine.importable).toBe(true);
+    expect(mine.reason).toBeNull();
+    // a budget in another currency can read the award but cannot import it
+    const eur = await inject("POST", `/api/v1/projects/${proj}/budgets`, u1.headers, { name: "Award sources EUR", currency: "EUR" });
+    const eurSources = await inject("GET", `/api/v1/budgets/${eur.json().id}/estimate-sources`, u1.headers);
+    const eurMine = (eurSources.json().items as Array<{ packageId: string; importable: boolean; reason: string | null }>).find((i) => i.packageId === packageId)!;
+    expect(eurMine.importable).toBe(false);
+    expect(eurMine.reason).toMatch(/kept in EUR/);
+  });
+
+  it("is closed to a read-only member and to another company", async () => {
+    const fresh = await inject("POST", `/api/v1/projects/${proj}/budgets`, u1.headers, { name: "Award tenancy", currency: "USD" });
+    const freshId = fresh.json().id as string;
+    expect((await inject("POST", `/api/v1/budgets/${freshId}/lines/from-estimate`, h4, { packageId })).statusCode).toBe(403);
+    expect((await inject("POST", `/api/v1/budgets/${freshId}/lines/from-estimate`, outsider.headers, { packageId })).statusCode).toBe(404);
+    expect((await inject("GET", `/api/v1/budgets/${freshId}/estimate-sources`, outsider.headers)).statusCode).toBe(404);
+    expect((await inject("GET", `/api/v1/budgets/${freshId}/estimate-sources`, h4)).statusCode).toBe(200);
   });
 });
 

@@ -116,6 +116,11 @@ export default function PhotosPage() {
   const list = useFieldResource<ListResponse<Photo>>(projectId ? `${base}${qs({ page, pageSize: PAGE_SIZE, album: selectedAlbum && selectedAlbum !== UNFILED ? selectedAlbum : "", unfiled: selectedAlbum === UNFILED, tag, hasGps, is360, search: debounced })}` : null, [version]);
   const albums = useFieldResource<{ items: AlbumRow[] }>(projectId ? `${base}/albums` : null, [version]);
   const tags = useFieldResource<{ items: Array<{ tag: string; manual: number; ai: number }> }>(projectId ? `${base}/tags` : null, [version]);
+  // Sheets power the drawing-pin picker (#433). The drawings tool is gated
+  // separately, so a 403 here just falls back to a free-text sheet id.
+  const sheets = useFieldResource<{ items: Array<{ id: string; number: string; title: string }> }>(
+    projectId ? `/api/v1/projects/${projectId}/sheets?pageSize=200` : null,
+  );
 
   const [uploadBusy, setUploadBusy] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<string | null>(null);
@@ -258,15 +263,16 @@ export default function PhotosPage() {
         <AlbumsPanel base={base} albums={albums} users={users} nameOf={nameOf} me={me} onChanged={refresh} />
       )}
 
-      <Lightbox base={base} photo={lightbox} albums={namedAlbums.map((a) => a.album)} locations={locations} nameOf={nameOf} cache={blobCache} onClose={() => setLightbox(null)} onChanged={(p) => { setLightbox(p); refresh(); }} onDeleted={() => { setLightbox(null); refresh(); }} />
+      <Lightbox base={base} photo={lightbox} albums={namedAlbums.map((a) => a.album)} sheets={sheets.data?.items ?? []} locations={locations} nameOf={nameOf} cache={blobCache} onClose={() => setLightbox(null)} onChanged={(p) => { setLightbox(p); refresh(); }} onDeleted={() => { setLightbox(null); refresh(); }} />
     </div>
   );
 }
 
-function Lightbox({ base, photo, albums, locations, nameOf, cache, onClose, onChanged, onDeleted }: {
+function Lightbox({ base, photo, albums, sheets, locations, nameOf, cache, onClose, onChanged, onDeleted }: {
   base: string;
   photo: Photo | null;
   albums: string[];
+  sheets: Array<{ id: string; number: string; title: string }>;
   locations: { items: Array<{ id: string; name: string }>; labelOf: (id: string | null | undefined) => string };
   nameOf: (id: string | null | undefined) => string;
   cache: BlobCache;
@@ -279,6 +285,9 @@ function Lightbox({ base, photo, albums, locations, nameOf, cache, onClose, onCh
   const [tags, setTags] = useState("");
   const [is360, setIs360] = useState(false);
   const [locationId, setLocationId] = useState("");
+  const [pinSheet, setPinSheet] = useState("");
+  const [pinX, setPinX] = useState("");
+  const [pinY, setPinY] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [url, setUrl] = useState<string | null>(null);
@@ -289,6 +298,9 @@ function Lightbox({ base, photo, albums, locations, nameOf, cache, onClose, onCh
     setTags(photo.tags.join(", "));
     setIs360(photo.is360 === 1);
     setLocationId(photo.locationId ?? "");
+    setPinSheet(photo.pin?.sheetId ?? "");
+    setPinX(photo.pin ? String(photo.pin.x) : "");
+    setPinY(photo.pin ? String(photo.pin.y) : "");
     setError(null);
     const src = `${base}/${photo.id}/content`;
     const cached = cache.current.get(src);
@@ -305,7 +317,18 @@ function Lightbox({ base, photo, albums, locations, nameOf, cache, onClose, onCh
     setBusy(true);
     setError(null);
     try {
-      const updated = await api.patch<Photo>(`${base}/${photo.id}`, { caption: caption.trim() || null, album: album.trim() || null, tags: tags.split(",").map((t) => t.trim()).filter(Boolean), is360, locationId: locationId || null });
+      let pin: { sheetId: string; x: number; y: number } | null = null;
+      if (pinSheet.trim() !== "") {
+        const x = Number(pinX);
+        const y = Number(pinY);
+        if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > 1 || y < 0 || y > 1) {
+          setError("A drawing pin needs x and y between 0 and 1 (fractions of the sheet).");
+          setBusy(false);
+          return;
+        }
+        pin = { sheetId: pinSheet.trim(), x, y };
+      }
+      const updated = await api.patch<Photo>(`${base}/${photo.id}`, { caption: caption.trim() || null, album: album.trim() || null, tags: tags.split(",").map((t) => t.trim()).filter(Boolean), is360, locationId: locationId || null, pin });
       onChanged(updated);
     } catch (err) {
       setError(errorMessage(err));
@@ -362,6 +385,21 @@ function Lightbox({ base, photo, albums, locations, nameOf, cache, onClose, onCh
         </div>
         <datalist id="photo-albums">{albums.map((a) => <option key={a} value={a} />)}</datalist>
         <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={is360} onChange={(e) => setIs360(e.target.checked)} /> 360° / panoramic capture</label>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
+          <Field label="Drawing pin — sheet" hint={sheets.length > 0 ? "Where on the drawings this photo was taken (#433)." : "Sheet list unavailable — paste the sheet id if you know it."}>
+            {sheets.length > 0 ? (
+              <Select value={pinSheet} onChange={(e) => setPinSheet(e.target.value)}>
+                <option value="">Not pinned</option>
+                {sheets.map((sh) => <option key={sh.id} value={sh.id}>{sh.number} {sh.title}</option>)}
+              </Select>
+            ) : (
+              <Input value={pinSheet} onChange={(e) => setPinSheet(e.target.value)} placeholder="sht_…" />
+            )}
+          </Field>
+          <Field label="Pin x" hint="0 = left edge, 1 = right edge."><Input type="number" min="0" max="1" step="0.01" value={pinX} onChange={(e) => setPinX(e.target.value)} disabled={pinSheet.trim() === ""} /></Field>
+          <Field label="Pin y" hint="0 = top edge, 1 = bottom edge."><Input type="number" min="0" max="1" step="0.01" value={pinY} onChange={(e) => setPinY(e.target.value)} disabled={pinSheet.trim() === ""} /></Field>
+          <div className="flex items-end"><Button variant="ghost" size="sm" disabled={pinSheet.trim() === ""} onClick={() => { setPinSheet(""); setPinX(""); setPinY(""); }}>Clear pin</Button></div>
+        </div>
         <div className="grid grid-cols-2 gap-2 text-xs text-ink-500 sm:grid-cols-4">
           <span>Uploaded by {nameOf(photo.uploadedBy)}</span>
           <span>{formatDateTime(photo.createdAt)}</span>

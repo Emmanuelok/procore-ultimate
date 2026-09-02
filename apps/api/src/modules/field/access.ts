@@ -10,14 +10,20 @@
  *    tenant, so ball-in-court, distribution, verifier and reviewer fields can
  *    never point at a stranger (audit: rfis.ts:137).
  *  - `projectManagerIds` lists who the escalation ladder treats as "PM".
+ *  - `vendorProjectUserIds` resolves a vendor to the platform users who work
+ *    for it on this project (vendor contact email → user account → project
+ *    membership), so assigning a defect to a subcontractor actually reaches
+ *    the subcontractor rather than only the person who raised it.
  */
 import type { FastifyInstance } from "fastify";
 import { and, eq, inArray } from "drizzle-orm";
 import {
   companyMemberships,
+  contacts,
   locations,
   permissionTemplates,
   projectMemberships,
+  users,
   vendors,
 } from "@constructos/db";
 import {
@@ -181,4 +187,29 @@ export async function projectMemberIds(db: Db, companyId: string, projectId: str
     .from(projectMemberships)
     .where(and(eq(projectMemberships.companyId, companyId), eq(projectMemberships.projectId, projectId)));
   return rows.map((r) => r.userId);
+}
+
+/**
+ * Users who belong to `vendorId` and are members of `projectId`: the vendor's
+ * contacts (directory) matched to platform accounts by email. A vendor with
+ * no contact that has a login returns [] — the caller keeps its own targets.
+ */
+export async function vendorProjectUserIds(
+  db: Db,
+  companyId: string,
+  projectId: string,
+  vendorId: string | null | undefined,
+): Promise<string[]> {
+  if (!vendorId) return [];
+  const rows = await db
+    .select({ userId: users.id })
+    .from(contacts)
+    .innerJoin(users, eq(users.email, contacts.email))
+    .innerJoin(
+      projectMemberships,
+      and(eq(projectMemberships.userId, users.id), eq(projectMemberships.projectId, projectId)),
+    )
+    .where(and(eq(contacts.companyId, companyId), eq(contacts.vendorId, vendorId)))
+    .limit(100);
+  return [...new Set(rows.map((r) => r.userId))];
 }

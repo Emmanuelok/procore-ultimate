@@ -703,3 +703,1177 @@ export const turnoverPackages = pgTable(
     index("turnover_packages_system_idx").on(t.systemId),
   ],
 );
+
+/* ================================================================== */
+/* WP-QUAL — Domain V depth and Domain Z quality registers            */
+/*                                                                     */
+/* Everything below hangs off the four tables above rather than        */
+/* restating them. The rule the whole section obeys: a quality record  */
+/* is only worth keeping if it can answer a challenge years later, so  */
+/* every register stores WHO said it, WHEN, against WHICH criterion,   */
+/* and WHICH document proves it — never just a status.                 */
+/* ================================================================== */
+
+/* ------------------------------------------------------------------ */
+/* Sequential sign-off on an intervention point (#1092–1094)           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * One nominated party's leg of a hold or witness point.
+ *
+ * A hold point in a real ITP is almost never released by one signature: the
+ * contractor's own QC signs first, then the engineer, then the client or a
+ * third-party surveillance body (a notified body, an insurer's engineer, a
+ * certifying authority). Holding the chain as rows rather than as a jsonb bag
+ * on the activity buys three things the bag cannot: an ORDER that can be
+ * enforced, a per-party release that is separately ledgered and separately
+ * attributable, and a place to put the surveillance report the third party
+ * actually issued.
+ *
+ * `required` distinguishes the parties whose signature the point waits for
+ * from the ones who are merely invited. `position` is the sequence: a party
+ * may not sign before every required party ahead of it has.
+ */
+export const itpActivityReleases = pgTable(
+  "itp_activity_releases",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    itpId: text("itp_id").notNull(),
+    activityId: text("activity_id").notNull(),
+    /** order in the chain: contractor QC 1, engineer 2, third party 3 */
+    position: integer("position").default(0).notNull(),
+    party: text("party").notNull(), // ItpResponsibleParty
+    /** 1 = the point waits for this party; 0 = invited, does not block */
+    required: integer("required").default(1).notNull(),
+    /** the platform user nominated, where the verifier has an account */
+    userId: text("user_id"),
+    vendorId: text("vendor_id"),
+    organisation: text("organisation"),
+    contactName: text("contact_name"),
+    contactEmail: text("contact_email"),
+    /** third-party surveillance body accreditation, e.g. "UKAS 0086" */
+    accreditation: text("accreditation"),
+    status: text("status").default("pending").notNull(), // ReleasePartyStatus
+    notifiedAt: timestamp("notified_at", { withTimezone: true, mode: "string" }),
+    notifiedBy: text("notified_by"),
+    /** attendance is a different fact from a signature */
+    attendedAt: timestamp("attended_at", { withTimezone: true, mode: "string" }),
+    attendedByName: text("attended_by_name"),
+    releasedBy: text("released_by"),
+    releasedAt: timestamp("released_at", { withTimezone: true, mode: "string" }),
+    releasedByName: text("released_by_name"),
+    note: text("note"),
+    /** the surveillance report the third party issued for its visit */
+    reportFileId: text("report_file_id"),
+    signatureFileId: text("signature_file_id"),
+    /** a leg released against a concession names it */
+    concessionId: text("concession_id"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("itp_activity_releases_activity_idx").on(t.activityId, t.position),
+    index("itp_activity_releases_project_idx").on(t.projectId, t.status),
+    index("itp_activity_releases_user_idx").on(t.userId, t.status),
+  ],
+);
+
+/* ------------------------------------------------------------------ */
+/* Concessions, deviation permits and waivers (#1091)                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The register of departures somebody agreed to.
+ *
+ * `use_as_is` and `repair` dispositions leave non-conforming work in the
+ * building; both are only defensible if the DESIGNER accepted them, and that
+ * acceptance is a document with an author, a date, conditions and — very
+ * often — an expiry or a quantity limit. Holding it as a register rather than
+ * as a text field on the NCR is what makes "how many concessions have we
+ * given this subcontractor" and "which concessions expire before handover"
+ * answerable at all.
+ */
+export const qualityConcessions = pgTable(
+  "quality_concessions",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    kind: text("kind").default("concession").notNull(), // ConcessionKind
+    title: text("title").notNull(),
+    description: text("description").notNull(),
+    /** the departure from the specified requirement, stated as a departure */
+    departureFromRequirement: text("departure_from_requirement"),
+    justification: text("justification"),
+    status: text("status").default("draft").notNull(), // ConcessionStatus
+    /* what it covers */
+    ncrId: text("ncr_id"),
+    itpActivityId: text("itp_activity_id"),
+    checklistId: text("checklist_id"),
+    testRecordId: text("test_record_id"),
+    weldId: text("weld_id"),
+    pourId: text("pour_id"),
+    certificateId: text("certificate_id"),
+    specSectionId: text("spec_section_id"),
+    specClauseRef: text("spec_clause_ref"),
+    drawingSheetId: text("drawing_sheet_id"),
+    locationId: text("location_id"),
+    locationText: text("location_text"),
+    assetId: text("asset_id"),
+    vendorId: text("vendor_id"),
+    commitmentId: text("commitment_id"),
+    /* the limits that make it a concession rather than a rewrite of the spec */
+    quantityLimit: doublePrecision("quantity_limit"),
+    unit: text("unit"),
+    conditions: text("conditions"),
+    expiryDate: text("expiry_date"),
+    /* who decided */
+    requestedBy: text("requested_by").notNull(),
+    requestedAt: timestamp("requested_at", { withTimezone: true, mode: "string" }),
+    designerOrganisation: text("designer_organisation"),
+    designerContact: text("designer_contact"),
+    /** the designer's/client's acceptance — never the party who requested it */
+    approvedBy: text("approved_by"),
+    approvedAt: timestamp("approved_at", { withTimezone: true, mode: "string" }),
+    approvalAuthority: text("approval_authority"),
+    approvalComments: text("approval_comments"),
+    rejectionReason: text("rejection_reason"),
+    closedBy: text("closed_by"),
+    closedAt: timestamp("closed_at", { withTimezone: true, mode: "string" }),
+    /* commercial consequence of accepting non-conforming work */
+    valueImpact: doublePrecision("value_impact"),
+    currency: text("currency").default("USD").notNull(),
+    changeEventId: text("change_event_id"),
+    documentFileId: text("document_file_id"),
+    attachmentFileIds: jsonb("attachment_file_ids").$type<string[]>().default([]).notNull(),
+    signalId: text("signal_id"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("quality_concessions_uq").on(t.projectId, t.number),
+    index("quality_concessions_project_idx").on(t.projectId, t.status),
+    index("quality_concessions_ncr_idx").on(t.ncrId),
+    index("quality_concessions_expiry_idx").on(t.projectId, t.expiryDate),
+    index("quality_concessions_vendor_idx").on(t.vendorId, t.status),
+  ],
+);
+
+/* ------------------------------------------------------------------ */
+/* Concrete pours and specimen statistics (#1085–1086)                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A pour is the single most irreversible act on a construction site: once it
+ * has gone off, every question about it is answered from records made in the
+ * two hours around it or not at all. The columns are those questions —
+ * which mix, from which plant, on which tickets, at what slump and what
+ * temperature, cured how, with which pre-pour checklist released by whom.
+ */
+export const concretePours = pgTable(
+  "concrete_pours",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    pourName: text("pour_name").notNull(),
+    elementType: text("element_type"),
+    locationId: text("location_id"),
+    locationText: text("location_text"),
+    drawingSheetId: text("drawing_sheet_id"),
+    drawingReference: text("drawing_reference"),
+    status: text("status").default("planned").notNull(), // PourStatus
+    plannedDate: text("planned_date"),
+    pouredAt: timestamp("poured_at", { withTimezone: true, mode: "string" }),
+    /* the mix and its provenance */
+    mixReference: text("mix_reference"),
+    specifiedGrade: text("specified_grade"),
+    /** the characteristic strength the grade names, in MPa */
+    specifiedStrengthMpa: doublePrecision("specified_strength_mpa"),
+    testAgeDays: integer("test_age_days").default(28).notNull(),
+    acceptanceCode: text("acceptance_code").default("specified_only").notNull(), // ConcreteAcceptanceCode
+    volumeM3: doublePrecision("volume_m3"),
+    supplierVendorId: text("supplier_vendor_id"),
+    batchPlant: text("batch_plant"),
+    /** [{ ticketNumber, batchedAt, volumeM3, batchNumber?, truck? }] */
+    deliveryTickets: jsonb("delivery_tickets").$type<unknown[]>().default([]).notNull(),
+    batchNumbers: jsonb("batch_numbers").$type<string[]>().default([]).notNull(),
+    /** heat/batch traceability into the certificate register */
+    materialCertificateIds: jsonb("material_certificate_ids")
+      .$type<string[]>()
+      .default([])
+      .notNull(),
+    /* fresh-concrete tests, taken at the truck */
+    slumpMm: doublePrecision("slump_mm"),
+    slumpSpecMin: doublePrecision("slump_spec_min"),
+    slumpSpecMax: doublePrecision("slump_spec_max"),
+    airContentPct: doublePrecision("air_content_pct"),
+    concreteTempC: doublePrecision("concrete_temp_c"),
+    ambientTempC: doublePrecision("ambient_temp_c"),
+    curingMethod: text("curing_method"),
+    curingStartedAt: timestamp("curing_started_at", { withTimezone: true, mode: "string" }),
+    /* the controls */
+    itpActivityId: text("itp_activity_id"),
+    /** the pre-pour checklist; a pour without one released is a signal */
+    prePourChecklistId: text("pre_pour_checklist_id"),
+    holdPointReleasedAt: timestamp("hold_point_released_at", {
+      withTimezone: true,
+      mode: "string",
+    }),
+    holdPointReleasedBy: text("hold_point_released_by"),
+    pouredByVendorId: text("poured_by_vendor_id"),
+    supervisedBy: text("supervised_by"),
+    /* specimen rollup — recomputed from the specimen rows, never typed in */
+    specimenCount: integer("specimen_count").default(0).notNull(),
+    testedSpecimenCount: integer("tested_specimen_count").default(0).notNull(),
+    failedSpecimenCount: integer("failed_specimen_count").default(0).notNull(),
+    meanStrengthMpa: doublePrecision("mean_strength_mpa"),
+    minStrengthMpa: doublePrecision("min_strength_mpa"),
+    standardDeviationMpa: doublePrecision("standard_deviation_mpa"),
+    /** the acceptance verdict and the reasoning behind it, as computed */
+    acceptanceVerdict: text("acceptance_verdict"),
+    acceptanceReasons: jsonb("acceptance_reasons").$type<string[]>().default([]).notNull(),
+    ncrId: text("ncr_id"),
+    concessionId: text("concession_id"),
+    signalId: text("signal_id"),
+    photoFileIds: jsonb("photo_file_ids").$type<string[]>().default([]).notNull(),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("concrete_pours_uq").on(t.projectId, t.number),
+    index("concrete_pours_project_idx").on(t.projectId, t.status),
+    index("concrete_pours_date_idx").on(t.projectId, t.plannedDate),
+    index("concrete_pours_supplier_idx").on(t.supplierVendorId),
+  ],
+);
+
+/** One cube, cylinder or core, and what the lab said about it. */
+export const concreteTestSpecimens = pgTable(
+  "concrete_test_specimens",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    pourId: text("pour_id").notNull(),
+    specimenRef: text("specimen_ref").notNull(),
+    specimenType: text("specimen_type").default("cube").notNull(), // SpecimenType
+    castAt: text("cast_at"),
+    testAgeDays: integer("test_age_days").default(28).notNull(),
+    testDate: text("test_date"),
+    strengthMpa: doublePrecision("strength_mpa"),
+    densityKgM3: doublePrecision("density_kg_m3"),
+    result: text("result").default("pending").notNull(), // SpecimenResult
+    failureMode: text("failure_mode"),
+    labName: text("lab_name"),
+    labAccreditation: text("lab_accreditation"),
+    certificateNumber: text("certificate_number"),
+    certificateFileId: text("certificate_file_id"),
+    /** a specimen voided for a stated reason is not a specimen that failed */
+    voidReason: text("void_reason"),
+    notes: text("notes"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("concrete_test_specimens_uq").on(t.pourId, t.specimenRef),
+    index("concrete_test_specimens_pour_idx").on(t.pourId, t.testAgeDays),
+    index("concrete_test_specimens_project_idx").on(t.projectId, t.result),
+  ],
+);
+
+/* ------------------------------------------------------------------ */
+/* Welding: procedures, welders, welds, NDT (#1087–1088)               */
+/* ------------------------------------------------------------------ */
+
+/** A welding procedure specification, and the PQR that qualified it. */
+export const weldingProcedures = pgTable(
+  "welding_procedures",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    wpsNumber: text("wps_number").notNull(),
+    title: text("title").notNull(),
+    revision: text("revision"),
+    standard: text("standard"),
+    process: text("process").default("smaw").notNull(), // WeldProcess
+    secondaryProcess: text("secondary_process"),
+    jointTypes: jsonb("joint_types").$type<string[]>().default([]).notNull(),
+    positions: jsonb("positions").$type<string[]>().default([]).notNull(),
+    baseMaterialGroup: text("base_material_group"),
+    fillerMaterial: text("filler_material"),
+    thicknessMinMm: doublePrecision("thickness_min_mm"),
+    thicknessMaxMm: doublePrecision("thickness_max_mm"),
+    diameterMinMm: doublePrecision("diameter_min_mm"),
+    diameterMaxMm: doublePrecision("diameter_max_mm"),
+    preheatMinC: doublePrecision("preheat_min_c"),
+    interpassMaxC: doublePrecision("interpass_max_c"),
+    pwhtRequired: integer("pwht_required").default(0).notNull(),
+    pqrReference: text("pqr_reference"),
+    vendorId: text("vendor_id"),
+    status: text("status").default("draft").notNull(), // WpsStatus
+    approvedBy: text("approved_by"),
+    approvedAt: timestamp("approved_at", { withTimezone: true, mode: "string" }),
+    validFrom: text("valid_from"),
+    validUntil: text("valid_until"),
+    documentFileId: text("document_file_id"),
+    supersedesId: text("supersedes_id"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("welding_procedures_uq").on(t.projectId, t.wpsNumber),
+    index("welding_procedures_project_idx").on(t.projectId, t.status),
+    index("welding_procedures_vendor_idx").on(t.vendorId),
+  ],
+);
+
+/**
+ * A welder's qualification. Two things end one: the certificate's expiry
+ * date, and CONTINUITY — most standards void a qualification when the welder
+ * has not used the process for six months, which is why
+ * `continuityConfirmedAt` is a column rather than an assumption.
+ */
+export const welderQualifications = pgTable(
+  "welder_qualifications",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    welderName: text("welder_name").notNull(),
+    /** the stamp mark that appears on the joint itself */
+    welderStamp: text("welder_stamp"),
+    workerId: text("worker_id"),
+    vendorId: text("vendor_id"),
+    certificateNumber: text("certificate_number"),
+    qualificationStandard: text("qualification_standard"),
+    processes: jsonb("processes").$type<string[]>().default([]).notNull(),
+    positions: jsonb("positions").$type<string[]>().default([]).notNull(),
+    materialGroups: jsonb("material_groups").$type<string[]>().default([]).notNull(),
+    thicknessMinMm: doublePrecision("thickness_min_mm"),
+    thicknessMaxMm: doublePrecision("thickness_max_mm"),
+    diameterMinMm: doublePrecision("diameter_min_mm"),
+    diameterMaxMm: doublePrecision("diameter_max_mm"),
+    qualifiedFrom: text("qualified_from"),
+    expiryDate: text("expiry_date"),
+    /** last confirmation the welder is still working the process */
+    continuityConfirmedAt: text("continuity_confirmed_at"),
+    continuityMonths: integer("continuity_months").default(6).notNull(),
+    status: text("status").default("valid").notNull(), // WelderQualificationStatus
+    suspensionReason: text("suspension_reason"),
+    certificateFileId: text("certificate_file_id"),
+    wpsIds: jsonb("wps_ids").$type<string[]>().default([]).notNull(),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("welder_qualifications_project_idx").on(t.projectId, t.status),
+    index("welder_qualifications_expiry_idx").on(t.projectId, t.expiryDate),
+    index("welder_qualifications_stamp_idx").on(t.projectId, t.welderStamp),
+    index("welder_qualifications_vendor_idx").on(t.vendorId),
+  ],
+);
+
+/**
+ * The weld map. One row per joint, naming the procedure it was welded to and
+ * the welder who made it — which is the whole point: when an NDT report
+ * rejects a joint, the question that follows is "what else did that welder
+ * make to that procedure", and this table answers it in one query.
+ */
+export const welds = pgTable(
+  "welds",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    weldMapRef: text("weld_map_ref"),
+    jointReference: text("joint_reference"),
+    jointType: text("joint_type"),
+    description: text("description"),
+    drawingSheetId: text("drawing_sheet_id"),
+    drawingReference: text("drawing_reference"),
+    isometricRef: text("isometric_ref"),
+    lineOrElementRef: text("line_or_element_ref"),
+    systemId: text("system_id"),
+    assetId: text("asset_id"),
+    locationId: text("location_id"),
+    materialSpec: text("material_spec"),
+    thicknessMm: doublePrecision("thickness_mm"),
+    diameterMm: doublePrecision("diameter_mm"),
+    /** the heats that met at this joint — traceability both ways */
+    heatNumbers: jsonb("heat_numbers").$type<string[]>().default([]).notNull(),
+    materialCertificateIds: jsonb("material_certificate_ids")
+      .$type<string[]>()
+      .default([])
+      .notNull(),
+    wpsId: text("wps_id"),
+    welderQualificationId: text("welder_qualification_id"),
+    welderStamp: text("welder_stamp"),
+    weldedAt: text("welded_at"),
+    vendorId: text("vendor_id"),
+    status: text("status").default("planned").notNull(), // WeldStatus
+    visualResult: text("visual_result"),
+    visualInspectedBy: text("visual_inspected_by"),
+    visualInspectedAt: timestamp("visual_inspected_at", { withTimezone: true, mode: "string" }),
+    /** the percentage of joints in this class the spec requires be examined */
+    ndtRequiredPercent: doublePrecision("ndt_required_percent"),
+    ndtMethodsRequired: jsonb("ndt_methods_required").$type<string[]>().default([]).notNull(),
+    ndtRecordCount: integer("ndt_record_count").default(0).notNull(),
+    ndtAcceptCount: integer("ndt_accept_count").default(0).notNull(),
+    ndtRejectCount: integer("ndt_reject_count").default(0).notNull(),
+    repairCount: integer("repair_count").default(0).notNull(),
+    pwhtCompletedAt: text("pwht_completed_at"),
+    ncrId: text("ncr_id"),
+    concessionId: text("concession_id"),
+    itpActivityId: text("itp_activity_id"),
+    photoFileIds: jsonb("photo_file_ids").$type<string[]>().default([]).notNull(),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("welds_uq").on(t.projectId, t.number),
+    index("welds_project_idx").on(t.projectId, t.status),
+    index("welds_welder_idx").on(t.projectId, t.welderQualificationId),
+    index("welds_wps_idx").on(t.wpsId),
+    index("welds_system_idx").on(t.systemId),
+  ],
+);
+
+/** A non-destructive examination of a weld, and the report that carries it. */
+export const ndtRecords = pgTable(
+  "ndt_records",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    weldId: text("weld_id").notNull(),
+    method: text("method").notNull(), // NdtMethod
+    techniqueRef: text("technique_ref"),
+    procedureRef: text("procedure_ref"),
+    acceptanceStandard: text("acceptance_standard"),
+    coverageDescription: text("coverage_description"),
+    coveragePercent: doublePrecision("coverage_percent"),
+    requestedAt: timestamp("requested_at", { withTimezone: true, mode: "string" }),
+    requestedBy: text("requested_by"),
+    performedAt: timestamp("performed_at", { withTimezone: true, mode: "string" }),
+    /** the inspection body — almost never the contractor */
+    performedByOrganisation: text("performed_by_organisation"),
+    technicianName: text("technician_name"),
+    /** the level the standard requires for interpretation, e.g. "II" */
+    technicianLevel: text("technician_level"),
+    technicianCertNumber: text("technician_cert_number"),
+    result: text("result").default("pending").notNull(), // NdtResult
+    defectType: text("defect_type"),
+    defectLengthMm: doublePrecision("defect_length_mm"),
+    defectLocation: text("defect_location"),
+    reportNumber: text("report_number"),
+    reportFileId: text("report_file_id"),
+    /** the record this re-examines after a repair */
+    retestOfId: text("retest_of_id"),
+    ncrId: text("ncr_id"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("ndt_records_uq").on(t.projectId, t.number),
+    index("ndt_records_weld_idx").on(t.weldId, t.method),
+    index("ndt_records_project_idx").on(t.projectId, t.result),
+  ],
+);
+
+/* ------------------------------------------------------------------ */
+/* Material test certificates (#1089)                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The certificate itself, and whether its numbers meet the specification.
+ *
+ * The supply-chain module holds the traceability CHAIN (heat → delivery →
+ * installed location, supplychain.material_trace_records); this register
+ * holds the TEST CERTIFICATE and the verification of it, which is a quality
+ * act rather than a logistics one: somebody has to read the yield strength on
+ * the mill certificate and compare it with the one the spec demanded. That
+ * comparison is stored as measured-against-required rows so the verification
+ * can be re-read years later without the certificate PDF.
+ */
+export const materialTestCertificates = pgTable(
+  "material_test_certificates",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    certificateNumber: text("certificate_number").notNull(),
+    certificateType: text("certificate_type").default("en_10204_3_1").notNull(), // CertificateType
+    materialDescription: text("material_description").notNull(),
+    materialType: text("material_type"),
+    materialGrade: text("material_grade"),
+    standard: text("standard"),
+    /* traceability */
+    heatNumber: text("heat_number"),
+    batchNumber: text("batch_number"),
+    castNumber: text("cast_number"),
+    lotNumber: text("lot_number"),
+    serialNumbers: jsonb("serial_numbers").$type<string[]>().default([]).notNull(),
+    quantity: doublePrecision("quantity"),
+    unit: text("unit"),
+    /* provenance */
+    manufacturer: text("manufacturer"),
+    millName: text("mill_name"),
+    supplierVendorId: text("supplier_vendor_id"),
+    originCountry: text("origin_country"),
+    issuedAt: text("issued_at"),
+    receivedAt: text("received_at"),
+    /* links into the registers that already exist */
+    materialTraceRecordId: text("material_trace_record_id"),
+    materialItemId: text("material_item_id"),
+    deliveryId: text("delivery_id"),
+    specSectionId: text("spec_section_id"),
+    specClauseRef: text("spec_clause_ref"),
+    submittalId: text("submittal_id"),
+    /* the verification */
+    /** [{ property, required{min,max,value,operator}, measured, unit, pass, reason }] */
+    requiredProperties: jsonb("required_properties").$type<unknown[]>().default([]).notNull(),
+    measuredProperties: jsonb("measured_properties").$type<unknown[]>().default([]).notNull(),
+    verificationStatus: text("verification_status").default("unverified").notNull(),
+    verificationReasons: jsonb("verification_reasons").$type<string[]>().default([]).notNull(),
+    verifiedBy: text("verified_by"),
+    verifiedAt: timestamp("verified_at", { withTimezone: true, mode: "string" }),
+    verificationNotes: text("verification_notes"),
+    ncrId: text("ncr_id"),
+    concessionId: text("concession_id"),
+    documentFileId: text("document_file_id"),
+    attachmentFileIds: jsonb("attachment_file_ids").$type<string[]>().default([]).notNull(),
+    /** where the material went — the other half of traceability */
+    installedLocationIds: jsonb("installed_location_ids").$type<string[]>().default([]).notNull(),
+    installedDescription: text("installed_description"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("material_test_certificates_uq").on(t.projectId, t.number),
+    index("material_test_certificates_project_idx").on(t.projectId, t.verificationStatus),
+    index("material_test_certificates_heat_idx").on(t.companyId, t.heatNumber),
+    index("material_test_certificates_batch_idx").on(t.companyId, t.batchNumber),
+    index("material_test_certificates_supplier_idx").on(t.supplierVendorId),
+  ],
+);
+
+/* ------------------------------------------------------------------ */
+/* Calibration register (#1097)                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Every instrument whose reading is used as evidence.
+ *
+ * Commissioning test records already refuse a pass taken on an
+ * out-of-calibration meter; that refusal is only as good as the calibration
+ * dates it is given, which is why the register exists and why the test route
+ * can be pointed at an instrument id rather than at a typed-in date.
+ */
+export const calibratedInstruments = pgTable(
+  "calibrated_instruments",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    name: text("name").notNull(),
+    instrumentType: text("instrument_type"),
+    manufacturer: text("manufacturer"),
+    model: text("model"),
+    serialNumber: text("serial_number").notNull(),
+    assetTag: text("asset_tag"),
+    equipmentId: text("equipment_id"),
+    ownerVendorId: text("owner_vendor_id"),
+    ownerName: text("owner_name"),
+    custodian: text("custodian"),
+    storageLocation: text("storage_location"),
+    rangeMin: doublePrecision("range_min"),
+    rangeMax: doublePrecision("range_max"),
+    rangeUnit: text("range_unit"),
+    accuracy: text("accuracy"),
+    calibrationStandard: text("calibration_standard"),
+    calibrationIntervalMonths: integer("calibration_interval_months").default(12).notNull(),
+    lastCalibratedAt: text("last_calibrated_at"),
+    calibrationDueDate: text("calibration_due_date"),
+    certificateNumber: text("certificate_number"),
+    certificateFileId: text("certificate_file_id"),
+    calibratedByOrganisation: text("calibrated_by_organisation"),
+    /** the accreditation that makes the certificate traceable to a standard */
+    calibrationAccreditation: text("calibration_accreditation"),
+    status: text("status").default("in_service").notNull(), // InstrumentStatus
+    outOfServiceReason: text("out_of_service_reason"),
+    signalId: text("signal_id"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("calibrated_instruments_uq").on(t.projectId, t.number),
+    uniqueIndex("calibrated_instruments_serial_uq").on(t.projectId, t.serialNumber),
+    index("calibrated_instruments_project_idx").on(t.projectId, t.status),
+    index("calibrated_instruments_due_idx").on(t.projectId, t.calibrationDueDate),
+  ],
+);
+
+/** One calibration event. History matters: an instrument found out of
+ *  tolerance casts doubt on every reading taken since its last pass. */
+export const calibrationRecords = pgTable(
+  "calibration_records",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    instrumentId: text("instrument_id").notNull(),
+    calibratedAt: text("calibrated_at").notNull(),
+    calibrationDueDate: text("calibration_due_date"),
+    result: text("result").default("pass").notNull(), // CalibrationResult
+    /** the condition the instrument arrived in — the audit-critical field */
+    asFoundCondition: text("as_found_condition"),
+    asLeftCondition: text("as_left_condition"),
+    deviationFound: doublePrecision("deviation_found"),
+    certificateNumber: text("certificate_number"),
+    certificateFileId: text("certificate_file_id"),
+    calibratedByOrganisation: text("calibrated_by_organisation"),
+    technicianName: text("technician_name"),
+    notes: text("notes"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    index("calibration_records_instrument_idx").on(t.instrumentId, t.calibratedAt),
+    index("calibration_records_project_idx").on(t.projectId, t.result),
+  ],
+);
+
+/* ------------------------------------------------------------------ */
+/* Rework register (#1098) and the cost of quality (#1099–1100)        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * What it cost to do it twice, and why it had to be done twice.
+ *
+ * The cause taxonomy is the point. "Rework" as one number is a rounding
+ * error in a monthly report; rework split by cause is a management decision —
+ * late information is a client problem, workmanship is a subcontract problem,
+ * and design error is a professional-indemnity problem. `discoveryPhase`
+ * carries the second half of the story: the same defect caught at inspection
+ * and caught after handover are not the same cost, and the cost-of-quality
+ * model depends on the difference.
+ */
+export const reworkItems = pgTable(
+  "rework_items",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    title: text("title").notNull(),
+    description: text("description"),
+    status: text("status").default("identified").notNull(), // ReworkStatus
+    sourceType: text("source_type").default("self_identified").notNull(),
+    sourceId: text("source_id"),
+    ncrId: text("ncr_id"),
+    punchItemId: text("punch_item_id"),
+    checklistId: text("checklist_id"),
+    testRecordId: text("test_record_id"),
+    auditFindingId: text("audit_finding_id"),
+    causeCategory: text("cause_category").default("workmanship").notNull(), // ReworkCause
+    causeDescription: text("cause_description"),
+    discoveryPhase: text("discovery_phase").default("during_works").notNull(),
+    discoveredAt: text("discovered_at"),
+    responsibleVendorId: text("responsible_vendor_id"),
+    responsibleParty: text("responsible_party"),
+    trade: text("trade"),
+    locationId: text("location_id"),
+    locationText: text("location_text"),
+    systemId: text("system_id"),
+    /* the cost, itemised so the total can be defended */
+    labourHours: doublePrecision("labour_hours"),
+    labourCost: doublePrecision("labour_cost"),
+    materialCost: doublePrecision("material_cost"),
+    plantCost: doublePrecision("plant_cost"),
+    subcontractorCost: doublePrecision("subcontractor_cost"),
+    otherCost: doublePrecision("other_cost"),
+    totalCost: doublePrecision("total_cost"),
+    currency: text("currency").default("USD").notNull(),
+    costBasis: text("cost_basis").default("estimated").notNull(), // ReworkCostBasis
+    scheduleImpactDays: doublePrecision("schedule_impact_days"),
+    quantityAffected: doublePrecision("quantity_affected"),
+    unit: text("unit"),
+    isBackcharged: integer("is_backcharged").default(0).notNull(),
+    changeEventId: text("change_event_id"),
+    /** whether a control existed that should have caught it */
+    preventable: integer("preventable").default(1).notNull(),
+    lessonId: text("lesson_id"),
+    startedAt: text("started_at"),
+    completedAt: text("completed_at"),
+    verifiedBy: text("verified_by"),
+    verifiedAt: timestamp("verified_at", { withTimezone: true, mode: "string" }),
+    verificationChecklistId: text("verification_checklist_id"),
+    photoFileIds: jsonb("photo_file_ids").$type<string[]>().default([]).notNull(),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("rework_items_uq").on(t.projectId, t.number),
+    index("rework_items_project_idx").on(t.projectId, t.status),
+    index("rework_items_cause_idx").on(t.projectId, t.causeCategory),
+    index("rework_items_vendor_idx").on(t.responsibleVendorId, t.status),
+    index("rework_items_trade_idx").on(t.projectId, t.trade),
+  ],
+);
+
+/* ------------------------------------------------------------------ */
+/* Quality audits and ISO 9001 evidence (#1095–1096)                   */
+/* ------------------------------------------------------------------ */
+
+export const qualityAudits = pgTable(
+  "quality_audits",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    title: text("title").notNull(),
+    auditType: text("audit_type").default("internal").notNull(), // QualityAuditType
+    standard: text("standard"),
+    scope: text("scope"),
+    objectives: text("objectives"),
+    clauseReferences: jsonb("clause_references").$type<string[]>().default([]).notNull(),
+    auditedVendorId: text("audited_vendor_id"),
+    auditedFunction: text("audited_function"),
+    /** the lead auditor — independent of the area audited, by definition */
+    leadAuditorId: text("lead_auditor_id"),
+    leadAuditorName: text("lead_auditor_name"),
+    leadAuditorOrganisation: text("lead_auditor_organisation"),
+    auditTeam: jsonb("audit_team").$type<unknown[]>().default([]).notNull(),
+    status: text("status").default("planned").notNull(), // QualityAuditStatus
+    plannedDate: text("planned_date"),
+    startedAt: text("started_at"),
+    completedAt: text("completed_at"),
+    reportIssuedAt: text("report_issued_at"),
+    responseDueDate: text("response_due_date"),
+    closedAt: timestamp("closed_at", { withTimezone: true, mode: "string" }),
+    closedBy: text("closed_by"),
+    reportFileId: text("report_file_id"),
+    /* findings rollup, recomputed from the finding rows */
+    findingCount: integer("finding_count").default(0).notNull(),
+    majorFindingCount: integer("major_finding_count").default(0).notNull(),
+    minorFindingCount: integer("minor_finding_count").default(0).notNull(),
+    observationCount: integer("observation_count").default(0).notNull(),
+    openFindingCount: integer("open_finding_count").default(0).notNull(),
+    conformityPercent: doublePrecision("conformity_percent"),
+    nextAuditDueDate: text("next_audit_due_date"),
+    signalId: text("signal_id"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("quality_audits_uq").on(t.projectId, t.number),
+    index("quality_audits_project_idx").on(t.projectId, t.status),
+    index("quality_audits_vendor_idx").on(t.auditedVendorId),
+    index("quality_audits_date_idx").on(t.projectId, t.plannedDate),
+  ],
+);
+
+export const qualityAuditFindings = pgTable(
+  "quality_audit_findings",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    auditId: text("audit_id").notNull(),
+    position: integer("position").default(0).notNull(),
+    reference: text("reference").notNull(),
+    findingType: text("finding_type").default("observation").notNull(), // AuditFindingType
+    clauseReference: text("clause_reference"),
+    /** what the requirement actually says — quoted, not paraphrased */
+    requirement: text("requirement"),
+    /** what was seen; the evidence for the finding, not the conclusion */
+    evidence: text("evidence"),
+    description: text("description").notNull(),
+    status: text("status").default("open").notNull(), // AuditFindingStatus
+    responsibleUserId: text("responsible_user_id"),
+    responsibleVendorId: text("responsible_vendor_id"),
+    responseDueDate: text("response_due_date"),
+    dueDate: text("due_date"),
+    response: text("response"),
+    respondedAt: timestamp("responded_at", { withTimezone: true, mode: "string" }),
+    rootCause: text("root_cause"),
+    correctiveActionId: text("corrective_action_id"),
+    ncrId: text("ncr_id"),
+    reworkItemId: text("rework_item_id"),
+    verificationEvidence: text("verification_evidence"),
+    verifiedBy: text("verified_by"),
+    verifiedAt: timestamp("verified_at", { withTimezone: true, mode: "string" }),
+    closedBy: text("closed_by"),
+    closedAt: timestamp("closed_at", { withTimezone: true, mode: "string" }),
+    attachmentFileIds: jsonb("attachment_file_ids").$type<string[]>().default([]).notNull(),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("quality_audit_findings_uq").on(t.auditId, t.reference),
+    index("quality_audit_findings_audit_idx").on(t.auditId, t.position),
+    index("quality_audit_findings_project_idx").on(t.projectId, t.status),
+    index("quality_audit_findings_due_idx").on(t.projectId, t.dueDate),
+  ],
+);
+
+/* ------------------------------------------------------------------ */
+/* Closeout: DLP, guarantees, training, spares, POE (Domain V)         */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A defects liability period. It starts when something is handed over and it
+ * ends on a date somebody has to be told about, which is exactly what an
+ * Obligation is for — `makeGoodObligationId` points at the row in the
+ * assurance register rather than at a reminder this module invents.
+ */
+export const defectsLiabilityPeriods = pgTable(
+  "defects_liability_periods",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    name: text("name").notNull(),
+    scopeDescription: text("scope_description"),
+    turnoverPackageId: text("turnover_package_id"),
+    systemId: text("system_id"),
+    assetId: text("asset_id"),
+    commitmentId: text("commitment_id"),
+    vendorId: text("vendor_id"),
+    contractClause: text("contract_clause"),
+    startDate: text("start_date").notNull(),
+    endDate: text("end_date").notNull(),
+    durationMonths: integer("duration_months"),
+    status: text("status").default("not_started").notNull(), // DlpStatus
+    /** obligations.id — the deadline lives in the assurance register */
+    makeGoodObligationId: text("make_good_obligation_id"),
+    extendedToDate: text("extended_to_date"),
+    extensionReason: text("extension_reason"),
+    retentionReleaseDate: text("retention_release_date"),
+    retentionAmount: doublePrecision("retention_amount"),
+    currency: text("currency").default("USD").notNull(),
+    finalCertificateDate: text("final_certificate_date"),
+    finalCertificateFileId: text("final_certificate_file_id"),
+    defectCount: integer("defect_count").default(0).notNull(),
+    openDefectCount: integer("open_defect_count").default(0).notNull(),
+    closedBy: text("closed_by"),
+    closedAt: timestamp("closed_at", { withTimezone: true, mode: "string" }),
+    signalId: text("signal_id"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("defects_liability_periods_uq").on(t.projectId, t.number),
+    index("defects_liability_periods_project_idx").on(t.projectId, t.status),
+    index("defects_liability_periods_end_idx").on(t.projectId, t.endDate),
+    index("defects_liability_periods_package_idx").on(t.turnoverPackageId),
+  ],
+);
+
+/** A defect reported during a liability period, and whether it was made good. */
+export const dlpDefects = pgTable(
+  "dlp_defects",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    dlpId: text("dlp_id").notNull(),
+    position: integer("position").default(0).notNull(),
+    reference: text("reference").notNull(),
+    title: text("title").notNull(),
+    description: text("description"),
+    reportedAt: text("reported_at"),
+    reportedByName: text("reported_by_name"),
+    reportedByOrganisation: text("reported_by_organisation"),
+    severity: text("severity").default("minor").notNull(), // NcrSeverity
+    locationId: text("location_id"),
+    locationText: text("location_text"),
+    assetId: text("asset_id"),
+    systemId: text("system_id"),
+    responsibleVendorId: text("responsible_vendor_id"),
+    status: text("status").default("reported").notNull(), // DlpDefectStatus
+    /** the register entries this defect became, where it became one */
+    ncrId: text("ncr_id"),
+    punchItemId: text("punch_item_id"),
+    warrantyClaimId: text("warranty_claim_id"),
+    reworkItemId: text("rework_item_id"),
+    targetRectificationDate: text("target_rectification_date"),
+    rectifiedAt: text("rectified_at"),
+    verifiedBy: text("verified_by"),
+    verifiedAt: timestamp("verified_at", { withTimezone: true, mode: "string" }),
+    disputeReason: text("dispute_reason"),
+    cost: doublePrecision("cost"),
+    currency: text("currency").default("USD").notNull(),
+    photoFileIds: jsonb("photo_file_ids").$type<string[]>().default([]).notNull(),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("dlp_defects_uq").on(t.dlpId, t.reference),
+    index("dlp_defects_dlp_idx").on(t.dlpId, t.status),
+    index("dlp_defects_project_idx").on(t.projectId, t.status),
+  ],
+);
+
+/**
+ * A performance guarantee on a system, and what the test actually measured.
+ *
+ * The shortfall is the commercial event: contracts price under-performance in
+ * liquidated damages per unit of shortfall, so the register stores the rate
+ * and computes the exposure with its basis written out. Where the rate is not
+ * held the exposure is `null` with a reason — never zero, which would read as
+ * "no exposure" rather than "nobody told us the rate".
+ */
+export const performanceGuarantees = pgTable(
+  "performance_guarantees",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    title: text("title").notNull(),
+    systemId: text("system_id"),
+    assetId: text("asset_id"),
+    turnoverPackageId: text("turnover_package_id"),
+    commitmentId: text("commitment_id"),
+    vendorId: text("vendor_id"),
+    contractClause: text("contract_clause"),
+    parameter: text("parameter").notNull(),
+    operator: text("operator").default("at_least").notNull(), // GuaranteeOperator
+    guaranteedValue: doublePrecision("guaranteed_value"),
+    guaranteedMin: doublePrecision("guaranteed_min"),
+    guaranteedMax: doublePrecision("guaranteed_max"),
+    unit: text("unit"),
+    tolerancePercent: doublePrecision("tolerance_percent"),
+    measurementMethod: text("measurement_method"),
+    testRecordId: text("test_record_id"),
+    measuredValue: doublePrecision("measured_value"),
+    measuredAt: timestamp("measured_at", { withTimezone: true, mode: "string" }),
+    measuredBy: text("measured_by"),
+    /** independent verification of the measurement — never the performer */
+    verifiedBy: text("verified_by"),
+    verifiedAt: timestamp("verified_at", { withTimezone: true, mode: "string" }),
+    status: text("status").default("declared").notNull(), // GuaranteeStatus
+    shortfall: doublePrecision("shortfall"),
+    shortfallPercent: doublePrecision("shortfall_percent"),
+    /* liquidated damages for shortfall */
+    ldRatePerUnit: doublePrecision("ld_rate_per_unit"),
+    ldRateUnit: text("ld_rate_unit"),
+    ldCapAmount: doublePrecision("ld_cap_amount"),
+    ldAmount: doublePrecision("ld_amount"),
+    ldBasis: text("ld_basis"),
+    currency: text("currency").default("USD").notNull(),
+    ncrId: text("ncr_id"),
+    concessionId: text("concession_id"),
+    waivedBy: text("waived_by"),
+    waivedAt: timestamp("waived_at", { withTimezone: true, mode: "string" }),
+    waiverReason: text("waiver_reason"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("performance_guarantees_uq").on(t.projectId, t.number),
+    index("performance_guarantees_project_idx").on(t.projectId, t.status),
+    index("performance_guarantees_system_idx").on(t.systemId),
+  ],
+);
+
+/** Operator and maintainer training delivered as part of handover. */
+export const operatorTrainingRecords = pgTable(
+  "operator_training_records",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    title: text("title").notNull(),
+    description: text("description"),
+    trainingKind: text("training_kind").default("hands_on").notNull(), // TrainingKind
+    systemId: text("system_id"),
+    assetId: text("asset_id"),
+    turnoverPackageId: text("turnover_package_id"),
+    vendorId: text("vendor_id"),
+    trainerName: text("trainer_name"),
+    trainerOrganisation: text("trainer_organisation"),
+    status: text("status").default("planned").notNull(), // TrainingStatus
+    scheduledFor: text("scheduled_for"),
+    deliveredAt: text("delivered_at"),
+    durationHours: doublePrecision("duration_hours"),
+    /** [{ name, organisation, role, userId?, signedAt? }] */
+    attendees: jsonb("attendees").$type<unknown[]>().default([]).notNull(),
+    attendeeCount: integer("attendee_count").default(0).notNull(),
+    competencyAssessed: integer("competency_assessed").default(0).notNull(),
+    materialsFileIds: jsonb("materials_file_ids").$type<string[]>().default([]).notNull(),
+    recordingFileId: text("recording_file_id"),
+    attendanceSheetFileId: text("attendance_sheet_file_id"),
+    /** the owner's acceptance that the training was adequate */
+    acceptedBy: text("accepted_by"),
+    acceptedAt: timestamp("accepted_at", { withTimezone: true, mode: "string" }),
+    acceptanceNote: text("acceptance_note"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("operator_training_records_uq").on(t.projectId, t.number),
+    index("operator_training_records_project_idx").on(t.projectId, t.status),
+    index("operator_training_records_system_idx").on(t.systemId),
+    index("operator_training_records_package_idx").on(t.turnoverPackageId),
+  ],
+);
+
+/** Spares and special tools an owner is contractually owed at handover. */
+export const spareParts = pgTable(
+  "spare_parts",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    description: text("description").notNull(),
+    category: text("category").default("operational_spare").notNull(), // SparePartCategory
+    partNumber: text("part_number"),
+    manufacturer: text("manufacturer"),
+    supplierVendorId: text("supplier_vendor_id"),
+    systemId: text("system_id"),
+    assetId: text("asset_id"),
+    turnoverPackageId: text("turnover_package_id"),
+    materialItemId: text("material_item_id"),
+    quantityRequired: doublePrecision("quantity_required"),
+    quantityDelivered: doublePrecision("quantity_delivered").default(0).notNull(),
+    unit: text("unit"),
+    unitCost: doublePrecision("unit_cost"),
+    currency: text("currency").default("USD").notNull(),
+    leadTimeWeeks: doublePrecision("lead_time_weeks"),
+    status: text("status").default("specified").notNull(), // SparePartStatus
+    orderedAt: text("ordered_at"),
+    deliveredAt: text("delivered_at"),
+    storageLocation: text("storage_location"),
+    receivedBy: text("received_by"),
+    handedOverAt: timestamp("handed_over_at", { withTimezone: true, mode: "string" }),
+    handoverNote: text("handover_note"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("spare_parts_uq").on(t.projectId, t.number),
+    index("spare_parts_project_idx").on(t.projectId, t.status),
+    index("spare_parts_system_idx").on(t.systemId),
+    index("spare_parts_package_idx").on(t.turnoverPackageId),
+  ],
+);
+
+/**
+ * Post-occupancy evaluation and soft landings (#973–975).
+ *
+ * The building's performance in use is the only test of whether the design
+ * intent survived construction, and it is measured months after everyone has
+ * left. Energy actuals against design is stored as two numbers plus the unit,
+ * so the gap is computed rather than asserted; where either is missing the
+ * variance is null with a reason.
+ */
+export const postOccupancyEvaluations = pgTable(
+  "post_occupancy_evaluations",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    title: text("title").notNull(),
+    poeKind: text("poe_kind").default("soft_landings_review").notNull(), // PoeKind
+    turnoverPackageId: text("turnover_package_id"),
+    systemId: text("system_id"),
+    status: text("status").default("planned").notNull(), // PoeStatus
+    periodStart: text("period_start"),
+    periodEnd: text("period_end"),
+    scheduledFor: text("scheduled_for"),
+    completedAt: text("completed_at"),
+    conductedBy: text("conducted_by"),
+    conductedByOrganisation: text("conducted_by_organisation"),
+    /* occupant satisfaction */
+    surveyResponseCount: integer("survey_response_count"),
+    surveyInviteCount: integer("survey_invite_count"),
+    satisfactionScore: doublePrecision("satisfaction_score"),
+    satisfactionScale: text("satisfaction_scale"),
+    /* energy in use against design */
+    energyDesignValue: doublePrecision("energy_design_value"),
+    energyActualValue: doublePrecision("energy_actual_value"),
+    energyUnit: text("energy_unit"),
+    /* what the first year actually produced */
+    defectsRaisedCount: integer("defects_raised_count"),
+    warrantyClaimCount: integer("warranty_claim_count"),
+    findings: text("findings"),
+    recommendations: text("recommendations"),
+    lessonId: text("lesson_id"),
+    reportFileId: text("report_file_id"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("post_occupancy_evaluations_uq").on(t.projectId, t.number),
+    index("post_occupancy_evaluations_project_idx").on(t.projectId, t.status),
+    index("post_occupancy_evaluations_package_idx").on(t.turnoverPackageId),
+  ],
+);

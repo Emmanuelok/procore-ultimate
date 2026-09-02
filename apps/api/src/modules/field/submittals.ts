@@ -26,7 +26,7 @@ import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { pushNotifications } from "../notifications/service.js";
 import { addDaysISO, isoDateSchema, todayISO } from "./dates.js";
-import { assertCompanyUsers, hasToolAdmin, isCompanyAdmin, requireToolLevel } from "./access.js";
+import { assertCompanyUsers, assertVendor, hasToolAdmin, isCompanyAdmin, requireToolLevel } from "./access.js";
 import { ageInDays, bucketise } from "./ageingEngine.js";
 import {
   BUILTIN_RESPONSE_CODES,
@@ -284,6 +284,7 @@ export const submittalRoutes: FastifyPluginAsync = async (app) => {
   app.post("/projects/:projectId/submittals", { preHandler: standardGate }, async (req, reply) => {
     const body = submittalCreateSchema.parse(req.body);
     await assertCompanyUsers(app.db, req.companyId!, [body.ballInCourtId, ...(body.distribution ?? [])]);
+    await assertVendor(app.db, req.companyId!, body.vendorId);
     const settings = await loadFieldSettings(app.db, req.companyId!, req.projectId!);
     const number = await nextRecordNumber(app.db, req.projectId!, "submittal");
     const id = newId("sub");
@@ -526,6 +527,7 @@ export const submittalRoutes: FastifyPluginAsync = async (app) => {
       throw badRequest(`A ${row.status} submittal cannot be edited`);
     }
     await assertCompanyUsers(app.db, req.companyId!, [body.ballInCourtId, ...(body.distribution ?? [])]);
+    await assertVendor(app.db, req.companyId!, body.vendorId);
     const set: Record<string, unknown> = { updatedAt: nowIso() };
     for (const [k, v] of Object.entries(body)) if (v !== undefined) set[k] = v;
     if (body.submittalType !== undefined) set["isCloseout"] = isCloseoutType(body.submittalType) ? 1 : 0;

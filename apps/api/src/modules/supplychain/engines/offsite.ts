@@ -5,7 +5,8 @@
  * WITNESSED is a separate, smaller number that a valuation may rely on:
  *
  *  - `percentComplete`            stages complete ÷ stages total (self-reported)
- *  - `percentVerifiedForPayment`  the latest passed inspection's percentVerified
+ *  - `percentVerifiedForPayment`  the highest percent a passed or conditional
+ *                                 inspection has witnessed (never the factory's)
  *  - a failed, un-waived QA gate puts the unit on `qa_hold`; nothing advances
  *    past it (readyToShip is false) until the gate passes or is waived
  *

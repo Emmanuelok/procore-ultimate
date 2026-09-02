@@ -169,6 +169,61 @@ describe("RFIs", () => {
     expect(ageing.json().groups[0].key).toBe(pm.userId);
   });
 
+  it("locks the question once the RFI is issued and ledgers before/after values", async () => {
+    const created = await inject("POST", api("/rfis"), H(owner), { subject: "Locked subject", question: "Original question", assigneeId: engineer.userId });
+    const id = created.json().id as string;
+    expect((await inject("PATCH", api(`/rfis/${id}`), H(owner), { question: "Edited while draft" })).statusCode).toBe(200);
+    await inject("POST", api(`/rfis/${id}/issue`), H(owner));
+    const locked = await inject("PATCH", api(`/rfis/${id}`), H(owner), { question: "Rewritten after issue" });
+    expect(locked.statusCode).toBe(400);
+    expect(locked.json().message).toContain("question");
+    const lockedSubject = await inject("PATCH", api(`/rfis/${id}`), H(owner), { subject: "Rewritten subject" });
+    expect(lockedSubject.statusCode).toBe(400);
+    // A non-frozen field still edits, and the ledger keeps what changed from what to what.
+    expect((await inject("PATCH", api(`/rfis/${id}`), H(owner), { costImpact: "yes" })).statusCode).toBe(200);
+    const entries = await built.app.db
+      .select()
+      .from(ledgerEntries)
+      .where(and(eq(ledgerEntries.objectType, "rfi"), eq(ledgerEntries.objectId, id), eq(ledgerEntries.action, "update")));
+    const payloads = entries.map((e) => JSON.stringify(e.payload ?? {}));
+    expect(payloads.some((p) => p.includes("Original question"))).toBe(true);
+    expect(payloads.some((p) => p.includes('"costImpact":"yes"'))).toBe(true);
+    await inject("POST", api(`/rfis/${id}/void`), H(owner));
+  });
+
+  it("keeps private RFIs out of another user's analytics and ageing report", async () => {
+    const priv = await inject("POST", api("/rfis"), H(sub), {
+      subject: "Confidential rate query",
+      question: "internal only",
+      isPrivate: true,
+      dueDate: addDaysISO(todayISO(), -20),
+      assigneeId: pm.userId,
+    });
+    expect(priv.statusCode).toBe(201);
+    const privId = priv.json().id as string;
+    await inject("POST", api(`/rfis/${privId}/issue`), H(sub));
+    // Re-privatise the issued RFI: the register must respect it everywhere,
+    // not only on the list route (the analytics/ageing routes used to leak it).
+    const rePrivate = await inject("PATCH", api(`/rfis/${privId}`), H(sub), { isPrivate: true });
+    expect(rePrivate.statusCode).toBe(200);
+
+    const theirAgeing = await inject("GET", api("/rfis/ageing"), H(engineer));
+    expect(theirAgeing.statusCode).toBe(200);
+    expect(theirAgeing.json().items.map((i: { id: string }) => i.id)).not.toContain(privId);
+    expect(JSON.stringify(theirAgeing.json())).not.toContain("Confidential rate query");
+
+    const theirAnalytics = await inject("GET", api("/rfis/analytics"), H(engineer));
+    const mineAnalytics = await inject("GET", api("/rfis/analytics"), H(sub));
+    expect(theirAnalytics.json().overdue).toBeLessThan(mineAnalytics.json().overdue);
+
+    const mineAgeing = await inject("GET", api("/rfis/ageing"), H(sub));
+    expect(mineAgeing.json().items.map((i: { id: string }) => i.id)).toContain(privId);
+    const adminAgeing = await inject("GET", api("/rfis/ageing"), H(owner));
+    expect(adminAgeing.json().items.map((i: { id: string }) => i.id)).toContain(privId);
+
+    await inject("POST", api(`/rfis/${privId}/void`), H(sub));
+  });
+
   it("ingests inbound email as a draft RFI and as a draft response to an existing one", async () => {
     const created = await inject("POST", api("/rfis/inbound"), H(owner), {
       email: { from: "Site Agent <agent@example.com>", subject: "Fwd: Slab edge detail at C4", text: "Please confirm the slab edge detail.\n\nOn Tue wrote:\n> old stuff", messageId: "<m1@example.com>" },
@@ -253,6 +308,49 @@ describe("Submittals", () => {
     expect(notified.some((n) => n.title.includes("responded"))).toBe(true);
   });
 
+  it("finalises exactly once when two parallel reviewers respond at the same moment", async () => {
+    const res = await inject("POST", api("/submittals"), H(owner), { title: "Race: louvre schedules", submittalType: "product_data" });
+    const id = res.json().id as string;
+    const steps = await inject("POST", api(`/submittals/${id}/review-steps`), H(owner), {
+      steps: [
+        { reviewerId: engineer.userId, position: 0, isParallel: true },
+        { reviewerId: pm.userId, position: 0, isParallel: true },
+      ],
+    });
+    const stepOf = (u: string) => steps.json().items.find((x: { reviewerId: string }) => x.reviewerId === u).id as string;
+    await inject("POST", api(`/submittals/${id}/submit`), H(owner));
+
+    const [a, b] = await Promise.all([
+      inject("POST", `/api/v1/submittal-steps/${stepOf(engineer.userId)}/respond`, H(engineer), { responseCode: "approved" }),
+      inject("POST", `/api/v1/submittal-steps/${stepOf(pm.userId)}/respond`, H(pm), { responseCode: "approved_as_noted" }),
+    ]);
+    expect(a!.statusCode).toBe(200);
+    expect(b!.statusCode).toBe(200);
+
+    // Neither reviewer may be left holding a record with nothing to do.
+    const detail = await inject("GET", api(`/submittals/${id}`), H(owner));
+    expect(detail.json().status).toBe("responded");
+    expect(detail.json().responseCode).toBe("approved_as_noted");
+    expect(detail.json().ballInCourtId).toBe(owner.userId);
+    expect(detail.json().reviewSteps.every((st: { responseCode: string | null }) => st.responseCode !== null)).toBe(true);
+    expect(detail.json().stranded).toBeFalsy();
+  });
+
+  it("tells each viewer which steps they may actually respond to", async () => {
+    const res = await inject("POST", api("/submittals"), H(owner), { title: "Permission-aware respond", submittalType: "sample" });
+    const id = res.json().id as string;
+    const steps = await inject("POST", api(`/submittals/${id}/review-steps`), H(owner), { steps: [{ reviewerId: pm.userId, position: 0 }] });
+    const stepId = steps.json().items[0].id as string;
+    await inject("POST", api(`/submittals/${id}/submit`), H(owner));
+
+    const mine = await inject("GET", api(`/submittals/${id}`), H(pm));
+    expect(mine.json().permissions.canRespondStepIds).toContain(stepId);
+    const theirs = await inject("GET", api(`/submittals/${id}`), H(sub));
+    expect(theirs.json().permissions.canRespondStepIds).toHaveLength(0);
+    const blocked = await inject("POST", api(`/submittals/${id}/steps/${stepId}/respond`), H(sub), { responseCode: "approved" });
+    expect(blocked.statusCode).toBe(403);
+  });
+
   it("keeps a pure for_record chain as for_record and resubmits exactly once, superseding the parent", async () => {
     const res = await inject("POST", api("/submittals"), H(owner), { title: "Mock-up photos", submittalType: "mock_up" });
     const id = res.json().id;
@@ -329,6 +427,16 @@ describe("Submittals", () => {
     expect(a.reviewers.find((r: { reviewerId: string }) => r.reviewerId === pm.userId).responded).toBeGreaterThanOrEqual(2);
     expect(a.resubmissionBySpecSection.find((r: { specSection: string }) => r.specSection === "05 12 00").revisions).toBe(1);
     expect(a.basis).toContain("activatedAt");
+  });
+
+  it("refuses a submittal whose vendor is not a vendor of this company", async () => {
+    const bad = await inject("POST", api("/submittals"), H(owner), { title: "Ductwork shops", vendorId: "ven_nobody" });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json().message).toContain("ven_nobody");
+    const good = await inject("POST", api("/submittals"), H(owner), { title: "Ductwork shops" });
+    expect(good.statusCode).toBe(201);
+    const badPatch = await inject("PATCH", api(`/submittals/${good.json().id}`), H(owner), { vendorId: "ven_nobody" });
+    expect(badPatch.statusCode).toBe(400);
   });
 
   it("lets a company admin configure the response-code set and rejects a set without a resubmit code", async () => {

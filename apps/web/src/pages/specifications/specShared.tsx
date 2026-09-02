@@ -128,6 +128,10 @@ export interface SpecSection {
   tradeCode: string | null;
   requirementsConfirmed: number;
   submittalRequirementCount: number;
+  /** withdrawal (#288): a section absent from the current issue, retired by a person */
+  withdrawnAt?: string | null;
+  withdrawnBy?: string | null;
+  withdrawnReason?: string | null;
   createdBy: string;
   createdAt: string;
   updatedAt: string;
@@ -1046,4 +1050,106 @@ export function useSpecConflicts(
     [projectId, includeResolved, version],
   );
   return useResource<SpecConflictsResponse>(path);
+}
+
+/* ---------------------------------------------------------------- */
+/* Reissue notices and full-text search (#288, #298)                  */
+/* ---------------------------------------------------------------- */
+
+export interface SpecAffectedSubmittal {
+  submittalId: string;
+  requirementId: string;
+  paragraphRef: string | null;
+  kind: "removed" | "amended";
+}
+
+export interface SpecRevisionNotice {
+  id: string;
+  sectionId: string;
+  sectionCode: string;
+  sectionTitle: string | null;
+  sectionStatus: string | null;
+  revisionId: string;
+  previousRevisionId: string | null;
+  bookId: string | null;
+  revision: string;
+  changedClauseCount: number;
+  requirementsSuperseded: number;
+  requirementsToReconfirm: number;
+  requirementsNew: number;
+  submittalsAffected: SpecAffectedSubmittal[];
+  notifiedUserIds: string[];
+  notifiedNames: string[];
+  acknowledgedBy: string | null;
+  acknowledgedByName: string | null;
+  acknowledgedAt: string | null;
+  detail: Record<string, unknown>;
+  createdBy: string;
+  createdByName: string | null;
+  createdAt: string;
+}
+
+export interface SpecRevisionNoticesResponse extends Paginated<SpecRevisionNotice> {
+  unacknowledged: number;
+}
+
+export function useSpecRevisionNotices(
+  projectId: string | undefined,
+  acknowledged: "" | "0" | "1",
+  version: number,
+) {
+  const path = useMemo(() => {
+    if (!projectId) return null;
+    const params = new URLSearchParams({ page: "1", pageSize: "200", _v: String(version) });
+    if (acknowledged) params.set("acknowledged", acknowledged);
+    return `${base(projectId)}/spec-revision-notices?${params.toString()}`;
+  }, [projectId, acknowledged, version]);
+  return useResource<SpecRevisionNoticesResponse>(path);
+}
+
+export interface SpecSearchHit {
+  sectionId: string;
+  code: string;
+  title: string;
+  status: string;
+  revisionId: string;
+  revision: string;
+  pageStart: number | null;
+  rank: number;
+  snippet: string;
+}
+
+export interface SpecSearchResponse {
+  q: string;
+  items: SpecSearchHit[];
+  total: number;
+  basis: string;
+}
+
+export function useSpecSearch(projectId: string | undefined, query: string, version: number) {
+  const path = useMemo(() => {
+    const term = query.trim();
+    if (!projectId || term.length < 2) return null;
+    return `${base(projectId)}/spec-search?q=${encodeURIComponent(term)}&limit=50&_v=${version}`;
+  }, [projectId, query, version]);
+  return useResource<SpecSearchResponse>(path);
+}
+
+/**
+ * `ts_headline` marks matches with `[[ ]]` (the server picks delimiters that
+ * cannot appear in a spec clause). Split into runs so React renders the
+ * emphasis rather than the API echoing HTML back into the page.
+ */
+export function snippetRuns(snippet: string): Array<{ text: string; hit: boolean }> {
+  const out: Array<{ text: string; hit: boolean }> = [];
+  const re = /\[\[(.*?)\]\]/gs;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(snippet)) !== null) {
+    if (m.index > last) out.push({ text: snippet.slice(last, m.index), hit: false });
+    out.push({ text: m[1] ?? "", hit: true });
+    last = m.index + m[0].length;
+  }
+  if (last < snippet.length) out.push({ text: snippet.slice(last), hit: false });
+  return out;
 }

@@ -27,7 +27,6 @@ import {
   Modal,
   Select,
   Textarea,
-  useConfirm,
 } from "../../ui";
 import { DataTable, type DataColumns } from "../../ui/data";
 import {
@@ -82,9 +81,10 @@ export default function PaymentsPanel({
   onChanged: () => void;
 }) {
   const { busy, refusal, clear, run } = useAction();
-  const { confirm, dialog } = useConfirm();
   const { ask, dialog: reasonDialog } = useReason();
   const [scheduling, setScheduling] = useState(false);
+  /** The payment the issue dialog is open on — issuing is never a one-click act. */
+  const [issuing, setIssuing] = useState<CommitmentPayment | null>(null);
   /** The compliance result the API returned alongside the last successful act. */
   const [lastCompliance, setLastCompliance] = useState<ComplianceResult | null>(null);
 
@@ -240,20 +240,7 @@ export default function PaymentsPanel({
               </Button>
             ) : null}
             {row.status === "scheduled" && row.approvedBy ? (
-              <Button
-                size="xs"
-                disabled={busy !== null}
-                onClick={async () => {
-                  const ok = await confirm({
-                    title: `Issue ${row.reference}?`,
-                    description:
-                      "Issuing is the irreversible act. The vendor's insurance, bonding and lien-waiver position is re-read at this moment and may refuse the payment outright.",
-                    confirmLabel: "Issue the payment",
-                    tone: "warning",
-                  });
-                  if (ok) await act(row, "issue", "issue", { acknowledgeWarnings: true });
-                }}
-              >
+              <Button size="xs" disabled={busy !== null} onClick={() => setIssuing(row)}>
                 Issue
               </Button>
             ) : null}
@@ -307,7 +294,6 @@ export default function PaymentsPanel({
 
   return (
     <div className="space-y-3">
-      {dialog}
       {reasonDialog}
 
       <PaymentGate commitment={commitment} compliance={compliance} />
@@ -388,6 +374,19 @@ export default function PaymentsPanel({
           aria-label={`Payments against ${commitment.reference}`}
         />
       )}
+
+      <IssuePayment
+        payment={issuing}
+        compliance={compliance}
+        currency={currency}
+        busy={busy !== null}
+        onClose={() => setIssuing(null)}
+        onIssue={async (acknowledgeWarnings) => {
+          const target = issuing;
+          setIssuing(null);
+          if (target) await act(target, "issue", "issue", { acknowledgeWarnings });
+        }}
+      />
 
       <SchedulePayment
         open={scheduling}
@@ -487,6 +486,115 @@ function PaymentGate({
       <FindingList findings={compliance.blocking} heading="Blocking" />
       <FindingList findings={compliance.warnings} heading="Warnings" />
     </Alert>
+  );
+}
+
+/**
+ * ISSUING IS THE IRREVERSIBLE ACT, so it is never one click.
+ *
+ * The API stamps `acknowledgedWarnings` onto the payment and into the ledger
+ * when the caller sends it — an assertion that the issuer SAW the exposure and
+ * paid anyway. Sending that flag without showing the findings would make the
+ * platform assert something untrue on the issuer's behalf, so this dialog
+ * lists every warning verbatim and only enables the button once the issuer has
+ * ticked the acknowledgement. With no warnings on file there is nothing to
+ * acknowledge and the flag is not sent at all.
+ */
+function IssuePayment({
+  payment,
+  compliance,
+  currency,
+  busy,
+  onClose,
+  onIssue,
+}: {
+  payment: CommitmentPayment | null;
+  compliance: ComplianceResult;
+  currency: string;
+  busy: boolean;
+  onClose: () => void;
+  onIssue: (acknowledgeWarnings: boolean) => void | Promise<void>;
+}) {
+  const [acknowledged, setAcknowledged] = useState(false);
+  const warnings = compliance.warnings;
+  const needsAck = warnings.length > 0;
+  const key = payment?.id ?? "none";
+
+  return (
+    <Modal
+      key={key}
+      open={payment !== null}
+      onClose={onClose}
+      title={payment ? `Issue ${payment.reference}?` : "Issue payment"}
+      size="md"
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose} disabled={busy}>
+            Cancel
+          </Button>
+          <Button
+            disabled={busy || (needsAck && !acknowledged)}
+            onClick={() => void onIssue(needsAck ? acknowledged : false)}
+          >
+            {busy ? "Issuing…" : "Issue the payment"}
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        <p className="text-meta text-content-muted">
+          Issuing cuts the payment. The vendor&rsquo;s insurance, bonding and lien-waiver position
+          is re-read at this moment and may refuse it outright.
+        </p>
+        {payment ? (
+          <Card>
+            <CardBody className="grid gap-3 sm:grid-cols-3">
+              <Money label="Approved amount" value={payment.amount} currency={currency} />
+              <Money
+                label="Retainage released"
+                value={payment.retainageReleasedAmount}
+                currency={currency}
+              />
+              <div>
+                <div className="text-label uppercase text-content-subtle">Approved by</div>
+                <div className="mt-0.5 font-mono text-2xs">
+                  {payment.approvedBy ?? "—"}
+                </div>
+              </div>
+            </CardBody>
+          </Card>
+        ) : null}
+        {needsAck ? (
+          <Alert
+            tone="warning"
+            title={`${warnings.length} compliance warning${warnings.length === 1 ? "" : "s"} stand against this vendor`}
+          >
+            <p>
+              These do not block the payment, but issuing records on the payment and in the ledger
+              that they were known at the moment the money moved.
+            </p>
+            <FindingList findings={warnings} />
+            <label className="mt-3 flex items-start gap-2 text-meta">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={acknowledged}
+                onChange={(e) => setAcknowledged(e.target.checked)}
+              />
+              <span>
+                I have read the warnings above and am issuing this payment anyway. Record my
+                acknowledgement against the payment.
+              </span>
+            </label>
+          </Alert>
+        ) : (
+          <p className="text-meta text-content-subtle">
+            No compliance warnings are on file for this vendor as at {compliance.asOf}, so nothing
+            is acknowledged on your behalf.
+          </p>
+        )}
+      </div>
+    </Modal>
   );
 }
 

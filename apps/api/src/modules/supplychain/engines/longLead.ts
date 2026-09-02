@@ -129,11 +129,32 @@ export function assessLongLead(input: LongLeadInput, today: string): LongLeadAss
     if (rank[to] > rank[state.level]) state.level = to;
   };
 
-  /* 1. Already late on site */
-  if (input.actualArrivalDate && floatDays !== null && floatDays < 0) {
-    escalate("late");
-    reasons.push(`Arrived ${-floatDays} day(s) after the required-on-site date ${input.requiredOnSite}.`);
-  } else if (floatDays !== null && floatDays < 0) {
+  /*
+   * 0. Already on site. The register's whole question is "will it arrive in
+   * time"; once it HAS arrived the only remaining fact is whether it was
+   * late. Thin float, a missed planned ship date or an unchased order are
+   * all history at that point — reporting a delivered item as `at_risk`
+   * (and signalling it) would be a false alarm the sweep repeats daily.
+   */
+  if (input.actualArrivalDate) {
+    const lateBy = floatDays !== null && floatDays < 0 ? -floatDays : null;
+    return {
+      orderByDate,
+      expectedOnSite: expected.date,
+      expectedOnSiteBasis: expected.basis,
+      floatDays,
+      riskLevel: lateBy !== null ? "late" : "on_track",
+      reasons: [
+        lateBy !== null
+          ? `Arrived ${lateBy} day(s) after the required-on-site date ${input.requiredOnSite}.`
+          : `Arrived ${input.actualArrivalDate}, ${floatDays ?? 0} day(s) before it was needed on ${input.requiredOnSite}; nothing left to expedite.`,
+      ],
+      orderLatenessDays,
+    };
+  }
+
+  /* 1. Expected to land after it is needed */
+  if (floatDays !== null && floatDays < 0) {
     escalate("late");
     reasons.push(
       `Expected on site ${expected.date} (${basisLabel(expected.basis)}), ${-floatDays} day(s) after it is needed on ${input.requiredOnSite}.`,

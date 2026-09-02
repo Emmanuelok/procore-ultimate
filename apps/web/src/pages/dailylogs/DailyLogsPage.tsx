@@ -19,7 +19,7 @@ import { api } from "../../lib/api";
 import { Alert, Badge, Button, Card, CardBody, EmptyState, ErrorAlert, Field, Input, Modal, PageHeader, Select, Skeleton, Stat, Tabs, Textarea, statusTone } from "../../ui";
 import { IconDailyLog } from "../../ui/icons";
 import { formatDateTime, humanize } from "../format";
-import { DASH, addDaysIso, errorMessage, fetchBlob, openBlob, qs, todayIso, useCompanyUsers, useFieldResource, useMe } from "../rfis/fieldShared";
+import { DASH, addDaysIso, errorMessage, fetchBlob, openBlob, qs, todayIso, useCompanyUsers, useFieldResource, useMe, type ListResponse } from "../rfis/fieldShared";
 
 type EditRow = Record<string, string>;
 
@@ -312,6 +312,10 @@ export default function DailyLogsPage() {
   const [error, setError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const [reconciliation, setReconciliation] = useState<Reconciliation | null>(null);
+  const [logKind, setLogKind] = useState("internal");
+  const [vendorId, setVendorId] = useState("");
+  const [kindDirty, setKindDirty] = useState(false);
+  const vendors = useFieldResource<ListResponse<{ id: string; name: string }>>("/api/v1/vendors?pageSize=200");
 
   const log = dateRes.data?.log ?? null;
   const isMine = dateRes.data?.isMine ?? false;
@@ -331,6 +335,9 @@ export default function DailyLogsPage() {
     setWeather({ tempC: str(w["tempC"]), conditions: typeof w["conditions"] === "string" ? w["conditions"] : "", windKph: str(w["windKph"]), precipitationMm: str(w["precipitationMm"]) });
     setWeatherDirty(false);
     setReconciliation(null);
+    setLogKind(log?.logKind ?? "internal");
+    setVendorId(log?.vendorId ?? "");
+    setKindDirty(false);
   }, [log]);
 
   function switchTab(next: TabKey) {
@@ -367,6 +374,11 @@ export default function DailyLogsPage() {
     const payload: Record<string, unknown> = {};
     if (Object.keys(sections).length > 0) payload["sections"] = sections;
     if (notesDirty) payload["notes"] = notes.trim() !== "" ? notes : null;
+    if (kindDirty) {
+      if (logKind === "subcontractor" && vendorId === "") return "A subcontractor self-reported log must name its vendor.";
+      payload["logKind"] = logKind;
+      payload["vendorId"] = logKind === "subcontractor" ? vendorId : null;
+    }
     if (weatherDirty) {
       const w: Record<string, unknown> = {};
       if (weather.tempC.trim() !== "") w["tempC"] = Number(weather.tempC);
@@ -483,6 +495,30 @@ export default function DailyLogsPage() {
                     </span>
                   ) : null}
                   {savedAt ? <span className="text-xs text-emerald-600">Saved ✓</span> : null}
+                  {editable ? (
+                    <span className="flex items-center gap-1.5">
+                      <span className="w-40">
+                        <Select
+                          value={logKind}
+                          onChange={(e) => { setLogKind(e.target.value); setKindDirty(true); if (e.target.value !== "subcontractor") setVendorId(""); }}
+                          aria-label="Log kind"
+                        >
+                          <option value="internal">Our own log</option>
+                          <option value="subcontractor">Subcontractor self-reported</option>
+                        </Select>
+                      </span>
+                      {logKind === "subcontractor" ? (
+                        <span className="w-52">
+                          <Select value={vendorId} onChange={(e) => { setVendorId(e.target.value); setKindDirty(true); }} aria-label="Reporting vendor">
+                            <option value="">Choose the vendor…</option>
+                            {(vendors.data?.items ?? []).map((v) => (
+                              <option key={v.id} value={v.id}>{v.name}</option>
+                            ))}
+                          </Select>
+                        </span>
+                      ) : null}
+                    </span>
+                  ) : null}
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
                   {editable ? (

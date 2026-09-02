@@ -2,7 +2,14 @@ import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, asc, eq, gt } from "drizzle-orm";
-import { chainSeals, companyMemberships, ledgerEntries, signals, signingKeys } from "@constructos/db";
+import {
+  chainSeals,
+  chainWatermarks,
+  companyMemberships,
+  ledgerEntries,
+  signals,
+  signingKeys,
+} from "@constructos/db";
 import {
   buildSealBody,
   canonicalize as libCanonicalize,
@@ -17,6 +24,7 @@ import { AppError } from "../../lib/errors.js";
 import {
   anchorKeyState,
   assertPublicOnly,
+  registerPublicKey,
   requireAnchorKey,
   DERIVED_KEY_WEAKENING,
 } from "./keys.js";
@@ -25,6 +33,7 @@ import {
   encodeTimeStampReq,
   parseTimeStampResp,
   submitAnchor,
+  upgradeOpenTimestamps,
 } from "./providers.js";
 import { canonicalize as cliCanonicalize, verifyReceiptDocument } from "../../scripts/verify-receipt.js";
 
@@ -329,15 +338,31 @@ describe("sealing", () => {
     expect(read.statusCode).toBe(200);
   });
 
-  it("writes a heartbeat seal on a list read once the interval has passed", async () => {
+  it("writes a heartbeat seal from the SCHEDULER, not from a page read", async () => {
+    // REGRESSION (audit: production blocker). The heartbeat used to run inside
+    // GET /ledger/seals, so a tenant whose users never opened the Ledger
+    // workspace had no bound at all on how long a truncation could hide. A
+    // read must now change nothing; the scheduler does the sealing.
     const previous = process.env["ANCHOR_HEARTBEAT_HOURS"];
     try {
       const actor = await registerActor(app);
       await grow(actor.companyId, actor.userId, 2);
       expect((await seal(actor)).statusCode).toBe(201);
-      // an interval of 3.6 seconds expressed in hours, then wait it out
+      // an interval of 0.36 seconds expressed in hours, then wait it out
       process.env["ANCHOR_HEARTBEAT_HOURS"] = "0.0001";
       await new Promise((r) => setTimeout(r, 450));
+
+      const readOnly = await app.inject({
+        method: "GET",
+        url: url("/ledger/seals"),
+        headers: actor.headers,
+      });
+      expect(
+        (readOnly.json() as { items: Array<Record<string, any>> }).items.length,
+      ).toBe(1);
+
+      await app.scheduler.runNow("anchoring.heartbeat-seal");
+
       const list = await app.inject({
         method: "GET",
         url: url("/ledger/seals"),
@@ -347,6 +372,8 @@ describe("sealing", () => {
       expect(items.length).toBeGreaterThanOrEqual(2);
       expect(items[0]!.isHeartbeat).toBe(true);
       expect(items[0]!.sequence).toBe(2);
+      // A heartbeat seal written by the scheduler is attributed to the system.
+      expect(items[0]!.sealedBy).toBeNull();
     } finally {
       if (previous === undefined) delete process.env["ANCHOR_HEARTBEAT_HOURS"];
       else process.env["ANCHOR_HEARTBEAT_HOURS"] = previous;
@@ -591,10 +618,41 @@ describe("chain verdicts", () => {
       .set({ payload: { value: 125_000, description: "Additional piling" } })
       .where(eq(ledgerEntries.seq, target!.seq));
 
-    const result = await verdict(actor);
-    expect(result["verdict"]).toBe("entry_altered");
-    expect(result["failedEntrySeq"]).toBe(Number(target!.seq));
-    expect(String(result["reason"])).toMatch(/no longer hashes to its payloadHash/);
+    // The chain-verdict read no longer loads payload snapshots — that was a
+    // full-table jsonb scan on a monitoring endpoint and could OOM the API
+    // from a single page view. The snapshot re-hash moved to the bounded,
+    // resumable `anchoring.deep-verify` job, which raises the signal.
+    const shallow = await verdict(actor);
+    expect(shallow["verdict"]).toBe("intact");
+
+    await app.scheduler.runNow("anchoring.deep-verify");
+
+    const raised = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, actor.companyId),
+          eq(signals.detector, "ledger_entry_altered"),
+        ),
+      );
+    expect(raised.length).toBe(1);
+    const refs = raised[0]!.evidenceRefs as { entrySeq?: number };
+    expect(refs.entrySeq).toBe(Number(target!.seq));
+    expect(raised[0]!.explanation).toMatch(/no longer hashes to its recorded payloadHash/);
+
+    // …and it is idempotent: a second pass does not manufacture a twin.
+    await app.scheduler.runNow("anchoring.deep-verify");
+    const again = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, actor.companyId),
+          eq(signals.detector, "ledger_entry_altered"),
+        ),
+      );
+    expect(again.length).toBe(1);
   });
 
   it("says so when seals were signed under a key this process does not hold", async () => {
@@ -1342,5 +1400,240 @@ describe("trust anchor", () => {
     } finally {
       delete process.env["ANCHOR_TRUSTED_FINGERPRINTS"];
     }
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Platform-upgrade regressions                                        */
+/* ------------------------------------------------------------------ */
+
+describe("REGRESSION: escrow verify and seal deletion", () => {
+  it("reports seal_broken when the receipt's seal has been deleted from the register", async () => {
+    // THE ATTACK. An insider deletes seal N and every seal after it, so the
+    // surviving seal chain is contiguous 1..N-1 and classifies as intact; the
+    // ENTRIES are untouched, so every prefix check passes. The holder of the
+    // receipt for seal N used to be told "intact" while the seal they hold had
+    // been erased from the register they were verifying against.
+    const actor = await registerActor(app);
+    await grow(actor.companyId, actor.userId, 4);
+    expect((await seal(actor)).statusCode).toBe(201);
+    await grow(actor.companyId, actor.userId, 2);
+    const second = await seal(actor);
+    expect(second.statusCode).toBe(201);
+    const sealId = (second.json() as { id: string }).id;
+
+    const issued = await app.inject({
+      method: "POST",
+      url: url(`/ledger/seals/${sealId}/escrow`),
+      headers: actor.headers,
+      payload: { recipientName: "Lender plc" },
+    });
+    expect(issued.statusCode).toBe(201);
+    const document = (issued.json() as { document: Record<string, unknown> }).document;
+
+    const before = await app.inject({
+      method: "POST",
+      url: url("/ledger/escrow/verify"),
+      headers: actor.headers,
+      payload: { document },
+    });
+    expect(before.json()["verdict"]).toBe("intact");
+
+    // Delete the sealed-away seal. The remaining seal chain is 1..1.
+    await app.db.delete(chainSeals).where(eq(chainSeals.id, sealId));
+
+    const after = await app.inject({
+      method: "POST",
+      url: url("/ledger/escrow/verify"),
+      headers: actor.headers,
+      payload: { document },
+    });
+    expect(after.statusCode).toBe(200);
+    const body = after.json() as Record<string, any>;
+    expect(body["verdict"]).toBe("seal_broken");
+    expect(body["reason"]).toMatch(/NOT in this tenant's seal register/);
+    expect(body["receipt"]["sealOnRecord"]).toBe(false);
+
+    // …and it raises the finding rather than only rendering a sub-field.
+    const raised = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, actor.companyId),
+          eq(signals.detector, "chain_seal_broken"),
+        ),
+      );
+    expect(raised.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("REGRESSION: concurrent sealing and key registration", () => {
+  it("two concurrent seals produce contiguous sequences, never a unique-violation 500", async () => {
+    // Sequence allocation now happens inside one transaction holding a
+    // per-company advisory lock, so the loser of the race reads the winner's
+    // sequence instead of colliding on chain_seals_company_sequence_idx.
+    const actor = await registerActor(app);
+    await grow(actor.companyId, actor.userId, 4);
+    const [a, b] = await Promise.all([seal(actor), seal(actor)]);
+    for (const res of [a, b]) {
+      expect([200, 201, 409]).toContain(res.statusCode);
+      expect(res.statusCode).not.toBe(500);
+    }
+    const rows = await app.db
+      .select()
+      .from(chainSeals)
+      .where(eq(chainSeals.companyId, actor.companyId))
+      .orderBy(asc(chainSeals.sequence));
+    expect(rows.length).toBeGreaterThanOrEqual(1);
+    rows.forEach((row, i) => {
+      expect(row.sequence).toBe(i + 1);
+    });
+    // …and the seal chain still classifies as intact afterwards.
+    expect((await verdict(actor))["verdict"]).toBe("intact");
+  });
+
+  it("registerPublicKey is idempotent under a concurrent first registration", async () => {
+    const state = anchorKeyState({
+      NODE_ENV: "test",
+      AUTH_SECRET: "a-secret-that-is-long-enough",
+    });
+    expect(state.available).toBe(true);
+    if (!state.available) return;
+    const results = await Promise.all([
+      registerPublicKey(app.db, state.record),
+      registerPublicKey(app.db, state.record),
+      registerPublicKey(app.db, state.record),
+    ]);
+    const ids = new Set(results.map((r) => r.row.keyId));
+    expect(ids.size).toBe(1);
+    const rows = await app.db
+      .select()
+      .from(signingKeys)
+      .where(eq(signingKeys.keyId, state.record.keyId));
+    expect(rows).toHaveLength(1);
+  });
+});
+
+describe("REGRESSION: key rotation is not a cross-tenant act", () => {
+  it("does not retire other tenants' platform keys unless asked, and ledgers it everywhere when it does", async () => {
+    const a = await registerActor(app);
+    await grow(a.companyId, a.userId, 2);
+    expect((await seal(a)).statusCode).toBe(201);
+
+    // A foreign platform-wide key on record, as a rotation would leave behind.
+    const foreignKeyId = `ankx_${newId("k")}`;
+    await app.db.insert(signingKeys).values({
+      id: newId("skey"),
+      companyId: null,
+      keyId: foreignKeyId,
+      algorithm: "ed25519",
+      publicKeyPem: "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n",
+      fingerprint: "a".repeat(64),
+    });
+
+    const plain = await app.inject({
+      method: "POST",
+      url: url("/ledger/keys/rotate"),
+      headers: a.headers,
+      payload: {},
+    });
+    expect(plain.statusCode).toBe(200);
+    expect(plain.json().retiredOtherKeys).toBe(0);
+    const untouched = await app.db
+      .select()
+      .from(signingKeys)
+      .where(eq(signingKeys.keyId, foreignKeyId));
+    expect(untouched[0]!.retiredAt).toBeNull();
+    expect(plain.json().note).toMatch(/were NOT retired/);
+
+    const deliberate = await app.inject({
+      method: "POST",
+      url: url("/ledger/keys/rotate"),
+      headers: a.headers,
+      payload: { retireOtherPlatformKeys: true },
+    });
+    expect(deliberate.statusCode).toBe(200);
+    expect(deliberate.json().retiredOtherKeys).toBeGreaterThanOrEqual(1);
+    const retired = await app.db
+      .select()
+      .from(signingKeys)
+      .where(eq(signingKeys.keyId, foreignKeyId));
+    expect(retired[0]!.retiredAt).not.toBeNull();
+  });
+});
+
+describe("REGRESSION: reads no longer load payload snapshots", () => {
+  it("classifies a chain without reading jsonb payloads, and the deep job does the snapshot check", async () => {
+    const actor = await registerActor(app);
+    await grow(actor.companyId, actor.userId, 3);
+    await appendLedger(app.db, {
+      companyId: actor.companyId,
+      actorId: actor.userId,
+      action: "create",
+      objectType: "variation",
+      objectId: newId("var"),
+      payload: { value: 1000 },
+      storePayload: true,
+    });
+    expect((await seal(actor)).statusCode).toBe(201);
+    const clean = await verdict(actor);
+    expect(clean["verdict"]).toBe("intact");
+
+    // A clean deep pass leaves a watermark that the next run resumes from.
+    await app.scheduler.runNow("anchoring.deep-verify");
+    const marks = await app.db
+      .select()
+      .from(chainWatermarks)
+      .where(eq(chainWatermarks.companyId, actor.companyId));
+    expect(marks).toHaveLength(1);
+    expect(marks[0]!.deepVerifiedSeq).toBeGreaterThan(0);
+  });
+});
+
+describe("OpenTimestamps upgrade", () => {
+  it("stays pending while the calendar has nothing, and upgrades once it does", async () => {
+    const digest = "b".repeat(64);
+    const timestampUrl = `https://calendar.example/timestamp/${digest}`;
+    const pendingResult = await upgradeOpenTimestamps({
+      bodyHash: digest,
+      calendar: "https://calendar.example",
+      env: {},
+      http: createFixtureAnchorHttpClient({ [timestampUrl]: { status: 404, body: "" } }),
+    });
+    expect(pendingResult.upgraded).toBe(false);
+    expect(pendingResult.status).toBe("pending");
+    expect(pendingResult.detail).toMatch(/has not yet aggregated/);
+
+    const upgraded = await upgradeOpenTimestamps({
+      bodyHash: digest,
+      calendar: "https://calendar.example",
+      env: {},
+      http: createFixtureAnchorHttpClient({
+        [timestampUrl]: { status: 200, body: "attestation-bytes" },
+      }),
+    });
+    expect(upgraded.upgraded).toBe(true);
+    expect(upgraded.status).toBe("anchored");
+    expect(upgraded.proof!["attestationBase64"]).toBeTruthy();
+    expect(String(upgraded.proof!["verify"])).toMatch(/ots verify/);
+  });
+
+  it("says so, rather than pretending, when there is no calendar to ask", async () => {
+    const result = await upgradeOpenTimestamps({
+      bodyHash: "c".repeat(64),
+      calendar: "",
+      env: {},
+    });
+    expect(result.upgraded).toBe(false);
+    expect(result.detail).toMatch(/nowhere to ask/);
+  });
+
+  it("the scheduled job reports the absence of a configured provider instead of failing", async () => {
+    const status = await app.scheduler.runNow("anchoring.submit-and-upgrade");
+    expect(status.state).toBe("succeeded");
+    expect(String((status.lastResult as { skipped?: string }).skipped ?? "")).toMatch(
+      /No external anchor provider is configured/,
+    );
   });
 });

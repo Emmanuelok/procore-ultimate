@@ -226,10 +226,28 @@ export default function ChangesTab({
                       confirmLabel: "Reject it",
                     });
                     if (!reason) return;
-                    await act(row, "reject", "reject", { reason });
+                    await act(row, "reject", "reject", { reason, outcome: "rejected" });
                   }}
                 >
                   Reject
+                </Button>
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  disabled={busy !== null}
+                  onClick={async () => {
+                    const reason = await ask({
+                      title: `Send ${row.reference} back?`,
+                      description:
+                        "The change order returns to the author for correction and can be edited and resubmitted. Rejecting instead closes it.",
+                      label: "What has to change?",
+                      confirmLabel: "Send it back",
+                    });
+                    if (!reason) return;
+                    await act(row, "reject", "reject", { reason, outcome: "revise_and_resubmit" });
+                  }}
+                >
+                  Send back
                 </Button>
               </>
             ) : null}
@@ -240,6 +258,26 @@ export default function ChangesTab({
                 onClick={() => act(row, "execute", "execute")}
               >
                 Execute
+              </Button>
+            ) : null}
+            {row.status !== "executed" && row.status !== "void" ? (
+              <Button
+                size="xs"
+                variant="danger"
+                disabled={busy !== null}
+                onClick={async () => {
+                  const reason = await ask({
+                    title: `Void ${row.reference}?`,
+                    description:
+                      "A void change order leaves the register with its reason and stops counting as exposure. An executed change order is reversed by a further change order, never voided.",
+                    label: "Why is this change order void?",
+                    confirmLabel: "Void it",
+                  });
+                  if (!reason) return;
+                  await act(row, "void", "void", { reason });
+                }}
+              >
+                Void
               </Button>
             ) : null}
           </div>

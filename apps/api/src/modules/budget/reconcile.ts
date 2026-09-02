@@ -702,7 +702,16 @@ async function raiseDriftSignal(
     const refs = s.evidenceRefs as Record<string, unknown> | null;
     return refs && refs["budgetId"] === budget.id;
   });
-  if (existing) return existing.id;
+  if (existing) {
+    // Same condition, another run: refresh the sighting rather than raising a
+    // second finding. Two rows for one drift is the false-positive fatigue the
+    // assurance register exists to avoid.
+    await db
+      .update(signals)
+      .set({ lastSeenAt: nowIso(), occurrences: sql`${signals.occurrences} + 1` })
+      .where(eq(signals.id, existing.id));
+    return existing.id;
+  }
   const share = revisedTotal > 0 ? driftAmount / revisedTotal : 1;
   const id = newId("sig");
   await db.insert(signals).values({
@@ -717,6 +726,14 @@ async function raiseDriftSignal(
       `The scheduled reconciliation ${reference} rebuilt the cost-side columns of ${budget.reference} from the commitments, invoicing and payments tables and found ${drift.length} line/column pair(s) whose stored value disagreed with the rebuilt value (Σ|Δ| ${driftAmount.toFixed(2)} ${budget.currency}). The stored figures were corrected and the previous values recorded on the reconciliation. Drift on a reconciled budget means a writer bypassed the posting path — review who wrote those columns.`,
     evidenceRefs: { budgetId: budget.id, reconciliationId, reference, drift: drift.slice(0, 50) },
     disposition: "new",
+    // The finding is "this budget's stored cost columns disagree with their
+    // sources" — one identity, however many runs observe it. Stamping it
+    // keeps the assurance register's dedupe and precision figures honest.
+    fingerprint: `budget.cost_drift|${budget.id}`,
+    subjectType: "budget",
+    subjectId: budget.id,
+    firstSeenAt: nowIso(),
+    lastSeenAt: nowIso(),
   });
   return id;
 }

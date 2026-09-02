@@ -69,3 +69,54 @@ export type AgentReportKind = (typeof AGENT_REPORT_KINDS)[number];
 /** Outcome of a model invocation as stored on ai_runs.status. */
 export const AGENT_RUN_STATUSES = ["succeeded", "failed", "refused"] as const;
 export type AgentRunStatus = (typeof AGENT_RUN_STATUSES)[number];
+
+/**
+ * Every target type a fleet proposal may carry. The first four are the legacy
+ * operational targets (they mutate an operational record on approval); the
+ * rest are advisory artefacts recorded against the source record.
+ */
+export const AGENT_TARGET_TYPES = [
+  "daily_log",
+  "rfi_response",
+  "drawing_sheet",
+  "submittal_review",
+  "obligation_finding",
+  "notice_draft",
+  "claim_narrative",
+  "rebuttal",
+  "evidence_assessment",
+  "counterfactual",
+  "signal_explanation",
+  "integrity_memo",
+  "risk_finding",
+  "document_synthesis",
+  "cost_forecast",
+  "schedule_risk",
+  "meeting_minutes",
+  "incident_classification",
+  "spec_compliance",
+  "change_impact",
+  "bid_levelling",
+] as const;
+export type AgentTargetType = (typeof AGENT_TARGET_TYPES)[number];
+
+/** Target types low-consequence enough for a policy to auto-apply (#1022). */
+export const AGENT_AUTO_APPLY_TARGET_TYPES = ["drawing_sheet"] as const;
+
+/** Categories of data an agent transmits to the model (transparency, #775/#1027). */
+export const AGENT_DATA_CATEGORIES = [
+  "project_metadata",
+  "contract_terms",
+  "correspondence",
+  "financial",
+  "schedule",
+  "field_records",
+  "safety_records",
+  "assurance_records",
+  "vendor_records",
+  "worker_records",
+  "drawing_text",
+  "specification_text",
+  "images",
+] as const;
+export type AgentDataCategory = (typeof AGENT_DATA_CATEGORIES)[number];

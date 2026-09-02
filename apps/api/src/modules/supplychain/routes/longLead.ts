@@ -6,7 +6,7 @@
  * stale on the row the register reads.
  */
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, ilike, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, ilike, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { longLeadExpeditingLog, longLeadItems } from "@constructos/db";
 import {
@@ -296,7 +296,13 @@ export const longLeadRoutes: FastifyPluginAsync = async (app) => {
       loggedBy: req.user!.id,
       loggedAt,
     });
-    const set: Record<string, unknown> = { lastExpeditedAt: loggedAt, expeditingCount: current.expeditingCount + 1, updatedAt: loggedAt };
+    // The count is incremented IN SQL: two chasers logging at once must not
+    // read the same number and write it back twice.
+    const set: Record<string, unknown> = {
+      lastExpeditedAt: loggedAt,
+      expeditingCount: sql`${longLeadItems.expeditingCount} + 1`,
+      updatedAt: loggedAt,
+    };
     if (body.promisedDate) set["forecastArrivalDate"] = body.promisedDate;
     const [updated] = await app.db.update(longLeadItems).set(set).where(eq(longLeadItems.id, itemId)).returning();
     const ctx = await loadLongLeadContext(app.db, projectId, [updated!]);

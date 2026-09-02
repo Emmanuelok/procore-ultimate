@@ -17,7 +17,7 @@
  * unwaived work, because that exposure cannot be withdrawn — only chased.
  */
 import { useMemo, useState } from "react";
-import { Alert, Badge, Button, Card, CardBody, CardHeader, EmptyState, ErrorAlert, Field, Input, Modal, Select, Stat, Textarea } from "../../ui";
+import { Alert, Badge, Button, Card, CardBody, CardHeader, EmptyState, ErrorAlert, Field, Input, Select, Stat, Textarea } from "../../ui";
 import { Modal, toast } from "../../ui/overlays";
 import { DataTable, type DataColumns } from "../../ui/data";
 import { NumberInput } from "../../ui/inputs";

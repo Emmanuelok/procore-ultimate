@@ -211,7 +211,18 @@ describe("delivery lifecycle, on-time analytics and the carbon hook", () => {
     expect(stats.json().issues.damage).toBe(1);
     expect(stats.json().carbon.deliveriesWithoutDistance).toBe(1);
     expect(stats.json().method).toMatch(/15 minutes/);
-    expect(stats.json().byGate).toHaveLength(1);
+    // Every gate with a booking in the window gets a bucket — including the
+    // crane gate, whose two bookings are still open. Its percentage is null
+    // with the reason rather than a flattering (or damning) zero.
+    const byGate = stats.json().byGate as Array<{ key: string; completed: number; onTimePercent: number | null; reasons: string[] }>;
+    expect(byGate).toHaveLength(2);
+    const main = byGate.find((g) => g.key === gateId);
+    expect(main?.completed).toBe(2);
+    expect(main?.onTimePercent).toBe(50);
+    const crane = byGate.find((g) => g.key === craneGateId);
+    expect(crane?.completed).toBe(0);
+    expect(crane?.onTimePercent).toBeNull();
+    expect(crane?.reasons[0]).toMatch(/No completed deliveries/);
   });
 
   it("marks bookings that never arrived as no-shows through the scheduler, once", async () => {
@@ -405,6 +416,8 @@ describe("summary and health inputs", () => {
     expect(s.traceability.records).toBe(4);
     expect(s.map.nodes).toBe(0);
     expect(s.signals.open).toBeGreaterThanOrEqual(1);
+    // The roll-up reads every register under a ceiling and says so when it hits one.
+    expect(s.truncated).toEqual([]);
 
     const health = await get(`/projects/${projectId}/supply-chain/health-inputs`);
     expect(health.statusCode).toBe(200);

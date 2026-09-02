@@ -15,7 +15,7 @@
  * observations (modules/safety) and drawing markup rendering (drawings).
  */
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
-import { and, count, desc, eq, ilike, inArray, isNotNull, lt, type SQL } from "drizzle-orm";
+import { and, count, desc, eq, ilike, inArray, isNotNull, isNull, lt, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import {
   changeEvents,
@@ -36,7 +36,7 @@ import {
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
-import { AppError, badRequest, notFound } from "../../lib/errors.js";
+import { AppError, badRequest, conflict, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { pushNotifications } from "../notifications/service.js";
 import { isoDateSchema, todayISO } from "./dates.js";
@@ -455,117 +455,137 @@ export const observationRoutes: FastifyPluginAsync = async (app) => {
     let targetId = "";
     let targetLabel = "";
     let targetObjectType = "";
+    // Compare-and-swap on convertedToType: two clicks on "Convert" must
+    // produce one punch item, not two. Only the request that flips the column
+    // from NULL proceeds; the loser sees the guard rather than a duplicate.
+    const claimed = await app.db
+      .update(fieldObservations)
+      .set({ convertedToType: body.target, convertedAt: now, updatedAt: now })
+      .where(and(eq(fieldObservations.id, row.id), isNull(fieldObservations.convertedToType)))
+      .returning({ id: fieldObservations.id });
+    if (claimed.length === 0) throw conflict("This observation is already being converted");
 
-    if (body.target === "punch_item") {
-      const number = await nextRecordNumber(app.db, req.projectId!, "punch");
-      targetId = newId("pun");
-      targetLabel = `Punch #${pad3(number)}`;
-      targetObjectType = "punch_item";
-      await app.db.insert(punchItems).values({
-        id: targetId,
-        companyId: req.companyId!,
-        projectId: req.projectId!,
-        number,
-        title: row.title,
-        description: row.description,
-        status: "open",
-        itemType: row.observationType,
-        assigneeId: row.assigneeId,
-        verifierId: row.verifierId,
-        vendorId: row.vendorId,
-        locationId: row.locationId,
-        dueDate: body.dueDate !== undefined ? body.dueDate : row.dueDate,
-        priority: row.priority,
-        beforePhotoIds: row.photoIds,
-        afterPhotoIds: [],
-        distribution: row.distribution,
-        observationId: row.id,
-        createdBy: me,
-      });
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: me,
-        action: "create",
-        objectType: "punch_item",
-        objectId: targetId,
-        payload: { number, title: row.title, fromObservation: row.id },
-        projectId: req.projectId!,
-      });
-      if (row.assigneeId && row.assigneeId !== me) {
-        await pushNotifications(app.db, [
-          {
-            companyId: req.companyId!,
-            userId: row.assigneeId,
-            projectId: req.projectId!,
-            kind: "assignment",
-            title: `${targetLabel} assigned to you: ${row.title}`,
-            recordType: "punch_item",
-            recordId: targetId,
-          },
-        ]);
+    try {
+      if (body.target === "punch_item") {
+        const number = await nextRecordNumber(app.db, req.projectId!, "punch");
+        targetId = newId("pun");
+        targetLabel = `Punch #${pad3(number)}`;
+        targetObjectType = "punch_item";
+        await app.db.insert(punchItems).values({
+          id: targetId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          number,
+          title: row.title,
+          description: row.description,
+          status: "open",
+          itemType: row.observationType,
+          assigneeId: row.assigneeId,
+          verifierId: row.verifierId,
+          vendorId: row.vendorId,
+          locationId: row.locationId,
+          dueDate: body.dueDate !== undefined ? body.dueDate : row.dueDate,
+          priority: row.priority,
+          beforePhotoIds: row.photoIds,
+          afterPhotoIds: [],
+          distribution: row.distribution,
+          observationId: row.id,
+          createdBy: me,
+        });
+        await appendLedger(app.db, {
+          companyId: req.companyId!,
+          actorId: me,
+          action: "create",
+          objectType: "punch_item",
+          objectId: targetId,
+          payload: { number, title: row.title, fromObservation: row.id },
+          projectId: req.projectId!,
+        });
+        if (row.assigneeId && row.assigneeId !== me) {
+          await pushNotifications(app.db, [
+            {
+              companyId: req.companyId!,
+              userId: row.assigneeId,
+              projectId: req.projectId!,
+              kind: "assignment",
+              title: `${targetLabel} assigned to you: ${row.title}`,
+              recordType: "punch_item",
+              recordId: targetId,
+            },
+          ]);
+        }
+      } else if (body.target === "incident") {
+        const seq = await nextRecordNumber(app.db, req.projectId!, "safety_incident");
+        targetId = newId("inc");
+        targetLabel = `INC-${pad4(seq)}`;
+        targetObjectType = "safety_incident";
+        const occurredAt = body.occurredAt ?? row.createdAt;
+        if (Number.isNaN(Date.parse(occurredAt))) throw badRequest("occurredAt must be an ISO timestamp");
+        await app.db.insert(safetyIncidents).values({
+          id: targetId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          number: seq,
+          reference: targetLabel,
+          incidentType: body.incidentType ?? "near_miss",
+          severity: body.severity ?? "minor",
+          title: row.title,
+          description: row.description ?? row.title,
+          occurredAt: new Date(occurredAt).toISOString(),
+          reportedAt: now,
+          locationId: row.locationId,
+          vendorId: row.vendorId,
+          createdBy: me,
+        });
+        await appendLedger(app.db, {
+          companyId: req.companyId!,
+          actorId: me,
+          action: "create",
+          objectType: "safety_incident",
+          objectId: targetId,
+          payload: { reference: targetLabel, title: row.title, fromObservation: row.id },
+          projectId: req.projectId!,
+        });
+      } else {
+        const number = await nextRecordNumber(app.db, req.projectId!, "change_event");
+        targetId = newId("ce");
+        targetLabel = `CE-${pad3(number)}`;
+        targetObjectType = "change_event";
+        await app.db.insert(changeEvents).values({
+          id: targetId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          number,
+          reference: targetLabel,
+          title: row.title,
+          description: row.description,
+          status: "open",
+          eventType: body.eventType ?? "field_condition",
+          originType: "observation",
+          originId: row.id,
+          locationId: row.locationId,
+          identifiedDate: todayISO(),
+          createdBy: me,
+        });
+        await appendLedger(app.db, {
+          companyId: req.companyId!,
+          actorId: me,
+          action: "create",
+          objectType: "change_event",
+          objectId: targetId,
+          payload: { reference: targetLabel, title: row.title, fromObservation: row.id },
+          projectId: req.projectId!,
+        });
       }
-    } else if (body.target === "incident") {
-      const seq = await nextRecordNumber(app.db, req.projectId!, "safety_incident");
-      targetId = newId("inc");
-      targetLabel = `INC-${pad4(seq)}`;
-      targetObjectType = "safety_incident";
-      const occurredAt = body.occurredAt ?? row.createdAt;
-      if (Number.isNaN(Date.parse(occurredAt))) throw badRequest("occurredAt must be an ISO timestamp");
-      await app.db.insert(safetyIncidents).values({
-        id: targetId,
-        companyId: req.companyId!,
-        projectId: req.projectId!,
-        number: seq,
-        reference: targetLabel,
-        incidentType: body.incidentType ?? "near_miss",
-        severity: body.severity ?? "minor",
-        title: row.title,
-        description: row.description ?? row.title,
-        occurredAt: new Date(occurredAt).toISOString(),
-        reportedAt: now,
-        locationId: row.locationId,
-        vendorId: row.vendorId,
-        createdBy: me,
-      });
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: me,
-        action: "create",
-        objectType: "safety_incident",
-        objectId: targetId,
-        payload: { reference: targetLabel, title: row.title, fromObservation: row.id },
-        projectId: req.projectId!,
-      });
-    } else {
-      const number = await nextRecordNumber(app.db, req.projectId!, "change_event");
-      targetId = newId("ce");
-      targetLabel = `CE-${pad3(number)}`;
-      targetObjectType = "change_event";
-      await app.db.insert(changeEvents).values({
-        id: targetId,
-        companyId: req.companyId!,
-        projectId: req.projectId!,
-        number,
-        reference: targetLabel,
-        title: row.title,
-        description: row.description,
-        status: "open",
-        eventType: body.eventType ?? "field_condition",
-        originType: "observation",
-        originId: row.id,
-        locationId: row.locationId,
-        identifiedDate: todayISO(),
-        createdBy: me,
-      });
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: me,
-        action: "create",
-        objectType: "change_event",
-        objectId: targetId,
-        payload: { reference: targetLabel, title: row.title, fromObservation: row.id },
-        projectId: req.projectId!,
-      });
+    } catch (err) {
+      // The claim above reserved the observation; if the target record could
+      // not be written, release it so the conversion can be retried rather
+      // than leaving a record that claims a conversion that never happened.
+      await app.db
+        .update(fieldObservations)
+        .set({ convertedToType: null, convertedAt: null, updatedAt: nowIso() })
+        .where(eq(fieldObservations.id, row.id));
+      throw err;
     }
 
     await app.db.insert(recordLinks).values({
@@ -583,9 +603,7 @@ export const observationRoutes: FastifyPluginAsync = async (app) => {
     await app.db
       .update(fieldObservations)
       .set({
-        convertedToType: body.target,
         convertedToId: targetId,
-        convertedAt: now,
         ...(close ? { status: "closed", closedBy: me, closedAt: now } : {}),
         updatedAt: now,
       })
