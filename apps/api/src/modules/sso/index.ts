@@ -177,6 +177,17 @@ const providerCoreSchema = z.object({
   defaultTemplateKey: z.string().min(1).max(80).optional(),
   groupClaimName: z.string().min(1).max(120).optional(),
   groupRoleMappings: z.array(groupMappingSchema).max(100).optional(),
+  /**
+   * WP-AUTH — projects a JIT-provisioned member is given access to, under
+   * `defaultTemplateKey`. Without this the template key was resolved,
+   * ledgered and applied to nothing: a provisioned user held a company
+   * membership and could not open a single project.
+   */
+  provisionProjectIds: z.array(z.string().min(1).max(64)).max(200).optional(),
+  /** WP-AUTH — does this IdP perform MFA itself? See the schema comment. */
+  idpPerformsMfa: z.boolean().optional(),
+  /** amr/acr values that count as a second factor, e.g. ["mfa","otp","hwk"] */
+  mfaAmrValues: z.array(z.string().min(1).max(64)).max(20).optional(),
 });
 
 const createProviderSchema = providerCoreSchema.extend({
@@ -289,21 +300,32 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
     metadata?: Record<string, unknown>;
     req: FastifyRequest;
   }): Promise<void> {
-    await app.db.insert(authSecurityEvents).values({
-      id: newId("ase"),
-      companyId: fields.companyId ?? null,
-      userId: fields.userId ?? null,
-      email: fields.email ?? null,
-      kind: fields.kind,
-      outcome: fields.outcome ?? "success",
-      sessionId: fields.sessionId ?? null,
-      providerId: fields.providerId ?? null,
-      identityId: fields.identityId ?? null,
-      ip: fields.req.ip,
-      userAgent: fields.req.headers["user-agent"] ?? null,
-      reason: fields.reason ?? null,
-      metadata: fields.metadata ?? {},
-    });
+    // FAIL-SAFE, like recordAuthEvent (account/events.ts) and
+    // recordSecurityEvent (mfa/service.ts). This one used to insert without a
+    // guard, and `finishSignIn` awaits it AFTER the session row and the
+    // refresh token are already written — so a transient database error turned
+    // a completed sign-in into a 500 and left the user on an error page while
+    // holding a live session. A trail write must never fail the request it
+    // describes.
+    try {
+      await app.db.insert(authSecurityEvents).values({
+        id: newId("ase"),
+        companyId: fields.companyId ?? null,
+        userId: fields.userId ?? null,
+        email: fields.email ?? null,
+        kind: fields.kind,
+        outcome: fields.outcome ?? "success",
+        sessionId: fields.sessionId ?? null,
+        providerId: fields.providerId ?? null,
+        identityId: fields.identityId ?? null,
+        ip: fields.req.ip,
+        userAgent: fields.req.headers["user-agent"] ?? null,
+        reason: fields.reason ?? null,
+        metadata: fields.metadata ?? {},
+      });
+    } catch (err) {
+      fields.req.log.error({ err, kind: fields.kind }, "sso security trail write failed");
+    }
   }
 
   function readCookie(req: FastifyRequest, name: string): string | null {
@@ -627,6 +649,9 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
       defaultTemplateKey: body.defaultTemplateKey ?? null,
       groupClaimName: body.groupClaimName ?? "groups",
       groupRoleMappings: body.groupRoleMappings ?? [],
+      provisionProjectIds: body.provisionProjectIds ?? [],
+      idpPerformsMfa: body.idpPerformsMfa ?? false,
+      mfaAmrValues: body.mfaAmrValues ?? [],
       isEnabled: false,
       createdBy: req.user!.id,
       createdAt: now,
@@ -1344,13 +1369,37 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
     }
   });
 
+  /**
+   * Finish a failed callback.
+   *
+   * REDIRECT MODE PUTS ITS MESSAGE IN A URL, which lands in browser history,
+   * in the Referer header of the next request and in every proxy log between
+   * here and the user. So only a message WRITTEN FOR A USER travels: an
+   * `AppError` below 500, which is this codebase's way of saying "this text is
+   * the explanation the caller is entitled to". Anything else — a decryption
+   * failure, a driver error, an unexpected throw — is logged server-side with
+   * a correlation id and the browser is told only that something went wrong
+   * and which reference to quote. The production 5xx masking in app.ts covers
+   * the JSON path; this covers the one that goes around it.
+   */
   function finishError(reply: FastifyReply, flow: SsoFlowRecord, err: Error) {
     if (flow.mode === "json") throw err;
     const status = err instanceof AppError ? err.statusCode : 500;
+    const safe = err instanceof AppError && err.statusCode < 500;
+    const reference = safe ? null : newId("ssoerr");
+    if (!safe) {
+      app.log.error(
+        { err, reference, providerId: flow.providerId, companyId: flow.companyId },
+        "sso callback failed",
+      );
+    }
     return reply.redirect(
       buildAppUrl(config.APP_BASE_URL, "/auth/sso/complete", {
         error: String(status),
-        message: err.message,
+        message: safe
+          ? err.message
+          : "The sign-in could not be completed. Quote this reference to your administrator.",
+        ...(reference ? { reference } : {}),
         ...(flow.returnTo ? { returnTo: flow.returnTo } : {}),
       }),
       302,
