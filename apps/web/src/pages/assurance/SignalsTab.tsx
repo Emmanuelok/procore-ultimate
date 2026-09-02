@@ -41,9 +41,25 @@ const DETECTORS = [
 ] as const;
 
 interface RunResult {
+  runId?: string;
   created: number;
-  skipped?: string[];
+  refreshed?: number;
+  superseded?: number;
+  autoClosed?: number;
+  executed?: string[];
+  skipped?: { detector: string; reason: string }[] | string[];
   perDetector: Record<string, number>;
+  durationMs?: number;
+}
+
+/** Lifecycle fields added by the platform upgrade wave. */
+interface LifecycleFields {
+  fingerprint?: string | null;
+  occurrences?: number;
+  firstSeenAt?: string | null;
+  lastSeenAt?: string | null;
+  autoClosedAt?: string | null;
+  supersededById?: string | null;
 }
 
 export default function SignalsTab({ projectId }: { projectId: string }) {
@@ -172,20 +188,40 @@ export default function SignalsTab({ projectId }: { projectId: string }) {
           </div>
           <ErrorAlert message={runError} />
           {runResult ? (
-            <div className="mt-3 flex flex-wrap items-center gap-2">
-              <Badge tone={runResult.created > 0 ? "amber" : "green"}>
-                {runResult.created} signal{runResult.created === 1 ? "" : "s"} created
-              </Badge>
-              {Object.entries(runResult.perDetector).map(([k, v]) => (
-                <Badge key={k} tone={v > 0 ? "red" : "gray"}>
-                  {humanize(k)}: {v}
+            <div className="mt-3 space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge tone={runResult.created > 0 ? "amber" : "green"}>
+                  {runResult.created} new
                 </Badge>
-              ))}
-              {(runResult.skipped ?? []).map((k) => (
-                <Badge key={`skip-${k}`} tone="gray">
-                  {humanize(k)}: skipped (insufficient data)
-                </Badge>
-              ))}
+                {/*
+                  A run that finds a condition already open REFRESHES it. Showing
+                  that separately is the point: repeated runs used to multiply
+                  signals, which is how a register becomes unreadable.
+                */}
+                <Badge tone="gray">{runResult.refreshed ?? 0} still true</Badge>
+                <Badge tone="gray">{runResult.autoClosed ?? 0} auto-closed</Badge>
+                {runResult.superseded ? (
+                  <Badge tone="amber">{runResult.superseded} superseded</Badge>
+                ) : null}
+                {Object.entries(runResult.perDetector).map(([k, v]) => (
+                  <Badge key={k} tone={v > 0 ? "red" : "gray"}>
+                    {humanize(k)}: {v}
+                  </Badge>
+                ))}
+              </div>
+              {(runResult.skipped ?? []).length > 0 ? (
+                <ul className="list-inside list-disc text-[11px] text-ink-500">
+                  {(runResult.skipped ?? []).map((k, i) =>
+                    typeof k === "string" ? (
+                      <li key={`skip-${k}`}>{humanize(k)}: skipped</li>
+                    ) : (
+                      <li key={`skip-${k.detector}-${i}`}>
+                        <span className="font-medium">{k.detector}</span> skipped — {k.reason}
+                      </li>
+                    ),
+                  )}
+                </ul>
+              ) : null}
             </div>
           ) : null}
         </CardBody>
@@ -231,6 +267,7 @@ export default function SignalsTab({ projectId }: { projectId: string }) {
               <Th>Detector</Th>
               <Th>Title</Th>
               <Th>Confidence</Th>
+              <Th>Seen</Th>
               <Th>Disposition</Th>
               <Th>Created</Th>
             </tr>
@@ -246,8 +283,28 @@ export default function SignalsTab({ projectId }: { projectId: string }) {
                   <span className="line-clamp-2 font-medium text-ink-900">{s.title}</span>
                 </Td>
                 <Td className="tabular-nums">{pct(s.confidence)}</Td>
+                <Td className="whitespace-nowrap text-xs text-ink-500">
+                  {/*
+                    Occurrences, not duplicates. A detector re-run that finds the
+                    same condition refreshes this signal instead of raising a
+                    twin, so a rising count means "still true", never "raised
+                    again".
+                  */}
+                  {(s as SignalRow & LifecycleFields).occurrences ?? 1}×
+                  {(s as SignalRow & LifecycleFields).lastSeenAt ? (
+                    <span
+                      className="ml-1 text-ink-400"
+                      title={`last observed ${(s as SignalRow & LifecycleFields).lastSeenAt}`}
+                    >
+                      ↻
+                    </span>
+                  ) : null}
+                </Td>
                 <Td>
                   <Badge tone={dispositionTone(s.disposition)}>{humanize(s.disposition)}</Badge>
+                  {(s as SignalRow & LifecycleFields).autoClosedAt ? (
+                    <span className="ml-1 text-[11px] text-ink-400">auto</span>
+                  ) : null}
                 </Td>
                 <Td className="whitespace-nowrap text-xs text-ink-500">{formatDateTime(s.createdAt)}</Td>
               </tr>

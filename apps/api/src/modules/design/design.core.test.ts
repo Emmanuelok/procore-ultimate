@@ -771,3 +771,84 @@ describe("cross-tool links", () => {
     expect(res.statusCode).toBe(400);
   });
 });
+
+/* ================================================================== */
+
+describe("register reads and lifecycle edges", () => {
+  it("lists comments across the project with filters", async () => {
+    const all = await get(`${base()}/comments`);
+    expect(all.statusCode).toBe(200);
+    const body = all.json() as { items: Array<{ status: string }>; total: number };
+    expect(body.total).toBeGreaterThan(0);
+    const open = await get(`${base()}/comments?open=true`);
+    expect(open.statusCode).toBe(200);
+    const openBody = open.json() as { items: Array<{ status: string }> };
+    for (const comment of openBody.items) expect(["open", "responded"]).toContain(comment.status);
+    expect((await get(`${base()}/comments`, stranger.headers)).statusCode).toBe(403);
+  });
+
+  it("serves the package lookup the workspace pickers use", async () => {
+    const res = await get(`${base()}/packages-lookup`);
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { items: Array<{ id: string; reference: string; name: string }>; total: number };
+    expect(body.total).toBeGreaterThan(0);
+    expect(body.items[0]?.reference).toMatch(/^DP-\d{3}$/);
+  });
+
+  it("serves a package's review and change history", async () => {
+    const pkg = await makePackage("History package");
+    await post(`${base()}/reviews`, { packageId: pkg.id, title: "First issue" });
+    const res = await get(`${base()}/packages/${pkg.id}/history`);
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { reviews: Array<{ cycleNumber: number }>; changeNotices: unknown[] };
+    expect(body.reviews).toHaveLength(1);
+    expect(body.changeNotices).toEqual([]);
+    expect((await get(`${base()}/packages/${pkg.id}/history`, stranger.headers)).statusCode).toBe(403);
+  });
+
+  it("edits an open review cycle and refuses to edit a closed one", async () => {
+    const pkg = await makePackage("Editable cycle");
+    const review = await post(`${base()}/reviews`, { packageId: pkg.id, title: "Editable" });
+    const reviewId = (review.json() as { id: string }).id;
+    const patched = await patch(`${base()}/reviews/${reviewId}`, { title: "Renamed cycle", dueAt: "2026-05-01T00:00:00.000Z" });
+    expect(patched.statusCode).toBe(200);
+    expect((patched.json() as { title: string }).title).toBe("Renamed cycle");
+
+    const added = await post(`${base()}/reviews/${reviewId}/reviewers`, { userId: reviewerActor.userId, isRequired: true });
+    const participantId = (added.json() as { id: string }).id;
+    await post(`${base()}/reviews/${reviewId}/reviewers/${participantId}/return`, { code: "A" }, reviewerActor.headers);
+    await post(`${base()}/reviews/${reviewId}/close`, {});
+    const afterClose = await patch(`${base()}/reviews/${reviewId}`, { title: "Too late" });
+    expect(afterClose.statusCode).toBe(409);
+  });
+
+  it("cancels a cycle that should never have been issued", async () => {
+    const pkg = await makePackage("Cancelled cycle");
+    const review = await post(`${base()}/reviews`, { packageId: pkg.id, title: "Issued in error" });
+    const reviewId = (review.json() as { id: string }).id;
+    const res = await post(`${base()}/reviews/${reviewId}/cancel`, { reason: "Issued against the wrong revision" });
+    expect(res.statusCode).toBe(200);
+    expect((res.json() as { status: string }).status).toBe("cancelled");
+    const again = await post(`${base()}/reviews/${reviewId}/close`, {});
+    expect(again.statusCode).toBe(409);
+  });
+
+  it("rejects a stage gate with a recorded reason", async () => {
+    const created = await post(`${base()}/stages`, { stageKey: "stage_5", criteria: [] });
+    const gateId = (created.json() as { id: string }).id;
+    const res = await post(`${base()}/stages/${gateId}/reject`, { reason: "Coordination not complete at the gate meeting" });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { status: string; rejectedReason: string };
+    expect(body.status).toBe("rejected");
+    expect(body.rejectedReason).toContain("Coordination");
+  });
+
+  it("keeps another company out of the stage plan and the freeze register", async () => {
+    expect((await get(`${base()}/stages`, stranger.headers)).statusCode).toBe(403);
+    expect((await get(`${base()}/freezes`, stranger.headers)).statusCode).toBe(403);
+    expect((await post(`${base()}/freezes`, { scope: "project", title: "x" }, stranger.headers)).statusCode).toBe(403);
+    expect((await get(`${base()}/decisions`, stranger.headers)).statusCode).toBe(403);
+    expect((await get(`${base()}/reviews`, stranger.headers)).statusCode).toBe(403);
+    expect((await get(`${base()}/links`, stranger.headers)).statusCode).toBe(403);
+  });
+});

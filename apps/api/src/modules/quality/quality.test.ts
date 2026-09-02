@@ -778,7 +778,9 @@ describe("non-conformance reports", () => {
         ),
       );
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.reference).toMatch(/^CA-\d{3}$/);
+    // The shared register's format, allocated from the shared counter — see
+    // the regression test in qualityRegressions.test.ts for why that matters.
+    expect(rows[0]!.reference).toMatch(/^CA-\d{4}$/);
   });
 
   it("refuses closeout while a corrective action is still open, naming it", async () => {

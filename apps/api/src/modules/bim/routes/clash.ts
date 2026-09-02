@@ -14,7 +14,7 @@
  * that hides its coverage is worse than no clash count.
  */
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import {
   bimElements,
@@ -31,7 +31,7 @@ import { badRequest, conflict, notFound } from "../../../lib/errors.js";
 import { nextRecordNumber } from "../../../lib/numbering.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.js";
 import { detectClashes, type ClashElement } from "../clash.js";
-import { buildBimGates, buildLoaders, ledger, nowISO, raiseSignal } from "../shared.js";
+import { buildBimGates, buildLoaders, closeSignal, ledger, nowISO, raiseSignal } from "../shared.js";
 
 const filterSchema = z
   .object({
@@ -128,10 +128,11 @@ export const clashRoutes: FastifyPluginAsync = async (app) => {
       ? versionIds.filter((id) => selector.modelVersionIds!.includes(id))
       : versionIds;
     if (scoped.length === 0) return [];
+    // elements WITHOUT extents are loaded too: the engine counts them as
+    // excluded so the run can report its own coverage instead of hiding it
     const conds = [
       eq(bimElements.projectId, projectId),
       inArray(bimElements.modelVersionId, scoped),
-      sql`${bimElements.minX} is not null`,
       eq(bimModels.companyId, companyId),
     ];
     if (selector.disciplines?.length) {
@@ -378,7 +379,7 @@ export const clashRoutes: FastifyPluginAsync = async (app) => {
       const byFingerprint = new Map(existing.map((r) => [r.fingerprint, r]));
       const at = nowISO();
       const seen = new Set<string>();
-      let created = 0;
+      const inserts: Array<typeof clashResults.$inferInsert> = [];
       let persisting = 0;
 
       for (const hit of run.hits) {
@@ -402,8 +403,7 @@ export const clashRoutes: FastifyPluginAsync = async (app) => {
             .where(eq(clashResults.id, prior.id));
           continue;
         }
-        created += 1;
-        await app.db.insert(clashResults).values({
+        inserts.push({
           id: newId("clr"),
           companyId: req.companyId!,
           projectId: test.projectId,
@@ -430,6 +430,12 @@ export const clashRoutes: FastifyPluginAsync = async (app) => {
           lastSeenAt: at,
         });
       }
+      // new results go in in chunks: a first run over a real federation can
+      // produce thousands, and one round trip each is not acceptable
+      for (let i = 0; i < inserts.length; i += 500) {
+        await app.db.insert(clashResults).values(inserts.slice(i, i + 500));
+      }
+      const created = inserts.length;
 
       // anything previously open that this run did not find has gone away
       const goneIds = existing
@@ -476,6 +482,15 @@ export const clashRoutes: FastifyPluginAsync = async (app) => {
       });
 
       const openCount = created + persisting;
+      if (openCount === 0) {
+        await closeSignal(
+          app.db,
+          req.companyId!,
+          "bim_clash_unresolved",
+          `bim_clash_unresolved:${testId}`,
+          "Auto-closed: a later run of this clash test found no unresolved interference.",
+        );
+      }
       if (openCount > 0) {
         await raiseSignal(app.db, req.companyId!, test.projectId, req.user!.id, {
           detector: "bim_clash_unresolved",

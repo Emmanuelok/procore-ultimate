@@ -196,6 +196,12 @@ export const mapRoutes: FastifyPluginAsync = async (app) => {
     const wanted = new Set(
       (q.layers ?? "equipment,photo,capture,geofence").split(",").map((s) => s.trim()),
     );
+    // assets and model elements carry no coordinates of their own: they are
+    // located by their spatial container, not by latitude/longitude. Asking
+    // for them returns nothing, and the response says so rather than
+    // returning an empty layer that looks like "there are none".
+    const supported = new Set(["equipment", "photo", "capture", "geofence"]);
+    const unsupportedLayers = [...wanted].filter((layer) => !supported.has(layer));
 
     const [projectRow] = await app.db
       .select({
@@ -379,6 +385,11 @@ export const mapRoutes: FastifyPluginAsync = async (app) => {
       })),
       coverage,
       outsideAnyFence: assignment.outside.length,
+      unsupportedLayers,
+      unsupportedReason:
+        unsupportedLayers.length > 0
+          ? "Assets and model elements are located by their spatial container, not by coordinates, so they cannot be plotted on the map"
+          : null,
     };
   });
 

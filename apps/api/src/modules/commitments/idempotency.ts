@@ -56,3 +56,56 @@ export async function withIdempotency<T>(
   }
   return result;
 }
+
+/**
+ * The same contract in two halves, for handlers whose body is too long to
+ * wrap without reindenting it. `replayIdempotent` returns the stored response
+ * when the key has been seen (and sets the stored status on the reply);
+ * `rememberIdempotent` stores the response the first time through. Together
+ * they are `withIdempotency`, opened up.
+ */
+export async function replayIdempotent<T>(
+  db: Db,
+  req: FastifyRequest,
+  reply: FastifyReply,
+): Promise<{ body: T } | null> {
+  const header = req.headers["idempotency-key"];
+  const key = Array.isArray(header) ? header[0] : header;
+  const companyId = req.companyId;
+  if (!key || !companyId || key.length > 200) return null;
+  const existing = await db
+    .select()
+    .from(idempotencyKeys)
+    .where(and(eq(idempotencyKeys.companyId, companyId), eq(idempotencyKeys.key, key)))
+    .limit(1);
+  const hit = existing[0];
+  if (!hit) return null;
+  reply.status(hit.responseStatus);
+  reply.header("idempotent-replayed", "true");
+  return { body: hit.responseBody as T };
+}
+
+export async function rememberIdempotent(
+  db: Db,
+  req: FastifyRequest,
+  route: string,
+  status: number,
+  body: unknown,
+): Promise<void> {
+  const header = req.headers["idempotency-key"];
+  const key = Array.isArray(header) ? header[0] : header;
+  const companyId = req.companyId;
+  if (!key || !companyId || key.length > 200) return;
+  try {
+    await db.insert(idempotencyKeys).values({
+      id: newId("idk"),
+      companyId,
+      key,
+      route,
+      responseStatus: status,
+      responseBody: body ?? null,
+    });
+  } catch {
+    /* a concurrent replay already stored it — the stored body wins next time */
+  }
+}

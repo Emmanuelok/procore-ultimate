@@ -59,7 +59,13 @@ const inject = (
   url: string,
   headers: Record<string, string>,
   payload?: unknown,
-) => built.app.inject({ method, url, headers, ...(payload !== undefined ? { payload } : {}) });
+) =>
+  built.app.inject({
+    method,
+    url,
+    headers,
+    ...(payload !== undefined ? { payload } : {}),
+  });
 
 const OH_PROFIT: MarkupRule[] = [
   { kind: "percent", label: "Overhead", basis: "cost", rate: 10 },
@@ -78,7 +84,10 @@ beforeAll(async () => {
     userId: u2.userId,
     role: "admin",
   });
-  h2 = { authorization: `Bearer ${u2.accessToken}`, "x-company-id": u1.companyId };
+  h2 = {
+    authorization: `Bearer ${u2.accessToken}`,
+    "x-company-id": u1.companyId,
+  };
 
   proj = newId("prj");
   await built.app.db.insert(projects).values({
@@ -105,7 +114,9 @@ beforeAll(async () => {
   });
 
   vendorA = newId("ven");
-  await built.app.db.insert(vendors).values({ id: vendorA, companyId: u1.companyId, name: "Apex Concrete" });
+  await built.app.db
+    .insert(vendors)
+    .values({ id: vendorA, companyId: u1.companyId, name: "Apex Concrete" });
 
   contractId = newId("pc");
   await built.app.db.insert(primeContracts).values({
@@ -207,11 +218,16 @@ afterAll(async () => {
 
 /** A PCO priced from its cost lines, stopping short of submission. */
 async function pcoPricedOnly(title: string, amount: number): Promise<string> {
-  const created = await inject("POST", `/api/v1/projects/${proj}/potential-change-orders`, u1.headers, {
-    title,
-    commitmentId,
-    reason: "design_error",
-  });
+  const created = await inject(
+    "POST",
+    `/api/v1/projects/${proj}/potential-change-orders`,
+    u1.headers,
+    {
+      title,
+      commitmentId,
+      reason: "design_error",
+    },
+  );
   const id = created.json().id as string;
   await inject("POST", `/api/v1/projects/${proj}/potential-change-orders/${id}/lines`, u1.headers, {
     description: title,
@@ -241,20 +257,30 @@ async function quotedRfq(pcoId: string, amount: number): Promise<string> {
   if (rfq.statusCode !== 201) throw new Error(`rfq failed: ${rfq.body}`);
   const quoteId = rfq.json().id as string;
   await inject("POST", `/api/v1/projects/${proj}/quote-requests/${quoteId}/send`, u1.headers, {});
-  const quoted = await inject("POST", `/api/v1/projects/${proj}/quote-requests/${quoteId}/quote`, u1.headers, {
-    quotedAmount: amount,
-  });
+  const quoted = await inject(
+    "POST",
+    `/api/v1/projects/${proj}/quote-requests/${quoteId}/quote`,
+    u1.headers,
+    {
+      quotedAmount: amount,
+    },
+  );
   if (quoted.statusCode !== 200) throw new Error(`quote failed: ${quoted.body}`);
   return quoteId;
 }
 
 /** A priced, approved PCO against the commitment, ready to be requested or packaged. */
 async function pricedPco(title: string, amount: number): Promise<string> {
-  const created = await inject("POST", `/api/v1/projects/${proj}/potential-change-orders`, u1.headers, {
-    title,
-    commitmentId,
-    reason: "design_error",
-  });
+  const created = await inject(
+    "POST",
+    `/api/v1/projects/${proj}/potential-change-orders`,
+    u1.headers,
+    {
+      title,
+      commitmentId,
+      reason: "design_error",
+    },
+  );
   const id = created.json().id as string;
   await inject("POST", `/api/v1/projects/${proj}/potential-change-orders/${id}/lines`, u1.headers, {
     description: title,
@@ -263,8 +289,18 @@ async function pricedPco(title: string, amount: number): Promise<string> {
     budgetLineItemId: lineSub,
     costAmount: amount,
   });
-  await inject("POST", `/api/v1/projects/${proj}/potential-change-orders/${id}/price`, u1.headers, {});
-  await inject("POST", `/api/v1/projects/${proj}/potential-change-orders/${id}/submit`, u1.headers, {});
+  await inject(
+    "POST",
+    `/api/v1/projects/${proj}/potential-change-orders/${id}/price`,
+    u1.headers,
+    {},
+  );
+  await inject(
+    "POST",
+    `/api/v1/projects/${proj}/potential-change-orders/${id}/submit`,
+    u1.headers,
+    {},
+  );
   await inject("POST", `/api/v1/projects/${proj}/potential-change-orders/${id}/approve`, h2, {});
   return id;
 }
@@ -278,9 +314,18 @@ describe("markup schedule (pure)", () => {
     const schedule = {
       rules: [] as MarkupRule[],
       bands: [
-        { upTo: 50_000, rules: [{ kind: "percent", label: "OH&P", basis: "cost", rate: 15 }] as MarkupRule[] },
-        { upTo: 250_000, rules: [{ kind: "percent", label: "OH&P", basis: "cost", rate: 10 }] as MarkupRule[] },
-        { upTo: null, rules: [{ kind: "percent", label: "OH&P", basis: "cost", rate: 5 }] as MarkupRule[] },
+        {
+          upTo: 50_000,
+          rules: [{ kind: "percent", label: "OH&P", basis: "cost", rate: 15 }] as MarkupRule[],
+        },
+        {
+          upTo: 250_000,
+          rules: [{ kind: "percent", label: "OH&P", basis: "cost", rate: 10 }] as MarkupRule[],
+        },
+        {
+          upTo: null,
+          rules: [{ kind: "percent", label: "OH&P", basis: "cost", rate: 5 }] as MarkupRule[],
+        },
       ],
     };
     expect(rulesForSubtotal(schedule, 20_000).rules[0]!.rate).toBe(15);
@@ -293,15 +338,24 @@ describe("markup schedule (pure)", () => {
     const schedule = {
       rules: [] as MarkupRule[],
       bands: [
-        { upTo: 50_000, rules: [{ kind: "percent", label: "OH&P", basis: "cost", rate: 15 }] as MarkupRule[] },
-        { upTo: null, rules: [{ kind: "percent", label: "OH&P", basis: "cost", rate: 5 }] as MarkupRule[] },
+        {
+          upTo: 50_000,
+          rules: [{ kind: "percent", label: "OH&P", basis: "cost", rate: 15 }] as MarkupRule[],
+        },
+        {
+          upTo: null,
+          rules: [{ kind: "percent", label: "OH&P", basis: "cost", rate: 5 }] as MarkupRule[],
+        },
       ],
     };
     expect(rulesForSubtotal(schedule, -20_000).rules[0]!.rate).toBe(15);
   });
 
   it("falls back to the default rules when no band matches", () => {
-    const schedule = { rules: OH_PROFIT, bands: [{ upTo: 10, rules: [] as MarkupRule[] }] };
+    const schedule = {
+      rules: OH_PROFIT,
+      bands: [{ upTo: 10, rules: [] as MarkupRule[] }],
+    };
     const { rules, band } = rulesForSubtotal(schedule, 100_000);
     expect(band).toBeNull();
     expect(rules).toHaveLength(2);
@@ -330,7 +384,12 @@ describe("markup schedule (pure)", () => {
   it("carries the stack validator's own complaints through, labelled by band", () => {
     const problems = validateSchedule({
       rules: [],
-      bands: [{ upTo: null, rules: [{ kind: "percent", label: "Bad", basis: "cost", rate: 400 }] as MarkupRule[] }],
+      bands: [
+        {
+          upTo: null,
+          rules: [{ kind: "percent", label: "Bad", basis: "cost", rate: 400 }] as MarkupRule[],
+        },
+      ],
     });
     expect(problems[0]).toContain("Band 1:");
   });
@@ -346,25 +405,34 @@ describe("tier definitions (pure)", () => {
 
   it("names the stage a three-tier member skipped", () => {
     expect(
-      skippedStages({ tier: "three_tier", requireQuoteForSubcontract: false }, {
-        hasCor: false,
-        hasAcceptedQuote: false,
-        subcontract: true,
-      }),
+      skippedStages(
+        { tier: "three_tier", requireQuoteForSubcontract: false },
+        {
+          hasCor: false,
+          hasAcceptedQuote: false,
+          subcontract: true,
+        },
+      ),
     ).toEqual(["cor"]);
     expect(
-      skippedStages({ tier: "three_tier", requireQuoteForSubcontract: true }, {
-        hasCor: true,
-        hasAcceptedQuote: false,
-        subcontract: true,
-      }),
+      skippedStages(
+        { tier: "three_tier", requireQuoteForSubcontract: true },
+        {
+          hasCor: true,
+          hasAcceptedQuote: false,
+          subcontract: true,
+        },
+      ),
     ).toEqual(["rfq"]);
     expect(
-      skippedStages({ tier: "two_tier", requireQuoteForSubcontract: true }, {
-        hasCor: false,
-        hasAcceptedQuote: false,
-        subcontract: true,
-      }),
+      skippedStages(
+        { tier: "two_tier", requireQuoteForSubcontract: true },
+        {
+          hasCor: false,
+          hasAcceptedQuote: false,
+          subcontract: true,
+        },
+      ),
     ).toEqual([]);
   });
 });
@@ -398,9 +466,24 @@ describe("ageing and cycle-time maths (pure)", () => {
 
   it("turns a dated transition list into per-stage timestamps, keeping the FIRST time a stage was reached", () => {
     const timeline = stageTimeline("2026-01-01T00:00:00.000Z", [
-      { objectType: "potential_change_order", objectId: "p1", toStatus: "priced", at: "2026-01-02T00:00:00.000Z" },
-      { objectType: "potential_change_order", objectId: "p1", toStatus: "submitted", at: "2026-01-05T00:00:00.000Z" },
-      { objectType: "potential_change_order", objectId: "p1", toStatus: "priced", at: "2026-01-09T00:00:00.000Z" },
+      {
+        objectType: "potential_change_order",
+        objectId: "p1",
+        toStatus: "priced",
+        at: "2026-01-02T00:00:00.000Z",
+      },
+      {
+        objectType: "potential_change_order",
+        objectId: "p1",
+        toStatus: "submitted",
+        at: "2026-01-05T00:00:00.000Z",
+      },
+      {
+        objectType: "potential_change_order",
+        objectId: "p1",
+        toStatus: "priced",
+        at: "2026-01-09T00:00:00.000Z",
+      },
     ]);
     expect(timeline.identified).toBe("2026-01-01T00:00:00.000Z");
     expect(timeline.priced).toBe("2026-01-02T00:00:00.000Z");
@@ -439,7 +522,10 @@ describe("markup schedules", () => {
     const res = await inject(
       "PUT",
       `/api/v1/projects/${proj}/change-markups`,
-      { authorization: `Bearer ${standard.accessToken}`, "x-company-id": u1.companyId },
+      {
+        authorization: `Bearer ${standard.accessToken}`,
+        "x-company-id": u1.companyId,
+      },
       { name: "Sneaky", rules: OH_PROFIT },
     );
     expect(res.statusCode).toBe(403);
@@ -450,8 +536,14 @@ describe("markup schedules", () => {
       name: "Standard OH&P",
       rules: OH_PROFIT,
       bands: [
-        { upTo: 50_000, rules: [{ kind: "percent", label: "OH&P", basis: "cost", rate: 15 }] },
-        { upTo: null, rules: [{ kind: "percent", label: "OH&P", basis: "cost", rate: 5 }] },
+        {
+          upTo: 50_000,
+          rules: [{ kind: "percent", label: "OH&P", basis: "cost", rate: 15 }],
+        },
+        {
+          upTo: null,
+          rules: [{ kind: "percent", label: "OH&P", basis: "cost", rate: 5 }],
+        },
       ],
     });
     expect(res.statusCode).toBe(200);
@@ -488,7 +580,10 @@ describe("markup schedules", () => {
       "PUT",
       `/api/v1/projects/${proj}/change-markups?primeContractId=${contractId}`,
       u1.headers,
-      { name: "PC-001 negotiated", rules: [{ kind: "percent", label: "OH&P", basis: "cost", rate: 8 }] },
+      {
+        name: "PC-001 negotiated",
+        rules: [{ kind: "percent", label: "OH&P", basis: "cost", rate: 8 }],
+      },
     );
     expect(res.statusCode).toBe(200);
     const resolved = await inject(
@@ -502,7 +597,9 @@ describe("markup schedules", () => {
 
   it("refuses a contract override for a contract on another project", async () => {
     const other = newId("prj");
-    await built.app.db.insert(projects).values({ id: other, companyId: u1.companyId, name: "Elsewhere" });
+    await built.app.db
+      .insert(projects)
+      .values({ id: other, companyId: u1.companyId, name: "Elsewhere" });
     const res = await inject(
       "PUT",
       `/api/v1/projects/${other}/change-markups?primeContractId=${contractId}`,
@@ -569,7 +666,9 @@ describe("tier configuration", () => {
   });
 
   it("permits it again once the project is back on two tier", async () => {
-    await inject("PUT", `/api/v1/projects/${proj}/change-config`, u1.headers, { tier: "two_tier" });
+    await inject("PUT", `/api/v1/projects/${proj}/change-config`, u1.headers, {
+      tier: "two_tier",
+    });
     const pcoId = await pricedPco("Two-tier package", 5_000);
     const res = await inject("POST", `/api/v1/projects/${proj}/change-order-packages`, u1.headers, {
       kind: "commitment",
@@ -597,10 +696,25 @@ describe("regression: accepting a quote never re-prices a committed position", (
     const pcoId = await pcoPricedOnly("Approved before the quote landed", 10_000);
     const quoteId = await quotedRfq(pcoId, 15_000);
     /* the sub's price arrives AFTER an independent approver signed off 10,000 */
-    await inject("POST", `/api/v1/projects/${proj}/potential-change-orders/${pcoId}/submit`, u1.headers, {});
-    await inject("POST", `/api/v1/projects/${proj}/potential-change-orders/${pcoId}/approve`, h2, {});
+    await inject(
+      "POST",
+      `/api/v1/projects/${proj}/potential-change-orders/${pcoId}/submit`,
+      u1.headers,
+      {},
+    );
+    await inject(
+      "POST",
+      `/api/v1/projects/${proj}/potential-change-orders/${pcoId}/approve`,
+      h2,
+      {},
+    );
 
-    const res = await inject("POST", `/api/v1/projects/${proj}/quote-requests/${quoteId}/accept`, u1.headers, {});
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${proj}/quote-requests/${quoteId}/accept`,
+      u1.headers,
+      {},
+    );
     expect(res.statusCode).toBe(409);
     expect(res.json().message).toContain("cannot re-price");
 
@@ -622,7 +736,12 @@ describe("regression: accepting a quote never re-prices a committed position", (
       pcoIds: [pcoId],
     });
     expect(cor.statusCode).toBe(201);
-    const res = await inject("POST", `/api/v1/projects/${proj}/quote-requests/${quoteId}/accept`, u1.headers, {});
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${proj}/quote-requests/${quoteId}/accept`,
+      u1.headers,
+      {},
+    );
     expect(res.statusCode).toBe(409);
     expect(res.json().message).toMatch(/owner change order request|change order package/);
   });
@@ -637,10 +756,15 @@ describe("regression: accepting a quote never re-prices a committed position", (
     );
     const quoteId = rfq.json().id as string;
     await inject("POST", `/api/v1/projects/${proj}/quote-requests/${quoteId}/send`, u1.headers, {});
-    const res = await inject("POST", `/api/v1/projects/${proj}/quote-requests/${quoteId}/quote`, u1.headers, {
-      quotedAmount: 900,
-      respondedAt: "today",
-    });
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${proj}/quote-requests/${quoteId}/quote`,
+      u1.headers,
+      {
+        quotedAmount: 900,
+        respondedAt: "today",
+      },
+    );
     expect(res.statusCode).toBe(400);
   });
 });
@@ -658,7 +782,12 @@ describe("regression: a rejected owner request releases its priced positions", (
       pcoIds: [pcoId],
     });
     const corId = cor.json().changeOrderRequest.id as string;
-    await inject("POST", `/api/v1/projects/${proj}/change-order-requests/${corId}/submit`, u1.headers, {});
+    await inject(
+      "POST",
+      `/api/v1/projects/${proj}/change-order-requests/${corId}/submit`,
+      u1.headers,
+      {},
+    );
     const rejected = await inject(
       "POST",
       `/api/v1/projects/${proj}/change-order-requests/${corId}/reject`,
@@ -668,11 +797,16 @@ describe("regression: a rejected owner request releases its priced positions", (
     expect(rejected.statusCode).toBe(200);
     expect(rejected.json().detail.releasedPcoIds).toContain(pcoId);
 
-    const again = await inject("POST", `/api/v1/projects/${proj}/change-order-requests`, u1.headers, {
-      title: "Revised ask",
-      primeContractId: contractId,
-      pcoIds: [pcoId],
-    });
+    const again = await inject(
+      "POST",
+      `/api/v1/projects/${proj}/change-order-requests`,
+      u1.headers,
+      {
+        title: "Revised ask",
+        primeContractId: contractId,
+        pcoIds: [pcoId],
+      },
+    );
     expect(again.statusCode).toBe(201);
   });
 });
@@ -699,7 +833,12 @@ describe("regression: voiding a PCO inside a live owner request", () => {
     expect(res.statusCode).toBe(409);
     expect(res.json().message).toContain(cor.json().changeOrderRequest.reference);
 
-    await inject("POST", `/api/v1/projects/${proj}/change-order-requests/${corId}/withdraw`, u1.headers, {});
+    await inject(
+      "POST",
+      `/api/v1/projects/${proj}/change-order-requests/${corId}/withdraw`,
+      u1.headers,
+      {},
+    );
     const after = await inject(
       "POST",
       `/api/v1/projects/${proj}/potential-change-orders/${pcoId}/void`,
@@ -728,7 +867,12 @@ describe("regression: commitment package execution keeps the original sum frozen
     });
     expect(pkg.statusCode).toBe(201);
     pkgId = pkg.json().id;
-    await inject("POST", `/api/v1/projects/${proj}/change-order-packages/${pkgId}/submit`, u1.headers, {});
+    await inject(
+      "POST",
+      `/api/v1/projects/${proj}/change-order-packages/${pkgId}/submit`,
+      u1.headers,
+      {},
+    );
     await inject("POST", `/api/v1/projects/${proj}/change-order-packages/${pkgId}/approve`, h2, {});
     const res = await inject(
       "POST",
@@ -772,9 +916,13 @@ describe("regression: commitment package execution keeps the original sum frozen
       `/api/v1/projects/${proj}/commitments/rollups/reconcile`,
       u1.headers,
     );
-    const mine = (res.json().results as Array<{ commitmentId: string; reconciles: boolean; failing: unknown[] }>).find(
-      (r) => r.commitmentId === commitmentId,
-    );
+    const mine = (
+      res.json().results as Array<{
+        commitmentId: string;
+        reconciles: boolean;
+        failing: unknown[];
+      }>
+    ).find((r) => r.commitmentId === commitmentId);
     expect(mine?.failing).toEqual([]);
     expect(mine?.reconciles).toBe(true);
     const row = (
@@ -786,7 +934,11 @@ describe("regression: commitment package execution keeps the original sum frozen
 
   it("moved the committed cost onto the budget line through the currency-aware sync", async () => {
     const line = (
-      await built.app.db.select().from(budgetLineItems).where(eq(budgetLineItems.id, lineSub)).limit(1)
+      await built.app.db
+        .select()
+        .from(budgetLineItems)
+        .where(eq(budgetLineItems.id, lineSub))
+        .limit(1)
     )[0]!;
     expect(line.committedCost).toBeCloseTo(110_000, 2);
   });
@@ -802,7 +954,12 @@ describe("change analytics", () => {
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body.items.length).toBeGreaterThan(0);
-    expect(body.buckets.map((b: { bucket: string }) => b.bucket)).toEqual(["0-7", "8-30", "31-60", "60+"]);
+    expect(body.buckets.map((b: { bucket: string }) => b.bucket)).toEqual([
+      "0-7",
+      "8-30",
+      "31-60",
+      "60+",
+    ]);
     // sorted oldest first
     const days = body.items.map((i: { daysInStatus: number }) => i.daysInStatus);
     expect([...days].sort((a: number, b: number) => b - a)).toEqual(days);
@@ -814,7 +971,13 @@ describe("change analytics", () => {
     const res = await inject("GET", `/api/v1/projects/${proj}/change-log/cycle-time`, u1.headers);
     expect(res.statusCode).toBe(200);
     expect(Array.isArray(res.json().overall)).toBe(true);
-    expect(res.json().overall.some((s: { from: string; to: string }) => s.from === "identified" && s.to === "priced")).toBe(true);
+    expect(
+      res
+        .json()
+        .overall.some(
+          (s: { from: string; to: string }) => s.from === "identified" && s.to === "priced",
+        ),
+    ).toBe(true);
     expect(res.json().note).toBeNull();
   });
 
@@ -833,9 +996,13 @@ describe("change analytics", () => {
       u1.headers,
     );
     expect(res.statusCode).toBe(200);
-    const contract = (res.json().contracts as Array<{ primeContractId: string; approvedChangePercent: unknown; pendingChangePercent: unknown }>).find(
-      (c) => c.primeContractId === contractId,
-    );
+    const contract = (
+      res.json().contracts as Array<{
+        primeContractId: string;
+        approvedChangePercent: unknown;
+        pendingChangePercent: unknown;
+      }>
+    ).find((c) => c.primeContractId === contractId);
     expect(contract?.approvedChangePercent).toBeDefined();
     expect(contract?.pendingChangePercent).toBeDefined();
   });

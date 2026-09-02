@@ -67,7 +67,13 @@ const inject = (
   url: string,
   headers: Record<string, string>,
   payload?: unknown,
-) => built.app.inject({ method, url, headers, ...(payload !== undefined ? { payload } : {}) });
+) =>
+  built.app.inject({
+    method,
+    url,
+    headers,
+    ...(payload !== undefined ? { payload } : {}),
+  });
 
 beforeAll(async () => {
   built = await buildTestApp();
@@ -84,14 +90,24 @@ beforeAll(async () => {
       role: "member",
     });
   }
-  secondH = { authorization: `Bearer ${second.accessToken}`, "x-company-id": owner.companyId };
-  thirdH = { authorization: `Bearer ${third.accessToken}`, "x-company-id": owner.companyId };
+  secondH = {
+    authorization: `Bearer ${second.accessToken}`,
+    "x-company-id": owner.companyId,
+  };
+  thirdH = {
+    authorization: `Bearer ${third.accessToken}`,
+    "x-company-id": owner.companyId,
+  };
 
   proj = newId("prj");
   projOther = newId("prj");
   await built.app.db.insert(projects).values([
     { id: proj, companyId: owner.companyId, name: "FIN2 commitments" },
-    { id: projOther, companyId: owner.companyId, name: "FIN2 commitments — other" },
+    {
+      id: projOther,
+      companyId: owner.companyId,
+      name: "FIN2 commitments — other",
+    },
   ]);
   for (const projectId of [proj, projOther]) {
     for (const actor of [second, third]) {
@@ -161,19 +177,31 @@ afterAll(async () => {
 });
 
 /** An approved, executed subcontract with a two-line schedule. */
-async function makeCommitment(
-  opts: { title: string; lines: Array<Record<string, unknown>>; projectId?: string; retainage?: number } ,
-): Promise<{ id: string; sovLineIds: string[] }> {
-  const res = await inject("POST", `/api/v1/projects/${opts.projectId ?? proj}/commitments`, owner.headers, {
-    kind: "subcontract",
-    title: opts.title,
-    vendorId: vendor,
-    defaultRetainagePercent: opts.retainage ?? 10,
-    requiresLienWaiver: false,
-    compliance: { strictness: "warn", requiredPolicyTypes: ["employers_liability"] },
-    sovLines: opts.lines,
-  });
-  if (res.statusCode !== 201) throw new Error(`makeCommitment failed: ${res.statusCode} ${res.body}`);
+async function makeCommitment(opts: {
+  title: string;
+  lines: Array<Record<string, unknown>>;
+  projectId?: string;
+  retainage?: number;
+}): Promise<{ id: string; sovLineIds: string[] }> {
+  const res = await inject(
+    "POST",
+    `/api/v1/projects/${opts.projectId ?? proj}/commitments`,
+    owner.headers,
+    {
+      kind: "subcontract",
+      title: opts.title,
+      vendorId: vendor,
+      defaultRetainagePercent: opts.retainage ?? 10,
+      requiresLienWaiver: false,
+      compliance: {
+        strictness: "warn",
+        requiredPolicyTypes: ["employers_liability"],
+      },
+      sovLines: opts.lines,
+    },
+  );
+  if (res.statusCode !== 201)
+    throw new Error(`makeCommitment failed: ${res.statusCode} ${res.body}`);
   const body = res.json();
   await inject("POST", `/api/v1/commitments/${body.commitment.id}/approve`, secondH, {});
   await inject("POST", `/api/v1/commitments/${body.commitment.id}/execute`, secondH, {});
@@ -188,7 +216,12 @@ async function makeCommitment(
 /* ================================================================== */
 
 describe("purchase-order tax (pure)", () => {
-  const header = { kind: "purchase_order", taxable: 1, taxPercent: 10, taxAmount: null };
+  const header = {
+    kind: "purchase_order",
+    taxable: 1,
+    taxPercent: 10,
+    taxAmount: null,
+  };
 
   it("taxes ONLY the taxable lines when any line carries the flag", () => {
     const tax = purchaseOrderTax(header, [
@@ -223,7 +256,10 @@ describe("purchase-order tax (pure)", () => {
 
 describe("closeout checklist (pure)", () => {
   it("fails while a required item is outstanding and names it", () => {
-    const items = defaultCloseoutItems("subcontract").map((i) => ({ ...i, done: false }));
+    const items = defaultCloseoutItems("subcontract").map((i) => ({
+      ...i,
+      done: false,
+    }));
     const result = evaluateCloseout(items);
     expect(result.passes).toBe(false);
     expect(result.outstanding.length).toBeGreaterThan(0);
@@ -241,7 +277,10 @@ describe("closeout checklist (pure)", () => {
   });
 
   it("refuses a tick with no evidence on an item that is not auto-verified", () => {
-    const items = defaultCloseoutItems("subcontract").map((i) => ({ ...i, done: true }));
+    const items = defaultCloseoutItems("subcontract").map((i) => ({
+      ...i,
+      done: true,
+    }));
     const manual = items.filter((i) => !i.autoVerified && i.required);
     const result = evaluateCloseout(items);
     if (manual.length > 0) {
@@ -262,18 +301,29 @@ describe("backcharges", () => {
   beforeAll(async () => {
     const c = await makeCommitment({
       title: "Steel erection",
-      lines: [{ description: "Erection", budgetLineItemId: budgetLine, scheduledValue: 100000 }],
+      lines: [
+        {
+          description: "Erection",
+          budgetLineItemId: budgetLine,
+          scheduledValue: 100000,
+        },
+      ],
     });
     commitmentId = c.id;
   });
 
   it("raises a draft backcharge with its reason code and evidence", async () => {
-    const res = await inject("POST", `/api/v1/commitments/${commitmentId}/backcharges`, owner.headers, {
-      reasonCode: "cleanup",
-      title: "Site cleanup after steel",
-      amount: 4000,
-      evidence: [{ type: "punch_item", id: "pnc-1", label: "Debris left in bay 3" }],
-    });
+    const res = await inject(
+      "POST",
+      `/api/v1/commitments/${commitmentId}/backcharges`,
+      owner.headers,
+      {
+        reasonCode: "cleanup",
+        title: "Site cleanup after steel",
+        amount: 4000,
+        evidence: [{ type: "punch_item", id: "pnc-1", label: "Debris left in bay 3" }],
+      },
+    );
     expect(res.statusCode).toBe(201);
     backchargeId = res.json().id;
     expect(res.json().status).toBe("draft");
@@ -298,12 +348,22 @@ describe("backcharges", () => {
   });
 
   it("refuses to issue one with no evidence behind it", async () => {
-    const created = await inject("POST", `/api/v1/commitments/${commitmentId}/backcharges`, owner.headers, {
-      reasonCode: "defective_work",
-      title: "Assertion only",
-      amount: 500,
-    });
-    const res = await inject("POST", `/api/v1/backcharges/${created.json().id}/issue`, owner.headers, {});
+    const created = await inject(
+      "POST",
+      `/api/v1/commitments/${commitmentId}/backcharges`,
+      owner.headers,
+      {
+        reasonCode: "defective_work",
+        title: "Assertion only",
+        amount: 500,
+      },
+    );
+    const res = await inject(
+      "POST",
+      `/api/v1/backcharges/${created.json().id}/issue`,
+      owner.headers,
+      {},
+    );
     expect(res.statusCode).toBe(400);
     expect(res.json().message).toContain("evidence");
     await inject("POST", `/api/v1/backcharges/${created.json().id}/void`, owner.headers, {
@@ -312,7 +372,12 @@ describe("backcharges", () => {
   });
 
   it("issues by raising a NEGATIVE commitment change order, still pending approval", async () => {
-    const res = await inject("POST", `/api/v1/backcharges/${backchargeId}/issue`, owner.headers, {});
+    const res = await inject(
+      "POST",
+      `/api/v1/backcharges/${backchargeId}/issue`,
+      owner.headers,
+      {},
+    );
     expect(res.statusCode).toBe(200);
     expect(res.json().backcharge.status).toBe("issued");
     const changeId = res.json().commitmentChangeId as string;
@@ -326,9 +391,14 @@ describe("backcharges", () => {
   });
 
   it("RESERVES the open backcharge against the next payment", async () => {
-    const res = await inject("POST", `/api/v1/commitments/${commitmentId}/payments`, owner.headers, {
-      amount: 99_000,
-    });
+    const res = await inject(
+      "POST",
+      `/api/v1/commitments/${commitmentId}/payments`,
+      owner.headers,
+      {
+        amount: 99_000,
+      },
+    );
     expect(res.statusCode).toBe(400);
     expect(res.json().message).toContain("reserved for open backcharges");
     expect(res.json().details.reservedForBackcharges).toBe(4000);
@@ -336,9 +406,14 @@ describe("backcharges", () => {
   });
 
   it("lets a payment inside the reserved ceiling through, warning about the reservation", async () => {
-    const res = await inject("POST", `/api/v1/commitments/${commitmentId}/payments`, owner.headers, {
-      amount: 90_000,
-    });
+    const res = await inject(
+      "POST",
+      `/api/v1/commitments/${commitmentId}/payments`,
+      owner.headers,
+      {
+        amount: 90_000,
+      },
+    );
     expect(res.statusCode).toBe(201);
     expect((res.json().warnings as string[]).join(" ")).toContain("backcharges are open");
   });
@@ -349,16 +424,25 @@ describe("backcharges", () => {
     });
     expect(res.statusCode).toBe(200);
     expect(res.json().status).toBe("disputed");
-    const settled = await inject("POST", `/api/v1/backcharges/${backchargeId}/settle`, owner.headers, {
-      agreedAmount: 1500,
-      note: "Split the cleanup 60/40",
-    });
+    const settled = await inject(
+      "POST",
+      `/api/v1/backcharges/${backchargeId}/settle`,
+      owner.headers,
+      {
+        agreedAmount: 1500,
+        note: "Split the cleanup 60/40",
+      },
+    );
     expect(settled.statusCode).toBe(200);
     expect(settled.json().amount).toBe(1500);
     const row = (
       await built.app.db.select().from(backcharges).where(eq(backcharges.id, backchargeId)).limit(1)
     )[0]!;
-    const change = await inject("GET", `/api/v1/commitment-changes/${row.commitmentChangeId!}`, owner.headers);
+    const change = await inject(
+      "GET",
+      `/api/v1/commitment-changes/${row.commitmentChangeId!}`,
+      owner.headers,
+    );
     expect(change.json().amount).toBe(-1500);
   });
 
@@ -428,7 +512,11 @@ describe("closeout and final release", () => {
   it("refuses a tick with nothing behind it", async () => {
     const manual = (
       await inject("GET", `/api/v1/commitments/${commitmentId}/closeout`, owner.headers)
-    ).json().items.find((i: { autoVerified: boolean; required: boolean }) => !i.autoVerified && i.required);
+    )
+      .json()
+      .items.find(
+        (i: { autoVerified: boolean; required: boolean }) => !i.autoVerified && i.required,
+      );
     const res = await inject(
       "PUT",
       `/api/v1/commitments/${commitmentId}/closeout/items/${manual.key}`,
@@ -440,16 +528,26 @@ describe("closeout and final release", () => {
   });
 
   it("refuses the final release while the checklist does not pass", async () => {
-    const res = await inject("POST", `/api/v1/commitments/${commitmentId}/final-release`, owner.headers, {});
+    const res = await inject(
+      "POST",
+      `/api/v1/commitments/${commitmentId}/final-release`,
+      owner.headers,
+      {},
+    );
     expect(res.statusCode).toBe(409);
     expect(res.json().details.control).toBe("closeout_checklist");
     expect(res.json().details.outstanding.length).toBeGreaterThan(0);
   });
 
   it("releases exactly the remaining retainage when the checklist is overridden, with the reason recorded", async () => {
-    const res = await inject("POST", `/api/v1/commitments/${commitmentId}/final-release`, owner.headers, {
-      overrideReason: "Client instructed release ahead of the O&M manuals",
-    });
+    const res = await inject(
+      "POST",
+      `/api/v1/commitments/${commitmentId}/final-release`,
+      owner.headers,
+      {
+        overrideReason: "Client instructed release ahead of the O&M manuals",
+      },
+    );
     expect(res.statusCode).toBe(201);
     expect(res.json().payment.amount).toBe(20000);
     expect(res.json().payment.retainageReleasedAmount).toBe(20000);
@@ -460,18 +558,32 @@ describe("closeout and final release", () => {
   });
 
   it("refuses a second final release while the first stands", async () => {
-    const res = await inject("POST", `/api/v1/commitments/${commitmentId}/final-release`, owner.headers, {
-      overrideReason: "again",
-    });
+    const res = await inject(
+      "POST",
+      `/api/v1/commitments/${commitmentId}/final-release`,
+      owner.headers,
+      {
+        overrideReason: "again",
+      },
+    );
     expect(res.statusCode).toBe(409);
     expect(res.json().message).toContain("already exists");
   });
 
   it("zeroes the retainage held once the final release is approved and issued", async () => {
-    const closeout = await inject("GET", `/api/v1/commitments/${commitmentId}/closeout`, owner.headers);
+    const closeout = await inject(
+      "GET",
+      `/api/v1/commitments/${commitmentId}/closeout`,
+      owner.headers,
+    );
     const paymentId = closeout.json().finalReleasePaymentId as string;
     expect(paymentId).toBeTruthy();
-    const approved = await inject("POST", `/api/v1/commitment-payments/${paymentId}/approve`, secondH, {});
+    const approved = await inject(
+      "POST",
+      `/api/v1/commitment-payments/${paymentId}/approve`,
+      secondH,
+      {},
+    );
     expect(approved.statusCode).toBe(200);
     const issued = await inject("POST", `/api/v1/commitment-payments/${paymentId}/issue`, thirdH, {
       acknowledgeWarnings: true,
@@ -484,9 +596,14 @@ describe("closeout and final release", () => {
   });
 
   it("refuses a second final release once the first has been issued", async () => {
-    const res = await inject("POST", `/api/v1/commitments/${commitmentId}/final-release`, owner.headers, {
-      overrideReason: "nothing left",
-    });
+    const res = await inject(
+      "POST",
+      `/api/v1/commitments/${commitmentId}/final-release`,
+      owner.headers,
+      {
+        overrideReason: "nothing left",
+      },
+    );
     expect(res.statusCode).toBe(409);
     expect(res.json().message).toContain("already exists");
   });
@@ -527,7 +644,9 @@ describe("contract documents", () => {
   it("lists the code-resident templates with their merge fields", async () => {
     const res = await inject("GET", "/api/v1/contract-templates", owner.headers);
     expect(res.statusCode).toBe(200);
-    expect(res.json().items.some((t: { key: string }) => t.key === "subcontract_standard")).toBe(true);
+    expect(res.json().items.some((t: { key: string }) => t.key === "subcontract_standard")).toBe(
+      true,
+    );
   });
 
   it("generates a versioned document whose merge data IS the commitment", async () => {
@@ -561,7 +680,11 @@ describe("contract documents", () => {
     const res = await inject("POST", `/api/v1/contract-documents/${docId}/route`, owner.headers, {
       signers: [
         { name: "Us Ltd", email: "contracts@us.test", role: "Contractor" },
-        { name: "Northgate Steel", email: "signing@northgate.test", role: "Subcontractor" },
+        {
+          name: "Northgate Steel",
+          email: "signing@northgate.test",
+          role: "Subcontractor",
+        },
       ],
     });
     expect(res.statusCode).toBe(200);
@@ -593,7 +716,12 @@ describe("contract documents", () => {
     const hook = await built.app.inject({
       method: "POST",
       url: `/api/v1${webhookPath.replace("/api/v1", "")}`,
-      payload: { event: "signed", signerOrder: 2, method: "e_signature", reference: "env-77" },
+      payload: {
+        event: "signed",
+        signerOrder: 2,
+        method: "e_signature",
+        reference: "env-77",
+      },
     });
     expect(hook.statusCode).toBe(200);
     expect(hook.json().complete).toBe(true);
@@ -644,10 +772,15 @@ describe("payment runs", () => {
     });
     commitmentId = c.id;
     for (const amount of [10000, 15000]) {
-      const res = await inject("POST", `/api/v1/commitments/${commitmentId}/payments`, owner.headers, {
-        amount,
-        method: "ach",
-      });
+      const res = await inject(
+        "POST",
+        `/api/v1/commitments/${commitmentId}/payments`,
+        owner.headers,
+        {
+          amount,
+          method: "ach",
+        },
+      );
       const id = res.json().payment.id as string;
       await inject("POST", `/api/v1/commitment-payments/${id}/approve`, secondH, {});
       if (payA === undefined) payA = id;
@@ -682,15 +815,25 @@ describe("payment runs", () => {
     const pay = await inject("POST", `/api/v1/commitments/${eurId}/payments`, owner.headers, {
       amount: 1000,
     });
-    const res = await inject("POST", `/api/v1/projects/${proj}/payment-runs/${runId}/members`, owner.headers, {
-      add: [pay.json().payment.id],
-    });
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${proj}/payment-runs/${runId}/members`,
+      owner.headers,
+      {
+        add: [pay.json().payment.id],
+      },
+    );
     expect(res.statusCode).toBe(400);
     expect(res.json().message).toContain("one currency");
   });
 
   it("refuses the run's author approving it", async () => {
-    const res = await inject("POST", `/api/v1/projects/${proj}/payment-runs/${runId}/approve`, owner.headers, {});
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${proj}/payment-runs/${runId}/approve`,
+      owner.headers,
+      {},
+    );
     expect(res.statusCode).toBe(403);
   });
 
@@ -702,14 +845,23 @@ describe("payment runs", () => {
       {},
     );
     expect(approved.statusCode).toBe(200);
-    const res = await inject("POST", `/api/v1/projects/${proj}/payment-runs/${runId}/issue`, thirdH, {
-      acknowledgeWarnings: true,
-    });
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${proj}/payment-runs/${runId}/issue`,
+      thirdH,
+      {
+        acknowledgeWarnings: true,
+      },
+    );
     expect(res.statusCode).toBe(200);
     expect(res.json().issued).toHaveLength(2);
     for (const id of [payA, payB]) {
       const row = (
-        await built.app.db.select().from(commitmentPayments).where(eq(commitmentPayments.id, id)).limit(1)
+        await built.app.db
+          .select()
+          .from(commitmentPayments)
+          .where(eq(commitmentPayments.id, id))
+          .limit(1)
       )[0]!;
       expect(row.status).toBe("issued");
       expect(row.issuedBy).toBe(third.userId);
@@ -730,12 +882,21 @@ describe("payment runs", () => {
   });
 
   it("refuses issuing the same run twice", async () => {
-    const res = await inject("POST", `/api/v1/projects/${proj}/payment-runs/${runId}/issue`, thirdH, {});
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${proj}/payment-runs/${runId}/issue`,
+      thirdH,
+      {},
+    );
     expect(res.statusCode).toBe(409);
   });
 
   it("does not leak a run to another company", async () => {
-    const res = await inject("GET", `/api/v1/projects/${proj}/payment-runs/${runId}`, outsider.headers);
+    const res = await inject(
+      "GET",
+      `/api/v1/projects/${proj}/payment-runs/${runId}`,
+      outsider.headers,
+    );
     expect([403, 404]).toContain(res.statusCode);
   });
 });
@@ -773,7 +934,12 @@ describe("proactive compliance expiry alerting", () => {
       owner.headers,
     );
     expect(res.statusCode).toBe(200);
-    const items = res.json().items as Array<{ commitmentId: string; line: number; renewalRequest: string; daysUntilExpiry: number }>;
+    const items = res.json().items as Array<{
+      commitmentId: string;
+      line: number;
+      renewalRequest: string;
+      daysUntilExpiry: number;
+    }>;
     const mine = items.find((i) => i.commitmentId === commitmentId);
     expect(mine).toBeDefined();
     expect(mine!.daysUntilExpiry).toBeLessThanOrEqual(7);
@@ -887,10 +1053,15 @@ describe("regression: a failed payment returns the retainage it released", () =>
       .set({ totalInvoiced: 90000, retainageHeld: 10000 })
       .where(eq(commitments.id, commitmentId));
 
-    const res = await inject("POST", `/api/v1/commitments/${commitmentId}/payments`, owner.headers, {
-      amount: 5000,
-      retainageReleasedAmount: 5000,
-    });
+    const res = await inject(
+      "POST",
+      `/api/v1/commitments/${commitmentId}/payments`,
+      owner.headers,
+      {
+        amount: 5000,
+        retainageReleasedAmount: 5000,
+      },
+    );
     paymentId = res.json().payment.id;
     await inject("POST", `/api/v1/commitment-payments/${paymentId}/approve`, secondH, {});
     await inject("POST", `/api/v1/commitment-payments/${paymentId}/issue`, thirdH, {
@@ -906,9 +1077,14 @@ describe("regression: a failed payment returns the retainage it released", () =>
   });
 
   it("puts it back when the payment fails", async () => {
-    const res = await inject("POST", `/api/v1/commitment-payments/${paymentId}/fail`, owner.headers, {
-      reason: "Cheque returned unpaid",
-    });
+    const res = await inject(
+      "POST",
+      `/api/v1/commitment-payments/${paymentId}/fail`,
+      owner.headers,
+      {
+        reason: "Cheque returned unpaid",
+      },
+    );
     expect(res.statusCode).toBe(200);
     expect(res.json().status).toBe("failed");
     const row = (
@@ -918,9 +1094,14 @@ describe("regression: a failed payment returns the retainage it released", () =>
   });
 
   it("does not put it back TWICE when the failed payment is then voided", async () => {
-    const res = await inject("POST", `/api/v1/commitment-payments/${paymentId}/void`, owner.headers, {
-      reason: "Superseded by a re-issue",
-    });
+    const res = await inject(
+      "POST",
+      `/api/v1/commitment-payments/${paymentId}/void`,
+      owner.headers,
+      {
+        reason: "Superseded by a re-issue",
+      },
+    );
     expect(res.statusCode).toBe(200);
     const row = (
       await built.app.db.select().from(commitments).where(eq(commitments.id, commitmentId)).limit(1)
@@ -929,10 +1110,15 @@ describe("regression: a failed payment returns the retainage it released", () =>
   });
 
   it("then permits the legitimate re-release the drift would have blocked", async () => {
-    const res = await inject("POST", `/api/v1/commitments/${commitmentId}/payments`, owner.headers, {
-      amount: 10000,
-      retainageReleasedAmount: 10000,
-    });
+    const res = await inject(
+      "POST",
+      `/api/v1/commitments/${commitmentId}/payments`,
+      owner.headers,
+      {
+        amount: 10000,
+        retainageReleasedAmount: 10000,
+      },
+    );
     expect(res.statusCode).toBe(201);
   });
 });
@@ -954,11 +1140,22 @@ describe("regression: a change order allocation cannot point at a deleted SOV li
     });
     commitmentId = res.json().commitment.id;
     lineToDelete = res.json().sovLines[1].id;
-    const change = await inject("POST", `/api/v1/commitments/${commitmentId}/changes`, owner.headers, {
-      title: "Extra work",
-      amount: 5000,
-      lines: [{ sovLineId: lineToDelete, description: "Extra work on the deleted line", amount: 5000 }],
-    });
+    const change = await inject(
+      "POST",
+      `/api/v1/commitments/${commitmentId}/changes`,
+      owner.headers,
+      {
+        title: "Extra work",
+        amount: 5000,
+        lines: [
+          {
+            sovLineId: lineToDelete,
+            description: "Extra work on the deleted line",
+            amount: 5000,
+          },
+        ],
+      },
+    );
     changeId = change.json().id;
   });
 
@@ -975,9 +1172,7 @@ describe("regression: a change order allocation cannot point at a deleted SOV li
 
   it("and if the line vanishes anyway, REFUSES the approval naming the missing id", async () => {
     /* the belt to the route's braces: the line is removed underneath the change */
-    await built.app.db
-      .delete(commitmentSovLines)
-      .where(eq(commitmentSovLines.id, lineToDelete));
+    await built.app.db.delete(commitmentSovLines).where(eq(commitmentSovLines.id, lineToDelete));
     await inject("POST", `/api/v1/commitments/${commitmentId}/approve`, secondH, {});
     await inject("POST", `/api/v1/commitment-changes/${changeId}/submit`, owner.headers, {});
     const res = await inject("POST", `/api/v1/commitment-changes/${changeId}/approve`, secondH, {});
@@ -1030,21 +1225,46 @@ describe("regression: pending change orders reach the budget's pending exposure"
   it("puts a priced-but-unapproved CCO into pendingCommitments, not into committedCost", async () => {
     const c = await makeCommitment({
       title: "Pending exposure",
-      lines: [{ description: "Scope", budgetLineItemId: budgetLine, scheduledValue: 20000 }],
+      lines: [
+        {
+          description: "Scope",
+          budgetLineItemId: budgetLine,
+          scheduledValue: 20000,
+        },
+      ],
     });
     const before = (
-      await built.app.db.select().from(budgetLineItems).where(eq(budgetLineItems.id, budgetLine)).limit(1)
+      await built.app.db
+        .select()
+        .from(budgetLineItems)
+        .where(eq(budgetLineItems.id, budgetLine))
+        .limit(1)
     )[0]!;
     const change = await inject("POST", `/api/v1/commitments/${c.id}/changes`, owner.headers, {
       title: "Priced, not yet approved",
       amount: 7000,
-      lines: [{ sovLineId: c.sovLineIds[0]!, description: "Priced, not yet approved", amount: 7000 }],
+      lines: [
+        {
+          sovLineId: c.sovLineIds[0]!,
+          description: "Priced, not yet approved",
+          amount: 7000,
+        },
+      ],
     });
     expect(change.statusCode).toBe(201);
-    await inject("POST", `/api/v1/commitment-changes/${change.json().id}/submit`, owner.headers, {});
+    await inject(
+      "POST",
+      `/api/v1/commitment-changes/${change.json().id}/submit`,
+      owner.headers,
+      {},
+    );
     await inject("POST", `/api/v1/projects/${proj}/commitments/rollups/sync`, owner.headers, {});
     const after = (
-      await built.app.db.select().from(budgetLineItems).where(eq(budgetLineItems.id, budgetLine)).limit(1)
+      await built.app.db
+        .select()
+        .from(budgetLineItems)
+        .where(eq(budgetLineItems.id, budgetLine))
+        .limit(1)
     )[0]!;
     expect(after.pendingCommitments - before.pendingCommitments).toBeCloseTo(7000, 2);
     expect(after.committedCost).toBeCloseTo(before.committedCost, 2);
@@ -1063,7 +1283,11 @@ describe("regression: replacing a schedule of values is all or nothing", () => {
     const replace = await inject("PUT", `/api/v1/commitments/${id}/sov`, owner.headers, {
       lines: [
         { description: "Good", scheduledValue: 1000 },
-        { description: "Bad budget binding", scheduledValue: 2000, budgetLineItemId: "bli_not_real" },
+        {
+          description: "Bad budget binding",
+          scheduledValue: 2000,
+          budgetLineItemId: "bli_not_real",
+        },
       ],
     });
     expect(replace.statusCode).toBeGreaterThanOrEqual(400);

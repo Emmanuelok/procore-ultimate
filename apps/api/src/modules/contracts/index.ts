@@ -1,8 +1,16 @@
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, ilike, inArray, isNotNull, lt, lte } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, isNotNull, lte } from "drizzle-orm";
 import { z } from "zod";
-import { contractEvents, contracts, eotClaims, obligations, signals } from "@constructos/db";
 import {
+  contractEvents,
+  contractObligationLinks,
+  contracts,
+  eotClaims,
+  obligations,
+  type ParticularCondition,
+} from "@constructos/db";
+import {
+  CALENDAR_BASES,
   CLAUSE_CATEGORIES,
   CONTRACT_EVENT_KINDS,
   CONTRACT_EVENT_STATUSES,
@@ -17,7 +25,19 @@ import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { addDaysISO, isoDateSchema, todayISO } from "../field/dates.js";
-import { CLAUSE_LIBRARY, clausesForForm, findClause } from "./clause-library.js";
+import { necValuationBasis } from "./ce.js";
+import { ceRoutes } from "./ce-routes.js";
+import { CLAUSE_LIBRARY, clausesForForm } from "./clause-library.js";
+import { complianceRoutes } from "./compliance-routes.js";
+import { raiseSignalOnce, registerContractJobs, sweepTimeBars } from "./sweeps.js";
+import {
+  chainedDeadlines,
+  computeDeadline,
+  daysBetweenIso,
+  effectiveClauses,
+  resolveClause,
+} from "./timebar.js";
+import { computeLdExposure } from "../commercial/valuation-engine.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -29,9 +49,20 @@ const isoTimestamp = z
   .min(4)
   .refine((s) => !Number.isNaN(Date.parse(s)), "invalid ISO timestamp");
 
+/**
+ * Particular Conditions are STRUCTURED (#201-202). `amendment` is the human
+ * text; the optional fields are what the time-bar engine acts on. An amendment
+ * with no structured bar is still flagged as amended, so the UI can warn that
+ * the wording changed even where the engine cannot act on it.
+ */
 const particularConditionSchema = z.object({
   clauseRef: z.string().min(1).max(40),
   amendment: z.string().min(1).max(4000),
+  timeBarDays: z.number().int().min(0).max(3650).nullable().optional(),
+  noticeRequired: z.boolean().optional(),
+  calendarBasis: z.enum(CALENDAR_BASES).optional(),
+  warnDaysBefore: z.number().int().min(0).max(365).optional(),
+  deleted: z.boolean().optional(),
 });
 
 const contractCreateSchema = z.object({
@@ -42,13 +73,20 @@ const contractCreateSchema = z.object({
   baseDate: isoDateSchema.nullable().optional(),
   commencementDate: isoDateSchema.nullable().optional(),
   completionDate: isoDateSchema.nullable().optional(),
+  takingOverDate: isoDateSchema.nullable().optional(),
+  actualCompletionDate: isoDateSchema.nullable().optional(),
   currency: z.string().length(3).optional(),
   contractSum: z.number().nonnegative().nullable().optional(),
   retentionPercent: z.number().min(0).max(100).optional(),
   retentionCap: z.number().nonnegative().nullable().optional(),
+  retentionReleaseAtTakingOver: z.number().min(0).max(1).optional(),
   defectsPeriodMonths: z.number().int().min(0).max(240).nullable().optional(),
   ldRatePerDay: z.number().nonnegative().nullable().optional(),
   ldCap: z.number().nonnegative().nullable().optional(),
+  paymentDueDays: z.number().int().min(0).max(365).nullable().optional(),
+  calendarBasis: z.enum(CALENDAR_BASES).optional(),
+  holidays: z.array(isoDateSchema).max(400).optional(),
+  jurisdiction: z.string().max(80).nullable().optional(),
   particularConditions: z.array(particularConditionSchema).max(200).optional(),
 });
 
@@ -61,6 +99,8 @@ const contractListQuery = pageQuerySchema.extend({
 
 const contractStatusSchema = z.object({
   status: z.enum(["executed", "completed", "terminated"]),
+  takingOverDate: isoDateSchema.optional(),
+  actualCompletionDate: isoDateSchema.optional(),
 });
 
 /** Forward-only lifecycle: draft → executed → completed | terminated. */
@@ -77,6 +117,11 @@ const eventCreateSchema = z.object({
   title: z.string().min(1).max(300),
   description: z.string().max(20000).nullable().optional(),
   eventDate: isoDateSchema,
+  /** the date the claiming party became aware — the bar usually runs from here */
+  awarenessDate: isoDateSchema.nullable().optional(),
+  /** bespoke forms and unlisted clauses: state the bar directly (#193-224) */
+  timeBarDays: z.number().int().min(1).max(3650).nullable().optional(),
+  noticeDeadline: isoDateSchema.nullable().optional(),
   costImpactEstimate: z.number().nullable().optional(),
   timeImpactDaysEstimate: z.number().int().nullable().optional(),
 });
@@ -90,6 +135,9 @@ const serveNoticeSchema = z.object({
   method: z.enum(["email", "letter", "portal", "registered_post"]),
   reference: z.string().max(300).nullable().optional(),
   servedAt: isoTimestamp.optional(),
+  /** required when backdating service by more than a day */
+  reason: z.string().max(2000).optional(),
+  evidenceRef: z.string().max(300).optional(),
 });
 
 const eventStatusSchema = z.object({ status: z.enum(["resolved", "withdrawn"]) });
@@ -109,6 +157,25 @@ const eotListQuery = pageQuerySchema.extend({
 const eotStatusSchema = z.object({
   status: z.enum(["submitted", "assessed", "agreed", "rejected", "referred"]),
   daysAwarded: z.number().int().min(0).max(10000).optional(),
+  /** the assessment record: method, concurrency, float ownership, reasons */
+  assessment: z
+    .object({
+      method: z
+        .enum([
+          "as_planned_impacted",
+          "time_impact_analysis",
+          "collapsed_as_built",
+          "as_planned_versus_as_built",
+          "time_slice_windows",
+          "impacted_as_planned_windows",
+        ])
+        .optional(),
+      concurrency: z.enum(["none", "true_concurrency", "sequential", "pacing"]).optional(),
+      floatOwnership: z.enum(["project", "contractor", "employer", "shared"]).optional(),
+      reasons: z.string().max(20000).optional(),
+      criticalPathEffectDays: z.number().int().optional(),
+    })
+    .optional(),
 });
 
 const EOT_TRANSITIONS: Record<string, string[]> = {
@@ -126,9 +193,7 @@ const EOT_TRANSITIONS: Record<string, string[]> = {
 
 /** Whole days from today (UTC) to an ISO date; negative = already past. */
 function daysUntil(isoDate: string): number {
-  return Math.round(
-    (Date.parse(`${isoDate}T00:00:00Z`) - Date.parse(`${todayISO()}T00:00:00Z`)) / 86_400_000,
-  );
+  return daysBetweenIso(todayISO(), isoDate);
 }
 
 function necFormCheck(form: string, necOption: string | null | undefined): void {
@@ -142,13 +207,19 @@ function necFormCheck(form: string, necOption: string | null | undefined): void 
 }
 
 /**
- * Contract intelligence — spec Vol II Domain C / M8 (#193-264 foundation
- * subset): code-resident clause library, contract register with Particular
- * Conditions overlay, notice/event register with the automatic time-bar
- * engine (#225-231), EOT claim lifecycle (#237-240) and LD exposure
- * (#249-250). Time-barred clauses materialize assurance Obligations so the
- * contract obligation register (#260) and the assurance layer see the same
- * deadlines.
+ * Contract intelligence — spec Vol II Domain C / M8 (#193-264).
+ *
+ * Code-resident clause library; contract register with a STRUCTURED Particular
+ * Conditions overlay that actually drives the time-bar engine (#201-202); the
+ * notice/event register with pre-expiry warnings, calendar-aware arithmetic and
+ * chained deadlines (#225-231); NEC compensation-event cycle and accepted
+ * programmes (#206-211, in ce-routes.ts); insurance/bond clause compliance
+ * (#251-253, in compliance-routes.ts); the EOT claim lifecycle with a recorded
+ * assessment (#237-240); and LD exposure that stops at taking-over (#249-250).
+ *
+ * Obligations belong to a CONTRACT through `contract_obligation_links` — the
+ * `obligations` table is owned by the assurance package, so the link is an
+ * explicit join rather than a column this package does not own.
  */
 export const contractsModule: FastifyPluginAsync = async (app) => {
   const readGate = [app.authenticate, app.requireCompany, app.requireTool("contracts", "read")];
@@ -157,6 +228,7 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
     app.requireCompany,
     app.requireTool("contracts", "standard"),
   ];
+  const adminGate = [app.authenticate, app.requireCompany, app.requireTool("contracts", "admin")];
 
   async function fetchContract(contractId: string, companyId: string, projectId: string) {
     const rows = await app.db
@@ -218,68 +290,6 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
     return rows[0];
   }
 
-  /**
-   * Lazy time-bar sweep (#230): open events whose notice deadline has fully
-   * elapsed become time_barred, the linked obligation is breached and a
-   * critical signal is raised — exactly once, guarded on the event still
-   * being `open` at sweep time.
-   */
-  async function sweepTimeBars(
-    contractIds: string[],
-    companyId: string,
-    projectId: string,
-    actorId: string,
-  ): Promise<void> {
-    if (contractIds.length === 0) return;
-    const today = todayISO();
-    const stale = await app.db
-      .select()
-      .from(contractEvents)
-      .where(
-        and(
-          eq(contractEvents.companyId, companyId),
-          eq(contractEvents.projectId, projectId),
-          inArray(contractEvents.contractId, contractIds),
-          eq(contractEvents.status, "open"),
-          isNotNull(contractEvents.noticeDeadline),
-          lt(contractEvents.noticeDeadline, today),
-        ),
-      );
-    for (const ev of stale) {
-      await app.db
-        .update(contractEvents)
-        .set({ status: "time_barred", updatedAt: new Date().toISOString() })
-        .where(and(eq(contractEvents.id, ev.id), eq(contractEvents.status, "open")));
-      if (ev.obligationId) {
-        await app.db
-          .update(obligations)
-          .set({ status: "breached" })
-          .where(and(eq(obligations.id, ev.obligationId), eq(obligations.status, "open")));
-      }
-      await app.db.insert(signals).values({
-        id: newId("sig"),
-        companyId,
-        projectId,
-        detector: "time_bar_missed",
-        severity: "critical",
-        confidence: 1,
-        title: `Notice time bar missed — event #${ev.number}: ${ev.title}`,
-        explanation:
-          `Contract event #${ev.number} (${ev.kind}${ev.clauseRef ? `, clause ${ev.clauseRef}` : ""}) ` +
-          `dated ${ev.eventDate} required a notice by ${ev.noticeDeadline}. No notice was recorded ` +
-          `before the deadline elapsed; the event is now time-barred and any related entitlement is at risk.`,
-      });
-      await appendLedger(app.db, {
-        companyId,
-        actorId,
-        action: "state_change",
-        objectType: "contract_event",
-        objectId: ev.id,
-        payload: { from: "open", to: "time_barred", noticeDeadline: ev.noticeDeadline },
-      });
-    }
-  }
-
   /* ---------------------------------------------------------------- */
   /* Clause library (reference data, not tenant data)                  */
   /* ---------------------------------------------------------------- */
@@ -322,44 +332,71 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
     const body = contractCreateSchema.parse(req.body);
     necFormCheck(body.form, body.necOption);
     const id = newId("con");
-    await app.db.insert(contracts).values({
-      id,
-      companyId: req.companyId!,
-      projectId: req.projectId!,
-      name: body.name,
-      form: body.form,
-      necOption: body.necOption ?? null,
-      parties: body.parties ?? {},
-      baseDate: body.baseDate ?? null,
-      commencementDate: body.commencementDate ?? null,
-      completionDate: body.completionDate ?? null,
-      currency: body.currency ?? "USD",
-      contractSum: body.contractSum ?? null,
-      retentionPercent: body.retentionPercent ?? 0,
-      retentionCap: body.retentionCap ?? null,
-      defectsPeriodMonths: body.defectsPeriodMonths ?? null,
-      ldRatePerDay: body.ldRatePerDay ?? null,
-      ldCap: body.ldCap ?? null,
-      particularConditions: body.particularConditions ?? [],
-      status: "draft",
-      createdBy: req.user!.id,
-    });
-
-    // #260 — materialize the form's standing obligations into the contract
-    // obligation register (assurance layer) at the moment the contract exists.
     const standing = clausesForForm(body.form).filter((c) => c.standingObligation);
-    for (const clause of standing) {
-      await app.db.insert(obligations).values({
-        id: newId("obl"),
+    const pcs = (body.particularConditions ?? []) as ParticularCondition[];
+    const deletedRefs = new Set(pcs.filter((p) => p.deleted).map((p) => p.clauseRef));
+
+    // The contract and its standing obligation register are ONE write: a
+    // failure part-way through the loop used to leave a contract with half a
+    // register and no way to know it.
+    await app.db.transaction(async (tx) => {
+      await tx.insert(contracts).values({
+        id,
         companyId: req.companyId!,
         projectId: req.projectId!,
-        sourceClause: `${body.form} ${clause.clauseRef} — ${clause.title}`,
-        trigger: clause.standingObligation!.description,
-        deadline: null,
-        status: "open",
+        name: body.name,
+        form: body.form,
+        necOption: body.necOption ?? null,
+        parties: body.parties ?? {},
+        baseDate: body.baseDate ?? null,
+        commencementDate: body.commencementDate ?? null,
+        completionDate: body.completionDate ?? null,
+        takingOverDate: body.takingOverDate ?? null,
+        actualCompletionDate: body.actualCompletionDate ?? null,
+        currency: body.currency ?? "USD",
+        contractSum: body.contractSum ?? null,
+        retentionPercent: body.retentionPercent ?? 0,
+        retentionCap: body.retentionCap ?? null,
+        retentionReleaseAtTakingOver: body.retentionReleaseAtTakingOver ?? 0.5,
+        defectsPeriodMonths: body.defectsPeriodMonths ?? null,
+        ldRatePerDay: body.ldRatePerDay ?? null,
+        ldCap: body.ldCap ?? null,
+        paymentDueDays: body.paymentDueDays ?? null,
+        calendarBasis: body.calendarBasis ?? "calendar",
+        holidays: body.holidays ?? [],
+        jurisdiction: body.jurisdiction ?? null,
+        particularConditions: pcs,
+        status: "draft",
         createdBy: req.user!.id,
       });
-    }
+
+      // #260 — materialize the form's standing obligations into the contract
+      // obligation register, each linked to THIS contract.
+      for (const clause of standing) {
+        if (deletedRefs.has(clause.clauseRef)) continue;
+        const obligationId = newId("obl");
+        await tx.insert(obligations).values({
+          id: obligationId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          sourceClause: `${body.form} ${clause.clauseRef} — ${clause.title}`,
+          trigger: clause.standingObligation!.description,
+          deadline: null,
+          status: "open",
+          createdBy: req.user!.id,
+        });
+        await tx.insert(contractObligationLinks).values({
+          id: newId("col"),
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          contractId: id,
+          contractEventId: null,
+          obligationId,
+          kind: "standing",
+          clauseRef: clause.clauseRef,
+        });
+      }
+    });
 
     await appendLedger(app.db, {
       companyId: req.companyId!,
@@ -367,12 +404,14 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
       action: "create",
       objectType: "contract",
       objectId: id,
+      projectId: req.projectId!,
       payload: {
         name: body.name,
         form: body.form,
         necOption: body.necOption ?? null,
         contractSum: body.contractSum ?? null,
-        standingObligations: standing.length,
+        standingObligations: standing.length - deletedRefs.size,
+        particularConditions: pcs.length,
       },
       storePayload: true,
     });
@@ -403,7 +442,8 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
 
   /**
    * Time-bar radar (#229): open events with a notice deadline inside the
-   * window (or already past and not yet swept), soonest first.
+   * window (or already past and not yet swept), soonest first, each carrying
+   * the source its deadline came from.
    */
   app.get("/projects/:projectId/contracts/deadlines", { preHandler: readGate }, async (req) => {
     const q = z
@@ -437,8 +477,11 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
       const contract = byId.get(ev.contractId);
       const clause =
         contract && ev.clauseRef
-          ? findClause(contract.form as ContractForm, ev.clauseRef)
-          : undefined;
+          ? resolveClause(contract.form as ContractForm, ev.clauseRef, contract.particularConditions, {
+              calendarBasis: contract.calendarBasis as "calendar" | "working",
+            })
+          : null;
+      const daysRemaining = daysUntil(ev.noticeDeadline!);
       return {
         id: ev.id,
         contractId: ev.contractId,
@@ -449,8 +492,14 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
         clauseRef: ev.clauseRef,
         clauseTitle: clause?.title ?? null,
         eventDate: ev.eventDate,
+        awarenessDate: ev.awarenessDate,
         noticeDeadline: ev.noticeDeadline,
-        daysRemaining: daysUntil(ev.noticeDeadline!),
+        effectiveTimeBarDays: ev.effectiveTimeBarDays,
+        deadlineSource: ev.deadlineSource,
+        calendarBasis: ev.calendarBasis,
+        warnDaysBefore: ev.warnDaysBefore,
+        daysRemaining,
+        inWarningWindow: ev.warnDaysBefore != null && daysRemaining <= ev.warnDaysBefore,
       };
     });
     return { items, windowDays: q.days };
@@ -460,32 +509,40 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
     const { contractId } = req.params as { contractId: string };
     const contract = await fetchContract(contractId, req.companyId!, req.projectId!);
 
-    // Effective clause list = library for the form overlaid with the
-    // Particular Conditions (#201-202): amended clauses are flagged, never
-    // silently replaced.
-    const pcs = (contract.particularConditions ?? []) as {
-      clauseRef: string;
-      amendment: string;
-    }[];
-    const pcByRef = new Map(pcs.map((p) => [p.clauseRef, p.amendment] as const));
-    const effectiveClauses = clausesForForm(contract.form as ContractForm).map((c) => ({
-      ...c,
-      amended: pcByRef.has(c.clauseRef),
-      amendment: pcByRef.get(c.clauseRef) ?? null,
-    }));
+    // Effective clause list = library ⊕ Particular Conditions (#201-202): the
+    // PC is authoritative and the overlay says so, clause by clause.
+    const clauses = effectiveClauses(
+      contract.form as ContractForm,
+      contract.particularConditions,
+      { calendarBasis: contract.calendarBasis as "calendar" | "working" },
+    );
 
-    // Obligation register size for this contract's form on this project
-    // (standing obligations + notice obligations both carry the form prefix).
-    const [oblRow] = await app.db
-      .select({ n: count() })
-      .from(obligations)
+    // Obligations belonging to THIS contract, via the link table — the old
+    // `sourceClause LIKE '<form> %'` match merged every contract of the same
+    // form on the project.
+    const links = await app.db
+      .select({ obligationId: contractObligationLinks.obligationId, kind: contractObligationLinks.kind })
+      .from(contractObligationLinks)
       .where(
         and(
-          eq(obligations.companyId, req.companyId!),
-          eq(obligations.projectId, req.projectId!),
-          ilike(obligations.sourceClause, `${contract.form} %`),
+          eq(contractObligationLinks.companyId, req.companyId!),
+          eq(contractObligationLinks.contractId, contractId),
         ),
       );
+    const obligationRows =
+      links.length === 0
+        ? []
+        : await app.db
+            .select({ id: obligations.id, status: obligations.status })
+            .from(obligations)
+            .where(
+              inArray(
+                obligations.id,
+                links.map((l) => l.obligationId),
+              ),
+            );
+    const obligationStatus: Record<string, number> = {};
+    for (const o of obligationRows) obligationStatus[o.status] = (obligationStatus[o.status] ?? 0) + 1;
 
     const eventRows = await app.db
       .select({ status: contractEvents.status, n: count() })
@@ -502,9 +559,14 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
 
     return {
       ...contract,
-      effectiveClauses,
-      obligationCount: Number(oblRow?.n ?? 0),
+      effectiveClauses: clauses,
+      amendedClauseCount: clauses.filter((c) => c.amended).length,
+      obligationCount: obligationRows.length,
+      obligationStatus,
       eventCounts,
+      necBasis: contract.form.startsWith("nec")
+        ? necValuationBasis(contract.necOption as never)
+        : null,
     };
   });
 
@@ -537,9 +599,35 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
         action: "update",
         objectType: "contract",
         objectId: contractId,
-        payload: { changed: Object.keys(body) },
+        projectId: req.projectId!,
+        payload: {
+          changed: Object.keys(body),
+          particularConditions:
+            body.particularConditions !== undefined ? body.particularConditions : undefined,
+        },
+        storePayload: body.particularConditions !== undefined,
       });
-      return fetchContract(contractId, req.companyId!, req.projectId!);
+      const updated = await fetchContract(contractId, req.companyId!, req.projectId!);
+      // Amending the Particular Conditions changes what is owed and by when.
+      // Existing events keep the deadline they were created under (a deadline
+      // already served or breached is a historic fact), and the change is
+      // surfaced so it can be reviewed.
+      const affected =
+        body.particularConditions === undefined
+          ? 0
+          : (
+              await app.db
+                .select({ id: contractEvents.id })
+                .from(contractEvents)
+                .where(
+                  and(
+                    eq(contractEvents.contractId, contractId),
+                    eq(contractEvents.status, "open"),
+                    isNotNull(contractEvents.noticeDeadline),
+                  ),
+                )
+            ).length;
+      return { ...updated, openEventsUnderPreviousConditions: affected };
     },
   );
 
@@ -554,17 +642,25 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
       if (!allowed.includes(body.status)) {
         throw badRequest(`Cannot transition a ${contract.status} contract to ${body.status}`);
       }
-      await app.db
-        .update(contracts)
-        .set({ status: body.status, updatedAt: new Date().toISOString() })
-        .where(eq(contracts.id, contractId));
+      const set: Record<string, unknown> = {
+        status: body.status,
+        updatedAt: new Date().toISOString(),
+      };
+      if (body.takingOverDate) set["takingOverDate"] = body.takingOverDate;
+      if (body.actualCompletionDate) set["actualCompletionDate"] = body.actualCompletionDate;
+      await app.db.update(contracts).set(set).where(eq(contracts.id, contractId));
       await appendLedger(app.db, {
         companyId: req.companyId!,
         actorId: req.user!.id,
         action: "state_change",
         objectType: "contract",
         objectId: contractId,
-        payload: { from: contract.status, to: body.status },
+        projectId: req.projectId!,
+        payload: {
+          from: contract.status,
+          to: body.status,
+          takingOverDate: body.takingOverDate ?? contract.takingOverDate,
+        },
       });
       return fetchContract(contractId, req.companyId!, req.projectId!);
     },
@@ -581,71 +677,108 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
       const { contractId } = req.params as { contractId: string };
       const body = eventCreateSchema.parse(req.body);
       const contract = await fetchContract(contractId, req.companyId!, req.projectId!);
+      if (body.awarenessDate && body.awarenessDate < body.eventDate) {
+        throw badRequest("The awareness date cannot be earlier than the event date");
+      }
       const number = await nextRecordNumber(app.db, req.projectId!, "contract_event");
       const id = newId("cev");
 
-      // Time-bar engine (#225): a clauseRef that resolves in the library for
-      // this contract's form and carries a time bar fixes the notice deadline
-      // and materializes a deadline obligation in the assurance layer (#226).
-      let noticeDeadline: string | null = null;
+      // Time-bar engine (#225): the EFFECTIVE clause (library ⊕ Particular
+      // Conditions) fixes the deadline, counted on the contract's calendar,
+      // and materialises a deadline obligation linked to this contract (#226).
+      const startDate = body.awarenessDate ?? body.eventDate;
+      const deadline = computeDeadline({
+        form: contract.form as ContractForm,
+        clauseRef: body.clauseRef ?? null,
+        particularConditions: contract.particularConditions,
+        calendarBasis: contract.calendarBasis as "calendar" | "working",
+        holidays: contract.holidays,
+        startDate,
+        manualTimeBarDays: body.timeBarDays ?? null,
+        manualDeadline: body.noticeDeadline ?? null,
+      });
+
       let obligationId: string | null = null;
-      const clause = body.clauseRef
-        ? findClause(contract.form as ContractForm, body.clauseRef)
-        : undefined;
-      if (clause?.timeBarDays) {
-        noticeDeadline = addDaysISO(body.eventDate, clause.timeBarDays);
-        obligationId = newId("obl");
-        await app.db.insert(obligations).values({
-          id: obligationId,
+      const isCe =
+        body.kind === "compensation_event" && contract.form.startsWith("nec") ? "notified" : null;
+
+      await app.db.transaction(async (tx) => {
+        if (deadline.noticeDeadline) {
+          obligationId = newId("obl");
+          await tx.insert(obligations).values({
+            id: obligationId,
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            sourceClause: `${contract.form} ${body.clauseRef ?? "(stated)"}`,
+            trigger: `Notice required: ${body.title}`,
+            deadline: `${deadline.noticeDeadline}T23:59:59Z`,
+            warnDaysBefore: deadline.warnDaysBefore,
+            evidenceRequirement: "Served notice with proof of service",
+            status: "open",
+            createdBy: req.user!.id,
+          });
+          await tx.insert(contractObligationLinks).values({
+            id: newId("col"),
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            contractId,
+            contractEventId: id,
+            obligationId,
+            kind: "notice",
+            clauseRef: body.clauseRef ?? null,
+          });
+        }
+        await tx.insert(contractEvents).values({
+          id,
           companyId: req.companyId!,
           projectId: req.projectId!,
-          sourceClause: `${contract.form} ${clause.clauseRef}`,
-          trigger: `Notice required: ${body.title}`,
-          deadline: `${noticeDeadline}T23:59:59Z`,
-          warnDaysBefore: Math.min(14, Math.ceil(clause.timeBarDays / 4)),
-          evidenceRequirement: "Served notice with proof of service",
+          contractId,
+          number,
+          kind: body.kind,
+          clauseRef: body.clauseRef ?? null,
+          title: body.title,
+          description: body.description ?? null,
+          eventDate: body.eventDate,
+          awarenessDate: body.awarenessDate ?? null,
+          noticeDeadline: deadline.noticeDeadline,
+          effectiveTimeBarDays: deadline.effectiveTimeBarDays,
+          deadlineSource: deadline.deadlineSource,
+          calendarBasis: deadline.calendarBasis,
+          warnDaysBefore: deadline.warnDaysBefore,
           status: "open",
-          createdBy: req.user!.id,
+          obligationId,
+          ceState: isCe,
+          costImpactEstimate: body.costImpactEstimate ?? null,
+          timeImpactDaysEstimate: body.timeImpactDaysEstimate ?? null,
+          raisedBy: req.user!.id,
         });
-      }
-
-      await app.db.insert(contractEvents).values({
-        id,
-        companyId: req.companyId!,
-        projectId: req.projectId!,
-        contractId,
-        number,
-        kind: body.kind,
-        clauseRef: body.clauseRef ?? null,
-        title: body.title,
-        description: body.description ?? null,
-        eventDate: body.eventDate,
-        noticeDeadline,
-        status: "open",
-        obligationId,
-        costImpactEstimate: body.costImpactEstimate ?? null,
-        timeImpactDaysEstimate: body.timeImpactDaysEstimate ?? null,
-        raisedBy: req.user!.id,
       });
+
       await appendLedger(app.db, {
         companyId: req.companyId!,
         actorId: req.user!.id,
         action: "create",
         objectType: "contract_event",
         objectId: id,
+        projectId: req.projectId!,
         payload: {
           number,
           kind: body.kind,
           clauseRef: body.clauseRef ?? null,
           eventDate: body.eventDate,
-          noticeDeadline,
+          awarenessDate: body.awarenessDate ?? null,
+          noticeDeadline: deadline.noticeDeadline,
+          deadlineSource: deadline.deadlineSource,
+          effectiveTimeBarDays: deadline.effectiveTimeBarDays,
           obligationId,
         },
       });
       const created = await fetchEvent(id, contractId, req.companyId!, req.projectId!);
-      return reply
-        .status(201)
-        .send({ ...created, daysToDeadline: noticeDeadline ? daysUntil(noticeDeadline) : null });
+      return reply.status(201).send({
+        ...created,
+        daysToDeadline: deadline.noticeDeadline ? daysUntil(deadline.noticeDeadline) : null,
+        deadlineExplanation: deadline.explanation,
+      });
     },
   );
 
@@ -656,7 +789,6 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
       const { contractId } = req.params as { contractId: string };
       const q = eventListQuery.parse(req.query);
       await fetchContract(contractId, req.companyId!, req.projectId!);
-      await sweepTimeBars([contractId], req.companyId!, req.projectId!, req.user!.id);
       const clauses = [
         eq(contractEvents.companyId, req.companyId!),
         eq(contractEvents.projectId, req.projectId!),
@@ -681,82 +813,263 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
     },
   );
 
+  /**
+   * Run the time-bar sweep on demand. The sweep is a SCHEDULED job
+   * (contracts.time-bars); this endpoint exists so an operator or a test can
+   * force a cycle without waiting an hour, and it is admin-gated because it
+   * writes state changes.
+   */
+  app.post(
+    "/projects/:projectId/contracts/sweep-time-bars",
+    { preHandler: adminGate },
+    async (req) => {
+      const result = await sweepTimeBars(app.db, req.companyId!, new Date(), {
+        projectId: req.projectId!,
+      });
+      return result;
+    },
+  );
+
   app.get(
     "/projects/:projectId/contracts/:contractId/events/:eventId",
     { preHandler: readGate },
     async (req) => {
       const { contractId, eventId } = req.params as { contractId: string; eventId: string };
+      const contract = await fetchContract(contractId, req.companyId!, req.projectId!);
       const ev = await fetchEvent(eventId, contractId, req.companyId!, req.projectId!);
-      return { ...ev, daysToDeadline: ev.noticeDeadline ? daysUntil(ev.noticeDeadline) : null };
+      const clause = ev.clauseRef
+        ? resolveClause(contract.form as ContractForm, ev.clauseRef, contract.particularConditions, {
+            calendarBasis: contract.calendarBasis as "calendar" | "working",
+          })
+        : null;
+      const chain = await app.db
+        .select()
+        .from(contractEvents)
+        .where(eq(contractEvents.chainParentId, eventId));
+      return {
+        ...ev,
+        daysToDeadline: ev.noticeDeadline ? daysUntil(ev.noticeDeadline) : null,
+        clause,
+        chainedEvents: chain.map((c) => ({
+          id: c.id,
+          number: c.number,
+          title: c.title,
+          clauseRef: c.clauseRef,
+          noticeDeadline: c.noticeDeadline,
+          status: c.status,
+          chainStage: c.chainStage,
+        })),
+      };
     },
   );
 
+  /**
+   * Serve a notice (#228, #230).
+   *
+   * Three things the first cut got wrong and this fixes:
+   *  • a client-supplied `servedAt` before the deadline turned a time-barred
+   *    event into a clean "notice served" with nothing persisted about it;
+   *  • lateness lived only in a ledger payload, so the register could not tell
+   *    a timely notice from one served after the bar;
+   *  • serving a notice never started the NEXT clock the form imposes.
+   */
   app.post(
     "/projects/:projectId/contracts/:contractId/events/:eventId/serve-notice",
     { preHandler: standardGate },
     async (req) => {
       const { contractId, eventId } = req.params as { contractId: string; eventId: string };
       const body = serveNoticeSchema.parse(req.body);
+      const contract = await fetchContract(contractId, req.companyId!, req.projectId!);
       const ev = await fetchEvent(eventId, contractId, req.companyId!, req.projectId!);
       if (ev.status !== "open" && ev.status !== "time_barred") {
         throw badRequest(`Notice cannot be served on a ${ev.status} event`);
       }
-      const servedAt = body.servedAt ?? new Date().toISOString();
+      const nowIso = new Date().toISOString();
+      const servedAt = body.servedAt ?? nowIso;
+      if (Date.parse(servedAt) > Date.parse(nowIso) + 60_000) {
+        throw badRequest("A notice cannot be recorded as served in the future");
+      }
       const servedDate = new Date(servedAt).toISOString().slice(0, 10);
+      // Backdating service is exactly the move that would launder a missed
+      // bar, so it needs a reason and a pointer to the proof of service.
+      const backdatedDays = daysBetweenIso(servedDate, todayISO());
+      if (backdatedDays > 1 && (!body.reason || !body.evidenceRef)) {
+        throw badRequest(
+          `Recording service ${backdatedDays} days in the past requires a reason and an evidence reference (proof of service).`,
+        );
+      }
       const late = ev.noticeDeadline !== null && servedDate > ev.noticeDeadline;
+      // A barred event stays visibly barred: a late notice is a served notice
+      // on a time-barred event, not a clean one.
+      const nextStatus = late || ev.status === "time_barred" ? "time_barred" : "notice_served";
+
       await app.db
         .update(contractEvents)
         .set({
-          status: "notice_served",
+          status: nextStatus,
           noticeServedAt: servedAt,
           noticeMethod: body.method,
           noticeReference: body.reference ?? null,
-          updatedAt: new Date().toISOString(),
+          noticeServedLate: late,
+          deadlineAtService: ev.noticeDeadline,
+          lateReason: body.reason ?? null,
+          serviceEvidenceRef: body.evidenceRef ?? null,
+          updatedAt: nowIso,
         })
         .where(eq(contractEvents.id, eventId));
-      // Evidence-free satisfy of the deadline obligation (#228 keeps the
-      // proof on the event's noticeMethod/noticeReference). A breached
-      // obligation (already swept) is left breached — serving late does not
-      // rewrite the register.
-      if (ev.obligationId) {
+
+      // The deadline obligation is satisfied only by a timely notice; a
+      // breached obligation is left breached — serving late does not rewrite
+      // the register.
+      if (ev.obligationId && !late) {
         await app.db
           .update(obligations)
           .set({ status: "satisfied" })
           .where(and(eq(obligations.id, ev.obligationId), eq(obligations.status, "open")));
       }
+
       if (late) {
-        await app.db.insert(signals).values({
-          id: newId("sig"),
+        await raiseSignalOnce(app.db, {
           companyId: req.companyId!,
           projectId: req.projectId!,
           detector: "time_bar_breach_risk",
+          key: `time_bar_breach_risk:${eventId}`,
           severity: "high",
           confidence: 1,
           title: "Notice served after time bar",
           explanation:
             `Notice for contract event #${ev.number} ("${ev.title}") was served on ${servedDate}, ` +
-            `after the notice deadline of ${ev.noticeDeadline} computed from the event date ${ev.eventDate}. ` +
+            `after the notice deadline of ${ev.noticeDeadline} computed from ${ev.awarenessDate ?? ev.eventDate}` +
+            `${ev.deadlineSource === "particular_condition" ? " under the amended Particular Condition" : ""}. ` +
             `The related entitlement may be barred; review the clause's condition-precedent wording.`,
+          evidenceRefs: {
+            eventId,
+            servedDate,
+            noticeDeadline: ev.noticeDeadline,
+            reason: body.reason ?? null,
+          },
         });
       }
+
+      // Chained deadlines (#227): serving this notice starts the next clock.
+      const clause = ev.clauseRef
+        ? resolveClause(contract.form as ContractForm, ev.clauseRef, contract.particularConditions, {
+            calendarBasis: contract.calendarBasis as "calendar" | "working",
+          })
+        : null;
+      const chain = chainedDeadlines(clause, {
+        form: contract.form as ContractForm,
+        particularConditions: contract.particularConditions,
+        calendarBasis: contract.calendarBasis as "calendar" | "working",
+        holidays: contract.holidays,
+        awarenessDate: ev.awarenessDate ?? ev.eventDate,
+        servedDate,
+      });
+      const spawned: Array<{ id: string; clauseRef: string; deadline: string }> = [];
+      for (const link of chain) {
+        const already = await app.db
+          .select({ id: contractEvents.id })
+          .from(contractEvents)
+          .where(
+            and(
+              eq(contractEvents.chainParentId, eventId),
+              eq(contractEvents.chainStage, link.clauseRef),
+            ),
+          )
+          .limit(1);
+        if (already[0]) continue;
+        const childNumber = await nextRecordNumber(app.db, req.projectId!, "contract_event");
+        const childId = newId("cev");
+        const childObligationId = newId("obl");
+        await app.db.transaction(async (tx) => {
+          await tx.insert(obligations).values({
+            id: childObligationId,
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            sourceClause: `${contract.form} ${link.clauseRef}`,
+            trigger: `${link.label} for event #${ev.number}: ${ev.title}`,
+            deadline: `${link.deadline}T23:59:59Z`,
+            warnDaysBefore: link.warnDaysBefore,
+            evidenceRequirement: "Submission with proof of service",
+            status: "open",
+            createdBy: req.user!.id,
+          });
+          await tx.insert(contractObligationLinks).values({
+            id: newId("col"),
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            contractId,
+            contractEventId: childId,
+            obligationId: childObligationId,
+            kind: "chain",
+            clauseRef: link.clauseRef,
+          });
+          await tx.insert(contractEvents).values({
+            id: childId,
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            contractId,
+            number: childNumber,
+            kind: ev.kind,
+            clauseRef: link.clauseRef,
+            title: `${link.label} — ${ev.title}`,
+            description: link.explanation,
+            eventDate: servedDate,
+            awarenessDate: ev.awarenessDate ?? ev.eventDate,
+            noticeDeadline: link.deadline,
+            effectiveTimeBarDays: link.days,
+            deadlineSource: link.deadlineSource,
+            calendarBasis: link.calendarBasis,
+            warnDaysBefore: link.warnDaysBefore,
+            status: "open",
+            obligationId: childObligationId,
+            chainParentId: eventId,
+            chainStage: link.clauseRef,
+            raisedBy: req.user!.id,
+          });
+        });
+        spawned.push({ id: childId, clauseRef: link.clauseRef, deadline: link.deadline });
+        await appendLedger(app.db, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "create",
+          objectType: "contract_event",
+          objectId: childId,
+          projectId: req.projectId!,
+          payload: {
+            number: childNumber,
+            chainParentId: eventId,
+            clauseRef: link.clauseRef,
+            noticeDeadline: link.deadline,
+            source: "deadline_chain",
+          },
+        });
+      }
+
       await appendLedger(app.db, {
         companyId: req.companyId!,
         actorId: req.user!.id,
         action: "state_change",
         objectType: "contract_event",
         objectId: eventId,
+        projectId: req.projectId!,
         payload: {
           from: ev.status,
-          to: "notice_served",
+          to: nextStatus,
           method: body.method,
           servedAt,
           late,
+          deadlineAtService: ev.noticeDeadline,
+          reason: body.reason ?? null,
+          chained: spawned.map((s) => s.clauseRef),
         },
+        storePayload: true,
       });
       const updated = await fetchEvent(eventId, contractId, req.companyId!, req.projectId!);
       return {
         ...updated,
         late,
+        chainedEvents: spawned,
         daysToDeadline: updated.noticeDeadline ? daysUntil(updated.noticeDeadline) : null,
       };
     },
@@ -782,6 +1095,7 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
         action: "state_change",
         objectType: "contract_event",
         objectId: eventId,
+        projectId: req.projectId!,
         payload: { from: ev.status, to: body.status },
       });
       return fetchEvent(eventId, contractId, req.companyId!, req.projectId!);
@@ -837,6 +1151,7 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
         action: "create",
         objectType: "eot_claim",
         objectId: id,
+        projectId: req.projectId!,
         payload: { number, title: body.title, daysClaimed: body.daysClaimed, eventIds },
       });
       const created = await fetchEotClaim(id, contractId, req.companyId!, req.projectId!);
@@ -875,7 +1190,15 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
     { preHandler: readGate },
     async (req) => {
       const { contractId, claimId } = req.params as { contractId: string; claimId: string };
-      return fetchEotClaim(claimId, contractId, req.companyId!, req.projectId!);
+      const claim = await fetchEotClaim(claimId, contractId, req.companyId!, req.projectId!);
+      const events =
+        claim.eventIds.length === 0
+          ? []
+          : await app.db
+              .select()
+              .from(contractEvents)
+              .where(inArray(contractEvents.id, claim.eventIds));
+      return { ...claim, events };
     },
   );
 
@@ -901,9 +1224,15 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
         if (body.daysAwarded === undefined) {
           throw badRequest("daysAwarded is required to assess an EOT claim");
         }
+        if (!body.assessment?.method) {
+          throw badRequest(
+            "An assessment must record the delay-analysis method used (SCL protocol methods)",
+          );
+        }
         set["daysAwarded"] = body.daysAwarded;
         set["assessedBy"] = req.user!.id;
         set["assessedAt"] = now;
+        set["assessment"] = body.assessment;
       }
       await app.db.update(eotClaims).set(set).where(eq(eotClaims.id, claimId));
       await appendLedger(app.db, {
@@ -912,11 +1241,14 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
         action: "state_change",
         objectType: "eot_claim",
         objectId: claimId,
+        projectId: req.projectId!,
         payload: {
           from: claim.status,
           to: body.status,
           daysAwarded: body.status === "assessed" ? body.daysAwarded : claim.daysAwarded,
+          assessment: body.assessment ?? null,
         },
+        storePayload: body.status === "assessed",
       });
 
       // Agreement of an assessed award extends the contract completion date
@@ -935,6 +1267,7 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
             action: "state_change",
             objectType: "contract",
             objectId: contractId,
+            projectId: req.projectId!,
             payload: { from: contract.completionDate, to: newCompletion, eotClaimId: claimId },
           });
         }
@@ -953,21 +1286,113 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
     async (req) => {
       const { contractId } = req.params as { contractId: string };
       const contract = await fetchContract(contractId, req.companyId!, req.projectId!);
-      if (contract.ldRatePerDay == null || !contract.completionDate) {
-        return { applicable: false as const };
-      }
-      const daysLate = Math.max(0, -daysUntil(contract.completionDate));
-      const raw = daysLate * contract.ldRatePerDay;
-      const accrued = contract.ldCap != null ? Math.min(raw, contract.ldCap) : raw;
-      return {
-        applicable: true as const,
+      const exposure = computeLdExposure({
         completionDate: contract.completionDate,
-        daysLate,
+        takingOverDate: contract.takingOverDate,
+        actualCompletionDate: contract.actualCompletionDate,
         ldRatePerDay: contract.ldRatePerDay,
         ldCap: contract.ldCap,
-        accrued,
-        capReached: contract.ldCap != null && raw >= contract.ldCap,
-      };
+        contractStatus: contract.status,
+        today: todayISO(),
+      });
+      return { ...exposure, currency: contract.currency };
     },
   );
+
+  /* ---------------------------------------------------------------- */
+  /* Health inputs (platform contract 3.5)                             */
+  /* ---------------------------------------------------------------- */
+
+  app.get(
+    "/projects/:projectId/contracts/health-inputs",
+    { preHandler: readGate },
+    async (req) => {
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      const today = todayISO();
+      const reasons: string[] = [];
+      const metrics: Record<string, number | null> = {};
+
+      const projectContracts = await app.db
+        .select()
+        .from(contracts)
+        .where(and(eq(contracts.companyId, companyId), eq(contracts.projectId, projectId)));
+      metrics["contracts"] = projectContracts.length;
+      if (projectContracts.length === 0) {
+        reasons.push("No contracts are recorded on this project.");
+        return { metrics, reasons };
+      }
+
+      const events = await app.db
+        .select()
+        .from(contractEvents)
+        .where(
+          and(eq(contractEvents.companyId, companyId), eq(contractEvents.projectId, projectId)),
+        );
+      metrics["eventsOpen"] = events.filter((e) => e.status === "open").length;
+      metrics["timeBarsMissed"] = events.filter((e) => e.status === "time_barred").length;
+      metrics["noticesServedLate"] = events.filter((e) => e.noticeServedLate).length;
+      metrics["deadlinesInsideWarningWindow"] = events.filter(
+        (e) =>
+          e.status === "open" &&
+          e.noticeDeadline != null &&
+          e.warnDaysBefore != null &&
+          daysBetweenIso(today, e.noticeDeadline) <= e.warnDaysBefore,
+      ).length;
+      metrics["deadlinesOverdueUnswept"] = events.filter(
+        (e) => e.status === "open" && e.noticeDeadline != null && e.noticeDeadline < today,
+      ).length;
+
+      const eots = await app.db
+        .select({ status: eotClaims.status, claimed: eotClaims.daysClaimed, awarded: eotClaims.daysAwarded })
+        .from(eotClaims)
+        .where(and(eq(eotClaims.companyId, companyId), eq(eotClaims.projectId, projectId)));
+      metrics["eotClaimsOpen"] = eots.filter(
+        (e) => e.status !== "agreed" && e.status !== "rejected",
+      ).length;
+      metrics["eotDaysClaimedOpen"] = eots
+        .filter((e) => e.status !== "agreed" && e.status !== "rejected")
+        .reduce((s, e) => s + e.claimed, 0);
+      metrics["eotDaysAwarded"] = eots
+        .filter((e) => e.status === "agreed")
+        .reduce((s, e) => s + (e.awarded ?? 0), 0);
+
+      // LD exposure is money and therefore currency-bound: reported as days
+      // late on the worst contract, plus a per-currency accrual list.
+      let worstDaysLate = 0;
+      const ldByCurrency = new Map<string, number>();
+      for (const c of projectContracts) {
+        const ld = computeLdExposure({
+          completionDate: c.completionDate,
+          takingOverDate: c.takingOverDate,
+          actualCompletionDate: c.actualCompletionDate,
+          ldRatePerDay: c.ldRatePerDay,
+          ldCap: c.ldCap,
+          contractStatus: c.status,
+          today,
+        });
+        if (!ld.applicable) continue;
+        worstDaysLate = Math.max(worstDaysLate, ld.daysLate);
+        ldByCurrency.set(c.currency, (ldByCurrency.get(c.currency) ?? 0) + ld.accrued);
+      }
+      metrics["worstDaysLate"] = worstDaysLate;
+      if (ldByCurrency.size > 1) {
+        reasons.push(
+          "Contracts on this project are in more than one currency; LD accrual is not summed.",
+        );
+      }
+      metrics["ldAccrued"] = ldByCurrency.size === 1 ? [...ldByCurrency.values()][0]! : null;
+
+      const amended = projectContracts.filter(
+        (c) => (c.particularConditions ?? []).length > 0,
+      ).length;
+      metrics["contractsWithParticularConditions"] = amended;
+
+      return { metrics, reasons };
+    },
+  );
+
+  await app.register(ceRoutes);
+  await app.register(complianceRoutes);
+  registerContractJobs(app);
 };

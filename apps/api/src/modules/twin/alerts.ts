@@ -95,13 +95,18 @@ export function coolDownElapsed(
   return elapsed >= Math.max(0, cooldownMinutes) * 60_000;
 }
 
-/** Which notification horizon (days) should fire for an expiry, if any. */
+/**
+ * Which notification horizon (days) should fire for an expiry, if any.
+ * The MOST URGENT crossed horizon wins - a warranty with 20 days left is a
+ * 30-day notice, not a 90-day one - and a horizon already notified never
+ * fires again.
+ */
 export function expiryHorizon(daysLeft: number, alreadyNotified: number | null): number | null {
-  const horizons = [90, 30, 7, 0];
-  for (const h of horizons) {
-    if (daysLeft <= h && (alreadyNotified === null || h < alreadyNotified)) return h;
-  }
-  return null;
+  const horizons = [0, 7, 30, 90];
+  const crossed = horizons.find((h) => daysLeft <= h);
+  if (crossed === undefined) return null;
+  if (alreadyNotified !== null && crossed >= alreadyNotified) return null;
+  return crossed;
 }
 
 /* ------------------------------------------------------------------ */

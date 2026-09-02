@@ -9,7 +9,8 @@
  */
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { Link, useParams } from "react-router-dom";
-import { api, ApiClientError, tokenStore } from "../../lib/api";
+import { toast } from "sonner";
+import { api, ApiClientError } from "../../lib/api";
 import {
   Badge,
   Button,
@@ -24,6 +25,7 @@ import {
 import { humanize } from "../format";
 import {
   CdeBadge,
+  fetchAuthedBuffer,
   SuitabilityChip,
   type BimElement,
   type BimModelDetail,
@@ -33,22 +35,34 @@ import {
 } from "./bimShared";
 import { IfcEngine, type PickedElement, type TypeBucket } from "./ifcEngine";
 
+interface TwinElementLink {
+  globalId: string;
+  assetId: string;
+  tagCode: string;
+  name: string;
+  status: string;
+}
+
+interface TwinAssetOption {
+  id: string;
+  tagCode: string;
+  name: string;
+}
+
 type ViewerState = "idle" | "loading" | "ready" | "failed" | "unsupported";
 type PanelTab = "properties" | "types" | "elements";
 
 const ELEMENTS_PAGE_SIZE = 25;
 
+/**
+ * The wasm parser needs the raw bytes, so this is a fetch rather than an
+ * api.get — but it goes through the shared helper that retries once after a
+ * token refresh. Before that, opening a model with an expired access token
+ * failed with a bare "Model download failed (401)" until the page was
+ * reloaded.
+ */
 async function fetchModelBuffer(fileId: string): Promise<ArrayBuffer> {
-  // same auth-header pattern as lib/api's fetchBlobUrl, but we need the raw
-  // ArrayBuffer for the wasm parser rather than an object URL
-  const headers: Record<string, string> = {};
-  const access = tokenStore.access;
-  if (access) headers["authorization"] = `Bearer ${access}`;
-  const companyId = tokenStore.companyId;
-  if (companyId) headers["x-company-id"] = companyId;
-  const res = await fetch(`/api/v1/bim/files/${fileId}/model`, { headers });
-  if (!res.ok) throw new Error(`Model download failed (${res.status})`);
-  return res.arrayBuffer();
+  return fetchAuthedBuffer(`/api/v1/bim/files/${fileId}/model`);
 }
 
 export default function ModelViewerPage() {
@@ -83,6 +97,12 @@ export default function ModelViewerPage() {
   const [elementsSearch, setElementsSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState("");
   const [elementsError, setElementsError] = useState<string | null>(null);
+
+  const [assetMap, setAssetMap] = useState<Record<string, TwinElementLink>>({});
+  const [assets, setAssets] = useState<TwinAssetOption[]>([]);
+  const [assetOpen, setAssetOpen] = useState(false);
+  const [assetForm, setAssetForm] = useState({ tagCode: "", name: "", existingAssetId: "" });
+  const [assetError, setAssetError] = useState<string | null>(null);
 
   const [issueOpen, setIssueOpen] = useState(false);
   const [issueForm, setIssueForm] = useState({ title: "", description: "" });
@@ -184,6 +204,65 @@ export default function ModelViewerPage() {
     };
   }, [model, selectedVersionId]);
 
+  /* --------------------------- twin element map --------------------------- */
+
+  const loadTwin = useCallback(async () => {
+    if (!projectId) return;
+    try {
+      const [map, list] = await Promise.all([
+        api.get<{ items: TwinElementLink[] }>(`/api/v1/projects/${projectId}/twin/element-map`),
+        api.get<ListResponse<TwinAssetOption>>(`/api/v1/projects/${projectId}/assets?pageSize=200`),
+      ]);
+      setAssetMap(Object.fromEntries(map.items.map((i) => [i.globalId, i])));
+      setAssets(list.items);
+    } catch {
+      // the twin is optional context for the viewer: a missing twin permission
+      // must not stop the model from opening
+      setAssetMap({});
+      setAssets([]);
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    void loadTwin();
+  }, [loadTwin]);
+
+  async function onAssetSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (!picked?.globalId || !projectId) return;
+    setAssetError(null);
+    setBusy(true);
+    try {
+      if (assetForm.existingAssetId) {
+        await api.post(`/api/v1/assets/${assetForm.existingAssetId}/elements`, {
+          globalId: picked.globalId,
+          modelVersionId: selectedVersionId,
+        });
+        toast.success("Element linked to the asset.");
+      } else {
+        const created = await api.post<{ tagCode: string }>(
+          `/api/v1/projects/${projectId}/assets/from-element`,
+          {
+            globalId: picked.globalId,
+            modelVersionId: selectedVersionId,
+            tagCode: assetForm.tagCode.trim(),
+            ...(assetForm.name.trim() ? { name: assetForm.name.trim() } : {}),
+          },
+        );
+        toast.success(`Asset ${created.tagCode} created from this element.`);
+      }
+      setAssetOpen(false);
+      setAssetForm({ tagCode: "", name: "", existingAssetId: "" });
+      await loadTwin();
+    } catch (err) {
+      setAssetError(
+        err instanceof ApiClientError ? err.message : "The asset could not be created or linked.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
   /* ------------------------------ API elements ---------------------------- */
 
   useEffect(() => {
@@ -264,22 +343,41 @@ export default function ModelViewerPage() {
     engineRef.current?.setSectionHeight(value);
   }
 
+  /**
+   * Selecting a row works whether or not the 3D engine started: with the
+   * viewer offline (non-IFC container, failed wasm init, unsupported browser)
+   * the properties panel is filled from the API row instead of going inert.
+   */
   function onElementRowClick(el: BimElement) {
-    if (viewerState !== "ready") return;
-    const found = engineRef.current?.selectByGlobalId(el.globalId) ?? null;
+    const found =
+      viewerState === "ready" ? (engineRef.current?.selectByGlobalId(el.globalId) ?? null) : null;
     if (found) {
       setPicked(found);
       setTab("properties");
-    } else {
-      setPicked({
-        expressID: -1,
-        globalId: el.globalId,
-        name: el.name,
-        ifcType: el.ifcType,
-        attributes: [{ key: "note", value: "No renderable geometry for this element" }],
-      });
-      setTab("properties");
+      return;
     }
+    const attributes: Array<{ key: string; value: string }> = [];
+    if (el.typeName) attributes.push({ key: "Type", value: el.typeName });
+    if (el.classification) attributes.push({ key: "Classification", value: el.classification });
+    if (el.storey) attributes.push({ key: "Storey", value: el.storey });
+    for (const [key, value] of Object.entries(el.properties ?? {})) {
+      attributes.push({ key, value: value === null || value === undefined ? "—" : String(value) });
+    }
+    attributes.push({
+      key: "source",
+      value:
+        viewerState === "ready"
+          ? "No renderable geometry for this element"
+          : "From the extracted element record — the 3D viewer is not running",
+    });
+    setPicked({
+      expressID: -1,
+      globalId: el.globalId,
+      name: el.name,
+      ifcType: el.ifcType,
+      attributes,
+    });
+    setTab("properties");
   }
 
   async function onCreateIssue(e: FormEvent) {
@@ -486,6 +584,17 @@ export default function ModelViewerPage() {
                 <PropertiesTab
                   picked={picked}
                   viewerReady={viewerState === "ready"}
+                  projectId={projectId}
+                  linkedAsset={picked?.globalId ? (assetMap[picked.globalId] ?? null) : null}
+                  onAsset={() => {
+                    setAssetError(null);
+                    setAssetForm({
+                      tagCode: "",
+                      name: picked?.name ?? "",
+                      existingAssetId: "",
+                    });
+                    setAssetOpen(true);
+                  }}
                   onCreateIssue={() => {
                     setIssueForm({
                       title: picked?.name
@@ -616,8 +725,13 @@ export default function ModelViewerPage() {
                                   {el.ifcType}
                                 </span>
                               </div>
-                              <div className="truncate font-mono text-[10px] text-ink-400">
+                              <div className="flex items-center gap-1 truncate font-mono text-[10px] text-ink-400">
                                 {el.globalId}
+                                {assetMap[el.globalId] ? (
+                                  <span className="rounded bg-emerald-100 px-1 font-sans text-[10px] font-medium text-emerald-800">
+                                    {assetMap[el.globalId]?.tagCode}
+                                  </span>
+                                ) : null}
                               </div>
                             </button>
                           </li>
@@ -654,6 +768,66 @@ export default function ModelViewerPage() {
           </div>
         )}
       </div>
+
+      {/* --------------------------- asset-from-element ------------------------ */}
+      <Modal
+        open={assetOpen}
+        title="Create or link a digital twin asset"
+        onClose={() => setAssetOpen(false)}
+      >
+        <ErrorAlert message={assetError} />
+        <form onSubmit={onAssetSubmit} className="space-y-4">
+          <div className="rounded-md bg-ink-50 px-3 py-2 text-xs text-ink-600">
+            Element <span className="font-mono">{picked?.globalId ?? "—"}</span>
+            {picked?.name ? <span className="text-ink-400"> · {picked.name}</span> : null}
+          </div>
+          <Field
+            label="Link to an existing asset"
+            hint="Leave empty to create a new asset from this element instead."
+          >
+            <Select
+              value={assetForm.existingAssetId}
+              onChange={(e) => setAssetForm((f) => ({ ...f, existingAssetId: e.target.value }))}
+            >
+              <option value="">Create a new asset</option>
+              {assets.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.tagCode} — {a.name}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          {!assetForm.existingAssetId && (
+            <>
+              <Field label="Tag code" hint="Unique on the project — the identifier used on site.">
+                <Input
+                  required
+                  value={assetForm.tagCode}
+                  onChange={(e) => setAssetForm((f) => ({ ...f, tagCode: e.target.value }))}
+                  placeholder="AHU-01"
+                />
+              </Field>
+              <Field label="Name" hint="Defaults to the element name.">
+                <Input
+                  value={assetForm.name}
+                  onChange={(e) => setAssetForm((f) => ({ ...f, name: e.target.value }))}
+                />
+              </Field>
+            </>
+          )}
+          <div className="flex justify-end gap-2">
+            <Button variant="secondary" onClick={() => setAssetOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              disabled={busy || (!assetForm.existingAssetId && !assetForm.tagCode.trim())}
+            >
+              {assetForm.existingAssetId ? "Link" : "Create asset"}
+            </Button>
+          </div>
+        </form>
+      </Modal>
 
       {/* ------------------------- issue-from-element modal --------------------- */}
       <Modal
@@ -713,10 +887,16 @@ function BackLink({ projectId }: { projectId: string | undefined }) {
 function PropertiesTab({
   picked,
   viewerReady,
+  projectId,
+  linkedAsset,
+  onAsset,
   onCreateIssue,
 }: {
   picked: PickedElement | null;
   viewerReady: boolean;
+  projectId: string | undefined;
+  linkedAsset: TwinElementLink | null;
+  onAsset: () => void;
   onCreateIssue: () => void;
 }) {
   if (!picked) {
@@ -724,7 +904,7 @@ function PropertiesTab({
       <p className="py-6 text-center text-xs text-ink-400">
         {viewerReady
           ? "Click an element in the 3D view — or pick one from the Elements tab — to inspect its properties."
-          : "Pick an element from the Elements tab to inspect it."}
+          : "Pick an element from the Elements tab to inspect it — the properties come from the extracted record, so they work without the 3D engine."}
       </p>
     );
   }
@@ -748,9 +928,26 @@ function PropertiesTab({
           <PropRow key={a.key} label={a.key} value={a.value} />
         ))}
       </dl>
-      <Button size="sm" disabled={!picked.globalId} onClick={onCreateIssue}>
-        Create issue with this element
-      </Button>
+      {linkedAsset ? (
+        <div className="rounded-md bg-emerald-50 px-2 py-1.5 text-xs text-emerald-900">
+          Twin asset{" "}
+          <Link
+            to={`/projects/${projectId}/twin`}
+            className="font-medium underline"
+          >
+            {linkedAsset.tagCode}
+          </Link>{" "}
+          — {linkedAsset.name}
+        </div>
+      ) : null}
+      <div className="flex flex-wrap gap-2">
+        <Button size="sm" disabled={!picked.globalId} onClick={onCreateIssue}>
+          Create issue
+        </Button>
+        <Button size="sm" variant="secondary" disabled={!picked.globalId} onClick={onAsset}>
+          {linkedAsset ? "Link to another asset" : "Create or link an asset"}
+        </Button>
+      </div>
     </div>
   );
 }

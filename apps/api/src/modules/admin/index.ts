@@ -1,20 +1,57 @@
+/**
+ * Tenant administration: permission templates, project memberships, assurance
+ * grants, the audit trail, retention and legal hold, data export and
+ * delegated administration (Vol I §0.1 #20–#30, §0.8 #45–#47).
+ *
+ * WHAT CHANGED IN THIS WAVE
+ *  • assurance grants enforce segregation of duties. `POST /assurance-grants`
+ *    accepted any userId — including the caller's own — so a company admin
+ *    could grant themselves `integrity_reviewer` and then disposition the
+ *    signals raised about their own records, which is precisely the model the
+ *    assurance layer exists to prevent.
+ *  • the auth-event register is scoped to events that happened in THIS
+ *    tenant. It used to join through company_memberships, showing an admin of
+ *    company A every sign-in a shared user made while working in company B.
+ *  • an audit viewer over the hash-chained ledger (#92), retention policies
+ *    and legal holds with real enforcement (#46–#47), a company data export
+ *    (#45), and delegated administration (#27).
+ */
 import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
-import { and, asc, count, desc, eq, or, isNull, gte } from "drizzle-orm";
+import { and, asc, count, desc, eq, gt, or, isNull, isNotNull, inArray, gte, lte } from "drizzle-orm";
 import {
+  adminDelegations,
   assuranceGrants,
   authEvents,
   companyMemberships,
+  contacts,
+  costCodes,
+  exportJobs,
+  ledgerEntries,
+  legalHolds,
+  locations,
   permissionTemplates,
   projectMemberships,
   projects,
+  retentionPolicies,
   users,
+  vendors,
+  workflowTemplates,
 } from "@constructos/db";
-import { ASSURANCE_ROLES, PERMISSION_LEVELS, TOOLS } from "@constructos/shared";
+import {
+  ADMIN_DELEGATION_CAPABILITIES,
+  ASSURANCE_ROLES,
+  EXPORT_JOB_STATUSES,
+  PERMISSION_LEVELS,
+  RETENTION_ACTIONS,
+  TOOLS,
+} from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
-import { badRequest, conflict, notFound } from "../../lib/errors.js";
+import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
+import { forEachCompany } from "../../lib/scheduler.js";
+import type { Db } from "../../lib/db.js";
 
 /* ------------------------------------------------------------------ */
 /* Validation                                                          */

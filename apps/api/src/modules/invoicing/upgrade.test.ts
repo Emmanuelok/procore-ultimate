@@ -74,7 +74,13 @@ const inject = (
   url: string,
   headers: Record<string, string>,
   payload?: unknown,
-) => built.app.inject({ method, url, headers, ...(payload !== undefined ? { payload } : {}) });
+) =>
+  built.app.inject({
+    method,
+    url,
+    headers,
+    ...(payload !== undefined ? { payload } : {}),
+  });
 
 let commitmentSeq = 0;
 
@@ -82,12 +88,14 @@ let commitmentSeq = 0;
  * A fresh executed subcontract with two schedule lines, so each block bills
  * against its own contract without tripping the one-open-invoice rule.
  */
-async function makeCommitment(opts: {
-  projectId?: string;
-  strictness?: "off" | "warn" | "block";
-  requiresLienWaiver?: boolean;
-  billed?: number; // pre-bill line 01 and hold 10% retainage against it
-} = {}): Promise<{ id: string; line1: string; line2: string }> {
+async function makeCommitment(
+  opts: {
+    projectId?: string;
+    strictness?: "off" | "warn" | "block";
+    requiresLienWaiver?: boolean;
+    billed?: number; // pre-bill line 01 and hold 10% retainage against it
+  } = {},
+): Promise<{ id: string; line1: string; line2: string }> {
   commitmentSeq += 1;
   const id = newId("cmt");
   const projectId = opts.projectId ?? projA;
@@ -194,8 +202,14 @@ beforeAll(async () => {
       role: "member",
     });
   }
-  billerH = { authorization: `Bearer ${biller.accessToken}`, "x-company-id": owner.companyId };
-  clerkH = { authorization: `Bearer ${clerk.accessToken}`, "x-company-id": owner.companyId };
+  billerH = {
+    authorization: `Bearer ${biller.accessToken}`,
+    "x-company-id": owner.companyId,
+  };
+  clerkH = {
+    authorization: `Bearer ${clerk.accessToken}`,
+    "x-company-id": owner.companyId,
+  };
 
   projA = newId("prj");
   projB = newId("prj");
@@ -283,19 +297,39 @@ describe("certified and outstanding (pure)", () => {
   });
 
   it("honours an approved-as-noted reduction", () => {
-    expect(certifiedOf({ detail: { approvedAmount: 8000 }, currentPaymentDue: 10000 })).toBe(8000);
+    expect(
+      certifiedOf({
+        detail: { approvedAmount: 8000 },
+        currentPaymentDue: 10000,
+      }),
+    ).toBe(8000);
   });
 
   it("never certifies MORE than was applied for, whatever the detail says", () => {
-    expect(certifiedOf({ detail: { approvedAmount: 99999 }, currentPaymentDue: 10000 })).toBe(10000);
+    expect(
+      certifiedOf({
+        detail: { approvedAmount: 99999 },
+        currentPaymentDue: 10000,
+      }),
+    ).toBe(10000);
   });
 
   it("reports outstanding against the certified figure, never below zero", () => {
     expect(
-      outstandingOf({ detail: { approvedAmount: 8000 }, currentPaymentDue: 10000, amountPaid: 8000 }),
+      outstandingOf({
+        detail: { approvedAmount: 8000 },
+        currentPaymentDue: 10000,
+        amountPaid: 8000,
+      }),
     ).toBe(0);
     expect(outstandingOf({ detail: {}, currentPaymentDue: 10000, amountPaid: 3000 })).toBe(7000);
-    expect(outstandingOf({ detail: {}, currentPaymentDue: 10000, amountPaid: 12000 })).toBe(0);
+    expect(
+      outstandingOf({
+        detail: {},
+        currentPaymentDue: 10000,
+        amountPaid: 12000,
+      }),
+    ).toBe(0);
   });
 });
 
@@ -335,7 +369,14 @@ describe("line-level approval", () => {
 
   it("refuses certifying MORE than was billed on the line", async () => {
     const res = await inject("PUT", `/api/v1/invoices/${invId}/line-approvals`, owner.headers, {
-      decisions: [{ lineId, status: "reduced", approvedAmount: 30000, note: "generous" }],
+      decisions: [
+        {
+          lineId,
+          status: "reduced",
+          approvedAmount: 30000,
+          note: "generous",
+        },
+      ],
     });
     expect(res.statusCode).toBe(400);
     expect(res.json().message).toContain("never more");
@@ -344,7 +385,12 @@ describe("line-level approval", () => {
   it("certifies the line at less than billed and moves the invoice under review", async () => {
     const res = await inject("PUT", `/api/v1/invoices/${invId}/line-approvals`, owner.headers, {
       decisions: [
-        { lineId, status: "reduced", approvedAmount: 15000, note: "Erection not complete at cut-off" },
+        {
+          lineId,
+          status: "reduced",
+          approvedAmount: 15000,
+          note: "Erection not complete at cut-off",
+        },
       ],
     });
     expect(res.statusCode).toBe(200);
@@ -386,7 +432,11 @@ describe("line-level approval", () => {
     expect(pay.statusCode).toBe(201);
     expect(pay.json().invoice.status).toBe("paid");
     const aging = await inject("GET", `/api/v1/projects/${projA}/invoicing/aging`, owner.headers);
-    const refs = (aging.json().payable.byCurrency as Array<{ vendors: Array<{ invoices: Array<{ invoiceId: string }> }> }>)
+    const refs = (
+      aging.json().payable.byCurrency as Array<{
+        vendors: Array<{ invoices: Array<{ invoiceId: string }> }>;
+      }>
+    )
       .flatMap((c) => c.vendors)
       .flatMap((v) => v.invoices)
       .map((i) => i.invoiceId);
@@ -446,6 +496,38 @@ describe("the invoice pay route enforces the register's controls", () => {
     expect(res.json().details.blocking[0].code).toBe("certificate_expired");
   });
 
+  it("replays a retried payment on the same Idempotency-Key rather than paying twice", async () => {
+    await built.app.db
+      .update(insuranceCertificates)
+      .set({ validTo: isoDaysFromNow(400) })
+      .where(eq(insuranceCertificates.id, cert));
+    const c = await makeCommitment();
+    const invId = await submittedInvoice(c.id, 4000);
+    await inject("POST", `/api/v1/invoices/${invId}/review`, clerkH, {});
+    await inject("POST", `/api/v1/invoices/${invId}/approve`, owner.headers, {});
+
+    const headers = { ...clerkH, "idempotency-key": `test-key-${invId}` };
+    const first = await built.app.inject({
+      method: "POST",
+      url: `/api/v1/invoices/${invId}/payments`,
+      headers,
+      payload: { amount: 3600, method: "ach" },
+    });
+    expect(first.statusCode).toBe(201);
+    const second = await built.app.inject({
+      method: "POST",
+      url: `/api/v1/invoices/${invId}/payments`,
+      headers,
+      payload: { amount: 3600, method: "ach" },
+    });
+    expect(second.statusCode).toBe(201);
+    expect(second.headers["idempotent-replayed"]).toBe("true");
+    expect(second.json().payment.id).toBe(first.json().payment.id);
+
+    const inv = (await built.app.db.select().from(invoices).where(eq(invoices.id, invId)).limit(1))[0]!;
+    expect(inv.amountPaid).toBeCloseTo(3600, 2);
+  });
+
   it("pays once cover is reinstated, recording the compliance position on the payment", async () => {
     await built.app.db
       .update(insuranceCertificates)
@@ -485,7 +567,9 @@ describe("regression: an invoice cannot be paid twice through two registers", ()
   });
 
   it("records the override ON HOLD, with nothing paid", async () => {
-    const inv = (await built.app.db.select().from(invoices).where(eq(invoices.id, invId)).limit(1))[0]!;
+    const inv = (
+      await built.app.db.select().from(invoices).where(eq(invoices.id, invId)).limit(1)
+    )[0]!;
     expect(inv.amountPaid).toBe(0);
   });
 
@@ -521,14 +605,21 @@ describe("regression: an invoice cannot be paid twice through two registers", ()
       { reason: "Waiver received" },
     );
     expect(released.statusCode).toBe(200);
-    const approved = await inject("POST", `/api/v1/commitment-payments/${paymentId}/approve`, billerH, {});
+    const approved = await inject(
+      "POST",
+      `/api/v1/commitment-payments/${paymentId}/approve`,
+      billerH,
+      {},
+    );
     expect(approved.statusCode).toBe(200);
     const issued = await inject("POST", `/api/v1/commitment-payments/${paymentId}/issue`, clerkH, {
       acknowledgeWarnings: true,
     });
     expect(issued.statusCode).toBe(200);
 
-    const inv = (await built.app.db.select().from(invoices).where(eq(invoices.id, invId)).limit(1))[0]!;
+    const inv = (
+      await built.app.db.select().from(invoices).where(eq(invoices.id, invId)).limit(1)
+    )[0]!;
     expect(inv.amountPaid).toBeCloseTo(10800, 2);
     expect(inv.status).toBe("paid");
   });
@@ -542,11 +633,18 @@ describe("regression: an invoice cannot be paid twice through two registers", ()
   });
 
   it("reverses the invoice when the payment is voided through the commitments route", async () => {
-    const res = await inject("POST", `/api/v1/commitment-payments/${paymentId}/void`, owner.headers, {
-      reason: "Bank rejected the file",
-    });
+    const res = await inject(
+      "POST",
+      `/api/v1/commitment-payments/${paymentId}/void`,
+      owner.headers,
+      {
+        reason: "Bank rejected the file",
+      },
+    );
     expect(res.statusCode).toBe(200);
-    const inv = (await built.app.db.select().from(invoices).where(eq(invoices.id, invId)).limit(1))[0]!;
+    const inv = (
+      await built.app.db.select().from(invoices).where(eq(invoices.id, invId)).limit(1)
+    )[0]!;
     expect(inv.amountPaid).toBe(0);
     expect(inv.status).not.toBe("paid");
   });
@@ -653,9 +751,14 @@ describe("regression: excusing a waiver is an admin act by an independent party"
   });
 
   it("records who excused it when a third party does it", async () => {
-    const res = await inject("POST", `/api/v1/lien-waivers/${waiverId}/not-required`, owner.headers, {
-      reason: "Statutory waiver not applicable in this jurisdiction",
-    });
+    const res = await inject(
+      "POST",
+      `/api/v1/lien-waivers/${waiverId}/not-required`,
+      owner.headers,
+      {
+        reason: "Statutory waiver not applicable in this jurisdiction",
+      },
+    );
     expect(res.statusCode).toBe(200);
     expect(res.json().status).toBe("not_required");
     expect(res.json().detail.notRequiredBy).toBe(owner.userId);
@@ -668,7 +771,10 @@ describe("regression: excusing a waiver is an admin act by an independent party"
       owner.headers,
     );
     expect(res.statusCode).toBe(200);
-    const excused = (res.json().excused ?? []) as Array<{ excusedBy: string | null; invoiceId: string }>;
+    const excused = (res.json().excused ?? []) as Array<{
+      excusedBy: string | null;
+      invoiceId: string;
+    }>;
     expect(excused.some((e) => e.invoiceId === invId && e.excusedBy === owner.userId)).toBe(true);
   });
 
@@ -782,16 +888,33 @@ describe("retainage releases", () => {
       });
       if (draft.statusCode !== 201) throw new Error(`release draft failed: ${draft.body}`);
       const id = draft.json().id as string;
-      const submitted = await inject("POST", `/api/v1/retainage-releases/${id}/submit`, billerH, {});
+      const submitted = await inject(
+        "POST",
+        `/api/v1/retainage-releases/${id}/submit`,
+        billerH,
+        {},
+      );
       if (submitted.statusCode !== 200) throw new Error(`submit failed: ${submitted.body}`);
-      const approved = await inject("POST", `/api/v1/retainage-releases/${id}/approve`, owner.headers, {});
+      const approved = await inject(
+        "POST",
+        `/api/v1/retainage-releases/${id}/approve`,
+        owner.headers,
+        {},
+      );
       if (approved.statusCode !== 200) throw new Error(`approve failed: ${approved.body}`);
-      const released = await inject("POST", `/api/v1/retainage-releases/${id}/release`, owner.headers, {});
+      const released = await inject(
+        "POST",
+        `/api/v1/retainage-releases/${id}/release`,
+        owner.headers,
+        {},
+      );
       if (released.statusCode !== 200) throw new Error(`release failed: ${released.body}`);
     };
     await runRelease(3000);
     await runRelease(2000);
-    const inv = (await built.app.db.select().from(invoices).where(eq(invoices.id, invId)).limit(1))[0]!;
+    const inv = (
+      await built.app.db.select().from(invoices).where(eq(invoices.id, invId)).limit(1)
+    )[0]!;
     expect(inv.retainageReleased).toBeCloseTo(5000, 2);
   });
 
@@ -825,11 +948,16 @@ describe("regression: unpaidOnly agrees with its own total", () => {
 
 describe("regression: period rollups count the same invoices in both places", () => {
   it("reports invoiceCount over the live rows the money columns use", async () => {
-    const created = await inject("POST", `/api/v1/projects/${projA}/billing-periods`, owner.headers, {
-      name: "Rollup period",
-      startDate: "2027-01-01",
-      endDate: "2027-01-31",
-    });
+    const created = await inject(
+      "POST",
+      `/api/v1/projects/${projA}/billing-periods`,
+      owner.headers,
+      {
+        name: "Rollup period",
+        startDate: "2027-01-01",
+        endDate: "2027-01-31",
+      },
+    );
     expect(created.statusCode).toBe(201);
     const periodId = created.json().id as string;
     const c = await makeCommitment();
@@ -846,10 +974,11 @@ describe("regression: period rollups count the same invoices in both places", ()
       {},
     );
     expect(recalc.statusCode).toBe(200);
-    const currencyCounts = ((recalc.json().detail?.currencies ?? []) as Array<{ invoiceCount: number }>).reduce(
-      (s, x) => s + x.invoiceCount,
-      0,
-    );
+    const currencyCounts = (
+      (recalc.json().detail?.currencies ?? []) as Array<{
+        invoiceCount: number;
+      }>
+    ).reduce((s, x) => s + x.invoiceCount, 0);
     // one DRAFT invoice: excluded from both the money columns and the count
     expect(recalc.json().invoiceCount).toBe(currencyCounts);
     expect(recalc.json().invoiceCount).toBe(0);
@@ -860,13 +989,18 @@ describe("regression: the subcontractor submission window is enforced", () => {
   let invId: string;
 
   beforeAll(async () => {
-    const period = await inject("POST", `/api/v1/projects/${projA}/billing-periods`, owner.headers, {
-      name: "Window period",
-      startDate: "2027-03-01",
-      endDate: "2027-03-31",
-      subcontractorSubmitStart: "2027-03-20",
-      subcontractorSubmitEnd: "2027-03-25",
-    });
+    const period = await inject(
+      "POST",
+      `/api/v1/projects/${projA}/billing-periods`,
+      owner.headers,
+      {
+        name: "Window period",
+        startDate: "2027-03-01",
+        endDate: "2027-03-31",
+        subcontractorSubmitStart: "2027-03-20",
+        subcontractorSubmitEnd: "2027-03-25",
+      },
+    );
     if (period.statusCode !== 201) throw new Error(`period create failed: ${period.body}`);
     const c = await makeCommitment();
     const created = await inject("POST", `/api/v1/projects/${projA}/invoices`, billerH, {
@@ -914,11 +1048,16 @@ describe("vendor self-service portal", () => {
   });
 
   it("mints a scoped token, shown once", async () => {
-    const res = await inject("POST", `/api/v1/projects/${projA}/vendor-portal/tokens`, owner.headers, {
-      vendorId: vendorSub,
-      label: "Ironbridge AR",
-      scopes: ["invoices", "rfqs"],
-    });
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projA}/vendor-portal/tokens`,
+      owner.headers,
+      {
+        vendorId: vendorSub,
+        label: "Ironbridge AR",
+        scopes: ["invoices", "rfqs"],
+      },
+    );
     expect(res.statusCode).toBe(201);
     token = res.json().token;
     tokenId = res.json().id;
@@ -927,15 +1066,23 @@ describe("vendor self-service portal", () => {
   });
 
   it("refuses a token for a vendor outside the company", async () => {
-    const res = await inject("POST", `/api/v1/projects/${projA}/vendor-portal/tokens`, owner.headers, {
-      vendorId: "ven_not_real",
-      label: "Nope",
-    });
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projA}/vendor-portal/tokens`,
+      owner.headers,
+      {
+        vendorId: "ven_not_real",
+        label: "Nope",
+      },
+    );
     expect(res.statusCode).toBe(400);
   });
 
   it("serves the vendor only their own project's commitments", async () => {
-    const res = await built.app.inject({ method: "GET", url: `/api/v1/vendor-portal/${token}` });
+    const res = await built.app.inject({
+      method: "GET",
+      url: `/api/v1/vendor-portal/${token}`,
+    });
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body.vendor.id).toBe(vendorSub);
@@ -996,7 +1143,10 @@ describe("vendor self-service portal", () => {
     const res = await built.app.inject({
       method: "POST",
       url: `/api/v1/vendor-portal/${token}/invoices`,
-      payload: { commitmentId: portalComm, lines: [{ sovLineId: commOtherL1, thisPeriodWork: 100 }] },
+      payload: {
+        commitmentId: portalComm,
+        lines: [{ sovLineId: commOtherL1, thisPeriodWork: 100 }],
+      },
     });
     expect(res.statusCode).toBe(400);
   });
@@ -1009,7 +1159,10 @@ describe("vendor self-service portal", () => {
       {},
     );
     expect(revoke.statusCode).toBe(200);
-    const res = await built.app.inject({ method: "GET", url: `/api/v1/vendor-portal/${token}` });
+    const res = await built.app.inject({
+      method: "GET",
+      url: `/api/v1/vendor-portal/${token}`,
+    });
     expect(res.statusCode).toBe(401);
   });
 });

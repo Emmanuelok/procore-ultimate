@@ -72,6 +72,21 @@ export const ingestionRuns = pgTable(
     /** validation report: [{ row, field, code, message }] capped server-side */
     report: jsonb("report").$type<unknown[]>().default([]).notNull(),
     error: text("error"),
+    /* ------------------ WP-ANALYTICS: the upgrade wave ----------------- */
+    /**
+     * insert  — reject a row whose externalId was already committed
+     * reconcile — diff it against the committed record and offer an update
+     */
+    mode: text("mode").default("insert").notNull(),
+    /** rows whose committed record was UPDATED (reconcile mode) */
+    updatedCount: integer("updated_count").default(0).notNull(),
+    /** connector pulls run in the background; this is what they report */
+    pagesFetched: integer("pages_fetched").default(0).notNull(),
+    progressNote: text("progress_note"),
+    /** opaque connector cursor so a pull can resume where it stopped */
+    connectorCursor: text("connector_cursor"),
+    /** parser that produced the staged rows: csv | p6_xer | msp_xml | connector | push */
+    parser: text("parser").default("csv").notNull(),
     startedBy: text("started_by").notNull(),
     committedBy: text("committed_by"),
     committedAt: timestamp("committed_at", { withTimezone: true, mode: "string" }),
@@ -81,6 +96,8 @@ export const ingestionRuns = pgTable(
   (t) => [
     index("ingestion_runs_company_idx").on(t.companyId),
     index("ingestion_runs_source_idx").on(t.sourceId),
+    index("ingestion_runs_status_idx").on(t.companyId, t.status),
+    index("ingestion_runs_project_idx").on(t.projectId),
   ],
 );
 
@@ -100,11 +117,49 @@ export const ingestedRecords = pgTable(
     reason: text("reason"),
     /** id of the real record created at commit time — provenance forward-link */
     committedRecordId: text("committed_record_id"),
+    /**
+     * RECONCILE MODE. When an externalId matches a record an earlier run
+     * committed, the row is not a duplicate to reject but a restatement to
+     * consider: `matchedRecordId` names what it matches and `diff` holds the
+     * field-by-field difference an operator approves or skips.
+     */
+    matchedRecordId: text("matched_record_id"),
+    diff: jsonb("diff").$type<Record<string, unknown>>(),
+    /** insert | update | skip — the operator's decision in reconcile mode */
+    resolution: text("resolution"),
     createdAt: createdAt(),
   },
   (t) => [
     index("ingested_records_run_idx").on(t.runId),
     index("ingested_records_external_idx").on(t.externalId),
+    index("ingested_records_run_status_idx").on(t.runId, t.status),
+  ],
+);
+
+/**
+ * A saved column map. The mapping step is the slow part of every migration and
+ * it is identical every month; a template makes the second import of the same
+ * export a two-click operation and keeps the mapping auditable.
+ */
+export const ingestionMappingTemplates = pgTable(
+  "ingestion_mapping_templates",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    /** null = usable with any source of this dataset */
+    sourceId: text("source_id"),
+    dataset: text("dataset").notNull(),
+    name: text("name").notNull(),
+    /** { targetField: sourceColumn } */
+    columnMap: jsonb("column_map").$type<Record<string, string>>().default({}).notNull(),
+    /** how many runs adopted it — the honest measure of whether it is right */
+    useCount: integer("use_count").default(0).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("ingestion_mapping_templates_company_idx").on(t.companyId, t.dataset),
   ],
 );
 

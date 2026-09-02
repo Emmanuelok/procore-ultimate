@@ -88,7 +88,6 @@ import {
   recomputeEstimate,
   sectionsOfEstimate,
   todayIso,
-  toMarkupSpec,
   type EstimateLineRow,
   type EstimateRow,
 } from "./shared.js";
@@ -2425,3 +2424,1989 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
       return { id: markupId, deleted: true, estimateTotals: totals };
     },
   );
+
+  /* ================================================================== */
+  /* Takeoff (#184–190)                                                  */
+  /* ================================================================== */
+
+  app.get("/projects/:projectId/takeoff/layers", { preHandler: readGate }, async (req) => {
+    const items = await app.db
+      .select()
+      .from(takeoffLayers)
+      .where(
+        and(eq(takeoffLayers.companyId, req.companyId!), eq(takeoffLayers.projectId, req.projectId!)),
+      )
+      .orderBy(asc(takeoffLayers.sortOrder), asc(takeoffLayers.name));
+    return { items, total: items.length };
+  });
+
+  app.post("/projects/:projectId/takeoff/layers", { preHandler: standardGate }, async (req, reply) => {
+    const body = S.layerCreateSchema.parse(req.body);
+    const id = newId("tly");
+    await app.db.insert(takeoffLayers).values({
+      id,
+      companyId: req.companyId!,
+      projectId: req.projectId!,
+      name: body.name,
+      colour: body.colour ?? "#2563eb",
+      description: body.description ?? null,
+      costCodeId: body.costCodeId ?? null,
+      costCode: body.costCode ?? null,
+      measurementType: body.measurementType ?? null,
+      unit: body.unit ?? null,
+      visible: body.visible === false ? 0 : 1,
+      sortOrder: body.sortOrder ?? 0,
+      detail: body.detail ?? {},
+      createdBy: req.user!.id,
+    });
+    await ledger(req, "create", "takeoff_layer", id, { projectId: req.projectId!, name: body.name });
+    const rows = await app.db.select().from(takeoffLayers).where(eq(takeoffLayers.id, id)).limit(1);
+    return reply.status(201).send(rows[0]);
+  });
+
+  app.patch("/projects/:projectId/takeoff/layers/:layerId", { preHandler: standardGate }, async (req) => {
+    const { layerId } = req.params as { layerId: string };
+    const body = S.layerPatchSchema.parse(req.body);
+    const rows = await app.db
+      .select()
+      .from(takeoffLayers)
+      .where(
+        and(
+          eq(takeoffLayers.id, layerId),
+          eq(takeoffLayers.companyId, req.companyId!),
+          eq(takeoffLayers.projectId, req.projectId!),
+        ),
+      )
+      .limit(1);
+    const layer = rows[0];
+    if (!layer) throw notFound("Takeoff layer not found on this project");
+    const patch: Record<string, unknown> = { updatedAt: nowIso() };
+    for (const key of [
+      "name",
+      "colour",
+      "description",
+      "costCodeId",
+      "costCode",
+      "measurementType",
+      "unit",
+      "sortOrder",
+      "detail",
+    ] as const) {
+      const value = (body as Record<string, unknown>)[key];
+      if (value !== undefined) patch[key] = value;
+    }
+    if (body.visible !== undefined) patch["visible"] = body.visible ? 1 : 0;
+    await app.db.update(takeoffLayers).set(patch).where(eq(takeoffLayers.id, layerId));
+    await ledger(req, "update", "takeoff_layer", layerId, {
+      projectId: req.projectId!,
+      name: layer.name,
+      changed: Object.keys(patch).filter((k) => k !== "updatedAt"),
+    });
+    const after = await app.db.select().from(takeoffLayers).where(eq(takeoffLayers.id, layerId)).limit(1);
+    return after[0];
+  });
+
+  app.delete("/projects/:projectId/takeoff/layers/:layerId", { preHandler: standardGate }, async (req) => {
+    const { layerId } = req.params as { layerId: string };
+    const rows = await app.db
+      .select()
+      .from(takeoffLayers)
+      .where(
+        and(
+          eq(takeoffLayers.id, layerId),
+          eq(takeoffLayers.companyId, req.companyId!),
+          eq(takeoffLayers.projectId, req.projectId!),
+        ),
+      )
+      .limit(1);
+    const layer = rows[0];
+    if (!layer) throw notFound("Takeoff layer not found on this project");
+    const [{ n } = { n: 0 }] = await app.db
+      .select({ n: count() })
+      .from(takeoffItems)
+      .where(eq(takeoffItems.layerId, layerId));
+    if (Number(n) > 0) {
+      throw conflict(
+        `${n} takeoff item${Number(n) === 1 ? " is" : "s are"} drawn on "${layer.name}". Move them to another layer first — deleting a layer must not delete a measurement.`,
+      );
+    }
+    await app.db.delete(takeoffLayers).where(eq(takeoffLayers.id, layerId));
+    await ledger(req, "delete", "takeoff_layer", layerId, { projectId: req.projectId!, name: layer.name });
+    return { id: layerId, deleted: true };
+  });
+
+  /** Scale calibration as a pure preview — nothing is written (#188). */
+  app.post("/projects/:projectId/takeoff/calibrate", { preHandler: readGate }, async (req) => {
+    const body = S.calibrateSchema.parse(req.body);
+    const result =
+      body.mode === "reference"
+        ? calibrateScale({ drawnLength: body.drawnLength, realLength: body.realLength, unit: body.unit })
+        : calibrateFromRatio({
+            ratio: body.ratio,
+            unit: body.unit,
+            paperUnitsPerMm: body.paperUnitsPerMm,
+          });
+    return {
+      ...result,
+      explanation: `${round4(result.pixelsPerUnit)} drawing units make one ${result.scaleUnit}. Store this as the sheet's pixelsPerUnit so every measurement on it converts the same way.`,
+    };
+  });
+
+  /** Measure without persisting — the live readout while a shape is drawn. */
+  app.post("/projects/:projectId/takeoff/measure", { preHandler: readGate }, async (req) => {
+    const body = S.measurePreviewSchema.parse(req.body);
+    return computeTakeoff({
+      measurementType: body.measurementType,
+      geometry: (body.geometry ?? null) as Geometry | null,
+      pixelsPerUnit: body.pixelsPerUnit ?? null,
+      scaleUnit: (body.scaleUnit ?? null) as LengthUnit | null,
+      depth: body.depth ?? null,
+      height: body.height ?? null,
+      deduction: body.deduction ?? 0,
+      multiplier: body.multiplier ?? 1,
+      manualRawValue: body.manualRawValue ?? null,
+      unit: body.unit ?? null,
+    });
+  });
+
+  async function takeoffValues(
+    req: FastifyRequest,
+    body: Partial<ReturnType<typeof S.takeoffCreateSchema.parse>>,
+    existing?: typeof takeoffItems.$inferSelect,
+  ) {
+    const companyId = req.companyId!;
+    const projectId = req.projectId!;
+    let layerCostCodeId: string | null = null;
+    let layerCostCode: string | null = null;
+    let layerColour: string | null = null;
+    const layerId = body.layerId !== undefined ? body.layerId : (existing?.layerId ?? null);
+    if (layerId) {
+      const rows = await app.db
+        .select()
+        .from(takeoffLayers)
+        .where(
+          and(
+            eq(takeoffLayers.id, layerId),
+            eq(takeoffLayers.companyId, companyId),
+            eq(takeoffLayers.projectId, projectId),
+          ),
+        )
+        .limit(1);
+      const layer = rows[0];
+      if (!layer) throw notFound("Takeoff layer not found on this project");
+      layerCostCodeId = layer.costCodeId;
+      layerCostCode = layer.costCode;
+      layerColour = layer.colour;
+    }
+    const estimateId = body.estimateId !== undefined ? body.estimateId : (existing?.estimateId ?? null);
+    if (estimateId) await fetchEstimate(app.db, estimateId, companyId, projectId);
+
+    const measurementType = body.measurementType ?? existing?.measurementType ?? "linear";
+    const measured = computeTakeoff({
+      measurementType: measurementType as "linear" | "area" | "volume" | "count",
+      geometry: ((body.geometry !== undefined ? body.geometry : existing?.geometry) ?? null) as Geometry | null,
+      pixelsPerUnit:
+        body.pixelsPerUnit !== undefined ? body.pixelsPerUnit : (existing?.pixelsPerUnit ?? null),
+      scaleUnit: ((body.scaleUnit !== undefined ? body.scaleUnit : existing?.scaleUnit) ?? null) as
+        | LengthUnit
+        | null,
+      depth: body.depth !== undefined ? body.depth : (existing?.depth ?? null),
+      height: body.height !== undefined ? body.height : (existing?.height ?? null),
+      deduction: body.deduction ?? existing?.deduction ?? 0,
+      multiplier: body.multiplier ?? existing?.multiplier ?? 1,
+      manualRawValue:
+        body.manualRawValue !== undefined
+          ? body.manualRawValue
+          : ((existing?.detail as Record<string, unknown> | undefined)?.["manualRawValue"] as
+              | number
+              | undefined) ?? null,
+      unit: body.unit !== undefined ? body.unit : (existing?.unit ?? null),
+    });
+
+    const detail = { ...(existing?.detail ?? {}), ...(body.detail ?? {}) } as Record<string, unknown>;
+    if (body.manualRawValue !== undefined) {
+      if (body.manualRawValue === null) delete detail["manualRawValue"];
+      else detail["manualRawValue"] = body.manualRawValue;
+    }
+    detail["basis"] = measured.basis;
+    detail["warnings"] = measured.warnings;
+
+    return {
+      measured,
+      values: {
+        id: existing?.id ?? newId("tko"),
+        companyId,
+        projectId,
+        estimateId,
+        layerId,
+        name: body.name ?? existing?.name ?? "",
+        description: body.description !== undefined ? body.description : (existing?.description ?? null),
+        measurementType,
+        status: body.status ?? existing?.status ?? "measured",
+        sheetId: body.sheetId !== undefined ? body.sheetId : (existing?.sheetId ?? null),
+        sheetNumber: body.sheetNumber !== undefined ? body.sheetNumber : (existing?.sheetNumber ?? null),
+        revisionId: body.revisionId !== undefined ? body.revisionId : (existing?.revisionId ?? null),
+        pageNumber: body.pageNumber ?? existing?.pageNumber ?? 1,
+        pixelsPerUnit:
+          body.pixelsPerUnit !== undefined ? body.pixelsPerUnit : (existing?.pixelsPerUnit ?? null),
+        scaleUnit: body.scaleUnit !== undefined ? body.scaleUnit : (existing?.scaleUnit ?? null),
+        scaleLabel: body.scaleLabel !== undefined ? body.scaleLabel : (existing?.scaleLabel ?? null),
+        geometry: (body.geometry !== undefined ? body.geometry : existing?.geometry) ?? null,
+        rawValue: measured.rawValue,
+        depth: body.depth !== undefined ? body.depth : (existing?.depth ?? null),
+        height: body.height !== undefined ? body.height : (existing?.height ?? null),
+        deduction: body.deduction ?? existing?.deduction ?? 0,
+        multiplier: body.multiplier ?? existing?.multiplier ?? 1,
+        quantity: measured.quantity,
+        unit: measured.unit,
+        perimeter: measured.perimeter,
+        costCodeId:
+          body.costCodeId !== undefined
+            ? body.costCodeId
+            : (existing?.costCodeId ?? layerCostCodeId),
+        costCode: body.costCode !== undefined ? body.costCode : (existing?.costCode ?? layerCostCode),
+        colour: body.colour !== undefined ? body.colour : (existing?.colour ?? layerColour),
+        notes: body.notes !== undefined ? body.notes : (existing?.notes ?? null),
+        detail,
+        measuredBy: existing?.measuredBy ?? req.user!.id,
+        measuredAt: existing?.measuredAt ?? nowIso(),
+        updatedAt: nowIso(),
+      } satisfies typeof takeoffItems.$inferInsert,
+    };
+  }
+
+  app.get("/projects/:projectId/takeoff/items", { preHandler: readGate }, async (req) => {
+    const q = S.takeoffListQuery.parse(req.query);
+    const clauses = [
+      eq(takeoffItems.companyId, req.companyId!),
+      eq(takeoffItems.projectId, req.projectId!),
+    ];
+    if (q.estimateId) clauses.push(eq(takeoffItems.estimateId, q.estimateId));
+    if (q.layerId) clauses.push(eq(takeoffItems.layerId, q.layerId));
+    if (q.sheetId) clauses.push(eq(takeoffItems.sheetId, q.sheetId));
+    if (q.status) clauses.push(eq(takeoffItems.status, q.status));
+    if (q.measurementType) clauses.push(eq(takeoffItems.measurementType, q.measurementType));
+    if (q.search) {
+      clauses.push(
+        or(ilike(takeoffItems.name, `%${q.search}%`), ilike(takeoffItems.costCode, `%${q.search}%`)) ??
+          sql`true`,
+      );
+    }
+    const where = and(...clauses);
+    if (q.unpricedOnly === "true") {
+      const rows = await app.db
+        .select({ item: takeoffItems })
+        .from(takeoffItems)
+        .leftJoin(estimateLineItems, eq(estimateLineItems.takeoffItemId, takeoffItems.id))
+        .where(and(where, isNull(estimateLineItems.id)))
+        .orderBy(desc(takeoffItems.createdAt))
+        .limit(q.pageSize)
+        .offset(pageOffset(q));
+      const [totalRow] = await app.db
+        .select({ n: count() })
+        .from(takeoffItems)
+        .leftJoin(estimateLineItems, eq(estimateLineItems.takeoffItemId, takeoffItems.id))
+        .where(and(where, isNull(estimateLineItems.id)));
+      return paginate(rows.map((r) => r.item), Number(totalRow?.n ?? 0), q);
+    }
+    const [totalRow] = await app.db.select({ n: count() }).from(takeoffItems).where(where);
+    const items = await app.db
+      .select()
+      .from(takeoffItems)
+      .where(where)
+      .orderBy(desc(takeoffItems.createdAt))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    return paginate(items, Number(totalRow?.n ?? 0), q);
+  });
+
+  app.post("/projects/:projectId/takeoff/items", { preHandler: standardGate }, async (req, reply) => {
+    const body = S.takeoffCreateSchema.parse(req.body);
+    const { values, measured } = await takeoffValues(req, body);
+    await app.db.insert(takeoffItems).values(values);
+    await ledger(req, "create", "takeoff_item", String(values.id), {
+      projectId: req.projectId!,
+      name: values.name,
+      measurementType: values.measurementType,
+      quantity: values.quantity,
+      unit: values.unit,
+      sheetNumber: values.sheetNumber,
+    });
+    const rows = await app.db.select().from(takeoffItems).where(eq(takeoffItems.id, String(values.id))).limit(1);
+    return reply.status(201).send({ ...rows[0], measurement: measured });
+  });
+
+  app.get("/projects/:projectId/takeoff/items/:itemId", { preHandler: readGate }, async (req) => {
+    const { itemId } = req.params as { itemId: string };
+    const rows = await app.db
+      .select()
+      .from(takeoffItems)
+      .where(
+        and(
+          eq(takeoffItems.id, itemId),
+          eq(takeoffItems.companyId, req.companyId!),
+          eq(takeoffItems.projectId, req.projectId!),
+        ),
+      )
+      .limit(1);
+    const item = rows[0];
+    if (!item) throw notFound("Takeoff item not found on this project");
+    const lines = await app.db
+      .select({
+        id: estimateLineItems.id,
+        estimateId: estimateLineItems.estimateId,
+        description: estimateLineItems.description,
+        amount: estimateLineItems.amount,
+      })
+      .from(estimateLineItems)
+      .where(eq(estimateLineItems.takeoffItemId, itemId));
+    return { ...item, pricedOn: lines };
+  });
+
+  app.patch("/projects/:projectId/takeoff/items/:itemId", { preHandler: standardGate }, async (req) => {
+    const { itemId } = req.params as { itemId: string };
+    const body = S.takeoffPatchSchema.parse(req.body);
+    const rows = await app.db
+      .select()
+      .from(takeoffItems)
+      .where(
+        and(
+          eq(takeoffItems.id, itemId),
+          eq(takeoffItems.companyId, req.companyId!),
+          eq(takeoffItems.projectId, req.projectId!),
+        ),
+      )
+      .limit(1);
+    const existing = rows[0];
+    if (!existing) throw notFound("Takeoff item not found on this project");
+    const { values, measured } = await takeoffValues(req, body, existing);
+    const { id: _id, ...updatable } = values;
+    await app.db.update(takeoffItems).set(updatable).where(eq(takeoffItems.id, itemId));
+    await ledger(req, "update", "takeoff_item", itemId, {
+      projectId: req.projectId!,
+      name: values.name,
+      quantityBefore: existing.quantity,
+      quantityAfter: values.quantity,
+      unit: values.unit,
+    });
+    // A re-measured takeoff does NOT silently re-price the estimate lines that
+    // cite it: the estimator has to accept the new quantity, so the change is
+    // reported instead of applied.
+    const pricedOn = await app.db
+      .select({ id: estimateLineItems.id, estimateId: estimateLineItems.estimateId, quantity: estimateLineItems.quantity })
+      .from(estimateLineItems)
+      .where(eq(estimateLineItems.takeoffItemId, itemId));
+    const after = await app.db.select().from(takeoffItems).where(eq(takeoffItems.id, itemId)).limit(1);
+    return {
+      ...after[0],
+      measurement: measured,
+      pricedOn,
+      warnings:
+        pricedOn.length > 0 && existing.quantity !== values.quantity
+          ? [
+              `This measurement is priced on ${pricedOn.length} estimate line${pricedOn.length === 1 ? "" : "s"}, which still carry the OLD quantity of ${existing.quantity} ${existing.unit}. Update them deliberately — an estimate must not change because a drawing was re-measured.`,
+            ]
+          : [],
+    };
+  });
+
+  app.delete("/projects/:projectId/takeoff/items/:itemId", { preHandler: standardGate }, async (req) => {
+    const { itemId } = req.params as { itemId: string };
+    const rows = await app.db
+      .select()
+      .from(takeoffItems)
+      .where(
+        and(
+          eq(takeoffItems.id, itemId),
+          eq(takeoffItems.companyId, req.companyId!),
+          eq(takeoffItems.projectId, req.projectId!),
+        ),
+      )
+      .limit(1);
+    const item = rows[0];
+    if (!item) throw notFound("Takeoff item not found on this project");
+    const [{ n } = { n: 0 }] = await app.db
+      .select({ n: count() })
+      .from(estimateLineItems)
+      .where(eq(estimateLineItems.takeoffItemId, itemId));
+    if (Number(n) > 0) {
+      throw conflict(
+        `This measurement is priced on ${n} estimate line${Number(n) === 1 ? "" : "s"}. Void it instead of deleting it, so the provenance of those lines survives.`,
+      );
+    }
+    await app.db
+      .update(takeoffItems)
+      .set({ status: "void", updatedAt: nowIso() })
+      .where(eq(takeoffItems.id, itemId));
+    await ledger(req, "state_change", "takeoff_item", itemId, {
+      projectId: req.projectId!,
+      name: item.name,
+      from: item.status,
+      to: "void",
+    });
+    return { id: itemId, status: "void" };
+  });
+
+  /* ================================================================== */
+  /* Sub-quotes (#202–203)                                               */
+  /* ================================================================== */
+
+  type SubQuoteRow = typeof estimateSubQuotes.$inferSelect;
+
+  async function fetchSubQuote(id: string, companyId: string, projectId: string): Promise<SubQuoteRow> {
+    const rows = await app.db
+      .select()
+      .from(estimateSubQuotes)
+      .where(
+        and(
+          eq(estimateSubQuotes.id, id),
+          eq(estimateSubQuotes.companyId, companyId),
+          eq(estimateSubQuotes.projectId, projectId),
+        ),
+      )
+      .limit(1);
+    const row = rows[0];
+    if (!row) throw notFound("Sub-quote not found on this project");
+    return row;
+  }
+
+  const quoteLinesOf = (quoteId: string) =>
+    app.db
+      .select()
+      .from(estimateSubQuoteLines)
+      .where(eq(estimateSubQuoteLines.subQuoteId, quoteId))
+      .orderBy(asc(estimateSubQuoteLines.position));
+
+  /** Replace a quote's lines and re-materialize its totals. */
+  async function writeQuoteLines(
+    quote: SubQuoteRow,
+    specs: ReadonlyArray<ReturnType<typeof S.subQuoteLineSchema.parse>>,
+    /** when the caller did not state a header total, derive it from the lines */
+    deriveTotal: boolean,
+  ): Promise<{ lineCount: number; quotedTotal: number }> {
+    await app.db
+      .delete(estimateSubQuoteLines)
+      .where(eq(estimateSubQuoteLines.subQuoteId, quote.id));
+    const values = specs.map((spec, position) => {
+      const amount =
+        spec.amount ??
+        (spec.quantity !== null && spec.quantity !== undefined && spec.unitRate !== null && spec.unitRate !== undefined
+          ? round2(spec.quantity * spec.unitRate)
+          : 0);
+      return {
+        id: newId("sql"),
+        companyId: quote.companyId,
+        projectId: quote.projectId,
+        subQuoteId: quote.id,
+        position,
+        itemCode: spec.itemCode ?? null,
+        description: spec.description,
+        scopeKey: normaliseScopeKey(spec.scopeKey ?? spec.description),
+        unit: spec.unit ?? null,
+        quantity: spec.quantity ?? null,
+        unitRate: spec.unitRate ?? null,
+        amount,
+        costCodeId: spec.costCodeId ?? null,
+        costCode: spec.costCode ?? null,
+        costType: spec.costType ?? "subcontract",
+        excluded: spec.excluded ? 1 : 0,
+        note: spec.note ?? null,
+        detail: {},
+      };
+    });
+    if (values.length > 0) await app.db.insert(estimateSubQuoteLines).values(values);
+    const derived = round2(
+      values.filter((v) => v.excluded === 0).reduce((sum, v) => sum + v.amount, 0),
+    );
+    const quotedTotal = deriveTotal ? derived : quote.quotedTotal;
+    await app.db
+      .update(estimateSubQuotes)
+      .set({
+        lineCount: values.length,
+        quotedTotal,
+        levelledTotal: round2(quotedTotal + quote.adjustmentAmount),
+        updatedAt: nowIso(),
+      })
+      .where(eq(estimateSubQuotes.id, quote.id));
+    return { lineCount: values.length, quotedTotal };
+  }
+
+  app.get("/projects/:projectId/estimating/sub-quotes", { preHandler: readGate }, async (req) => {
+    const q = S.subQuoteListQuery.parse(req.query);
+    const clauses = [
+      eq(estimateSubQuotes.companyId, req.companyId!),
+      eq(estimateSubQuotes.projectId, req.projectId!),
+    ];
+    if (q.estimateId) clauses.push(eq(estimateSubQuotes.estimateId, q.estimateId));
+    if (q.status) clauses.push(eq(estimateSubQuotes.status, q.status));
+    if (q.tradePackage) clauses.push(eq(estimateSubQuotes.tradePackage, q.tradePackage));
+    if (q.vendorId) clauses.push(eq(estimateSubQuotes.vendorId, q.vendorId));
+    if (q.search) {
+      clauses.push(
+        or(
+          ilike(estimateSubQuotes.vendorName, `%${q.search}%`),
+          ilike(estimateSubQuotes.tradePackage, `%${q.search}%`),
+          ilike(estimateSubQuotes.reference, `%${q.search}%`),
+        ) ?? sql`true`,
+      );
+    }
+    const where = and(...clauses);
+    const [totalRow] = await app.db.select({ n: count() }).from(estimateSubQuotes).where(where);
+    const items = await app.db
+      .select()
+      .from(estimateSubQuotes)
+      .where(where)
+      .orderBy(desc(estimateSubQuotes.number))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    return paginate(items, Number(totalRow?.n ?? 0), q);
+  });
+
+  app.post("/projects/:projectId/estimating/sub-quotes", { preHandler: standardGate }, async (req, reply) => {
+    const body = S.subQuoteCreateSchema.parse(req.body);
+    const companyId = req.companyId!;
+    const projectId = req.projectId!;
+    if (body.estimateId) await fetchEstimate(app.db, body.estimateId, companyId, projectId);
+    if (body.vendorId) {
+      const rows = await app.db
+        .select({ id: vendors.id })
+        .from(vendors)
+        .where(and(eq(vendors.id, body.vendorId), eq(vendors.companyId, companyId)))
+        .limit(1);
+      if (!rows[0]) throw notFound("Vendor not found in this company");
+    }
+    const number = await nextRecordNumber(app.db, projectId, "estimate_sub_quote");
+    const id = newId("sqt");
+    const reference = `SQ-${pad3(number)}`;
+    const adjustment = body.adjustmentAmount ?? 0;
+    const quoted = body.quotedTotal ?? 0;
+    await app.db.insert(estimateSubQuotes).values({
+      id,
+      companyId,
+      projectId,
+      estimateId: body.estimateId ?? null,
+      number,
+      reference,
+      vendorId: body.vendorId ?? null,
+      vendorName: body.vendorName,
+      tradePackage: body.tradePackage,
+      source: "manual",
+      currency: body.currency ?? "USD",
+      quotedTotal: quoted,
+      adjustmentAmount: adjustment,
+      levelledTotal: round2(quoted + adjustment),
+      quoteDate: body.quoteDate ?? null,
+      validUntil: body.validUntil ?? null,
+      inclusions: body.inclusions ?? null,
+      exclusions: body.exclusions ?? null,
+      qualifications: body.qualifications ?? null,
+      documentIds: body.documentIds ?? [],
+      notes: body.notes ?? null,
+      detail: body.detail ?? {},
+      createdBy: req.user!.id,
+    });
+    const quote = await fetchSubQuote(id, companyId, projectId);
+    if (body.lines && body.lines.length > 0) {
+      await writeQuoteLines(quote, body.lines, body.quotedTotal === undefined);
+    }
+    await ledger(req, "create", "estimate_sub_quote", id, {
+      projectId,
+      reference,
+      vendorName: body.vendorName,
+      tradePackage: body.tradePackage,
+      quotedTotal: quoted,
+      currency: body.currency ?? "USD",
+    });
+    return reply
+      .status(201)
+      .send({ ...(await fetchSubQuote(id, companyId, projectId)), lines: await quoteLinesOf(id) });
+  });
+
+  app.get("/projects/:projectId/estimating/sub-quotes/:quoteId", { preHandler: readGate }, async (req) => {
+    const { quoteId } = req.params as { quoteId: string };
+    const quote = await fetchSubQuote(quoteId, req.companyId!, req.projectId!);
+    return { ...quote, lines: await quoteLinesOf(quoteId) };
+  });
+
+  app.patch(
+    "/projects/:projectId/estimating/sub-quotes/:quoteId",
+    { preHandler: standardGate },
+    async (req) => {
+      const { quoteId } = req.params as { quoteId: string };
+      const body = S.subQuotePatchSchema.parse(req.body);
+      const quote = await fetchSubQuote(quoteId, req.companyId!, req.projectId!);
+      const patch: Record<string, unknown> = { updatedAt: nowIso() };
+      for (const key of [
+        "vendorId",
+        "vendorName",
+        "tradePackage",
+        "currency",
+        "quotedTotal",
+        "adjustmentAmount",
+        "quoteDate",
+        "validUntil",
+        "inclusions",
+        "exclusions",
+        "qualifications",
+        "notes",
+        "documentIds",
+        "status",
+        "estimateId",
+        "detail",
+      ] as const) {
+        const value = (body as Record<string, unknown>)[key];
+        if (value !== undefined) patch[key] = value;
+      }
+      const quoted = body.quotedTotal ?? quote.quotedTotal;
+      const adjustment = body.adjustmentAmount ?? quote.adjustmentAmount;
+      patch["levelledTotal"] = round2(quoted + adjustment);
+      await app.db.update(estimateSubQuotes).set(patch).where(eq(estimateSubQuotes.id, quoteId));
+      // A re-dated or withdrawn quote clears the validity findings it raised.
+      if (body.validUntil !== undefined || body.status !== undefined) {
+        await closeSignalByKey(
+          app.db,
+          req.companyId!,
+          "sub_quote_expiring",
+          quoteId,
+          "The quote was re-dated or its status changed.",
+        );
+        await closeSignalByKey(
+          app.db,
+          req.companyId!,
+          "sub_quote_expired",
+          quoteId,
+          "The quote was re-dated or its status changed.",
+        );
+      }
+      await ledger(req, "update", "estimate_sub_quote", quoteId, {
+        projectId: req.projectId!,
+        reference: quote.reference,
+        changed: Object.keys(patch).filter((k) => k !== "updatedAt"),
+      });
+      return {
+        ...(await fetchSubQuote(quoteId, req.companyId!, req.projectId!)),
+        lines: await quoteLinesOf(quoteId),
+      };
+    },
+  );
+
+  app.put(
+    "/projects/:projectId/estimating/sub-quotes/:quoteId/lines",
+    { preHandler: standardGate },
+    async (req) => {
+      const { quoteId } = req.params as { quoteId: string };
+      const body = S.subQuoteLinesSchema.parse(req.body);
+      const quote = await fetchSubQuote(quoteId, req.companyId!, req.projectId!);
+      if (quote.status === "accepted") {
+        throw conflict(
+          `Sub-quote ${quote.reference} has been accepted into an estimate; its lines can no longer be rewritten.`,
+        );
+      }
+      const result = await writeQuoteLines(quote, body.lines, true);
+      await ledger(req, "update", "estimate_sub_quote", quoteId, {
+        projectId: req.projectId!,
+        reference: quote.reference,
+        lines: result.lineCount,
+        quotedTotal: result.quotedTotal,
+      });
+      return {
+        ...(await fetchSubQuote(quoteId, req.companyId!, req.projectId!)),
+        lines: await quoteLinesOf(quoteId),
+      };
+    },
+  );
+
+  app.delete(
+    "/projects/:projectId/estimating/sub-quotes/:quoteId",
+    { preHandler: standardGate },
+    async (req) => {
+      const { quoteId } = req.params as { quoteId: string };
+      const quote = await fetchSubQuote(quoteId, req.companyId!, req.projectId!);
+      if (quote.status === "accepted") {
+        throw conflict(
+          `Sub-quote ${quote.reference} has been accepted into an estimate; withdraw it rather than deleting it.`,
+        );
+      }
+      await app.db
+        .update(estimateSubQuotes)
+        .set({ status: "withdrawn", updatedAt: nowIso() })
+        .where(eq(estimateSubQuotes.id, quoteId));
+      await ledger(req, "state_change", "estimate_sub_quote", quoteId, {
+        projectId: req.projectId!,
+        reference: quote.reference,
+        from: quote.status,
+        to: "withdrawn",
+      });
+      return { id: quoteId, status: "withdrawn" };
+    },
+  );
+
+  /** Import a bid submission from the bidding module as a sub-quote (#203). */
+  app.post(
+    "/projects/:projectId/estimating/sub-quotes/import-bid",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const body = S.importBidSchema.parse(req.body);
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      if (body.estimateId) await fetchEstimate(app.db, body.estimateId, companyId, projectId);
+      const submissionRows = await app.db
+        .select()
+        .from(bidSubmissions)
+        .where(
+          and(
+            eq(bidSubmissions.id, body.submissionId),
+            eq(bidSubmissions.companyId, companyId),
+            eq(bidSubmissions.projectId, projectId),
+          ),
+        )
+        .limit(1);
+      const submission = submissionRows[0];
+      if (!submission) throw notFound("Bid submission not found on this project");
+      const existing = await app.db
+        .select({ id: estimateSubQuotes.id, reference: estimateSubQuotes.reference })
+        .from(estimateSubQuotes)
+        .where(
+          and(
+            eq(estimateSubQuotes.companyId, companyId),
+            eq(estimateSubQuotes.source, "bid_submission"),
+            eq(estimateSubQuotes.sourceId, submission.id),
+          ),
+        )
+        .limit(1);
+      if (existing[0]) {
+        throw conflict(
+          `Bid submission ${submission.reference} has already been imported as ${existing[0].reference}.`,
+        );
+      }
+      const vendorRows = await app.db
+        .select({ name: vendors.name })
+        .from(vendors)
+        .where(and(eq(vendors.id, submission.vendorId), eq(vendors.companyId, companyId)))
+        .limit(1);
+      const lines = await app.db
+        .select()
+        .from(bidSubmissionLines)
+        .where(eq(bidSubmissionLines.submissionId, submission.id))
+        .orderBy(asc(bidSubmissionLines.position));
+
+      const number = await nextRecordNumber(app.db, projectId, "estimate_sub_quote");
+      const id = newId("sqt");
+      const reference = `SQ-${pad3(number)}`;
+      const quotedTotal = submission.totalAmount ?? submission.baseBidAmount ?? 0;
+      await app.db.insert(estimateSubQuotes).values({
+        id,
+        companyId,
+        projectId,
+        estimateId: body.estimateId ?? null,
+        number,
+        reference,
+        vendorId: submission.vendorId,
+        vendorName: vendorRows[0]?.name ?? submission.reference,
+        tradePackage: body.tradePackage ?? submission.packageId,
+        status: "received",
+        source: "bid_submission",
+        sourceId: submission.id,
+        currency: submission.currency,
+        quotedTotal,
+        adjustmentAmount: 0,
+        levelledTotal: quotedTotal,
+        quoteDate: submission.submittedAt ? String(submission.submittedAt).slice(0, 10) : null,
+        validUntil: submission.validUntil,
+        exclusions: submission.exclusions,
+        qualifications: submission.qualifications,
+        notes: submission.assumptions,
+        detail: { importedFrom: "bid_submission", submissionReference: submission.reference },
+        createdBy: req.user!.id,
+      });
+      const quote = await fetchSubQuote(id, companyId, projectId);
+      if (lines.length > 0) {
+        await writeQuoteLines(
+          quote,
+          lines.map((l) => ({
+            itemCode: l.itemCode,
+            description: l.description,
+            scopeKey: l.description,
+            unit: l.unit,
+            quantity: l.quantity,
+            unitRate: l.unitRate,
+            amount: l.amount ?? 0,
+            costCodeId: l.costCodeId,
+            costCode: null,
+            costType: "subcontract" as const,
+            excluded: l.isExcluded === 1,
+            note: l.inclusionNote,
+          })),
+          // The bidder's own header total is the contractual number; the line
+          // sum is only a check on it.
+          submission.totalAmount === null && submission.baseBidAmount === null,
+        );
+      }
+      await ledger(req, "create", "estimate_sub_quote", id, {
+        projectId,
+        reference,
+        source: "bid_submission",
+        submissionReference: submission.reference,
+        quotedTotal,
+        currency: submission.currency,
+        lines: lines.length,
+      });
+      const imported = await fetchSubQuote(id, companyId, projectId);
+      const derived = round2(
+        (await quoteLinesOf(id)).filter((l) => l.excluded === 0).reduce((s, l) => s + l.amount, 0),
+      );
+      return reply.status(201).send({
+        ...imported,
+        lines: await quoteLinesOf(id),
+        warnings:
+          lines.length > 0 && Math.abs(derived - imported.quotedTotal) > 0.5
+            ? [
+                `The bidder's header total (${imported.quotedTotal}) and the sum of their priced lines (${derived}) differ by ${round2(imported.quotedTotal - derived)} ${imported.currency}. The header total was kept, because that is the number they are bound by.`,
+              ]
+            : [],
+      });
+    },
+  );
+
+  /** Level every live quote on a package (#203). */
+  app.get("/projects/:projectId/estimating/sub-quotes/levelling", { preHandler: readGate }, async (req) => {
+    const q = S.levellingQuery.parse(req.query);
+    const clauses = [
+      eq(estimateSubQuotes.companyId, req.companyId!),
+      eq(estimateSubQuotes.projectId, req.projectId!),
+    ];
+    if (q.tradePackage) clauses.push(eq(estimateSubQuotes.tradePackage, q.tradePackage));
+    if (q.estimateId) clauses.push(eq(estimateSubQuotes.estimateId, q.estimateId));
+    if (q.includeExpired !== "true") {
+      clauses.push(
+        inArray(estimateSubQuotes.status, ["received", "under_review", "levelled", "accepted"]),
+      );
+    }
+    const quotes = await app.db
+      .select()
+      .from(estimateSubQuotes)
+      .where(and(...clauses))
+      .orderBy(asc(estimateSubQuotes.vendorName));
+    if (quotes.length === 0) {
+      return {
+        rows: [],
+        totals: [],
+        scopeGaps: [],
+        outliers: [],
+        currencies: [],
+        currency: null,
+        tradePackage: q.tradePackage ?? null,
+        warnings: ["No quotes match this filter, so there is nothing to level."],
+      };
+    }
+    const allLines = await app.db
+      .select()
+      .from(estimateSubQuoteLines)
+      .where(inArray(estimateSubQuoteLines.subQuoteId, quotes.map((x) => x.id)))
+      .orderBy(asc(estimateSubQuoteLines.position));
+    const inputs: QuoteInput[] = quotes.map((quote) => ({
+      id: quote.id,
+      vendorId: quote.vendorId,
+      vendorName: quote.vendorName,
+      tradePackage: quote.tradePackage,
+      status: quote.status,
+      currency: quote.currency,
+      quotedTotal: quote.quotedTotal,
+      adjustmentAmount: quote.adjustmentAmount,
+      validUntil: quote.validUntil,
+      lines: allLines
+        .filter((l) => l.subQuoteId === quote.id)
+        .map((l) => ({
+          quoteId: quote.id,
+          vendorName: quote.vendorName,
+          lineId: l.id,
+          scopeKey: l.scopeKey ?? l.description,
+          description: l.description,
+          unit: l.unit,
+          quantity: l.quantity,
+          unitRate: l.unitRate,
+          amount: l.amount,
+          excluded: l.excluded === 1,
+        })),
+    }));
+    const result = levelQuotes(inputs);
+    const noLines = quotes.filter((quote) => !allLines.some((l) => l.subQuoteId === quote.id));
+    if (noLines.length > 0) {
+      result.warnings.push(
+        `${noLines.length} quote${noLines.length === 1 ? "" : "s"} (${noLines.map((x) => x.vendorName).join(", ")}) carry a header total but no priced lines, so they take no part in the scope comparison.`,
+      );
+    }
+    return { ...result, quotes: quotes.map((x) => ({ id: x.id, reference: x.reference, validUntil: x.validUntil })) };
+  });
+
+  /** Accept a quote's lines onto an estimate (#202). */
+  app.post(
+    "/projects/:projectId/estimating/sub-quotes/:quoteId/accept",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { quoteId } = req.params as { quoteId: string };
+      const body = S.acceptQuoteSchema.parse(req.body);
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      const quote = await fetchSubQuote(quoteId, companyId, projectId);
+      const estimate = await fetchEstimate(app.db, body.estimateId, companyId, projectId);
+      await guardEditable(req, estimate);
+      if (quote.status === "expired") {
+        throw conflict(
+          `Sub-quote ${quote.reference} is out of validity (${quote.validUntil}). Re-confirm the price with ${quote.vendorName} and re-date it before pricing it into an estimate.`,
+        );
+      }
+      const warnings: string[] = [];
+      if (quote.currency !== estimate.currency) {
+        warnings.push(
+          `The quote is in ${quote.currency} and the estimate is in ${estimate.currency}. The amounts were carried across WITHOUT conversion — level them by hand.`,
+        );
+      }
+      const lines = (await quoteLinesOf(quoteId)).filter(
+        (l) => l.excluded === 0 && (!body.lineIds || body.lineIds.includes(l.id)),
+      );
+      if (lines.length === 0) {
+        throw badRequest(
+          `Sub-quote ${quote.reference} has no priced, non-excluded lines to bring into the estimate.`,
+        );
+      }
+      let position = estimate.lineCount;
+      const values = lines.map((l) => {
+        const priced = priceLine({
+          baseQuantity: l.quantity ?? 1,
+          rates: { [l.costType === "subcontract" ? "subcontract" : "other"]:
+            l.unitRate ?? (l.quantity && l.quantity !== 0 ? round4(l.amount / l.quantity) : l.amount) },
+        });
+        const row: typeof estimateLineItems.$inferInsert = {
+          id: newId("eli"),
+          companyId,
+          projectId,
+          estimateId: estimate.id,
+          sectionId: body.sectionId ?? null,
+          lineageId: newId("lng"),
+          position: position++,
+          itemCode: l.itemCode,
+          description: l.description,
+          costCodeId: l.costCodeId,
+          costCode: l.costCode,
+          costType: l.costType,
+          status: "active",
+          source: "sub_quote",
+          unit: l.unit,
+          quantity: priced.quantity,
+          unitRate: priced.unitRate,
+          labourRate: priced.rates.labour,
+          materialRate: priced.rates.material,
+          equipmentRate: priced.rates.equipment,
+          subcontractRate: priced.rates.subcontract,
+          otherRate: priced.rates.other,
+          labourAmount: priced.amounts.labour,
+          materialAmount: priced.amounts.material,
+          equipmentAmount: priced.amounts.equipment,
+          subcontractAmount: priced.amounts.subcontract,
+          otherAmount: priced.amounts.other,
+          amount: priced.amount,
+          subQuoteId: quote.id,
+          subQuoteLineId: l.id,
+          rateAsAt: quote.quoteDate,
+          notes: `From ${quote.vendorName} quote ${quote.reference}.`,
+          createdBy: req.user!.id,
+        };
+        return row;
+      });
+      await app.db.insert(estimateLineItems).values(values);
+      for (const [i, l] of lines.entries()) {
+        await app.db
+          .update(estimateSubQuoteLines)
+          .set({ estimateLineItemId: String(values[i]?.id ?? ""), updatedAt: nowIso() })
+          .where(eq(estimateSubQuoteLines.id, l.id));
+      }
+      await app.db
+        .update(estimateSubQuotes)
+        .set({
+          status: "accepted",
+          acceptedBy: req.user!.id,
+          acceptedAt: nowIso(),
+          estimateId: estimate.id,
+          updatedAt: nowIso(),
+        })
+        .where(eq(estimateSubQuotes.id, quoteId));
+      const totals = await recomputeEstimate(app.db, estimate.id);
+      await ledger(req, "state_change", "estimate_sub_quote", quoteId, {
+        projectId,
+        reference: quote.reference,
+        from: quote.status,
+        to: "accepted",
+        estimateId: estimate.id,
+        linesCreated: values.length,
+        estimateTotal: totals.total,
+      });
+      return reply
+        .status(201)
+        .send({ created: values.length, ids: values.map((v) => v.id), estimateTotals: totals, warnings });
+    },
+  );
+
+  /* ================================================================== */
+  /* Estimate → budget (#204)                                            */
+  /* ================================================================== */
+
+  const appliedMarkupsOf = async (estimate: EstimateRow): Promise<AppliedMarkup[]> => {
+    const rows = await markupsOfEstimate(app.db, estimate.id);
+    return rows
+      .filter((m) => m.enabled === 1)
+      .map((m) => ({
+        id: m.id,
+        sequence: m.sequence,
+        kind: m.kind,
+        name: m.name,
+        method: m.method,
+        basis: m.basis,
+        rate: m.rate,
+        baseAmount: m.baseAmount,
+        amount: m.amount,
+        explanation: `${m.name}: ${m.amount} on a base of ${m.baseAmount}.`,
+      }));
+  };
+
+  app.post(
+    "/projects/:projectId/estimates/:estimateId/convert-to-budget",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { estimateId } = req.params as { estimateId: string };
+      const body = S.convertSchema.parse(req.body ?? {});
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      const estimate = await fetchEstimate(app.db, estimateId, companyId, projectId);
+
+      // Order matters: an already-converted estimate is reported as such, not
+      // as "not approved" — the second message would send somebody looking for
+      // an approval that already happened.
+      if (estimate.convertedBudgetId && !body.dryRun) {
+        throw conflict(
+          `Estimate ${estimate.reference} has already been converted into budget ${estimate.convertedBudgetId}. Cut a new version and convert that instead.`,
+        );
+      }
+      if (estimate.status !== "approved" && !body.dryRun) {
+        throw conflict(
+          `Estimate ${estimate.reference} is ${estimate.status}. Only an APPROVED estimate becomes a budget — the budget is what the project is then measured against, and it may not rest on a number nobody signed.`,
+        );
+      }
+
+      const [lines, markups] = await Promise.all([
+        linesOfEstimate(app.db, estimate.id),
+        appliedMarkupsOf(estimate),
+      ]);
+      if (lines.length === 0) throw badRequest(`Estimate ${estimate.reference} has no lines to convert.`);
+
+      const plan = planBudgetLines({
+        lines: lines.map((l) => ({
+          id: l.id,
+          description: l.description,
+          costCode: l.costCode,
+          costCodeId: l.costCodeId,
+          costType: l.costType,
+          status: l.status,
+          unit: l.unit,
+          quantity: l.quantity,
+          unitRate: l.unitRate,
+          amount: l.amount,
+          labourAmount: l.labourAmount,
+          materialAmount: l.materialAmount,
+          equipmentAmount: l.equipmentAmount,
+          subcontractAmount: l.subcontractAmount,
+          otherAmount: l.otherAmount,
+        })),
+        markups,
+        markupTreatment: body.markupTreatment ?? "separate_lines",
+        uncodedCostCode: body.uncodedCostCode,
+        markupCostCodePrefix: body.markupCostCodePrefix,
+        includeAlternates: body.includeAlternates,
+      });
+
+      const reconciles = Math.abs(plan.total - estimate.total) < 0.5;
+      const warnings = [...plan.warnings];
+      if (!reconciles) {
+        warnings.unshift(
+          `The budget totals ${plan.total} ${estimate.currency} against the estimate's ${estimate.total}. The difference of ${round2(estimate.total - plan.total)} is explained by the warnings below; do not convert until it is understood.`,
+        );
+      }
+
+      if (body.dryRun) {
+        return {
+          dryRun: true,
+          plan: plan.lines,
+          totals: {
+            estimateTotal: estimate.total,
+            budgetTotal: plan.total,
+            directCostTotal: plan.directCostTotal,
+            markupTotal: plan.markupTotal,
+            reconciles,
+          },
+          currency: estimate.currency,
+          warnings,
+        };
+      }
+
+      const budgetId = newId("bdg");
+      const number = await nextRecordNumber(app.db, projectId, "budget");
+      const budgetReference = `BUD-${pad3(number)}`;
+      // The whole conversion is one transaction: a budget with half its lines
+      // is worse than no budget, because every rollup would quietly be wrong.
+      await app.db.transaction(async (tx) => {
+        if (body.makeActive) {
+          await tx
+            .update(budgets)
+            .set({ isActive: 0, updatedAt: nowIso() })
+            .where(eq(budgets.projectId, projectId));
+        }
+        await tx.insert(budgets).values({
+          id: budgetId,
+          companyId,
+          projectId,
+          number,
+          reference: budgetReference,
+          name: body.budgetName ?? `${estimate.name} (from ${estimate.reference})`,
+          description: `Converted from estimate ${estimate.reference} rev ${estimate.version} on ${todayIso()}.`,
+          status: "draft",
+          isActive: body.makeActive ? 1 : 0,
+          currency: estimate.currency,
+          originalBudgetTotal: plan.total,
+          revisedBudgetTotal: plan.total,
+          forecastToCompleteTotal: plan.total,
+          forecastFinalTotal: plan.total,
+          varianceTotal: 0,
+          totalsCalculatedAt: nowIso(),
+          detail: {
+            sourceType: "estimate",
+            sourceId: estimate.id,
+            sourceReference: estimate.reference,
+            markupTreatment: body.markupTreatment ?? "separate_lines",
+          },
+          createdBy: req.user!.id,
+        });
+        await tx.insert(budgetLineItems).values(
+          plan.lines.map((line, index) => ({
+            id: newId("bli"),
+            budgetId,
+            companyId,
+            projectId,
+            costCodeId: line.costCodeId,
+            costCode: line.costCode,
+            costType: line.costType,
+            description: line.description,
+            lineKind: line.lineKind,
+            status: "active",
+            unit: line.unit,
+            quantity: line.quantity,
+            unitRate: line.unitRate,
+            originalBudget: line.originalBudget,
+            revisedBudget: line.originalBudget,
+            forecastToComplete: line.originalBudget,
+            forecastFinal: line.originalBudget,
+            projectedOverUnder: 0,
+            sortOrder: index,
+            detail: {
+              sourceType: "estimate",
+              sourceEstimateId: estimate.id,
+              sourceLineIds: line.sourceLineIds,
+              sourceMarkupIds: line.sourceMarkupIds,
+            },
+            createdBy: req.user!.id,
+          })),
+        );
+        await tx
+          .update(estimates)
+          .set({
+            status: "converted",
+            convertedBudgetId: budgetId,
+            convertedAt: nowIso(),
+            convertedBy: req.user!.id,
+            updatedAt: nowIso(),
+          })
+          .where(eq(estimates.id, estimate.id));
+      });
+
+      await ledger(req, "create", "budget", budgetId, {
+        projectId,
+        reference: budgetReference,
+        sourceType: "estimate",
+        sourceReference: estimate.reference,
+        lines: plan.lines.length,
+        total: plan.total,
+        currency: estimate.currency,
+      });
+      await ledger(req, "state_change", "estimate", estimate.id, {
+        projectId,
+        reference: estimate.reference,
+        from: "approved",
+        to: "converted",
+        budgetId,
+        budgetReference,
+        budgetTotal: plan.total,
+        estimateTotal: estimate.total,
+        reconciles,
+      });
+      await closeSignalByKey(
+        app.db,
+        companyId,
+        "estimate_unconverted",
+        estimate.id,
+        `Converted into budget ${budgetReference}.`,
+      );
+      await pushNotifications(app.db, [
+        {
+          companyId,
+          userId: estimate.createdBy,
+          projectId,
+          kind: "estimate",
+          title: `Estimate ${estimate.reference} converted to budget ${budgetReference}`,
+          body: `${plan.lines.length} budget lines totalling ${plan.total} ${estimate.currency}.`,
+          recordType: "budget",
+          recordId: budgetId,
+        },
+      ]);
+
+      return reply.status(201).send({
+        budgetId,
+        budgetReference,
+        lines: plan.lines.length,
+        totals: {
+          estimateTotal: estimate.total,
+          budgetTotal: plan.total,
+          directCostTotal: plan.directCostTotal,
+          markupTotal: plan.markupTotal,
+          reconciles,
+        },
+        currency: estimate.currency,
+        warnings,
+      });
+    },
+  );
+
+  /** Change-order estimating (#208): push the priced total onto the event. */
+  app.post(
+    "/projects/:projectId/estimates/:estimateId/push-to-change-event",
+    { preHandler: standardGate },
+    async (req) => {
+      const { estimateId } = req.params as { estimateId: string };
+      const body = S.pushChangeEventSchema.parse(req.body);
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      const estimate = await fetchEstimate(app.db, estimateId, companyId, projectId);
+      const rows = await app.db
+        .select()
+        .from(changeEvents)
+        .where(
+          and(
+            eq(changeEvents.id, body.changeEventId),
+            eq(changeEvents.companyId, companyId),
+            eq(changeEvents.projectId, projectId),
+          ),
+        )
+        .limit(1);
+      const event = rows[0];
+      if (!event) throw notFound("Change event not found on this project");
+      if (estimate.lineCount === 0) {
+        throw badRequest(`Estimate ${estimate.reference} has no priced lines to push.`);
+      }
+      const totals = await recomputeEstimate(app.db, estimate.id);
+      const field = body.field ?? "both";
+      const patch: Record<string, unknown> = { updatedAt: nowIso() };
+      if (field === "estimated" || field === "both") patch["estimatedCost"] = totals.total;
+      if (field === "latest" || field === "both") patch["latestCost"] = totals.total;
+      await app.db.update(changeEvents).set(patch).where(eq(changeEvents.id, event.id));
+      await app.db
+        .update(estimates)
+        .set({ sourceType: "change_event", sourceId: event.id, updatedAt: nowIso() })
+        .where(eq(estimates.id, estimate.id));
+      await ledger(req, "update", "change_event", event.id, {
+        projectId,
+        reference: event.reference,
+        sourceType: "estimate",
+        sourceReference: estimate.reference,
+        estimatedCostBefore: event.estimatedCost,
+        latestCostBefore: event.latestCost,
+        pushed: totals.total,
+        field,
+        currency: estimate.currency,
+      });
+      return {
+        changeEventId: event.id,
+        changeEventReference: event.reference,
+        pushed: totals.total,
+        currency: estimate.currency,
+        field,
+        warnings:
+          estimate.status === "draft"
+            ? [
+                `Estimate ${estimate.reference} is still a draft; the change event now carries an unapproved number.`,
+              ]
+            : [],
+      };
+    },
+  );
+
+  /* ================================================================== */
+  /* Proposals (#205) and export (#206)                                  */
+  /* ================================================================== */
+
+  async function proposalInputs(estimate: EstimateRow) {
+    const [sections, lines, markups] = await Promise.all([
+      sectionsOfEstimate(app.db, estimate.id),
+      linesOfEstimate(app.db, estimate.id),
+      appliedMarkupsOf(estimate),
+    ]);
+    const projectRows = await app.db
+      .select({ name: projects.name })
+      .from(projects)
+      .where(eq(projects.id, estimate.projectId))
+      .limit(1);
+    return {
+      sections: sections.map((s) => ({ id: s.id, code: s.code, name: s.name, sortOrder: s.sortOrder })),
+      lines: lines.map((l) => ({
+        id: l.id,
+        sectionId: l.sectionId,
+        itemCode: l.itemCode,
+        description: l.description,
+        unit: l.unit,
+        quantity: l.quantity,
+        unitRate: l.unitRate,
+        amount: l.amount,
+        status: l.status,
+      })),
+      markups,
+      projectName: projectRows[0]?.name ?? "Project",
+    };
+  }
+
+  app.get(
+    "/projects/:projectId/estimates/:estimateId/proposal-preview",
+    { preHandler: readGate },
+    async (req) => {
+      const { estimateId } = req.params as { estimateId: string };
+      const body = S.proposalCreateSchema.parse(req.query ?? {});
+      const estimate = await fetchEstimate(app.db, estimateId, req.companyId!, req.projectId!);
+      const inputs = await proposalInputs(estimate);
+      return buildProposalDocument({
+        reference: "(preview)",
+        title: body.title ?? estimate.name,
+        clientName: body.clientName ?? null,
+        projectName: inputs.projectName,
+        estimateReference: estimate.reference,
+        estimateVersion: estimate.version,
+        currency: estimate.currency,
+        detailLevel: (body.detailLevel ?? "section") as ProposalDetailLevel,
+        sections: inputs.sections,
+        lines: inputs.lines,
+        markups: inputs.markups,
+        coveringNote: body.coveringNote ?? null,
+        exclusions: body.exclusions ?? null,
+        assumptions: body.assumptions ?? null,
+        validUntil: body.validUntil ?? null,
+        generatedAt: nowIso(),
+      });
+    },
+  );
+
+  app.post(
+    "/projects/:projectId/estimates/:estimateId/proposals",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { estimateId } = req.params as { estimateId: string };
+      const body = S.proposalCreateSchema.parse(req.body ?? {});
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      const estimate = await fetchEstimate(app.db, estimateId, companyId, projectId);
+      if (estimate.lineCount === 0) {
+        throw badRequest(`Estimate ${estimate.reference} has no lines, so there is nothing to propose.`);
+      }
+      await recomputeEstimate(app.db, estimate.id);
+      const fresh = await fetchEstimate(app.db, estimateId, companyId, projectId);
+      const inputs = await proposalInputs(fresh);
+      const number = await nextRecordNumber(app.db, projectId, "estimate_proposal");
+      const id = newId("prp");
+      const reference = `PRO-${pad3(number)}`;
+      const document = buildProposalDocument({
+        reference,
+        title: body.title ?? fresh.name,
+        clientName: body.clientName ?? null,
+        projectName: inputs.projectName,
+        estimateReference: fresh.reference,
+        estimateVersion: fresh.version,
+        currency: fresh.currency,
+        detailLevel: (body.detailLevel ?? "section") as ProposalDetailLevel,
+        sections: inputs.sections,
+        lines: inputs.lines,
+        markups: inputs.markups,
+        coveringNote: body.coveringNote ?? null,
+        exclusions: body.exclusions ?? null,
+        assumptions: body.assumptions ?? null,
+        validUntil: body.validUntil ?? null,
+        generatedAt: nowIso(),
+      });
+      await app.db.insert(estimateProposals).values({
+        id,
+        companyId,
+        projectId,
+        estimateId: fresh.id,
+        number,
+        reference,
+        title: document.title,
+        clientName: body.clientName ?? null,
+        status: "draft",
+        currency: fresh.currency,
+        total: document.totals.total,
+        document: document as unknown as Record<string, unknown>,
+        detailLevel: body.detailLevel ?? "section",
+        validUntil: body.validUntil ?? null,
+        coveringNote: body.coveringNote ?? null,
+        exclusions: body.exclusions ?? null,
+        assumptions: body.assumptions ?? null,
+        detail: body.detail ?? {},
+        createdBy: req.user!.id,
+      });
+      await ledger(req, "create", "estimate_proposal", id, {
+        projectId,
+        reference,
+        estimateReference: fresh.reference,
+        total: document.totals.total,
+        currency: fresh.currency,
+        detailLevel: body.detailLevel ?? "section",
+      });
+      const rows = await app.db
+        .select()
+        .from(estimateProposals)
+        .where(eq(estimateProposals.id, id))
+        .limit(1);
+      return reply.status(201).send(rows[0]);
+    },
+  );
+
+  app.get("/projects/:projectId/estimating/proposals", { preHandler: readGate }, async (req) => {
+    const q = S.proposalListQuery.parse(req.query);
+    const clauses = [
+      eq(estimateProposals.companyId, req.companyId!),
+      eq(estimateProposals.projectId, req.projectId!),
+    ];
+    if (q.estimateId) clauses.push(eq(estimateProposals.estimateId, q.estimateId));
+    if (q.status) clauses.push(eq(estimateProposals.status, q.status));
+    const where = and(...clauses);
+    const [totalRow] = await app.db.select({ n: count() }).from(estimateProposals).where(where);
+    const items = await app.db
+      .select({
+        id: estimateProposals.id,
+        reference: estimateProposals.reference,
+        title: estimateProposals.title,
+        clientName: estimateProposals.clientName,
+        status: estimateProposals.status,
+        currency: estimateProposals.currency,
+        total: estimateProposals.total,
+        detailLevel: estimateProposals.detailLevel,
+        validUntil: estimateProposals.validUntil,
+        estimateId: estimateProposals.estimateId,
+        issuedAt: estimateProposals.issuedAt,
+        createdAt: estimateProposals.createdAt,
+      })
+      .from(estimateProposals)
+      .where(where)
+      .orderBy(desc(estimateProposals.number))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    return paginate(items, Number(totalRow?.n ?? 0), q);
+  });
+
+  async function fetchProposal(id: string, companyId: string, projectId: string) {
+    const rows = await app.db
+      .select()
+      .from(estimateProposals)
+      .where(
+        and(
+          eq(estimateProposals.id, id),
+          eq(estimateProposals.companyId, companyId),
+          eq(estimateProposals.projectId, projectId),
+        ),
+      )
+      .limit(1);
+    const row = rows[0];
+    if (!row) throw notFound("Proposal not found on this project");
+    return row;
+  }
+
+  app.get("/projects/:projectId/estimating/proposals/:proposalId", { preHandler: readGate }, async (req) => {
+    const { proposalId } = req.params as { proposalId: string };
+    return fetchProposal(proposalId, req.companyId!, req.projectId!);
+  });
+
+  app.get(
+    "/projects/:projectId/estimating/proposals/:proposalId/html",
+    { preHandler: readGate },
+    async (req, reply) => {
+      const { proposalId } = req.params as { proposalId: string };
+      const proposal = await fetchProposal(proposalId, req.companyId!, req.projectId!);
+      const html = renderProposalHtml(
+        proposal.document as unknown as Parameters<typeof renderProposalHtml>[0],
+      );
+      return reply.type("text/html; charset=utf-8").send(html);
+    },
+  );
+
+  app.post(
+    "/projects/:projectId/estimating/proposals/:proposalId/status",
+    { preHandler: standardGate },
+    async (req) => {
+      const { proposalId } = req.params as { proposalId: string };
+      const body = S.proposalStatusSchema.parse(req.body);
+      const proposal = await fetchProposal(proposalId, req.companyId!, req.projectId!);
+      if (proposal.status === body.status) {
+        throw conflict(`Proposal ${proposal.reference} is already ${body.status}.`);
+      }
+      const patch: Record<string, unknown> = { status: body.status, updatedAt: nowIso() };
+      if (body.status === "issued") {
+        patch["issuedBy"] = req.user!.id;
+        patch["issuedAt"] = nowIso();
+      }
+      await app.db.update(estimateProposals).set(patch).where(eq(estimateProposals.id, proposalId));
+      await ledger(req, "state_change", "estimate_proposal", proposalId, {
+        projectId: req.projectId!,
+        reference: proposal.reference,
+        from: proposal.status,
+        to: body.status,
+        note: body.note ?? null,
+        total: proposal.total,
+        currency: proposal.currency,
+      });
+      return fetchProposal(proposalId, req.companyId!, req.projectId!);
+    },
+  );
+
+  /** Spreadsheet export (#206) — CSV, because it opens everywhere. */
+  app.get(
+    "/projects/:projectId/estimates/:estimateId/export.csv",
+    { preHandler: readGate },
+    async (req, reply) => {
+      const { estimateId } = req.params as { estimateId: string };
+      const estimate = await fetchEstimate(app.db, estimateId, req.companyId!, req.projectId!);
+      const [sections, lines, markups] = await Promise.all([
+        sectionsOfEstimate(app.db, estimate.id),
+        linesOfEstimate(app.db, estimate.id),
+        markupsOfEstimate(app.db, estimate.id),
+      ]);
+      const sectionName = new Map(sections.map((s) => [s.id, s.code ? `${s.code} ${s.name}` : s.name]));
+      const header = [
+        "Section", "Item", "Description", "Cost code", "Cost type", "Status", "Source",
+        "Unit", "Measured qty", "Waste %", "Quantity", "Labour rate", "Material rate",
+        "Equipment rate", "Subcontract rate", "Other rate", "Unit rate", "Amount",
+        "Labour hours", "Rate as at", "Currency",
+      ];
+      const rows = lines.map((l) => [
+        l.sectionId ? (sectionName.get(l.sectionId) ?? "") : "",
+        l.itemCode ?? "", l.description, l.costCode ?? "", l.costType, l.status, l.source,
+        l.unit ?? "", l.takeoffQuantity ?? "", l.wastePercent, l.quantity,
+        l.labourRate, l.materialRate, l.equipmentRate, l.subcontractRate, l.otherRate,
+        l.unitRate, l.amount, l.labourHours, l.rateAsAt ?? "", estimate.currency,
+      ]);
+      for (const m of markups.filter((x) => x.enabled === 1)) {
+        rows.push([
+          "Markups", "", `${m.name} (${m.kind})`, "", "", m.enabled === 1 ? "active" : "disabled",
+          m.method, "", "", "", "", "", "", "", "", "", m.rate, m.amount, "", "", estimate.currency,
+        ]);
+      }
+      rows.push([
+        "", "", `TOTAL — ${estimate.reference} rev ${estimate.version}`, "", "", "", "", "", "", "",
+        "", "", "", "", "", "", "", estimate.total, estimate.labourHours, "", estimate.currency,
+      ]);
+      const csv = [header, ...rows].map((r) => r.map(csvCell).join(",")).join("\r\n");
+      return reply
+        .type("text/csv; charset=utf-8")
+        .header(
+          "content-disposition",
+          `attachment; filename="${estimate.reference}-rev${estimate.version}.csv"`,
+        )
+        .send(csv);
+    },
+  );
+
+  /* ================================================================== */
+  /* Historical cost reference (#207)                                    */
+  /* ================================================================== */
+
+  /**
+   * What this tenant has actually paid for the same work before, drawn from
+   * its own approved and converted estimates. Deliberately NOT an external
+   * benchmark: the benchmarks module owns cross-company distributions with
+   * their min-n suppression, and a figure from a different discipline
+   * masquerading as one of ours would be worse than no figure at all.
+   */
+  app.get("/projects/:projectId/estimating/historical-rates", { preHandler: readGate }, async (req) => {
+    const q = S.benchmarkQuery.parse(req.query);
+    if (!q.costCode && !q.search) {
+      throw badRequest("Give a cost code or a search term to look up a historical rate.");
+    }
+    const clauses = [
+      eq(estimateLineItems.companyId, req.companyId!),
+      inArray(estimates.status, ["approved", "converted", "superseded"]),
+      ne(estimateLineItems.quantity, 0),
+    ];
+    if (q.costCode) clauses.push(eq(estimateLineItems.costCode, q.costCode));
+    if (q.search) clauses.push(ilike(estimateLineItems.description, `%${q.search}%`));
+    if (q.unit) clauses.push(eq(estimateLineItems.unit, q.unit));
+    const rows = await app.db
+      .select({
+        unitRate: estimateLineItems.unitRate,
+        quantity: estimateLineItems.quantity,
+        unit: estimateLineItems.unit,
+        description: estimateLineItems.description,
+        costCode: estimateLineItems.costCode,
+        rateAsAt: estimateLineItems.rateAsAt,
+        projectId: estimateLineItems.projectId,
+        estimateReference: estimates.reference,
+        currency: estimates.currency,
+        approvedAt: estimates.approvedAt,
+      })
+      .from(estimateLineItems)
+      .innerJoin(estimates, eq(estimates.id, estimateLineItems.estimateId))
+      .where(and(...clauses))
+      .orderBy(desc(estimates.approvedAt))
+      .limit(q.limit);
+
+    // Money is bucketed by currency and by unit; a rate in GBP/m² and a rate
+    // in USD/sf are two facts, not one average.
+    const buckets = new Map<
+      string,
+      { currency: string; unit: string; rates: number[]; projects: Set<string>; samples: typeof rows }
+    >();
+    for (const row of rows) {
+      const key = `${row.currency}|${row.unit ?? "—"}`;
+      const bucket = buckets.get(key) ?? {
+        currency: row.currency,
+        unit: row.unit ?? "—",
+        rates: [],
+        projects: new Set<string>(),
+        samples: [] as typeof rows,
+      };
+      bucket.rates.push(row.unitRate);
+      bucket.projects.add(row.projectId);
+      bucket.samples.push(row);
+      buckets.set(key, bucket);
+    }
+
+    const distributions = [...buckets.values()].map((bucket) => {
+      const sorted = [...bucket.rates].sort((a, b) => a - b);
+      const n = sorted.length;
+      const mid = Math.floor(n / 2);
+      const median =
+        n === 0
+          ? null
+          : n % 2 === 1
+            ? (sorted[mid] ?? null)
+            : ((sorted[mid - 1] ?? 0) + (sorted[mid] ?? 0)) / 2;
+      return {
+        currency: bucket.currency,
+        unit: bucket.unit,
+        n,
+        projects: bucket.projects.size,
+        low: n > 0 ? round4(sorted[0] ?? 0) : null,
+        high: n > 0 ? round4(sorted[n - 1] ?? 0) : null,
+        median: median === null ? null : round4(median),
+        mean: n > 0 ? round4(sorted.reduce((s, v) => s + v, 0) / n) : null,
+        basis:
+          n === 1
+            ? "A single past line — a data point, not a distribution."
+            : `${n} priced lines across ${bucket.projects.size} project${bucket.projects.size === 1 ? "" : "s"} on approved or converted estimates.`,
+      };
+    });
+
+    return {
+      query: { costCode: q.costCode ?? null, search: q.search ?? null, unit: q.unit ?? null },
+      distributions,
+      samples: rows.map((r) => ({
+        description: r.description,
+        costCode: r.costCode,
+        unit: r.unit,
+        unitRate: round4(r.unitRate),
+        currency: r.currency,
+        estimateReference: r.estimateReference,
+        rateAsAt: r.rateAsAt,
+        approvedAt: r.approvedAt,
+      })),
+      reasons:
+        rows.length === 0
+          ? [
+              "No approved or converted estimate in this company carries a line matching that filter, so there is no historical rate to show. This is a gap in our records, not a rate of zero.",
+            ]
+          : [],
+    };
+  });
+
+  /* ================================================================== */
+  /* Summary, health inputs, risks, manual sweep                          */
+  /* ================================================================== */
+
+  async function summaryFor(companyId: string, projectId: string) {
+    const estimateRows = await app.db
+      .select({
+        id: estimates.id,
+        status: estimates.status,
+        currency: estimates.currency,
+        total: estimates.total,
+        directCostTotal: estimates.directCostTotal,
+        markupTotal: estimates.markupTotal,
+        labourHours: estimates.labourHours,
+        lineCount: estimates.lineCount,
+        supersededById: estimates.supersededById,
+        convertedBudgetId: estimates.convertedBudgetId,
+        approvedAt: estimates.approvedAt,
+        reference: estimates.reference,
+        name: estimates.name,
+        version: estimates.version,
+        updatedAt: estimates.updatedAt,
+      })
+      .from(estimates)
+      .where(and(eq(estimates.companyId, companyId), eq(estimates.projectId, projectId)));
+
+    const live = estimateRows.filter((e) => e.supersededById === null && e.status !== "void");
+    const byStatus: Record<string, number> = {};
+    for (const e of estimateRows) byStatus[e.status] = (byStatus[e.status] ?? 0) + 1;
+
+    // Never summed across currencies: bucketed, and said out loud.
+    const byCurrency = new Map<string, { currency: string; estimates: number; total: number; directCost: number; markup: number }>();
+    for (const e of live) {
+      const bucket = byCurrency.get(e.currency) ?? {
+        currency: e.currency,
+        estimates: 0,
+        total: 0,
+        directCost: 0,
+        markup: 0,
+      };
+      bucket.estimates += 1;
+      bucket.total = round2(bucket.total + e.total);
+      bucket.directCost = round2(bucket.directCost + e.directCostTotal);
+      bucket.markup = round2(bucket.markup + e.markupTotal);
+      byCurrency.set(e.currency, bucket);
+    }
+
+    const [takeoffRows, quoteRows, layerRows, proposalRows, signalRows] = await Promise.all([
+      app.db
+        .select({ status: takeoffItems.status, n: count() })
+        .from(takeoffItems)
+        .where(and(eq(takeoffItems.companyId, companyId), eq(takeoffItems.projectId, projectId)))
+        .groupBy(takeoffItems.status),
+      app.db
+        .select({ status: estimateSubQuotes.status, n: count() })
+        .from(estimateSubQuotes)
+        .where(
+          and(eq(estimateSubQuotes.companyId, companyId), eq(estimateSubQuotes.projectId, projectId)),
+        )
+        .groupBy(estimateSubQuotes.status),
+      app.db
+        .select({ n: count() })
+        .from(takeoffLayers)
+        .where(and(eq(takeoffLayers.companyId, companyId), eq(takeoffLayers.projectId, projectId))),
+      app.db
+        .select({ status: estimateProposals.status, n: count() })
+        .from(estimateProposals)
+        .where(
+          and(eq(estimateProposals.companyId, companyId), eq(estimateProposals.projectId, projectId)),
+        )
+        .groupBy(estimateProposals.status),
+      app.db
+        .select({ detector: signals.detector, n: count() })
+        .from(signals)
+        .where(
+          and(
+            eq(signals.companyId, companyId),
+            eq(signals.projectId, projectId),
+            inArray(signals.disposition, [...OPEN_DISPOSITIONS]),
+            inArray(signals.detector, [
+              "estimate_stale_rates",
+              "estimate_unconverted",
+              "sub_quote_expiring",
+              "sub_quote_expired",
+              "takeoff_unpriced",
+              "quote_outlier",
+            ]),
+          ),
+        )
+        .groupBy(signals.detector),
+    ]);
+
+    const takeoffByStatus: Record<string, number> = {};
+    for (const r of takeoffRows) takeoffByStatus[r.status] = Number(r.n);
+    const quotesByStatus: Record<string, number> = {};
+    for (const r of quoteRows) quotesByStatus[r.status] = Number(r.n);
+    const proposalsByStatus: Record<string, number> = {};
+    for (const r of proposalRows) proposalsByStatus[r.status] = Number(r.n);
+    const signalsByDetector: Record<string, number> = {};
+    for (const r of signalRows) signalsByDetector[r.detector] = Number(r.n);
+
+    const [unpricedRow] = await app.db
+      .select({ n: count() })
+      .from(takeoffItems)
+      .leftJoin(estimateLineItems, eq(estimateLineItems.takeoffItemId, takeoffItems.id))
+      .where(
+        and(
+          eq(takeoffItems.companyId, companyId),
+          eq(takeoffItems.projectId, projectId),
+          inArray(takeoffItems.status, ["measured", "assigned"]),
+          isNull(estimateLineItems.id),
+        ),
+      );
+
+    const [staleRow] = await app.db
+      .select({ n: count() })
+      .from(estimateLineItems)
+      .innerJoin(estimates, eq(estimates.id, estimateLineItems.estimateId))
+      .where(
+        and(
+          eq(estimateLineItems.companyId, companyId),
+          eq(estimateLineItems.projectId, projectId),
+          isNotNull(estimateLineItems.rateAsAt),
+          sql`${estimateLineItems.rateAsAt} < ${addDays(todayIso(), -RATE_STALENESS_DAYS)}`,
+          isNull(estimates.supersededById),
+        ),
+      );
+
+    const latest = [...live].sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))[0] ?? null;
+
+    return {
+      estimates: {
+        total: estimateRows.length,
+        live: live.length,
+        byStatus,
+        approvedUnconverted: estimateRows.filter(
+          (e) => e.status === "approved" && e.convertedBudgetId === null,
+        ).length,
+        converted: estimateRows.filter((e) => e.convertedBudgetId !== null).length,
+      },
+      /** one bucket per currency; there is deliberately no grand total */
+      byCurrency: [...byCurrency.values()].sort((a, b) => a.currency.localeCompare(b.currency)),
+      crossCurrency:
+        byCurrency.size > 1
+          ? {
+              value: null,
+              reasons: [
+                `Live estimates on this project are in ${byCurrency.size} currencies (${[...byCurrency.keys()].sort().join(", ")}). A single total would require an exchange rate nobody recorded.`,
+              ],
+            }
+          : { value: [...byCurrency.values()][0]?.total ?? 0, reasons: [] },
+      takeoff: {
+        byStatus: takeoffByStatus,
+        total: takeoffRows.reduce((s, r) => s + Number(r.n), 0),
+        unpriced: Number(unpricedRow?.n ?? 0),
+        layers: Number(layerRows[0]?.n ?? 0),
+      },
+      subQuotes: {
+        byStatus: quotesByStatus,
+        total: quoteRows.reduce((s, r) => s + Number(r.n), 0),
+      },
+      proposals: {
+        byStatus: proposalsByStatus,
+        total: proposalRows.reduce((s, r) => s + Number(r.n), 0),
+      },
+      staleRateLines: Number(staleRow?.n ?? 0),
+      openSignals: {
+        byDetector: signalsByDetector,
+        total: Object.values(signalsByDetector).reduce((s, v) => s + v, 0),
+      },
+      latestEstimate: latest
+        ? {
+            id: latest.id,
+            reference: latest.reference,
+            name: latest.name,
+            version: latest.version,
+            status: latest.status,
+            total: latest.total,
+            currency: latest.currency,
+            lineCount: latest.lineCount,
+            labourHours: latest.labourHours,
+          }
+        : null,
+      staleThresholdDays: RATE_STALENESS_DAYS,
+      generatedAt: nowIso(),
+    };
+  }
+
+  app.get("/projects/:projectId/estimating/summary", { preHandler: readGate }, async (req) =>
+    summaryFor(req.companyId!, req.projectId!),
+  );
+
+  /** Health inputs for the intelligence layer (contract §3.5). */
+  app.get("/projects/:projectId/estimating/health-inputs", { preHandler: readGate }, async (req) => {
+    const s = await summaryFor(req.companyId!, req.projectId!);
+    const reasons: string[] = [];
+    if (s.estimates.total === 0) reasons.push("No estimate has been prepared on this project yet.");
+    if (s.estimates.approvedUnconverted > 0) {
+      reasons.push(
+        `${s.estimates.approvedUnconverted} approved estimate${s.estimates.approvedUnconverted === 1 ? " has" : "s have"} not been converted into a budget.`,
+      );
+    }
+    if (s.takeoff.unpriced > 0) {
+      reasons.push(`${s.takeoff.unpriced} measured takeoff items are not priced onto any estimate line.`);
+    }
+    if (s.staleRateLines > 0) {
+      reasons.push(
+        `${s.staleRateLines} priced lines rest on a rate more than ${RATE_STALENESS_DAYS} days old.`,
+      );
+    }
+    if (s.subQuotes.byStatus["expired"]) {
+      reasons.push(`${s.subQuotes.byStatus["expired"]} subcontract quotes are out of validity.`);
+    }
+    return {
+      metrics: {
+        estimatesLive: s.estimates.live,
+        estimatesApprovedUnconverted: s.estimates.approvedUnconverted,
+        takeoffUnpriced: s.takeoff.unpriced,
+        staleRateLines: s.staleRateLines,
+        subQuotesExpired: s.subQuotes.byStatus["expired"] ?? 0,
+        subQuotesLive:
+          (s.subQuotes.byStatus["received"] ?? 0) +
+          (s.subQuotes.byStatus["under_review"] ?? 0) +
+          (s.subQuotes.byStatus["levelled"] ?? 0),
+        openEstimatingSignals: s.openSignals.total,
+        latestEstimateTotal: s.latestEstimate?.total ?? null,
+      },
+      reasons,
+    };
+  });
+
+  app.get("/projects/:projectId/estimating/risks", { preHandler: readGate }, async (req) => {
+    const q = S.riskListQuery.parse(req.query);
+    const clauses = [
+      eq(signals.companyId, req.companyId!),
+      eq(signals.projectId, req.projectId!),
+      inArray(signals.detector, [
+        "estimate_stale_rates",
+        "estimate_unconverted",
+        "sub_quote_expiring",
+        "sub_quote_expired",
+        "takeoff_unpriced",
+        "quote_outlier",
+      ]),
+    ];
+    if (q.includeClosed !== "true") {
+      clauses.push(inArray(signals.disposition, [...OPEN_DISPOSITIONS]));
+    }
+    const where = and(...clauses);
+    const [totalRow] = await app.db.select({ n: count() }).from(signals).where(where);
+    const items = await app.db
+      .select()
+      .from(signals)
+      .where(where)
+      .orderBy(desc(signals.createdAt))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    return paginate(items, Number(totalRow?.n ?? 0), q);
+  });
+
+  /** Run both sweeps for this tenant now — the operator/test entry point. */
+  app.post("/projects/:projectId/estimating/sweep", { preHandler: standardGate }, async (req) => {
+    const result = await runEstimatingSweeps(app.db, req.companyId!, new Date());
+    await ledger(req, "update", "estimating_sweep", newId("swp"), {
+      projectId: req.projectId!,
+      quotes: result.quotes,
+      hygiene: result.hygiene,
+    });
+    return result;
+  });
+};

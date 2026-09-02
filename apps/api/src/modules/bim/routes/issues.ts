@@ -32,7 +32,7 @@ import {
   type CoordinationIssueStatus,
 } from "@constructos/shared";
 import { newId } from "../../../lib/ids.js";
-import { badRequest, conflict, notFound } from "../../../lib/errors.js";
+import { badRequest, conflict } from "../../../lib/errors.js";
 import { nextRecordNumber } from "../../../lib/numbering.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.js";
 import { pushNotifications } from "../../notifications/service.js";
@@ -87,7 +87,7 @@ const escalateSchema = z.object({
 
 export const issueRoutes: FastifyPluginAsync = async (app) => {
   const gates = buildBimGates(app);
-  const { getIssue, getVersion } = buildLoaders(app);
+  const { getIssue } = buildLoaders(app);
 
   /** Every referenced user must be a member of the tenant (#241 assignment). */
   async function assertCompanyMembers(companyId: string, ids: Array<string | null | undefined>) {
@@ -519,7 +519,7 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
 
   app.post("/bim/issues/:issueId/escalate", { preHandler: gates.companyGate }, async (req, reply) => {
     const { issueId } = req.params as { issueId: string };
-    const body = escalateSchema.parse(req.body);
+    const body = escalateSchema.parse(req.body ?? {});
     const issue = await getIssue(issueId, req.companyId!);
     await gates.requireToolFor(req, reply, issue.projectId, "standard");
     if (issue.rfiId) throw conflict("This issue has already been escalated to an RFI");

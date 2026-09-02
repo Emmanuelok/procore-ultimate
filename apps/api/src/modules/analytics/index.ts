@@ -1,22 +1,26 @@
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
-import { and, asc, count, desc, eq, inArray, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import { z } from "zod";
 import {
-  assuranceGrants,
+  analyticsForecasts,
   dashboards,
   obligations,
-  projectMemberships,
   projects,
   reportDefinitions,
+  reportRuns,
   reportSchedules,
   signals,
 } from "@constructos/db";
 import {
+  meetsLevel,
   REPORT_AGGREGATIONS,
   REPORT_DATASETS,
   REPORT_FILTER_OPERATORS,
+  REPORT_FORMATS,
   WIDGET_KINDS,
+  type PermissionLevel,
+  type ToolKey,
   type WidgetKind,
 } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
@@ -25,7 +29,9 @@ import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import type { Db } from "../../lib/db.js";
 import {
+  applySensitivity,
   datasetCatalog,
+  DATASETS,
   executeReport,
   MAX_LIMIT_ROWS,
   resolveReport,
@@ -35,6 +41,15 @@ import {
   type FilterInput,
   type ReportSpec,
 } from "./datasets.js";
+import { reachOf, type Reach } from "./authz.js";
+import { registerReportDelivery, runDueSchedules } from "./delivery.js";
+import {
+  computeForecast,
+  FORECAST_KIND_LIST,
+  registerForecastJob,
+  storeForecast,
+  type ForecastKindKey,
+} from "./forecast.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -119,6 +134,20 @@ const scheduleCreateSchema = z.object({
   cadence: z.enum(["daily", "weekly", "monthly"]),
   dayOfPeriod: z.number().int().min(0).max(28).nullable().optional(),
   recipients: z.array(z.string().email().max(320)).min(1).max(50),
+  format: z.enum(REPORT_FORMATS).optional(),
+});
+
+const schedulePatchSchema = z
+  .object({
+    active: z.boolean().optional(),
+    recipients: z.array(z.string().email().max(320)).min(1).max(50).optional(),
+    format: z.enum(REPORT_FORMATS).optional(),
+  })
+  .refine((b) => Object.keys(b).length > 0, "no fields to update");
+
+const runsListQuery = pageQuerySchema.extend({
+  reportId: z.string().min(1).max(60).optional(),
+  status: z.enum(["succeeded", "failed"]).optional(),
 });
 
 const seedSchema = z.object({ projectId: z.string().min(1).max(60) });
@@ -243,23 +272,34 @@ export function computeNextRunAt(
 }
 
 /**
- * Scheduled report delivery is RECORDED, NOT SENT.
+ * What this deployment will actually do when `nextRunAt` passes.
  *
- * This deployment runs a single API process with no worker, queue or cron, and
- * no outbound mail transport is configured. A schedule row therefore stores the
- * cadence, the recipients and a maintained `nextRunAt`, and nothing else
- * happens when that instant passes: no email is sent. Wiring delivery means
- * adding a scheduler that polls `report_schedules` for due rows, executes the
- * report and hands the CSV to a mail transport. Every schedule response repeats
- * this in its `delivery` block so no user believes a report is arriving.
+ * The scheduler job `analytics.report-delivery` now executes due schedules,
+ * renders them and hands them to the transport lib/email.ts resolves. Whether
+ * anything LEAVES depends on `EMAIL_PROVIDER`, and the answer is computed from
+ * the running configuration rather than asserted: with no provider the
+ * platform records the message, reports `dispatched:false` with the variable
+ * that would change it, and says so here — the same discipline
+ * MetricComputation applies to a figure it cannot compute.
  */
-const DELIVERY_NOTICE = {
-  enabled: false,
-  note:
-    "Recorded only. This deployment has no scheduler or mail transport, so no email is sent " +
-    "when nextRunAt passes; the schedule and its next run instant are maintained for when a " +
-    "delivery worker is added.",
-} as const;
+function deliveryNotice(app: { appConfig: { EMAIL_PROVIDER: string } }) {
+  const provider = app.appConfig.EMAIL_PROVIDER;
+  const dispatches = provider !== "none";
+  return {
+    enabled: true,
+    dispatches,
+    provider,
+    job: "analytics.report-delivery",
+    note: dispatches
+      ? `Due schedules are executed by the scheduler job "analytics.report-delivery" and sent ` +
+        `through the ${provider} transport. Each run is recorded in GET /analytics/reports/runs ` +
+        "with what was sent, to whom, and whether the provider accepted it."
+      : "Due schedules ARE executed by the scheduler job \"analytics.report-delivery\", but " +
+        "EMAIL_PROVIDER is unset, so the rendered report is recorded and NOT delivered. Every run " +
+        "row carries deliveryDispatched=false and the reason. Set EMAIL_PROVIDER (plus " +
+        "EMAIL_API_KEY and EMAIL_FROM_ADDRESS) to make delivery real.",
+  };
+}
 
 /* ------------------------------------------------------------------ */
 /* Module                                                              */
@@ -275,74 +315,74 @@ const DELIVERY_NOTICE = {
  * executor rather than by the definition (#751).
  *
  * All routes are company-scoped: analytics crosses projects by design, so the
- * `:projectId` tool gate does not apply. Project reach is checked per report
- * against the caller's project membership instead (see `assertProjectReadable`).
+ * `:projectId` tool gate cannot apply as a preHandler. Authority is resolved
+ * per report instead, against the DATASET'S GOVERNING TOOL and the caller's
+ * effective level on it — see ./authz.ts. A report is never a wider door than
+ * the module it reports on, and a column classed `commercial` or `pii` needs
+ * the level that could edit the record it came from.
+ *
+ * Scheduled delivery is real (./delivery.ts): a scheduler job renders due
+ * reports and hands them to lib/email.ts, which reports `dispatched:false` with
+ * reasons when no transport is configured. Predictive insights (#753-758) live
+ * in ./forecast.ts.
  */
 export const analyticsModule: FastifyPluginAsync = async (app) => {
   const gate = [app.authenticate, app.requireCompany];
+  /** Running every due schedule now mails data out of the tenant: admin only. */
+  const adminGate = [
+    app.authenticate,
+    app.requireCompany,
+    app.requireCompanyRole(["owner", "admin"]),
+  ];
+
+  // Delivery and forecasting are time-driven, so they are scheduler jobs
+  // rather than side effects of somebody opening a page (PLAN §6.1).
+  registerReportDelivery(app, (cadence, dayOfPeriod, from) =>
+    computeNextRunAt(cadence as ScheduleCadence, dayOfPeriod, from),
+  );
+  registerForecastJob(app);
 
   const isCompanyAdmin = (req: FastifyRequest) =>
     req.companyRole === "owner" || req.companyRole === "admin";
 
   /**
-   * Which projects this caller may read, mirroring `requireTool`'s model so
-   * analytics is never a wider door than the module it reports on:
-   *
-   *  - company owner / admin        → every project (returns `null`)
-   *  - company-wide assurance grant → every project (auditors and regulators
-   *    hold read across the tenant, and a report is a read)
-   *  - anyone else                  → their project memberships, plus any
-   *    project-specific assurance grant
-   *
-   * `null` means unrestricted; an array — possibly empty — is exhaustive.
+   * ROW-LEVEL SECURITY, TOOL-AWARE (#751). See ./authz.ts for why this is not
+   * "every project you are a member of": a membership carries a LEVEL per
+   * tool, and a report over `workers` is a read of the workforce module.
    */
-  async function reachableProjectIds(req: FastifyRequest): Promise<string[] | null> {
-    if (isCompanyAdmin(req)) return null;
-    const now = new Date().toISOString();
-    const grants = await app.db
-      .select({ projectId: assuranceGrants.projectId, expiresAt: assuranceGrants.expiresAt })
-      .from(assuranceGrants)
-      .where(
-        and(
-          eq(assuranceGrants.companyId, req.companyId!),
-          eq(assuranceGrants.userId, req.user!.id),
-        ),
-      );
-    const live = grants.filter((g) => !g.expiresAt || g.expiresAt > now);
-    if (live.some((g) => g.projectId === null)) return null;
-    const memberships = await app.db
-      .select({ projectId: projectMemberships.projectId })
-      .from(projectMemberships)
-      .where(
-        and(
-          eq(projectMemberships.companyId, req.companyId!),
-          eq(projectMemberships.userId, req.user!.id),
-        ),
-      );
-    return [
-      ...new Set([
-        ...memberships.map((m) => m.projectId),
-        ...live.map((g) => g.projectId!).filter(Boolean),
-      ]),
-    ];
+  const reach = (req: FastifyRequest) => reachOf(app.db, req);
+
+  /** The tool a dataset key is governed by; 400 on an unknown dataset. */
+  function toolForDataset(dataset: string): ToolKey {
+    if (!Object.hasOwn(DATASETS, dataset)) {
+      throw badRequest(`Unknown dataset "${dataset}"`, { allowed: REPORT_DATASETS });
+    }
+    return DATASETS[dataset as keyof typeof DATASETS].tool;
   }
 
   /**
-   * Row-level security for project-scoped runs (#751): the project must belong
-   * to the caller's company, and — unless they reach every project — the caller
-   * must be a member of it (or hold an assurance grant over it). A report
-   * cannot be used to read a project the user cannot otherwise open.
+   * A project a report is pinned to must be in the tenant AND readable by the
+   * caller at the dataset's tool. Passing the tool is what makes the check
+   * mean something — the old version accepted any membership.
    */
-  async function assertProjectReadable(req: FastifyRequest, projectId: string): Promise<void> {
+  async function assertProjectReadable(
+    req: FastifyRequest,
+    projectId: string,
+    tool: ToolKey,
+  ): Promise<void> {
+    await reach(req).assertProjectReadable(projectId, tool);
+  }
+
+  /** A dashboard is a container: reaching it needs any access to its project. */
+  async function assertProjectVisible(req: FastifyRequest, projectId: string): Promise<void> {
     const rows = await app.db
       .select({ id: projects.id })
       .from(projects)
       .where(and(eq(projects.id, projectId), eq(projects.companyId, req.companyId!)))
       .limit(1);
     if (!rows[0]) throw badRequest("projectId is not a project in this company");
-    const reach = await reachableProjectIds(req);
-    if (reach === null || reach.includes(projectId)) return;
-    throw forbidden("No access to this project");
+    const any = await reach(req).anyReach();
+    if (any !== null && !any.includes(projectId)) throw forbidden("No access to this project");
   }
 
   async function fetchReport(reportId: string, companyId: string) {
@@ -386,38 +426,126 @@ export const analyticsModule: FastifyPluginAsync = async (app) => {
   }
 
   function viewReport(row: ReportRow) {
-    return { ...row, isShared: row.isShared === 1 };
+    return { ...row, isShared: row.isShared === 1, tool: toolForDataset(row.dataset) };
   }
 
-  /** Resolve the project a run executes against and check reach. */
+  /** Resolve the project a run executes against. */
   async function resolveRunScope(
     req: FastifyRequest,
+    dataset: string,
     reportProjectId: string | null,
     requestedProjectId?: string | null,
   ): Promise<string | null> {
     // A definition's own project wins; a run may only supply one when the
     // definition is company-wide, and never widen an existing scope.
     const projectId = reportProjectId ?? requestedProjectId ?? null;
-    if (projectId) await assertProjectReadable(req, projectId);
+    if (projectId) await assertProjectReadable(req, projectId, toolForDataset(dataset));
     return projectId;
   }
 
+  interface RunOutcome {
+    result: ExecutionResult;
+    /** the effective scope, recorded on every export and scheduled run */
+    scope: {
+      tool: ToolKey;
+      level: PermissionLevel;
+      projectId: string | null;
+      projectIds: string[] | null;
+      hiddenColumns: string[];
+    };
+  }
+
+  /**
+   * Execute a spec under the caller's authority.
+   *
+   * Two questions are answered here and nowhere else: WHICH PROJECTS' rows may
+   * be read (the dataset's tool at `read`), and WHICH COLUMNS may be projected
+   * (the dataset's tool at `standard` for commercial and pii classes). A
+   * company-wide run takes the WEAKER of the levels it spans — holding standard
+   * on one project does not unlock salaries on another.
+   */
   async function runSpec(
     req: FastifyRequest,
     spec: ReportSpec,
     projectId: string | null,
     window: { pageSize: number; offset: number },
-  ): Promise<ExecutionResult> {
+  ): Promise<RunOutcome> {
     const plan = resolveReport(spec);
-    // A run that names no project still cannot cross into projects the caller
-    // does not reach — omitting `projectId` must not widen the query (#751).
-    const projectIds = projectId ? null : await reachableProjectIds(req);
-    return executeReport(
+    const tool = plan.dataset.tool;
+    const r = reach(req);
+    let level: PermissionLevel;
+    let projectIds: Reach = null;
+    if (projectId) {
+      level = await r.levelFor(projectId, tool);
+      if (!meetsLevel(level, "read")) {
+        throw forbidden(`Requires read access to ${tool} on this project`);
+      }
+    } else {
+      const readReach = await r.reachFor(tool, "read");
+      const stdReach = await r.reachFor(tool, "standard");
+      projectIds = readReach;
+      const standardEverywhere =
+        stdReach === null ||
+        (readReach !== null && readReach.every((id) => stdReach.includes(id)));
+      level = standardEverywhere ? "standard" : "read";
+    }
+    const { plan: narrowed, hiddenColumns } = applySensitivity(plan, level);
+    const result = await executeReport(
       app.db,
-      plan,
+      narrowed,
       { companyId: req.companyId!, projectId, projectIds },
       window,
+      { hiddenColumns },
     );
+    return {
+      result,
+      scope: {
+        tool,
+        level,
+        projectId,
+        projectIds: projectIds === null ? null : [...projectIds],
+        hiddenColumns,
+      },
+    };
+  }
+
+  /** Record an execution: what ran, under whose reach, and what came back. */
+  async function recordRun(
+    req: FastifyRequest | null,
+    input: {
+      companyId: string;
+      reportId: string;
+      trigger: "manual" | "scheduled" | "dashboard";
+      outcome: RunOutcome | null;
+      format?: "csv" | "json";
+      error?: string | null;
+    },
+  ): Promise<string> {
+    const id = newId("rrn");
+    const res = input.outcome?.result;
+    await app.db.insert(reportRuns).values({
+      id,
+      companyId: input.companyId,
+      reportId: input.reportId,
+      scheduleId: null,
+      trigger: input.trigger,
+      status: input.error ? "failed" : "succeeded",
+      projectId: input.outcome?.scope.projectId ?? null,
+      rowCount: res?.rowCount ?? 0,
+      truncated: res?.truncated ? 1 : 0,
+      durationMs: res?.ms ?? 0,
+      // Aggregate results are small and are the ones a trend chart wants; a
+      // row-mode result is NOT frozen (it would duplicate the record).
+      resultSummary: res && res.rows.length <= 50 ? res.rows : [],
+      scope: (input.outcome?.scope ?? {}) as Record<string, unknown>,
+      format: input.format ?? "csv",
+      recipients: [],
+      deliveryDispatched: 0,
+      deliveryReasons: [],
+      error: input.error ?? null,
+      runBy: req?.user?.id ?? null,
+    });
+    return id;
   }
 
   /* ---------------------------------------------------------------- */
@@ -438,7 +566,9 @@ export const analyticsModule: FastifyPluginAsync = async (app) => {
 
   app.post("/analytics/reports", { preHandler: gate }, async (req, reply) => {
     const body = reportCreateSchema.parse(req.body);
-    if (body.projectId) await assertProjectReadable(req, body.projectId);
+    if (body.projectId) {
+      await assertProjectReadable(req, body.projectId, toolForDataset(body.dataset));
+    }
     // Validate the whole definition before it is stored — an unstorable
     // definition is better than a stored one that 400s on every run.
     resolveReport({ ...body, limitRows: body.limitRows ?? 500 });
@@ -518,7 +648,9 @@ export const analyticsModule: FastifyPluginAsync = async (app) => {
     if (!canManageReport(row, req)) {
       throw forbidden("Only the report's creator or a company admin may edit it");
     }
-    if (body.projectId) await assertProjectReadable(req, body.projectId);
+    if (body.projectId) {
+      await assertProjectReadable(req, body.projectId, toolForDataset(body.dataset ?? row.dataset));
+    }
 
     const merged: ReportSpec = {
       dataset: body.dataset ?? row.dataset,
@@ -588,30 +720,44 @@ export const analyticsModule: FastifyPluginAsync = async (app) => {
     const body = specSchema.parse(req.body);
     const q = pageQuerySchema.parse(req.query);
     const projectId = body.projectId ?? null;
-    if (projectId) await assertProjectReadable(req, projectId);
-    const result = await runSpec(
+    if (projectId) await assertProjectReadable(req, projectId, toolForDataset(body.dataset));
+    const { result, scope } = await runSpec(
       req,
       { ...body, limitRows: body.limitRows ?? 500 },
       projectId,
       { pageSize: q.pageSize, offset: pageOffset(q) },
     );
-    return { ...result, page: q.page, pageSize: q.pageSize, saved: false };
+    return { ...result, page: q.page, pageSize: q.pageSize, saved: false, scope };
   });
 
   app.post("/analytics/reports/:reportId/run", { preHandler: gate }, async (req) => {
     const { reportId } = req.params as { reportId: string };
     const q = runQuery.parse(req.query);
     const row = requireReadable(await fetchReport(reportId, req.companyId!), req);
-    const projectId = await resolveRunScope(req, row.projectId, q.projectId);
-    const result = await runSpec(req, specFromRow(row), projectId, {
+    const projectId = await resolveRunScope(req, row.dataset, row.projectId, q.projectId);
+    const outcome = await runSpec(req, specFromRow(row), projectId, {
       pageSize: q.pageSize,
       offset: pageOffset(q),
     });
+    await recordRun(req, {
+      companyId: req.companyId!,
+      reportId: row.id,
+      trigger: "manual",
+      outcome,
+    });
     return {
-      ...result,
+      ...outcome.result,
       page: q.page,
       pageSize: q.pageSize,
-      report: { id: row.id, name: row.name, dataset: row.dataset, projectId },
+      scope: outcome.scope,
+      report: {
+        id: row.id,
+        name: row.name,
+        dataset: row.dataset,
+        projectId,
+        /** the definition's own scope, so the UI can say which it ran */
+        definitionProjectId: row.projectId,
+      },
     };
   });
 
@@ -619,19 +765,37 @@ export const analyticsModule: FastifyPluginAsync = async (app) => {
     const { reportId } = req.params as { reportId: string };
     const q = runQuery.parse(req.query);
     const row = requireReadable(await fetchReport(reportId, req.companyId!), req);
-    const projectId = await resolveRunScope(req, row.projectId, q.projectId);
-    const result = await runSpec(req, specFromRow(row), projectId, {
+    const projectId = await resolveRunScope(req, row.dataset, row.projectId, q.projectId);
+    const { result, scope } = await runSpec(req, specFromRow(row), projectId, {
       pageSize: row.limitRows,
       offset: 0,
     });
-    // Data leaving the platform is a ledgered access event (#737).
+    await recordRun(req, {
+      companyId: req.companyId!,
+      reportId: row.id,
+      trigger: "manual",
+      outcome: { result, scope },
+      format: "csv",
+    });
+    // Data leaving the platform is a ledgered access event (#737), and the
+    // entry records the EFFECTIVE SCOPE it left under: which tool governed it,
+    // which level the caller held, which projects were in reach and which
+    // columns were withheld. An export nobody can characterise afterwards is
+    // not an audited export.
     await appendLedger(app.db, {
       companyId: req.companyId!,
       actorId: req.user!.id,
       action: "access",
       objectType: "report_definition",
       objectId: reportId,
-      payload: { export: "csv", rowCount: result.rowCount, projectId },
+      payload: {
+        export: "csv",
+        rowCount: result.rowCount,
+        truncated: result.truncated,
+        projectId,
+        scope,
+      },
+      storePayload: true,
     });
     const safeName = row.name.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 60) || "report";
     return reply
@@ -667,6 +831,7 @@ export const analyticsModule: FastifyPluginAsync = async (app) => {
       cadence: body.cadence,
       dayOfPeriod: body.dayOfPeriod ?? null,
       recipients: body.recipients,
+      format: body.format ?? "csv",
       nextRunAt,
       createdBy: req.user!.id,
     });
@@ -684,7 +849,7 @@ export const analyticsModule: FastifyPluginAsync = async (app) => {
       .from(reportSchedules)
       .where(eq(reportSchedules.id, id))
       .limit(1);
-    return reply.status(201).send({ ...created, delivery: DELIVERY_NOTICE });
+    return reply.status(201).send({ ...created, delivery: deliveryNotice(app) });
   });
 
   app.get("/analytics/reports/:reportId/schedules", { preHandler: gate }, async (req) => {
@@ -700,7 +865,7 @@ export const analyticsModule: FastifyPluginAsync = async (app) => {
         ),
       )
       .orderBy(asc(reportSchedules.createdAt));
-    return { items: rows, delivery: DELIVERY_NOTICE };
+    return { items: rows, delivery: deliveryNotice(app) };
   });
 
   app.delete(
@@ -734,6 +899,309 @@ export const analyticsModule: FastifyPluginAsync = async (app) => {
         payload: { reportId, cadence: row.cadence },
       });
       return reply.status(204).send();
+    },
+  );
+
+  /**
+   * Pause, resume, re-address or re-format a schedule. A paused schedule keeps
+   * its next instant so resuming does not deliver a backlog, and every change
+   * is ledgered — a standing instruction to mail data out of the tenant is a
+   * consequential object.
+   */
+  app.patch(
+    "/analytics/reports/:reportId/schedules/:scheduleId",
+    { preHandler: gate },
+    async (req) => {
+      const { reportId, scheduleId } = req.params as { reportId: string; scheduleId: string };
+      const body = schedulePatchSchema.parse(req.body);
+      const report = requireReadable(await fetchReport(reportId, req.companyId!), req);
+      if (!canManageReport(report, req)) {
+        throw forbidden("Only the report's creator or a company admin may change its schedules");
+      }
+      const [row] = await app.db
+        .select()
+        .from(reportSchedules)
+        .where(
+          and(
+            eq(reportSchedules.id, scheduleId),
+            eq(reportSchedules.reportId, reportId),
+            eq(reportSchedules.companyId, req.companyId!),
+          ),
+        )
+        .limit(1);
+      if (!row) throw notFound("Schedule not found");
+      const nextRunAt =
+        body.active === true && row.isActive !== 1
+          ? computeNextRunAt(row.cadence as ScheduleCadence, row.dayOfPeriod)
+          : row.nextRunAt;
+      await app.db
+        .update(reportSchedules)
+        .set({
+          isActive: body.active === undefined ? row.isActive : body.active ? 1 : 0,
+          recipients: body.recipients ?? row.recipients,
+          format: body.format ?? row.format,
+          nextRunAt,
+        })
+        .where(eq(reportSchedules.id, scheduleId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "report_schedule",
+        objectId: scheduleId,
+        payload: { changed: Object.keys(body), active: body.active ?? row.isActive === 1 },
+      });
+      const [after] = await app.db
+        .select()
+        .from(reportSchedules)
+        .where(eq(reportSchedules.id, scheduleId))
+        .limit(1);
+      return { ...after, delivery: deliveryNotice(app) };
+    },
+  );
+
+  /**
+   * Run every due schedule for this tenant NOW. The scheduler runs the same
+   * function on its own clock; this is the operator's "do it now" and the seam
+   * every delivery test drives.
+   */
+  app.post(
+    "/analytics/reports/schedules/run-due",
+    { preHandler: adminGate },
+    async (req) => {
+      const out = await runDueSchedules(
+        app.db,
+        app.appConfig,
+        req.companyId!,
+        new Date(),
+        (cadence, dayOfPeriod, from) =>
+          computeNextRunAt(cadence as ScheduleCadence, dayOfPeriod, from),
+      );
+      return { ...out, delivery: deliveryNotice(app) };
+    },
+  );
+
+  /**
+   * The run history (#752). Every execution — manual, scheduled or through a
+   * dashboard — leaves a row, and a scheduled row states whether the message
+   * was actually dispatched. It is also the series a trend widget charts.
+   */
+  app.get("/analytics/reports/runs", { preHandler: gate }, async (req) => {
+    const q = runsListQuery.parse(req.query);
+    // A run row names a report and a project, so it is filtered to the reports
+    // the caller may read, exactly like the definitions list.
+    const visible = await app.db
+      .select({ id: reportDefinitions.id })
+      .from(reportDefinitions)
+      .where(
+        and(
+          eq(reportDefinitions.companyId, req.companyId!),
+          isCompanyAdmin(req)
+            ? undefined
+            : or(
+                eq(reportDefinitions.createdBy, req.user!.id),
+                eq(reportDefinitions.isShared, 1),
+              )!,
+        ),
+      );
+    const visibleIds = visible.map((r) => r.id);
+    if (visibleIds.length === 0) return paginate([], 0, q);
+    const where = and(
+      eq(reportRuns.companyId, req.companyId!),
+      inArray(reportRuns.reportId, q.reportId ? [q.reportId] : visibleIds),
+      q.reportId && !visibleIds.includes(q.reportId) ? sql`false` : undefined,
+      q.status ? eq(reportRuns.status, q.status) : undefined,
+    );
+    const [totalRow] = await app.db.select({ n: count() }).from(reportRuns).where(where);
+    const rows = await app.db
+      .select()
+      .from(reportRuns)
+      .where(where)
+      .orderBy(desc(reportRuns.createdAt))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    return paginate(
+      rows.map((r) => ({
+        ...r,
+        truncated: r.truncated === 1,
+        deliveryDispatched: r.deliveryDispatched === 1,
+      })),
+      totalRow?.n ?? 0,
+      q,
+    );
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Predictive insights (#753-758)                                    */
+  /* ---------------------------------------------------------------- */
+
+  const forecastQuery = z.object({
+    kind: z.enum(["cost_overrun", "schedule_overrun"]).optional(),
+    assetClass: z.string().min(2).max(40).optional(),
+    region: z.string().min(2).max(40).optional(),
+  });
+
+  /**
+   * The live forecast for a project. Read-only: nothing is stored, nothing is
+   * signalled — a GET that writes is a GET a prefetching browser can fire.
+   */
+  app.get(
+    "/projects/:projectId/analytics/forecast",
+    { preHandler: [app.authenticate, app.requireCompany, app.requireTool("analytics", "read")] },
+    async (req) => {
+      const q = forecastQuery.parse(req.query);
+      const kinds = q.kind ? [q.kind as ForecastKindKey] : [...FORECAST_KIND_LIST];
+      const forecasts = [];
+      for (const kind of kinds) {
+        forecasts.push(
+          await computeForecast(app.db, {
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            kind,
+            assetClass: q.assetClass ?? null,
+            region: q.region ?? null,
+          }),
+        );
+      }
+      return {
+        projectId: req.projectId!,
+        computedAt: new Date().toISOString(),
+        forecasts,
+        method:
+          "Reference-class forecasting: the project's booked growth placed in the empirical " +
+          "distribution of comparable projects. No parametric model, no smoothing — with a small " +
+          "n the probability moves in whole samples, which is why n and the contributor count are " +
+          "always returned.",
+      };
+    },
+  );
+
+  /** Freeze a forecast, so the number a contingency decision cited survives. */
+  app.post(
+    "/projects/:projectId/analytics/forecast",
+    { preHandler: [app.authenticate, app.requireCompany, app.requireTool("analytics", "standard")] },
+    async (req, reply) => {
+      const q = forecastQuery.parse(req.body ?? {});
+      const kinds = q.kind ? [q.kind as ForecastKindKey] : [...FORECAST_KIND_LIST];
+      const stored = [];
+      for (const kind of kinds) {
+        const f = await computeForecast(app.db, {
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          kind,
+          assetClass: q.assetClass ?? null,
+          region: q.region ?? null,
+        });
+        const id = await storeForecast(
+          app.db,
+          {
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            computedBy: req.user!.id,
+          },
+          f,
+        );
+        await appendLedger(app.db, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "create",
+          objectType: "analytics_forecast",
+          objectId: id,
+          projectId: req.projectId!,
+          payload: {
+            kind: f.kind,
+            probability: f.probability,
+            p80Uplift: f.p80Uplift,
+            referenceClass: f.referenceClass,
+            sampleSize: f.sampleSize,
+            reasons: f.reasons,
+          },
+          storePayload: true,
+        });
+        stored.push({ id, ...f });
+      }
+      return reply.status(201).send({ forecasts: stored });
+    },
+  );
+
+  /** The stored forecast history for a project. */
+  app.get(
+    "/projects/:projectId/analytics/forecasts",
+    { preHandler: [app.authenticate, app.requireCompany, app.requireTool("analytics", "read")] },
+    async (req) => {
+      const q = pageQuerySchema.parse(req.query);
+      const where = and(
+        eq(analyticsForecasts.companyId, req.companyId!),
+        eq(analyticsForecasts.projectId, req.projectId!),
+      );
+      const [totalRow] = await app.db.select({ n: count() }).from(analyticsForecasts).where(where);
+      const rows = await app.db
+        .select()
+        .from(analyticsForecasts)
+        .where(where)
+        .orderBy(desc(analyticsForecasts.createdAt))
+        .limit(q.pageSize)
+        .offset(pageOffset(q));
+      return paginate(rows, totalRow?.n ?? 0, q);
+    },
+  );
+
+  /**
+   * Health inputs for the intelligence layer (contract §3.5). Cheap, indexed
+   * and project-scoped: the count of open signals and obligations this project
+   * carries, plus the overrun probabilities if they are computable. A metric
+   * the platform cannot compute is `null` with a reason, never 0.
+   */
+  app.get(
+    "/projects/:projectId/analytics/health-inputs",
+    { preHandler: [app.authenticate, app.requireCompany, app.requireTool("analytics", "read")] },
+    async (req) => {
+      const reasons: string[] = [];
+      const [signalRow] = await app.db
+        .select({ n: count() })
+        .from(signals)
+        .where(
+          and(
+            eq(signals.companyId, req.companyId!),
+            eq(signals.projectId, req.projectId!),
+            inArray(signals.disposition, ["new", "under_review"]),
+          ),
+        );
+      const [obligationRow] = await app.db
+        .select({ n: count() })
+        .from(obligations)
+        .where(
+          and(
+            eq(obligations.companyId, req.companyId!),
+            eq(obligations.projectId, req.projectId!),
+            eq(obligations.status, "open"),
+          ),
+        );
+      const cost = await computeForecast(app.db, {
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        kind: "cost_overrun",
+      });
+      const schedule = await computeForecast(app.db, {
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        kind: "schedule_overrun",
+      });
+      if (cost.probability === null) reasons.push(...cost.reasons.slice(0, 2));
+      if (schedule.probability === null) reasons.push(...schedule.reasons.slice(0, 2));
+      return {
+        metrics: {
+          openSignals: signalRow?.n ?? 0,
+          openObligations: obligationRow?.n ?? 0,
+          costOverrunProbability: cost.probability,
+          scheduleOverrunProbability: schedule.probability,
+          costGrowthPct:
+            typeof cost.inputs["growthToDatePct"] === "number"
+              ? (cost.inputs["growthToDatePct"] as number)
+              : null,
+        },
+        reasons: [...new Set(reasons)],
+      };
     },
   );
 
@@ -789,7 +1257,7 @@ export const analyticsModule: FastifyPluginAsync = async (app) => {
 
   app.post("/analytics/dashboards", { preHandler: gate }, async (req, reply) => {
     const body = dashboardCreateSchema.parse(req.body);
-    if (body.projectId) await assertProjectReadable(req, body.projectId);
+    if (body.projectId) await assertProjectVisible(req, body.projectId);
     const widgets = await normalizeWidgets(req, body.widgets ?? []);
     const id = newId("dsh");
     await app.db.insert(dashboards).values({
@@ -814,12 +1282,30 @@ export const analyticsModule: FastifyPluginAsync = async (app) => {
     return reply.status(201).send(await fetchDashboard(id, req.companyId!));
   });
 
+  /**
+   * A dashboard PINNED to a project is listed for callers who reach that
+   * project; a COMPANY-WIDE dashboard (projectId null) is listed for everyone
+   * in the tenant, because it is exactly the object a company-level view is
+   * made of and its widgets are still executed under the reader's own reach.
+   *
+   * `projectId=` narrows to that project AND the company-wide ones, which is
+   * what the project workspace wants: previously a company-wide dashboard
+   * created through the API was invisible in every screen the app has.
+   */
   app.get("/analytics/dashboards", { preHandler: gate }, async (req) => {
     const q = reportListQuery.parse(req.query);
-    const clauses = [
-      eq(dashboards.companyId, req.companyId!),
-      q.projectId ? eq(dashboards.projectId, q.projectId) : undefined,
-    ].filter((c) => c !== undefined);
+    const any = await reach(req).anyReach();
+    const scopeClause = q.projectId
+      ? or(eq(dashboards.projectId, q.projectId), isNull(dashboards.projectId))!
+      : any === null
+        ? undefined
+        : any.length === 0
+          ? isNull(dashboards.projectId)
+          : or(inArray(dashboards.projectId, any), isNull(dashboards.projectId))!;
+    if (q.projectId) await assertProjectVisible(req, q.projectId);
+    const clauses = [eq(dashboards.companyId, req.companyId!), scopeClause].filter(
+      (c) => c !== undefined,
+    );
     const where = and(...clauses);
     const [totalRow] = await app.db.select({ n: count() }).from(dashboards).where(where);
     const rows = await app.db
@@ -829,12 +1315,22 @@ export const analyticsModule: FastifyPluginAsync = async (app) => {
       .orderBy(desc(dashboards.isDefault), asc(dashboards.name))
       .limit(q.pageSize)
       .offset(pageOffset(q));
-    return paginate(rows, totalRow?.n ?? 0, q);
+    return paginate(
+      rows.map((d) => ({ ...d, companyWide: d.projectId === null })),
+      totalRow?.n ?? 0,
+      q,
+    );
   });
 
   app.get("/analytics/dashboards/:dashboardId", { preHandler: gate }, async (req) => {
     const { dashboardId } = req.params as { dashboardId: string };
-    return fetchDashboard(dashboardId, req.companyId!);
+    const dash = await fetchDashboard(dashboardId, req.companyId!);
+    // The definition names project ids and report ids: reading it is reading
+    // something about the project, so it takes the same reach check its data
+    // does. Without this a member on no project could enumerate which projects
+    // have which dashboards.
+    if (dash.projectId) await assertProjectVisible(req, dash.projectId);
+    return { ...dash, companyWide: dash.projectId === null };
   });
 
   /**
@@ -847,30 +1343,53 @@ export const analyticsModule: FastifyPluginAsync = async (app) => {
   app.get("/analytics/dashboards/:dashboardId/data", { preHandler: gate }, async (req) => {
     const { dashboardId } = req.params as { dashboardId: string };
     const dash = await fetchDashboard(dashboardId, req.companyId!);
+    if (dash.projectId) await assertProjectVisible(req, dash.projectId);
     const all = (dash.widgets ?? []) as DashboardWidget[];
     const widgets = all.slice(0, MAX_DASHBOARD_WIDGETS);
+    // One batched fetch for every backing definition instead of one query per
+    // widget: a twelve-widget dashboard used to run ~60 queries, most of them
+    // recomputing the same membership set.
+    const reportIds = [...new Set(widgets.map((w) => w.reportId).filter((v): v is string => !!v))];
+    const reportRows = reportIds.length
+      ? await app.db
+          .select()
+          .from(reportDefinitions)
+          .where(
+            and(
+              eq(reportDefinitions.companyId, req.companyId!),
+              inArray(reportDefinitions.id, reportIds),
+            ),
+          )
+      : [];
+    const reportsById = new Map(reportRows.map((r) => [r.id, r]));
+    const metricReach = dash.projectId ? null : await reach(req).anyReach();
     const results = [];
     for (const w of widgets) {
       const base = { widgetId: w.id, kind: w.kind, title: w.title, span: w.span };
       try {
         if (w.reportId) {
-          const report = requireReadable(await fetchReport(w.reportId, req.companyId!), req);
-          const projectId = await resolveRunScope(req, report.projectId ?? dash.projectId, null);
-          const data = await runSpec(req, specFromRow(report), projectId, {
+          const found = reportsById.get(w.reportId);
+          if (!found) throw notFound("Report not found");
+          const report = requireReadable(found, req);
+          const projectId = await resolveRunScope(
+            req,
+            report.dataset,
+            report.projectId ?? dash.projectId,
+            null,
+          );
+          const { result, scope } = await runSpec(req, specFromRow(report), projectId, {
             pageSize: Math.min(report.limitRows, WIDGET_ROW_CAP),
             offset: 0,
           });
-          results.push({ ...base, reportId: report.id, data });
+          results.push({ ...base, reportId: report.id, data: result, scope });
         } else if (w.metric) {
           if (!Object.hasOwn(METRICS, w.metric)) throw badRequest(`Unknown metric "${w.metric}"`);
           const metric = METRICS[w.metric]!;
-          // A metric reads rows too, so it takes the same reach check a report
-          // widget gets from resolveRunScope.
-          if (dash.projectId) await assertProjectReadable(req, dash.projectId);
+          if (dash.projectId) await assertProjectVisible(req, dash.projectId);
           const value = await metric.run(app.db, {
             companyId: req.companyId!,
             projectId: dash.projectId,
-            projectIds: dash.projectId ? null : await reachableProjectIds(req),
+            projectIds: metricReach,
           });
           results.push({ ...base, metric: w.metric, data: { label: metric.label, value } });
         } else {
@@ -895,7 +1414,7 @@ export const analyticsModule: FastifyPluginAsync = async (app) => {
     if (!canManageDashboard(row, req)) {
       throw forbidden("Only the dashboard's creator or a company admin may edit it");
     }
-    if (body.projectId) await assertProjectReadable(req, body.projectId);
+    if (body.projectId) await assertProjectVisible(req, body.projectId);
     const widgets = body.widgets ? await normalizeWidgets(req, body.widgets) : row.widgets;
     await app.db
       .update(dashboards)
@@ -1109,7 +1628,7 @@ export const analyticsModule: FastifyPluginAsync = async (app) => {
    */
   app.post("/analytics/dashboards/seed-defaults", { preHandler: gate }, async (req, reply) => {
     const { projectId } = seedSchema.parse(req.body);
-    await assertProjectReadable(req, projectId);
+    await assertProjectVisible(req, projectId);
     const companyId = req.companyId!;
 
     const existingReports = await app.db

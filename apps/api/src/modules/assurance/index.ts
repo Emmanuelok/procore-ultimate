@@ -96,7 +96,6 @@ import {
   resolveLevel,
   type AssuranceRole,
   type PermissionLevel,
-  type ScreeningList,
   type SignalSeverity,
   type ToolPermissionMap,
 } from "@constructos/shared";
@@ -117,7 +116,6 @@ import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { isExpired } from "../../lib/time.js";
 import { pushNotifications } from "../notifications/service.js";
 import {
-  DETECTOR_NAMES,
   approvalVelocity,
   benfordFirstDigit,
   contradictedClaimant,
@@ -126,7 +124,6 @@ import {
   roundNumberClustering,
   segregationOfDuties,
   sortedIds,
-  type DetectorName,
   type SignalDraft,
 } from "./detectors.js";
 import {
@@ -159,8 +156,6 @@ import {
   RECONCILERS,
   autoReconcile,
   effectiveIndependence,
-  reconcilersFor,
-  runReconciler,
   type AssertionLike,
   type EvidenceLike,
   type TolerancePolicy,

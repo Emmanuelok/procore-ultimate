@@ -108,9 +108,21 @@ export default function CommitmentDrawer({
   const tabs = useMemo(
     () => [
       { value: "overview" as const, label: "Overview" },
-      { value: "sov" as const, label: "Schedule of values", count: data?.sovLines.length },
-      { value: "changes" as const, label: "Change orders", count: data?.changes.length },
-      { value: "payments" as const, label: "Payments", count: data?.payments.length },
+      {
+        value: "sov" as const,
+        label: "Schedule of values",
+        count: data?.sovLines.length,
+      },
+      {
+        value: "changes" as const,
+        label: "Change orders",
+        count: data?.changes.length,
+      },
+      {
+        value: "payments" as const,
+        label: "Payments",
+        count: data?.payments.length,
+      },
       {
         value: "compliance" as const,
         label: "Compliance",
@@ -599,7 +611,11 @@ function Overview({
       );
     }
     return {
-      rows: [...byLine.entries()].map(([id, value]) => ({ id, value, budget: budgetById.get(id) })),
+      rows: [...byLine.entries()].map(([id, value]) => ({
+        id,
+        value,
+        budget: budgetById.get(id),
+      })),
       unbound: Number(unbound.toFixed(2)),
     };
   }, [detail.sovLines, budgetById]);
@@ -620,8 +636,7 @@ function Overview({
     },
     {
       label: "Payment terms",
-      value:
-        c.paymentTermsDays === null ? "not recorded" : `${c.paymentTermsDays} days`,
+      value: c.paymentTermsDays === null ? "not recorded" : `${c.paymentTermsDays} days`,
     },
     {
       label: "Lien waiver",
@@ -629,10 +644,19 @@ function Overview({
     },
     { label: "Contract date", value: isoDate(c.contractDate) },
     { label: "Start", value: isoDate(c.startDate) },
-    { label: "Estimated completion", value: isoDate(c.estimatedCompletionDate) },
+    {
+      label: "Estimated completion",
+      value: isoDate(c.estimatedCompletionDate),
+    },
     { label: "Actual completion", value: isoDate(c.actualCompletionDate) },
-    { label: "Signed contract received", value: isoDate(c.signedContractReceivedDate) },
-    { label: "Executed", value: c.executed === 1 ? isoDate(c.executionDate) : "not executed" },
+    {
+      label: "Signed contract received",
+      value: isoDate(c.signedContractReceivedDate),
+    },
+    {
+      label: "Executed",
+      value: c.executed === 1 ? isoDate(c.executionDate) : "not executed",
+    },
   ];
   if (c.kind === "purchase_order") {
     items.push(
@@ -697,8 +721,8 @@ function Overview({
                         </>
                       ) : (
                         <span className="text-content-subtle">
-                          <span className="font-mono">{row.id}</span> — not on the active budget,
-                          so no budget figure is available for it
+                          <span className="font-mono">{row.id}</span> — not on the active budget, so
+                          no budget figure is available for it
                         </span>
                       )}
                     </td>
@@ -723,9 +747,7 @@ function Overview({
                 ))}
                 {consumption.unbound !== 0 ? (
                   <tr>
-                    <td className="py-1 text-warning-fg">
-                      Not bound to any budget line
-                    </td>
+                    <td className="py-1 text-warning-fg">Not bound to any budget line</td>
                     <td className="py-1 text-right font-mono tabular-nums text-warning-fg">
                       {money(consumption.unbound, c.currency)}
                     </td>
@@ -750,11 +772,7 @@ function Overview({
               <code className="font-mono text-content-muted">{check.identity}</code>
               <span className="font-mono tabular-nums">
                 {money(check.left, c.currency)} vs {money(check.right, c.currency)}
-                <Badge
-                  tone={check.reconciles ? "success" : "danger"}
-                  size="xs"
-                  className="ml-2"
-                >
+                <Badge tone={check.reconciles ? "success" : "danger"} size="xs" className="ml-2">
                   {check.reconciles ? "ok" : `off by ${money(check.delta, c.currency)}`}
                 </Badge>
               </span>

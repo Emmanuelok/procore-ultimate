@@ -286,14 +286,19 @@ export function priceLine(input: PriceLineInput): PricedLine {
       })
     : null;
   if (buildUp && buildUp.hoursPerUnit !== null) {
-    // An explicit typed labour rate wins over the build-up: a person who
-    // overrode the crew rate meant it. Everything else is filled in.
-    rates = {
-      ...rates,
-      labour: rates.labour !== 0 ? rates.labour : buildUp.labourRate,
-      equipment: rates.equipment !== 0 ? rates.equipment : buildUp.equipmentRate,
-    };
-    basis.push(`Labour rate: ${buildUp.reason}`);
+    // The build-up replaces the labour AND plant half of the rate as a unit,
+    // and only when neither is already priced. A line that already carries a
+    // labour or plant rate came from somewhere — a catalogue item, a quote, a
+    // person — and quietly adding crew cost on top of it is how a rate ends up
+    // 6% higher than the library it was taken from with nobody able to say why.
+    if (rates.labour === 0 && rates.equipment === 0) {
+      rates = { ...rates, labour: buildUp.labourRate, equipment: buildUp.equipmentRate };
+      basis.push(`Labour rate: ${buildUp.reason}`);
+    } else {
+      basis.push(
+        `Crew build-up NOT applied: the line already carries a labour or plant rate (${round2(rates.labour)} / ${round2(rates.equipment)}). The crew is kept for the labour-hour count only.`,
+      );
+    }
   } else if (buildUp) {
     basis.push(buildUp.reason);
   }

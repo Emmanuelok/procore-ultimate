@@ -16,7 +16,7 @@
  */
 
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, ilike, inArray } from "drizzle-orm";
+import { and, asc, count, desc, eq, ilike, inArray, isNotNull, lt } from "drizzle-orm";
 import { z } from "zod";
 import {
   changeEvents,
@@ -55,7 +55,9 @@ import {
   ledger,
   nowISO,
   pad3,
+  pad4,
   round2,
+  todayISO,
 } from "./shared.js";
 import { createNcr } from "./raise.js";
 import { sweepQuality } from "./sweeps.js";
@@ -101,7 +103,6 @@ const ncrPatchSchema = z.object({
   description: z.string().min(1).max(20_000).optional(),
   category: z.enum(NCR_CATEGORIES).optional(),
   severity: z.enum(NCR_SEVERITIES).optional(),
-  status: z.enum(["open", "under_review", "void"]).optional(),
   raisedAgainstVendorId: idSchema.nullable().optional(),
   commitmentId: idSchema.nullable().optional(),
   specSectionId: idSchema.nullable().optional(),
@@ -195,6 +196,9 @@ const backchargeSchema = z.object({
 
 const reopenSchema = z.object({ reason: z.string().min(1).max(10_000) });
 
+/** Voiding and sending back are decisions; both must carry their reason. */
+const voidSchema = z.object({ reason: z.string().min(1).max(10_000) });
+
 const NCR_OPEN_STATUSES = [
   "open",
   "under_review",
@@ -209,7 +213,6 @@ const NCR_PATCH_COLUMNS = [
   "description",
   "category",
   "severity",
-  "status",
   "raisedAgainstVendorId",
   "commitmentId",
   "specSectionId",
@@ -419,27 +422,31 @@ export const ncrRoutes: FastifyPluginAsync = async (app) => {
     if (q.vendorId) clauses.push(eq(nonConformanceReports.raisedAgainstVendorId, q.vendorId));
     if (q.assetId) clauses.push(eq(nonConformanceReports.assetId, q.assetId));
     if (q.search) clauses.push(ilike(nonConformanceReports.title, `%${q.search}%`));
+    /*
+     * OVERDUE IS A SQL PREDICATE, not a filter applied to the page.
+     *
+     * Filtering after limit/offset returned short pages against a total that
+     * counted every NCR, so a caller paging through overdue responses saw
+     * empty pages and a misleading count. Expressed here it bounds both the
+     * page and the total.
+     */
+    if (q.overdueOnly) {
+      clauses.push(isNotNull(nonConformanceReports.responseDueDate));
+      clauses.push(lt(nonConformanceReports.responseDueDate, todayISO()));
+      if (!q.status) clauses.push(inArray(nonConformanceReports.status, NCR_OPEN_STATUSES));
+    }
     const where = and(...clauses);
     const [totalRow] = await app.db
       .select({ n: count() })
       .from(nonConformanceReports)
       .where(where);
-    let items = await app.db
+    const items = await app.db
       .select()
       .from(nonConformanceReports)
       .where(where)
       .orderBy(desc(nonConformanceReports.number))
       .limit(q.pageSize)
       .offset(pageOffset(q));
-    if (q.overdueOnly) {
-      const today = new Date().toISOString().slice(0, 10);
-      items = items.filter(
-        (n) =>
-          n.responseDueDate !== null &&
-          n.responseDueDate < today &&
-          NCR_OPEN_STATUSES.includes(n.status),
-      );
-    }
     return paginate(items, Number(totalRow?.n ?? 0), q);
   });
 
@@ -688,7 +695,19 @@ export const ncrRoutes: FastifyPluginAsync = async (app) => {
       const body = actionCreateSchema.parse(req.body);
       const ncr = await fetchNcr(ncrId, req.companyId!, req.projectId!);
       if (body.ownerVendorId) await assertVendor(app.db, req.companyId!, body.ownerVendorId);
-      const number = await nextRecordNumber(app.db, req.projectId!, "corrective_action");
+      /*
+       * ONE COUNTER FOR ONE TABLE.
+       *
+       * Corrective actions raised here and corrective actions raised from an
+       * incident, an observation or an inspection land in the same table,
+       * which carries a unique index on (projectId, number). Allocating from a
+       * register-specific counter meant both registers issued number 1 on the
+       * same project and the second insert died on a unique violation — a 500
+       * on whichever route was used second. The counter key and the reference
+       * format below are the SAME ones modules/safety/index.ts uses, on
+       * purpose: the register is shared, so the sequence is shared.
+       */
+      const number = await nextRecordNumber(app.db, req.projectId!, "safety_corrective_action");
       const id = newId("sca");
       const [created] = await app.db
         .insert(safetyCorrectiveActions)
@@ -697,7 +716,7 @@ export const ncrRoutes: FastifyPluginAsync = async (app) => {
           companyId: req.companyId!,
           projectId: req.projectId!,
           number,
-          reference: `CA-${pad3(number)}`,
+          reference: `CA-${pad4(number)}`,
           sourceType: "ncr",
           sourceId: ncrId,
           sourceReference: ncr.reference,
@@ -740,7 +759,7 @@ export const ncrRoutes: FastifyPluginAsync = async (app) => {
             userId: body.ownerId,
             projectId: req.projectId!,
             kind: "assignment",
-            title: `Corrective action CA-${pad3(number)} from ${ncr.reference}: ${body.title}`,
+            title: `Corrective action CA-${pad4(number)} from ${ncr.reference}: ${body.title}`,
             recordType: "safety_corrective_action",
             recordId: id,
           },
@@ -896,6 +915,114 @@ export const ncrRoutes: FastifyPluginAsync = async (app) => {
     });
     return fetchNcr(ncrId, req.companyId!, req.projectId!);
   });
+
+  /**
+   * VOID an NCR — it should never have been raised.
+   *
+   * This exists because the generic PATCH used to accept `status`, which let
+   * an NCR be walked backwards from `disposition_approved` to `open` while
+   * `dispositionApprovedBy` stayed populated. The close route only checks that
+   * the column is set, so the approval of a superseded disposition went on
+   * authorising a closure nobody had approved. Voiding is now an explicit act
+   * with a reason, and it CLEARS the approval columns rather than leaving them
+   * pointing at a decision that no longer applies.
+   */
+  app.post("/projects/:projectId/ncrs/:ncrId/void", { preHandler: standardGate }, async (req) => {
+    const { ncrId } = req.params as { ncrId: string };
+    const body = voidSchema.parse(req.body);
+    const ncr = await fetchNcr(ncrId, req.companyId!, req.projectId!);
+    if (ncr.status === "void") throw badRequest(`${ncr.reference} is already void.`);
+    if (ncr.status === "closed") {
+      throw badRequest(
+        `${ncr.reference} is closed. A closed non-conformance is history; reopen it with a reason if the closure was wrong.`,
+      );
+    }
+    const at = nowISO();
+    await app.db
+      .update(nonConformanceReports)
+      .set({
+        status: "void",
+        disposition: "pending",
+        dispositionProposedBy: null,
+        dispositionProposedAt: null,
+        dispositionApprovedBy: null,
+        dispositionApprovedAt: null,
+        detail: { ...(ncr.detail as Record<string, unknown>), voidReason: body.reason },
+        updatedAt: at,
+      })
+      .where(eq(nonConformanceReports.id, ncrId));
+    await ledger(app.db, {
+      companyId: req.companyId!,
+      projectId: req.projectId!,
+      actorId: req.user!.id,
+      action: "state_change",
+      objectType: "non_conformance_report",
+      objectId: ncrId,
+      payload: {
+        from: ncr.status,
+        to: "void",
+        reason: body.reason,
+        clearedDisposition: ncr.disposition,
+        clearedApprovalBy: ncr.dispositionApprovedBy,
+      },
+      storePayload: true,
+    });
+    return fetchNcr(ncrId, req.companyId!, req.projectId!);
+  });
+
+  /**
+   * SEND BACK — the disposition needs rethinking. The approval is cleared with
+   * it, because an approval belongs to the disposition it approved.
+   */
+  app.post(
+    "/projects/:projectId/ncrs/:ncrId/send-back",
+    { preHandler: standardGate },
+    async (req) => {
+      const { ncrId } = req.params as { ncrId: string };
+      const body = voidSchema.parse(req.body);
+      const ncr = await fetchNcr(ncrId, req.companyId!, req.projectId!);
+      if (["closed", "void"].includes(ncr.status)) {
+        throw badRequest(`${ncr.reference} is ${ncr.status}.`);
+      }
+      if (ncr.status === "open" || ncr.status === "under_review") {
+        throw badRequest(
+          `${ncr.reference} is ${ncr.status}; there is no disposition to send back yet.`,
+        );
+      }
+      const at = nowISO();
+      await app.db
+        .update(nonConformanceReports)
+        .set({
+          status: "under_review",
+          disposition: "pending",
+          dispositionProposedBy: null,
+          dispositionProposedAt: null,
+          dispositionApprovedBy: null,
+          dispositionApprovedAt: null,
+          detail: { ...(ncr.detail as Record<string, unknown>), lastSendBackReason: body.reason },
+          updatedAt: at,
+        })
+        .where(eq(nonConformanceReports.id, ncrId));
+      await ledger(app.db, {
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "non_conformance_report",
+        objectId: ncrId,
+        payload: {
+          from: ncr.status,
+          to: "under_review",
+          reason: body.reason,
+          clearedDisposition: ncr.disposition,
+          clearedProposedBy: ncr.dispositionProposedBy,
+          clearedApprovedBy: ncr.dispositionApprovedBy,
+        },
+        storePayload: true,
+      });
+      return fetchNcr(ncrId, req.companyId!, req.projectId!);
+    },
+  );
 
   /* ---------------------------------------------------------------- */
   /* Backcharge — the commercial consequence                           */

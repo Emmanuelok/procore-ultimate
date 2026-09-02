@@ -114,12 +114,34 @@ const activityCreateSchema = z.object({
   detail: z.record(z.string(), z.unknown()).optional(),
 });
 
+/**
+ * NOTE ON `status`: it is deliberately NOT patchable.
+ *
+ * It used to be. That meant anybody holding quality:standard could PATCH an
+ * unreleased hold point straight to `closed` or `not_applicable` — both
+ * terminal — which dropped it out of the open count, let the plan be closed,
+ * removed it from the overdue sweep and recorded no verifying party, no reason
+ * and no second pair of eyes. The entire control the module exists to carry
+ * was one PATCH away from being switched off. Status now moves only through
+ * the explicit transitions below, each of which records who and why.
+ */
 const activityPatchSchema = activityCreateSchema.partial().extend({
   actualDate: isoDateSchema.nullable().optional(),
   checklistId: idSchema.nullable().optional(),
   testRecordId: idSchema.nullable().optional(),
-  status: z.enum(["pending", "failed", "closed", "not_applicable"]).optional(),
 });
+
+const failActivitySchema = z.object({
+  reason: z.string().min(1).max(4000),
+  checklistId: idSchema.nullable().optional(),
+  ncrId: idSchema.nullable().optional(),
+});
+
+const notApplicableSchema = z.object({ reason: z.string().min(1).max(4000) });
+
+const closeActivitySchema = z.object({ note: z.string().max(4000).nullable().optional() });
+
+const reopenActivitySchema = z.object({ reason: z.string().min(1).max(4000) });
 
 const notifySchema = z.object({
   method: z.string().min(1).max(200),
@@ -199,12 +221,7 @@ const ACTIVITY_PLAN_COLUMNS = [
   "detail",
 ] as const;
 
-const ACTIVITY_EXECUTION_COLUMNS = [
-  "actualDate",
-  "checklistId",
-  "testRecordId",
-  "status",
-] as const;
+const ACTIVITY_EXECUTION_COLUMNS = ["actualDate", "checklistId", "testRecordId"] as const;
 
 /* ------------------------------------------------------------------ */
 /* Routes                                                              */
@@ -540,6 +557,15 @@ export const itpRoutes: FastifyPluginAsync = async (app) => {
   app.post("/projects/:projectId/itps/:itpId/close", { preHandler: standardGate }, async (req) => {
     const { itpId } = req.params as { itpId: string };
     const itp = await fetchItp(itpId, req.companyId!, req.projectId!);
+    // A plan is closed at the END of its life, not instead of one: closing a
+    // draft would leave a plan that was never agreed sitting in the register
+    // as if its hold points had been worked through, and closing a superseded
+    // revision would close the wrong document.
+    if (!["approved", "approved_as_noted", "active"].includes(itp.status)) {
+      throw badRequest(
+        `${itp.reference} is ${itp.status}. A plan is closed once it has been agreed and worked through; a ${itp.status} plan has nothing to close.`,
+      );
+    }
     const acts = await loadActivities(itpId);
     const open = acts.filter((a) => !isTerminalActivityStatus(a.status));
     if (open.length > 0) {
@@ -1016,6 +1042,227 @@ export const itpRoutes: FastifyPluginAsync = async (app) => {
         objectType: "itp_activity",
         objectId: activityId,
         payload: { from: activity.status, to: "waived", waivedBy: req.user!.id, reason: body.reason },
+        storePayload: true,
+      });
+      return decorate(await fetchActivity(activityId, itpId, req.projectId!), Date.now());
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Explicit activity transitions                                     */
+  /*                                                                    */
+  /* Each one records WHO and WHY. They replace a patchable status,     */
+  /* which let a hold point be closed with neither.                     */
+  /* ---------------------------------------------------------------- */
+
+  /** The verification was carried out and the work did not pass. */
+  app.post(
+    "/projects/:projectId/itps/:itpId/activities/:activityId/fail",
+    { preHandler: standardGate },
+    async (req) => {
+      const { itpId, activityId } = req.params as { itpId: string; activityId: string };
+      const body = failActivitySchema.parse(req.body);
+      await fetchItp(itpId, req.companyId!, req.projectId!);
+      const activity = await fetchActivity(activityId, itpId, req.projectId!);
+      if (isTerminalActivityStatus(activity.status)) {
+        throw badRequest(
+          `Activity "${activity.activityCode ?? activity.activity}" is already ${activity.status}; a finished point is not failed retrospectively. Reopen it first if the verification is being redone.`,
+        );
+      }
+      const at = nowISO();
+      await app.db
+        .update(itpActivities)
+        .set({
+          status: "failed",
+          actualDate: activity.actualDate ?? todayISO(),
+          checklistId: body.checklistId ?? activity.checklistId,
+          ncrId: body.ncrId ?? activity.ncrId,
+          detail: { ...(activity.detail as Record<string, unknown>), failureReason: body.reason },
+          updatedAt: at,
+        })
+        .where(eq(itpActivities.id, activityId));
+      await refreshCounters(itpId);
+      await ledger(app.db, {
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "itp_activity",
+        objectId: activityId,
+        payload: { from: activity.status, to: "failed", reason: body.reason, ncrId: body.ncrId ?? null },
+        storePayload: true,
+      });
+      return decorate(await fetchActivity(activityId, itpId, req.projectId!), Date.now());
+    },
+  );
+
+  /**
+   * The point does not apply to the work as built. Terminal, so it is
+   * segregated exactly like a release: the person who raised or served notice
+   * on a hold or witness point may not be the person who decides it never
+   * applied. The reason is mandatory, and it is what a challenge is answered
+   * with.
+   */
+  app.post(
+    "/projects/:projectId/itps/:itpId/activities/:activityId/not-applicable",
+    { preHandler: standardGate },
+    async (req) => {
+      const { itpId, activityId } = req.params as { itpId: string; activityId: string };
+      const body = notApplicableSchema.parse(req.body);
+      const itp = await fetchItp(itpId, req.companyId!, req.projectId!);
+      const activity = await fetchActivity(activityId, itpId, req.projectId!);
+      if (isTerminalActivityStatus(activity.status)) {
+        throw badRequest(`Activity "${activity.activityCode ?? activity.activity}" is already ${activity.status}.`);
+      }
+      if (activity.interventionPoint === "hold_point" || activity.interventionPoint === "witness_point") {
+        assertDistinctActor(
+          req.user!.id,
+          activity.notifiedBy ?? itp.createdBy,
+          `Marking ${activity.interventionPoint.replace(/_/g, " ")} "${activity.activityCode ?? activity.activity}" not applicable`,
+          activity.notifiedBy ? "served notice on" : "raised",
+        );
+      }
+      const at = nowISO();
+      await app.db
+        .update(itpActivities)
+        .set({
+          status: "not_applicable",
+          detail: {
+            ...(activity.detail as Record<string, unknown>),
+            notApplicableReason: body.reason,
+            notApplicableBy: req.user!.id,
+            notApplicableAt: at,
+          },
+          updatedAt: at,
+        })
+        .where(eq(itpActivities.id, activityId));
+      await refreshCounters(itpId);
+      await ledger(app.db, {
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "itp_activity",
+        objectId: activityId,
+        payload: {
+          from: activity.status,
+          to: "not_applicable",
+          reason: body.reason,
+          interventionPoint: activity.interventionPoint,
+          raisedBy: activity.notifiedBy ?? itp.createdBy,
+        },
+        storePayload: true,
+      });
+      return decorate(await fetchActivity(activityId, itpId, req.projectId!), Date.now());
+    },
+  );
+
+  /**
+   * Administratively finish a point whose record has been made. A hold point
+   * may only be closed once it has been released or waived — closing an
+   * unreleased hold point is the exact move the register exists to prevent.
+   */
+  app.post(
+    "/projects/:projectId/itps/:itpId/activities/:activityId/close",
+    { preHandler: standardGate },
+    async (req) => {
+      const { itpId, activityId } = req.params as { itpId: string; activityId: string };
+      const body = closeActivitySchema.parse(req.body ?? {});
+      await fetchItp(itpId, req.companyId!, req.projectId!);
+      const activity = await fetchActivity(activityId, itpId, req.projectId!);
+      if (activity.status === "closed") {
+        throw badRequest(`Activity "${activity.activityCode ?? activity.activity}" is already closed.`);
+      }
+      if (
+        (activity.interventionPoint === "hold_point" || activity.interventionPoint === "witness_point") &&
+        activity.status !== "released" &&
+        activity.status !== "waived"
+      ) {
+        throw badRequest(
+          `${activity.interventionPoint.replace(/_/g, " ")} "${activity.activityCode ?? activity.activity}" is ${activity.status}. ` +
+            `It is closed once it has been released by its verifying party or waived in writing — closing it while it is outstanding would ` +
+            `drop it from the open count and from the overdue sweep without anybody having verified anything.`,
+        );
+      }
+      const at = nowISO();
+      await app.db
+        .update(itpActivities)
+        .set({
+          status: "closed",
+          actualDate: activity.actualDate ?? todayISO(),
+          detail: { ...(activity.detail as Record<string, unknown>), closeNote: body.note ?? null },
+          updatedAt: at,
+        })
+        .where(eq(itpActivities.id, activityId));
+      await refreshCounters(itpId);
+      await ledger(app.db, {
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "itp_activity",
+        objectId: activityId,
+        payload: { from: activity.status, to: "closed", note: body.note ?? null },
+        storePayload: true,
+      });
+      return decorate(await fetchActivity(activityId, itpId, req.projectId!), Date.now());
+    },
+  );
+
+  /**
+   * Reopen a finished point. It CLEARS the release and waiver columns: a
+   * reopened point that still carried `releasedBy` would read as released by
+   * somebody who released a different piece of work.
+   */
+  app.post(
+    "/projects/:projectId/itps/:itpId/activities/:activityId/reopen",
+    { preHandler: standardGate },
+    async (req) => {
+      const { itpId, activityId } = req.params as { itpId: string; activityId: string };
+      const body = reopenActivitySchema.parse(req.body);
+      await fetchItp(itpId, req.companyId!, req.projectId!);
+      const activity = await fetchActivity(activityId, itpId, req.projectId!);
+      if (activity.status === "pending" || activity.status === "notified") {
+        throw badRequest(
+          `Activity "${activity.activityCode ?? activity.activity}" is ${activity.status} and is already open.`,
+        );
+      }
+      const at = nowISO();
+      await app.db
+        .update(itpActivities)
+        .set({
+          status: activity.notifiedAt ? "notified" : "pending",
+          releasedBy: null,
+          releasedAt: null,
+          releaseNote: null,
+          waivedBy: null,
+          waivedAt: null,
+          waiverReason: null,
+          detail: {
+            ...(activity.detail as Record<string, unknown>),
+            lastReopenReason: body.reason,
+            reopenedFrom: activity.status,
+            reopenedBy: req.user!.id,
+            reopenedAt: at,
+          },
+          updatedAt: at,
+        })
+        .where(eq(itpActivities.id, activityId));
+      await refreshCounters(itpId);
+      await ledger(app.db, {
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "itp_activity",
+        objectId: activityId,
+        payload: {
+          from: activity.status,
+          to: activity.notifiedAt ? "notified" : "pending",
+          reason: body.reason,
+          clearedReleasedBy: activity.releasedBy,
+          clearedWaivedBy: activity.waivedBy,
+        },
         storePayload: true,
       });
       return decorate(await fetchActivity(activityId, itpId, req.projectId!), Date.now());

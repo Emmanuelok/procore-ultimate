@@ -138,7 +138,10 @@ export default function SovPanel({
         header: "Budget line",
         headerTooltip:
           "The budget line this commitment consumes. Committed cost on the budget is re-derived from these bindings on every consequential write.",
-        accessor: (row) => (row.budgetLineItemId ? (budgetByLine.get(row.budgetLineItemId)?.costCode ?? row.budgetLineItemId) : ""),
+        accessor: (row) =>
+          row.budgetLineItemId
+            ? (budgetByLine.get(row.budgetLineItemId)?.costCode ?? row.budgetLineItemId)
+            : "",
         type: "text",
         width: 210,
         truncate: false,
@@ -355,8 +358,8 @@ export default function SovPanel({
         <Alert tone="info" size="sm" title={`This commitment is ${commitment.status}`}>
           Its schedule of values is fixed. Scheduled value, quantity, unit rate and retainage are
           not editable here because the API refuses them — the commitment sum moves only through
-          change orders once it is approved. Description, cost coding and the budget binding
-          remain editable.
+          change orders once it is approved. Description, cost coding and the budget binding remain
+          editable.
         </Alert>
       ) : null}
       {dead ? (
@@ -397,7 +400,10 @@ export default function SovPanel({
           const value = change.value;
           setPending((prev) => {
             const next = new Map(prev);
-            next.set(change.rowId, { ...(next.get(change.rowId) ?? {}), scheduledValue: value });
+            next.set(change.rowId, {
+              ...(next.get(change.rowId) ?? {}),
+              scheduledValue: value,
+            });
             return next;
           });
         }}
@@ -524,8 +530,9 @@ function AddLine({
       <div className="space-y-3">
         <RefusalPanel refusal={refusal} onDismiss={clear} title="This line was refused" />
         <p className="text-meta text-content-subtle">
-          The schedule IS the commitment sum, so adding {money(Number.isFinite(amount) ? amount : 0, currency)}{" "}
-          here raises the sum by exactly that.
+          The schedule IS the commitment sum, so adding{" "}
+          {money(Number.isFinite(amount) ? amount : 0, currency)} here raises the sum by exactly
+          that.
         </p>
         <div className="grid gap-3 sm:grid-cols-2">
           <Field label="Line number" hint="Left blank, the next number is allocated.">
@@ -580,7 +587,9 @@ function ReplaceSchedule({
 
   async function submit() {
     const ok = await run("replace", () =>
-      api.put(`/api/v1/commitments/${commitment.id}/sov`, { lines: parsed.lines }),
+      api.put(`/api/v1/commitments/${commitment.id}/sov`, {
+        lines: parsed.lines,
+      }),
     );
     if (ok !== null) {
       setCsv("");
@@ -622,7 +631,11 @@ function ReplaceSchedule({
           <Textarea rows={10} value={csv} onChange={(e) => setCsv(e.target.value)} />
         </Field>
         {parsed.problems.length > 0 ? (
-          <Alert tone="danger" size="sm" title={`${parsed.problems.length} row(s) could not be read`}>
+          <Alert
+            tone="danger"
+            size="sm"
+            title={`${parsed.problems.length} row(s) could not be read`}
+          >
             <ul className="list-disc pl-4">
               {parsed.problems.map((p) => (
                 <li key={p}>{p}</li>

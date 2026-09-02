@@ -522,20 +522,23 @@ async function plantSelfApproval(): Promise<void> {
 }
 
 async function plantRubberStamping(): Promise<void> {
-  // A starts a 3-signature workflow; B approves all three seconds after
-  // assignment (well under the 60s plausible-review floor).
-  const steps = await startWorkflow(
-    ctx.ownerA,
-    ctx.plantedProjectId,
-    "Variation order triple sign-off",
-    [
-      { name: "Commercial review", assigneeId: ctx.memberB.userId, parallel: true },
-      { name: "Technical review", assigneeId: ctx.memberB.userId, parallel: true },
-      { name: "Final approval", assigneeId: ctx.memberB.userId, parallel: true },
-    ],
-    { recordType: "variation_order", recordId: "VO-017" },
-  );
-  for (const step of steps) await approveStep(ctx.memberB, step.id);
+  // B approves three separate variation orders seconds after each is assigned
+  // (well under the 60s plausible-review floor). Three SEPARATE instances
+  // rather than three parallel steps on one: `workflow_steps_uq` is unique on
+  // (instanceId, position, assigneeId), so one assignee cannot legitimately
+  // hold several parallel steps at the same position — and the detector groups
+  // fast approvals by ASSIGNEE across instances anyway, which is the pattern
+  // being planted.
+  for (const [i, name] of ["Commercial review", "Technical review", "Final approval"].entries()) {
+    const steps = await startWorkflow(
+      ctx.ownerA,
+      ctx.plantedProjectId,
+      `Variation order sign-off ${i + 1}`,
+      [{ name, assigneeId: ctx.memberB.userId }],
+      { recordType: "variation_order", recordId: `VO-01${i + 7}` },
+    );
+    await approveStep(ctx.memberB, steps[0]!.id);
+  }
 }
 
 async function plantOverCertification(): Promise<void> {

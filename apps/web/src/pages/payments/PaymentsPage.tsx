@@ -4,10 +4,11 @@
  * register with the deadline radar and deemed-liability surfacing,
  * days-to-pay analytics and the claim drawer's statutory timeline.
  */
-import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from "react";
-import { useParams } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useParams, useSearchParams } from "react-router-dom";
 import { api, ApiClientError } from "../../lib/api";
 import {
+  Alert,
   Badge,
   Button,
   Card,
@@ -21,6 +22,7 @@ import {
   Select,
   Spinner,
   Table,
+  Tabs,
   Td,
   Textarea,
   Th,
@@ -42,6 +44,20 @@ import {
   type ValuationLite,
 } from "./paymentsShared";
 import PaymentClaimDrawer from "./PaymentClaimDrawer";
+import AdjudicationTab from "./AdjudicationTab";
+import LiensTab from "./LiensTab";
+import ReportingTab from "./ReportingTab";
+import SecurityTab from "./SecurityTab";
+
+const TABS = [
+  { value: "claims", label: "Payment claims" },
+  { value: "liens", label: "Liens & notices" },
+  { value: "security", label: "Trusts & PBAs" },
+  { value: "adjudication", label: "Adjudication" },
+  { value: "reporting", label: "Payment practice" },
+] as const;
+
+type TabKey = (typeof TABS)[number]["value"];
 
 const PAGE_SIZE = 25;
 
@@ -83,7 +99,22 @@ function radarChipClass(days: number): string {
 
 export default function PaymentsPage() {
   const { projectId } = useParams<{ projectId: string }>();
+  const [params, setParams] = useSearchParams();
   const base = `/api/v1/projects/${projectId}`;
+
+  const tab = useMemo<TabKey>(() => {
+    const requested = params.get("tab");
+    return TABS.some((t) => t.value === requested) ? (requested as TabKey) : "claims";
+  }, [params]);
+
+  const selectTab = useCallback(
+    (next: TabKey) => {
+      const p = new URLSearchParams(params);
+      p.set("tab", next);
+      setParams(p, { replace: true });
+    },
+    [params, setParams],
+  );
 
   const [items, setItems] = useState<PaymentClaimRow[] | null>(null);
   const [total, setTotal] = useState(0);
@@ -91,13 +122,17 @@ export default function PaymentsPage() {
   const [analytics, setAnalytics] = useState<PaymentsAnalytics | null>(null);
   const [deadlines, setDeadlines] = useState<DeadlineItem[]>([]);
   const [regimes, setRegimes] = useState<RegimeDef[]>([]);
+  const [disclaimer, setDisclaimer] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!projectId) return;
     setError(null);
     try {
-      const params = new URLSearchParams({ page: String(page), pageSize: String(PAGE_SIZE) });
+      const params = new URLSearchParams({
+        page: String(page),
+        pageSize: String(PAGE_SIZE),
+      });
       const [list, stats, radar] = await Promise.all([
         api.get<ListResponse<PaymentClaimRow>>(`${base}/payment-claims?${params}`),
         api.get<PaymentsAnalytics>(`${base}/payments/analytics`),
@@ -121,8 +156,13 @@ export default function PaymentsPage() {
     let cancelled = false;
     (async () => {
       try {
-        const res = await api.get<{ items: RegimeDef[] }>("/api/v1/payment-regimes");
-        if (!cancelled) setRegimes(res.items);
+        const res = await api.get<{ items: RegimeDef[]; disclaimer: string }>(
+          "/api/v1/payment-regimes",
+        );
+        if (!cancelled) {
+          setRegimes(res.items);
+          setDisclaimer(res.disclaimer);
+        }
       } catch {
         // reference cards simply don't render
       }
@@ -221,203 +261,237 @@ export default function PaymentsPage() {
     <div>
       <PageHeader
         title="Payment Security"
-        subtitle="Statutory payment claims, response deadlines, deemed liability and the right to suspend"
-        actions={<Button onClick={() => void openCreate()}>New payment claim</Button>}
+        subtitle="Statutory payment claims, liens, retention trusts, adjudication and payment-practice reporting — every deadline computed from a code-resident model of the statute and labelled indicative."
+        actions={
+          tab === "claims" ? (
+            <Button onClick={() => void openCreate()}>New payment claim</Button>
+          ) : null
+        }
+        tabs={<Tabs items={TABS} value={tab} onChange={selectTab} />}
       />
 
-      {/* Analytics */}
-      {analytics ? (
-        <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-7">
-          <Stat label="Claims" value={analytics.claims} />
-          <Stat label="Served" value={analytics.served} />
-          <Stat label="Responded" value={analytics.responded} />
-          <Stat
-            label="Deemed"
-            value={analytics.deemed}
-            tone={analytics.deemed > 0 ? "red" : undefined}
-          />
-          <Stat label="Paid" value={analytics.paid} tone={analytics.paid > 0 ? "green" : undefined} />
-          <Stat
-            label="Avg days to pay"
-            value={analytics.avgDaysToPay ?? "—"}
-          />
-          <Stat
-            label="Deemed exposure"
-            value={fmtMoney(analytics.deemedExposure)}
-            tone={analytics.deemedExposure > 0 ? "red" : undefined}
-          />
-        </div>
-      ) : null}
+      {tab === "liens" ? <LiensTab projectId={projectId} /> : null}
+      {tab === "security" ? <SecurityTab projectId={projectId} /> : null}
+      {tab === "adjudication" ? <AdjudicationTab projectId={projectId} /> : null}
+      {tab === "reporting" ? <ReportingTab /> : null}
 
-      {/* Deadline radar */}
-      {deadlines.length > 0 ? (
-        <Card className="mb-4 border-l-4 border-l-amber-500">
-          <CardBody className="py-3">
-            <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-500">
-              Deadline radar — statutory response deadlines inside 14 days
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {deadlines.map((d) => (
-                <button
-                  key={d.id}
-                  type="button"
-                  onClick={() => setSelectedId(d.id)}
-                  title={`${pcLabel(d.number)} — response due ${formatDate(d.responseDeadline)}`}
-                  className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${radarChipClass(d.daysRemaining)}`}
-                >
-                  <span className="font-mono">{pcLabel(d.number)}</span>
-                  <span>{fmtMoney(d.claimedAmount, d.currency)}</span>
-                  <span className="font-semibold whitespace-nowrap">
-                    {d.daysRemaining < 0
-                      ? "OVERDUE"
-                      : d.daysRemaining === 0
-                        ? "due today"
-                        : `${d.daysRemaining}d`}
-                  </span>
-                </button>
-              ))}
-            </div>
-          </CardBody>
-        </Card>
-      ) : null}
+      {tab !== "claims" ? null : (
+        <>
+          {/*
+           * THE DISCLAIMER IS NOT A FOOTNOTE. Every date on this page comes
+           * from a simplified model of the statute (weekend-only business
+           * days, one response clock, a pinned interest rate), and a user who
+           * mistakes the radar for legal advice can miss a pay-less window.
+           */}
+          {disclaimer ? (
+            <Alert
+              tone="warning"
+              variant="subtle"
+              className="mb-4"
+              title="Deadlines here are indicative"
+            >
+              {disclaimer}
+            </Alert>
+          ) : null}
 
-      {/* Regime reference cards */}
-      {regimes.length > 0 ? (
-        <div className="mb-5 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-5">
-          {regimes.map((r) => (
-            <Card key={r.regime}>
-              <CardBody className="px-4 py-3">
-                <div className="mb-1 flex items-center justify-between">
-                  <span className="text-sm font-semibold text-ink-900">
-                    {regimeShort(r.regime)}
-                  </span>
-                  <span className="text-xs text-ink-400">{r.jurisdiction}</span>
+          {/* Analytics */}
+          {analytics ? (
+            <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-7">
+              <Stat label="Claims" value={analytics.claims} />
+              <Stat label="Served" value={analytics.served} />
+              <Stat label="Responded" value={analytics.responded} />
+              <Stat
+                label="Deemed"
+                value={analytics.deemed}
+                tone={analytics.deemed > 0 ? "red" : undefined}
+              />
+              <Stat
+                label="Paid"
+                value={analytics.paid}
+                tone={analytics.paid > 0 ? "green" : undefined}
+              />
+              <Stat label="Avg days to pay" value={analytics.avgDaysToPay ?? "—"} />
+              <Stat
+                label="Deemed exposure"
+                value={fmtMoney(analytics.deemedExposure)}
+                tone={analytics.deemedExposure > 0 ? "red" : undefined}
+              />
+            </div>
+          ) : null}
+
+          {/* Deadline radar */}
+          {deadlines.length > 0 ? (
+            <Card className="mb-4 border-l-4 border-l-amber-500">
+              <CardBody className="py-3">
+                <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-500">
+                  Deadline radar — statutory response deadlines inside 14 days
                 </div>
-                <div className="space-y-0.5 text-xs text-ink-600">
-                  <div>
-                    Respond:{" "}
-                    <strong>
-                      {r.responseDeadlineDays} {r.responseDayBasis === "business" ? "bus." : "cal."}{" "}
-                      days
-                    </strong>
-                  </div>
-                  <div>
-                    Pay:{" "}
-                    <strong>
-                      {r.finalPaymentDays} {r.finalPaymentBasis === "business" ? "bus." : "cal."}{" "}
-                      days
-                    </strong>
-                  </div>
-                  <div>
-                    Interest: <strong>{r.annualInterestPercent}% p.a.</strong>
-                  </div>
+                <div className="flex flex-wrap gap-2">
+                  {deadlines.map((d) => (
+                    <button
+                      key={d.id}
+                      type="button"
+                      onClick={() => setSelectedId(d.id)}
+                      title={`${pcLabel(d.number)} — response due ${formatDate(d.responseDeadline)}`}
+                      className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${radarChipClass(d.daysRemaining)}`}
+                    >
+                      <span className="font-mono">{pcLabel(d.number)}</span>
+                      <span>{fmtMoney(d.claimedAmount, d.currency)}</span>
+                      <span className="font-semibold whitespace-nowrap">
+                        {d.daysRemaining < 0
+                          ? "OVERDUE"
+                          : d.daysRemaining === 0
+                            ? "due today"
+                            : `${d.daysRemaining}d`}
+                      </span>
+                    </button>
+                  ))}
                 </div>
-                <details className="mt-2">
-                  <summary className="cursor-pointer text-xs font-medium text-brand-700 hover:text-brand-800">
-                    Summary
-                  </summary>
-                  <p className="mt-1 text-xs font-medium leading-5 text-ink-700">{r.name}</p>
-                  <p className="mt-1 text-xs leading-5 text-ink-500">{r.summary}</p>
-                  <p className="mt-1 text-xs leading-5 text-ink-400">{r.deemedRule}</p>
-                </details>
               </CardBody>
             </Card>
-          ))}
-        </div>
-      ) : null}
+          ) : null}
 
-      <ErrorAlert message={error} />
-
-      {/* Register */}
-      {items === null ? (
-        <Spinner />
-      ) : items.length === 0 ? (
-        <EmptyState
-          title="No payment claims yet"
-          hint="Raise a payment claim under a statutory regime — the deadline engine computes the response and final payment clocks when it is served."
-          action={<Button onClick={() => void openCreate()}>Create the first claim</Button>}
-        />
-      ) : (
-        <>
-          <Table>
-            <thead>
-              <tr>
-                <Th>No.</Th>
-                <Th>Regime</Th>
-                <Th className="text-right">Claimed</Th>
-                <Th>Served</Th>
-                <Th>Response deadline</Th>
-                <Th>Status</Th>
-                <Th>Final payment</Th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-ink-100">
-              {items.map((c) => (
-                <tr
-                  key={c.id}
-                  className="cursor-pointer hover:bg-ink-50/60"
-                  onClick={() => setSelectedId(c.id)}
-                >
-                  <Td className="whitespace-nowrap font-mono text-xs text-ink-500">
-                    {pcLabel(c.number)}
-                  </Td>
-                  <Td>
-                    <Badge tone="blue">{regimeShort(c.regime)}</Badge>
-                  </Td>
-                  <Td className="whitespace-nowrap text-right font-medium tabular-nums">
-                    {fmtMoney(c.claimedAmount, c.currency)}
-                  </Td>
-                  <Td className="whitespace-nowrap">{formatDate(c.servedAt)}</Td>
-                  <Td className="whitespace-nowrap">
-                    {c.responseDeadline ? (
-                      <span className="inline-flex items-center gap-2">
-                        <span className="text-xs">{formatDate(c.responseDeadline)}</span>
-                        {c.status === "served" ? (
-                          <CountdownBadge days={c.daysToResponseDeadline} />
-                        ) : null}
+          {/* Regime reference cards */}
+          {regimes.length > 0 ? (
+            <div className="mb-5 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-5">
+              {regimes.map((r) => (
+                <Card key={r.regime}>
+                  <CardBody className="px-4 py-3">
+                    <div className="mb-1 flex items-center justify-between">
+                      <span className="text-sm font-semibold text-ink-900">
+                        {regimeShort(r.regime)}
                       </span>
-                    ) : (
-                      <span className="text-xs text-ink-300">on service</span>
-                    )}
-                  </Td>
-                  <Td>
-                    {c.status === "deemed" ? (
-                      <span className="inline-flex items-center rounded-full bg-red-900 px-2 py-0.5 text-xs font-bold text-red-100">
-                        DEEMED
-                      </span>
-                    ) : (
-                      <Badge tone={paymentStatusTone(c.status)}>{humanize(c.status)}</Badge>
-                    )}
-                  </Td>
-                  <Td className="whitespace-nowrap text-xs">{formatDate(c.finalPaymentDate)}</Td>
-                </tr>
+                      <span className="text-xs text-ink-400">{r.jurisdiction}</span>
+                    </div>
+                    <div className="space-y-0.5 text-xs text-ink-600">
+                      <div>
+                        Respond:{" "}
+                        <strong>
+                          {r.responseDeadlineDays}{" "}
+                          {r.responseDayBasis === "business" ? "bus." : "cal."} days
+                        </strong>
+                      </div>
+                      <div>
+                        Pay:{" "}
+                        <strong>
+                          {r.finalPaymentDays}{" "}
+                          {r.finalPaymentBasis === "business" ? "bus." : "cal."} days
+                        </strong>
+                      </div>
+                      <div>
+                        Interest: <strong>{r.annualInterestPercent}% p.a.</strong>
+                      </div>
+                    </div>
+                    <details className="mt-2">
+                      <summary className="cursor-pointer text-xs font-medium text-brand-700 hover:text-brand-800">
+                        Summary
+                      </summary>
+                      <p className="mt-1 text-xs font-medium leading-5 text-ink-700">{r.name}</p>
+                      <p className="mt-1 text-xs leading-5 text-ink-500">{r.summary}</p>
+                      <p className="mt-1 text-xs leading-5 text-ink-400">{r.deemedRule}</p>
+                    </details>
+                  </CardBody>
+                </Card>
               ))}
-            </tbody>
-          </Table>
-
-          <div className="mt-4 flex items-center justify-between text-sm text-ink-500">
-            <span>
-              {total} claim{total === 1 ? "" : "s"} · page {page} of {totalPages}
-            </span>
-            <div className="flex gap-2">
-              <Button
-                variant="secondary"
-                size="sm"
-                disabled={page <= 1}
-                onClick={() => setPage((p) => Math.max(1, p - 1))}
-              >
-                Previous
-              </Button>
-              <Button
-                variant="secondary"
-                size="sm"
-                disabled={page >= totalPages}
-                onClick={() => setPage((p) => p + 1)}
-              >
-                Next
-              </Button>
             </div>
-          </div>
+          ) : null}
+
+          <ErrorAlert message={error} />
+
+          {/* Register */}
+          {items === null ? (
+            <Spinner />
+          ) : items.length === 0 ? (
+            <EmptyState
+              title="No payment claims yet"
+              hint="Raise a payment claim under a statutory regime — the deadline engine computes the response and final payment clocks when it is served."
+              action={<Button onClick={() => void openCreate()}>Create the first claim</Button>}
+            />
+          ) : (
+            <>
+              <Table>
+                <thead>
+                  <tr>
+                    <Th>No.</Th>
+                    <Th>Regime</Th>
+                    <Th className="text-right">Claimed</Th>
+                    <Th>Served</Th>
+                    <Th>Response deadline</Th>
+                    <Th>Status</Th>
+                    <Th>Final payment</Th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-ink-100">
+                  {items.map((c) => (
+                    <tr
+                      key={c.id}
+                      className="cursor-pointer hover:bg-ink-50/60"
+                      onClick={() => setSelectedId(c.id)}
+                    >
+                      <Td className="whitespace-nowrap font-mono text-xs text-ink-500">
+                        {pcLabel(c.number)}
+                      </Td>
+                      <Td>
+                        <Badge tone="blue">{regimeShort(c.regime)}</Badge>
+                      </Td>
+                      <Td className="whitespace-nowrap text-right font-medium tabular-nums">
+                        {fmtMoney(c.claimedAmount, c.currency)}
+                      </Td>
+                      <Td className="whitespace-nowrap">{formatDate(c.servedAt)}</Td>
+                      <Td className="whitespace-nowrap">
+                        {c.responseDeadline ? (
+                          <span className="inline-flex items-center gap-2">
+                            <span className="text-xs">{formatDate(c.responseDeadline)}</span>
+                            {c.status === "served" ? (
+                              <CountdownBadge days={c.daysToResponseDeadline} />
+                            ) : null}
+                          </span>
+                        ) : (
+                          <span className="text-xs text-ink-300">on service</span>
+                        )}
+                      </Td>
+                      <Td>
+                        {c.status === "deemed" ? (
+                          <span className="inline-flex items-center rounded-full bg-red-900 px-2 py-0.5 text-xs font-bold text-red-100">
+                            DEEMED
+                          </span>
+                        ) : (
+                          <Badge tone={paymentStatusTone(c.status)}>{humanize(c.status)}</Badge>
+                        )}
+                      </Td>
+                      <Td className="whitespace-nowrap text-xs">
+                        {formatDate(c.finalPaymentDate)}
+                      </Td>
+                    </tr>
+                  ))}
+                </tbody>
+              </Table>
+
+              <div className="mt-4 flex items-center justify-between text-sm text-ink-500">
+                <span>
+                  {total} claim{total === 1 ? "" : "s"} · page {page} of {totalPages}
+                </span>
+                <div className="flex gap-2">
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={page <= 1}
+                    onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  >
+                    Previous
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={page >= totalPages}
+                    onClick={() => setPage((p) => p + 1)}
+                  >
+                    Next
+                  </Button>
+                </div>
+              </div>
+            </>
+          )}
         </>
       )}
 
@@ -457,7 +531,10 @@ export default function PaymentsPage() {
           ) : null}
 
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-            <Field label="Valuation" hint="Optional — prefills the claimed amount with its net due.">
+            <Field
+              label="Valuation"
+              hint="Optional — prefills the claimed amount with its net due."
+            >
               <Select value={cValuationId} onChange={(e) => onValuationChange(e.target.value)}>
                 <option value="">None</option>
                 {valuations.map((v) => (

@@ -34,6 +34,23 @@ export interface ClauseDef {
   noticeRequired: boolean;
   /** continuing duty materialized into the obligation register on contract creation (#260) */
   standingObligation?: { party: ObligationParty; description: string };
+  /** days before the deadline at which the platform warns (#229); defaults to ceil(bar/4) capped at 14 */
+  warnDaysBefore?: number;
+  /**
+   * Deadlines that follow from serving this notice (#227). Serving the notice
+   * materializes the next obligation automatically, so a FIDIC 20.2 notice
+   * spawns the 20.2.4 fully-detailed claim clock and an NEC 61.3 notification
+   * spawns the 62.3 quotation clock without anyone remembering to.
+   *
+   * `from` says what the follow-on clock runs from: "awareness" = the original
+   * event/awareness date, "service" = the date this notice was served.
+   */
+  deadlineChain?: Array<{
+    clauseRef: string;
+    days: number;
+    from: "awareness" | "service";
+    label: string;
+  }>;
 }
 
 /* ------------------------------------------------------------------ */
@@ -293,6 +310,14 @@ const FIDIC_RED_2017: ClauseDef[] = [
     timeBarDays: 28,
     noticeBy: "either",
     noticeRequired: true,
+    deadlineChain: [
+      {
+        clauseRef: "20.2.4",
+        days: 84,
+        from: "awareness",
+        label: "Fully detailed claim (20.2.4)",
+      },
+    ],
   },
   {
     form: "fidic_red_2017",
@@ -304,6 +329,14 @@ const FIDIC_RED_2017: ClauseDef[] = [
     timeBarDays: 84,
     noticeBy: "either",
     noticeRequired: true,
+    deadlineChain: [
+      {
+        clauseRef: "3.7",
+        days: 42,
+        from: "service",
+        label: "Engineer's agreement or determination (3.7)",
+      },
+    ],
   },
   {
     form: "fidic_red_2017",
@@ -480,6 +513,14 @@ const FIDIC_YELLOW_2017: ClauseDef[] = [
     timeBarDays: 28,
     noticeBy: "either",
     noticeRequired: true,
+    deadlineChain: [
+      {
+        clauseRef: "20.2.4",
+        days: 84,
+        from: "awareness",
+        label: "Fully detailed claim (20.2.4)",
+      },
+    ],
   },
   {
     form: "fidic_yellow_2017",
@@ -570,6 +611,14 @@ const FIDIC_SILVER_2017: ClauseDef[] = [
     timeBarDays: 28,
     noticeBy: "either",
     noticeRequired: true,
+    deadlineChain: [
+      {
+        clauseRef: "20.2.4",
+        days: 84,
+        from: "awareness",
+        label: "Fully detailed claim (20.2.4)",
+      },
+    ],
   },
   {
     form: "fidic_silver_2017",
@@ -724,6 +773,14 @@ const NEC4_ECC: ClauseDef[] = [
     timeBarDays: 56,
     noticeBy: "contractor",
     noticeRequired: true,
+    deadlineChain: [
+      {
+        clauseRef: "62.3",
+        days: 21,
+        from: "service",
+        label: "Quotation for the compensation event (62.3)",
+      },
+    ],
   },
   {
     form: "nec4_ecc",
@@ -845,6 +902,14 @@ const NEC3_ECC: ClauseDef[] = [
     timeBarDays: 56,
     noticeBy: "contractor",
     noticeRequired: true,
+    deadlineChain: [
+      {
+        clauseRef: "62.3",
+        days: 21,
+        from: "service",
+        label: "Quotation for the compensation event (62.3)",
+      },
+    ],
   },
   {
     form: "nec3_ecc",

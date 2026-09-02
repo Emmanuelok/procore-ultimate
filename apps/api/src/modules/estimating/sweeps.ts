@@ -33,13 +33,7 @@ import { forEachCompany } from "../../lib/scheduler.js";
 import type { Db } from "../../lib/db.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { pushNotifications } from "../notifications/service.js";
-import {
-  addDays,
-  daysBetween,
-  raiseSignalOnce,
-  reconcileSignals,
-  todayIso,
-} from "./shared.js";
+import { addDays, daysBetween, raiseSignalOnce, reconcileSignals } from "./shared.js";
 
 /** How old a catalogue rate may be before it is flagged for review. */
 export const RATE_STALENESS_DAYS = 365;
@@ -471,5 +465,3 @@ export function registerEstimatingJobs(app: FastifyInstance): void {
 
 /** Exposed for the route that lets an operator run the sweeps on demand. */
 export const SWEEP_JOB_NAMES = ["estimating.quote-validity", "estimating.hygiene"] as const;
-
-export { todayIso };

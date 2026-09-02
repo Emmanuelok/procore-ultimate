@@ -21,8 +21,16 @@ import { HashChip, type LedgerEntryRow, type ListResponse } from "./assuranceSha
 interface VerifyResult {
   count: number;
   valid: boolean;
+  /** index into the slice that was walked — NOT a ledger sequence */
   brokenAt?: number | null;
+  /** the real ledger sequence of the break */
+  brokenSeq?: number | null;
   reason?: string | null;
+  mode?: string;
+  verifiedFromSeq?: number;
+  verifiedToSeq?: number | null;
+  deepVerifiedSeq?: number;
+  note?: string;
 }
 
 function actionTone(action: string): string {
@@ -91,7 +99,8 @@ export default function LedgerTab() {
             <div>
               <div className="text-sm font-semibold text-ink-900">Chain integrity</div>
               <p className="mt-0.5 text-xs text-ink-500">
-                Recomputes every entry hash in sequence — any tampered or missing row breaks the chain.
+                Recomputes every entry hash in sequence — any tampered or missing row breaks the
+                chain. Requires an assurance grant or company owner/admin.
               </p>
             </div>
             <Button onClick={() => void runVerify()} disabled={verifyBusy}>
@@ -102,12 +111,26 @@ export default function LedgerTab() {
           {verify ? (
             verify.valid ? (
               <div className="mt-3 rounded-md bg-emerald-50 px-3 py-2 text-sm font-medium text-emerald-800 ring-1 ring-emerald-200">
-                Chain intact — {verify.count} entr{verify.count === 1 ? "y" : "ies"} verified.
+                Chain intact — {verify.count} entr{verify.count === 1 ? "y" : "ies"} verified
+                {verify.verifiedToSeq ? ` up to ledger sequence ${verify.verifiedToSeq}` : ""}.
+                {typeof verify.deepVerifiedSeq === "number" ? (
+                  <div className="mt-1 text-xs font-normal text-emerald-700">
+                    Payload snapshots re-hashed up to sequence {verify.deepVerifiedSeq} by the
+                    scheduled deep pass. The chain covers the payload HASH, not the snapshot, so
+                    that pass is the only check that catches a snapshot rewritten in place.
+                  </div>
+                ) : null}
               </div>
             ) : (
               <div className="mt-3 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700 ring-1 ring-red-200">
-                <span className="font-semibold">Chain BROKEN</span> at sequence{" "}
-                <span className="font-mono">{verify.brokenAt ?? "?"}</span>
+                <span className="font-semibold">Chain BROKEN</span> at ledger sequence{" "}
+                {/*
+                  `seq` is a global bigserial shared across every tenant, so the
+                  index into the verified slice is almost never the row's own
+                  sequence. Printing the index sent investigators to the wrong
+                  row; `brokenSeq` is the number that identifies the entry.
+                */}
+                <span className="font-mono">{verify.brokenSeq ?? "not reported"}</span>
                 {verify.reason ? ` — ${verify.reason}` : ""}. Treat downstream entries as unverified.
               </div>
             )

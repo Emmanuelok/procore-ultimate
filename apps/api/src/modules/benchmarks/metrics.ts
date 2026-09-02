@@ -186,6 +186,7 @@ async function readCostBasis(db: Db, ctx: MetricContext) {
       status: variations.status,
       agreedValue: variations.agreedValue,
       costEstimate: variations.costEstimate,
+      currency: variations.currency,
     })
     .from(variations)
     .where(and(eq(variations.companyId, ctx.companyId), eq(variations.projectId, ctx.projectId)));
@@ -195,14 +196,51 @@ async function readCostBasis(db: Db, ctx: MetricContext) {
     0,
   );
 
+  /*
+   * CURRENCIES ARE NOT SUMMED (PLAN §6.2).
+   *
+   * `originalContractSum` above adds every counted contract regardless of the
+   * currency it is denominated in, and the variations add their own. That is
+   * arithmetic on incomparable quantities: a project with a GBP prime contract
+   * and a USD subcontract produces a "budget" that is neither, and a cost
+   * metric derived from it — contributed into a shared pool keyed only by
+   * metric, asset class and region — makes the distribution describe the
+   * exchange rate. Every consumer of this basis therefore checks
+   * `currencies.length` and refuses rather than reporting the sum.
+   */
+  const currencies = [
+    ...new Set(
+      [
+        ...counted.map((c) => c.currency),
+        ...agreed.map((v) => v.currency),
+      ].filter((c): c is string => typeof c === "string" && c.length > 0),
+    ),
+  ].sort();
+
   return {
     originalContractSum,
     approvedVariationsValue,
     currentApprovedBudget: originalContractSum + approvedVariationsValue,
     contractsCounted: counted.length,
     variationsCounted: agreed.length,
-    currency: counted[0]?.currency ?? null,
+    currency: currencies.length === 1 ? currencies[0]! : null,
+    currencies,
   };
+}
+
+/**
+ * The reason a money-derived metric must refuse, or null when it may proceed.
+ * Shared by every metric that reads the cost basis so the rule is stated once.
+ */
+export function mixedCurrencyReason(currencies: readonly string[]): string | null {
+  if (currencies.length <= 1) return null;
+  return (
+    `This project holds contracts and variations in ${currencies.length} currencies ` +
+    `(${currencies.join(", ")}). Adding them would produce a figure in no currency at all, and ` +
+    "contributing it to a shared distribution would make the benchmark describe the exchange " +
+    "rate. Record a single project currency, or dated fx_rates so the basis can be normalised, " +
+    "before computing a cost metric."
+  );
 }
 
 /** Active schedule + its earliest baseline — the as-planned reference. */
@@ -260,6 +298,8 @@ const costPerGfaM2: BenchmarkMetricDef = {
     if (basis.contractsCounted === 0) {
       reasons.push("No executed or completed contract with a contract sum on this project.");
     }
+    const mixed = mixedCurrencyReason(basis.currencies);
+    if (mixed) reasons.push(mixed);
     if (gfaM2 == null || !Number.isFinite(gfaM2) || gfaM2 <= 0) {
       reasons.push(
         "Project settings.gfaM2 is not set — declare the gross floor area (m²) in project settings.",
@@ -290,12 +330,15 @@ const costGrowthPct: BenchmarkMetricDef = {
   async compute(db, ctx) {
     const basis = await readCostBasis(db, ctx);
     const inputs = { ...basis };
-    if (basis.contractsCounted === 0 || basis.originalContractSum <= 0) {
+    const mixed = mixedCurrencyReason(basis.currencies);
+    if (basis.contractsCounted === 0 || basis.originalContractSum <= 0 || mixed) {
       return {
         value: null,
         unit: this.unit,
         inputs,
-        reasons: ["No executed or completed contract with a contract sum on this project."],
+        reasons: mixed
+          ? [mixed]
+          : ["No executed or completed contract with a contract sum on this project."],
       };
     }
     return {
@@ -418,12 +461,15 @@ const variationRatePct: BenchmarkMetricDef = {
   async compute(db, ctx) {
     const basis = await readCostBasis(db, ctx);
     const inputs = { ...basis };
-    if (basis.contractsCounted === 0 || basis.originalContractSum <= 0) {
+    const mixed = mixedCurrencyReason(basis.currencies);
+    if (basis.contractsCounted === 0 || basis.originalContractSum <= 0 || mixed) {
       return {
         value: null,
         unit: this.unit,
         inputs,
-        reasons: ["No executed or completed contract with a contract sum on this project."],
+        reasons: mixed
+          ? [mixed]
+          : ["No executed or completed contract with a contract sum on this project."],
       };
     }
     return {

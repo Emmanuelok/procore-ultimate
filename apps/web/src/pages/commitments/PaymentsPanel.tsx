@@ -94,12 +94,7 @@ export default function PaymentsPanel({
 
   const blocked = compliance.blocking.length > 0;
 
-  async function act(
-    payment: CommitmentPayment,
-    verb: string,
-    path: string,
-    body?: unknown,
-  ) {
+  async function act(payment: CommitmentPayment, verb: string, path: string, body?: unknown) {
     const result = await run(`${verb}:${payment.id}`, () =>
       api.post<{ compliance?: ComplianceResult }>(
         `/api/v1/commitment-payments/${payment.id}/${path}`,
@@ -557,9 +552,7 @@ function IssuePayment({
               />
               <div>
                 <div className="text-label uppercase text-content-subtle">Approved by</div>
-                <div className="mt-0.5 font-mono text-2xs">
-                  {payment.approvedBy ?? "—"}
-                </div>
+                <div className="mt-0.5 font-mono text-2xs">{payment.approvedBy ?? "—"}</div>
               </div>
             </CardBody>
           </Card>

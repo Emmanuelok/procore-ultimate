@@ -10,17 +10,46 @@
  */
 
 import type { FastifyPluginAsync } from "fastify";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import {
+  calibratedInstruments,
+  checklistTemplates,
   checklists,
   commissioningSystems,
+  commissioningTestRecords,
+  concretePours,
+  defectsLiabilityPeriods,
+  dlpDefects,
   inspectionTestPlans,
   itpActivities,
+  materialTestCertificates,
+  ndtRecords,
   nonConformanceReports,
+  operatorTrainingRecords,
+  performanceGuarantees,
+  qualityAuditFindings,
+  qualityAudits,
+  qualityConcessions,
+  reworkItems,
   turnoverPackages,
+  vendors,
+  welds,
 } from "@constructos/db";
-import { buildGates, figure, isoDateSchema, medianOrNull, round2, todayISO } from "./shared.js";
+import {
+  buildGates,
+  figure,
+  isoDateSchema,
+  medianOrNull,
+  round2,
+  todayISO,
+  totalsByCurrency,
+} from "./shared.js";
+import { costOfQuality, firstTimeRightByTrade } from "./costOfQuality.js";
+import { instrumentStanding } from "./calibrationStatus.js";
+import { concessionStanding } from "./concessions.js";
+import { dlpStanding } from "./closeout.js";
+import { assessGuarantee } from "./guarantees.js";
 import { isUnreleasedPastPlannedDate, isTerminalActivityStatus, noticeStatus } from "./holdPoints.js";
 import { artefactGap } from "./turnover.js";
 import { sweepQuality } from "./sweeps.js";
@@ -178,28 +207,58 @@ export const summaryRoutes: FastifyPluginAsync = async (app) => {
             { closedNcrs: closureDays.length },
             [],
           );
-    const ncrCostImpacts = ncrRows
-      .map((n) => n.costImpact)
-      .filter((c): c is number => typeof c === "number");
+    /*
+     * COST OF NON-CONFORMANCE, BUCKETED BY CURRENCY.
+     *
+     * NCRs carry their own currency. Adding a GBP cost impact to a USD one and
+     * labelling the result with whichever currency happened to be on the first
+     * row is not a rounding error, it is a fabricated number — so the register
+     * returns one figure per currency and a null total whenever more than one
+     * currency is present, with the per-currency figures beside it.
+     */
+    const ncrMoney = totalsByCurrency(
+      ncrRows.map((n) => ({ amount: n.costImpact, currency: n.currency })),
+    );
+    const excludedReason =
+      ncrMoney.withoutAmount > 0
+        ? [
+            `${ncrMoney.withoutAmount} of ${ncrRows.length} NCRs carry no cost impact and are excluded, so every total below is a floor rather than the figure.`,
+          ]
+        : [];
+    const costByCurrency = ncrMoney.totals.map((t) =>
+      figure(t.amount, t.currency, { ncrsWithCost: t.recordCount, currency: t.currency }, excludedReason),
+    );
     const totalNcrCost =
-      ncrCostImpacts.length === 0
+      ncrMoney.totals.length === 0
         ? figure(null, "currency", { ncrsWithCost: 0, totalNcrs: ncrRows.length }, [
             "No NCR on this project carries a recorded cost impact, so the cost of non-conformance cannot be totalled. It is not zero — it is unmeasured.",
           ])
-        : figure(
-            round2(ncrCostImpacts.reduce((a, b) => a + b, 0)),
-            "currency",
-            {
-              ncrsWithCost: ncrCostImpacts.length,
-              totalNcrs: ncrRows.length,
-              currency: ncrRows[0]?.currency ?? "USD",
-            },
-            ncrCostImpacts.length < ncrRows.length
-              ? [
-                  `${ncrRows.length - ncrCostImpacts.length} of ${ncrRows.length} NCRs carry no cost impact and are excluded from the total, which is therefore a floor rather than the figure.`,
-                ]
-              : [],
-          );
+        : ncrMoney.totals.length === 1
+          ? figure(
+              ncrMoney.totals[0]!.amount,
+              ncrMoney.totals[0]!.currency,
+              {
+                ncrsWithCost: ncrMoney.totals[0]!.recordCount,
+                totalNcrs: ncrRows.length,
+                currency: ncrMoney.totals[0]!.currency,
+              },
+              excludedReason,
+            )
+          : figure(
+              null,
+              "currency",
+              {
+                currencies: ncrMoney.totals.map((t) => t.currency),
+                ncrsWithCost: ncrMoney.withAmount,
+                totalNcrs: ncrRows.length,
+              },
+              [
+                `Costs are recorded in ${ncrMoney.totals.length} currencies (${ncrMoney.totals
+                  .map((t) => `${t.currency} ${t.amount}`)
+                  .join(", ")}). They are reported per currency rather than summed — a cross-currency total would be an invented number.`,
+                ...excludedReason,
+              ],
+            );
 
     /* --- commissioning + turnover --- */
     const systemsWithoutAsset = systemRows.filter((s) => !s.assetId);
@@ -223,7 +282,150 @@ export const summaryRoutes: FastifyPluginAsync = async (app) => {
             [],
           );
 
+    /*
+     * The Domain Z and closeout registers, as counts. Cheap indexed counts
+     * rather than full loads: the overview needs to know whether a register
+     * has anything in it and whether anything in it is overdue, and the tab
+     * for each register loads its own detail.
+     */
+    const [
+      concessionRows,
+      pourRows,
+      weldRows,
+      ndtRows,
+      certificateRows,
+      instrumentRows,
+      reworkRows,
+      auditRows,
+      findingRows,
+      dlpRows,
+      guaranteeRows,
+    ] = await Promise.all([
+      app.db.select().from(qualityConcessions).where(and(eq(qualityConcessions.companyId, scope.companyId), eq(qualityConcessions.projectId, scope.projectId))),
+      app.db.select().from(concretePours).where(and(eq(concretePours.companyId, scope.companyId), eq(concretePours.projectId, scope.projectId))),
+      app.db.select().from(welds).where(and(eq(welds.companyId, scope.companyId), eq(welds.projectId, scope.projectId))),
+      app.db.select().from(ndtRecords).where(and(eq(ndtRecords.companyId, scope.companyId), eq(ndtRecords.projectId, scope.projectId))),
+      app.db.select().from(materialTestCertificates).where(and(eq(materialTestCertificates.companyId, scope.companyId), eq(materialTestCertificates.projectId, scope.projectId))),
+      app.db.select().from(calibratedInstruments).where(and(eq(calibratedInstruments.companyId, scope.companyId), eq(calibratedInstruments.projectId, scope.projectId))),
+      app.db.select().from(reworkItems).where(and(eq(reworkItems.companyId, scope.companyId), eq(reworkItems.projectId, scope.projectId))),
+      app.db.select().from(qualityAudits).where(and(eq(qualityAudits.companyId, scope.companyId), eq(qualityAudits.projectId, scope.projectId))),
+      app.db.select().from(qualityAuditFindings).where(and(eq(qualityAuditFindings.companyId, scope.companyId), eq(qualityAuditFindings.projectId, scope.projectId))),
+      app.db.select().from(defectsLiabilityPeriods).where(and(eq(defectsLiabilityPeriods.companyId, scope.companyId), eq(defectsLiabilityPeriods.projectId, scope.projectId))),
+      app.db.select().from(performanceGuarantees).where(and(eq(performanceGuarantees.companyId, scope.companyId), eq(performanceGuarantees.projectId, scope.projectId))),
+    ]);
+
+    const liveConcessions = concessionRows.filter((c) => concessionStanding(c, today).live);
+    const instrumentStandings = instrumentRows.map((i) => instrumentStanding(i, today));
+    const guaranteeAssessments = guaranteeRows.map((g) =>
+      assessGuarantee({
+        id: g.id,
+        reference: g.reference,
+        parameter: g.parameter,
+        operator: g.operator,
+        guaranteedValue: g.guaranteedValue,
+        guaranteedMin: g.guaranteedMin,
+        guaranteedMax: g.guaranteedMax,
+        unit: g.unit,
+        tolerancePercent: g.tolerancePercent,
+        measuredValue: g.measuredValue,
+        ldRatePerUnit: g.ldRatePerUnit,
+        ldCapAmount: g.ldCapAmount,
+        currency: g.currency,
+        status: g.status,
+      }),
+    );
+    const reworkMoney = totalsByCurrency(
+      reworkRows
+        .filter((r) => r.status !== "cancelled")
+        .map((r) => ({ amount: r.totalCost, currency: r.currency })),
+    );
+
+    const registers = {
+      concessions: {
+        total: concessionRows.length,
+        live: liveConcessions.length,
+        expired: concessionRows.filter((c) => c.status === "expired").length,
+        awaitingDecision: concessionRows.filter(
+          (c) => c.status === "submitted" || c.status === "under_review",
+        ).length,
+        expiringWithin30Days: liveConcessions.filter((c) => {
+          const d = concessionStanding(c, today).daysToExpiry;
+          return d !== null && d <= 30;
+        }).length,
+      },
+      concrete: {
+        pours: pourRows.length,
+        poured: pourRows.filter((p) => p.pouredAt !== null).length,
+        failing: pourRows.filter((p) => p.acceptanceVerdict === "rejected").length,
+        awaitingResults: pourRows.filter(
+          (p) => p.pouredAt !== null && p.testedSpecimenCount < p.specimenCount,
+        ).length,
+        pouredWithoutRelease: pourRows.filter(
+          (p) => (p.detail as Record<string, unknown>)["pouredWithoutRelease"] === true,
+        ).length,
+      },
+      welding: {
+        welds: weldRows.length,
+        welded: weldRows.filter((w) => w.weldedAt !== null).length,
+        rejected: weldRows.filter((w) => w.status === "rejected").length,
+        ndtRecords: ndtRows.length,
+        pendingExaminations: ndtRows.filter((r) => r.result === "pending").length,
+        awaitingRequiredNdt: weldRows.filter(
+          (w) => w.ndtRequiredPercent !== null && w.ndtRequiredPercent > 0 && w.ndtRecordCount === 0,
+        ).length,
+      },
+      certificates: {
+        total: certificateRows.length,
+        unverified: certificateRows.filter((c) => c.verificationStatus === "unverified").length,
+        failed: certificateRows.filter((c) => c.verificationStatus === "failed").length,
+        withoutTraceability: certificateRows.filter(
+          (c) => !c.heatNumber && !c.batchNumber && !c.castNumber,
+        ).length,
+      },
+      calibration: {
+        instruments: instrumentRows.length,
+        overdue: instrumentStandings.filter((s) => s.status === "overdue").length,
+        dueSoon: instrumentStandings.filter((s) => s.status === "due_soon").length,
+        unusable: instrumentStandings.filter((s) => !s.usable).length,
+      },
+      rework: {
+        total: reworkRows.length,
+        open: reworkRows.filter((r) => ["identified", "approved", "in_progress"].includes(r.status))
+          .length,
+        costByCurrency: reworkMoney.totals,
+        uncosted: reworkMoney.withoutAmount,
+      },
+      audits: {
+        total: auditRows.length,
+        open: auditRows.filter((a) => a.status !== "closed" && a.status !== "cancelled").length,
+        findings: findingRows.length,
+        openFindings: findingRows.filter((f) =>
+          ["open", "response_received", "action_agreed", "action_complete"].includes(f.status),
+        ).length,
+        majorNonConformities: findingRows.filter((f) => f.findingType === "major_nonconformity")
+          .length,
+        overdueFindings: findingRows.filter(
+          (f) =>
+            f.dueDate !== null &&
+            f.dueDate < today &&
+            ["open", "response_received", "action_agreed", "action_complete"].includes(f.status),
+        ).length,
+      },
+      closeout: {
+        liabilityPeriods: dlpRows.length,
+        expiringWithin60Days: dlpRows.filter((d) => dlpStanding(d, today).status === "expiring")
+          .length,
+        expired: dlpRows.filter((d) => dlpStanding(d, today).status === "expired").length,
+        guarantees: guaranteeRows.length,
+        guaranteesNotMet: guaranteeAssessments.filter((a) => a.met === false).length,
+        guaranteesUnmeasured: guaranteeAssessments.filter(
+          (a) => a.met === null && a.status !== "waived",
+        ).length,
+      },
+    };
+
     return {
+      registers,
       itps: {
         total: itpRows.length,
         byStatus: countBy(itpRows, "status"),
@@ -274,6 +476,7 @@ export const summaryRoutes: FastifyPluginAsync = async (app) => {
         backcharged: ncrRows.filter((n) => n.isBackcharged === 1).length,
         medianClosureDays,
         totalCostImpact: totalNcrCost,
+        costByCurrency,
       },
       commissioning: {
         systems: systemRows.length,
@@ -289,6 +492,175 @@ export const summaryRoutes: FastifyPluginAsync = async (app) => {
         artefactCompleteness: turnoverCompleteness,
         gaps: packageGaps.filter((g) => g.gap > 0),
       },
+    };
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Cost of quality (#1099) and first-time right (#1100)              */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * The PAF model over what this project actually holds. Prevention and
+   * appraisal are counted rather than costed — the platform does not hold the
+   * inspection hours, and reporting them as zero would make the ratio
+   * flattering and false. Failure money is bucketed by currency and never
+   * summed across them.
+   */
+  app.get("/projects/:projectId/quality/cost-of-quality", { preHandler: readGate }, async (req) => {
+    const scope = { companyId: req.companyId!, projectId: req.projectId! };
+    const [rework, ncrs, defects, itps, templates, training, checklistRows, tests, ndt, specimenPours, audits] =
+      await Promise.all([
+        app.db.select().from(reworkItems).where(and(eq(reworkItems.companyId, scope.companyId), eq(reworkItems.projectId, scope.projectId))),
+        app.db.select().from(nonConformanceReports).where(and(eq(nonConformanceReports.companyId, scope.companyId), eq(nonConformanceReports.projectId, scope.projectId))),
+        app.db.select().from(dlpDefects).where(and(eq(dlpDefects.companyId, scope.companyId), eq(dlpDefects.projectId, scope.projectId))),
+        app.db.select().from(inspectionTestPlans).where(and(eq(inspectionTestPlans.companyId, scope.companyId), eq(inspectionTestPlans.projectId, scope.projectId))),
+        app.db.select().from(checklistTemplates).where(eq(checklistTemplates.companyId, scope.companyId)),
+        app.db.select().from(operatorTrainingRecords).where(and(eq(operatorTrainingRecords.companyId, scope.companyId), eq(operatorTrainingRecords.projectId, scope.projectId))),
+        app.db.select().from(checklists).where(and(eq(checklists.companyId, scope.companyId), eq(checklists.projectId, scope.projectId))),
+        app.db.select().from(commissioningTestRecords).where(and(eq(commissioningTestRecords.companyId, scope.companyId), eq(commissioningTestRecords.projectId, scope.projectId))),
+        app.db.select().from(ndtRecords).where(and(eq(ndtRecords.companyId, scope.companyId), eq(ndtRecords.projectId, scope.projectId))),
+        app.db.select().from(concretePours).where(and(eq(concretePours.companyId, scope.companyId), eq(concretePours.projectId, scope.projectId))),
+        app.db.select().from(qualityAudits).where(and(eq(qualityAudits.companyId, scope.companyId), eq(qualityAudits.projectId, scope.projectId))),
+      ]);
+    return costOfQuality({
+      rework: rework.map((r) => ({
+        id: r.id,
+        totalCost: r.totalCost,
+        currency: r.currency,
+        causeCategory: r.causeCategory,
+        discoveryPhase: r.discoveryPhase,
+        status: r.status,
+        trade: r.trade,
+        responsibleVendorId: r.responsibleVendorId,
+        labourHours: r.labourHours,
+      })),
+      ncrs: ncrs.map((n) => ({
+        id: n.id,
+        costImpact: n.costImpact,
+        currency: n.currency,
+        status: n.status,
+      })),
+      dlpDefects: defects.map((d) => ({ id: d.id, cost: d.cost, currency: d.currency })),
+      activity: {
+        approvedItps: itps.filter((i) => i.status === "approved" || i.status === "active" || i.status === "closed").length,
+        approvedTemplates: templates.filter((t) => t.status === "active").length,
+        trainingSessions: training.filter((t) => t.status === "delivered" || t.status === "accepted").length,
+        completedChecklists: checklistRows.filter((c) => c.performedAt !== null).length,
+        commissioningTests: tests.filter((t) => t.performedAt !== null).length,
+        ndtExaminations: ndt.filter((n) => n.result !== "pending").length,
+        concreteSpecimens: specimenPours.reduce((n, p) => n + p.testedSpecimenCount, 0),
+        qualityAudits: audits.filter((a) => a.reportIssuedAt !== null).length,
+      },
+    });
+  });
+
+  /**
+   * First-time right by trade. "Right" is computed from the record — a
+   * checklist with any failed item is not first-time right whatever its
+   * headline result — and a trade with nothing judged returns null rather than
+   * 100%.
+   */
+  app.get("/projects/:projectId/quality/first-time-right", { preHandler: readGate }, async (req) => {
+    const rows = await app.db
+      .select()
+      .from(checklists)
+      .where(
+        and(eq(checklists.companyId, req.companyId!), eq(checklists.projectId, req.projectId!)),
+      );
+    const vendorIds = [...new Set(rows.map((r) => r.vendorId).filter((v): v is string => !!v))];
+    const vendorRows = vendorIds.length
+      ? await app.db
+          .select({ id: vendors.id, name: vendors.name })
+          .from(vendors)
+          .where(and(eq(vendors.companyId, req.companyId!), inArray(vendors.id, vendorIds)))
+      : [];
+    const labels = new Map(vendorRows.map((v) => [v.id, v.name] as const));
+    return firstTimeRightByTrade(
+      rows.map((r) => ({
+        id: r.id,
+        result: r.result,
+        failedItemCount: r.failedItemCount,
+        criticalFailureCount: r.criticalFailureCount,
+        vendorId: r.vendorId,
+        category: r.category,
+        detail: r.detail as Record<string, unknown>,
+      })),
+      labels,
+    );
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Health inputs (plan §3.5)                                         */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * The quality dimension, as numbers another module can score. Every metric
+   * is a count or a rate the register can defend; a metric with no denominator
+   * is `null` with a reason rather than a zero that would read as perfect.
+   */
+  app.get("/projects/:projectId/quality/health-inputs", { preHandler: readGate }, async (req) => {
+    const scope = { companyId: req.companyId!, projectId: req.projectId! };
+    const today = todayISO();
+    const [activities, ncrRows, checklistRows, packages, concessionRows, instrumentRows, findingRows, pourRows, weldRows] =
+      await Promise.all([
+        app.db.select().from(itpActivities).where(and(eq(itpActivities.companyId, scope.companyId), eq(itpActivities.projectId, scope.projectId))),
+        app.db.select().from(nonConformanceReports).where(and(eq(nonConformanceReports.companyId, scope.companyId), eq(nonConformanceReports.projectId, scope.projectId))),
+        app.db.select().from(checklists).where(and(eq(checklists.companyId, scope.companyId), eq(checklists.projectId, scope.projectId))),
+        app.db.select().from(turnoverPackages).where(and(eq(turnoverPackages.companyId, scope.companyId), eq(turnoverPackages.projectId, scope.projectId))),
+        app.db.select().from(qualityConcessions).where(and(eq(qualityConcessions.companyId, scope.companyId), eq(qualityConcessions.projectId, scope.projectId))),
+        app.db.select().from(calibratedInstruments).where(and(eq(calibratedInstruments.companyId, scope.companyId), eq(calibratedInstruments.projectId, scope.projectId))),
+        app.db.select().from(qualityAuditFindings).where(and(eq(qualityAuditFindings.companyId, scope.companyId), eq(qualityAuditFindings.projectId, scope.projectId))),
+        app.db.select().from(concretePours).where(and(eq(concretePours.companyId, scope.companyId), eq(concretePours.projectId, scope.projectId))),
+        app.db.select().from(welds).where(and(eq(welds.companyId, scope.companyId), eq(welds.projectId, scope.projectId))),
+      ]);
+
+    const openNcrs = ncrRows.filter((n) => OPEN_NCR_STATUSES.includes(n.status));
+    const overdueNcrs = openNcrs.filter((n) => n.responseDueDate !== null && n.responseDueDate < today);
+    const judged = checklistRows.filter((c) => c.result !== null);
+    const firstTimeRight = judged.filter((c) => c.failedItemCount === 0 && c.result !== "fail");
+    const overdueHoldPoints = activities.filter((a) => isUnreleasedPastPlannedDate(a, today));
+    const reasons: string[] = [];
+    if (judged.length === 0) {
+      reasons.push(
+        "No checklist has been completed with a result, so the first-time-right rate is unmeasured rather than perfect.",
+      );
+    }
+    if (ncrRows.length === 0) {
+      reasons.push(
+        "No non-conformance has been raised on this project. On a live project that usually means the register is not being used rather than that nothing has gone wrong.",
+      );
+    }
+    return {
+      metrics: {
+        openNcrs: openNcrs.length,
+        overdueNcrs: overdueNcrs.length,
+        criticalOpenNcrs: openNcrs.filter((n) => n.severity === "critical").length,
+        overdueHoldPoints: overdueHoldPoints.length,
+        openHoldPoints: activities.filter(
+          (a) => a.interventionPoint === "hold_point" && !isTerminalActivityStatus(a.status),
+        ).length,
+        firstTimeRightPercent:
+          judged.length === 0 ? null : round2((firstTimeRight.length / judged.length) * 100),
+        turnoverArtefactGap: packages.reduce(
+          (n, p) => n + Math.max(0, p.requiredArtefactCount - p.presentArtefactCount),
+          0,
+        ),
+        liveConcessions: concessionRows.filter((c) => concessionStanding(c, today).live).length,
+        expiredConcessions: concessionRows.filter((c) => c.status === "expired").length,
+        instrumentsOutOfCalibration: instrumentRows.filter(
+          (i) => instrumentStanding(i, today).status === "overdue",
+        ).length,
+        openAuditFindings: findingRows.filter((f) =>
+          ["open", "response_received", "action_agreed", "action_complete"].includes(f.status),
+        ).length,
+        majorNonConformities: findingRows.filter((f) => f.findingType === "major_nonconformity").length,
+        failedConcretePours: pourRows.filter((p) => p.acceptanceVerdict === "rejected").length,
+        weldsAwaitingRequiredNdt: weldRows.filter(
+          (w) => w.ndtRequiredPercent !== null && w.ndtRequiredPercent > 0 && w.ndtRecordCount === 0,
+        ).length,
+        rejectedWelds: weldRows.filter((w) => w.status === "rejected").length,
+      },
+      reasons,
     };
   });
 };

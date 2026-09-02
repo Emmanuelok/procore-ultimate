@@ -274,6 +274,10 @@ export const estimateLineItems = pgTable(
     index("estimate_line_items_costcode_idx").on(t.estimateId, t.costCode, t.costType),
     index("estimate_line_items_takeoff_idx").on(t.takeoffItemId),
     index("estimate_line_items_catalogue_idx").on(t.catalogueItemId),
+    /* the historical-rate lookup: every past line on one cost code */
+    index("estimate_line_items_history_idx").on(t.companyId, t.costCode),
+    /* the staleness sweep: lines resting on a rate older than the window */
+    index("estimate_line_items_stale_idx").on(t.companyId, t.rateAsAt),
   ],
 );
 
@@ -732,6 +736,8 @@ export const estimateSubQuotes = pgTable(
     index("estimate_sub_quotes_estimate_idx").on(t.estimateId),
     index("estimate_sub_quotes_package_idx").on(t.projectId, t.tradePackage),
     index("estimate_sub_quotes_validity_idx").on(t.companyId, t.validUntil),
+    /* the import-dedupe lookup: has this bid submission already come across? */
+    index("estimate_sub_quotes_source_idx").on(t.companyId, t.source, t.sourceId),
   ],
 );
 

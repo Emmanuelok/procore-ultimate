@@ -70,7 +70,13 @@ const inject = (
   url: string,
   headers: Record<string, string>,
   payload?: unknown,
-) => app.inject({ method, url, headers, ...(payload !== undefined ? { payload } : {}) });
+) =>
+  app.inject({
+    method,
+    url,
+    headers,
+    ...(payload !== undefined ? { payload } : {}),
+  });
 
 /* ================================================================== */
 /* Pure engines                                                        */
@@ -168,7 +174,11 @@ describe("payment practice metrics (pure)", () => {
     }));
 
   it("buckets days to pay at the regulation's boundaries", () => {
-    const m = computeMetrics("GBP", sample([10, 30, 31, 60, 61, 200], [true, true, true, false, false, false]), 3);
+    const m = computeMetrics(
+      "GBP",
+      sample([10, 30, 31, 60, 61, 200], [true, true, true, false, false, false]),
+      3,
+    );
     expect(m.invoicesPaid).toBe(6);
     expect(m.paidWithin30Pct).toBeCloseTo(33.3, 1);
     expect(m.paid31To60Pct).toBeCloseTo(33.3, 1);
@@ -224,7 +234,11 @@ describe("statutory liens", () => {
     expect(res.json().status).toBe("noticed");
     expect(res.json().obligationId).toBeTruthy();
     const obl = (
-      await app.db.select().from(obligations).where(eq(obligations.id, res.json().obligationId)).limit(1)
+      await app.db
+        .select()
+        .from(obligations)
+        .where(eq(obligations.id, res.json().obligationId))
+        .limit(1)
     )[0]!;
     expect(obl.status).toBe("open");
   });
@@ -249,14 +263,21 @@ describe("statutory liens", () => {
     });
     const res = await inject("GET", `/api/v1/projects/${projectId}/liens/summary`, owner.headers);
     expect(res.statusCode).toBe(200);
-    const currencies = (res.json().byCurrency as Array<{ currency: string; amount: number }>).map((c) => c.currency);
+    const currencies = (res.json().byCurrency as Array<{ currency: string; amount: number }>).map(
+      (c) => c.currency,
+    );
     expect(currencies).toContain("USD");
     expect(currencies).toContain("EUR");
     expect(res.json().dueWithin14).toBeGreaterThanOrEqual(1);
   });
 
   it("walks the lifecycle and satisfies the deadline obligation on release", async () => {
-    const filed = await inject("POST", `/api/v1/projects/${projectId}/liens/${lienId}/file`, owner.headers, {});
+    const filed = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/liens/${lienId}/file`,
+      owner.headers,
+      {},
+    );
     expect(filed.statusCode).toBe(200);
     expect(filed.json().status).toBe("filed");
     expect(filed.json().filedAt).toBeTruthy();
@@ -270,13 +291,22 @@ describe("statutory liens", () => {
     expect(released.statusCode).toBe(200);
     expect(released.json().status).toBe("released");
     const obl = (
-      await app.db.select().from(obligations).where(eq(obligations.id, released.json().obligationId)).limit(1)
+      await app.db
+        .select()
+        .from(obligations)
+        .where(eq(obligations.id, released.json().obligationId))
+        .limit(1)
     )[0]!;
     expect(obl.status).toBe("satisfied");
   });
 
   it("refuses a transition out of a closed lien", async () => {
-    const res = await inject("POST", `/api/v1/projects/${projectId}/liens/${lienId}/file`, owner.headers, {});
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/liens/${lienId}/file`,
+      owner.headers,
+      {},
+    );
     expect(res.statusCode).toBe(409);
   });
 
@@ -295,10 +325,16 @@ describe("statutory liens", () => {
     const raised = await app.db
       .select()
       .from(signals)
-      .where(and(eq(signals.companyId, owner.companyId), eq(signals.detector, "lien_deadline_passed")));
+      .where(
+        and(eq(signals.companyId, owner.companyId), eq(signals.detector, "lien_deadline_passed")),
+      );
     expect(raised.length).toBe(1);
     const obl = (
-      await app.db.select().from(obligations).where(eq(obligations.id, created.json().obligationId)).limit(1)
+      await app.db
+        .select()
+        .from(obligations)
+        .where(eq(obligations.id, created.json().obligationId))
+        .limit(1)
     )[0]!;
     expect(obl.status).toBe("breached");
 
@@ -307,7 +343,9 @@ describe("statutory liens", () => {
     const again = await app.db
       .select()
       .from(signals)
-      .where(and(eq(signals.companyId, owner.companyId), eq(signals.detector, "lien_deadline_passed")));
+      .where(
+        and(eq(signals.companyId, owner.companyId), eq(signals.detector, "lien_deadline_passed")),
+      );
     expect(again.length).toBe(1);
     void id;
   });
@@ -507,9 +545,13 @@ describe("adjudication case management", () => {
       owner.headers,
     );
     expect(res.statusCode).toBe(200);
-    const mine = (res.json().items as Array<{ id: string; nextStep: string; daysRemaining: number | null }>).find(
-      (i) => i.id === caseId,
-    );
+    const mine = (
+      res.json().items as Array<{
+        id: string;
+        nextStep: string;
+        daysRemaining: number | null;
+      }>
+    ).find((i) => i.id === caseId);
     expect(mine?.nextStep).toBe("referral");
     expect(mine?.daysRemaining).toBeGreaterThanOrEqual(0);
   });
@@ -551,7 +593,10 @@ describe("adjudication case management", () => {
       "POST",
       `/api/v1/projects/${projectId}/adjudications/${caseId}/decide`,
       owner.headers,
-      { decisionAmount: 70000, decisionSummary: "Award of 70,000 plus the adjudicator's fee." },
+      {
+        decisionAmount: 70000,
+        decisionSummary: "Award of 70,000 plus the adjudicator's fee.",
+      },
     );
     expect(decided.statusCode).toBe(200);
     expect(decided.json().status).toBe("decided");
@@ -559,12 +604,22 @@ describe("adjudication case management", () => {
   });
 
   it("refuses a decision with no summary behind it", async () => {
-    const created = await inject("POST", `/api/v1/projects/${projectId}/adjudications`, owner.headers, {
-      regime: "sg_sopa",
-      disputedAmount: 1000,
-    });
+    const created = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/adjudications`,
+      owner.headers,
+      {
+        regime: "sg_sopa",
+        disputedAmount: 1000,
+      },
+    );
     const id = created.json().id as string;
-    await inject("POST", `/api/v1/projects/${projectId}/adjudications/${id}/refer`, owner.headers, {});
+    await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/adjudications/${id}/refer`,
+      owner.headers,
+      {},
+    );
     const res = await inject(
       "POST",
       `/api/v1/projects/${projectId}/adjudications/${id}/decide`,
@@ -575,10 +630,15 @@ describe("adjudication case management", () => {
   });
 
   it("moots the open deadlines when a case settles", async () => {
-    const created = await inject("POST", `/api/v1/projects/${projectId}/adjudications`, owner.headers, {
-      regime: "nz_cca",
-      disputedAmount: 5000,
-    });
+    const created = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/adjudications`,
+      owner.headers,
+      {
+        regime: "nz_cca",
+        disputedAmount: 5000,
+      },
+    );
     const id = created.json().id as string;
     const settled = await inject(
       "POST",
@@ -684,12 +744,17 @@ describe("regression: deemed liability does not depend on someone opening a page
   let claimId: string;
 
   beforeAll(async () => {
-    const created = await inject("POST", `/api/v1/projects/${projectId}/payment-claims`, owner.headers, {
-      regime: "uk_hgcra",
-      referenceDate: addDaysISO(todayISO(), -60),
-      claimedAmount: 25000,
-      currency: "GBP",
-    });
+    const created = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/payment-claims`,
+      owner.headers,
+      {
+        regime: "uk_hgcra",
+        referenceDate: addDaysISO(todayISO(), -60),
+        claimedAmount: 25000,
+        currency: "GBP",
+      },
+    );
     claimId = created.json().id;
     await inject(
       "POST",
@@ -719,7 +784,10 @@ describe("regression: deemed liability does not depend on someone opening a page
       .select()
       .from(signals)
       .where(
-        and(eq(signals.companyId, owner.companyId), eq(signals.detector, "payment_deemed_liability")),
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "payment_deemed_liability"),
+        ),
       );
     expect(raised.length).toBe(1);
     expect(raised[0]!.severity).toBe("critical");

@@ -10,19 +10,30 @@ export interface Asset {
   category: string | null;
   classificationSystem: string | null;
   classificationCode: string | null;
+  parentId: string | null;
   locationId: string | null;
+  ownerId: string | null;
   manufacturer: string | null;
   modelNumber: string | null;
   serialNumber: string | null;
   installedAt: string | null;
   commissionedAt: string | null;
+  decommissionedAt?: string | null;
   warrantyStart: string | null;
   warrantyMonths: number | null;
   expectedLifeYears: number | null;
   criticality: string;
   status: string;
+  designBaseline?: Record<string, number> | null;
   attributes: Record<string, unknown>;
   createdAt: string;
+}
+
+/** A row of the asset register: the asset plus the counts the list computes. */
+export interface AssetRow extends Asset {
+  elementLinkCount: number;
+  sensorCount: number;
+  warranties: Array<{ endDate: string; status: string }>;
 }
 
 export interface AssetElementLink {
@@ -34,27 +45,110 @@ export interface AssetElementLink {
 
 export interface Warranty {
   id: string;
+  assetId?: string;
   provider: string;
   description: string | null;
   startDate: string;
   endDate: string;
+  status?: string;
+  documentFileId?: string | null;
+  obligationId?: string | null;
+  notifiedDays?: number | null;
+  expired?: boolean;
+  daysRemaining?: number;
+  assetName?: string;
+  tagCode?: string;
+}
+
+export interface WarrantyClaim {
+  id: string;
+  warrantyId: string;
+  assetId: string;
+  number: number;
+  title: string;
+  description: string | null;
+  status: string;
+  lodgedAt: string | null;
+  respondedAt: string | null;
+  closedAt: string | null;
+  resolution: string | null;
+  assetName?: string;
+  tagCode?: string;
+  provider?: string;
 }
 
 export interface Sensor {
   id: string;
+  projectId?: string;
   assetId: string | null;
+  locationId: string | null;
+  ownerId: string | null;
+  externalId: string | null;
   name: string;
   kind: string;
   unit: string;
   minValue: number | null;
   maxValue: number | null;
+  designSetpoint: number | null;
+  staleAfterMinutes: number | null;
+  cooldownMinutes: number;
+  lastReadingAt: string | null;
+  lastValue: number | null;
+  lastAlertAt: string | null;
   isActive: string;
 }
 
+export interface SensorOverviewRow extends Sensor {
+  window: {
+    hours: number;
+    readings: number;
+    avg: number | null;
+    min: number | null;
+    max: number | null;
+    basis: string;
+  };
+  openAlerts: number;
+  alertKinds: string[];
+}
+
+export interface SensorAlert {
+  id: string;
+  sensorId: string;
+  assetId: string | null;
+  kind: string;
+  status: string;
+  value: number | null;
+  threshold: number | null;
+  breachCount: number;
+  firstBreachAt: string | null;
+  lastBreachAt: string | null;
+  acknowledgedBy: string | null;
+  acknowledgedAt: string | null;
+  clearedAt: string | null;
+  notes: string | null;
+  sensorName?: string;
+  unit?: string;
+  assetName?: string | null;
+  assetTag?: string | null;
+}
+
 export interface AssetDetail extends Asset {
+  location: { id: string; name: string; path: string } | null;
   elementLinks: AssetElementLink[];
   warranties: Warranty[];
+  warrantyClaims: WarrantyClaim[];
   sensors: Sensor[];
+  children: Array<{ id: string; tagCode: string; name: string; status: string }>;
+  openAlerts: SensorAlert[];
+}
+
+export interface AssetTreeNode {
+  id: string;
+  tagCode: string;
+  name: string;
+  status: string;
+  criticality: string;
+  children: AssetTreeNode[];
 }
 
 export interface ReadingBucket {
@@ -65,6 +159,16 @@ export interface ReadingBucket {
   count: number;
 }
 
+export interface MilestoneContainerVerdict {
+  id: string;
+  label: string;
+  kind: string;
+  satisfied: boolean;
+  reason: string;
+  currentState: string | null;
+  currentSuitability: string | null;
+}
+
 export interface DeliveryMilestone {
   id: string;
   name: string;
@@ -73,6 +177,101 @@ export interface DeliveryMilestone {
   requiredSuitability: string | null;
   description: string | null;
   status: string;
+  containerCount?: number;
+  overdue?: boolean;
+  deliveredAt?: string | null;
+  acceptedBy?: string | null;
+  acceptedAt?: string | null;
+  decisionNote?: string | null;
+}
+
+export interface MilestoneDetail extends DeliveryMilestone {
+  containers: MilestoneContainerVerdict[];
+  containersSatisfied: boolean;
+}
+
+export interface HandoverDimension {
+  key: string;
+  label: string;
+  weight: number;
+  populated: number;
+  total: number;
+  percent: number;
+  basis: string;
+  missingTagCodes: string[];
+}
+
+export interface HandoverReadiness {
+  score: number | null;
+  scoreBasis: string;
+  assetsAssessed: number;
+  dimensions: HandoverDimension[];
+  blockers: string[];
+  cobie: { completeness: number; errors: number; warnings: number };
+  milestones: Record<string, number>;
+}
+
+export interface CobieValidation {
+  ok: boolean;
+  errors: number;
+  warnings: number;
+  issues: Array<{
+    sheet: string;
+    row: number | null;
+    column: string | null;
+    severity: string;
+    message: string;
+  }>;
+  completeness: {
+    score: number;
+    fieldCoverage: Array<{ field: string; populated: number; total: number; percent: number }>;
+    missingByComponent: Array<{ tagCode: string; missing: string[] }>;
+  };
+  sheets: Array<{ name: string; rows: number; reason: string | null }>;
+}
+
+export interface PerformanceRow {
+  assetId: string | null;
+  assetTag: string | null;
+  assetName: string | null;
+  sensorId: string;
+  sensorName: string;
+  kind: string;
+  unit: string;
+  designSetpoint: number | null;
+  readings: number;
+  avg: number | null;
+  min: number | null;
+  max: number | null;
+  lastValue: number | null;
+  lastAt: string | null;
+  gap: number | null;
+  gapPercent: number | null;
+  verdict: string;
+  basis: string;
+}
+
+export interface TwinSummary {
+  assets: Record<string, number>;
+  assetsTotal: number;
+  sensors: Record<string, number>;
+  sensorsTotal: number;
+  alerts: Record<string, number>;
+  openAlerts: number;
+  warranties: { total: number; active: number; expired: number; expiringWithin90Days: number };
+  claims: Record<string, number>;
+  openClaims: number;
+  milestones: { total: number; accepted: number; overdue: number };
+  elementLinks: number;
+  geometryCoverage: number | null;
+  geometryCoverageBasis: string;
+  simulationAvailable: boolean;
+}
+
+export interface CompanyUser {
+  id: string;
+  name: string;
+  email: string;
 }
 
 export interface ListResponse<T> {

@@ -24,16 +24,138 @@ import {
   complianceTone,
   money,
   titleCase,
+  useResource,
   type Loadable,
 } from "./shared";
 import type { ComplianceEntry, ComplianceReport, ComplianceStatus } from "./types";
 
 const ORDER: ComplianceStatus[] = ["blocked", "warning", "unknown", "compliant"];
 
+/** What the daily sweep is about to notify on: cover running out inside the window. */
+interface UpcomingExpiry {
+  commitmentId: string;
+  reference: string;
+  vendorName: string | null;
+  currency: string;
+  unpaidBalance: number;
+  subjectType: "certificate" | "bond";
+  coverage: string;
+  expiresOn: string;
+  daysUntilExpiry: number;
+  line: number | null;
+  renewalRequest: string;
+}
+
+interface UpcomingReport {
+  asOf: string;
+  windowDays: number;
+  items: UpcomingExpiry[];
+  byLine: { within7: number; within14: number; within30: number };
+  lastSweptAt: string | null;
+  note: string | null;
+}
+
+/**
+ * COVER ABOUT TO RUN OUT (#530-#532). A certificate that expires on the 14th
+ * is a phone call on the 1st and a stopped payment on the 15th; the whole
+ * value of this panel is that it appears BEFORE the answer becomes no. Each
+ * row carries the renewal request the project can send the vendor verbatim.
+ */
+function UpcomingExpiries({
+  projectId,
+  onOpen,
+}: {
+  projectId: string;
+  onOpen: (commitmentId: string) => void;
+}) {
+  const upcoming = useResource<UpcomingReport>(
+    `/api/v1/projects/${projectId}/commitments/compliance/upcoming?days=30`,
+  );
+  const data = upcoming.data;
+  if (upcoming.error) return <ErrorAlert message={upcoming.error} onRetry={upcoming.reload} />;
+  if (!data) return null;
+  if (data.items.length === 0) {
+    return (
+      <Card>
+        <CardBody>
+          <p className="text-meta text-content-muted">
+            No insurance certificate or bond on a commitment with money still to pay expires within{" "}
+            {data.windowDays} days.
+          </p>
+          <p className="mt-1 text-2xs text-content-subtle">
+            {data.note ?? `Last swept ${data.lastSweptAt ?? "—"}.`}
+          </p>
+        </CardBody>
+      </Card>
+    );
+  }
+  return (
+    <Card>
+      <CardBody className="space-y-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-label uppercase text-content-subtle">
+            Cover running out inside {data.windowDays} days
+          </span>
+          <Badge size="xs" tone={data.byLine.within7 > 0 ? "danger" : "neutral"}>
+            {data.byLine.within7} within 7d
+          </Badge>
+          <Badge size="xs" tone={data.byLine.within14 > 0 ? "warning" : "neutral"}>
+            {data.byLine.within14} within 14d
+          </Badge>
+          <Badge size="xs" tone="neutral">
+            {data.byLine.within30} within 30d
+          </Badge>
+        </div>
+        <p className="text-2xs text-content-subtle">
+          {data.note ??
+            `The daily sweep last ran at ${data.lastSweptAt}. It notifies the project team once per line crossed, not every morning.`}
+        </p>
+        <ul className="space-y-2">
+          {data.items.map((it) => (
+            <li
+              key={`${it.subjectType}-${it.commitmentId}-${it.expiresOn}-${it.coverage}`}
+              className="rounded-md border border-border p-2"
+            >
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge
+                  size="xs"
+                  tone={it.daysUntilExpiry <= 7 ? "danger" : it.daysUntilExpiry <= 14 ? "warning" : "neutral"}
+                >
+                  {it.daysUntilExpiry}d
+                </Badge>
+                <span className="font-mono text-2xs">{it.reference}</span>
+                <span className="text-meta">
+                  {it.vendorName ?? "vendor"} — {it.coverage} {it.subjectType} expires {it.expiresOn}
+                </span>
+                <span className="text-2xs text-content-subtle">
+                  {money(it.unpaidBalance, it.currency)} still unpaid
+                </span>
+                <Button size="xs" variant="ghost" onClick={() => onOpen(it.commitmentId)}>
+                  Open
+                </Button>
+              </div>
+              <details className="mt-1">
+                <summary className="cursor-pointer text-2xs text-accent-text">
+                  Renewal request to send
+                </summary>
+                <p className="mt-1 whitespace-pre-wrap text-2xs text-content-muted">
+                  {it.renewalRequest}
+                </p>
+              </details>
+            </li>
+          ))}
+        </ul>
+      </CardBody>
+    </Card>
+  );
+}
+
 export default function ComplianceTab({
+  projectId,
   report,
   onOpen,
 }: {
+  projectId: string;
   report: Loadable<ComplianceReport>;
   onOpen: (commitmentId: string) => void;
 }) {
@@ -64,6 +186,8 @@ export default function ComplianceTab({
 
   return (
     <div className="space-y-4">
+      <UpcomingExpiries projectId={projectId} onOpen={onOpen} />
+
       <Card>
         <CardBody className="space-y-3">
           <div className="flex flex-wrap items-center gap-2">

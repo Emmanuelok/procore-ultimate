@@ -76,7 +76,13 @@ export interface ValuationRow {
   valuationDate: string;
   basis: string;
   status: string;
+  currency: string;
   retentionPercent: number;
+  retentionCap: number | null;
+  sectionsTotal: number;
+  grossTotal: number;
+  dueDate: string | null;
+  dueDateBasis: string | null;
   workDoneToDate: number;
   materialsOnSite: number;
   materialsOffSite: number;
@@ -105,23 +111,33 @@ export interface ValuationLine {
 
 export interface ValuationDetail extends ValuationRow {
   lines?: ValuationLine[];
+  sections?: ValuationSection[];
+  certificates?: CertificateRow[];
 }
 
 export interface CertificateRow {
   id: string;
   valuationId: string;
   number: number;
+  currency: string;
   certifiedWorkDone: number;
   certifiedMaterials: number;
+  certifiedSections: number;
   retentionHeld: number;
   previousCertified: number;
   netCertified: number;
   varianceFromApplication: number;
   varianceReason: string | null;
   dueDate: string | null;
+  dueDateBasis: string | null;
   status: string;
+  withdrawnReason: string | null;
+  paidAmount: number | null;
+  paidAt: string | null;
+  paymentReference: string | null;
   issuedBy: string;
   issuedAt: string;
+  overdue?: boolean;
 }
 
 export interface VariationRow {
@@ -140,13 +156,281 @@ export interface VariationRow {
   boqItemRefs?: string[];
 }
 
-export interface CommercialSummary {
+export interface CurrencyPosition {
+  currency: string;
   boqTotal: number;
   certifiedToDate: number;
+  paidToDate: number;
   retentionHeld: number;
   variationsAgreed: number;
   variationsPending: number;
   forecastFinal: number;
+  boqCount: number;
+}
+
+/**
+ * The project commercial position. `byCurrency` is always the truth; the flat
+ * fields are populated only when the project holds ONE currency and are null
+ * otherwise, with `reasons` saying why. Never render a flat null as 0.
+ */
+export interface CommercialSummary {
+  currency: string | null;
+  byCurrency: CurrencyPosition[];
+  reasons: string[];
+  boqTotal: number | null;
+  certifiedToDate: number | null;
+  paidToDate: number | null;
+  retentionHeld: number | null;
+  variationsAgreed: number | null;
+  variationsPending: number | null;
+  forecastFinal: number | null;
+}
+
+/* ------------------------- Upgrade-wave record types ----------------------- */
+
+export interface ValuationSection {
+  id: string;
+  kind: string;
+  description: string;
+  sourceType: string | null;
+  sourceId: string | null;
+  amountToDate: number;
+  previousAmount: number;
+  thisPeriod: number;
+  retentionApplies: boolean;
+  evidenceRef: string | null;
+  notes: string | null;
+}
+
+export interface DayworkItemRow {
+  id: string;
+  kind: string;
+  description: string;
+  unit: string | null;
+  qty: number;
+  rate: number;
+  amount: number;
+  percentAddition: number;
+  amountWithAddition: number;
+}
+
+export interface DayworkSheetRow {
+  id: string;
+  number: number;
+  reference: string | null;
+  workDate: string;
+  description: string;
+  location: string | null;
+  basis: string;
+  status: string;
+  currency: string;
+  percentAdditions: Record<string, number>;
+  netTotal: number;
+  additionTotal: number;
+  grossTotal: number;
+  submittedBy: string | null;
+  verifiedBy: string | null;
+  rejectionReason: string | null;
+  items?: DayworkItemRow[];
+}
+
+export interface RemeasurementRow {
+  id: string;
+  boqId: string;
+  boqItemId: string;
+  originalQuantity: number | null;
+  remeasuredQuantity: number;
+  method: string;
+  status: string;
+  measuredAt: string;
+  measuredBy: string;
+  witnessedBy: string | null;
+  agreedBy: string | null;
+  note: string | null;
+  code?: string;
+  description?: string;
+  unit?: string | null;
+  rate?: number | null;
+  quantityMovement?: number | null;
+  valueMovement?: number | null;
+}
+
+export interface ProvisionalSumRow {
+  id: string;
+  boqItemId: string;
+  kind: string;
+  title: string;
+  allowance: number;
+  currency: string;
+  status: string;
+  instructionRef: string | null;
+  expendedTotal: number;
+  code?: string;
+  description?: string;
+  variance?: number;
+  variancePercent?: number | null;
+}
+
+export interface MomFinding {
+  itemId: string | null;
+  code: string | null;
+  ruleId: string;
+  severity: "error" | "warning" | "info";
+  scope: string;
+  message: string;
+  reference: string;
+}
+
+export interface MomReport {
+  method: string;
+  standardName: string;
+  supported: boolean;
+  itemsChecked: number;
+  findings: MomFinding[];
+  counts: { error: number; warning: number; info: number };
+  complianceScore: number | null;
+  notes: string[];
+}
+
+export interface RateAnalysis {
+  itemId: string;
+  code: string;
+  description: string;
+  unit: string | null;
+  rate: number | null;
+  currency: string;
+  buildUp: {
+    total: number;
+    reconciles: boolean;
+    difference: number;
+    split: Record<string, number>;
+    splitPercent: Record<string, number>;
+    observations: string[];
+  };
+  benchmark: {
+    verdict: string;
+    rate: number | null;
+    sampleSize: number;
+    median: number | null;
+    p25: number | null;
+    p75: number | null;
+    deviationPercent: number | null;
+    basis: string;
+    samples: Array<{ rate: number; source: string; label: string; currency: string }>;
+  };
+}
+
+export interface CvrRow {
+  scope: string;
+  label: string;
+  packageRef: string | null;
+  valueToDate: number | null;
+  certifiedToDate: number | null;
+  costToDate: number | null;
+  accruals: number;
+  margin: number | null;
+  marginPercent: number | null;
+}
+
+export interface CvrResult {
+  currency: string;
+  currencies: string[];
+  periodEnd: string;
+  valueToDate: number | null;
+  certifiedToDate: number;
+  costToDate: number | null;
+  accruals: number;
+  wip: number | null;
+  margin: number | null;
+  marginPercent: number | null;
+  overUnderCertification: number | null;
+  rows: CvrRow[];
+  gaps: string[];
+  cvrPeriodId: string | null;
+}
+
+export interface SCurveResult {
+  currency: string;
+  currencies: string[];
+  points: Array<{
+    period: string;
+    planned: number;
+    plannedCumulative: number;
+    actualCumulative: number | null;
+  }>;
+  totalAllocated: number;
+  unallocated: number;
+  totalBoq?: number;
+  linkedTasks?: number;
+  reasons: string[];
+}
+
+export interface FinalAccountLine {
+  id: string;
+  sequence: number;
+  category: string;
+  description: string;
+  amount: number;
+  sourceType: string | null;
+  sourceId: string | null;
+  manual: boolean;
+  note: string | null;
+}
+
+export interface FinalAccountRow {
+  id: string;
+  number: number;
+  contractId: string;
+  status: string;
+  currency: string;
+  contractSum: number;
+  finalContractSum: number;
+  certifiedToDate: number;
+  balanceDue: number;
+  gaps: string[];
+  computedAt: string | null;
+  issuedAt: string | null;
+  contractorSignedBy: string | null;
+  employerSignedBy: string | null;
+  lines?: FinalAccountLine[];
+}
+
+export interface RetentionPosition {
+  boqId: string;
+  boqName: string;
+  currency: string;
+  retentionPercent: number;
+  retentionCap: number | null;
+  retentionHeld: number;
+  released: number;
+  dueNow: number;
+  firstTranche: number;
+  firstTrancheDate: string | null;
+  secondTranche: number;
+  secondTrancheDate: string | null;
+  reasons: string[];
+}
+
+export interface FluctuationCalcRow {
+  id: string;
+  formula: string;
+  baseDate: string;
+  currentPeriod: string;
+  nonAdjustable: number;
+  workDoneAmount: number;
+  factor: number;
+  adjustment: number;
+  currency: string;
+  createdAt: string;
+}
+
+export interface IndexSeriesRow {
+  id: string;
+  code: string;
+  name: string;
+  source: string | null;
+  country: string | null;
+  values: Array<{ period: string; value: number }>;
 }
 
 /* ------------------------------- Formatting -------------------------------- */
@@ -185,6 +469,75 @@ export function money(value: number | null | undefined, currency: string): strin
 export function money0(value: number | null | undefined, currency: string): string {
   if (value === null || value === undefined || !Number.isFinite(value)) return "—";
   return moneyFormatter(currency, 0).format(value);
+}
+
+/** Signed money, for movements and variances. */
+export function moneySigned(value: number | null | undefined, currency: string): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
+  return `${value > 0 ? "+" : ""}${moneyFormatter(currency, 2).format(value)}`;
+}
+
+export function percent(value: number | null | undefined, digits = 1): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
+  return `${value.toFixed(digits)}%`;
+}
+
+export function dayworkStatusTone(status: string): string {
+  switch (status) {
+    case "submitted":
+      return "blue";
+    case "verified":
+      return "green";
+    case "valued":
+      return "violet";
+    case "rejected":
+      return "red";
+    default:
+      return "gray";
+  }
+}
+
+export function remeasurementTone(status: string): string {
+  switch (status) {
+    case "proposed":
+      return "blue";
+    case "agreed":
+      return "green";
+    case "applied":
+      return "violet";
+    case "disputed":
+      return "red";
+    default:
+      return "gray";
+  }
+}
+
+export function severityTone(severity: string): string {
+  if (severity === "error") return "red";
+  if (severity === "warning") return "amber";
+  return "gray";
+}
+
+export function verdictTone(verdict: string): string {
+  if (verdict === "high") return "red";
+  if (verdict === "low") return "amber";
+  if (verdict === "in_range") return "green";
+  return "gray";
+}
+
+export function sectionKindLabel(kind: string): string {
+  const map: Record<string, string> = {
+    variation: "Variation",
+    daywork: "Daywork",
+    claim: "Claim / loss & expense",
+    fluctuation: "Fluctuation",
+    materials_on_site: "Materials on site",
+    materials_off_site: "Materials off site",
+    contra_charge: "Contra charge",
+    provisional_sum: "Provisional sum",
+    other: "Other",
+  };
+  return map[kind] ?? kind;
 }
 
 /** Measured quantity, up to 3 decimal places. */

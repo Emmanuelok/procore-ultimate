@@ -62,7 +62,19 @@ const emptyEvidence: EvidenceForm = {
   metadata: "",
 };
 
+interface AutoResult {
+  assertions: number;
+  created: number;
+  skipped: number;
+  results: Record<string, number>;
+  contradicted: { assertionId: string; reconciliationId: string; variancePercent: number | null }[];
+  signalsCreated: number;
+}
+
 export default function ReconcileTab({ projectId }: { projectId: string }) {
+  const [autoBusy, setAutoBusy] = useState(false);
+  const [autoResult, setAutoResult] = useState<AutoResult | null>(null);
+  const [autoError, setAutoError] = useState<string | null>(null);
   const base = `/api/v1/projects/${projectId}`;
 
   const [assertions, setAssertions] = useState<AssertionRow[] | null>(null);
@@ -114,6 +126,21 @@ export default function ReconcileTab({ projectId }: { projectId: string }) {
   useEffect(() => {
     void load();
   }, [load]);
+
+  async function runAutoReconcile() {
+    setAutoBusy(true);
+    setAutoError(null);
+    setAutoResult(null);
+    try {
+      const res = await api.post<AutoResult>(`${base}/reconciliations/auto`, {});
+      setAutoResult(res);
+      await load();
+    } catch (err) {
+      setAutoError(err instanceof Error ? err.message : "Auto-reconciliation failed");
+    } finally {
+      setAutoBusy(false);
+    }
+  }
 
   async function onCreateReconciliation() {
     if (!selAssertion || selEvidence.size === 0) return;
@@ -244,6 +271,40 @@ export default function ReconcileTab({ projectId }: { projectId: string }) {
       <ErrorAlert message={error} />
       <WarnBanner message={sodWarning} />
       <ErrorAlert message={createError} />
+
+      <Card>
+        <CardBody>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold text-ink-900">Auto-reconcile</div>
+              <p className="mt-0.5 max-w-2xl text-xs text-ink-500">
+                Runs every competent reconciler over every unreconciled assertion against{" "}
+                <span className="font-medium">the whole project evidence pool</span> — not a
+                selection. That is what stops a claimant supporting a claim with the one favourable
+                survey while four others contradict it. Each reconciler accepts only the evidence
+                kinds it is competent to read, weights each row by independence and capture
+                proximity, and reports the rows it rejected with the reason.
+              </p>
+            </div>
+            <Button variant="secondary" onClick={() => void runAutoReconcile()} disabled={autoBusy}>
+              {autoBusy ? "Reconciling…" : "Auto-reconcile"}
+            </Button>
+          </div>
+          <ErrorAlert message={autoError} />
+          {autoResult ? (
+            <div className="mt-3 rounded-md bg-brand-50 px-3 py-2 text-sm text-brand-900 ring-1 ring-brand-200">
+              {autoResult.created} reconciliation{autoResult.created === 1 ? "" : "s"} created over{" "}
+              {autoResult.assertions} assertion{autoResult.assertions === 1 ? "" : "s"} ({autoResult.skipped}{" "}
+              already reconciled) ·{" "}
+              {Object.entries(autoResult.results)
+                .map(([k, v]) => `${v} ${humanize(k).toLowerCase()}`)
+                .join(", ") || "no numeric verdicts"}{" "}
+              · {autoResult.signalsCreated} over-certification signal
+              {autoResult.signalsCreated === 1 ? "" : "s"} raised.
+            </div>
+          ) : null}
+        </CardBody>
+      </Card>
 
       {loading ? (
         <Spinner />

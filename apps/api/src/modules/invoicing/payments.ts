@@ -15,6 +15,7 @@ import { AppError, badRequest, conflict, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import type { Db } from "../../lib/db.js";
 import { assessCommitment } from "../commitments/compliance.js";
+import { rememberIdempotent, replayIdempotent } from "../commitments/idempotency.js";
 import { assertCompliancePermits } from "../commitments/payments.js";
 import { fetchInvoice, type InvoiceRow } from "./invoices.js";
 import {
@@ -110,7 +111,17 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
   /** What is still payable on this invoice, honouring an "as noted" cut. */
   const payableOf = (inv: InvoiceRow): number => payableOfInvoice(inv);
 
+  /*
+   * Recording a payment is the irreversible act, so it honours
+   * `Idempotency-Key` (plan §6.2): a client that times out and retries gets
+   * the FIRST response back rather than cutting a second cheque. Without the
+   * header the invoice row lock and the payable re-check inside the
+   * transaction still refuse the second payment; the key makes the refusal a
+   * replay instead of a 400.
+   */
   app.post("/invoices/:invoiceId/payments", { preHandler: companyGate }, async (req, reply) => {
+    const replayed = await replayIdempotent<unknown>(app.db, req, reply);
+    if (replayed) return replayed.body;
     const { invoiceId } = req.params as { invoiceId: string };
     const body = paymentCreateSchema.parse(req.body);
     const inv = await fetchInvoice(app.db, invoiceId, req.companyId!);
@@ -399,7 +410,7 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
       );
     }
     for (const w of compliance.warnings) warnings.push(w.message);
-    return reply.status(201).send({
+    const response = {
       payment: payment[0],
       invoice: await fetchInvoice(app.db, invoiceId, req.companyId!),
       lienWaiver: gate,
@@ -408,7 +419,9 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
       settlement: settledInvoice?.invoice ?? null,
       waiverRequested,
       warnings,
-    });
+    };
+    await rememberIdempotent(app.db, req, "invoice.payment", 201, response);
+    return reply.status(201).send(response);
   });
 
   app.get("/invoices/:invoiceId/payments", { preHandler: companyGate }, async (req, reply) => {

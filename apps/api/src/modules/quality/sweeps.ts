@@ -1,10 +1,12 @@
 /**
- * The lazy quality sweeps.
+ * The quality sweeps.
  *
- * No cron, ever. Every sweep runs at the top of the list reads of the
- * register it concerns, which is the platform-wide pattern (insurance expiry,
- * payment deemed liability, contract time bars): a record nobody reads harms
- * nobody, and the read is the exact moment the answer has to be true.
+ * They run in TWO places, and the second one is the important one. Every
+ * sweep runs at the top of the list reads of the register it concerns, so an
+ * open page is always telling the truth; and every sweep is also registered
+ * as a scheduler job (./jobs.ts), because a platform whose product is "the
+ * hold point was never released and here is the record" cannot depend on
+ * somebody opening a browser tab to notice.
  *
  * Four detectors, each keyed in `signals.evidenceRefs.key` so a second read
  * of the same page raises nothing:
@@ -55,15 +57,11 @@ export interface SweepOutcome {
   byDetector: Record<QualityDetector, number>;
 }
 
-const emptyOutcome = (): SweepOutcome => ({
-  raised: 0,
-  byDetector: {
-    [QUALITY_DETECTORS.holdPointUnreleased]: 0,
-    [QUALITY_DETECTORS.ncrResponseOverdue]: 0,
-    [QUALITY_DETECTORS.turnoverArtefactsMissing]: 0,
-    [QUALITY_DETECTORS.systemDeficienciesOverdue]: 0,
-  },
-});
+export const emptyOutcome = (): SweepOutcome => {
+  const byDetector = {} as Record<QualityDetector, number>;
+  for (const detector of Object.values(QUALITY_DETECTORS)) byDetector[detector] = 0;
+  return { raised: 0, byDetector };
+};
 
 /* ------------------------------------------------------------------ */
 /* 1. Unreleased hold point past its planned date                      */

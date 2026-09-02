@@ -1,6 +1,8 @@
 /**
  * Bills of Quantities tab — BoQ register, hierarchical item editor with
- * rate build-ups (#145-149) and taking-off dimension sheets (#135-140).
+ * rate build-ups (#145-149), taking-off dimension sheets with deductions
+ * (#135-140), method-of-measurement compliance (#117-134) and CSV
+ * import/export so the bill is machine-readable (#191).
  */
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import { BOQ_ITEM_TYPES, BOQ_LEVELS, BOQ_METHODS } from "@constructos/shared";
@@ -31,9 +33,11 @@ import {
   parseNum,
   qty,
   round2,
+  severityTone,
   type BoqDetail,
   type BoqRow,
   type FlatBoqItem,
+  type MomReport,
   type TakeoffLine,
 } from "./commercialShared";
 
@@ -957,6 +961,15 @@ export default function BoqTab({
 
       <ErrorAlert message={error} />
 
+      {detail !== null ? (
+        <BillToolsPanel
+          boq={detail}
+          editable={editable}
+          onImported={refresh}
+          onError={setError}
+        />
+      ) : null}
+
       {detail === null ? (
         <Spinner />
       ) : detail.items.length === 0 ? (
@@ -1063,6 +1076,220 @@ export default function BoqTab({
           onChanged={refresh}
         />
       ) : null}
+    </div>
+  );
+}
+
+
+/* -------------------- Measurement check + CSV interchange ------------------ */
+
+/**
+ * Two things a bill needs that a grid cannot show: whether it actually
+ * complies with the measurement standard it claims, and a way in and out as
+ * CSV so an estimating package or an ERP can exchange it.
+ */
+function BillToolsPanel({
+  boq,
+  editable,
+  onImported,
+  onError,
+}: {
+  boq: BoqDetail;
+  editable: boolean;
+  onImported: () => void;
+  onError: (message: string | null) => void;
+}) {
+  const [report, setReport] = useState<MomReport | null>(null);
+  const [open, setOpen] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [csv, setCsv] = useState("");
+  const [replace, setReplace] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState<{
+    imported: number;
+    rejected: number;
+    errors: string[];
+  } | null>(null);
+
+  const check = useCallback(async () => {
+    setChecking(true);
+    onError(null);
+    try {
+      setReport(await api.get<MomReport>(`/api/v1/boqs/${boq.id}/measurement-check`));
+      setOpen(true);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "Failed to run the measurement check");
+    } finally {
+      setChecking(false);
+    }
+  }, [boq.id, onError]);
+
+  async function exportCsv() {
+    onError(null);
+    try {
+      const text = await api.get<string>(`/api/v1/boqs/${boq.id}/export?format=csv`);
+      const blob = new Blob([typeof text === "string" ? text : JSON.stringify(text)], {
+        type: "text/csv;charset=utf-8",
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${boq.name.replace(/[^\w.-]+/g, "_")}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "Failed to export the bill");
+    }
+  }
+
+  const score = report?.complianceScore;
+
+  return (
+    <div className="mb-4 flex flex-wrap items-center gap-2 rounded-md bg-ink-50 px-3 py-2">
+      <span className="text-xs font-semibold uppercase tracking-wide text-ink-500">
+        {methodLabel(boq.method)} compliance
+      </span>
+      {report ? (
+        <>
+          <Badge tone={report.counts.error > 0 ? "red" : report.counts.warning > 0 ? "amber" : "green"}>
+            {report.counts.error} error{report.counts.error === 1 ? "" : "s"} ·{" "}
+            {report.counts.warning} warning{report.counts.warning === 1 ? "" : "s"}
+          </Badge>
+          {score != null ? <Badge tone="gray">{score}/100</Badge> : null}
+          <button
+            type="button"
+            className="text-xs font-medium text-brand-700 hover:text-brand-900"
+            onClick={() => setOpen(true)}
+          >
+            View findings
+          </button>
+        </>
+      ) : (
+        <span className="text-xs text-ink-400">Not checked yet</span>
+      )}
+      <div className="ml-auto flex items-center gap-2">
+        <Button variant="secondary" size="sm" disabled={checking} onClick={() => void check()}>
+          {checking ? "Checking…" : "Run measurement check"}
+        </Button>
+        <Button variant="secondary" size="sm" onClick={() => void exportCsv()}>
+          Export CSV
+        </Button>
+        {editable && boq.status === "draft" ? (
+          <Button variant="secondary" size="sm" onClick={() => setImportOpen(true)}>
+            Import CSV
+          </Button>
+        ) : null}
+      </div>
+
+      <Drawer
+        open={open && report !== null}
+        title={`Measurement check — ${report?.standardName ?? ""}`}
+        onClose={() => setOpen(false)}
+        wide
+      >
+        {report ? (
+          <>
+            <p className="mb-3 text-sm text-ink-600">
+              {report.itemsChecked} measured item{report.itemsChecked === 1 ? "" : "s"} checked.
+              {report.notes.length > 0 ? ` ${report.notes.join(" ")}` : ""}
+            </p>
+            {report.findings.length === 0 ? (
+              <EmptyState
+                title="No findings"
+                hint="The bill matches every rule this engine can check from the record itself."
+              />
+            ) : (
+              <Table>
+                <thead>
+                  <tr>
+                    <Th>Severity</Th>
+                    <Th>Item</Th>
+                    <Th>Finding</Th>
+                    <Th>Rule</Th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-ink-100">
+                  {report.findings.map((f, i) => (
+                    <tr key={`${f.ruleId}-${f.itemId ?? i}`}>
+                      <Td>
+                        <Badge tone={severityTone(f.severity)}>{humanize(f.severity)}</Badge>
+                      </Td>
+                      <Td className="whitespace-nowrap font-mono text-xs">{f.code ?? "—"}</Td>
+                      <Td className="text-sm">{f.message}</Td>
+                      <Td className="text-xs text-ink-400">
+                        {f.ruleId}
+                        <span className="block">{f.reference}</span>
+                      </Td>
+                    </tr>
+                  ))}
+                </tbody>
+              </Table>
+            )}
+          </>
+        ) : null}
+      </Drawer>
+
+      <Modal open={importOpen} title="Import bill items from CSV" onClose={() => setImportOpen(false)}>
+        <p className="mb-3 text-sm text-ink-600">
+          The file needs at least <code>code</code> and <code>description</code> columns; unit,
+          quantity, rate, level and itemType are used when present. Bills and sections are created
+          from the depth of the code (5, 5.2, 5.2.1) when the level is not stated.
+        </p>
+        <Field label="CSV">
+          <Textarea
+            rows={8}
+            value={csv}
+            onChange={(e) => setCsv(e.target.value)}
+            placeholder="code,description,unit,quantity,rate&#10;5,Substructure,,,&#10;5.1,Excavation,m3,120,32"
+          />
+        </Field>
+        <label className="mt-2 flex items-center gap-2 text-sm text-ink-600">
+          <input type="checkbox" checked={replace} onChange={(e) => setReplace(e.target.checked)} />
+          Replace the existing items instead of appending
+        </label>
+        {importResult ? (
+          <div className="mt-3 rounded-md bg-emerald-50 p-2 text-xs text-emerald-900 ring-1 ring-emerald-100">
+            Imported {importResult.imported} row{importResult.imported === 1 ? "" : "s"}
+            {importResult.rejected > 0 ? `, rejected ${importResult.rejected}` : ""}.
+            {importResult.errors.length > 0 ? (
+              <ul className="mt-1 space-y-0.5">
+                {importResult.errors.slice(0, 5).map((e) => (
+                  <li key={e}>• {e}</li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+        ) : null}
+        <div className="mt-4 flex justify-end gap-2">
+          <Button variant="secondary" onClick={() => setImportOpen(false)}>
+            Close
+          </Button>
+          <Button
+            disabled={importing || csv.trim().length === 0}
+            onClick={() => {
+              setImporting(true);
+              onError(null);
+              api
+                .post<{ imported: number; rejected: number; errors: string[] }>(
+                  `/api/v1/boqs/${boq.id}/import`,
+                  { content: csv, replace },
+                )
+                .then((res) => {
+                  setImportResult(res);
+                  setCsv("");
+                  onImported();
+                })
+                .catch((err: unknown) =>
+                  onError(err instanceof ApiClientError ? err.message : "Import failed"),
+                )
+                .finally(() => setImporting(false));
+            }}
+          >
+            {importing ? "Importing…" : "Import"}
+          </Button>
+        </div>
+      </Modal>
     </div>
   );
 }

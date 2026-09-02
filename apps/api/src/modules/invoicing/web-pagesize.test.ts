@@ -66,7 +66,8 @@ describe("web pages never ask for a page bigger than the API allows", () => {
         /* the paging helper's default page size counts too */
         for (const match of text.matchAll(/pageSize\s*=\s*(\d+)\b/g)) {
           const requested = Number(match[1]);
-          if (requested > cap) offenders.push(`${path.basename(file)}: default pageSize ${requested}`);
+          if (requested > cap)
+            offenders.push(`${path.basename(file)}: default pageSize ${requested}`);
         }
       }
       expect(offenders).toEqual([]);

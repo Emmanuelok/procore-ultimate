@@ -831,7 +831,6 @@ export async function computeReadiness(
     .select({ id: designPackages.id, status: designPackages.status, stageKey: designPackages.stageKey })
     .from(designPackages)
     .where(and(eq(designPackages.companyId, companyId), eq(designPackages.projectId, projectId), packageWhere));
-  const packageIds = packages.map((p) => p.id);
 
   const [reviews, comments, issues, deliverables, infoRequirements, notices, freezes] = await Promise.all([
     db
@@ -841,7 +840,7 @@ export async function computeReadiness(
         and(
           eq(designReviews.companyId, companyId),
           eq(designReviews.projectId, projectId),
-          packageIds.length > 0 && packageId ? inArray(designReviews.packageId, packageIds) : undefined,
+          packageId ? eq(designReviews.packageId, packageId) : undefined,
         ),
       ),
     db
@@ -851,7 +850,7 @@ export async function computeReadiness(
         and(
           eq(designComments.companyId, companyId),
           eq(designComments.projectId, projectId),
-          packageIds.length > 0 && packageId ? inArray(designComments.packageId, packageIds) : undefined,
+          packageId ? eq(designComments.packageId, packageId) : undefined,
         ),
       ),
     db

@@ -35,18 +35,33 @@ const contributeSchema = z.object({
   region: z.string().min(2).max(40),
   dataYear: z.coerce.number().int().min(1990).max(2100).optional(),
   methodology: z.string().min(1).max(2000).optional(),
+  /** reference-class dimensions (#833-838); optional, published when given */
+  sizeBand: z.enum(SIZE_BANDS).optional(),
+  procurementRoute: z.enum(PROCUREMENT_ROUTES).optional(),
 });
 
 const distributionQuery = z.object({
   metric: z.string().min(1).max(100),
   assetClass: z.enum(ASSET_CLASSES),
   region: z.string().min(2).max(40),
+  currency: z.string().length(3).optional(),
 });
 
 const compareQuery = z.object({
   metric: z.string().min(1).max(100),
   assetClass: z.enum(ASSET_CLASSES).optional(),
   region: z.string().min(2).max(40).optional(),
+  currency: z.string().length(3).optional(),
+});
+
+const rcfQuery = z.object({
+  metric: z.string().min(1).max(100),
+  assetClass: z.enum(ASSET_CLASSES),
+  region: z.string().min(2).max(40),
+  sizeBand: z.enum(SIZE_BANDS).optional(),
+  procurementRoute: z.enum(PROCUREMENT_ROUTES).optional(),
+  budget: z.coerce.number().positive().max(1e15).optional(),
+  currency: z.string().length(3).optional(),
 });
 
 /* ------------------------------------------------------------------ */
@@ -149,8 +164,8 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
   /* ---------------------------------------------------------------- */
 
   /**
-   * Contribute-to-access check (#855). The ONLY read of contributor ids in
-   * the module — used in a WHERE clause for enforcement, never returned.
+   * Contribute-to-access check (#855). Contributor ids are read in a WHERE
+   * clause for enforcement and never returned.
    */
   async function hasContributed(companyId: string, metric: string): Promise<boolean> {
     const rows = await app.db
@@ -167,44 +182,28 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
     return rows.length > 0;
   }
 
-  /**
-   * All samples in one distribution cell for one source. Deliberately
-   * selects only aggregate-safe columns — contributor ids never leave the
-   * database on any distribution read path.
-   */
-  async function cellRows(metric: string, assetClass: string, region: string, source: string) {
-    return app.db
-      .select({
-        value: benchmarkSamples.value,
-        dataYear: benchmarkSamples.dataYear,
-        methodology: benchmarkSamples.methodology,
-      })
-      .from(benchmarkSamples)
-      .where(
-        and(
-          eq(benchmarkSamples.metric, metric),
-          eq(benchmarkSamples.assetClass, assetClass),
-          eq(benchmarkSamples.region, region),
-          eq(benchmarkSamples.source, source),
-        ),
-      );
+  /** A sandbox tenant's figures are not real, so they never enter the pool. */
+  async function isSandbox(companyId: string): Promise<boolean> {
+    const rows = await app.db
+      .select({ companyId: developerSandboxes.companyId })
+      .from(developerSandboxes)
+      .where(eq(developerSandboxes.companyId, companyId))
+      .limit(1);
+    return rows.length > 0;
   }
 
   /**
-   * Lazy seed (deterministic, code-resident — see seed.ts): the first
-   * distributions query for a metric materializes its starter cells as
-   * source "seed" rows. Idempotent by the existence check; the ledger entry
-   * records which tenant's query triggered the materialization.
+   * Lazy seed materialisation, made race-safe.
+   *
+   * The existence check plus bulk insert it used to do let two first-time
+   * queries both see an empty cell and both write it, doubling n and the
+   * histogram. The marker table's PRIMARY KEY is the lock: only the insert that
+   * WINS the key may write the seed rows, and the loser proceeds to read the
+   * cell the winner wrote.
    */
   async function ensureSeeded(metric: string, companyId: string, actorId: string): Promise<void> {
     const cells = SEED_DISTRIBUTIONS[metric];
     if (!cells || cells.length === 0) return;
-    const existing = await app.db
-      .select({ id: benchmarkSamples.id })
-      .from(benchmarkSamples)
-      .where(and(eq(benchmarkSamples.metric, metric), eq(benchmarkSamples.source, "seed")))
-      .limit(1);
-    if (existing.length > 0) return;
     const def = requireMetric(metric);
     const rows: (typeof benchmarkSamples.$inferInsert)[] = [];
     for (const cell of cells) {
@@ -219,11 +218,18 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
           source: "seed",
           contributorCompanyId: null,
           contributorProjectId: null,
+          currency: null,
           dataYear: cell.dataYear,
           methodology: SEED_METHODOLOGY,
         });
       }
     }
+    const claimed = await app.db
+      .insert(benchmarkSeedMarkers)
+      .values({ metric, rowsInserted: rows.length, materialisedBy: companyId })
+      .onConflictDoNothing()
+      .returning({ metric: benchmarkSeedMarkers.metric });
+    if (claimed.length === 0) return; // another request materialised it
     await app.db.insert(benchmarkSamples).values(rows);
     await appendLedger(app.db, {
       companyId,
@@ -236,41 +242,54 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
     });
   }
 
-  interface CellSample {
-    value: number;
-    dataYear: number | null;
-    methodology: string | null;
+  /**
+   * Read a cell and apply the anonymity rules (see ./pool.ts). Falls back to
+   * the illustrative seed cell when the caller has not contributed, which is
+   * the contribute-to-access model — and says which it returned.
+   */
+  async function describeCell(
+    key: CellKey,
+    viewerCompanyId: string,
+    contributedAccess: boolean,
+  ): Promise<{ verdict: PoolVerdict; seedIncluded: boolean }> {
+    if (!contributedAccess) {
+      const seed = await readCell(app.db, { ...key, currency: null }, "seed");
+      return { verdict: assessPool(seed, viewerCompanyId, { seed: true }), seedIncluded: seed.length > 0 };
+    }
+    const contributed = await readCell(app.db, key, "contributed");
+    return { verdict: assessPool(contributed, viewerCompanyId), seedIncluded: false };
   }
 
   /** Disclosure lines shared by distributions and compare (#831, #832). */
-  function baseDisclosures(rows: CellSample[], suppressed: boolean, seedIncluded: boolean) {
-    const disclosures: string[] = [
-      `Sample size n=${rows.length} (#831 — sample size is always disclosed).`,
-    ];
-    if (suppressed) {
-      disclosures.push(
-        `Distribution suppressed: fewer than ${MIN_SAMPLE_N} contributed samples in this cell; ` +
-          "only the sample size is disclosed.",
-      );
-    }
-    if (seedIncluded && rows.length > 0) disclosures.push(SEED_METHODOLOGY);
-    const years = rows.map((r) => r.dataYear).filter((y): y is number => y != null);
+  function baseDisclosures(
+    verdict: PoolVerdict,
+    seedIncluded: boolean,
+  ): string[] {
+    const disclosures = [...verdict.disclosures];
+    if (seedIncluded && verdict.rows.length > 0) disclosures.push(SEED_METHODOLOGY);
+    const years = verdict.rows.map((r) => r.dataYear).filter((y): y is number => y != null);
     if (years.length > 0) {
       const lo = Math.min(...years);
       const hi = Math.max(...years);
       disclosures.push(
-        lo === hi ? `Samples carry data year ${lo}.` : `Samples span data years ${lo}–${hi}.`,
+        lo === hi ? `Samples carry data year ${lo}.` : `Samples span data years ${lo}\u2013${hi}.`,
       );
     }
-    if (!suppressed) {
+    if (!verdict.suppressed) {
       const methodologies = [
-        ...new Set(rows.map((r) => r.methodology).filter((m): m is string => m != null)),
+        ...new Set(verdict.rows.map((r) => r.methodology).filter((m): m is string => m != null)),
       ].sort();
       for (const m of methodologies.slice(0, 10)) {
         if (m !== SEED_METHODOLOGY) disclosures.push(`Methodology (verbatim): ${m}`);
       }
     }
     return disclosures;
+  }
+
+  /** The currency a money-unit metric's cell is keyed by; null for the rest. */
+  function cellCurrency(metric: BenchmarkMetricDef, explicit?: string | null): string | null {
+    if (!metric.unit.includes("currency")) return null;
+    return explicit ? explicit.toUpperCase() : null;
   }
 
   /* ---------------------------------------------------------------- */

@@ -458,6 +458,23 @@ describe("readiness, summary and analytics", () => {
     }
   });
 
+  it("scopes a package readiness request to that package alone", async () => {
+    const pkgA = await post(`${base()}/packages`, { name: "Readiness scope A" });
+    const pkgB = await post(`${base()}/packages`, { name: "Readiness scope B" });
+    const idA = (pkgA.json() as { id: string }).id;
+    const idB = (pkgB.json() as { id: string }).id;
+    // A review cycle exists on B only; A must not inherit it.
+    await post(`${base()}/reviews`, { packageId: idB, title: "B cycle" });
+    const a = (await get(`${base()}/readiness?packageId=${idA}`)).json() as {
+      dimensions: Array<{ key: string; inputs: Record<string, number | null> }>;
+    };
+    const b = (await get(`${base()}/readiness?packageId=${idB}`)).json() as {
+      dimensions: Array<{ key: string; inputs: Record<string, number | null> }>;
+    };
+    expect(a.dimensions.find((d) => d.key === "review_outcome")?.inputs["cycles"]).toBe(0);
+    expect(b.dimensions.find((d) => d.key === "review_outcome")?.inputs["cycles"]).toBe(1);
+  });
+
   it("writes a snapshot when the verdict moves and not when it does not", async () => {
     const first = await post(`${base()}/readiness/recompute`, {});
     expect(first.statusCode).toBe(200);
