@@ -1,15 +1,41 @@
-import type { FastifyPluginAsync, FastifyRequest } from "fastify";
-import { and, asc, count, desc, eq, inArray, isNotNull, isNull, lt, ne, or } from "drizzle-orm";
+import type { FastifyInstance, FastifyPluginAsync, FastifyRequest } from "fastify";
+import {
+  and,
+  asc,
+  count,
+  desc,
+  eq,
+  gte,
+  inArray,
+  isNotNull,
+  isNull,
+  lt,
+  lte,
+  ne,
+  or,
+  sql,
+} from "drizzle-orm";
 import { z } from "zod";
 import {
+  changeEvents,
+  companies,
+  contacts,
+  files,
   meetingActionItems,
   meetingAgendaItems,
+  meetingAgendaTemplates,
   meetingAttendees,
   meetingDecisions,
+  meetingMinuteDeliveries,
   meetingSeries,
   meetings,
   obligations,
+  projects,
+  recordLinks,
+  rfis,
+  risks,
   signals,
+  users,
 } from "@constructos/db";
 import {
   ACTION_ITEM_PRIORITIES,
@@ -18,16 +44,20 @@ import {
   MEETING_ATTENDANCE_STATES,
   MEETING_ATTENDEE_ROLES,
   MEETING_ITEM_CATEGORIES,
+  MEETING_RAISE_TARGETS,
   MEETING_RECURRENCES,
   MEETING_SERIES_STATUSES,
   MEETING_STATUSES,
   MEETING_TYPES,
+  MINUTE_DELIVERY_CHANNELS,
 } from "@constructos/shared";
+import type { Db } from "../../lib/db.js";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
+import { forEachCompany } from "../../lib/scheduler.js";
 import { pushNotifications } from "../notifications/service.js";
 import { isoDateSchema, todayISO } from "../field/dates.js";
 import {
@@ -36,6 +66,21 @@ import {
   ruleForRecurrence,
   UnsupportedRecurrenceRule,
 } from "./recurrence.js";
+import {
+  computeObjectionWindow,
+  renderMeetingDocument,
+  type MinutesAction,
+  type MinutesAgendaItem,
+  type MinutesAttendee,
+  type MinutesDecision,
+  type MinutesModel,
+} from "./minutes.js";
+import {
+  companyScopeOf,
+  companyToolGate,
+  scopeAllows,
+  scopeProjects,
+} from "./scope.js";
 
 /**
  * MEETINGS (M20, spec Vol I §2.9) — tool key `meetings`.
@@ -150,8 +195,19 @@ const meetingCreateSchema = z.object({
   objectionPeriodDays: z.number().int().min(0).max(90).nullable().optional(),
 });
 
+/*
+ * NO `status` HERE, AND THAT IS THE POINT.
+ *
+ * Every meeting transition has a dedicated route that enforces something:
+ * /hold settles quorum from the attendance, /minutes/issue stamps who issued
+ * them, /minutes/approve refuses the minute taker and the issuer, /cancel
+ * refuses an issued meeting. A generic PATCH that accepted `status` let a
+ * standard user write `minutes_accepted` with no approver, no objection check
+ * and no segregation — the audit control the module is built around,
+ * circumvented by choosing a different URL. `minuteTakerId` and `chairId` are
+ * accepted only while the minutes are still unwritten (see the route).
+ */
 const meetingPatchSchema = meetingCreateSchema.partial().extend({
-  status: z.enum(MEETING_STATUSES).optional(),
   actualStart: isoTimestamp.nullable().optional(),
   actualEnd: isoTimestamp.nullable().optional(),
   agendaFileId: z.string().max(64).nullable().optional(),
@@ -245,9 +301,29 @@ const actionCreateSchema = z.object({
   linkedRecordId: z.string().max(64).nullable().optional(),
 });
 
-const actionPatchSchema = actionCreateSchema.partial().extend({
-  status: z.enum(ACTION_ITEM_STATUSES).optional(),
-});
+/*
+ * Again no `status`: /complete records who completed it, /verify refuses that
+ * same person, /cancel refuses a promoted action and /block refuses a
+ * completed one. `PATCH { status: "verified" }` skipped all four and wrote no
+ * state_change to the ledger, so an action could be certified as verified by
+ * the person who did it, with nothing in the chain to show it.
+ */
+const actionPatchSchema = actionCreateSchema.partial();
+
+/**
+ * Once an action has been promoted, these columns are the obligation's terms,
+ * copied here so the two rows tell one story. Editing them on the action
+ * afterwards makes the action and the obligation disagree about what is owed,
+ * to whom and by when — and the obligation is the one with the time bar.
+ */
+const PROMOTED_LOCKED_FIELDS = [
+  "sourceClause",
+  "obligorId",
+  "obligeeId",
+  "deadline",
+  "warnDaysBefore",
+  "evidenceRequirement",
+] as const;
 
 const actionsListQuery = pageQuerySchema.extend({
   status: z.enum(ACTION_ITEM_STATUSES).optional(),
@@ -270,6 +346,29 @@ const CARRY_SIGNAL_THRESHOLD = 3;
 /** Agenda item states that do NOT carry forward. */
 const CLOSED_ITEM_STATES = ["closed", "noted"] as const;
 const OPEN_ACTION_STATES = ["open", "in_progress", "blocked"] as const;
+/** A meeting can only be *held* from these — see the /hold route. */
+const HOLDABLE_STATES = ["scheduled", "in_progress"] as const;
+/** Action states from which cancel / block / escalate are meaningful. */
+const CANCELLABLE_ACTION_STATES = ["open", "in_progress", "blocked"] as const;
+const BLOCKABLE_ACTION_STATES = ["open", "in_progress"] as const;
+/** How many days before the objection period closes the platform warns. */
+const OBJECTION_WARN_DAYS = 2;
+const OBJECTION_DETECTOR = "meeting_minutes_objection_closing";
+
+/** Printed on read routes that used to sweep, so the change is visible. */
+const SWEEP_NOTE =
+  "scheduler job meetings.overdue-actions (system actor) — this read performs no writes";
+
+/**
+ * A list boundary the caller gave us. `from=2026-06-01` is a date, not an
+ * instant; parsing it here (rather than in a post-filter) is what lets the
+ * predicate go into the WHERE clause where pagination can see it.
+ */
+function parseBoundary(raw: string, which: "from" | "to"): string {
+  const ms = Date.parse(raw.length === 10 ? `${raw}T${which === "from" ? "00:00:00" : "23:59:59"}.000Z` : raw);
+  if (Number.isNaN(ms)) throw badRequest(`"${which}" is not a date or instant this platform can read`);
+  return new Date(ms).toISOString();
+}
 
 export const meetingsModule: FastifyPluginAsync = async (app) => {
   const readGate = [app.authenticate, app.requireCompany, app.requireTool("meetings", "read")];
@@ -447,44 +546,24 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
     return { ...row, ...decisionImpacts(row) };
   }
 
-  /** The objection period, and whether silence has run its course. */
+  /**
+   * The objection period, and whether silence has run its course.
+   *
+   * Delegated to a pure function (minutes.ts) so the arithmetic — including
+   * the rule that the clock runs from DELIVERY when one is recorded and only
+   * falls back to issue when it is not — is unit-tested without a database.
+   */
   function minutesWindow(row: typeof meetings.$inferSelect) {
-    const objections = (detailOf(row)["objections"] as unknown[] | undefined) ?? [];
-    const openObjections = objections.filter(
-      (o) => (o as { resolvedAt?: unknown } | null)?.resolvedAt == null,
-    ).length;
-    if (!row.minutesIssuedAt || row.objectionPeriodDays == null) {
-      return {
-        closesAt: null,
-        expired: null,
-        objections: objections.length,
-        openObjections,
-        deemedAccepted: null,
-        reasons: [
-          row.minutesIssuedAt
-            ? "No objection period is recorded on this meeting, so nothing is deemed accepted."
-            : "Minutes have not been issued, so no objection period is running.",
-        ],
-      };
-    }
-    const closesAt = new Date(
-      Date.parse(row.minutesIssuedAt) + row.objectionPeriodDays * 86_400_000,
-    ).toISOString();
-    const expired = Date.now() > Date.parse(closesAt);
-    return {
-      closesAt,
-      expired,
-      objections: objections.length,
-      openObjections,
-      /*
-       * "Deemed accepted" is REPORTED, never written: the status stays
-       * minutes_issued until a human signs the minutes off. Silence has legal
-       * weight, but it is not a signature and the record must not pretend it
-       * is one.
-       */
-      deemedAccepted: expired && openObjections === 0 && row.approvedAt == null,
-      reasons: [],
-    };
+    const objections =
+      (detailOf(row)["objections"] as Array<{ resolvedAt?: unknown }> | undefined) ?? [];
+    return computeObjectionWindow({
+      minutesIssuedAt: row.minutesIssuedAt,
+      minutesDeliveredAt: row.minutesDeliveredAt,
+      objectionPeriodDays: row.objectionPeriodDays,
+      approvedAt: row.approvedAt,
+      objections,
+      nowMs: Date.now(),
+    });
   }
 
   async function loadAttendees(meetingId: string) {
@@ -532,12 +611,33 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       .where(eq(meetings.id, meetingId));
   }
 
-  /** Signal keys already raised for a detector in this company (idempotence). */
-  async function alreadySignalled(companyId: string, detector: string): Promise<Set<string>> {
+  /**
+   * Signal keys already raised for a detector in this company (idempotence).
+   *
+   * `candidateKeys` narrows the query to the keys actually being considered:
+   * the previous version loaded every signal row for the detector into a Set
+   * on every list read, which grows without bound. `signals` has no index on
+   * (company_id, detector) and belongs to another package, so the honest fix
+   * available here is to ask a bounded question.
+   */
+  async function alreadySignalled(
+    companyId: string,
+    detector: string,
+    candidateKeys?: readonly string[],
+  ): Promise<Set<string>> {
+    if (candidateKeys && candidateKeys.length === 0) return new Set();
     const rows = await app.db
       .select({ refs: signals.evidenceRefs })
       .from(signals)
-      .where(and(eq(signals.companyId, companyId), eq(signals.detector, detector)));
+      .where(
+        and(
+          eq(signals.companyId, companyId),
+          eq(signals.detector, detector),
+          candidateKeys
+            ? sql`${signals.evidenceRefs} ->> 'key' in ${candidateKeys}`
+            : undefined,
+        ),
+      );
     const keys = new Set<string>();
     for (const row of rows) {
       const refs = row.refs as { key?: unknown } | null;
@@ -547,18 +647,24 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
   }
 
   /* ---------------------------------------------------------------- */
-  /* THE LAZY OVERDUE SWEEP                                            */
+  /* THE OVERDUE SWEEP — now a scheduled job, not a read side effect   */
   /*                                                                   */
-  /* Runs on action-item and report reads. Never a cron: an action     */
-  /* nobody looks at harms nobody, and the read is the moment the      */
-  /* answer has to be true. Idempotent twice over — the signal is      */
-  /* keyed on the action id AND the action row records `signalId`.     */
+  /* It used to run on every action-item and report read. That was     */
+  /* wrong twice over: a project nobody opened was never warned about  */
+  /* (the deadline does not wait for a browser tab), and the ledger    */
+  /* attributed the resulting signals to whoever happened to open the  */
+  /* list — including read-only users and assurance grantees who hold  */
+  /* no write permission at all. It now runs under the platform        */
+  /* scheduler with a null (system) actor; reads are pure.             */
+  /*                                                                   */
+  /* Idempotent twice over — the signal is keyed on the action id AND  */
+  /* the action row records `signalId`.                                */
   /* ---------------------------------------------------------------- */
 
   async function sweepOverdueActions(
     companyId: string,
     projectId: string | null,
-    actorId: string,
+    actorId: string | null,
   ): Promise<{ raised: number; scanned: number }> {
     const today = todayISO();
     const nowIso = new Date().toISOString();
@@ -578,7 +684,11 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       );
     if (candidates.length === 0) return { raised: 0, scanned: 0 };
 
-    const seen = await alreadySignalled(companyId, OVERDUE_DETECTOR);
+    const seen = await alreadySignalled(
+      companyId,
+      OVERDUE_DETECTOR,
+      candidates.map((c) => c.id),
+    );
     let raised = 0;
     for (const item of candidates) {
       if (seen.has(item.id)) continue;
@@ -642,8 +752,8 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
   /** Carried-too-often agenda items, keyed on the ROOT item so a chain signals once. */
   async function sweepCarriedItems(
     companyId: string,
-    projectId: string,
-    actorId: string,
+    projectId: string | null,
+    actorId: string | null,
   ): Promise<{ raised: number }> {
     const rows = await app.db
       .select()
@@ -651,14 +761,19 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       .where(
         and(
           eq(meetingAgendaItems.companyId, companyId),
-          eq(meetingAgendaItems.projectId, projectId),
+          projectId ? eq(meetingAgendaItems.projectId, projectId) : undefined,
           isNull(meetingAgendaItems.carriedForwardToItemId),
           ne(meetingAgendaItems.status, "closed"),
+          gte(meetingAgendaItems.carryCount, CARRY_SIGNAL_THRESHOLD),
         ),
       );
     const overCarried = rows.filter((r) => r.carryCount >= CARRY_SIGNAL_THRESHOLD);
     if (overCarried.length === 0) return { raised: 0 };
-    const seen = await alreadySignalled(companyId, CARRY_DETECTOR);
+    const seen = await alreadySignalled(
+      companyId,
+      CARRY_DETECTOR,
+      overCarried.map((i) => (detailOf(i)["rootItemId"] as string | undefined) ?? i.id),
+    );
     let raised = 0;
     for (const item of overCarried) {
       const rootId = (detailOf(item)["rootItemId"] as string | undefined) ?? item.id;
@@ -668,7 +783,7 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       await app.db.insert(signals).values({
         id: signalId,
         companyId,
-        projectId,
+        projectId: item.projectId,
         detector: CARRY_DETECTOR,
         severity: item.carryCount >= 6 ? "high" : "medium",
         confidence: 1,
@@ -694,7 +809,7 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
         objectType: "signal",
         objectId: signalId,
         payload: { detector: CARRY_DETECTOR, agendaItemId: item.id, carryCount: item.carryCount },
-        projectId,
+        projectId: item.projectId,
       });
       raised += 1;
     }
@@ -827,6 +942,89 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       }
     }
     return { carried, skipped, actionsCarried };
+  }
+
+  /**
+   * APPLY THE SERIES STANDARDS TO ONE OCCURRENCE.
+   *
+   * Standing agenda first (so carried items land beneath it), then the
+   * standing invitees as `absent` — nobody has attended a meeting that has
+   * not happened yet — then the previous occurrence's unclosed items.
+   *
+   * Factored out of `generate-occurrences` because `POST /meetings` with a
+   * seriesId did none of it: it copied the location and the quorum and left
+   * the occurrence with no agenda, no roll and nothing carried, while the UI
+   * told the user the opposite in as many words. A series whose standards
+   * apply only when you press one particular button is not a series.
+   */
+  async function applySeriesStandards(
+    req: FastifyRequest,
+    meetingId: string,
+    series: typeof meetingSeries.$inferSelect,
+    previousMeetingId: string | null,
+  ): Promise<{
+    agendaItemsCreated: number;
+    inviteesCreated: number;
+    carriedForward: { carried: number; skipped: number; actionsCarried: number };
+  }> {
+    let agendaItemsCreated = 0;
+    let position = 0;
+    for (const raw of (series.agendaTemplate as unknown[]) ?? []) {
+      const parsed = agendaTemplateSchema.safeParse(raw);
+      if (!parsed.success) continue;
+      await app.db.insert(meetingAgendaItems).values({
+        id: newId("magi"),
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        meetingId,
+        seriesId: series.id,
+        itemNumber: parsed.data.itemNumber ?? null,
+        position: parsed.data.position ?? position,
+        title: parsed.data.title,
+        category: parsed.data.category ?? "other",
+        status: "open",
+        allocatedMinutes: parsed.data.allocatedMinutes ?? null,
+        firstRaisedMeetingId: meetingId,
+        detail: { fromTemplate: true },
+        createdBy: req.user!.id,
+      });
+      position += 1;
+      agendaItemsCreated += 1;
+    }
+
+    let inviteesCreated = 0;
+    for (const raw of (series.defaultAttendees as unknown[]) ?? []) {
+      const parsed = attendeeTemplateSchema.safeParse(raw);
+      if (!parsed.success) continue;
+      await app.db.insert(meetingAttendees).values({
+        id: newId("matt"),
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        meetingId,
+        userId: parsed.data.userId ?? null,
+        contactId: parsed.data.contactId ?? null,
+        vendorId: parsed.data.vendorId ?? null,
+        name: parsed.data.name,
+        organisation: parsed.data.organisation ?? null,
+        email: parsed.data.email ?? null,
+        jobTitle: parsed.data.jobTitle ?? null,
+        role: parsed.data.role ?? "required",
+        attendance: "absent",
+      });
+      inviteesCreated += 1;
+    }
+
+    const [meetingRow] = await app.db
+      .select()
+      .from(meetings)
+      .where(eq(meetings.id, meetingId))
+      .limit(1);
+    let carriedForward = { carried: 0, skipped: 0, actionsCarried: 0 };
+    if (previousMeetingId && meetingRow) {
+      carriedForward = await carryForwardInto(req, meetingRow, previousMeetingId);
+    }
+    await refreshMeetingCounts(meetingId);
+    return { agendaItemsCreated, inviteesCreated, carriedForward };
   }
 
   /* ================================================================ */
@@ -1102,71 +1300,13 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
           generated: true,
         });
 
-        // Standing agenda first, so carried items land beneath it.
-        const template = (series.agendaTemplate as unknown[]) ?? [];
-        let position = 0;
-        for (const raw of template) {
-          const parsed = agendaTemplateSchema.safeParse(raw);
-          if (!parsed.success) continue;
-          const itemId = newId("magi");
-          await app.db.insert(meetingAgendaItems).values({
-            id: itemId,
-            companyId: req.companyId!,
-            projectId: req.projectId!,
-            meetingId,
-            seriesId,
-            itemNumber: parsed.data.itemNumber ?? null,
-            position: parsed.data.position ?? position,
-            title: parsed.data.title,
-            category: parsed.data.category ?? "other",
-            status: "open",
-            allocatedMinutes: parsed.data.allocatedMinutes ?? null,
-            firstRaisedMeetingId: meetingId,
-            detail: { fromTemplate: true },
-            createdBy: req.user!.id,
-          });
-          position += 1;
-        }
-
-        // Standing invitees.
-        for (const raw of (series.defaultAttendees as unknown[]) ?? []) {
-          const parsed = attendeeTemplateSchema.safeParse(raw);
-          if (!parsed.success) continue;
-          await app.db.insert(meetingAttendees).values({
-            id: newId("matt"),
-            companyId: req.companyId!,
-            projectId: req.projectId!,
-            meetingId,
-            userId: parsed.data.userId ?? null,
-            contactId: parsed.data.contactId ?? null,
-            vendorId: parsed.data.vendorId ?? null,
-            name: parsed.data.name,
-            organisation: parsed.data.organisation ?? null,
-            email: parsed.data.email ?? null,
-            jobTitle: parsed.data.jobTitle ?? null,
-            role: parsed.data.role ?? "required",
-            // Nobody has attended a meeting that has not happened. Invitees
-            // start as `absent` and are marked present when they turn up.
-            attendance: "absent",
-          });
-        }
-
-        const [meetingRow] = await app.db
-          .select()
-          .from(meetings)
-          .where(eq(meetings.id, meetingId))
-          .limit(1);
-        let carry = { carried: 0, skipped: 0, actionsCarried: 0 };
-        if (previousMeetingId && meetingRow) {
-          carry = await carryForwardInto(req, meetingRow, previousMeetingId);
-        }
-        await refreshMeetingCounts(meetingId);
+        const applied = await applySeriesStandards(req, meetingId, series, previousMeetingId);
         const [finalRow] = await app.db
           .select()
           .from(meetings)
           .where(eq(meetings.id, meetingId))
           .limit(1);
-        created.push({ ...finalRow, carriedForward: carry });
+        created.push({ ...finalRow, ...applied });
 
         previousMeetingId = meetingId;
         occurrenceNumber += 1;
@@ -1245,18 +1385,33 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       seriesId: series?.id ?? null,
       occurrenceNumber,
     });
+    // A meeting created into a series inherits the series' standards, exactly
+    // as a generated occurrence does.
+    const applied = series
+      ? await applySeriesStandards(req, id, series, previousMeetingId)
+      : null;
     const [row] = await app.db.select().from(meetings).where(eq(meetings.id, id)).limit(1);
-    return reply.status(201).send(row);
+    return reply.status(201).send(applied ? { ...row, ...applied } : row);
   });
 
   app.get("/projects/:projectId/meetings", { preHandler: readGate }, async (req) => {
     const q = meetingsListQuery.parse(req.query);
+    /*
+     * The date filter belongs in the WHERE, not in a post-LIMIT array filter.
+     * Filtering after pagination made `total` count rows the page had already
+     * dropped: with 300 meetings and from=2026-06-01 the first page could come
+     * back empty while total said 300, and the matching rows sat on page 4.
+     */
+    const from = q.from ? parseBoundary(q.from, "from") : null;
+    const to = q.to ? parseBoundary(q.to, "to") : null;
     const where = and(
       eq(meetings.companyId, req.companyId!),
       eq(meetings.projectId, req.projectId!),
       q.seriesId ? eq(meetings.seriesId, q.seriesId) : undefined,
       q.status ? eq(meetings.status, q.status) : undefined,
       q.meetingType ? eq(meetings.meetingType, q.meetingType) : undefined,
+      from ? gte(meetings.scheduledStart, from) : undefined,
+      to ? lte(meetings.scheduledStart, to) : undefined,
     );
     const [totalRow] = await app.db.select({ n: count() }).from(meetings).where(where);
     const items = await app.db
@@ -1266,14 +1421,7 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       .orderBy(desc(meetings.number))
       .limit(q.pageSize)
       .offset(pageOffset(q));
-    const filtered = items.filter((m) => {
-      if (q.from && m.scheduledStart && Date.parse(m.scheduledStart) < Date.parse(q.from)) {
-        return false;
-      }
-      if (q.to && m.scheduledStart && Date.parse(m.scheduledStart) > Date.parse(q.to)) return false;
-      return true;
-    });
-    return paginate(filtered, Number(totalRow?.n ?? 0), q);
+    return paginate(items, Number(totalRow?.n ?? 0), q);
   });
 
   app.get("/projects/:projectId/meetings/:meetingId", { preHandler: readGate }, async (req) => {
@@ -1318,14 +1466,44 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
     const body = meetingPatchSchema.parse(req.body);
     const meeting = await fetchMeeting(req, meetingId);
     if (meeting.status === "cancelled") throw badRequest("A cancelled meeting cannot be edited");
+
+    /*
+     * The two identities the minutes approval rests on. `approve` refuses the
+     * minute taker and the issuer; swapping the minute taker afterwards let
+     * the author of the minutes sign off their own. Once the minutes exist,
+     * these are historical facts, not settings.
+     */
+    const minutesExist = Boolean(meeting.minutesBody || meeting.minutesFileId || meeting.minutesIssuedAt);
+    for (const key of ["minuteTakerId", "chairId"] as const) {
+      const next = body[key];
+      if (next === undefined || next === meeting[key]) continue;
+      if (minutesExist) {
+        throw conflict(
+          `The ${key === "chairId" ? "chair" : "minute taker"} cannot be changed once minutes ` +
+            "exist for this meeting: approval is refused to whoever wrote or issued them, so " +
+            "reassigning the role after the fact would defeat that check. Correct the minutes " +
+            "instead, or record the change as an agenda item at the next occurrence.",
+        );
+      }
+    }
+
+    const identityChanges: Record<string, unknown> = {};
     const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
     for (const [k, v] of Object.entries(body)) {
       if (v === undefined) continue;
       if (k === "seriesId") continue; // a meeting never changes series
       set[k] = k === "isVirtual" ? (v ? 1 : 0) : v;
+      if (k === "minuteTakerId" || k === "chairId") {
+        identityChanges[k] = { from: meeting[k as "minuteTakerId" | "chairId"], to: v };
+      }
     }
     await app.db.update(meetings).set(set).where(eq(meetings.id, meetingId));
     await ledger("update", "meeting", meetingId, req, { changed: Object.keys(body) });
+    if (Object.keys(identityChanges).length > 0) {
+      // Who chairs and who holds the pen decides who may sign the minutes off,
+      // so a change of either is a state change, not a field edit.
+      await ledger("state_change", "meeting", meetingId, req, { identity: identityChanges });
+    }
     return fetchMeeting(req, meetingId);
   });
 
@@ -1342,7 +1520,18 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
         })
         .parse(req.body ?? {});
       const meeting = await fetchMeeting(req, meetingId);
-      if (meeting.status === "cancelled") throw badRequest("A cancelled meeting cannot be held");
+      /*
+       * Hold moves a meeting FORWARD. Allowing it from minutes_draft upward
+       * rewrote an issued or accepted meeting back to "held", hiding the
+       * objection window and the acceptance from every list view and putting a
+       * backwards state_change in the ledger.
+       */
+      if (!HOLDABLE_STATES.includes(meeting.status as (typeof HOLDABLE_STATES)[number])) {
+        throw conflict(
+          `A meeting can only be held from scheduled or in_progress (this one is ` +
+            `"${meeting.status}"). Holding it again would rewind its minutes.`,
+        );
+      }
       const quorum = await quorumFor(meeting);
       const now = new Date().toISOString();
       await app.db
@@ -1670,6 +1859,26 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       const meeting = await fetchMeeting(req, meetingId);
       if (meeting.status === "cancelled") throw badRequest("A cancelled meeting has no minutes");
       if (meeting.approvedAt) throw conflict("Approved minutes cannot be redrafted");
+      /*
+       * THE DEADLOCK THIS PREVENTS.
+       *
+       * Saving a draft over ISSUED minutes used to set the status back to
+       * minutes_draft while minutesIssuedAt stayed set. /minutes/approve then
+       * refused (status is not minutes_issued) and /minutes/issue refused
+       * (already issued), so the meeting could never reach minutes_accepted —
+       * the core workflow, wedged, with no route out of it. Correction after
+       * issue is a deliberate, ledgered act with its own route: it withdraws
+       * the issued version, bumps the version number and lets the redraft
+       * proceed, so recipients can see that what they received was replaced.
+       */
+      if (meeting.minutesIssuedAt) {
+        throw conflict(
+          "These minutes have been issued and cannot be silently redrafted: recipients are " +
+            "relying on the version they received, and the objection period is running against " +
+            "it. Withdraw them first with POST /minutes/correct (which records why and bumps " +
+            "the version), then redraft and re-issue.",
+        );
+      }
       const now = new Date().toISOString();
       await app.db
         .update(meetings)
@@ -1872,7 +2081,16 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       }
 
       // Approval happens AT a meeting: the next occurrence of the series.
+      // Whatever the caller passes must be a real meeting in this project —
+      // an unvalidated string was previously persisted and ledgered as the
+      // place the minutes were tabled, including another tenant's id.
       let approvedAtMeetingId: string | null = body.atMeetingId ?? null;
+      if (approvedAtMeetingId) {
+        if (approvedAtMeetingId === meetingId) {
+          throw badRequest("Minutes are not approved at the meeting whose minutes they are");
+        }
+        await fetchMeeting(req, approvedAtMeetingId);
+      }
       if (meeting.seriesId) {
         const later = await app.db
           .select()
@@ -2032,13 +2250,45 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
         throw badRequest(`A ${row.status} decision cannot be edited`);
       }
       const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
+      const changed: string[] = [];
       for (const [k, v] of Object.entries(body)) {
         if (v === undefined) continue;
         set[k] = k === "impactsCost" || k === "impactsSchedule" ? (v ? 1 : 0) : v;
+        changed.push(k);
+      }
+      /*
+       * A RATIFIED DECISION IS CERTIFIED CONTENT.
+       *
+       * Ratification is an independent check by someone who is not the person
+       * who made the call. Editing the decision text, its cost impact or who
+       * made it while the row still says "ratified" makes that check certify
+       * words it never saw. Editing is allowed — minutes get corrected — but
+       * it costs the ratification, which must then be given again against the
+       * new text.
+       */
+      let unratified = false;
+      if (row.status === "ratified" && changed.length > 0) {
+        set["status"] = "recorded";
+        set["ratifiedBy"] = null;
+        set["ratifiedAt"] = null;
+        unratified = true;
       }
       await app.db.update(meetingDecisions).set(set).where(eq(meetingDecisions.id, decisionId));
-      await ledger("update", "meeting_decision", decisionId, req, { changed: Object.keys(body) });
-      return withImpacts(await fetchDecision(req, decisionId));
+      await ledger("update", "meeting_decision", decisionId, req, { changed });
+      if (unratified) {
+        await ledger("state_change", "meeting_decision", decisionId, req, {
+          from: "ratified",
+          to: "recorded",
+          reason: "The decision was edited after ratification; the ratification does not carry.",
+          previouslyRatifiedBy: row.ratifiedBy,
+          previouslyRatifiedAt: row.ratifiedAt,
+          changed,
+        });
+      }
+      return {
+        ...withImpacts(await fetchDecision(req, decisionId)),
+        unratifiedByEdit: unratified,
+      };
     },
   );
 
@@ -2249,8 +2499,8 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/meeting-action-items", { preHandler: readGate }, async (req) => {
     const q = actionsListQuery.parse(req.query);
-    // Lazy sweep on the read path (see the module header).
-    const swept = await sweepOverdueActions(req.companyId!, req.projectId!, req.user!.id);
+    // No sweep here: reads are pure (see the sweep's own comment). The
+    // overdue signals are raised by the scheduler under a system actor.
     const today = todayISO();
     const where = and(
       eq(meetingActionItems.companyId, req.companyId!),
@@ -2289,7 +2539,7 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
         Number(totalRow?.n ?? 0),
         q,
       ),
-      sweep: swept,
+      sweptBy: SWEEP_NOTE,
     };
   });
 
@@ -2319,6 +2569,28 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       const { actionId } = req.params as { actionId: string };
       const body = actionPatchSchema.parse(req.body);
       const row = await fetchAction(req, actionId);
+      if (row.status === "cancelled") {
+        throw conflict("A cancelled action cannot be edited — raise a new one.");
+      }
+      /*
+       * After promotion these columns are the OBLIGATION's terms, copied here
+       * so the two rows tell one story. Editing them on the action afterwards
+       * made the action and the obligation disagree about what is owed, to
+       * whom, and by when — while /promote's own comment claimed they could
+       * not drift.
+       */
+      if (row.obligationId) {
+        const locked = PROMOTED_LOCKED_FIELDS.filter(
+          (f) => body[f] !== undefined && body[f] !== row[f],
+        );
+        if (locked.length > 0) {
+          throw conflict(
+            `This action was promoted to obligation ${row.obligationId}; ${locked.join(", ")} ` +
+              "now belong to the obligation and cannot be changed here. Amend the obligation, " +
+              "which is what carries the time bar.",
+          );
+        }
+      }
       const now = new Date().toISOString();
       const set: Record<string, unknown> = { updatedAt: now };
       for (const [k, v] of Object.entries(body)) {
@@ -2431,8 +2703,12 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       const { actionId } = req.params as { actionId: string };
       const body = z.object({ reason: z.string().min(1).max(2000) }).parse(req.body);
       const row = await fetchAction(req, actionId);
-      if (row.status === "completed" || row.status === "verified") {
-        throw badRequest("A completed action cannot be blocked");
+      // Blocking is something that happens to LIVE work. Blocking a cancelled
+      // action resurrected it; blocking a completed one erased the completion.
+      if (!BLOCKABLE_ACTION_STATES.includes(row.status as (typeof BLOCKABLE_ACTION_STATES)[number])) {
+        throw conflict(
+          `Only an open or in-progress action can be blocked (this one is "${row.status}").`,
+        );
       }
       const now = new Date().toISOString();
       await app.db
@@ -2457,6 +2733,22 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
         .object({ escalatedToId: z.string().min(1).max(64), note: z.string().max(2000).optional() })
         .parse(req.body);
       const row = await fetchAction(req, actionId);
+      // Escalating a finished action tells someone senior to chase work that
+      // is done, cancelled or already verified. Nothing good follows.
+      if (!CANCELLABLE_ACTION_STATES.includes(row.status as (typeof CANCELLABLE_ACTION_STATES)[number])) {
+        throw conflict(
+          `Only an open, in-progress or blocked action can be escalated (this one is ` +
+            `"${row.status}").`,
+        );
+      }
+      const escalatee = await app.db
+        .select({ id: users.id, name: users.name })
+        .from(users)
+        .where(and(eq(users.id, body.escalatedToId), eq(users.companyId, req.companyId!)))
+        .limit(1);
+      if (!escalatee[0]) {
+        throw badRequest("escalatedToId is not a user in this company");
+      }
       const now = new Date().toISOString();
       await app.db
         .update(meetingActionItems)
@@ -2494,6 +2786,15 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
         throw badRequest(
           "This action has been promoted to an obligation — cancel or waive the obligation " +
             "instead; the time bar no longer lives here.",
+        );
+      }
+      // Cancelling a verified action overwrote its closure note with the
+      // cancellation reason and erased the verification. Whatever the reason
+      // for wanting that, it is not a cancellation.
+      if (!CANCELLABLE_ACTION_STATES.includes(row.status as (typeof CANCELLABLE_ACTION_STATES)[number])) {
+        throw conflict(
+          `Only an open, in-progress or blocked action can be cancelled (this one is ` +
+            `"${row.status}"). A completed or verified action is history.`,
         );
       }
       const now = new Date().toISOString();
@@ -2644,7 +2945,6 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
     async (req) => {
       const { seriesId } = req.params as { seriesId: string };
       const series = await fetchSeries(req, seriesId);
-      await sweepCarriedItems(req.companyId!, req.projectId!, req.user!.id);
       const items = await app.db
         .select()
         .from(meetingAgendaItems)
@@ -2695,7 +2995,6 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
     "/projects/:projectId/meeting-reports/carry-forward",
     { preHandler: readGate },
     async (req) => {
-      await sweepCarriedItems(req.companyId!, req.projectId!, req.user!.id);
       const items = await app.db
         .select()
         .from(meetingAgendaItems)
@@ -2742,7 +3041,6 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
     "/projects/:projectId/meeting-reports/overdue-actions",
     { preHandler: readGate },
     async (req) => {
-      const swept = await sweepOverdueActions(req.companyId!, req.projectId!, req.user!.id);
       const today = todayISO();
       const rows = await app.db
         .select()
@@ -2769,7 +3067,7 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       }
       return {
         asOf: today,
-        sweep: swept,
+        sweptBy: SWEEP_NOTE,
         summary: {
           openActions: rows.length,
           overdue: overdue.length,
@@ -2810,8 +3108,6 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
     const q = pageQuerySchema
       .extend({ includeClosed: z.enum(["0", "1"]).default("0") })
       .parse(req.query);
-    // Company-wide sweep: the same idempotent pass, unscoped by project.
-    const swept = await sweepOverdueActions(req.companyId!, null, req.user!.id);
     const today = todayISO();
     const where = and(
       eq(meetingActionItems.companyId, req.companyId!),
@@ -2841,13 +3137,13 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
         q,
       ),
       asOf: today,
-      sweep: swept,
+      sweptBy: SWEEP_NOTE,
     };
   });
 
   /** Company-level view: every overdue action across the tenant. */
   app.get("/meeting-action-items/overdue", { preHandler: companyRead }, async (req) => {
-    const swept = await sweepOverdueActions(req.companyId!, null, req.user!.id);
+    const scope = companyScopeOf(req, "meetings");
     const today = todayISO();
     const rows = await app.db
       .select()
@@ -2855,6 +3151,7 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       .where(
         and(
           eq(meetingActionItems.companyId, req.companyId!),
+          scopeProjects(scope, meetingActionItems.projectId),
           inArray(meetingActionItems.status, [...OPEN_ACTION_STATES]),
           lt(meetingActionItems.dueDate, today),
         ),
@@ -2864,7 +3161,8 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
     for (const r of rows) byProject.set(r.projectId, (byProject.get(r.projectId) ?? 0) + 1);
     return {
       asOf: today,
-      sweep: swept,
+      sweptBy: SWEEP_NOTE,
+      scope: scope.all ? "all_projects" : `${scope.projectIds.length} project(s) you hold meetings on`,
       total: rows.length,
       byProject: [...byProject.entries()].map(([projectId, overdue]) => ({ projectId, overdue })),
       items: rows,

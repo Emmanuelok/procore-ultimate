@@ -520,14 +520,57 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
        * not-lowest justification, and for the same reason: the control that
        * makes somebody write a sentence is the one that leaves a record.
        */
-      await runPackageIntegrityAndPersist(app.db, pkg, req.user!.id);
+      const integrityReport = await runPackageIntegrityAndPersist(app.db, pkg, req.user!.id);
       const integritySignals = await integritySignalsForPackage(app.db, companyId, packageId);
-      const blocking = integritySignals.filter(
+      const open = integritySignals.filter(
         (sig) =>
-          (sig.severity === "critical" || sig.severity === "high") &&
           sig.disposition !== "dismissed" &&
           sig.disposition !== "closed" &&
           sig.closedAt === null,
+      );
+
+      /*
+       * AN ABNORMALLY LOW BID CANNOT BE RECOMMENDED UNTIL IT HAS EXPLAINED
+       * ITSELF. Public procurement everywhere requires the buyer to ASK, and
+       * the asking is worthless unless the answer is on the record. The
+       * explanation is recorded through the compliance route, which puts it
+       * on the submission where the evaluation can see it.
+       */
+      const lowAssessment = integrityReport.abnormal.assessments.find(
+        (a) => a.submissionId === chosen.id && a.verdict === "abnormally_low",
+      );
+      if (lowAssessment?.requiresJustification) {
+        throw badRequest(
+          `${chosen.reference} is ${lowAssessment.deviationFromMedianPercent ?? lowAssessment.deviationFromEstimatePercent}% ` +
+            "below the field and no price explanation is on the record. An abnormally low tender " +
+            "accepted without asking the bidder to explain it is the one that returns as a claim, " +
+            "a variation account or an insolvency — and by then the second-lowest price is no " +
+            "longer available. Record the explanation with POST " +
+            "/bid-submissions/:id/compliance (abnormalLowJustification) and recommend again.",
+          {
+            control: "abnormally_low_requires_justification",
+            submissionId: chosen.id,
+            deviationFromMedianPercent: lowAssessment.deviationFromMedianPercent,
+            deviationFromEstimatePercent: lowAssessment.deviationFromEstimatePercent,
+          },
+        );
+      }
+
+      /*
+       * Everything else of high or critical severity must be ACKNOWLEDGED in
+       * writing — the same discipline as the not-lowest justification. A
+       * price-level finding about a bid nobody is recommending is not a
+       * blocker: it is information about the field, and blocking on it would
+       * teach people to dismiss findings to get their work done.
+       */
+      const blocking = open.filter(
+        (sig) =>
+          (sig.severity === "critical" || sig.severity === "high") &&
+          !(
+            (sig.detector === "bid_integrity_abnormally_low" ||
+              sig.detector === "bid_integrity_abnormally_high") &&
+            sig.subjectId !== chosen.id
+          ),
       );
       if (blocking.length > 0 && !body.integrityAcknowledgement) {
         throw badRequest(

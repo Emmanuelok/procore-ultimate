@@ -414,6 +414,33 @@ describe("environmental event log", () => {
   });
 });
 
+describe("the site plan", () => {
+  it("draws the project's own points and says what it could not place", async () => {
+    const res = await get(`${base()}/map`);
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.bounds).not.toBeNull();
+    const layers = body.byLayer as Record<string, number>;
+    expect(layers["survey"]).toBeGreaterThan(0);
+    expect(layers["utility"]).toBeGreaterThan(0);
+    // CP01 has grid coordinates only, so it cannot be placed and the plan says so.
+    expect((body.reasons as string[]).join(" ")).toContain("no latitude/longitude");
+    const service = (body.shapes as Array<{ layer: string; kind: string; ring: unknown[] }>).find((sh) => sh.layer === "utility");
+    expect(service?.kind).toBe("line");
+    expect(service?.ring).toHaveLength(3);
+  });
+
+  it("returns an empty plan with a reason when nothing carries a position", async () => {
+    const bare = newId("prj");
+    await app.db.insert(projects).values({ id: bare, companyId: owner.companyId, name: "No coordinates", stage: "course_of_construction" });
+    const res = await get(`/projects/${bare}/site/map`);
+    expect(res.statusCode).toBe(200);
+    expect(res.json().bounds).toBeNull();
+    expect(res.json().points).toEqual([]);
+    expect((res.json().reasons as string[]).join(" ")).toContain("Nothing on this site carries a position");
+  });
+});
+
 describe("tenant isolation", () => {
   it("refuses another company everywhere in this area", async () => {
     expect((await get(`${base()}/geotech`, stranger.headers)).statusCode).toBe(403);
@@ -421,6 +448,7 @@ describe("tenant isolation", () => {
     expect((await get(`${base()}/strikes`, stranger.headers)).statusCode).toBe(403);
     expect((await get(`${base()}/survey-points`, stranger.headers)).statusCode).toBe(403);
     expect((await get(`${base()}/environmental-events`, stranger.headers)).statusCode).toBe(403);
+    expect((await get(`${base()}/map`, stranger.headers)).statusCode).toBe(403);
     expect(
       (await post(`${base()}/setting-out`, { description: "x" }, stranger.headers)).statusCode,
     ).toBe(403);

@@ -20,6 +20,7 @@ import {
   Th,
 } from "../../ui";
 import ClaimVsEvidenceChart from "./ClaimVsEvidenceChart";
+import { PayrollIngestModal, SiteAccessIngestModal } from "./IngestForms";
 import {
   BRAND,
   BRAND_PALE,
@@ -62,6 +63,8 @@ export default function ReconcileTab({
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  /** the two evidence streams this reconciliation compares, ingested here */
+  const [ingest, setIngest] = useState<"access" | "payroll" | null>(null);
 
   const preview = useCallback(
     async (from: string, to: string) => {
@@ -129,6 +132,32 @@ export default function ReconcileTab({
 
   return (
     <div>
+      <div className="mb-3 flex flex-wrap items-center justify-end gap-2">
+        <Button size="sm" variant="secondary" onClick={() => setIngest("access")}>
+          Ingest turnstile export
+        </Button>
+        <Button size="sm" variant="secondary" onClick={() => setIngest("payroll")}>
+          Ingest payroll run
+        </Button>
+      </div>
+      <SiteAccessIngestModal
+        open={ingest === "access"}
+        onClose={() => setIngest(null)}
+        onDone={() => {
+          void preview(periodStart, periodEnd);
+          onMutate();
+        }}
+        projectId={projectId}
+      />
+      <PayrollIngestModal
+        open={ingest === "payroll"}
+        onClose={() => setIngest(null)}
+        onDone={() => {
+          void preview(periodStart, periodEnd);
+          onMutate();
+        }}
+        projectId={projectId}
+      />
       <Card className="mb-4">
         <CardBody className="flex flex-wrap items-end gap-3 py-3">
           <div className="w-44">

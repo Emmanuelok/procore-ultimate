@@ -73,7 +73,7 @@ import {
   testBodySchema,
   unsavedTestBodySchema,
 } from "./schemas.js";
-import { snapshotCatalogue } from "./snapshots.js";
+import { loadSnapshot, snapshotCatalogue } from "./snapshots.js";
 import { RULE_TEMPLATES, ruleTemplate } from "./templates.js";
 
 const ACTION_HINTS: Record<(typeof AUTOMATION_ACTION_TYPES)[number], { label: string; description: string; params: string[] }> = {
@@ -617,7 +617,7 @@ export const automationModule: FastifyPluginAsync = async (app) => {
     const body = runCycleBodySchema.parse(req.body ?? {});
     const now = new Date();
     const scan = body.scan === false ? null : await engine.scanSchedules(req.companyId!, now, body.force === true);
-    const drain = body.drain === false ? null : await engine.drain();
+    const drain = body.drain === false ? null : await engine.drain(undefined, req.companyId!);
     return { at: now.toISOString(), scan, drain, health: engine.getHealth() };
   });
 
@@ -719,14 +719,17 @@ export const automationModule: FastifyPluginAsync = async (app) => {
     const rule = await loadProjectRule(req, id, false);
     const body = testBodySchema.parse(req.body ?? {});
     // A project-level tester may only dry-run against this project's records.
-    const result = await engine.dryRun(rule, { ...body, persist: false });
-    if (body.objectId && result.context.record) {
-      const recProject = (result.context.record as { projectId?: unknown })["projectId"];
-      if (typeof recProject === "string" && recProject !== req.projectId) {
+    // The project comes from the snapshot registry, never from a `projectId`
+    // key on the row: a project record IS its own project and carries no such
+    // column, so reading the field would let this route return another
+    // project's row. Company-level records (no project at all) stay allowed.
+    if (body.objectId) {
+      const snapshot = await loadSnapshot(app.db, req.companyId!, rule.triggerObjectType, body.objectId);
+      if (snapshot && snapshot.projectId !== null && snapshot.projectId !== req.projectId) {
         throw forbidden("That record belongs to a different project");
       }
     }
-    return result;
+    return engine.dryRun(rule, { ...body, persist: false });
   });
 
   app.get("/projects/:projectId/automation/runs", { preHandler: projectRead }, async (req) => {

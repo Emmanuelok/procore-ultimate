@@ -57,10 +57,12 @@ import {
   QrCode,
   Reasons,
   ShowOnce,
+  discoverProviders,
   failureFrom,
   useAuthAction,
   usePasswordPolicy,
   type AuthFailure,
+  type ProviderDiscovery,
 } from "./authShared";
 
 /* ================================================================== */
@@ -903,6 +905,10 @@ function MethodsPanel({ nonce, onChanged }: { nonce: number; onChanged: () => vo
         </Card>
       ) : null}
 
+      {verification.data ? (
+        <EmailChangeCard currentEmail={verification.data.email} onChanged={onChanged} />
+      ) : null}
+
       {/* ------------------------- identities ------------------------- */}
       <Card>
         <CardBody className="space-y-3">
@@ -974,12 +980,19 @@ function MethodsPanel({ nonce, onChanged }: { nonce: number; onChanged: () => vo
               {identities.data.items.length === 0 ? (
                 <div className="rounded-lg border border-dashed border-border p-3">
                   <p className="text-meta text-content-muted">
-                    No identity provider is linked to this account. Signing in with Google,
-                    Microsoft or your company&rsquo;s own provider from the sign-in page links one
-                    the first time it is used.
+                    No identity provider is linked to this account yet.
                   </p>
                 </div>
               ) : null}
+
+              {/*
+                LINK A PROVIDER — the action the API kept telling people to
+                take here and that no page offered. `sso/index.ts` refuses an
+                unverified-email SSO sign-in with "link this provider from your
+                account settings instead", and this is those settings; without
+                the control the advice was a dead end.
+              */}
+              <LinkProviderRow linked={identities.data.items.map((i) => i.providerId)} />
 
               <p className="text-2xs text-content-subtle">
                 Unlinking also kills any session that provider authenticated: &ldquo;I removed that
@@ -1123,5 +1136,212 @@ function ActivityPanel({ nonce }: { nonce: number }) {
         <ActivityFeed items={items} timeFormat="absolute" aria-label="Account security events" />
       )}
     </div>
+  );
+}
+
+
+/* ================================================================== */
+/* Linking an identity provider from account settings                  */
+/* ================================================================== */
+
+/**
+ * Start a LINK flow for the signed-in account.
+ *
+ * The account being linked to is fixed on the server at start time, from a
+ * verified bearer token, and nothing the identity provider later asserts can
+ * change it — that is the whole security property, and it is why this control
+ * belongs here rather than on the sign-in page.
+ *
+ * `mode: "redirect"` sends the browser through the IdP and back to
+ * /auth/sso/complete, which recognises `linked: true` and returns here.
+ */
+function LinkProviderRow({ linked }: { linked: string[] }) {
+  const [discovery, setDiscovery] = useState<ProviderDiscovery | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [failure, setFailure] = useState<AuthFailure | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const { user } = useAuth();
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!user?.email) {
+      setLoading(false);
+      return;
+    }
+    discoverProviders(user.email)
+      .then((res) => {
+        if (!cancelled) setDiscovery(res);
+      })
+      .catch(() => {
+        // Discovery is an optimisation, never a gate: a deployment without SSO
+        // configured simply shows nothing here.
+        if (!cancelled) setDiscovery({ domain: null, providers: [], passwordLoginAllowed: true, reasons: [] });
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.email]);
+
+  async function link(providerId: string) {
+    setBusy(providerId);
+    setFailure(null);
+    try {
+      const res = await api.post<{ authorizationUrl: string }>("/api/v1/auth/sso/link", {
+        providerId,
+        mode: "redirect",
+        returnTo: "/account/security",
+      });
+      window.location.assign(res.authorizationUrl);
+    } catch (err) {
+      setFailure(failureFrom(err));
+      setBusy(null);
+    }
+  }
+
+  if (loading) return <Skeleton height={44} radius="md" />;
+  const available = (discovery?.providers ?? []).filter(
+    (p) => p.status === "ready" && !linked.includes(p.id),
+  );
+  if (available.length === 0) {
+    return (
+      <p className="text-2xs text-content-subtle">
+        {discovery && discovery.providers.length > 0
+          ? "Every identity provider available to your address is already linked."
+          : "No identity provider is configured for your email domain, so there is nothing to link."}
+      </p>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      <FailureAlert failure={failure} onDismiss={() => setFailure(null)} />
+      <p className="text-2xs text-content-subtle">
+        Link another way in. You stay signed in throughout; the provider is attached to this
+        account and cannot be redirected to another one.
+      </p>
+      <div className="flex flex-wrap gap-2">
+        {available.map((provider) => (
+          <Button
+            key={provider.id}
+            size="sm"
+            variant="secondary"
+            loading={busy === provider.id}
+            onClick={() => void link(provider.id)}
+          >
+            Link {provider.displayName}
+          </Button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ================================================================== */
+/* Changing the address on the account                                 */
+/* ================================================================== */
+
+interface PendingEmail {
+  pending: { email: string; expiresAt: string; requestedAt: string } | null;
+  history: Array<{ email: string; requestedAt: string; consumedAt: string | null }>;
+}
+
+/**
+ * The address is the recovery channel, so moving it costs the current
+ * password and is not applied until the NEW address is proved. A typo
+ * therefore cannot lock anybody out of their own account.
+ */
+export function EmailChangeCard({ currentEmail, onChanged }: { currentEmail: string; onChanged: () => void }) {
+  const action = useAuthAction();
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [pending, setPending] = useState<PendingEmail | null>(null);
+  const [started, setStarted] = useState<{ verifyUrl: string | null; reasons: string[] } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .get<PendingEmail>("/api/v1/account/email/pending")
+      .then((res) => {
+        if (!cancelled) setPending(res);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [started]);
+
+  async function submit() {
+    const res = await action.run("email", () =>
+      api.post<{ verifyUrl: string | null; reasons: string[] }>("/api/v1/account/email", {
+        email: email.trim().toLowerCase(),
+        password,
+      }),
+    );
+    if (res) {
+      setStarted(res);
+      setEmail("");
+      setPassword("");
+      onChanged();
+    }
+  }
+
+  return (
+    <Card>
+      <CardBody className="space-y-3">
+        <div>
+          <p className="text-sm font-semibold">Change your email address</p>
+          <p className="mt-0.5 text-meta text-content-muted">
+            Currently <span className="font-medium text-content">{currentEmail}</span>. The change
+            takes effect only when the link sent to the new address is opened — never before.
+          </p>
+        </div>
+        <FailureAlert failure={action.failure} onDismiss={action.clear} />
+        {pending?.pending ? (
+          <Alert tone="info" size="sm" title="A change is waiting to be proved">
+            <p>
+              {pending.pending.email} — requested {when(pending.pending.requestedAt)}, the link
+              expires {when(pending.pending.expiresAt)}.
+            </p>
+          </Alert>
+        ) : null}
+        {started ? (
+          <Alert tone="success" size="sm" title="Confirmation sent">
+            <Reasons reasons={started.reasons} />
+            {started.verifyUrl ? (
+              <p className="mt-1 break-all text-2xs">
+                No mail transport is configured, so the link is shown here once:{" "}
+                <code className="select-all font-mono">{started.verifyUrl}</code>
+              </p>
+            ) : null}
+          </Alert>
+        ) : null}
+        <Field label="New email address" required>
+          <Input
+            type="email"
+            autoComplete="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+          />
+        </Field>
+        <Field label="Your current password" required hint="Proof that this account is yours.">
+          <Input
+            type="password"
+            autoComplete="current-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+        </Field>
+        <Button
+          onClick={() => void submit()}
+          loading={action.busy === "email"}
+          disabled={email.trim().length === 0 || password.length === 0}
+        >
+          Send the confirmation link
+        </Button>
+      </CardBody>
+    </Card>
   );
 }

@@ -27,7 +27,7 @@
  */
 import { useCallback, useMemo, useState } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
-import { Alert, Badge, PageHeader, Tabs } from "../../ui";
+import { Alert, Badge, Button, PageHeader, Tabs } from "../../ui";
 import { IconWorkforce } from "../../ui/icons";
 import BatchesTab from "./BatchesTab";
 import CardsTab from "./CardsTab";
@@ -37,6 +37,7 @@ import ReconcileTab from "./ReconcileTab";
 import TicketDrawer from "./TicketDrawer";
 import TicketsTab from "./TicketsTab";
 import TimecardDrawer from "./TimecardDrawer";
+import { BatchCreateModal, TimecardCreateModal, type WorkerOption } from "./TimecardForms";
 import {
   hoursText,
   shiftDays,
@@ -52,6 +53,7 @@ import {
   useTicketDetail,
   useTickets,
   useTimecardDetail,
+  useResource,
   useTimecards,
   type CardFilters,
 } from "./timecardsShared";
@@ -104,6 +106,8 @@ export default function TimecardsPage() {
   );
 
   const users = useCompanyUsers();
+  /** which write form is open */
+  const [form, setForm] = useState<"card" | "batch" | null>(null);
   const crews = useCrews(projectId);
   const cards = useTimecards(projectId, cardFilters, tab === "cards");
   const reconciliation = useReconciliation(projectId, reconcileFrom, to, tab === "reconcile");
@@ -114,7 +118,21 @@ export default function TimecardsPage() {
   const tickets = useTickets(projectId, tab === "tickets");
   const ticketDetail = useTicketDetail(projectId, openTicket);
   const cardDetail = useTimecardDetail(projectId, openCard);
-  const costCodes = useCostCodes(projectId, openCard !== null);
+  const costCodes = useCostCodes(projectId, openCard !== null || form !== null);
+  /** the worker register this module reads from and never duplicates */
+  const workerList = useResource<{ items: WorkerOption[] }>(
+    form === "card" && projectId
+      ? `/api/v1/projects/${projectId}/workers?page=1&pageSize=500&status=active`
+      : null,
+  );
+
+  const refresh = useCallback(() => {
+    cards.reload();
+    batches.reload();
+    batchDetail.reload();
+    costReport.reload();
+    reconciliation.reload();
+  }, [cards, batches, batchDetail, costReport, reconciliation]);
 
   const selectTab = useCallback(
     (next: TabKey) => {
@@ -205,6 +223,16 @@ export default function TimecardsPage() {
             ) : null}
           </span>
         }
+        actions={
+          <div className="flex flex-wrap items-center gap-2">
+            <Button size="sm" variant="secondary" onClick={() => setForm("batch")}>
+              Start a week
+            </Button>
+            <Button size="sm" variant="primary" onClick={() => setForm("card")}>
+              Raise a timecard
+            </Button>
+          </div>
+        }
         tabs={
           <Tabs
             items={TABS.map((entry) => ({
@@ -265,6 +293,8 @@ export default function TimecardsPage() {
           detail={batchDetail}
           users={users}
           onOpenCard={openCardDrawer}
+          projectId={projectId}
+          onChanged={refresh}
         />
       ) : tab === "crews" ? (
         <CrewsTab
@@ -295,6 +325,23 @@ export default function TimecardsPage() {
         detail={ticketDetail}
         onClose={() => openTicketDrawer(null)}
         onMutated={refreshAll}
+      />
+
+      <TimecardCreateModal
+        open={form === "card"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        projectId={projectId}
+        workers={workerList.data?.items ?? []}
+        crews={crews.data?.items ?? []}
+        costCodes={costCodes.data?.items ?? []}
+      />
+      <BatchCreateModal
+        open={form === "batch"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        projectId={projectId}
+        crews={crews.data?.items ?? []}
       />
     </div>
   );

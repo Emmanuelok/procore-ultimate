@@ -1499,6 +1499,91 @@ CREATE TABLE "chain_watermarks" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
+CREATE TABLE "bond_facilities" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text,
+	"number" text NOT NULL,
+	"name" text NOT NULL,
+	"provider" text NOT NULL,
+	"provider_vendor_id" text,
+	"facility_reference" text,
+	"limit_amount" double precision NOT NULL,
+	"currency" text DEFAULT 'GBP' NOT NULL,
+	"permitted_bond_types" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"commission_rate_pct" double precision,
+	"collateral_amount" double precision,
+	"collateral_note" text,
+	"effective_from" text,
+	"effective_to" text,
+	"review_date" text,
+	"status" text DEFAULT 'draft' NOT NULL,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "insurance_premiums" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text,
+	"policy_id" text NOT NULL,
+	"kind" text DEFAULT 'premium' NOT NULL,
+	"amount" double precision NOT NULL,
+	"currency" text DEFAULT 'GBP' NOT NULL,
+	"period_start" text,
+	"period_end" text,
+	"due_date" text,
+	"paid_at" text,
+	"reference" text,
+	"note" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "insurance_requirements" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text,
+	"contract_id" text,
+	"vendor_id" text,
+	"policy_type" text NOT NULL,
+	"required_by_clause" text NOT NULL,
+	"minimum_limit" double precision,
+	"limit_basis" text,
+	"currency" text DEFAULT 'GBP' NOT NULL,
+	"maximum_deductible" double precision,
+	"waiver_of_subrogation" integer DEFAULT 0 NOT NULL,
+	"additional_insured_required" integer DEFAULT 0 NOT NULL,
+	"maintain_months_after_completion" integer,
+	"territorial_limits" text,
+	"notes" text,
+	"status" text DEFAULT 'required' NOT NULL,
+	"waived_by" text,
+	"waived_at" timestamp with time zone,
+	"waiver_reason" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "lesson_pushes" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"lesson_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"score" double precision,
+	"reasons" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"status" text DEFAULT 'pushed' NOT NULL,
+	"notified_user_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"acknowledged_by" text,
+	"acknowledged_at" timestamp with time zone,
+	"application_id" text,
+	"dismissed_reason" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
 CREATE TABLE "developer_sandboxes" (
 	"company_id" text PRIMARY KEY NOT NULL,
 	"purpose" text,
@@ -1909,6 +1994,44 @@ CREATE TABLE "spec_revision_notices" (
 	"acknowledged_at" timestamp with time zone,
 	"detail" jsonb DEFAULT '{}'::jsonb NOT NULL,
 	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "meeting_agenda_templates" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text,
+	"name" text NOT NULL,
+	"description" text,
+	"meeting_type" text DEFAULT 'progress' NOT NULL,
+	"items" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"default_attendees" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"contract_requirement" text,
+	"is_default" integer DEFAULT 0 NOT NULL,
+	"status" text DEFAULT 'active' NOT NULL,
+	"usage_count" integer DEFAULT 0 NOT NULL,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "meeting_minute_deliveries" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"meeting_id" text NOT NULL,
+	"minutes_version" integer DEFAULT 1 NOT NULL,
+	"user_id" text,
+	"contact_id" text,
+	"attendee_id" text,
+	"recipient_name" text NOT NULL,
+	"email" text,
+	"channel" text DEFAULT 'platform' NOT NULL,
+	"status" text DEFAULT 'pending' NOT NULL,
+	"delivered_at" timestamp with time zone,
+	"acknowledged_at" timestamp with time zone,
+	"failure_reason" text,
+	"document_sha256" text,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
@@ -6835,6 +6958,20 @@ ALTER TABLE "benchmark_samples" ADD COLUMN "superseded_at" timestamp with time z
 ALTER TABLE "benchmark_samples" ADD COLUMN "superseded_by_sample_id" text;--> statement-breakpoint
 ALTER TABLE "project_metric_snapshots" ADD COLUMN "currency" text;--> statement-breakpoint
 ALTER TABLE "project_metric_snapshots" ADD COLUMN "outlier_signal_id" text;--> statement-breakpoint
+ALTER TABLE "bonds" ADD COLUMN "facility_id" text;--> statement-breakpoint
+ALTER TABLE "insurance_policies" ADD COLUMN "renewal_status" text DEFAULT 'not_started' NOT NULL;--> statement-breakpoint
+ALTER TABLE "insurance_policies" ADD COLUMN "renewal_owner_id" text;--> statement-breakpoint
+ALTER TABLE "insurance_policies" ADD COLUMN "renewal_target_date" text;--> statement-breakpoint
+ALTER TABLE "insurance_policies" ADD COLUMN "renewal_notes" text;--> statement-breakpoint
+ALTER TABLE "insurance_policies" ADD COLUMN "previous_policy_id" text;--> statement-breakpoint
+ALTER TABLE "insurance_policies" ADD COLUMN "renewed_by_policy_id" text;--> statement-breakpoint
+ALTER TABLE "lesson_applications" ADD COLUMN "outcome" text DEFAULT 'unknown' NOT NULL;--> statement-breakpoint
+ALTER TABLE "lesson_applications" ADD COLUMN "outcome_value" double precision;--> statement-breakpoint
+ALTER TABLE "lesson_applications" ADD COLUMN "outcome_currency" text;--> statement-breakpoint
+ALTER TABLE "lesson_applications" ADD COLUMN "outcome_days" integer;--> statement-breakpoint
+ALTER TABLE "lesson_applications" ADD COLUMN "measured_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "lesson_applications" ADD COLUMN "measured_by" text;--> statement-breakpoint
+ALTER TABLE "lesson_triggers" ADD COLUMN "source_key" text;--> statement-breakpoint
 ALTER TABLE "webhook_deliveries" ADD COLUMN "lease_until" timestamp with time zone;--> statement-breakpoint
 ALTER TABLE "webhook_deliveries" ADD COLUMN "lease_owner" text;--> statement-breakpoint
 ALTER TABLE "webhook_deliveries" ADD COLUMN "secret_version" integer DEFAULT 1 NOT NULL;--> statement-breakpoint
@@ -6852,6 +6989,12 @@ ALTER TABLE "spec_sections" ADD COLUMN "withdrawn_reason" text;--> statement-bre
 ALTER TABLE "spec_submittal_requirements" ADD COLUMN "needs_reconfirmation" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
 ALTER TABLE "spec_submittal_requirements" ADD COLUMN "superseded_by_revision_id" text;--> statement-breakpoint
 ALTER TABLE "spec_submittal_requirements" ADD COLUMN "reissue_note" text;--> statement-breakpoint
+ALTER TABLE "meetings" ADD COLUMN "minutes_sha256" text;--> statement-breakpoint
+ALTER TABLE "meetings" ADD COLUMN "minutes_rendered_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "meetings" ADD COLUMN "minutes_version" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
+ALTER TABLE "meetings" ADD COLUMN "minutes_delivered_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "meetings" ADD COLUMN "agenda_pack_file_id" text;--> statement-breakpoint
+ALTER TABLE "meetings" ADD COLUMN "agenda_pack_sha256" text;--> statement-breakpoint
 ALTER TABLE "material_items" ADD COLUMN "schedule_activity_id" text;--> statement-breakpoint
 ALTER TABLE "material_items" ADD COLUMN "required_on_site_date" text;--> statement-breakpoint
 ALTER TABLE "material_items" ADD COLUMN "order_placed_at" text;--> statement-breakpoint
@@ -7042,6 +7185,17 @@ CREATE INDEX "benchmark_contributions_cell_idx" ON "benchmark_contributions" USI
 CREATE INDEX "benchmark_forecasts_project_idx" ON "benchmark_forecasts" USING btree ("project_id","metric","created_at");--> statement-breakpoint
 CREATE INDEX "benchmark_forecasts_company_idx" ON "benchmark_forecasts" USING btree ("company_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "chain_watermarks_company_uq" ON "chain_watermarks" USING btree ("company_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "bond_facilities_uq" ON "bond_facilities" USING btree ("company_id","number");--> statement-breakpoint
+CREATE INDEX "bond_facilities_company_idx" ON "bond_facilities" USING btree ("company_id","status");--> statement-breakpoint
+CREATE INDEX "bond_facilities_review_idx" ON "bond_facilities" USING btree ("company_id","review_date");--> statement-breakpoint
+CREATE INDEX "insurance_premiums_policy_idx" ON "insurance_premiums" USING btree ("policy_id");--> statement-breakpoint
+CREATE INDEX "insurance_premiums_company_idx" ON "insurance_premiums" USING btree ("company_id","currency");--> statement-breakpoint
+CREATE INDEX "insurance_requirements_company_idx" ON "insurance_requirements" USING btree ("company_id","status");--> statement-breakpoint
+CREATE INDEX "insurance_requirements_project_idx" ON "insurance_requirements" USING btree ("company_id","project_id","policy_type");--> statement-breakpoint
+CREATE INDEX "insurance_requirements_vendor_idx" ON "insurance_requirements" USING btree ("vendor_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "lesson_pushes_uq" ON "lesson_pushes" USING btree ("lesson_id","project_id");--> statement-breakpoint
+CREATE INDEX "lesson_pushes_project_idx" ON "lesson_pushes" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "lesson_pushes_company_idx" ON "lesson_pushes" USING btree ("company_id","status");--> statement-breakpoint
 CREATE INDEX "integration_export_profiles_company_idx" ON "integration_export_profiles" USING btree ("company_id","feed");--> statement-breakpoint
 CREATE UNIQUE INDEX "backcharges_uq" ON "backcharges" USING btree ("project_id","number");--> statement-breakpoint
 CREATE INDEX "backcharges_commitment_idx" ON "backcharges" USING btree ("commitment_id","status");--> statement-breakpoint
@@ -7092,6 +7246,11 @@ CREATE INDEX "vendor_portal_tokens_vendor_idx" ON "vendor_portal_tokens" USING b
 CREATE INDEX "spec_revision_notices_project_idx" ON "spec_revision_notices" USING btree ("project_id","created_at");--> statement-breakpoint
 CREATE INDEX "spec_revision_notices_section_idx" ON "spec_revision_notices" USING btree ("section_id");--> statement-breakpoint
 CREATE INDEX "spec_revision_notices_ack_idx" ON "spec_revision_notices" USING btree ("project_id","acknowledged_at");--> statement-breakpoint
+CREATE INDEX "meeting_agenda_templates_company_idx" ON "meeting_agenda_templates" USING btree ("company_id","status");--> statement-breakpoint
+CREATE INDEX "meeting_agenda_templates_type_idx" ON "meeting_agenda_templates" USING btree ("company_id","meeting_type");--> statement-breakpoint
+CREATE INDEX "meeting_minute_deliveries_meeting_idx" ON "meeting_minute_deliveries" USING btree ("meeting_id","minutes_version");--> statement-breakpoint
+CREATE INDEX "meeting_minute_deliveries_company_idx" ON "meeting_minute_deliveries" USING btree ("company_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "meeting_minute_deliveries_uq" ON "meeting_minute_deliveries" USING btree ("meeting_id","minutes_version","recipient_name","channel");--> statement-breakpoint
 CREATE UNIQUE INDEX "safety_regulatory_reports_uq" ON "safety_regulatory_reports" USING btree ("company_id","number");--> statement-breakpoint
 CREATE INDEX "safety_regulatory_reports_project_idx" ON "safety_regulatory_reports" USING btree ("project_id","form");--> statement-breakpoint
 CREATE INDEX "safety_regulatory_reports_incident_idx" ON "safety_regulatory_reports" USING btree ("incident_id");--> statement-breakpoint
@@ -7771,6 +7930,15 @@ CREATE INDEX "ingestion_runs_status_idx" ON "ingestion_runs" USING btree ("compa
 CREATE INDEX "ingestion_runs_project_idx" ON "ingestion_runs" USING btree ("project_id");--> statement-breakpoint
 CREATE INDEX "benchmark_samples_cell_idx" ON "benchmark_samples" USING btree ("metric","asset_class","region","currency");--> statement-breakpoint
 CREATE INDEX "benchmark_samples_live_idx" ON "benchmark_samples" USING btree ("metric","superseded_at");--> statement-breakpoint
+CREATE INDEX "bonds_facility_idx" ON "bonds" USING btree ("facility_id","status");--> statement-breakpoint
+CREATE INDEX "bonds_status_idx" ON "bonds" USING btree ("company_id","status");--> statement-breakpoint
+CREATE INDEX "insurance_certificates_project_idx" ON "insurance_certificates" USING btree ("company_id","project_id","valid_to");--> statement-breakpoint
+CREATE INDEX "insurance_claims_project_idx" ON "insurance_claims" USING btree ("company_id","project_id");--> statement-breakpoint
+CREATE INDEX "insurance_policies_period_idx" ON "insurance_policies" USING btree ("company_id","period_end");--> statement-breakpoint
+CREATE INDEX "insurance_policies_renewal_idx" ON "insurance_policies" USING btree ("company_id","renewal_status");--> statement-breakpoint
+CREATE INDEX "lesson_applications_outcome_idx" ON "lesson_applications" USING btree ("company_id","outcome");--> statement-breakpoint
+CREATE UNIQUE INDEX "lesson_triggers_source_uq" ON "lesson_triggers" USING btree ("project_id","kind","source_key");--> statement-breakpoint
+CREATE INDEX "lessons_origin_idx" ON "lessons" USING btree ("company_id","origin_project_id");--> statement-breakpoint
 CREATE INDEX "webhook_deliveries_due_idx" ON "webhook_deliveries" USING btree ("status","next_attempt_at");--> statement-breakpoint
 CREATE INDEX "webhook_deliveries_company_idx" ON "webhook_deliveries" USING btree ("company_id","status","created_at");--> statement-breakpoint
 CREATE INDEX "webhook_endpoints_active_idx" ON "webhook_endpoints" USING btree ("is_active","circuit_open_until");--> statement-breakpoint
@@ -7783,6 +7951,8 @@ CREATE INDEX "invoices_company_idx" ON "invoices" USING btree ("company_id","sta
 CREATE INDEX "potential_change_orders_cor_idx" ON "potential_change_orders" USING btree ("change_order_request_id");--> statement-breakpoint
 CREATE INDEX "spec_section_revisions_fts_idx" ON "spec_section_revisions" USING gin (to_tsvector('english', left(coalesce("extracted_text", ''), 400000)));--> statement-breakpoint
 CREATE INDEX "spec_submittal_requirements_reconfirm_idx" ON "spec_submittal_requirements" USING btree ("project_id","needs_reconfirmation");--> statement-breakpoint
+CREATE INDEX "meeting_action_items_company_due_idx" ON "meeting_action_items" USING btree ("company_id","status","due_date");--> statement-breakpoint
+CREATE INDEX "meetings_company_status_idx" ON "meetings" USING btree ("company_id","status");--> statement-breakpoint
 CREATE INDEX "equipment_telematics_readings_device_idx" ON "equipment_telematics_readings" USING btree ("company_id","device_id","recorded_at");--> statement-breakpoint
 CREATE INDEX "material_items_required_idx" ON "material_items" USING btree ("company_id","required_on_site_date");--> statement-breakpoint
 CREATE UNIQUE INDEX "bid_invitations_portal_token_uq" ON "bid_invitations" USING btree ("portal_token_hash");--> statement-breakpoint

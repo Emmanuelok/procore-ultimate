@@ -38,6 +38,14 @@ import { formatDate, formatDateTime, humanize } from "../format";
 import GanttSvg from "./GanttSvg";
 import QualityPanel from "./QualityPanel";
 import {
+  CalendarsPanel,
+  ConstraintsPanel,
+  EarnedValuePanel,
+  ImportPanel,
+  MilestonesPanel,
+  NarrativesPanel,
+} from "./ProgrammePanels";
+import {
   shortDate,
   type BaselineDetail,
   type BaselineRow,
@@ -56,7 +64,16 @@ import {
 /** Constraint types that require a date (mirrors the server rule). */
 const DATED_CONSTRAINTS = ["start_no_earlier_than", "finish_no_later_than", "must_start_on"];
 
-type Panel = "compare" | "lookahead" | "health";
+type Panel =
+  | "compare"
+  | "lookahead"
+  | "health"
+  | "earned-value"
+  | "milestones"
+  | "constraints"
+  | "calendars"
+  | "narratives"
+  | "import";
 
 function errMessage(err: unknown, fallback: string): string {
   return err instanceof ApiClientError || err instanceof Error ? err.message : fallback;
@@ -805,7 +822,17 @@ export default function SchedulePage() {
     }
   }
 
-  /** Edit an existing link: delete → recreate; restore the original if the new link is rejected. */
+  /**
+   * Edit an existing link.
+   *
+   * Changing the type or the lag is a PATCH on the link itself — this used to
+   * be delete-then-recreate, which dropped the link outright whenever the
+   * recreate failed and wrote a delete + create pair into the ledger for what
+   * is one edit. Repointing the predecessor still needs a new row (the
+   * endpoints are the link's identity), so the new link is CREATED FIRST and
+   * the old one removed only once the new one exists: a failure leaves the
+   * original in place rather than nothing at all.
+   */
   async function onUpdateDependency(
     dep: DepRow,
     next: { predecessorId: string; depType: string; lagDays: number },
@@ -814,24 +841,19 @@ export default function SchedulePage() {
     setDepError(null);
     setBusy(true);
     try {
-      await api.del(`${base}/schedule-dependencies/${dep.id}`);
-      try {
+      if (next.predecessorId === dep.predecessorId) {
+        await api.patch(`${base}/schedule-dependencies/${dep.id}`, {
+          depType: next.depType,
+          lagDays: next.lagDays,
+        });
+      } else {
         await api.post(`${base}/schedules/${selectedId}/dependencies`, {
           predecessorId: next.predecessorId,
           successorId: dep.successorId,
           depType: next.depType,
           lagDays: next.lagDays,
         });
-      } catch (err) {
-        await api
-          .post(`${base}/schedules/${selectedId}/dependencies`, {
-            predecessorId: dep.predecessorId,
-            successorId: dep.successorId,
-            depType: dep.depType,
-            lagDays: dep.lagDays,
-          })
-          .catch(() => undefined);
-        throw err;
+        await api.del(`${base}/schedule-dependencies/${dep.id}`);
       }
       flashRecomputed();
     } catch (err) {
@@ -858,6 +880,12 @@ export default function SchedulePage() {
     { key: "compare", label: "Baseline compare" },
     { key: "lookahead", label: "Lookahead" },
     { key: "health", label: "Schedule health" },
+    { key: "earned-value", label: "Earned value" },
+    { key: "milestones", label: "Milestones" },
+    { key: "constraints", label: "Constraints" },
+    { key: "calendars", label: "Calendars" },
+    { key: "narratives", label: "Narrative" },
+    { key: "import", label: "Import / export" },
   ];
 
   return (
@@ -1507,6 +1535,41 @@ export default function SchedulePage() {
                   onSelectTask={(id) => {
                     setSelectedTaskId(id);
                     setExpandedTaskId(id);
+                  }}
+                />
+              ) : null}
+
+              {panel === "earned-value" ? (
+                <EarnedValuePanel base={base} scheduleId={selectedId} />
+              ) : null}
+              {panel === "milestones" ? (
+                <MilestonesPanel
+                  base={base}
+                  scheduleId={selectedId}
+                  onSelectTask={(id) => {
+                    setSelectedTaskId(id);
+                    setExpandedTaskId(id);
+                  }}
+                />
+              ) : null}
+              {panel === "constraints" ? (
+                <ConstraintsPanel
+                  base={base}
+                  scheduleId={selectedId}
+                  tasks={tasks.map((t) => ({ id: t.id, name: t.name }))}
+                />
+              ) : null}
+              {panel === "calendars" ? <CalendarsPanel base={base} /> : null}
+              {panel === "narratives" ? (
+                <NarrativesPanel base={base} scheduleId={selectedId} />
+              ) : null}
+              {panel === "import" ? (
+                <ImportPanel
+                  base={base}
+                  schedules={schedules ?? []}
+                  onImported={(id) => {
+                    setSelectedId(id);
+                    bump();
                   }}
                 />
               ) : null}

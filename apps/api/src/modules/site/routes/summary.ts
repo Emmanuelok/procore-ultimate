@@ -46,7 +46,10 @@ export const summaryRoutes: FastifyPluginAsync = async (app) => {
     const where = and(
       eq(signals.companyId, req.companyId!),
       eq(signals.projectId, projectId),
-      q.detector ? eq(signals.detector, q.detector) : inArray(signals.detector, [...SITE_DETECTORS]),
+      // Always constrained to this module's detectors: `site_ops` read access
+      // is not read access to every detector that ever fired on the project.
+      inArray(signals.detector, [...SITE_DETECTORS]),
+      q.detector ? eq(signals.detector, q.detector) : undefined,
       q.disposition ? eq(signals.disposition, q.disposition) : undefined,
     );
     const [rows, [total]] = await Promise.all([

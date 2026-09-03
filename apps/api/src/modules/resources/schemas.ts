@@ -82,14 +82,9 @@ export const planCreateSchema = z.object({
   detail: detailSchema.optional(),
 });
 
-export const planPatchSchema = planCreateSchema
-  .omit({ supersedesPlanId: true })
-  .partial()
-  .extend({
-    /** status moves through dedicated routes, never a generic PATCH */
-    status: z.never().optional(),
-  })
-  .omit({ status: true });
+/** `status` is absent on purpose: activation and archiving are distinct acts
+ *  with their own routes, and a generic PATCH must never move a lifecycle. */
+export const planPatchSchema = planCreateSchema.omit({ supersedesPlanId: true }).partial();
 
 export const planListQuery = pageQuerySchema.extend({
   status: z.enum(RESOURCE_PLAN_STATUSES).optional(),

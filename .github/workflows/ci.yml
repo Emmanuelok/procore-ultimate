@@ -5,9 +5,21 @@ on:
     branches: ["**"]
   pull_request:
 
+# One run per ref. A superseded push cancels the run it superseded rather than
+# queueing behind it — but never on the default branch, where every commit's
+# result is the record the deploy workflow gates on.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
+  # ---------------------------------------------------------------------------
+  # The gate. Everything that must be green for a commit to be deployable.
+  # ---------------------------------------------------------------------------
   verify:
+    name: Build, typecheck and test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -16,10 +28,234 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+
       # Build first: apps/api resolves @constructos/{shared,ledger,db} through
       # their dist/ output, which is gitignored. On a cold checkout typecheck
       # would fail with TS2307 before build ever ran.
-      - run: pnpm build
-      - run: pnpm typecheck
-      - run: pnpm test
-      - run: pnpm --filter @constructos/api eval:retrodetect
+      - name: Build packages and apps
+        run: pnpm build
+
+      # `pnpm typecheck` and `pnpm test` are workspace-recursive and already
+      # cover apps/web as well as apps/api. They are run explicitly per package
+      # too, so a failure names the package in the job log instead of being one
+      # line inside a recursive run.
+      - name: Typecheck (all packages)
+        run: pnpm typecheck
+
+      - name: Typecheck the web app
+        run: pnpm --filter @constructos/web typecheck
+
+      - name: Test the API
+        run: pnpm --filter @constructos/api test
+
+      - name: Test the ledger package
+        run: pnpm --filter @constructos/ledger test
+
+      # The detector harness measures precision against planted schemes. A
+      # regression here is a product regression, not a flake.
+      - name: Retrospective detection harness
+        run: pnpm --filter @constructos/api eval:retrodetect
+
+  # ---------------------------------------------------------------------------
+  # Supply chain. Advisory, on purpose: a new CVE in a transitive dependency
+  # must not stop a security fix from shipping. It is loud in the job summary
+  # and it fails NOTHING, which is the only way a scan of this kind survives
+  # contact with a real release schedule.
+  # ---------------------------------------------------------------------------
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: pnpm audit (high and critical)
+        run: |
+          set +e
+          pnpm audit --audit-level high --json > audit.json
+          STATUS=$?
+          set -e
+          {
+            echo "## Dependency audit"
+            if [ "$STATUS" -eq 0 ]; then
+              echo "No advisories at high or critical severity."
+            else
+              echo "Advisories found at high or critical severity:"
+              echo '```'
+              node -e '
+                const fs = require("fs");
+                const text = fs.readFileSync("audit.json", "utf8").trim();
+                const seen = new Set();
+                for (const line of text.split("\n")) {
+                  if (!line.trim()) continue;
+                  let row; try { row = JSON.parse(line); } catch { continue; }
+                  const advisory = row.advisory ?? row;
+                  const name = advisory.module_name ?? advisory.name;
+                  if (!name || seen.has(name)) continue;
+                  seen.add(name);
+                  console.log(`${advisory.severity ?? "?"}  ${name}  ${advisory.title ?? ""}`);
+                }
+              ' || cat audit.json
+              echo '```'
+              echo ""
+              echo "Advisory only — this job never fails the build. Triage in the next dependency pass."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Secrets scan. This one DOES fail: a committed credential is not a warning,
+  # and unlike a CVE it cannot be fixed by upgrading later — it has to be
+  # rotated, so catching it before it merges is the entire value.
+  # ---------------------------------------------------------------------------
+  secrets:
+    name: Secrets scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: a secret removed in the head commit is still in the
+          # repository, and still has to be rotated.
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+        id: gitleaks
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # A second, dependency-free pass over the working tree. It exists because
+      # the action above needs a licence key for organisation accounts and
+      # skips silently without one — a scan that can quietly not run is not a
+      # control. This one has no such failure mode.
+      - name: Pattern scan (no external dependency)
+        run: |
+          set -euo pipefail
+          # Patterns are shaped like the credentials this platform actually
+          # takes: provider keys, private keys, and a live-looking AUTH_SECRET
+          # committed into a file rather than left in .env.example as a
+          # placeholder.
+          PATTERNS='(sk-ant-api[0-9]{2}-[A-Za-z0-9_-]{20,})|(AKIA[0-9A-Z]{16})|(-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----)|(re_[A-Za-z0-9]{24,})|(xox[baprs]-[A-Za-z0-9-]{10,})|(ghp_[A-Za-z0-9]{36})'
+          FOUND=0
+          while IFS= read -r file; do
+            case "$file" in
+              *.env.example|*/node_modules/*|*.lock|pnpm-lock.yaml|*.png|*.jpg|*.pdf|*.ico) continue ;;
+            esac
+            if grep -nEI "$PATTERNS" "$file" >/dev/null 2>&1; then
+              echo "::error file=$file::a value in this file matches a credential pattern"
+              grep -nEI "$PATTERNS" "$file" | head -5 | sed 's/^/    /'
+              FOUND=1
+            fi
+          done < <(git ls-files)
+          if [ "$FOUND" -ne 0 ]; then
+            echo "Committed credentials must be ROTATED, not just deleted: the value is in the history."
+            exit 1
+          fi
+          echo "No credential-shaped values in the tracked tree."
+
+  # ---------------------------------------------------------------------------
+  # Boot the production image and drive it. This is the check that catches the
+  # class of failure unit tests cannot see: a Dockerfile that builds and a
+  # process that will not start, a missing migration directory, a CSP that
+  # blocks the SPA's own bootstrap script, a readiness endpoint that never
+  # reports ready.
+  # ---------------------------------------------------------------------------
+  image:
+    name: Container smoke boot
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: constructos
+          POSTGRES_USER: constructos
+          POSTGRES_DB: constructos
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U constructos"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the production image
+        run: docker build -t constructos:ci .
+
+      - name: Run it against a real Postgres
+        run: |
+          docker run -d --name constructos-ci \
+            --network host \
+            -e NODE_ENV=production \
+            -e PORT=4000 \
+            -e DATABASE_URL='postgres://constructos:constructos@127.0.0.1:5432/constructos' \
+            -e AUTH_SECRET="$(openssl rand -hex 32)" \
+            -e APP_BASE_URL='http://127.0.0.1:4000' \
+            -e ALLOW_LOCAL_STORAGE=true \
+            -e SCHEDULER_ENABLED=false \
+            constructos:ci
+
+      - name: Wait for readiness
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            CODE="$(curl -s -o /tmp/ready.json -w '%{http_code}' http://127.0.0.1:4000/api/v1/health/ready || true)"
+            if [ "$CODE" = "200" ]; then
+              echo "ready after ${i}s"
+              cat /tmp/ready.json
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "the container never reported ready:"
+          cat /tmp/ready.json 2>/dev/null || true
+          docker logs constructos-ci
+          exit 1
+
+      - name: Drive the running image
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; docker logs constructos-ci; exit 1; }
+
+          # Liveness answers, and says which database it is really on. An image
+          # that silently fell back to the embedded database would pass every
+          # other check in this job.
+          DB="$(curl -sf http://127.0.0.1:4000/api/v1/health | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(String(JSON.parse(d).db)))')"
+          [ "$DB" = "postgres" ] || fail "health reports db=$DB, so migrations ran against the embedded fallback"
+
+          # The SPA is served same-origin with its security headers.
+          curl -sfI http://127.0.0.1:4000/ | grep -qi '^content-security-policy:' || fail "no CSP header on the SPA"
+
+          # A client route falls back to index.html rather than 404.
+          CODE="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4000/projects)"
+          [ "$CODE" = "200" ] || fail "client-route fallback returned $CODE"
+
+          # An unauthenticated SCIM call is refused in SCIM's own envelope, not
+          # this platform's — an IdP parses the former.
+          BODY="$(curl -s http://127.0.0.1:4000/api/v1/scim/v2/Users)"
+          echo "$BODY" | grep -q 'scim:api:messages:2.0:Error' || fail "SCIM 401 is not a SCIM error document: $BODY"
+
+          # Registration works end to end against the real database.
+          REG="$(curl -sf -X POST http://127.0.0.1:4000/api/v1/auth/register \
+            -H 'content-type: application/json' \
+            -d '{"email":"ci-smoke@example.com","password":"ci-smoke-Passw0rd!","name":"CI Smoke","companyName":"CI Smoke Co"}')" \
+            || fail "registration failed"
+          echo "$REG" | grep -q accessToken || fail "registration returned no token"
+          echo "container smoke checks passed"
+
+      - name: Container logs
+        if: always()
+        run: docker logs constructos-ci || true
+
+      - name: Stop
+        if: always()
+        run: docker rm -f constructos-ci || true

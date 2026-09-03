@@ -331,6 +331,23 @@ describe("dry runs", () => {
     expect((ok.json() as { matched: boolean }).matched).toBe(true);
     expect((await post(projectAdmin, `/projects/${projectId}/automation/rules/${ruleId}/test`, { objectId: theirs.id })).statusCode).toBe(403);
   });
+
+  it("a project tester cannot read another project's record through a type that carries no projectId column", async () => {
+    // A `project` record IS its own project: the guard must resolve the
+    // record's project from the registry, not from a projectId field.
+    const created = await post(projectAdmin, `/projects/${projectId}/automation/rules`, {
+      name: "Project trigger",
+      trigger: { kind: "event", objectType: "project", action: "*" },
+      actions: [{ type: "tag", params: { name: "probe" } }],
+    });
+    expect(created.statusCode).toBe(201);
+    const probeRuleId = (created.json() as { id: string }).id;
+    const own = await post(projectAdmin, `/projects/${projectId}/automation/rules/${probeRuleId}/test`, { objectId: projectId });
+    expect(own.statusCode).toBe(200);
+    const other = await post(projectAdmin, `/projects/${projectId}/automation/rules/${probeRuleId}/test`, { objectId: otherProjectId });
+    expect(other.statusCode).toBe(403);
+    expect(JSON.stringify(other.json())).not.toContain("Other route project");
+  });
 });
 
 describe("runs, summary, engine operations and health inputs", () => {
@@ -436,5 +453,18 @@ describe("runs, summary, engine operations and health inputs", () => {
     const drain = await t.app.scheduler.runNow("automation.drain");
     expect(drain.state).toBe("succeeded");
     expect(drain.lastResult).toMatchObject({ executed: 0 });
+  });
+
+  it("the manual cycle never drains another company's queued runs", async () => {
+    const theirProject = await createProject(t.app, outsider, "Their drain project");
+    await post(outsider, "/automation/rules", baseRule({ name: "Theirs", status: "active", conditions: null }));
+    await createRfi(t.app, outsider, theirProject, { subject: "Queued for them" });
+    const queuedBefore = (await get(outsider, "/automation/runs?status=queued")).json() as { items: Array<{ id: string }> };
+    expect(queuedBefore.items.length).toBeGreaterThanOrEqual(1);
+    const cycle = await post(owner, "/automation/run", { scan: false });
+    expect(cycle.statusCode).toBe(200);
+    expect((cycle.json() as { drain: { executed: number } }).drain.executed).toBe(0);
+    const queuedAfter = (await get(outsider, "/automation/runs?status=queued")).json() as { items: Array<{ id: string }> };
+    expect(queuedAfter.items.map((r) => r.id)).toEqual(queuedBefore.items.map((r) => r.id));
   });
 });

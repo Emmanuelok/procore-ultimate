@@ -519,6 +519,8 @@ export interface InvoiceMatchReport {
 
 export interface MaterialRow {
   id: string;
+  /** null = a COMPANY CATALOGUE item: the product as specified, with no stock */
+  projectId: string | null;
   number: number;
   reference: string;
   code: string | null;

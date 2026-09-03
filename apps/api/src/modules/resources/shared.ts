@@ -38,6 +38,9 @@ export type ResourcePlanRow = typeof resourcePlans.$inferSelect;
 export type ResourceAssignmentRow = typeof resourceAssignments.$inferSelect;
 export type ResourceSkillRow = typeof resourceSkills.$inferSelect;
 
+/** Ceiling on the activities read when deriving planned hours per budget line. */
+export const MAX_SCHEDULE_TASKS = 50_000;
+
 export const nowIso = (): string => new Date().toISOString();
 export const todayIso = (now: Date = new Date()): string => now.toISOString().slice(0, 10);
 export const pad3 = (n: number): string => String(n).padStart(3, "0");
@@ -337,7 +340,8 @@ export async function plannedLinesFor(
         budgetedHours: scheduleTasks.budgetedHours,
       })
       .from(scheduleTasks)
-      .where(eq(scheduleTasks.projectId, projectId));
+      .where(eq(scheduleTasks.projectId, projectId))
+      .limit(MAX_SCHEDULE_TASKS);
     for (const row of taskRows) {
       if (!row.budgetLineItemId || row.budgetedHours === null) continue;
       hoursByLine.set(
@@ -704,4 +708,32 @@ export async function projectMemberIds(
     )
     .limit(limit);
   return [...new Set(rows.map((r) => r.userId))];
+}
+
+/**
+ * The projects a caller may see in a company-wide list of project findings.
+ *
+ * Owners and admins see the portfolio; everybody else sees the projects they
+ * are a member of. Without this a bare company gate on a cross-project list
+ * hands every resourcing problem on every job to every user in the tenant.
+ */
+export async function visibleProjectIds(
+  db: Db,
+  req: FastifyRequest,
+): Promise<Set<string> | "all"> {
+  const companyId = companyOf(req);
+  const userId = actorOf(req);
+  const role = (req as FastifyRequest & { companyRole?: string }).companyRole;
+  if (role === "owner" || role === "admin") return "all";
+  const rows = await db
+    .select({ projectId: projectMemberships.projectId })
+    .from(projectMemberships)
+    .where(
+      and(
+        eq(projectMemberships.companyId, companyId),
+        eq(projectMemberships.userId, userId),
+      ),
+    )
+    .limit(1000);
+  return new Set(rows.map((r) => r.projectId));
 }

@@ -622,7 +622,10 @@ export const planRoutes: FastifyPluginAsync = async (app) => {
     const companyId = companyOf(req);
     const projectId = projectOf(req);
     await requireTypeForProject(app.db, body.resourceTypeId, companyId, projectId);
-    const weekStart = weekStartOf(body.weekStart, 1);
+    // Supply must bucket on the SAME week boundary as demand, or the histogram
+    // compares a Sunday-start supply week against a Monday-start demand week
+    // and reports every week as both short and unknown.
+    const weekStart = weekStartOf(body.weekStart, await weekStartsOnFor(companyId, projectId));
     const row = await upsertAvailability(
       companyId,
       projectId,
@@ -648,7 +651,7 @@ export const planRoutes: FastifyPluginAsync = async (app) => {
       const projectId = projectOf(req);
       if (body.to < body.from) throw badRequest("`to` must not precede `from`");
       await requireTypeForProject(app.db, body.resourceTypeId, companyId, projectId);
-      const weeks = enumerateWeeks(body.from, body.to, 1);
+      const weeks = enumerateWeeks(body.from, body.to, await weekStartsOnFor(companyId, projectId));
       if (weeks.length > MAX_HISTOGRAM_WEEKS) {
         throw badRequest(
           `That window is ${weeks.length} weeks. Availability is set in windows of at most ` +
@@ -943,6 +946,16 @@ export const planRoutes: FastifyPluginAsync = async (app) => {
       .limit(1);
     if (!rows[0]) throw notFound("Demand row not found on this plan");
     return rows[0];
+  }
+
+  /**
+   * The week boundary this project buckets on: the active plan's, or Monday.
+   * Demand and supply must agree on it — see the comment on the availability
+   * upsert.
+   */
+  async function weekStartsOnFor(companyId: string, projectId: string): Promise<number> {
+    const plan = await activePlan(companyId, projectId);
+    return plan?.weekStartsOn ?? 1;
   }
 
   async function activePlan(companyId: string, projectId: string) {

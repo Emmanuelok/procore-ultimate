@@ -223,10 +223,26 @@ describe("summary and health inputs", () => {
     expect(res.json().reasons.join(" ")).toContain("no gate feed");
   });
 
-  it("lists this module's signals", async () => {
+  it("lists this module's signals and nobody else's", async () => {
     const res = await get(`${base()}/signals`);
     expect(res.statusCode).toBe(200);
     expect(res.json().items.every((s: { detector: string }) => s.detector.startsWith("site_"))).toBe(true);
+
+    // A detector from another module is never returned, even when asked for
+    // by name: `site_ops` read access is not read access to every detector.
+    await app.db.insert(signals).values({
+      id: newId("sig"),
+      companyId: owner.companyId,
+      projectId,
+      detector: "ghost_vendor_shared_bank_account",
+      severity: "high",
+      confidence: 0.9,
+      title: "Not a site signal",
+      explanation: "Raised by the assurance layer.",
+    });
+    const asked = await get(`${base()}/signals?detector=ghost_vendor_shared_bank_account`);
+    expect(asked.statusCode).toBe(200);
+    expect(asked.json().total).toBe(0);
   });
 
   it("runs every sweep from one endpoint", async () => {

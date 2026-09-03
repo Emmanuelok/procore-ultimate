@@ -352,18 +352,52 @@ boot). "Image" = value baked into `Dockerfile`; set in Railway only what §2.5 l
 | `WEB_DIST_DIR` | unset (SPA serving off) | `/app/public` | — |
 | `MIGRATIONS_DIR` | unset (repo-relative search) | `/app/migrations` | — |
 | `TRUST_PROXY` | `false` | `true` | Must be `true` behind Railway's proxy |
+| `TRUST_PROXY_HOPS` | `1` | — | Raise only when a CDN sits in front of the Railway edge. Each increment is one more hop whose word is taken for the client's address. |
+| `CORS_ORIGINS` | `""` | — | Only when a browser on another origin calls the API. `APP_BASE_URL`'s origin is always allowed. |
+| `ALLOW_EMBEDDED_DB` | `false` | — | Set only for a deliberate throwaway environment — production otherwise refuses to boot without `DATABASE_URL`. |
+| `ALLOW_LOCAL_STORAGE` | `false` | — | Set only for the volume topology (§1.1). |
+| `UPLOAD_MAX_BYTES` | `268435456` (256 MiB) | — | Bounds memory per in-flight upload (multipart is buffered per request). |
+| `UPLOAD_MAX_FILES` | `25` | — | Optional tuning |
+| `DATABASE_POOL_MAX` | `10` | — | Multiply by replica count and compare with Postgres `max_connections` before raising. |
+| `SCHEDULER_ENABLED` | `true` | — | Leave on. Off means the sweeps (session/invitation expiry, security-webhook delivery, deadline detection, heartbeat seals) do not run at all — not "later". |
+| `SCHEDULER_TICK_MS` | `60000` | — | Tick granularity; a job's `everyMs` rounds up to it. |
 | `RATE_LIMIT_ENABLED` | `true` | — | — |
 | `RATE_LIMIT_MAX_PER_MINUTE` | `300` | — | Optional tuning (per IP, per replica) |
-| `AUTH_RATE_LIMIT_MAX_PER_MINUTE` | `10` | — | Optional tuning (credential endpoints) |
+| `AUTH_RATE_LIMIT_MAX_PER_MINUTE` | `10` | — | Optional tuning (credential endpoints). NOT a lockout — see §4.6. |
+| `WEBHOOK_SIGNING_KEY` | unset → derived from `AUTH_SECRET` | — | Set it: under the fallback anyone who can read the JWT secret can forge a webhook signature a receiver would accept. |
+| `WEBHOOK_ALLOW_HOSTS` | unset | — | Comma-separated hosts exempt from the SSRF refusal. Use only for a receiver inside your own network. |
+| `SSO_ENCRYPTION_KEY` | unset → derived from `AUTH_SECRET` | — | Set it before configuring SSO or MFA. **Rotating it makes every stored client secret and TOTP seed unreadable** — re-encrypt first. |
+| `ANCHOR_SIGNING_KEY` | unset → derived from `AUTH_SECRET` | — | Set it, or seals prove integrity against a database-only attacker and not against the operator. |
+| `ANCHOR_TRUSTED_FINGERPRINTS` | unset | — | Pin out of band; see `.env.example`. |
+| `ANCHOR_TSA_URL`, `ANCHOR_OTS_CALENDAR_URL` | unset | — | Optional external timestamping. |
+| `ANCHOR_HEARTBEAT_HOURS` | `24` | — | Bounds how long a tail truncation can hide. |
 | `ANTHROPIC_API_KEY` | unset | — | Optional — AI routes 503 without it |
 | `AI_MODEL` | `claude-opus-5` | — | Optional |
 | `LOG_LEVEL` | `info` | — | Optional (`debug`, `warn`, …) |
 
+There are deliberately **no environment variables** for the session timeout, password
+policy, lockout thresholds or IP allowlist. Those are **per tenant**, set by an owner or
+admin at `PUT /api/v1/company/security-policy` (web app → Security). The `LOGIN_*`,
+`SESSION_*` and `BCRYPT_COST` values are the platform DEFAULTS a tenant that has chosen
+nothing inherits; a tenant may tighten them and can never loosen them below the platform
+floor. See §4.6.
+
 ### 4.2 Upgrade and rollback
 
 - **Upgrade**: push to the deployed branch → Railway builds the Dockerfile and deploys.
-  The healthcheck (`/api/v1/health`) gates cutover — a build that cannot boot (bad
-  variable, failed migration) never replaces the running deployment.
+  The healthcheck gates cutover — a build that cannot boot (bad variable, failed
+  migration) never replaces the running deployment.
+- **The healthcheck is READINESS, not liveness.** `railway.json` points at
+  `/api/v1/health/ready`, which executes `select 1` against the database before
+  answering. `/api/v1/health` only proves the process is listening, and a container that
+  is listening while unable to reach Postgres would have passed it. Readiness answers
+  200 **with** configuration warnings present — a warning describes a smaller
+  deployment, not a broken one — and 503 only when a check genuinely failed.
+- **CI gates the deploy.** `.github/workflows/deploy-railway.yml` triggers on the
+  *completion* of the CI workflow and refuses to run unless that run concluded
+  `success`, then checks out `workflow_run.head_sha` — the exact commit CI tested, not
+  whatever the branch tip has become since. A manual `workflow_dispatch` is an operator's
+  deliberate act and is not gated.
 - **Migrations are forward-only and run at boot** (`lib/db.ts`). Write additive
   migrations: rolling back the *app image* does not roll back the *schema*, so an old
   image must tolerate the new schema. This repo's drizzle migrations are committed under
@@ -395,6 +429,76 @@ boot). "Image" = value baked into `Dockerfile`; set in Railway only what §2.5 l
 | Everyone hits 429 at once | `TRUST_PROXY` not `true` → all traffic keyed on the proxy's IP for rate limiting | Keep the image default `TRUST_PROXY=true`; don't override it |
 | Upload fails `EACCES` (volume mode only) | Railway mounts volumes as root; image runs as `USER node` | Set `RAILWAY_RUN_UID=0` on the service (§1.1) |
 | AI routes return `503 AiDisabled` | No `ANTHROPIC_API_KEY` | Intentional degradation; set the key to enable |
+| SSO sign-in fails ~half the time with "this sign-in link is not valid any more" | More than one replica **and** `DATABASE_URL` unset, so the authorization-code state lives in one process's memory and the callback lands on another | Set `DATABASE_URL`. With a shared Postgres the SSO flow/ticket store is a table (`sso_flows`, `sso_tickets`) and any replica can complete any sign-in. |
+| Everyone in a company is refused with "your organisation only permits sign-in from approved networks" | An IP allowlist was set to `enforce` with the wrong ranges, or `TRUST_PROXY` is off so every request appears to come from the proxy | An owner on the break-glass list can still sign in and fix it (`ipAllowlistBreakGlassUserIds`). Otherwise set `ipAllowlistMode` back to `off` in `company_security_policies`. Introduce allowlists in `monitor` mode first. |
+| A SIEM stops receiving security webhooks and nothing is logged | 20 consecutive delivery failures disabled the endpoint | The row carries `disabledReason`. Fix the destination, then re-enable it — re-enabling clears the failure count. |
+| SCIM calls answer 401 with a SCIM error document | The bearer token was revoked, expired, or is a user access token rather than a `scim_…` token | Mint a new one at `POST /api/v1/company/scim/tokens`; it is shown once. |
+
+### 4.5 Replica safety — what is and is not shared
+
+| Concern | Shared across replicas? | Where it lives |
+|---|---|---|
+| Application data | Yes | Postgres |
+| Uploaded evidence | Yes **with `STORAGE_DRIVER=s3`**; no with `local` | Bucket / container disk |
+| SSO authorization-code state and tickets | Yes **when `DATABASE_URL` is set** | `sso_flows` / `sso_tickets` |
+| Scheduler jobs | Yes — one runner per job via a Postgres advisory lock | `lib/scheduler.ts` |
+| Ledger appends | Yes — serialised per company by an advisory lock | `lib/ledger.ts` |
+| Account and IP lockout counters | Yes — derived from `auth_security_events`, not from process memory | `modules/account/lockout.ts` |
+| `@fastify/rate-limit` counters | **No** — per process | In-memory. `RATE_LIMIT_MAX_PER_MINUTE` is therefore per replica; the lockout engine, which is not, is the control that actually stops credential guessing. |
+| MFA challenge tokens | N/A — stateless, MAC-authenticated | `modules/mfa/challenge.ts` |
+
+### 4.6 Tenant security policy (spec #23, #24, #25)
+
+Each company sets its own policy; a person who belongs to several companies is governed
+by the **strictest** of them, because a session is an account-level object that can read
+every tenant the holder belongs to.
+
+| Setting | Effect | Platform default |
+|---|---|---|
+| `sessionIdleTimeoutMinutes` | Sign out a session idle this long | none |
+| `sessionAbsoluteTimeoutHours` | Hard ceiling on a session's age | 720 (30 days) |
+| `passwordMinLength` | Minimum length (floor 12, may only be raised) | 12 |
+| `passwordRequireComplexity` | Require upper, lower, digit and symbol | off |
+| `passwordHistoryDepth` | Refuse the last N passwords (ceiling 24) | 0 |
+| `passwordMaxAgeDays` | Maximum password age | none |
+| `lockoutMaxAttempts` / `WindowMinutes` / `DurationMinutes` | Account lockout | 5 / 15 / 15 |
+| `ipAllowlistMode` + `ipAllowlist` | `off`, `monitor` (records) or `enforce` (refuses) | off |
+| `ipAllowlistBreakGlassUserIds` | Members exempt from the allowlist | empty |
+| `mfaRequired` | Require a second factor, including for SSO | off |
+
+**Introduce an allowlist in `monitor` first.** It records every sign-in it would have
+refused (`login_blocked_ip`, outcome `pending`) without refusing anything, so you can
+read a week of real traffic before enforcing. The API refuses to enable `enforce` from an
+address the new list would itself refuse.
+
+### 4.7 SCIM 2.0 provisioning (spec #21)
+
+Base URL `https://<your-host>/api/v1/scim/v2`. Authentication is a per-tenant bearer
+token minted at `POST /api/v1/company/scim/tokens` and shown exactly once.
+
+- `Users` supports GET (filter `userName eq "…"`, `active eq true|false`), POST, GET/:id,
+  PUT, PATCH and DELETE.
+- `Groups` are this platform's four **company roles** (`owner`, `admin`, `member`,
+  `guest`). Per-project permission templates are not exposed: SCIM has no concept of a
+  project, so a directory cannot know which projects exist. `ServiceProviderConfig` says
+  so in the discovery document rather than only here.
+- `active: false` (via PUT, PATCH or DELETE) removes the company membership, revokes the
+  sessions opened in that company, and deactivates the account platform-wide when it
+  belongs to no other company.
+- The `owner` role is never removed by a directory: an IdP mapping mistake that removed
+  every owner would leave the tenant with nobody able to fix it.
+
+### 4.8 Security event webhooks
+
+`POST /api/v1/company/security-webhooks` registers a destination for a tenant's
+`auth_security_events`. Deliveries are signed exactly like the integrations webhooks
+(`x-constructos-signature: v1=HMAC-SHA256` over `v1:<timestamp>:<deliveryId>:<body>`), so
+one verifier serves both. Delivery is at-least-once — dedupe on
+`x-constructos-delivery`. Retries back off quadratically to a 30-minute ceiling over five
+attempts; twenty consecutive failures disable the endpoint with a stated reason, because
+a webhook that has been silently failing for a month is worse than one that is visibly
+off. Destinations are re-checked against the SSRF policy on **every** delivery, not only
+at registration, because DNS moves.
 
 ---
 

@@ -14,10 +14,12 @@ import { useParams, useSearchParams } from "react-router-dom";
 import { api } from "../../lib/api";
 import { Badge, ErrorAlert, PageHeader } from "../../ui";
 import AuditsTab from "./AuditsTab";
+import ComplianceTab from "./ComplianceTab";
 import IndicatorsTab from "./IndicatorsTab";
 import RegisterTab from "./RegisterTab";
 import ReconcileTab from "./ReconcileTab";
 import VendorRiskTab from "./VendorRiskTab";
+import VoiceTab from "./VoiceTab";
 import WelfareTab from "./WelfareTab";
 import {
   Stat,
@@ -38,6 +40,8 @@ import {
 const TABS = [
   { key: "register", label: "Worker register" },
   { key: "reconcile", label: "Payroll reconciliation" },
+  { key: "compliance", label: "Hours & wages" },
+  { key: "voice", label: "Worker voice" },
   { key: "indicators", label: "Rights indicators" },
   { key: "vendors", label: "Subcontractor risk" },
   { key: "welfare", label: "Welfare" },
@@ -169,6 +173,8 @@ export default function WorkforcePage() {
         <RegisterTab projectId={projectId} vendors={vendors} onMutate={load} />
       ) : null}
       {tab === "reconcile" ? <ReconcileTab projectId={projectId} onMutate={load} /> : null}
+      {tab === "compliance" ? <ComplianceTab projectId={projectId} /> : null}
+      {tab === "voice" ? <VoiceTab projectId={projectId} /> : null}
       {tab === "indicators" ? (
         <IndicatorsTab projectId={projectId} vendors={vendors} onMutate={load} />
       ) : null}

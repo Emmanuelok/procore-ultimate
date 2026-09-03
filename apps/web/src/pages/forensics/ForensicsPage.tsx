@@ -10,10 +10,14 @@ import { TabBar } from "./forensicsShared";
 import DelayEventsTab from "./DelayEventsTab";
 import AnalysisTab from "./AnalysisTab";
 import ClaimsTab from "./ClaimsTab";
+import MethodsTab from "./MethodsTab";
+import QuantumTab from "./QuantumTab";
 
 const TABS = [
   { key: "events", label: "Delay Events" },
   { key: "analysis", label: "Analysis" },
+  { key: "methods", label: "Method Suite" },
+  { key: "quantum", label: "Quantum & Disruption" },
   { key: "claims", label: "Claims" },
 ];
 
@@ -36,11 +40,13 @@ export default function ForensicsPage() {
     <div>
       <PageHeader
         title="Delay & Disruption Forensics"
-        subtitle="Delay events, time impact analysis, windows attribution and the claims workspace"
+        subtitle="Delay events, the AACE method suite, concurrency and float doctrine, quantum and disruption, and the claims workspace"
       />
       <TabBar tabs={TABS} active={tab} onSelect={selectTab} />
       {tab === "events" ? <DelayEventsTab projectId={projectId} /> : null}
       {tab === "analysis" ? <AnalysisTab projectId={projectId} /> : null}
+      {tab === "methods" ? <MethodsTab projectId={projectId} /> : null}
+      {tab === "quantum" ? <QuantumTab projectId={projectId} /> : null}
       {tab === "claims" ? <ClaimsTab projectId={projectId} /> : null}
     </div>
   );

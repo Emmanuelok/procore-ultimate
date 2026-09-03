@@ -12,7 +12,7 @@
  * carries a dedupe key naming the record and the condition, and every status
  * change is guarded by the status it moves from.
  */
-import { and, asc, count, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
 import {
   assertions,
   evidence,
@@ -248,11 +248,10 @@ export async function ingestGateEvents(
             and(
               eq(siteAccessPasses.companyId, input.companyId),
               eq(siteAccessPasses.projectId, input.projectId),
-              badgeCodes.length > 0 && passIds.length > 0
-                ? sql`(${inArray(siteAccessPasses.badgeCode, badgeCodes)} OR ${inArray(siteAccessPasses.id, passIds)})`
-                : badgeCodes.length > 0
-                  ? inArray(siteAccessPasses.badgeCode, badgeCodes)
-                  : inArray(siteAccessPasses.id, passIds),
+              or(
+                badgeCodes.length > 0 ? inArray(siteAccessPasses.badgeCode, badgeCodes) : undefined,
+                passIds.length > 0 ? inArray(siteAccessPasses.id, passIds) : undefined,
+              ),
             ),
           );
   const byBadge = new Map(passRows.map((p) => [p.badgeCode, p]));
@@ -341,21 +340,35 @@ export async function ingestGateEvents(
   }
 
   if (rows.length > 0) {
-    await db.insert(siteGateEvents).values(rows);
+    // The pre-check above catches a replay inside this batch and most replays
+    // across batches; ON CONFLICT DO NOTHING closes the race between two
+    // readers posting the same device reference at the same moment. Counts are
+    // taken from what actually landed, never from what was offered.
+    const landed = await db
+      .insert(siteGateEvents)
+      .values(rows)
+      .onConflictDoNothing({ target: [siteGateEvents.projectId, siteGateEvents.externalRef] })
+      .returning({ id: siteGateEvents.id, accepted: siteGateEvents.accepted });
+    const landedIds = new Set(landed.map((r) => r.id));
+    result.eventIds = result.eventIds.filter((id) => landedIds.has(id));
+    result.accepted = landed.filter((r) => r.accepted === 1).length;
+    result.refused = landed.length - result.accepted;
+    result.duplicates += rows.length - landed.length;
+    if (landed.length === 0) return result;
     await ledger(db, {
       companyId: input.companyId,
       projectId: input.projectId,
       actorId: input.actorId,
       action: "create",
       objectType: "site_gate_event",
-      objectId: rows[0]!.id,
+      objectId: result.eventIds[0]!,
       payload: {
-        batch: rows.length,
+        batch: landed.length,
         accepted: result.accepted,
         refused: result.refused,
         duplicates: result.duplicates,
-        firstEventId: rows[0]!.id,
-        lastEventId: rows[rows.length - 1]!.id,
+        firstEventId: result.eventIds[0]!,
+        lastEventId: result.eventIds[result.eventIds.length - 1]!,
         day: today,
       },
     });
@@ -443,7 +456,7 @@ export async function reconcileMusterRecord(
   const [updated] = await db
     .update(siteMusters)
     .set({
-      status: reconciliation.clear ? "reconciled" : muster.status === "closed" ? "closed" : "open",
+      status: muster.status === "closed" ? "closed" : reconciliation.clear ? "reconciled" : "open",
       expectedCount: reconciliation.expectedCount,
       accountedCount: reconciliation.accountedCount,
       unaccountedCount: reconciliation.unaccountedCount,
@@ -1356,7 +1369,7 @@ export interface SiteSummary {
     refusedEvents: number;
     reasons: string[];
   };
-  access: { activePasses: number; validInductions: number; expiringPasses: number };
+  access: { activePasses: number; validInductions: number; expiringPasses: number; passesWithoutValidInduction: number };
   permits: { open: number; active: number; expired: number; byType: Record<string, number> };
   entries: { inside: number; overdue: number };
   loneWorkers: { active: number; overdue: number; escalated: number };
@@ -1404,8 +1417,14 @@ export async function siteSummary(
   ] = await Promise.all([
     loadRegister(db, companyId, projectId, asOf),
     db
-      .select({ status: siteAccessPasses.status, validUntil: siteAccessPasses.validUntil })
+      .select({
+        status: siteAccessPasses.status,
+        validUntil: siteAccessPasses.validUntil,
+        inductionId: siteAccessPasses.inductionId,
+        inductionStatus: siteInductions.status,
+      })
       .from(siteAccessPasses)
+      .leftJoin(siteInductions, eq(siteAccessPasses.inductionId, siteInductions.id))
       .where(and(eq(siteAccessPasses.companyId, companyId), eq(siteAccessPasses.projectId, projectId)))
       .limit(LIMIT),
     db
@@ -1543,6 +1562,7 @@ export async function siteSummary(
       activePasses: passRows.filter((p) => p.status === "active").length,
       validInductions: inductionRows.filter((i) => i.status === "valid").length,
       expiringPasses: passRows.filter((p) => p.status === "active" && p.validUntil !== null && p.validUntil <= soon).length,
+      passesWithoutValidInduction: passRows.filter((p) => p.status === "active" && p.inductionStatus !== "valid").length,
     },
     permits: { open: permitsOpen, active: permitsActive, expired: permitsExpired, byType },
     entries: {
@@ -1624,7 +1644,7 @@ export async function siteHealthInputs(
     sitePermitsExpiredOpen: summary.permits.expired,
     siteConfinedSpaceOverdue: summary.entries.overdue,
     siteLoneWorkerEscalated: summary.loneWorkers.escalated,
-    sitePassesWithoutInduction: Math.max(0, summary.access.activePasses - summary.access.validInductions),
+    sitePassesWithoutInduction: summary.access.passesWithoutValidInduction,
     siteOpenGroundFindings: summary.ground.openFindings,
     siteUtilityStrikes: summary.ground.strikes,
     siteEnvironmentalExceedances: summary.environmental.exceedances,

@@ -63,6 +63,21 @@ import { timecardReportRoutes } from "./reports.js";
  *   /projects/:projectId/timecard-batches     (+ /collect, /submit, /approve, /lock, /export)
  *   /projects/:projectId/tm-tickets           (+ /lines, /lines/source, /sign,
  *                                                /submit, /promote)
+ *   /projects/:projectId/labour-productivity  earned hours against actual, by
+ *                                             budget line, crew and week
+ *   /projects/:projectId/timecard-batches/:id/payroll-export   generic CSV,
+ *                                             per-day CSV, WH-347 certified
+ *                                             payroll, or JSON with provenance
+ *   /projects/:projectId/certified-payroll    the WH-347 report, never signed
+ *   /projects/:projectId/labour-cost-report/post-to-budget     hours onto the
+ *                                             cost report (#715)
+ *   /projects/:projectId/timecards/health-inputs
+ *
+ * SCHEDULED JOBS. `timecards.access-links` attaches site-access records that
+ * land after a card did (this used to run as a WRITE on every list read, under
+ * a read-only permission); `timecards.orphan-cards` finds approved hours in no
+ * batch, which is hours somebody worked that no payroll export will ever
+ * reach.
  *
  * `read` sees everything; `standard` raises, codes, submits and approves; and
  * exactly three routes are `admin` — locking a card, locking a batch, and

@@ -381,7 +381,16 @@ export interface BatchRecord {
   doubleTimeHours: number;
   premiumHours: number;
   totalHours: number;
-  totalCost: number;
+  /**
+   * NULL when any card in the week could not be costed. The register used to
+   * render a materialised 0 here while the detail view — which recomputes —
+   * said the cost was unknown; payroll is paid from this figure.
+   */
+  totalCost: number | null;
+  /** cards in the week carrying hours the platform holds no rate for */
+  uncostedCardCount?: number;
+  totalCostIsKnown?: boolean;
+  costNote?: string | null;
   currency: string;
   varianceHours: number | null;
   exceptionCount: number;

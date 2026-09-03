@@ -118,8 +118,11 @@ import {
   signedQuantity,
 } from "./stock.js";
 import {
+  assessFaults,
+  checkGeofence,
   coerceTelematicsRow,
   engineHoursFromCounter,
+  reconcileFuel,
   reconcileTelematics,
   TELEMATICS_DATASET,
   TELEMATICS_FIELDS,
@@ -128,6 +131,7 @@ import {
   telematicsKey,
   type EquipmentReconcileInput,
   type TelematicsDayInput,
+  type TelematicsFault,
 } from "./telematics.js";
 import {
   assessSupplyItem,
@@ -228,6 +232,34 @@ const SWEEP_MIN_INTERVAL_MS = 5 * 60_000;
  * approver or verifier may never be the creator (only an integrity reviewer
  * may knowingly self-verify, and the override is ledgered); every
  * consequential mutation appends to the ledger.
+ *
+ * ---------------------------------------------------------------------------
+ * PLATFORM UPGRADE WAVE
+ *
+ *  • THE COMPANY ROUTES ARE GATED BY THE TOOL, not by company membership.
+ *    `companyToolGate` (gates.ts) asks for `equipment` at the stated level on
+ *    at least one project; before it, a company guest could read the whole
+ *    fleet and the raw telematics feed, and any member could register plant,
+ *    verify certificates and remap devices.
+ *  • THE SWEEP IS A SCHEDULED JOB (`equipment.sweep`), bounded to certificates
+ *    inside the expiry horizon and live schedules, debounced on the read path
+ *    and run as the SYSTEM actor — it used to scan the whole fleet with
+ *    per-row writes and ledger appends on every list and detail GET, under a
+ *    read-only permission.
+ *  • CERTIFICATE COVER IS PER TYPE. The latest validTo per (machine, type)
+ *    decides whether a machine is out of certificate, and adding a renewal
+ *    supersedes the earlier rows automatically. A renewal filed without
+ *    `supersedesId` used to leave in-date plant flagged and raise a critical
+ *    "stop the machine" signal against it.
+ *  • ASSIGNMENTS CAN BE CANCELLED AND TRANSFERRED, and confirming an off-hire
+ *    closes the live assignment; a hire that was approved and never arrived
+ *    used to block the machine from every other project for good.
+ *  • MATERIALS: order-by dates from lead time, shortage forecasts, delayed
+ *    deliveries, supplier scorecards and inventory valuation
+ *    (materials.ts), with `equipment.materials-supply` raising the signals.
+ *  • Delivery receipt validates every line before writing any of them and
+ *    books them in ONE transaction; stock movements take a row lock; company
+ *    catalogue items hold no stock at all.
  */
 export const equipmentModule: FastifyPluginAsync = async (app) => {
   const readGate = [
@@ -8111,6 +8143,140 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     lastSweptAt.set(companyId, Date.now());
     return { swept: true, supplySignalsRaised: supply.raised };
   });
+
+  /* ================================================================ */
+  /* TELEMATICS INTELLIGENCE — geofence, fuel and fault codes           */
+  /* ================================================================ */
+
+  /**
+   * What the machine's own feed says beyond hours: where it was worked, what
+   * it burned against what was put in it, and what it is complaining about.
+   *
+   * Each part refuses rather than guesses. No project location means no fence
+   * and no verdict. A feed that reports no fuel consumption cannot evidence a
+   * loss, however many litres were booked in. A single off-site reading says
+   * where the machine was, not how long it was there.
+   */
+  app.get(
+    "/projects/:projectId/equipment-telematics/intelligence",
+    { preHandler: readGate },
+    async (req) => {
+      const q = z
+        .object({
+          days: z.coerce.number().int().min(1).max(90).default(14),
+          radiusMetres: z.coerce.number().int().min(50).max(200_000).optional(),
+        })
+        .parse(req.query);
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      const to = todayISO();
+      const from = addDaysISO(to, -(q.days - 1));
+
+      const [project] = await app.db
+        .select({ latitude: projects.latitude, longitude: projects.longitude })
+        .from(projects)
+        .where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)))
+        .limit(1);
+      const site =
+        project?.latitude != null && project?.longitude != null
+          ? { latitude: project.latitude, longitude: project.longitude }
+          : null;
+
+      const assigned = await app.db
+        .select({ equipmentId: equipmentAssignments.equipmentId })
+        .from(equipmentAssignments)
+        .where(
+          and(
+            eq(equipmentAssignments.companyId, companyId),
+            eq(equipmentAssignments.projectId, projectId),
+            inArray(equipmentAssignments.status, [...IN_SERVICE_ASSIGNMENT_STATUSES]),
+          ),
+        );
+      const machineIds = [...new Set(assigned.map((a) => a.equipmentId))];
+      if (machineIds.length === 0) {
+        return {
+          from,
+          to,
+          machines: [],
+          reasons: ["no plant is assigned to this project, so there is no feed to read"],
+        };
+      }
+      const fleet = await app.db
+        .select()
+        .from(equipment)
+        .where(and(eq(equipment.companyId, companyId), inArray(equipment.id, machineIds)));
+      const readings = await app.db
+        .select()
+        .from(equipmentTelematicsReadings)
+        .where(
+          and(
+            eq(equipmentTelematicsReadings.companyId, companyId),
+            inArray(equipmentTelematicsReadings.equipmentId, machineIds),
+            gte(equipmentTelematicsReadings.recordedAt, `${from}T00:00:00.000Z`),
+            lte(equipmentTelematicsReadings.recordedAt, `${to}T23:59:59.999Z`),
+          ),
+        );
+      const fuelFills = await app.db
+        .select()
+        .from(equipmentReadings)
+        .where(
+          and(
+            eq(equipmentReadings.companyId, companyId),
+            inArray(equipmentReadings.equipmentId, machineIds),
+            eq(equipmentReadings.readingType, "fuel_fill"),
+            gte(equipmentReadings.readAt, `${from}T00:00:00.000Z`),
+            lte(equipmentReadings.readAt, `${to}T23:59:59.999Z`),
+          ),
+        );
+
+      const machines = fleet.map((machine) => {
+        const own = readings.filter((r) => r.equipmentId === machine.id);
+        const geofence = checkGeofence({
+          site,
+          ...(q.radiusMetres != null ? { radiusMetres: q.radiusMetres } : {}),
+          readings: own
+            .filter((r) => r.latitude !== null && r.longitude !== null)
+            .map((r) => ({
+              latitude: r.latitude as number,
+              longitude: r.longitude as number,
+              recordedAt: r.recordedAt,
+              engineRunning: r.engineRunning,
+            })),
+        });
+        const fuel = reconcileFuel({
+          telematicsFuelUsedLitres: own.map((r) => r.fuelUsedLitres),
+          fills: fuelFills
+            .filter((f) => f.equipmentId === machine.id && (f.value ?? 0) > 0)
+            .map((f) => ({ litres: f.value as number, at: f.readAt })),
+        });
+        const faults = assessFaults(
+          own.flatMap((r) => (r.faultCodes as TelematicsFault[] | null) ?? []),
+        );
+        return {
+          equipmentId: machine.id,
+          reference: machine.reference,
+          name: machine.name,
+          readings: own.length,
+          geofence,
+          fuel,
+          faults,
+        };
+      });
+
+      return {
+        from,
+        to,
+        site,
+        machines,
+        reasons: site
+          ? []
+          : [
+              "this project records no location, so no machine can be tested against a site " +
+                "boundary. Set the project's coordinates to make off-site use detectable.",
+            ],
+      };
+    },
+  );
 
   /* ================================================================ */
   /* SCHEDULED JOBS (plan §6.1)                                        */

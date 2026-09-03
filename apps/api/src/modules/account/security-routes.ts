@@ -455,6 +455,14 @@ export function registerSecurityRoutes(app: FastifyInstance): void {
 
   /* ================================================================ */
   /* Administering a member's access                                   */
+  /*                                                                   */
+  /* NAMESPACED UNDER /company/security/ deliberately. The directory    */
+  /* module owns /company/users/* (list, invite, role, remove, and its  */
+  /* own sessions/revoke); duplicating that prefix is how two modules   */
+  /* end up declaring the same route and Fastify refuses to boot. These */
+  /* are the SECURITY actions on a member — deactivate, cut every       */
+  /* session, clear a lost second factor — and they live under the      */
+  /* surface an administrator opens to do exactly that.                 */
   /* ================================================================ */
 
   /** Load a member of THIS company, or 404. Never leaks that a user exists. */
@@ -491,7 +499,7 @@ export function registerSecurityRoutes(app: FastifyInstance): void {
     }
   }
 
-  app.post("/company/users/:userId/deactivate", { preHandler: companyAdmin }, async (req) => {
+  app.post("/company/security/users/:userId/deactivate", { preHandler: companyAdmin }, async (req) => {
     const companyId = req.companyId!;
     const { userId } = req.params as { userId: string };
     const target = await loadMember(companyId, userId);
@@ -531,7 +539,7 @@ export function registerSecurityRoutes(app: FastifyInstance): void {
     return { ok: true, userId: target.id, isActive: false, sessionsRevoked: revoked };
   });
 
-  app.post("/company/users/:userId/reactivate", { preHandler: companyAdmin }, async (req) => {
+  app.post("/company/security/users/:userId/reactivate", { preHandler: companyAdmin }, async (req) => {
     const companyId = req.companyId!;
     const { userId } = req.params as { userId: string };
     const target = await loadMember(companyId, userId);
@@ -567,7 +575,7 @@ export function registerSecurityRoutes(app: FastifyInstance): void {
    * Cut a member off without deactivating them — the "their laptop was stolen"
    * action, distinct from "they left".
    */
-  app.post("/company/users/:userId/sessions/revoke", { preHandler: companyAdmin }, async (req) => {
+  app.post("/company/security/users/:userId/sessions/revoke", { preHandler: companyAdmin }, async (req) => {
     const companyId = req.companyId!;
     const { userId } = req.params as { userId: string };
     const scope = z
@@ -624,7 +632,7 @@ export function registerSecurityRoutes(app: FastifyInstance): void {
    * tenant policy says at the next sign-in — if MFA is required, the login
    * route issues an `enrol` challenge, so this is a re-enrolment, not a hole.
    */
-  app.post("/company/users/:userId/mfa/reset", { preHandler: companyAdmin }, async (req) => {
+  app.post("/company/security/users/:userId/mfa/reset", { preHandler: companyAdmin }, async (req) => {
     const companyId = req.companyId!;
     const { userId } = req.params as { userId: string };
     const target = await loadMember(companyId, userId);

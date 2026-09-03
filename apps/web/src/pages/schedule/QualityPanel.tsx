@@ -17,6 +17,12 @@ const CHECK_LABELS: Record<string, string> = {
   negativeFloat: "Negative float",
   highDuration: "High duration",
   invalidProgress: "Invalid progress",
+  invalidDates: "Invalid dates vs data date",
+  resources: "Resource loading",
+  missedTasks: "Missed tasks",
+  criticalPathTest: "Critical path test",
+  cpli: "Critical path length index",
+  bei: "Baseline execution index",
 };
 
 function labelForKey(key: string): string {
@@ -102,7 +108,11 @@ export default function QualityPanel({
     return `${p} → ${s} (${d.depType}${d.lagDays ? `${d.lagDays > 0 ? "+" : ""}${d.lagDays}` : ""})`;
   };
 
-  const checks = Object.entries(report.checks ?? {});
+  const allChecks = Object.entries(report.checks ?? {});
+  // A check that could not run is neither a pass nor a fail: it is reported
+  // separately so the score is never computed over checks that never ran.
+  const checks = allChecks.filter(([, c]) => c.applicable !== false);
+  const skipped = allChecks.filter(([, c]) => c.applicable === false);
   const passed = report.passed ?? checks.filter(([, c]) => c.pass).length;
   const total = report.total ?? checks.length;
 
@@ -124,6 +134,8 @@ export default function QualityPanel({
                   · {Math.round(report.criticalPercent * 100)}% of tasks on the critical path
                 </>
               ) : null}
+              {report.dataDate ? <> · data date {report.dataDate}</> : null}
+              {report.baselineName ? <> · baseline “{report.baselineName}”</> : null}
             </div>
             <div className="text-xs text-ink-400">
               A defensible programme is the substrate for delay forensics — fix the failing
@@ -151,11 +163,20 @@ export default function QualityPanel({
                     <div className="text-xs text-ink-400">{c.threshold}</div>
                   ) : null}
                   <div className="text-xs text-ink-600">
+                    {c.value !== undefined && c.value !== null ? (
+                      <>
+                        {labelForKey(key).toLowerCase().includes("index")
+                          ? c.value
+                          : `${c.value}`}
+                        {c.count > 0 ? " · " : null}
+                      </>
+                    ) : null}
                     {c.count} offender{c.count === 1 ? "" : "s"}
                     {c.ratio !== undefined && c.ratio !== null ? (
                       <> · {Math.round(c.ratio * 1000) / 10}%</>
                     ) : null}
                   </div>
+                  {c.basis ? <div className="text-[11px] text-ink-400">{c.basis}</div> : null}
                   {shown.length > 0 ? (
                     <div className="flex flex-wrap gap-1">
                       {shown.map((id) =>
@@ -192,6 +213,28 @@ export default function QualityPanel({
           })}
         </div>
       )}
+
+      {skipped.length > 0 ? (
+        <Card>
+          <CardBody className="space-y-2 py-3">
+            <div className="text-sm font-medium text-ink-900">
+              {skipped.length} check{skipped.length === 1 ? "" : "s"} could not run
+            </div>
+            <div className="text-xs text-ink-400">
+              These are excluded from the score rather than counted as failures — a score over
+              checks that never ran would misdescribe the programme.
+            </div>
+            <ul className="space-y-1">
+              {skipped.map(([key, c]) => (
+                <li key={key} className="text-xs text-ink-600">
+                  <span className="font-medium text-ink-800">{labelForKey(key)}</span>
+                  {c.basis ? <> — {c.basis}</> : null}
+                </li>
+              ))}
+            </ul>
+          </CardBody>
+        </Card>
+      ) : null}
     </div>
   );
 }

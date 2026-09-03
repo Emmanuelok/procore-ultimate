@@ -565,7 +565,17 @@ export const timecardRoutes: FastifyPluginAsync = async (app) => {
       assertSameCurrency(
         [
           { label: batch.reference, currency: batch.currency },
-          { label: "this card", currency: (body.currency ?? worker.currency ?? "USD").toUpperCase() },
+          {
+            label: "this card",
+            // The same precedence resolveRates uses, so the check and the
+            // stored currency can never disagree.
+            currency: (
+              body.currency ??
+              member?.currency ??
+              worker.currency ??
+              "USD"
+            ).toUpperCase(),
+          },
         ],
         `Adding a card to batch ${batch.reference}`,
       );

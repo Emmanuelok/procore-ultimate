@@ -402,7 +402,7 @@ export const matrixRoutes: FastifyPluginAsync = async (app) => {
     const to = q.to ?? addDays(from, 90);
     if (to < from) throw badRequest("`to` must not precede `from`");
 
-    const gaps = await computeSkillGaps(app.db, companyId, projectId, from, to);
+    const gaps = await computeSkillGaps(app.db, companyId, projectId, from, to, todayIso());
     return {
       window: { from, to },
       total: gaps.gaps.length,
@@ -534,6 +534,10 @@ export async function computeSkillGaps(
   projectId: string,
   from: string,
   to: string,
+  /** The date validity is judged as at — today, not the window start. A
+   *  window that begins in the past must not make a lapsed ticket look
+   *  current. */
+  today: string,
 ) {
   const bookings = await db
     .select({
@@ -633,7 +637,7 @@ export async function computeSkillGaps(
     workerBookings,
     skillRows.map(toSkillDefinition),
     cellRows.map(toCell),
-    { today: from },
+    { today },
   );
   return { gaps, workersConsidered: workerIds.length, reasons };
 }

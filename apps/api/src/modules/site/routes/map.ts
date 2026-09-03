@@ -12,7 +12,7 @@
  * a reason — never an arbitrary centre point.
  */
 import type { FastifyPluginAsync } from "fastify";
-import { and, count, desc, eq, gte, inArray, isNotNull } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull } from "drizzle-orm";
 import { z } from "zod";
 import {
   projects,

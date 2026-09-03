@@ -315,6 +315,37 @@ const RECONCILIATION_DETECTORS = ["ghost_worker", "payroll_overclaim", "wage_und
  * finding lands in the same signals/obligations spine the rest of the platform
  * uses, so a lender or auditor reads worker harm on the same page as money.
  */
+/**
+ * WORKFORCE RIGHTS & WELFARE (M17) — tool key `workforce`.
+ *
+ * Added in the platform upgrade wave, on top of the register, the
+ * ghost-worker reconciliation and the welfare/audit programme:
+ *
+ *  • WORKER VOICE (#689-691). `POST /worker-voice/reports` is UNAUTHENTICATED
+ *    on purpose: a grievance channel that needs the employer's account or the
+ *    employer's device is a channel the employer controls. The credential is a
+ *    token printed on a worker card, stored only as a sha256, and the reporter
+ *    keeps a tracking code whose hash is all we hold. An unanswered report is
+ *    escalated and signalled — an unanswered grievance register is worse than
+ *    no channel, because it evidences that workers raised something and
+ *    nobody answered.
+ *
+ *  • WAGE AND WORKING-TIME COMPLIANCE (#678-682). A code-resident jurisdiction
+ *    library (timecards/jurisdictions.ts) with a citation on every limit, run
+ *    over timecards where they exist and site access where they do not.
+ *    Findings raise a signal keyed (detector, worker, period) and a labour
+ *    risk flag against the EMPLOYER, which is what the vendor score reads.
+ *
+ *  • THE THREE-WAY LABOUR POSITION. Timecards (what the site approved),
+ *    payroll (what the employer says was paid) and site access (what the
+ *    turnstile recorded) set against each other, with a missing leg reported
+ *    as missing rather than as zero.
+ *
+ * PAYROLL INGEST IS IDEMPOTENT. `(workerId, periodStart, periodEnd,
+ * sourceRef)` is unique and the same run replaces itself: a file posted twice
+ * used to double every worker's claimed days and turn honest people into
+ * named "overclaims" with high-severity signals against them.
+ */
 export const workforceModule: FastifyPluginAsync = async (app) => {
   const readGate = [app.authenticate, app.requireCompany, app.requireTool("workforce", "read")];
   const standardGate = [
@@ -2484,7 +2515,7 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
     };
   });
 
-  app.get("/projects/:projectId/grievances", { preHandler: readGate }, async (req) => {
+  app.get("/projects/:projectId/worker-grievances", { preHandler: readGate }, async (req) => {
     const q = pageQuerySchema
       .extend({
         status: z.enum(WORKER_GRIEVANCE_STATUSES).optional(),
@@ -2534,7 +2565,7 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
   });
 
   app.post(
-    "/projects/:projectId/grievances/:grievanceId/updates",
+    "/projects/:projectId/worker-grievances/:grievanceId/updates",
     { preHandler: standardGate },
     async (req, reply) => {
       const { grievanceId } = req.params as { grievanceId: string };
@@ -2667,7 +2698,7 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
   }
 
   app.post(
-    "/projects/:projectId/grievances/sweep",
+    "/projects/:projectId/worker-grievances/sweep",
     { preHandler: standardGate },
     async (req) => sweepGrievanceSla(req.companyId!),
   );

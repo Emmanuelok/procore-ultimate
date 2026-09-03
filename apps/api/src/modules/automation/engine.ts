@@ -622,8 +622,13 @@ export class AutomationEngine {
     return final!;
   }
 
-  /** Execute every due queued run, oldest first, up to the batch size. */
-  async drain(limit = this.options.drainBatch): Promise<DrainSummary> {
+  /**
+   * Execute every due queued run, oldest first, up to the batch size. The
+   * scheduler job drains the whole platform; a tenant-facing caller (the
+   * manual cycle route) MUST pass its own companyId so one company can never
+   * drive — or count — another company's runs.
+   */
+  async drain(limit = this.options.drainBatch, companyId?: string): Promise<DrainSummary> {
     const summary: DrainSummary = { executed: 0, succeeded: 0, failed: 0, skipped: 0, deferred: 0, throttled: 0 };
     if (this.draining) return summary;
     this.draining = true;
@@ -632,7 +637,13 @@ export class AutomationEngine {
       const due = await this.db
         .select({ id: automationRuns.id })
         .from(automationRuns)
-        .where(and(eq(automationRuns.status, "queued"), lte(automationRuns.queuedAt, nowIso)))
+        .where(
+          and(
+            eq(automationRuns.status, "queued"),
+            lte(automationRuns.queuedAt, nowIso),
+            companyId ? eq(automationRuns.companyId, companyId) : undefined,
+          ),
+        )
         .orderBy(asc(automationRuns.queuedAt), asc(automationRuns.id))
         .limit(limit);
       for (const { id } of due) {

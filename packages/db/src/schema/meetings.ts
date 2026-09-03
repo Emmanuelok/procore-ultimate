@@ -127,6 +127,25 @@ export const meetings = pgTable(
     /** the minutes themselves, as authored in the platform */
     minutesBody: text("minutes_body"),
     minutesFileId: text("minutes_file_id"),
+    /**
+     * The rendered minutes document is content-addressed: the hash is what
+     * makes "these are the minutes that were issued" checkable a year later,
+     * when the body text in the database has been corrected twice.
+     */
+    minutesSha256: text("minutes_sha256"),
+    minutesRenderedAt: timestamp("minutes_rendered_at", { withTimezone: true, mode: "string" }),
+    /** incremented on every re-issue after a correction (see meetings module) */
+    minutesVersion: integer("minutes_version").default(0).notNull(),
+    /**
+     * Earliest recorded DELIVERY of the issued minutes. The objection period
+     * runs from here when it is known: issuing is an act of the sender,
+     * delivery is a fact about the recipient, and only the second can start a
+     * clock that binds them.
+     */
+    minutesDeliveredAt: timestamp("minutes_delivered_at", { withTimezone: true, mode: "string" }),
+    /** the agenda pack rendered before the meeting, same renderer */
+    agendaPackFileId: text("agenda_pack_file_id"),
+    agendaPackSha256: text("agenda_pack_sha256"),
     minutesIssuedAt: timestamp("minutes_issued_at", { withTimezone: true, mode: "string" }),
     minutesIssuedBy: text("minutes_issued_by"),
     /** days after issue within which objections must be raised */
@@ -157,6 +176,7 @@ export const meetings = pgTable(
     index("meetings_project_idx").on(t.projectId, t.status),
     index("meetings_series_idx").on(t.seriesId, t.occurrenceNumber),
     index("meetings_scheduled_idx").on(t.projectId, t.scheduledStart),
+    index("meetings_company_status_idx").on(t.companyId, t.status),
   ],
 );
 
@@ -389,5 +409,99 @@ export const meetingActionItems = pgTable(
     index("meeting_action_items_owner_idx").on(t.ownerId, t.status),
     index("meeting_action_items_due_idx").on(t.projectId, t.status, t.dueDate),
     index("meeting_action_items_obligation_idx").on(t.obligationId),
+    /*
+     * The company-wide overdue sweep and `GET /meeting-action-items/overdue`
+     * filter on (company_id, status, due_date) and had no index that started
+     * with company_id — every call was a sequential scan of the tenant's whole
+     * action table. Now the scheduler runs the sweep, but the company reports
+     * still ask the same question.
+     */
+    index("meeting_action_items_company_due_idx").on(t.companyId, t.status, t.dueDate),
+  ],
+);
+
+/**
+ * A COMPANY-LEVEL standing agenda library (#416). A progress meeting's agenda
+ * is an organisational standard, not a per-series invention: the same eight
+ * headings appear on every job, and typing them again per series is how the
+ * eighth ("safety moment") quietly stops appearing.
+ *
+ * A template is applied to a series (copied into `meeting_series.agenda_template`)
+ * or straight onto one occurrence. Copying rather than referencing is
+ * deliberate: minutes must not change retroactively because someone edited
+ * the library afterwards.
+ */
+export const meetingAgendaTemplates = pgTable(
+  "meeting_agenda_templates",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    /** null = available to every project in the company */
+    projectId: text("project_id"),
+    name: text("name").notNull(),
+    description: text("description"),
+    /** the meeting type this library entry is the standard for */
+    meetingType: text("meeting_type").default("progress").notNull(),
+    /** [{ title, category, position, allocatedMinutes, itemNumber }] */
+    items: jsonb("items").$type<unknown[]>().default([]).notNull(),
+    /** standing invitees to seed a series with: same shape as defaultAttendees */
+    defaultAttendees: jsonb("default_attendees").$type<unknown[]>().default([]).notNull(),
+    /** the contractual requirement this standard discharges, e.g. "NEC4 cl.31" */
+    contractRequirement: text("contract_requirement"),
+    isDefault: integer("is_default").default(0).notNull(),
+    status: text("status").default("active").notNull(),
+    usageCount: integer("usage_count").default(0).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("meeting_agenda_templates_company_idx").on(t.companyId, t.status),
+    index("meeting_agenda_templates_type_idx").on(t.companyId, t.meetingType),
+  ],
+);
+
+/**
+ * WHO ACTUALLY RECEIVED THE MINUTES (#422, #425).
+ *
+ * Deemed acceptance is the sharpest thing in this module: after the objection
+ * period, silence becomes agreement. A clock that starts when the sender
+ * clicks "issue" is therefore indefensible — the recipient may never have got
+ * the document. One row per recipient per issue, with the channel, the
+ * address, the delivery result and the hash of the document that was sent, is
+ * what makes the deeming survive challenge.
+ */
+export const meetingMinuteDeliveries = pgTable(
+  "meeting_minute_deliveries",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    meetingId: text("meeting_id").notNull(),
+    /** which issue of the minutes this delivery belongs to */
+    minutesVersion: integer("minutes_version").default(1).notNull(),
+    userId: text("user_id"),
+    contactId: text("contact_id"),
+    attendeeId: text("attendee_id"),
+    recipientName: text("recipient_name").notNull(),
+    email: text("email"),
+    channel: text("channel").default("platform").notNull(), // MinuteDeliveryChannel
+    status: text("status").default("pending").notNull(), // MinuteDeliveryStatus
+    deliveredAt: timestamp("delivered_at", { withTimezone: true, mode: "string" }),
+    acknowledgedAt: timestamp("acknowledged_at", { withTimezone: true, mode: "string" }),
+    failureReason: text("failure_reason"),
+    /** the document actually sent, so a later dispute compares hashes */
+    documentSha256: text("document_sha256"),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    index("meeting_minute_deliveries_meeting_idx").on(t.meetingId, t.minutesVersion),
+    index("meeting_minute_deliveries_company_idx").on(t.companyId),
+    uniqueIndex("meeting_minute_deliveries_uq").on(
+      t.meetingId,
+      t.minutesVersion,
+      t.recipientName,
+      t.channel,
+    ),
   ],
 );

@@ -1131,7 +1131,8 @@ export const tmTicketRoutes: FastifyPluginAsync = async (app) => {
 
       let pcoId: string | null = null;
       let pcoReference: string | null = null;
-      if (body.target === "potential_change_order" && !pcoUnpriced) {
+      const pcoEstimate = totals.total.value;
+      if (body.target === "potential_change_order" && pcoEstimate !== null) {
         if (body.vendorId) await requireVendor(app.db, body.vendorId, companyId);
         const number = await nextRecordNumber(app.db, projectId, "potential_change_order");
         pcoId = newId("pco");
@@ -1151,7 +1152,7 @@ export const tmTicketRoutes: FastifyPluginAsync = async (app) => {
           scope: "additive",
           commitmentId: body.commitmentId ?? ticket.commitmentId ?? null,
           vendorId,
-          estimatedAmount: totals.total.value,
+          estimatedAmount: pcoEstimate,
           quotedAmount: 0,
           amount: 0,
           scheduleImpactDays: 0,

@@ -210,6 +210,34 @@ describe("the gate feed", () => {
     expect(stored.json().items[0].passId).toBe(passId);
   });
 
+  it("counts only the reads that actually landed when a batch is partly replayed", async () => {
+    // A person of their own so the presence assertions below stay exact.
+    const induction = await post(`/projects/${projectId}/site/inductions`, { personName: "Ivy Shaw" });
+    await post(`/projects/${projectId}/site/passes`, {
+      inductionId: induction.json().id,
+      personName: "Ivy Shaw",
+      badgeCode: "B-4004",
+      validFrom: "2026-01-01",
+    });
+    const first = await post(`/projects/${projectId}/site/gate-events`, {
+      badgeCode: "B-4004",
+      direction: "in",
+      occurredAt: T("06:00"),
+      externalRef: "dev2-1",
+    });
+    expect(first.json().accepted).toBe(1);
+
+    const second = await post(`/projects/${projectId}/site/gate-events`, {
+      events: [
+        { badgeCode: "B-4004", direction: "in", occurredAt: T("06:00"), externalRef: "dev2-1" },
+        { badgeCode: "B-4004", direction: "out", occurredAt: T("14:00"), externalRef: "dev2-2" },
+      ],
+    });
+    expect(second.json().accepted).toBe(1);
+    expect(second.json().duplicates).toBe(1);
+    expect(second.json().eventIds).toHaveLength(1);
+  });
+
   it("ignores a replayed batch rather than doubling the headcount", async () => {
     const res = await post(`/projects/${projectId}/site/gate-events`, {
       events: [{ badgeCode: "B-1001", direction: "in", occurredAt: T("07:00"), externalRef: "dev1-1" }],
@@ -260,8 +288,8 @@ describe("the on-site register", () => {
 
   it("folds the feed as at a moment in time", async () => {
     const midday = await get(`/projects/${projectId}/site/register?asOf=${encodeURIComponent(T("12:00"))}`);
-    expect(midday.json().headcount).toBe(1);
-    expect(midday.json().onSite[0].personName).toBe("Ada Mason");
+    expect(midday.json().headcount).toBe(2);
+    expect(midday.json().onSite.map((p: { personName: string }) => p.personName)).toEqual(["Ada Mason", "Ivy Shaw"]);
     const evening = await get(`/projects/${projectId}/site/register?asOf=${encodeURIComponent(T("18:00"))}`);
     expect(evening.json().headcount).toBe(0);
     expect(evening.json().refusedEvents).toBeGreaterThan(0);
@@ -272,6 +300,8 @@ describe("the on-site register", () => {
     expect(res.statusCode).toBe(200);
     const ada = res.json().items.find((r: { personName: string }) => r.personName === "Ada Mason");
     expect(ada.hours).toBe(9);
+    const ivy = res.json().items.find((r: { personName: string }) => r.personName === "Ivy Shaw");
+    expect(ivy.hours).toBe(8);
   });
 
   it("refuses a presence window longer than a quarter", async () => {
@@ -353,11 +383,14 @@ describe("musters", () => {
     expect(res.json().reconciliation.accountedCount).toBe(1);
   });
 
-  it("closes once the muster is clear", async () => {
+  it("closes once the muster is clear, and a closed muster stays closed", async () => {
     const res = await post(`/projects/${projectId}/site/musters/${musterId}/close`, {});
     expect(res.statusCode).toBe(200);
     expect(res.json().status).toBe("closed");
     expect((await post(`/projects/${projectId}/site/musters/${musterId}/checkins`, { checkins: [{ personName: "Late", status: "present" }] })).statusCode).toBe(409);
+    // Re-running the reconciliation must not reopen a closed record.
+    const again = await post(`/projects/${projectId}/site/musters/${musterId}/reconcile`, {});
+    expect(again.json().muster.status).toBe("closed");
   });
 });
 

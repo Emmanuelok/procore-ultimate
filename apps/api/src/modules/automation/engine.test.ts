@@ -581,7 +581,20 @@ describe("executors", () => {
     expect(call2.headers["x-constructos-signature"]).toBe(signWebhookBody("per-endpoint-secret", Number(call2.headers["x-constructos-timestamp"]), "arun_test", call2.body));
     expect((JSON.parse(call2.body) as { record?: unknown }).record).toBeUndefined();
 
-    for (const bad of ["http://localhost:3000/x", "http://127.0.0.1/x", "http://10.0.0.5/x", "http://192.168.1.1/x", "http://169.254.169.254/latest", "ftp://x.example/y"]) {
+    for (const bad of [
+      "http://localhost:3000/x",
+      "http://127.0.0.1/x",
+      "http://10.0.0.5/x",
+      "http://192.168.1.1/x",
+      "http://169.254.169.254/latest",
+      "ftp://x.example/y",
+      // IPv6 literals, including the v4-mapped form the URL parser rewrites
+      // to "[::ffff:7f00:1]" — it still reaches loopback.
+      "http://[::1]:3000/x",
+      "http://[::ffff:127.0.0.1]:3000/x",
+      "http://[::ffff:169.254.169.254]/latest",
+      "http://[fd00::1]/x",
+    ]) {
       const r = await executeAction(deps, facts, ctx, "webhook", { url: bad });
       expect(r.outcome, bad).toBe("failed");
     }
@@ -635,8 +648,8 @@ describe("executors", () => {
     const groupId = newId("dg");
     await t.app.db.insert(distributionGroups).values({ id: groupId, companyId: owner.companyId, projectId: null, name: "Site team" });
     await t.app.db.insert(distributionGroupMembers).values([
-      { id: newId("dgm"), groupId, userId: member.userId },
-      { id: newId("dgm"), groupId, userId: outsider.userId },
+      { id: newId("dgm"), groupId, userId: member.userId, memberKey: `u:${member.userId}` },
+      { id: newId("dgm"), groupId, userId: outsider.userId, memberKey: `u:${outsider.userId}` },
     ]);
     const r = await resolveRecipients(t.app.db, facts, ctx, [
       { kind: "users", userIds: [outsider.userId] },

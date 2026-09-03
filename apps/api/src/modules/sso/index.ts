@@ -43,6 +43,8 @@ import {
   authSessions,
   companyMemberships,
   identityProviders,
+  projectMemberships,
+  projects,
   refreshTokens,
   userIdentities,
   users,
@@ -106,7 +108,16 @@ import {
   secretFingerprint,
   timingSafeEqualString,
 } from "./secrets.js";
-import { getStateStore, randomToken, type SsoFlowRecord } from "./state.js";
+import { getStateStore, randomToken, setStateStore, type SsoFlowRecord } from "./state.js";
+import { createPostgresSsoStateStore, PostgresSsoStateStore } from "./state-pg.js";
+// The tenant MFA policy applies to SSO sign-ins too — see `mfaGate`. Imported
+// from the MFA module's service (not its plugin), so there is no cycle.
+import { activeFactor, companiesRequiringMfa } from "../mfa/service.js";
+import {
+  challengeEnvelope,
+  mintChallengeToken,
+  type ChallengeScope,
+} from "../mfa/challenge.js";
 
 type ProviderRow = typeof identityProviders.$inferSelect;
 
@@ -238,6 +249,25 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
   // the database handle before the first call. Registering the real one only
   // when nothing is registered means a test's client is never clobbered by a
   // second app boot sharing the handle.
+  /*
+   * DURABLE SIGN-IN STATE (see state-pg.ts).
+   *
+   * The in-memory store is fine for one process and wrong for two: the
+   * callback from the identity provider lands on whichever replica the edge
+   * picks, so with N replicas roughly (N-1)/N of all SSO sign-ins failed with
+   * "this sign-in link is not valid any more" — a deployment fault that reads
+   * to the user as a security refusal. The Postgres-backed store keeps the
+   * same single-use, hash-keyed, lazily-swept semantics and adds the one thing
+   * the memory map could not have: another replica can answer.
+   *
+   * Registered only when there IS a shared database. Under embedded PGlite
+   * there is exactly one process, the memory store is correct, and writing
+   * rows for it would be ceremony.
+   */
+  if (config.DATABASE_URL) {
+    setStateStore(app.db, createPostgresSsoStateStore(app.db));
+  }
+
   if (!getSsoHttpClient(app.db)) {
     registerSsoHttpClient(app.db, createFetchSsoClient());
   }
@@ -444,6 +474,9 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
       defaultTemplateKey: row.defaultTemplateKey,
       groupClaimName: row.groupClaimName,
       groupRoleMappings: row.groupRoleMappings,
+      provisionProjectIds: row.provisionProjectIds,
+      idpPerformsMfa: row.idpPerformsMfa,
+      mfaAmrValues: row.mfaAmrValues,
       allowPasswordLogin: row.allowPasswordLogin,
       isEnabled: row.isEnabled,
       disabledReason: row.disabledReason,
@@ -539,6 +572,8 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
     identityId: string;
     providerId: string;
     req: FastifyRequest;
+    /** true when the IdP itself performed a second factor this platform accepts */
+    mfaSatisfied?: boolean;
   }) {
     const refreshToken = newId("rt") + newId();
     const refreshTokenId = newId("rtk");
@@ -569,6 +604,11 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
       identityId: options.identityId,
       providerId: options.providerId,
       authMethod: "sso",
+      // `mfa_satisfied_at` sits on the SESSION. An SSO sign-in only sets it
+      // when the connection is configured to perform MFA and the assertion
+      // proved it — otherwise the tenant's own MFA policy applies, exactly as
+      // it does to a password sign-in.
+      mfaSatisfiedAt: options.mfaSatisfied ? new Date(nowMs).toISOString() : null,
       userAgent,
       ip: options.req.ip,
       deviceLabel: deviceLabelFor(userAgent),
@@ -790,6 +830,29 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
     if (body.defaultTemplateKey !== undefined) patch.defaultTemplateKey = body.defaultTemplateKey;
     if (body.groupClaimName !== undefined) patch.groupClaimName = body.groupClaimName;
     if (body.groupRoleMappings !== undefined) patch.groupRoleMappings = body.groupRoleMappings;
+    if (body.provisionProjectIds !== undefined) {
+      // Every id must be a project of THIS company, or the connection would
+      // hand out access to somebody else's project on the next sign-in.
+      const owned = await app.db
+        .select({ id: projects.id })
+        .from(projects)
+        .where(
+          and(
+            eq(projects.companyId, req.companyId!),
+            inArray(projects.id, body.provisionProjectIds.length > 0 ? body.provisionProjectIds : [""]),
+          ),
+        );
+      const known = new Set(owned.map((p) => p.id));
+      const strangers = body.provisionProjectIds.filter((id) => !known.has(id));
+      if (strangers.length > 0) {
+        throw badRequest("provisionProjectIds must name projects in this company.", {
+          reasons: strangers.map((id) => `${id} is not a project of this company.`),
+        });
+      }
+      patch.provisionProjectIds = body.provisionProjectIds;
+    }
+    if (body.idpPerformsMfa !== undefined) patch.idpPerformsMfa = body.idpPerformsMfa;
+    if (body.mfaAmrValues !== undefined) patch.mfaAmrValues = body.mfaAmrValues;
 
     await app.db.update(identityProviders).set(patch).where(eq(identityProviders.id, row.id));
     const updated = await loadCompanyProvider(row.id, req.companyId!);
@@ -1271,6 +1334,11 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
       );
     }
     const store = getStateStore(app.db);
+    // Pull the row in when this replica did not issue it. A no-op for the
+    // memory store and for a flow this process already holds.
+    if (store instanceof PostgresSsoStateStore) {
+      await store.prefetch("flow", query.state, Date.now());
+    }
     const flow = store.consumeFlow(query.state, Date.now());
     if (!flow) {
       // Single-use, and spent whether it was used or merely expired. A replayed
@@ -1409,7 +1477,11 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
   /** Swap the single-use ticket from a redirect-mode callback for the session. */
   app.post("/auth/sso/ticket", authLimited, async (req) => {
     const body = z.object({ ticket: z.string().min(10).max(256) }).parse(req.body);
-    const record = getStateStore(app.db).consumeTicket(body.ticket, Date.now());
+    const store = getStateStore(app.db);
+    if (store instanceof PostgresSsoStateStore) {
+      await store.prefetch("ticket", body.ticket, Date.now());
+    }
+    const record = store.consumeTicket(body.ticket, Date.now());
     if (!record) {
       throw badRequest(
         "This sign-in ticket is not valid any more. Tickets are single-use and expire in two " +
@@ -1640,6 +1712,7 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
       .where(eq(users.email, asserted.email))
       .limit(1);
     const existingUser = found[0];
+    let provisionedProjects: string[] = [];
 
     if (existingUser) {
       if (!existingUser.isActive) {
@@ -1688,6 +1761,11 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
           role: resolved.companyRole,
         });
         role = resolved.companyRole;
+        provisionedProjects = await applyProvisionedProjectAccess(
+          provider,
+          existingUser.id,
+          resolved.templateKey ?? provider.defaultTemplateKey,
+        );
         await appendLedger(app.db, {
           companyId: provider.companyId,
           actorId: existingUser.id,
@@ -1698,6 +1776,8 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
             via: "sso",
             providerId: provider.id,
             role: resolved.companyRole,
+            templateKey: resolved.templateKey ?? provider.defaultTemplateKey,
+            projects: provisionedProjects,
             matchedClaimValue: resolved.matchedClaimValue,
           },
           storePayload: true,
@@ -1705,12 +1785,15 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
       }
 
       const identityId = await linkIdentity(provider, existingUser.id, asserted, req, "verified_email");
+      const gate = await mfaGate(provider, existingUser, payload, req);
+      if (gate.challenge) return { ...gate.challenge, returnTo: flow.returnTo };
       const session = await finishSignIn({
         user: existingUser,
         provider,
         identityId,
         req,
-        metadata: { matchedBy: "verified_email" },
+        metadata: { matchedBy: "verified_email", mfaViaIdp: gate.satisfied },
+        mfaSatisfied: gate.satisfied,
       });
       return {
         ...session,
@@ -1718,6 +1801,7 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
         company: { id: provider.companyId, role },
         identity: identityView(identityId, provider, asserted, true),
         provisioned: false,
+        projects: provisionedProjects,
         returnTo: flow.returnTo,
       };
     }
@@ -1761,6 +1845,11 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
       userId,
       role: resolved.companyRole,
     });
+    provisionedProjects = await applyProvisionedProjectAccess(
+      provider,
+      userId,
+      resolved.templateKey ?? provider.defaultTemplateKey,
+    );
     const identityId = await linkIdentity(provider, userId, asserted, req, "provisioned");
     await appendLedger(app.db, {
       companyId: provider.companyId,
@@ -1773,7 +1862,8 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
         providerId: provider.id,
         email: asserted.email,
         role: resolved.companyRole,
-        templateKey: resolved.templateKey,
+        templateKey: resolved.templateKey ?? provider.defaultTemplateKey,
+        projects: provisionedProjects,
         matchedClaimValue: resolved.matchedClaimValue,
       },
       storePayload: true,
@@ -1790,12 +1880,15 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
     });
 
     const user = { id: userId, email: asserted.email, name: asserted.displayName ?? asserted.email };
+    const gate = await mfaGate(provider, user, payload, req);
+    if (gate.challenge) return { ...gate.challenge, returnTo: flow.returnTo };
     const session = await finishSignIn({
       user,
       provider,
       identityId,
       req,
-      metadata: { provisioned: true },
+      metadata: { provisioned: true, mfaViaIdp: gate.satisfied },
+      mfaSatisfied: gate.satisfied,
     });
     return {
       ...session,
@@ -1803,7 +1896,106 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
       company: { id: provider.companyId, role: resolved.companyRole },
       identity: identityView(identityId, provider, asserted, true),
       provisioned: true,
+      projects: provisionedProjects,
       returnTo: flow.returnTo,
+    };
+  }
+
+  /**
+   * THE TENANT MFA POLICY, APPLIED TO SSO.
+   *
+   * Before this, `issueSession` wrote `auth_sessions` with `mfa_satisfied_at`
+   * null and never consulted `companiesRequiringMfa` or the assertion's
+   * amr/acr: a company that set `PUT /auth/mfa/policy {required:true}` still
+   * admitted every SSO user with no second factor, while password users in the
+   * same company were forced to enrol. The policy — and the coverage figure
+   * next to it — were cosmetic for exactly the tenants most likely to have SSO.
+   *
+   * Three outcomes, in order:
+   *
+   *  1. No company of this user requires MFA → sign in, `satisfied: false`.
+   *  2. The connection is configured to perform MFA and the assertion proves
+   *     it (`amr`/`acr` intersects `mfaAmrValues`) → sign in, and mark the
+   *     session MFA-satisfied so step-up does not ask again.
+   *  3. Otherwise → NO TOKENS. Return the same challenge envelope
+   *     `POST /auth/mfa/login` returns, so the SPA drives the identical
+   *     `POST /auth/mfa/challenge` flow it already implements. A user with no
+   *     enrolled factor gets an `enrol` challenge, exactly as a password user
+   *     would.
+   */
+  async function mfaGate(
+    provider: ProviderRow,
+    user: { id: string; email: string; name: string },
+    payload: Record<string, unknown>,
+    req: FastifyRequest,
+  ): Promise<{
+    satisfied: boolean;
+    challenge: Record<string, unknown> | null;
+  }> {
+    const requiredBy = await companiesRequiringMfa(app.db, user.id);
+    const factor = await activeFactor(app.db, user.id);
+    if (requiredBy.length === 0) {
+      // Nobody demands one. A user who has enrolled anyway keeps the factor for
+      // password sign-in and step-up; refusing their SSO sign-in over it would
+      // punish them for being careful.
+      const idp = idpAssertedMfa(provider, payload);
+      return { satisfied: idp.satisfied, challenge: null };
+    }
+    const idp = idpAssertedMfa(provider, payload);
+    if (idp.satisfied) {
+      await recordEvent({
+        kind: "sso_login_success",
+        outcome: "success",
+        companyId: provider.companyId,
+        userId: user.id,
+        email: user.email,
+        providerId: provider.id,
+        reason: "Tenant MFA policy satisfied by the identity provider's own assertion",
+        metadata: { amr: idp.matched, companies: requiredBy.map((r) => r.companyId) },
+        req,
+      });
+      return { satisfied: true, challenge: null };
+    }
+    const scope: ChallengeScope = factor ? "verify" : "enrol";
+    const minted = mintChallengeToken(config, {
+      userId: user.id,
+      scope,
+      ttlMinutes: config.MFA_CHALLENGE_TTL_MINUTES,
+    });
+    await recordEvent({
+      kind: "sso_login_success",
+      outcome: "pending",
+      companyId: provider.companyId,
+      userId: user.id,
+      email: user.email,
+      providerId: provider.id,
+      reason:
+        scope === "enrol"
+          ? "SSO assertion accepted; tenant policy requires enrolling a second factor"
+          : "SSO assertion accepted; awaiting second factor",
+      metadata: { challengeId: minted.claims.jti, scope, idpPerformsMfa: provider.idpPerformsMfa },
+      req,
+    });
+    return {
+      satisfied: false,
+      challenge: {
+        mfaRequired: true,
+        ...challengeEnvelope(minted),
+        // No tokens, no user id, no email: the holder has proved who they are
+        // to the IdP and not yet to this platform's policy.
+        policy: {
+          required: true,
+          companies: requiredBy.map((r) => ({ companyId: r.companyId, name: r.name })),
+        },
+        reasons: [
+          scope === "enrol"
+            ? "Your organisation requires a second factor and this account has none enrolled."
+            : "Your organisation requires a second factor.",
+          provider.idpPerformsMfa
+            ? "The identity provider did not assert one of the accepted authentication methods."
+            : "This SSO connection is not configured to perform multi-factor authentication itself.",
+        ],
+      },
     };
   }
 
@@ -1892,12 +2084,99 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
     return identityId;
   }
 
+  /**
+   * Apply `defaultTemplateKey` (or a group mapping's `templateKey`) to the
+   * projects the connection nominates.
+   *
+   * WHY THIS EXISTS. The template key was resolved on every JIT provision,
+   * written into the ledger payload, and then applied to nothing: the column
+   * on `identity_providers` says "permission template key applied to a
+   * provisioned user's project access" and no code applied it. A provisioned
+   * member got a company membership and could not open a single :projectId
+   * route until an administrator added them by hand — which is precisely the
+   * manual step auto-provisioning exists to remove.
+   *
+   * The projects are named on the connection (`provisionProjectIds`) rather
+   * than inferred, and every id is validated to belong to this company when it
+   * is set, so a connection can never hand out access to another tenant's
+   * project. An empty list means "company membership only", which is now a
+   * stated choice rather than an accident.
+   */
+  async function applyProvisionedProjectAccess(
+    provider: ProviderRow,
+    userId: string,
+    templateKey: string | null,
+  ): Promise<string[]> {
+    const wanted = provider.provisionProjectIds ?? [];
+    if (wanted.length === 0 || !templateKey) return [];
+    const owned = await app.db
+      .select({ id: projects.id })
+      .from(projects)
+      .where(and(eq(projects.companyId, provider.companyId), inArray(projects.id, wanted)));
+    const bound: string[] = [];
+    for (const project of owned) {
+      const [existing] = await app.db
+        .select({ id: projectMemberships.id })
+        .from(projectMemberships)
+        .where(
+          and(
+            eq(projectMemberships.projectId, project.id),
+            eq(projectMemberships.userId, userId),
+          ),
+        )
+        .limit(1);
+      if (existing) continue;
+      await app.db.insert(projectMemberships).values({
+        id: newId("pm"),
+        companyId: provider.companyId,
+        projectId: project.id,
+        userId,
+        templateKey,
+      });
+      bound.push(project.id);
+    }
+    return bound;
+  }
+
+  /**
+   * Did the identity provider assert that it performed a second factor?
+   *
+   * OpenID Connect carries this in `amr` (authentication methods references,
+   * an array) and `acr` (a context class reference string). Neither is
+   * meaningful without an administrator saying which values they accept for
+   * THEIR IdP — "mfa" from Entra, "http://schemas.microsoft.com/claims/multipleauthn",
+   * "otp", "hwk", "phr"/"phrh", or a custom ACR from a self-hosted provider —
+   * so the accepted set is configuration (`mfaAmrValues`) and the whole check
+   * is off unless `idpPerformsMfa` is explicitly on. Trusting an IdP's word
+   * about MFA is a decision an administrator takes, never a default.
+   */
+  function idpAssertedMfa(
+    provider: ProviderRow,
+    payload: Record<string, unknown>,
+  ): { satisfied: boolean; matched: string[] } {
+    if (!provider.idpPerformsMfa) return { satisfied: false, matched: [] };
+    const accepted = (provider.mfaAmrValues ?? []).map((v) => v.toLowerCase());
+    if (accepted.length === 0) return { satisfied: false, matched: [] };
+    const presented: string[] = [];
+    const amr = payload["amr"];
+    if (Array.isArray(amr)) {
+      for (const v of amr) if (typeof v === "string") presented.push(v.toLowerCase());
+    } else if (typeof amr === "string") {
+      presented.push(amr.toLowerCase());
+    }
+    const acr = payload["acr"];
+    if (typeof acr === "string") presented.push(acr.toLowerCase());
+    const matched = presented.filter((v) => accepted.includes(v));
+    return { satisfied: matched.length > 0, matched };
+  }
+
   async function finishSignIn(options: {
     user: { id: string; email: string; name: string };
     provider: ProviderRow;
     identityId: string;
     req: FastifyRequest;
     metadata?: Record<string, unknown>;
+    mfaSatisfied?: boolean;
   }) {
     const nowIso = new Date().toISOString();
     const session = await issueSession({
@@ -1906,6 +2185,7 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
       identityId: options.identityId,
       providerId: options.provider.id,
       req: options.req,
+      mfaSatisfied: options.mfaSatisfied ?? false,
     });
     await app.db.update(users).set({ lastLoginAt: nowIso }).where(eq(users.id, options.user.id));
     await app.db

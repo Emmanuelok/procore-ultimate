@@ -23,9 +23,16 @@
  */
 import { useCallback, useMemo, useState } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
-import { Alert, Badge, PageHeader, SegmentedControl, Tabs } from "../../ui";
+import { Alert, Badge, Button, PageHeader, SegmentedControl, Tabs } from "../../ui";
 import { IconEquipment } from "../../ui/icons";
 import CertificatesTab from "./CertificatesTab";
+import {
+  AssignPlantModal,
+  CertificateModal,
+  RegisterPlantModal,
+  StockMovementModal,
+  UtilisationModal,
+} from "./EquipmentForms";
 import EquipmentDrawer from "./EquipmentDrawer";
 import IdleTab from "./IdleTab";
 import MaintenanceTab from "./MaintenanceTab";
@@ -101,6 +108,10 @@ export default function EquipmentPage() {
   const [criticalOnly, setCriticalOnly] = useState(false);
   const [materialItemId, setMaterialItemId] = useState<string | null>(null);
   const [deliveryId, setDeliveryId] = useState<string | null>(null);
+  /** which write form is open — the module's whole write side lives here */
+  const [form, setForm] = useState<
+    "register" | "assign" | "utilisation" | "certificate" | "stock" | null
+  >(null);
 
   const utilisationTo = useMemo(() => today(), []);
   const utilisationFrom = useMemo(
@@ -115,7 +126,9 @@ export default function EquipmentPage() {
   const projectPlant = useProjectPlant(
     tab === "register" || tab === "idle" ? projectId : undefined,
   );
-  const fleet = useCompanyFleet(tab === "register" && scope === "company");
+  const fleet = useCompanyFleet(
+    (tab === "register" && scope === "company") || form === "assign" || form === "utilisation",
+  );
   const certificates = useCertificates(inServiceOnly, tab === "certificates");
   const maintenance = useMaintenance(tab === "maintenance", criticalOnly);
   const utilisationSummary = useUtilisationSummary(
@@ -133,11 +146,40 @@ export default function EquipmentPage() {
   const telematics = useTelematics(projectId, telematicsDays, tab === "telematics");
   const deliveries = useDeliveries(projectId, tab === "materials");
   const invoiceMatch = useInvoiceMatch(projectId, tab === "materials");
-  const materials = useMaterials(projectId, tab === "materials");
+  const materials = useMaterials(projectId, tab === "materials" || form === "stock");
   const stockLedger = useStockLedger(projectId, materialItemId);
   const stockMovements = useStockMovements(projectId, materialItemId);
   const deliveryDetail = useDeliveryDetail(projectId, deliveryId);
   const machineDetail = useEquipmentDetail(openMachine);
+
+  /** After any write, re-read the views that could have changed. */
+  const refresh = useCallback(() => {
+    summary.reload();
+    idle.reload();
+    projectPlant.reload();
+    fleet.reload();
+    certificates.reload();
+    maintenance.reload();
+    utilisationSummary.reload();
+    utilisationRows.reload();
+    materials.reload();
+    stockLedger.reload();
+    stockMovements.reload();
+    machineDetail.reload();
+  }, [
+    summary,
+    idle,
+    projectPlant,
+    fleet,
+    certificates,
+    maintenance,
+    utilisationSummary,
+    utilisationRows,
+    materials,
+    stockLedger,
+    stockMovements,
+    machineDetail,
+  ]);
 
   const selectTab = useCallback(
     (next: TabKey) => {
@@ -216,18 +258,41 @@ export default function EquipmentPage() {
           </span>
         }
         actions={
-          scopeSwitchable ? (
-            <SegmentedControl<Scope>
-              value={scope}
-              onChange={selectScope}
-              size="sm"
-              aria-label="Register scope"
-              options={[
-                { value: "project", label: "This project" },
-                { value: "company", label: "Company fleet" },
-              ]}
-            />
-          ) : null
+          <div className="flex flex-wrap items-center gap-2">
+            {scopeSwitchable ? (
+              <SegmentedControl<Scope>
+                value={scope}
+                onChange={selectScope}
+                size="sm"
+                aria-label="Register scope"
+                options={[
+                  { value: "project", label: "This project" },
+                  { value: "company", label: "Company fleet" },
+                ]}
+              />
+            ) : null}
+            {tab === "materials" ? (
+              <Button size="sm" variant="secondary" onClick={() => setForm("stock")}>
+                Move stock
+              </Button>
+            ) : null}
+            {tab === "utilisation" || tab === "idle" ? (
+              <Button size="sm" variant="secondary" onClick={() => setForm("utilisation")}>
+                Record a day
+              </Button>
+            ) : null}
+            {tab === "certificates" && openMachine ? (
+              <Button size="sm" variant="secondary" onClick={() => setForm("certificate")}>
+                Add certificate
+              </Button>
+            ) : null}
+            <Button size="sm" variant="secondary" onClick={() => setForm("assign")}>
+              Assign plant
+            </Button>
+            <Button size="sm" variant="primary" onClick={() => setForm("register")}>
+              Register plant
+            </Button>
+          </div>
         }
         tabs={
           <Tabs
@@ -321,6 +386,44 @@ export default function EquipmentPage() {
         equipmentId={openMachine}
         detail={machineDetail}
         onClose={() => openMachineDrawer(null)}
+      />
+
+      <RegisterPlantModal
+        open={form === "register"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+      />
+      <AssignPlantModal
+        open={form === "assign"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        projectId={projectId}
+        fleet={fleet.data?.items ?? []}
+      />
+      <UtilisationModal
+        open={form === "utilisation"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        projectId={projectId}
+        fleet={projectPlant.data?.items ?? fleet.data?.items ?? []}
+        defaultEquipmentId={openMachine}
+      />
+      {openMachine ? (
+        <CertificateModal
+          open={form === "certificate"}
+          onClose={() => setForm(null)}
+          onDone={refresh}
+          equipmentId={openMachine}
+          equipmentLabel={machineDetail.data?.reference ?? "this machine"}
+        />
+      ) : null}
+      <StockMovementModal
+        open={form === "stock"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        projectId={projectId}
+        materials={materials.data?.items ?? []}
+        defaultItemId={materialItemId}
       />
     </div>
   );
