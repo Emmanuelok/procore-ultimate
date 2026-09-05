@@ -3697,6 +3697,7 @@ CREATE TABLE "project_health_snapshots" (
 	"score" double precision,
 	"rated_dimensions" integer DEFAULT 0 NOT NULL,
 	"dimensions" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"basis" text DEFAULT '' NOT NULL,
 	"trigger" text DEFAULT 'interval' NOT NULL,
 	"computed_at" timestamp with time zone NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
@@ -3726,6 +3727,8 @@ CREATE TABLE "pulse_snapshots" (
 	"scores" jsonb DEFAULT '[]'::jsonb NOT NULL,
 	"attention_by_severity" jsonb DEFAULT '{}'::jsonb NOT NULL,
 	"open_attention" integer DEFAULT 0 NOT NULL,
+	"project_rollup" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"truncated_sources" jsonb DEFAULT '[]'::jsonb NOT NULL,
 	"changes" jsonb DEFAULT '{}'::jsonb NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
@@ -4501,6 +4504,8 @@ CREATE TABLE "design_deliverables" (
 	"planned_issue_date" text,
 	"forecast_issue_date" text,
 	"actual_issue_date" text,
+	"issued_by" text,
+	"issued_at" timestamp with time zone,
 	"accepted_at" timestamp with time zone,
 	"accepted_by" text,
 	"rejected_at" timestamp with time zone,
@@ -4638,6 +4643,7 @@ CREATE TABLE "design_packages" (
 	"frozen_at" timestamp with time zone,
 	"frozen_by" text,
 	"freeze_id" text,
+	"pre_freeze_status" text,
 	"superseded_by_id" text,
 	"review_count" integer DEFAULT 0 NOT NULL,
 	"open_issue_count" integer DEFAULT 0 NOT NULL,

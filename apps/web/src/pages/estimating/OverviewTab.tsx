@@ -79,11 +79,8 @@ export default function OverviewTab({
     const res = await action.run("sweep", () => estimatingApi.sweep(projectId));
     if (res) {
       setLastSweep(res);
-      toast.success(
-        `Sweeps complete — ${res.quotes.signalsRaised + res.hygiene.signalsRaised} new finding${
-          res.quotes.signalsRaised + res.hygiene.signalsRaised === 1 ? "" : "s"
-        }`,
-      );
+      const raised = res.quotes.signalsRaised + res.hygiene.signalsRaised + res.outliers.signalsRaised;
+      toast.success(`Sweeps complete — ${raised} new finding${raised === 1 ? "" : "s"} on this project`);
       risks.reload();
       onChanged();
     }
@@ -225,10 +222,10 @@ export default function OverviewTab({
       <Card>
         <CardHeader
           title="What the sweeps found"
-          subtitle="Stale catalogue rates, estimates resting on them, approved estimates nobody converted, measurements nobody priced, and quotes out of validity. Each is raised once and closed automatically when it clears."
+          subtitle="Stale catalogue rates, estimates resting on them, approved estimates nobody converted, measurements nobody priced, quotes out of validity, and bidders a long way from the pack on the same scope row. Each is raised once and closed automatically when it clears."
           actions={
             <Button size="sm" icon={IconRefresh} onClick={() => void runSweep()} loading={action.busy === "sweep"}>
-              Run the sweeps now
+              Run them on this project
             </Button>
           }
         />
@@ -246,7 +243,15 @@ export default function OverviewTab({
               {count(lastSweep.quotes.expiring)} expiring, {count(lastSweep.hygiene.catalogueFlagged)} catalogue
               rates flagged for review, {count(lastSweep.hygiene.staleRateEstimates)} estimates on stale rates,{" "}
               {count(lastSweep.hygiene.unconvertedEstimates)} approved but unconverted,{" "}
-              {count(lastSweep.hygiene.unpricedTakeoffItems)} unpriced measurements. The sweeps run company-wide.
+              {count(lastSweep.hygiene.unpricedTakeoffItems)} unpriced measurements,{" "}
+              {count(lastSweep.outliers.outliers)} outlying quote rows across{" "}
+              {count(lastSweep.outliers.packs)} levelled packages. This run covered THIS project only; the
+              scheduler runs the same sweeps across the company every few hours.
+              {lastSweep.hygiene.notes.map((n, i) => (
+                <span key={i} className="block">
+                  {n}
+                </span>
+              ))}
             </div>
           ) : null}
           {risks.error ? (
@@ -353,6 +358,7 @@ export default function OverviewTab({
                   .map((x) => `${x.estimateReference} ${money(x.unitRate, x.currency)}/${x.unit ?? DASH}`)
                   .join(" · ")}
               </div>
+              <ReasonList reasons={history.data.reasons} />
             </>
           ) : null}
         </CardBody>

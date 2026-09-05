@@ -2,7 +2,13 @@ import type { FastifyPluginAsync } from "fastify";
 import { and, eq, inArray } from "drizzle-orm";
 import bcrypt from "bcryptjs";
 import { z } from "zod";
-import { companies, companyMemberships, userMfa, users } from "@constructos/db";
+import {
+  companies,
+  companyMemberships,
+  companySecurityPolicies,
+  userMfa,
+  users,
+} from "@constructos/db";
 import { AppError, badRequest, conflict, unauthorized } from "../../lib/errors.js";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
@@ -1043,6 +1049,20 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
           updatedAt: nowIso,
         })
         .where(eq(companies.id, companyId));
+
+      // AND THE OTHER HOME OF THE SAME FACT. `userCompanyPolicies` (service.ts)
+      // ORs `companies.settings.mfa.required` with
+      // `company_security_policies.mfa_required`, so writing only the first one
+      // makes TURNING THE POLICY OFF here a no-op for any tenant that turned it
+      // on from the security-policy page: this route would answer
+      // `required: false` while every member was still challenged. The
+      // security-policy route already syncs in the other direction; this is the
+      // missing half. A tenant with no policy row is unaffected — the update
+      // matches nothing and the settings blob is the only source.
+      await app.db
+        .update(companySecurityPolicies)
+        .set({ mfaRequired: body.required, updatedAt: nowIso, updatedBy: user.id })
+        .where(eq(companySecurityPolicies.companyId, companyId));
 
       await appendLedger(app.db, {
         companyId,

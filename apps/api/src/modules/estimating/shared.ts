@@ -352,17 +352,24 @@ export async function reconcileSignals(
   detector: EstimatingDetector,
   currentKeys: ReadonlySet<string>,
   note: string,
+  /**
+   * When the sweep that produced `currentKeys` was itself narrowed to one
+   * project, the reconciliation must be narrowed the same way — otherwise a
+   * project-scoped run would close every other project's open findings on
+   * the grounds that it did not see them.
+   */
+  projectId?: string | null,
 ): Promise<number> {
+  const clauses = [
+    eq(signals.companyId, companyId),
+    eq(signals.detector, detector),
+    inArray(signals.disposition, [...OPEN_DISPOSITIONS]),
+  ];
+  if (projectId) clauses.push(eq(signals.projectId, projectId));
   const rows = await db
     .select({ id: signals.id, fingerprint: signals.fingerprint })
     .from(signals)
-    .where(
-      and(
-        eq(signals.companyId, companyId),
-        eq(signals.detector, detector),
-        inArray(signals.disposition, [...OPEN_DISPOSITIONS]),
-      ),
-    );
+    .where(and(...clauses));
   let closed = 0;
   for (const row of rows) {
     const key = row.fingerprint?.startsWith(`${detector}:`)

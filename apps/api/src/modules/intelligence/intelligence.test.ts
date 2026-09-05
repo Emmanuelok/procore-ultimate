@@ -7,7 +7,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import {
   aiReviewQueue,
   attentionItems,
@@ -33,7 +33,7 @@ import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { intelligenceModule } from "./index.js";
-import { dirtyProjects } from "./service.js";
+import { dirtyProjects, listCompanyProjects, refreshAttention, refreshPulse } from "./service.js";
 import type { AttentionItem, ProjectHealth, PulseResponse } from "./types.js";
 
 const DAY_MS = 86_400_000;
@@ -221,11 +221,11 @@ beforeAll(async () => {
     summary: "Explain the duplicate assertion signal",
     status: "pending",
   });
-}, 120_000);
+}, 900_000); // boots PGlite and applies every migration: generous because this box is shared
 
 afterAll(async () => {
   await built.close();
-}, 60_000);
+}, 180_000);
 
 /* ------------------------------------------------------------------ */
 /* Project health                                                      */
@@ -317,6 +317,37 @@ describe("project health", () => {
     expect(entry?.action).toBe("update");
     expect(entry?.actorId).toBe(owner.userId);
     expect((entry?.payload as { trigger: string }).trigger).toBe("manual");
+  });
+
+  it("explains the verdict the same way on a recompute and on a later read", async () => {
+    const recomputed = (await app.inject({ method: "POST", url: `/api/v1/projects/${p1}/health/recompute`, headers: owner.headers })).json() as HealthWire;
+    const read = (await app.inject({ method: "GET", url: `/api/v1/projects/${p1}/health`, headers: owner.headers })).json() as HealthWire;
+    expect(read.basis).toBe(recomputed.basis);
+    expect(read.basis.length).toBeGreaterThan(0);
+    // and the Pulse grid renders the same sentence for the same snapshot
+    const pulse = (await app.inject({ method: "GET", url: "/api/v1/pulse", headers: owner.headers })).json() as PulseResponse & {
+      scores: Array<{ projectId: string; basis?: string }>;
+    };
+    const grid = pulse.scores.find((s) => s.projectId === p1)!;
+    expect(grid.basis).toBe(recomputed.basis);
+  });
+
+  it("recomputing one project does not sweep the whole company's attention feed", async () => {
+    // a P1 condition disappears; recomputing P2 must not claim it resolved
+    await app.scheduler.runNow("intelligence.attention");
+    const before = (await app.inject({ method: "GET", url: "/api/v1/attention?kind=ncr_open", headers: owner.headers })).json() as AttentionList;
+    expect(before.total).toBe(1);
+    await app.db.update(nonConformanceReports).set({ status: "closed" }).where(eq(nonConformanceReports.projectId, p1));
+    const res = await app.inject({ method: "POST", url: `/api/v1/projects/${p2}/health/recompute`, headers: owner.headers });
+    expect(res.statusCode).toBe(200);
+    const during = (await app.inject({ method: "GET", url: "/api/v1/attention?kind=ncr_open", headers: owner.headers })).json() as AttentionList;
+    expect(during.total).toBe(1);
+    // the company-wide sweep is the scheduler's job, and it does resolve it
+    await app.scheduler.runNow("intelligence.attention");
+    const after = (await app.inject({ method: "GET", url: "/api/v1/attention?kind=ncr_open", headers: owner.headers })).json() as AttentionList;
+    expect(after.total).toBe(0);
+    await app.db.update(nonConformanceReports).set({ status: "open" }).where(eq(nonConformanceReports.projectId, p1));
+    await app.scheduler.runNow("intelligence.attention");
   });
 
   it("automatic recompute dedupes an identical snapshot inside the window", async () => {
@@ -507,6 +538,37 @@ describe("attention feed", () => {
     expect(back.total).toBe(1);
     expect(back.items[0]!.id).toBe(resolved.items[0]!.id);
   });
+
+  it("never resolves an item its source query could not reach: a capped source is reported, not emptied", async () => {
+    // three overdue RFIs, so a cap of one leaves two outside the sweep's reach
+    await app.db.insert(rfis).values([
+      { id: newId("rfi"), companyId: owner.companyId, projectId: p1, number: 5, subject: "Bearing type", question: "Which?", status: "open", dueDate: isoDate(-30), createdBy: owner.userId },
+      { id: newId("rfi"), companyId: owner.companyId, projectId: p1, number: 6, subject: "Deck joint", question: "Which?", status: "open", dueDate: isoDate(-25), createdBy: owner.userId },
+    ]);
+    await app.scheduler.runNow("intelligence.attention");
+    const full = (await app.inject({ method: "GET", url: "/api/v1/attention?kind=overdue_rfi&limit=50", headers: owner.headers })).json() as AttentionList;
+    expect(full.total).toBe(3);
+
+    const projectList = await listCompanyProjects(app.db, owner.companyId);
+    const capped = await refreshAttention(app.db, owner.companyId, projectList, new Date(), { sourceLimit: 1 });
+    expect(capped.truncatedSources).toContain("rfi");
+    // the two RFIs pushed out of the top 1 are still live — they are not "gone"
+    const afterCap = (await app.inject({ method: "GET", url: "/api/v1/attention?kind=overdue_rfi&limit=50", headers: owner.headers })).json() as AttentionList;
+    expect(afterCap.total).toBe(3);
+    const resolvedRows = (await app.inject({ method: "GET", url: "/api/v1/attention?kind=overdue_rfi&status=resolved&limit=50", headers: owner.headers })).json() as AttentionList;
+    expect(resolvedRows.total).toBe(0);
+
+    // and the Pulse says so rather than implying the feed is complete
+    await refreshPulse(app.db, owner.companyId, new Date(), { truncatedSources: capped.truncatedSources, force: true });
+    const pulse = (await app.inject({ method: "GET", url: "/api/v1/pulse", headers: owner.headers })).json() as PulseResponse;
+    expect(pulse.attentionTruncated).toContain("rfi");
+
+    // clean up: the extra RFIs leave the feed the honest way
+    await app.db.update(rfis).set({ status: "closed" }).where(and(eq(rfis.projectId, p1), inArray(rfis.number, [5, 6])));
+    await app.scheduler.runNow("intelligence.attention");
+    const cleaned = (await app.inject({ method: "GET", url: "/api/v1/attention?kind=overdue_rfi&limit=50", headers: owner.headers })).json() as AttentionList;
+    expect(cleaned.total).toBe(1);
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -662,10 +724,44 @@ describe("tenant isolation", () => {
   });
 
   it("a plain member sees only the projects they belong to, and the company briefing is withheld", async () => {
+    const ownerPulse = (await app.inject({ method: "GET", url: "/api/v1/pulse", headers: owner.headers })).json() as PulseResponse;
     const pulse = (await app.inject({ method: "GET", url: "/api/v1/pulse", headers: memberHeaders })).json() as PulseResponse;
     expect(pulse.portfolio.projects).toBe(1);
     expect(pulse.scores.map((s) => s.projectId)).toEqual([p2]);
     expect(pulse.attention.every((i) => i.projectId === p2 || i.projectId === null)).toBe(true);
+
+    // "since yesterday" is counted over the same projects as everything else
+    // beside it — never the company's totals next to a filtered feed
+    expect(pulse.changes.openAttentionTo).toBe(pulse.openAttention);
+    expect(ownerPulse.changes.openAttentionTo).toBe(ownerPulse.openAttention);
+    expect(ownerPulse.changes.openAttentionTo).toBeGreaterThan(pulse.changes.openAttentionTo);
+    expect(pulse.changes.newAttention).toBeLessThanOrEqual(pulse.openAttention);
+    expect(pulse.changes.newAttention).toBeLessThanOrEqual(ownerPulse.changes.newAttention);
+    expect(pulse.changes.openAttentionFrom === null || pulse.changes.openAttentionFrom <= pulse.openAttention).toBe(true);
+    if (ownerPulse.changes.openAttentionFrom !== null && pulse.changes.openAttentionFrom !== null) {
+      expect(pulse.changes.openAttentionFrom).toBeLessThanOrEqual(ownerPulse.changes.openAttentionFrom);
+    }
+    expect(pulse.changes.levelChanges.every((c) => c.projectId === p2)).toBe(true);
+
+    // and so is the history series
+    const memberHistory = (await app.inject({ method: "GET", url: "/api/v1/pulse/history?days=30", headers: memberHeaders })).json() as {
+      items: Array<{ projects: number; byHealth: Record<string, number>; openAttention: number; attentionBySeverity: Record<string, number> }>;
+      scope: string;
+    };
+    expect(memberHistory.scope).toBe("visible_projects");
+    expect(memberHistory.items.length).toBeGreaterThanOrEqual(1);
+    for (const point of memberHistory.items) {
+      expect(point.projects).toBe(1);
+      expect(Object.values(point.byHealth).reduce((a, b) => a + b, 0)).toBe(1);
+      expect(Object.values(point.attentionBySeverity).reduce((a, b) => a + b, 0)).toBe(point.openAttention);
+    }
+    const ownerHistory = (await app.inject({ method: "GET", url: "/api/v1/pulse/history?days=30", headers: owner.headers })).json() as {
+      items: Array<{ projects: number; openAttention: number }>;
+      scope: string;
+    };
+    expect(ownerHistory.scope).toBe("company");
+    expect(ownerHistory.items.at(-1)!.projects).toBe(2);
+    expect(ownerHistory.items.at(-1)!.openAttention).toBeGreaterThan(memberHistory.items.at(-1)!.openAttention);
     const feed = (await app.inject({ method: "GET", url: "/api/v1/attention?limit=100", headers: memberHeaders })).json() as AttentionList;
     expect(feed.items.every((i) => i.projectId === p2 || i.projectId === null)).toBe(true);
     expect(feed.items.some((i) => i.projectId === p1)).toBe(false);
@@ -684,6 +780,8 @@ describe("tenant isolation", () => {
     // a project manager on P2 may dismiss a P2 item (standard on intelligence)
     const p2Items = (await app.inject({ method: "GET", url: `/api/v1/attention?projectId=${p2}&limit=1`, headers: memberHeaders })).json() as AttentionList;
     expect(p2Items.items.length).toBe(1);
+    // the feed says so, so the page never offers a button that 403s
+    expect(p2Items.items[0]!.canAct).toBe(true);
     const ok = await app.inject({ method: "POST", url: `/api/v1/attention/${p2Items.items[0]!.id}/dismiss`, headers: memberHeaders, payload: { reason: "handled" } });
     expect(ok.statusCode).toBe(200);
     await app.inject({ method: "POST", url: `/api/v1/attention/${p2Items.items[0]!.id}/reopen`, headers: memberHeaders });
@@ -700,9 +798,17 @@ describe("tenant isolation", () => {
     expect(recompute.statusCode).toBe(403);
     const items = (await app.inject({ method: "GET", url: `/api/v1/attention?projectId=${p1}&limit=1`, headers })).json() as AttentionList;
     expect(items.items.length).toBe(1);
+    // the API tells the page it is read-only rather than letting it offer a Dismiss button
+    expect(items.items[0]!.canAct).toBe(false);
+    const projectFeed = (await app.inject({ method: "GET", url: `/api/v1/projects/${p1}/attention?limit=1`, headers })).json() as AttentionList & { canAct: boolean };
+    expect(projectFeed.canAct).toBe(false);
+    expect(projectFeed.items[0]!.canAct).toBe(false);
     const dismiss = await app.inject({ method: "POST", url: `/api/v1/attention/${items.items[0]!.id}/dismiss`, headers, payload: {} });
     expect(dismiss.statusCode).toBe(403);
     const projDismiss = await app.inject({ method: "POST", url: `/api/v1/projects/${p1}/attention/${items.items[0]!.id}/dismiss`, headers, payload: {} });
     expect(projDismiss.statusCode).toBe(403);
+    // ...and an owner is told the opposite on the same feed
+    const ownerFeed = (await app.inject({ method: "GET", url: `/api/v1/projects/${p1}/attention?limit=1`, headers: owner.headers })).json() as AttentionList & { canAct: boolean };
+    expect(ownerFeed.canAct).toBe(true);
   });
 });

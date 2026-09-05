@@ -13,7 +13,7 @@
  * readiness snapshots (#907–#908) and the analytics both the workspace and
  * WP-INTEL read.
  */
-import { and, desc, eq, inArray, isNull, ne, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, gt, inArray, isNotNull, isNull, ne, or } from "drizzle-orm";
 import {
   designChangeNotices,
   designComments,
@@ -61,6 +61,16 @@ import {
   todayISO,
   type Figure,
 } from "./shared.js";
+
+/** How many rows a sweep pulls into memory at a time (PLAN §6.4). */
+export const SWEEP_PAGE_SIZE = 500;
+
+/**
+ * The most rows any single roll-up or sweep query will pull into memory.
+ * Counting dimensions are SQL aggregates and are never capped; only the row
+ * loads that feed an engine are, and a roll-up names any cap that bit.
+ */
+export const ROLLUP_ROW_CAP = 5000;
 
 /** Deliverable statuses that are still live for sweep purposes. */
 export const OPEN_DELIVERABLE_STATUSES = ["planned", "in_progress", "rejected"] as const;
@@ -221,82 +231,95 @@ export async function sweepDeliverables(
   actorId: string | null,
   asOf: string = todayISO(),
 ): Promise<DeliverableSweepResult> {
-  const rows = await db
-    .select()
-    .from(designDeliverables)
-    .where(
-      and(
-        eq(designDeliverables.companyId, companyId),
-        eq(designDeliverables.projectId, projectId),
-        ne(designDeliverables.status, "cancelled"),
-      ),
-    );
-  if (rows.length === 0) return { assessed: 0, signalsRaised: 0, obligationsOpened: 0, byLevel: {} };
-
-  const tasks = await taskStarts(db, projectId, rows);
   const seen = await alreadySignalled(db, companyId, ["design_deliverable_late"], projectId);
   const byLevel: Record<string, number> = {};
   let signalsRaised = 0;
   let obligationsOpened = 0;
+  let assessed = 0;
 
-  for (const row of rows) {
-    const task = row.scheduleTaskId ? tasks.get(row.scheduleTaskId) ?? null : null;
-    const verdict = assessDeliverable(
-      {
-        status: row.status,
-        plannedIssueDate: row.plannedIssueDate,
-        forecastIssueDate: row.forecastIssueDate,
-        actualIssueDate: row.actualIssueDate,
-        acceptedAt: row.acceptedAt,
-        requiredOnSite: row.requiredOnSite,
-        taskStartDate: task?.startDate ?? null,
-      },
-      asOf,
-    );
-    byLevel[verdict.level] = (byLevel[verdict.level] ?? 0) + 1;
-    await persistDeliverableAssessment(db, row, {
-      id: row.id,
-      level: verdict.level,
-      slippageDays: verdict.slippageDays,
-      reasons: verdict.reasons,
-      basis: verdict.basis,
-      blocksTask: verdict.blocksTask,
-    });
-    const before = row.obligationId;
-    const obligationId = await syncDeliverableObligation(db, row, actorId);
-    if (!before && obligationId) obligationsOpened += 1;
+  // Keyset pagination rather than one unbounded select: the sweep still sees
+  // every live deliverable, but never holds more than a page of them in memory
+  // (PLAN §6.4).
+  let cursor: string | null = null;
+  for (;;) {
+    const rows = await db
+      .select()
+      .from(designDeliverables)
+      .where(
+        and(
+          eq(designDeliverables.companyId, companyId),
+          eq(designDeliverables.projectId, projectId),
+          ne(designDeliverables.status, "cancelled"),
+          cursor ? gt(designDeliverables.id, cursor) : undefined,
+        ),
+      )
+      .orderBy(asc(designDeliverables.id))
+      .limit(SWEEP_PAGE_SIZE);
+    if (rows.length === 0) break;
+    const tasks = await taskStarts(db, projectId, rows);
+    assessed += rows.length;
+    cursor = rows[rows.length - 1]?.id ?? null;
 
-    if (verdict.level === "late") {
-      const key = `design_deliverable_late:${row.id}:${row.plannedIssueDate ?? "none"}`;
-      if (!seen.has(key)) {
-        const signalId = await raiseSignal(db, companyId, projectId, actorId, {
-          detector: "design_deliverable_late",
-          severity: verdict.blocksTask ? "high" : "medium",
-          confidence: 0.95,
-          title: `Design deliverable ${row.reference} is late`,
-          explanation: `${row.title} was planned for ${row.plannedIssueDate} and has not been issued. ${verdict.reasons.join(" ")}`,
-          key,
-          evidence: {
-            deliverableId: row.id,
-            reference: row.reference,
-            plannedIssueDate: row.plannedIssueDate,
-            forecastIssueDate: row.forecastIssueDate,
-            slippageDays: verdict.slippageDays,
-            scheduleTaskId: row.scheduleTaskId,
-            scheduleTaskName: task?.name ?? null,
-            blocksTask: verdict.blocksTask,
-          },
-        });
-        seen.add(key);
-        signalsRaised += 1;
-        await db
-          .update(designDeliverables)
-          .set({ lateSignalId: signalId, updatedAt: nowISO() })
-          .where(eq(designDeliverables.id, row.id));
+    for (const row of rows) {
+      const task = row.scheduleTaskId ? tasks.get(row.scheduleTaskId) ?? null : null;
+      const verdict = assessDeliverable(
+        {
+          status: row.status,
+          plannedIssueDate: row.plannedIssueDate,
+          forecastIssueDate: row.forecastIssueDate,
+          actualIssueDate: row.actualIssueDate,
+          acceptedAt: row.acceptedAt,
+          requiredOnSite: row.requiredOnSite,
+          taskStartDate: task?.startDate ?? null,
+        },
+        asOf,
+      );
+      byLevel[verdict.level] = (byLevel[verdict.level] ?? 0) + 1;
+      await persistDeliverableAssessment(db, row, {
+        id: row.id,
+        level: verdict.level,
+        slippageDays: verdict.slippageDays,
+        reasons: verdict.reasons,
+        basis: verdict.basis,
+        blocksTask: verdict.blocksTask,
+      });
+      const before = row.obligationId;
+      const obligationId = await syncDeliverableObligation(db, row, actorId);
+      if (!before && obligationId) obligationsOpened += 1;
+
+      if (verdict.level === "late") {
+        const key = `design_deliverable_late:${row.id}:${row.plannedIssueDate ?? "none"}`;
+        if (!seen.has(key)) {
+          const signalId = await raiseSignal(db, companyId, projectId, actorId, {
+            detector: "design_deliverable_late",
+            severity: verdict.blocksTask ? "high" : "medium",
+            confidence: 0.95,
+            title: `Design deliverable ${row.reference} is late`,
+            explanation: `${row.title} was planned for ${row.plannedIssueDate} and has not been issued. ${verdict.reasons.join(" ")}`,
+            key,
+            evidence: {
+              deliverableId: row.id,
+              reference: row.reference,
+              plannedIssueDate: row.plannedIssueDate,
+              forecastIssueDate: row.forecastIssueDate,
+              slippageDays: verdict.slippageDays,
+              scheduleTaskId: row.scheduleTaskId,
+              scheduleTaskName: task?.name ?? null,
+              blocksTask: verdict.blocksTask,
+            },
+          });
+          seen.add(key);
+          signalsRaised += 1;
+          await db
+            .update(designDeliverables)
+            .set({ lateSignalId: signalId, updatedAt: nowISO() })
+            .where(eq(designDeliverables.id, row.id));
+        }
       }
     }
+    if (rows.length < SWEEP_PAGE_SIZE) break;
   }
-  return { assessed: rows.length, signalsRaised, obligationsOpened, byLevel };
+  return { assessed, signalsRaised, obligationsOpened, byLevel };
 }
 
 /* ================================================================== */
@@ -326,7 +349,9 @@ export async function sweepReviews(
         eq(designReviews.projectId, projectId),
         inArray(designReviews.status, [...OPEN_REVIEW_STATUSES]),
       ),
-    );
+    )
+    .orderBy(asc(designReviews.dueAt))
+    .limit(ROLLUP_ROW_CAP);
   if (rows.length === 0) return { checked: 0, overdue: 0, signalsRaised: 0 };
 
   const overdue = overdueCycles(
@@ -430,7 +455,9 @@ export async function sweepIssues(
         eq(designIssues.projectId, projectId),
         inArray(designIssues.status, [...OPEN_ISSUE_STATUSES]),
       ),
-    );
+    )
+    .orderBy(asc(designIssues.updatedAt))
+    .limit(ROLLUP_ROW_CAP);
   if (rows.length === 0) return { checked: 0, stale: 0, signalsRaised: 0 };
 
   const seen = await alreadySignalled(db, companyId, ["design_issue_stale"], projectId);
@@ -509,7 +536,9 @@ export async function sweepInfoRequirements(
         eq(designInfoRequirements.projectId, projectId),
         inArray(designInfoRequirements.status, ["planned", "in_progress", "overdue"]),
       ),
-    );
+    )
+    .orderBy(asc(designInfoRequirements.dueDate))
+    .limit(ROLLUP_ROW_CAP);
   if (rows.length === 0) return { checked: 0, overdue: 0, obligationsOpened: 0, signalsRaised: 0 };
 
   const seen = await alreadySignalled(db, companyId, ["design_info_requirement_overdue"], projectId);
@@ -714,7 +743,8 @@ export async function sweepProfessionalIndemnity(
         eq(designConsultants.projectId, projectId),
         inArray(designConsultants.status, ["appointed", "active", "novated"]),
       ),
-    );
+    )
+    .limit(ROLLUP_ROW_CAP);
   if (rows.length === 0) return { consultants: 0, inadequate: 0, signalsRaised: 0, items: [] };
 
   const seen = await alreadySignalled(db, companyId, ["design_pi_inadequate"], projectId);
@@ -780,7 +810,9 @@ export async function loadFreezes(db: Db, companyId: string, projectId: string):
   const rows = await db
     .select()
     .from(designFreezes)
-    .where(and(eq(designFreezes.companyId, companyId), eq(designFreezes.projectId, projectId)));
+    .where(and(eq(designFreezes.companyId, companyId), eq(designFreezes.projectId, projectId)))
+    .orderBy(desc(designFreezes.effectiveFrom))
+    .limit(ROLLUP_ROW_CAP);
   return rows.map((r) => ({
     id: r.id,
     scope: r.scope,
@@ -1013,6 +1045,7 @@ export async function designAnalytics(
   projectId: string,
   asOf: string = todayISO(),
 ): Promise<DesignAnalytics> {
+  // Bounded like the summary: narrow columns, newest first, an explicit cap.
   const [reviewRows, deliverableRows, issueRows, dcnRows, packageRows] = await Promise.all([
     db
       .select({
@@ -1026,7 +1059,9 @@ export async function designAnalytics(
         status: designReviews.status,
       })
       .from(designReviews)
-      .where(and(eq(designReviews.companyId, companyId), eq(designReviews.projectId, projectId))),
+      .where(and(eq(designReviews.companyId, companyId), eq(designReviews.projectId, projectId)))
+      .orderBy(desc(designReviews.createdAt))
+      .limit(ROLLUP_ROW_CAP),
     db
       .select({
         id: designDeliverables.id,
@@ -1040,19 +1075,43 @@ export async function designAnalytics(
         actualIssueDate: designDeliverables.actualIssueDate,
       })
       .from(designDeliverables)
-      .where(and(eq(designDeliverables.companyId, companyId), eq(designDeliverables.projectId, projectId))),
+      .where(and(eq(designDeliverables.companyId, companyId), eq(designDeliverables.projectId, projectId)))
+      .orderBy(desc(designDeliverables.createdAt))
+      .limit(ROLLUP_ROW_CAP),
     db
-      .select()
+      .select({
+        status: designIssues.status,
+        discipline: designIssues.discipline,
+        priority: designIssues.priority,
+        raisedAt: designIssues.raisedAt,
+        resolvedAt: designIssues.resolvedAt,
+        createdAt: designIssues.createdAt,
+      })
       .from(designIssues)
-      .where(and(eq(designIssues.companyId, companyId), eq(designIssues.projectId, projectId))),
+      .where(and(eq(designIssues.companyId, companyId), eq(designIssues.projectId, projectId)))
+      .orderBy(desc(designIssues.createdAt))
+      .limit(ROLLUP_ROW_CAP),
     db
-      .select()
+      .select({
+        packageId: designChangeNotices.packageId,
+        submittedAt: designChangeNotices.submittedAt,
+        classification: designChangeNotices.classification,
+        originator: designChangeNotices.originator,
+        status: designChangeNotices.status,
+        currency: designChangeNotices.currency,
+        assessedCost: designChangeNotices.assessedCost,
+        assessedTimeDays: designChangeNotices.assessedTimeDays,
+        isPostFreeze: designChangeNotices.isPostFreeze,
+      })
       .from(designChangeNotices)
-      .where(and(eq(designChangeNotices.companyId, companyId), eq(designChangeNotices.projectId, projectId))),
+      .where(and(eq(designChangeNotices.companyId, companyId), eq(designChangeNotices.projectId, projectId)))
+      .orderBy(desc(designChangeNotices.createdAt))
+      .limit(ROLLUP_ROW_CAP),
     db
       .select({ id: designPackages.id, reference: designPackages.reference })
       .from(designPackages)
-      .where(and(eq(designPackages.companyId, companyId), eq(designPackages.projectId, projectId))),
+      .where(and(eq(designPackages.companyId, companyId), eq(designPackages.projectId, projectId)))
+      .limit(2000),
   ]);
 
   const cycles: CycleTimeInput[] = reviewRows.map((r) => ({
@@ -1158,6 +1217,8 @@ export async function designAnalytics(
 
 export interface DesignSummary {
   asOf: string;
+  /** Non-fatal caveats about this roll-up, e.g. a row cap that bit. */
+  notes: string[];
   packages: { total: number; byStatus: Record<string, number>; byDiscipline: Record<string, number>; frozen: number; approved: number };
   stages: { planned: number; open: number; signedOff: number; current: { stageKey: string; label: string | null } | null };
   reviews: { open: number; overdue: number; total: number; averageTurnaroundDays: Figure; byCode: Record<string, number> };
@@ -1189,38 +1250,143 @@ export async function designSummary(
   projectId: string,
   asOf: string = todayISO(),
 ): Promise<DesignSummary> {
+  const notes: string[] = [];
+  /**
+   * Every count in this roll-up is a SQL aggregate, and every row load is
+   * capped: this runs on every workspace page load and again behind
+   * health-inputs, and `design_comments` in particular is the highest
+   * cardinality table in the schema (PLAN §6.4 — no roll-up may load an
+   * unbounded table into memory). Where a cap bites, the summary says so
+   * rather than quietly reporting a partial figure as the whole.
+   */
+  const cap = <T,>(rows: T[], what: string): T[] => {
+    if (rows.length <= ROLLUP_ROW_CAP) return rows;
+    notes.push(
+      `Only the ${ROLLUP_ROW_CAP.toLocaleString("en-GB")} most recent ${what} were included in this roll-up; the register itself is complete.`,
+    );
+    return rows.slice(0, ROLLUP_ROW_CAP);
+  };
   const [
-    packageRows,
+    packageGroups,
+    frozenPackages,
     stageRows,
-    reviewRows,
-    commentRows,
-    issueRows,
-    decisionRows,
-    deliverableRows,
-    dcnRows,
-    infoRows,
+    reviewRowsRaw,
+    commentGroups,
+    issueGroups,
+    decisionGroups,
+    deliverableRowsRaw,
+    dcnRowsRaw,
+    infoGroups,
     consultantRows,
-    freezeRows,
+    freezeCount,
     readinessRows,
     signalRows,
   ] = await Promise.all([
-    db.select().from(designPackages).where(and(eq(designPackages.companyId, companyId), eq(designPackages.projectId, projectId))),
+    db
+      .select({ status: designPackages.status, discipline: designPackages.discipline, n: count() })
+      .from(designPackages)
+      .where(and(eq(designPackages.companyId, companyId), eq(designPackages.projectId, projectId)))
+      .groupBy(designPackages.status, designPackages.discipline),
+    db
+      .select({ n: count() })
+      .from(designPackages)
+      .where(
+        and(
+          eq(designPackages.companyId, companyId),
+          eq(designPackages.projectId, projectId),
+          isNotNull(designPackages.frozenAt),
+        ),
+      ),
     db
       .select({ stageKey: designStageGates.stageKey, status: designStageGates.status, label: designStageGates.label, framework: designStageGates.framework })
       .from(designStageGates)
-      .where(and(eq(designStageGates.companyId, companyId), eq(designStageGates.projectId, projectId))),
-    db.select().from(designReviews).where(and(eq(designReviews.companyId, companyId), eq(designReviews.projectId, projectId))),
-    db.select({ status: designComments.status }).from(designComments).where(and(eq(designComments.companyId, companyId), eq(designComments.projectId, projectId))),
-    db.select().from(designIssues).where(and(eq(designIssues.companyId, companyId), eq(designIssues.projectId, projectId))),
+      .where(and(eq(designStageGates.companyId, companyId), eq(designStageGates.projectId, projectId)))
+      .limit(300),
     db
-      .select({ status: designDecisions.status })
+      .select({
+        id: designReviews.id,
+        packageId: designReviews.packageId,
+        cycleNumber: designReviews.cycleNumber,
+        issuedAt: designReviews.issuedAt,
+        dueAt: designReviews.dueAt,
+        closedAt: designReviews.closedAt,
+        consolidatedCode: designReviews.consolidatedCode,
+        status: designReviews.status,
+        turnaroundDays: designReviews.turnaroundDays,
+      })
+      .from(designReviews)
+      .where(and(eq(designReviews.companyId, companyId), eq(designReviews.projectId, projectId)))
+      .orderBy(desc(designReviews.createdAt))
+      .limit(ROLLUP_ROW_CAP + 1),
+    db
+      .select({ status: designComments.status, n: count() })
+      .from(designComments)
+      .where(and(eq(designComments.companyId, companyId), eq(designComments.projectId, projectId)))
+      .groupBy(designComments.status),
+    db
+      .select({
+        status: designIssues.status,
+        discipline: designIssues.discipline,
+        priority: designIssues.priority,
+        n: count(),
+      })
+      .from(designIssues)
+      .where(and(eq(designIssues.companyId, companyId), eq(designIssues.projectId, projectId)))
+      .groupBy(designIssues.status, designIssues.discipline, designIssues.priority),
+    db
+      .select({ status: designDecisions.status, n: count() })
       .from(designDecisions)
-      .where(and(eq(designDecisions.companyId, companyId), eq(designDecisions.projectId, projectId))),
-    db.select().from(designDeliverables).where(and(eq(designDeliverables.companyId, companyId), eq(designDeliverables.projectId, projectId))),
-    db.select().from(designChangeNotices).where(and(eq(designChangeNotices.companyId, companyId), eq(designChangeNotices.projectId, projectId))),
-    db.select({ status: designInfoRequirements.status }).from(designInfoRequirements).where(and(eq(designInfoRequirements.companyId, companyId), eq(designInfoRequirements.projectId, projectId))),
-    db.select().from(designConsultants).where(and(eq(designConsultants.companyId, companyId), eq(designConsultants.projectId, projectId))),
-    db.select({ id: designFreezes.id }).from(designFreezes).where(and(eq(designFreezes.companyId, companyId), eq(designFreezes.projectId, projectId), eq(designFreezes.status, "active"))),
+      .where(and(eq(designDecisions.companyId, companyId), eq(designDecisions.projectId, projectId)))
+      .groupBy(designDecisions.status),
+    db
+      .select({
+        id: designDeliverables.id,
+        consultantId: designDeliverables.consultantId,
+        discipline: designDeliverables.discipline,
+        packageId: designDeliverables.packageId,
+        status: designDeliverables.status,
+        slippageLevel: designDeliverables.slippageLevel,
+        slippageDays: designDeliverables.slippageDays,
+        plannedIssueDate: designDeliverables.plannedIssueDate,
+        actualIssueDate: designDeliverables.actualIssueDate,
+      })
+      .from(designDeliverables)
+      .where(and(eq(designDeliverables.companyId, companyId), eq(designDeliverables.projectId, projectId)))
+      .orderBy(desc(designDeliverables.createdAt))
+      .limit(ROLLUP_ROW_CAP + 1),
+    db
+      .select({
+        status: designChangeNotices.status,
+        currency: designChangeNotices.currency,
+        assessedCost: designChangeNotices.assessedCost,
+        isPostFreeze: designChangeNotices.isPostFreeze,
+      })
+      .from(designChangeNotices)
+      .where(and(eq(designChangeNotices.companyId, companyId), eq(designChangeNotices.projectId, projectId)))
+      .orderBy(desc(designChangeNotices.createdAt))
+      .limit(ROLLUP_ROW_CAP + 1),
+    db
+      .select({ status: designInfoRequirements.status, n: count() })
+      .from(designInfoRequirements)
+      .where(and(eq(designInfoRequirements.companyId, companyId), eq(designInfoRequirements.projectId, projectId)))
+      .groupBy(designInfoRequirements.status),
+    db
+      .select({
+        id: designConsultants.id,
+        name: designConsultants.name,
+        status: designConsultants.status,
+        piRequiredAmount: designConsultants.piRequiredAmount,
+        piCoverAmount: designConsultants.piCoverAmount,
+        piCurrency: designConsultants.piCurrency,
+        piExpiresOn: designConsultants.piExpiresOn,
+      })
+      .from(designConsultants)
+      .where(and(eq(designConsultants.companyId, companyId), eq(designConsultants.projectId, projectId)))
+      .limit(1000),
+    db
+      .select({ n: count() })
+      .from(designFreezes)
+      .where(and(eq(designFreezes.companyId, companyId), eq(designFreezes.projectId, projectId), eq(designFreezes.status, "active"))),
     db
       .select()
       .from(designReadinessSnapshots)
@@ -1235,9 +1401,39 @@ export async function designSummary(
       .limit(200),
   ]);
 
+  const reviewRows = cap(reviewRowsRaw, "review cycles");
+  const deliverableRows = cap(deliverableRowsRaw, "deliverables");
+  const dcnRows = cap(dcnRowsRaw, "change notices");
+
+  const sumGroups = <T extends { n: number }>(groups: readonly T[]): number =>
+    groups.reduce((total, g) => total + g.n, 0);
+  const groupTally = <T extends { n: number }>(
+    groups: readonly T[],
+    key: (g: T) => string | null | undefined,
+    keep: (g: T) => boolean = () => true,
+  ): Record<string, number> => {
+    const out: Record<string, number> = {};
+    for (const g of groups) {
+      if (!keep(g)) continue;
+      const k = key(g);
+      if (!k) continue;
+      out[k] = (out[k] ?? 0) + g.n;
+    }
+    return out;
+  };
+
+  const isOpenIssueStatus = (status: string) => (OPEN_ISSUE_STATUSES as readonly string[]).includes(status);
+  const packageTotal = sumGroups(packageGroups);
+  const commentTotal = sumGroups(commentGroups);
+  const issueTotal = sumGroups(issueGroups);
+  const openIssueTotal = sumGroups(issueGroups.filter((g) => isOpenIssueStatus(g.status)));
+  const decisionTotal = sumGroups(decisionGroups);
+  const infoTotal = sumGroups(infoGroups);
+  const statusCount = <T extends { n: number; status: string }>(groups: readonly T[], status: string): number =>
+    sumGroups(groups.filter((g) => g.status === status));
+
   const openReviews = reviewRows.filter((r) => (OPEN_REVIEW_STATUSES as readonly string[]).includes(r.status));
   const turnarounds = reviewRows.map((r) => r.turnaroundDays).filter((x): x is number => typeof x === "number");
-  const openIssues = issueRows.filter((i) => (OPEN_ISSUE_STATUSES as readonly string[]).includes(i.status));
   const slippage = slippageStats(
     deliverableRows.map((d) => ({
       id: d.id,
@@ -1279,12 +1475,13 @@ export async function designSummary(
 
   return {
     asOf,
+    notes,
     packages: {
-      total: packageRows.length,
-      byStatus: tally(packageRows, (p) => p.status),
-      byDiscipline: tally(packageRows, (p) => p.discipline),
-      frozen: packageRows.filter((p) => p.frozenAt !== null).length,
-      approved: packageRows.filter((p) => p.status === "approved" || p.status === "frozen").length,
+      total: packageTotal,
+      byStatus: groupTally(packageGroups, (g) => g.status),
+      byDiscipline: groupTally(packageGroups, (g) => g.discipline),
+      frozen: frozenPackages[0]?.n ?? 0,
+      approved: sumGroups(packageGroups.filter((g) => g.status === "approved" || g.status === "frozen")),
     },
     stages: {
       planned: stageRows.filter((g) => g.status === "planned").length,
@@ -1330,19 +1527,21 @@ export async function designSummary(
       byCode: tally(reviewRows, (r) => r.consolidatedCode),
     },
     comments: {
-      total: commentRows.length,
-      open: commentRows.filter((c) => c.status === "open" || c.status === "responded").length,
+      total: commentTotal,
+      open: sumGroups(commentGroups.filter((g) => g.status === "open" || g.status === "responded")),
     },
     issues: {
-      total: issueRows.length,
-      open: openIssues.length,
-      criticalOpen: openIssues.filter((i) => i.priority === "critical" || i.priority === "high").length,
-      byDiscipline: tally(openIssues, (i) => i.discipline),
+      total: issueTotal,
+      open: openIssueTotal,
+      criticalOpen: sumGroups(
+        issueGroups.filter((g) => isOpenIssueStatus(g.status) && (g.priority === "critical" || g.priority === "high")),
+      ),
+      byDiscipline: groupTally(issueGroups, (g) => g.discipline, (g) => isOpenIssueStatus(g.status)),
     },
     decisions: {
-      total: decisionRows.length,
-      proposed: decisionRows.filter((d) => d.status === "proposed").length,
-      decided: decisionRows.filter((d) => d.status === "decided").length,
+      total: decisionTotal,
+      proposed: statusCount(decisionGroups, "proposed"),
+      decided: statusCount(decisionGroups, "decided"),
     },
     deliverables: {
       total: deliverableRows.length,
@@ -1362,17 +1561,17 @@ export async function designSummary(
           : null,
     },
     infoRequirements: {
-      total: infoRows.length,
-      overdue: infoRows.filter((r) => r.status === "overdue").length,
-      delivered: infoRows.filter((r) => r.status === "delivered").length,
-      verified: infoRows.filter((r) => r.status === "verified").length,
+      total: infoTotal,
+      overdue: statusCount(infoGroups, "overdue"),
+      delivered: statusCount(infoGroups, "delivered"),
+      verified: statusCount(infoGroups, "verified"),
     },
     consultants: {
       total: consultantRows.length,
       piInadequate: piVerdicts.filter((v) => v.adequate === false).length,
       piUnknown: piVerdicts.filter((v) => v.adequate === null).length,
     },
-    freezes: { active: freezeRows.length },
+    freezes: { active: freezeCount[0]?.n ?? 0 },
     readiness: {
       level: latestReadiness?.level ?? "not_assessable",
       score: latestReadiness?.score ?? null,

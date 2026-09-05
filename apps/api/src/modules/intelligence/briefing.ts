@@ -289,26 +289,66 @@ export async function generateBriefing(
   const proposals: unknown[] = [];
   for (const action of reconciled.proposedActions) {
     const reviewId = newId("airev");
-    const proposal = {
-      kind: action.kind,
-      title: action.title,
-      rationale: action.rationale,
-      attentionId: action.attentionId,
-      briefingId,
-      citations: action.citations.map((r) => reconciled.citations.find((c) => c.ref === r)).filter(Boolean),
-    };
-    await app.db.insert(aiReviewQueue).values({
-      id: reviewId,
-      companyId,
-      projectId: opts.projectId,
-      runId: result.runId,
-      targetType: "attention_action",
-      targetId: action.attentionId,
-      proposal,
-      summary: action.title,
-      confidence: null,
-      status: "pending",
-    });
+    reviewIds.push(reviewId);
+    proposals.push({ ...action, reviewId });
+  }
+
+  /**
+   * The review-queue rows and the briefing they came from are written
+   * together: every proposal carries `briefingId` and the attention feed
+   * raises an item per pending row, so a half-written pair would leave a
+   * reviewer with proposals whose reasoning does not exist.
+   */
+  const briefing = await app.db.transaction(async (tx) => {
+    for (let i = 0; i < reconciled.proposedActions.length; i += 1) {
+      const action = reconciled.proposedActions[i]!;
+      const reviewId = reviewIds[i]!;
+      await tx.insert(aiReviewQueue).values({
+        id: reviewId,
+        companyId,
+        projectId: opts.projectId,
+        runId: result.runId,
+        targetType: "attention_action",
+        targetId: action.attentionId,
+        proposal: {
+          kind: action.kind,
+          title: action.title,
+          rationale: action.rationale,
+          attentionId: action.attentionId,
+          briefingId,
+          citations: action.citations.map((r) => reconciled.citations.find((c) => c.ref === r)).filter(Boolean),
+        },
+        summary: action.title,
+        confidence: null,
+        status: "pending",
+      });
+    }
+    const [row] = await tx
+      .insert(pulseBriefings)
+      .values({
+        id: briefingId,
+        companyId,
+        projectId: opts.projectId,
+        runId: result.runId,
+        headline: output.headline,
+        summary: output.summary,
+        highlights: reconciled.highlights,
+        citations: reconciled.citations,
+        proposals,
+        reviewIds,
+        requestedBy: actorId,
+        generatedAt: opts.now.toISOString(),
+      })
+      .returning();
+    return row!;
+  });
+
+  // The ledger is appended after the commit (it serialises per company and
+  // must never describe a write that rolled back).
+  for (const reviewId of reviewIds) {
+    const proposal = proposals.find((p) => (p as { reviewId: string }).reviewId === reviewId) as
+      | { attentionId: string | null }
+      | undefined;
     await appendLedger(app.db, {
       companyId,
       actorId,
@@ -316,29 +356,9 @@ export async function generateBriefing(
       objectType: "ai_review_item",
       objectId: reviewId,
       projectId: opts.projectId,
-      payload: { targetType: "attention_action", targetId: action.attentionId, runId: result.runId, briefingId },
+      payload: { targetType: "attention_action", targetId: proposal?.attentionId ?? null, runId: result.runId, briefingId },
     });
-    reviewIds.push(reviewId);
-    proposals.push({ ...action, reviewId });
   }
-
-  const [briefing] = await app.db
-    .insert(pulseBriefings)
-    .values({
-      id: briefingId,
-      companyId,
-      projectId: opts.projectId,
-      runId: result.runId,
-      headline: output.headline,
-      summary: output.summary,
-      highlights: reconciled.highlights,
-      citations: reconciled.citations,
-      proposals,
-      reviewIds,
-      requestedBy: actorId,
-      generatedAt: opts.now.toISOString(),
-    })
-    .returning();
 
   await appendLedger(app.db, {
     companyId,
@@ -374,7 +394,7 @@ export async function generateBriefing(
   }
 
   return {
-    briefing: briefing!,
+    briefing,
     reviewIds,
     dropped: { highlights: reconciled.droppedHighlights, actions: reconciled.droppedActions },
   };

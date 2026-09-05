@@ -23,6 +23,7 @@ import {
   Field,
   Progress,
   ProgressRing,
+  SegmentedControl,
   Skeleton,
   Sparkline,
   Textarea,
@@ -103,12 +104,25 @@ export interface AttentionItem {
   status?: string;
   firstSeenAt?: string;
   lastSeenAt?: string;
+  /** whether THIS caller may set the item aside — the API resolves it per project */
+  canAct?: boolean;
 }
 
 export interface AttentionList {
   items: AttentionItem[];
   total: number;
+  /** project routes answer once for the whole page */
+  canAct?: boolean;
 }
+
+/** The three states an attention item can be read in. */
+export type AttentionStatus = "open" | "dismissed" | "resolved";
+
+export const ATTENTION_STATUS_OPTIONS: ReadonlyArray<{ value: AttentionStatus; label: string; title: string }> = [
+  { value: "open", label: "Open", title: "Live items ranked by severity × urgency × money" },
+  { value: "dismissed", label: "Set aside", title: "Items a person dismissed with a reason — reopen one here" },
+  { value: "resolved", label: "Resolved", title: "Items whose underlying condition the sweep could no longer find" },
+];
 
 export interface PulseChanges {
   since: string | null;
@@ -149,6 +163,8 @@ export interface PulseResponse {
   scores: ProjectHealth[];
   briefing: BriefingSummary;
   changes: PulseChanges;
+  /** source types the sweep could not exhaust — the feed is the top of more */
+  attentionTruncated?: string[];
   computedOnRead: boolean;
 }
 
@@ -652,6 +668,90 @@ export function AttentionTable({
   );
 }
 
+/**
+ * Open / Set aside / Resolved. Dismissing is reversible only if a dismissed
+ * item can be found again, so this control is what makes the reopen route
+ * reachable from the product.
+ */
+export function AttentionStatusFilter({
+  value,
+  onChange,
+  counts,
+}: {
+  value: AttentionStatus;
+  onChange: (next: AttentionStatus) => void;
+  counts?: Partial<Record<AttentionStatus, number>>;
+}) {
+  return (
+    <SegmentedControl<AttentionStatus>
+      value={value}
+      onChange={onChange}
+      aria-label="Attention item status"
+      options={ATTENTION_STATUS_OPTIONS.map((o) => ({
+        value: o.value,
+        label: o.label,
+        title: o.title,
+        count: counts?.[o.value],
+      }))}
+    />
+  );
+}
+
+/** The empty state that belongs to each status — never the wrong reassurance. */
+export function attentionEmpty(status: AttentionStatus, scope: "company" | "project"): { title: string; hint: string } {
+  const where = scope === "project" ? " on this project" : "";
+  switch (status) {
+    case "dismissed":
+      return {
+        title: `Nothing has been set aside${where}`,
+        hint: "Items a person dismisses appear here with their reason, and can be reopened.",
+      };
+    case "resolved":
+      return {
+        title: `Nothing has resolved itself${where} yet`,
+        hint: "An item lands here when the sweep can no longer find its source record — a closed RFI, a met deadline, a cleared hold.",
+      };
+    default:
+      return {
+        title: `Nothing needs a decision${where}`,
+        hint: "Every obligation, deadline, signal and overdue record the platform holds is within tolerance.",
+      };
+  }
+}
+
+/** What the status filter is showing, said plainly under the table. */
+export function statusHint(status: AttentionStatus): string {
+  switch (status) {
+    case "dismissed":
+      return "Items someone set aside, with the reason on the ledger. Open one to reopen it.";
+    case "resolved":
+      return "Items the sweep could no longer find a source for. They return automatically if the condition comes back.";
+    default:
+      return "Live items, ranked by severity × urgency × money.";
+  }
+}
+
+/**
+ * Every source query is capped. When one hits its cap the feed is the most
+ * urgent slice of more, and saying so is the difference between a ranked feed
+ * and a false claim of completeness.
+ */
+export function TruncationNote({ sources }: { sources: string[] | undefined }) {
+  if (!sources || sources.length === 0) return null;
+  const named = sources.filter((s) => s !== "projects").map((s) => formatStatusLabel(s).toLowerCase());
+  const projectsCapped = sources.includes("projects");
+  return (
+    <p className="border-t border-border px-4 py-2 text-meta text-warning-fg">
+      {named.length > 0
+        ? `More items exist than the feed holds for ${named.join(", ")} — the most urgent are shown, and nothing from those sources is reported as resolved.`
+        : null}
+      {projectsCapped
+        ? " The company has more projects than one sweep covers; the rest are refreshed on the next cycles."
+        : null}
+    </p>
+  );
+}
+
 export function AttentionDrawer({
   item,
   onClose,
@@ -670,6 +770,7 @@ export function AttentionDrawer({
   const navigate = useNavigate();
   const [reason, setReason] = useState("");
   const dismissed = item?.status === "dismissed";
+  const resolved = item?.status === "resolved";
   return (
     <Drawer
       open={item !== null}
@@ -685,7 +786,7 @@ export function AttentionDrawer({
             <Button variant="secondary" size="sm" trailingIcon={IconArrowRight} onClick={() => navigate(item.href)}>
               Open the record
             </Button>
-            {canAct ? (
+            {canAct && !resolved ? (
               dismissed ? (
                 <Button size="sm" variant="secondary" loading={busy} onClick={() => void onReopen(item)}>
                   Reopen
@@ -722,10 +823,18 @@ export function AttentionDrawer({
             <Row label="Source" value={`${formatStatusLabel(item.sourceType)} ${item.sourceId}`} mono />
             {item.firstSeenAt ? <Row label="First seen" value={`${formatDateTime(item.firstSeenAt)} (${formatRelativeTime(item.firstSeenAt)})`} /> : null}
           </dl>
-          {canAct && !dismissed ? (
+          {canAct && !dismissed && !resolved ? (
             <Field label="Reason for dismissing" hint="Recorded on the ledger with your name. Leave blank if the item simply needs no action.">
               <Textarea rows={3} value={reason} onChange={(e) => setReason(e.target.value)} placeholder="e.g. Answered by phone, closing tomorrow" />
             </Field>
+          ) : null}
+          {dismissed ? (
+            <p className="text-meta text-content-subtle">Set aside by a person. Reopening puts it back at the top of the feed and is recorded on the ledger.</p>
+          ) : null}
+          {resolved ? (
+            <p className="text-meta text-content-subtle">
+              The sweep could no longer find this condition, so it left the feed on its own. It returns automatically — same row, same history — if the condition comes back.
+            </p>
           ) : null}
           {!canAct ? (
             <p className="text-meta text-content-subtle">You can read this item but not set it aside — that needs standard access to intelligence on the project.</p>

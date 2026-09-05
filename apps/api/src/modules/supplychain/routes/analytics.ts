@@ -237,8 +237,8 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
 
   app.get(`${base}/signals`, { preHandler: readGate }, async (req) => {
     const { projectId } = req.params as { projectId: string };
-    const { openSignals } = await gather(req.companyId!, projectId);
-    return { items: openSignals, total: openSignals.length };
+    const { openSignals, truncated } = await gather(req.companyId!, projectId);
+    return { items: openSignals, total: openSignals.length, truncated: truncated.filter((t) => t.includes("open supply signals")) };
   });
 };
 

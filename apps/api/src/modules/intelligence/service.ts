@@ -52,7 +52,8 @@ const SNAPSHOT_DEDUPE_MS = 6 * HOUR_MS;
 const HEALTH_RETENTION_DAYS = 90;
 const PULSE_RETENTION_DAYS = 30;
 const TREND_DAYS = 14;
-const MAX_PROJECTS_PER_COMPANY = 1000;
+/** a sweep never loads more than this many projects: past it, resolution is unsafe */
+export const MAX_PROJECTS_PER_COMPANY = 1000;
 /** above this, a first Pulse read does not recompute the whole portfolio inline */
 const COLD_READ_PROJECT_LIMIT = 25;
 
@@ -824,17 +825,34 @@ async function computeChanges(
   };
 }
 
+/**
+ * Key-order-independent serialisation. Postgres normalises jsonb key order,
+ * so a plain JSON.stringify of a stored object never equals the object that
+ * produced it — and the dedupe below would insert a snapshot every five
+ * minutes forever.
+ */
+function canonical(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value ?? null) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b));
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
+}
+
 function samePulse(
   prev: PulseRow,
   portfolio: PortfolioRollup,
   bySeverity: Record<string, number>,
   open: number,
   truncatedSources: string[],
+  projectRollup: ProjectRollup,
 ): boolean {
   return (
-    JSON.stringify(prev.portfolio) === JSON.stringify(portfolio) &&
-    JSON.stringify(prev.attentionBySeverity) === JSON.stringify(bySeverity) &&
-    JSON.stringify(prev.truncatedSources ?? []) === JSON.stringify(truncatedSources) &&
+    canonical(prev.portfolio) === canonical(portfolio) &&
+    canonical(prev.attentionBySeverity) === canonical(bySeverity) &&
+    canonical(prev.truncatedSources ?? []) === canonical(truncatedSources) &&
+    // the per-project slice matters too: a restricted reader's history is built
+    // from it, so a company total that happens to be unchanged is not enough
+    canonical(prev.projectRollup ?? {}) === canonical(projectRollup) &&
     prev.openAttention === open
   );
 }
@@ -872,7 +890,7 @@ export async function refreshPulse(db: Db, companyId: string, now: Date, opts: R
   if (
     !opts.force &&
     latest &&
-    samePulse(latest, portfolio, counts, open, truncatedSources) &&
+    samePulse(latest, portfolio, counts, open, truncatedSources, projectRollup) &&
     now.getTime() - Date.parse(latest.generatedAt) < SNAPSHOT_DEDUPE_MS
   ) {
     return latest;
@@ -1047,7 +1065,8 @@ export async function readPulse(db: Db, companyId: string, now: Date, opts: Read
           newAttention: storedChanges.newAttention ?? 0,
           resolvedAttention: storedChanges.resolvedAttention ?? 0,
           openAttentionFrom: storedChanges.openAttentionFrom ?? null,
-          openAttentionTo: storedChanges.openAttentionTo ?? sev.open,
+          // the live count, so the chip beside the hero can never disagree with it
+          openAttentionTo: sev.open,
         }
       : // A partial view must not carry the company's totals beside its own
         // filtered figures: recount the movements over the visible projects

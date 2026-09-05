@@ -125,7 +125,7 @@ const post = (url: string, payload?: unknown, headers = owner.headers) =>
   app.inject({ method: "POST", url: `/api/v1${url}`, headers, payload: payload ?? {} });
 const get = (url: string, headers = owner.headers) =>
   app.inject({ method: "GET", url: `/api/v1${url}`, headers });
-const patch = (url: string, payload: unknown, headers = owner.headers) =>
+const patch = (url: string, payload: object, headers = owner.headers) =>
   app.inject({ method: "PATCH", url: `/api/v1${url}`, headers, payload });
 const del = (url: string, headers = owner.headers) =>
   app.inject({ method: "DELETE", url: `/api/v1${url}`, headers });

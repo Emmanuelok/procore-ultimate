@@ -32,7 +32,17 @@ import {
   toast,
   type DataColumns,
 } from "../../ui";
-import { IconEdit, IconPlus, IconRefresh, IconTrash, IconVersion } from "../../ui/icons";
+import {
+  IconChangeOrder,
+  IconEdit,
+  IconExport,
+  IconLock,
+  IconPlus,
+  IconRefresh,
+  IconTrash,
+  IconUnlock,
+  IconVersion,
+} from "../../ui/icons";
 import {
   BasisList,
   COST_TYPES,
@@ -64,10 +74,19 @@ import {
   type EstimateDetail,
   type EstimateLine,
   type Paginated,
+  type ProposalDocument,
   type TakeoffItem,
 } from "./estimatingShared";
 
 type WorkspaceTab = "grid" | "markups" | "versions" | "convert";
+
+/** The change events this estimate can be pushed onto (#208). */
+interface ChangeEventOption {
+  id: string;
+  reference: string;
+  title: string;
+  status: string;
+}
 
 export default function EstimatesTab({
   projectId,
@@ -365,6 +384,10 @@ function EstimateWorkspace({
   onOpenOther: (id: string) => void;
 }) {
   const [tab, setTab] = useState<WorkspaceTab>("grid");
+  const [rejecting, setRejecting] = useState(false);
+  const [rejectReason, setRejectReason] = useState("");
+  const [editingHeader, setEditingHeader] = useState(false);
+  const [pushing, setPushing] = useState(false);
   const action = useAction();
   const estimate = useResource<EstimateDetail>(
     estimateId ? `/api/v1/projects/${projectId}/estimates/${estimateId}` : null,
@@ -425,6 +448,9 @@ function EstimateWorkspace({
                 <Button size="sm" onClick={() => void transition("approve")} loading={action.busy === "approve"}>
                   Approve
                 </Button>
+                <Button size="sm" variant="secondary" onClick={() => setRejecting(true)}>
+                  Reject
+                </Button>
                 <Button size="sm" variant="secondary" onClick={() => void transition("withdraw")} loading={action.busy === "withdraw"}>
                   Withdraw
                 </Button>
@@ -457,6 +483,51 @@ function EstimateWorkspace({
               loading={action.busy === "recalc"}
             >
               Recalculate
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={IconExport}
+              loading={action.busy === "csv"}
+              onClick={() =>
+                void action.run("csv", () => estimatingApi.exportCsv(projectId, e.id, e.reference))
+              }
+            >
+              Export CSV
+            </Button>
+            {editable ? (
+              <Button size="sm" variant="ghost" icon={IconEdit} onClick={() => setEditingHeader(true)}>
+                Edit
+              </Button>
+            ) : null}
+            {e.lockedAt ? (
+              <Button
+                size="sm"
+                variant="ghost"
+                icon={IconUnlock}
+                loading={action.busy === "unlock"}
+                onClick={() => void transition("unlock")}
+              >
+                Unlock
+              </Button>
+            ) : (
+              <Button
+                size="sm"
+                variant="ghost"
+                icon={IconLock}
+                loading={action.busy === "lock"}
+                onClick={() => void transition("lock")}
+              >
+                Lock
+              </Button>
+            )}
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={IconChangeOrder}
+              onClick={() => setPushing(true)}
+            >
+              Push to change event
             </Button>
           </div>
         ) : undefined
@@ -530,9 +601,322 @@ function EstimateWorkspace({
           {tab === "convert" ? (
             <ConvertPanel projectId={projectId} estimate={e} onReload={reload} />
           ) : null}
+
+          <Modal
+            open={rejecting}
+            title={`Reject ${e.reference}`}
+            description="A rejection is a decision on somebody else's work, so it carries a reason. The estimator sees it verbatim and the estimate goes back to draft."
+            onClose={() => setRejecting(false)}
+            footer={
+              <div className="flex justify-end gap-2">
+                <Button variant="secondary" onClick={() => setRejecting(false)}>
+                  Cancel
+                </Button>
+                <Button
+                  variant="danger"
+                  loading={action.busy === "reject"}
+                  disabled={rejectReason.trim().length === 0}
+                  onClick={() =>
+                    void action
+                      .run("reject", () =>
+                        estimatingApi.transition(projectId, e.id, "reject", {
+                          reason: rejectReason,
+                        }),
+                      )
+                      .then((res) => {
+                        if (res) {
+                          toast.success(`${res.reference} sent back to the estimator`);
+                          setRejecting(false);
+                          setRejectReason("");
+                          reload();
+                        }
+                      })
+                  }
+                >
+                  Reject
+                </Button>
+              </div>
+            }
+          >
+            <div className="space-y-3">
+              {action.error ? (
+                <Alert tone="danger" size="sm">
+                  {action.error}
+                </Alert>
+              ) : null}
+              <Field label="Reason" required hint="What has to change before this number can be approved.">
+                <Textarea
+                  value={rejectReason}
+                  onChange={(ev) => setRejectReason(ev.target.value)}
+                  rows={4}
+                  placeholder="The mechanical package is priced on the superseded rev C drawings."
+                />
+              </Field>
+            </div>
+          </Modal>
+
+          <HeaderEditor
+            projectId={projectId}
+            estimate={e}
+            open={editingHeader}
+            onClose={() => setEditingHeader(false)}
+            onSaved={() => {
+              setEditingHeader(false);
+              reload();
+            }}
+            onVoided={() => {
+              setEditingHeader(false);
+              onChanged();
+              onClose();
+            }}
+          />
+
+          <ChangeEventPusher
+            projectId={projectId}
+            estimate={e}
+            open={pushing}
+            onClose={() => setPushing(false)}
+            onPushed={reload}
+          />
         </div>
       )}
     </Drawer>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Header edit and void                                                */
+/* ------------------------------------------------------------------ */
+
+function HeaderEditor({
+  projectId,
+  estimate,
+  open,
+  onClose,
+  onSaved,
+  onVoided,
+}: {
+  projectId: string;
+  estimate: EstimateDetail;
+  open: boolean;
+  onClose: () => void;
+  onSaved: () => void;
+  onVoided: () => void;
+}) {
+  const action = useAction();
+  const [name, setName] = useState(estimate.name);
+  const [estimateType, setEstimateType] = useState(estimate.estimateType);
+  const [basis, setBasis] = useState(estimate.basis ?? "");
+  const [notes, setNotes] = useState(estimate.notes ?? "");
+  const [confirmVoid, setConfirmVoid] = useState(false);
+
+  useEffect(() => {
+    setName(estimate.name);
+    setEstimateType(estimate.estimateType);
+    setBasis(estimate.basis ?? "");
+    setNotes(estimate.notes ?? "");
+    setConfirmVoid(false);
+  }, [estimate.id, estimate.name, estimate.estimateType, estimate.basis, estimate.notes, open]);
+
+  return (
+    <Modal
+      open={open}
+      title={`Edit ${estimate.reference}`}
+      description="The header only — the priced lines are edited in the grid."
+      onClose={onClose}
+      footer={
+        <div className="flex justify-between gap-2">
+          <Button
+            variant="danger"
+            icon={IconTrash}
+            loading={action.busy === "void"}
+            onClick={() => {
+              if (!confirmVoid) {
+                setConfirmVoid(true);
+                return;
+              }
+              void action.run("void", () => estimatingApi.voidEstimate(projectId, estimate.id)).then((res) => {
+                if (res) {
+                  toast.success(`${estimate.reference} voided`);
+                  onVoided();
+                }
+              });
+            }}
+          >
+            {confirmVoid ? "Void it — this cannot be undone" : "Void this estimate"}
+          </Button>
+          <div className="flex gap-2">
+            <Button variant="secondary" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button
+              loading={action.busy === "save"}
+              disabled={name.trim().length === 0}
+              onClick={() =>
+                void action
+                  .run("save", () =>
+                    estimatingApi.patchEstimate(projectId, estimate.id, {
+                      name,
+                      estimateType,
+                      basis: basis.trim().length > 0 ? basis : null,
+                      notes: notes.trim().length > 0 ? notes : null,
+                    }),
+                  )
+                  .then((res) => {
+                    if (res) {
+                      toast.success("Saved");
+                      onSaved();
+                    }
+                  })
+              }
+            >
+              Save
+            </Button>
+          </div>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        {action.error ? (
+          <Alert tone="danger" size="sm" onDismiss={action.clear}>
+            {action.error}
+          </Alert>
+        ) : null}
+        {estimate.status === "in_review" ? (
+          <Alert tone="warning" size="sm">
+            This estimate is under review. Editing it returns it to draft and clears any approval — an
+            approval belongs to a set of numbers, not to a name.
+          </Alert>
+        ) : null}
+        <Field label="Name" required>
+          <Input value={name} onChange={(e) => setName(e.target.value)} />
+        </Field>
+        <Field label="Design maturity">
+          <Select value={estimateType} onChange={(e) => setEstimateType(e.target.value)}>
+            {ESTIMATE_TYPES.map((t) => (
+              <option key={t} value={t}>
+                {titleCase(t)}
+              </option>
+            ))}
+          </Select>
+        </Field>
+        <Field label="Basis" optional>
+          <Textarea value={basis} onChange={(e) => setBasis(e.target.value)} rows={3} />
+        </Field>
+        <Field label="Notes" optional>
+          <Textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} />
+        </Field>
+      </div>
+    </Modal>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Change-order estimating (#208)                                      */
+/* ------------------------------------------------------------------ */
+
+function ChangeEventPusher({
+  projectId,
+  estimate,
+  open,
+  onClose,
+  onPushed,
+}: {
+  projectId: string;
+  estimate: EstimateDetail;
+  open: boolean;
+  onClose: () => void;
+  onPushed: () => void;
+}) {
+  const action = useAction();
+  const [changeEventId, setChangeEventId] = useState("");
+  const [field, setField] = useState<"estimated" | "latest" | "both">("both");
+  const [result, setResult] = useState<string[] | null>(null);
+  const events = useResource<Paginated<ChangeEventOption>>(
+    open ? `/api/v1/projects/${projectId}/change-events?page=1&pageSize=200` : null,
+  );
+
+  return (
+    <Modal
+      open={open}
+      title={`Push ${estimate.reference} onto a change event`}
+      description="The estimate's total becomes the change event's cost. The estimate is stamped with the event it priced, so the number on the event can always be traced back to a priced build-up."
+      onClose={onClose}
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="secondary" onClick={onClose}>
+            Close
+          </Button>
+          <Button
+            loading={action.busy === "push"}
+            disabled={changeEventId.length === 0}
+            onClick={() =>
+              void action
+                .run("push", () =>
+                  estimatingApi.pushToChangeEvent(projectId, estimate.id, { changeEventId, field }),
+                )
+                .then((res) => {
+                  if (res) {
+                    toast.success(
+                      `${money(res.pushed, res.currency)} pushed onto ${res.changeEventReference}`,
+                    );
+                    setResult(res.warnings.length > 0 ? res.warnings : ["Pushed."]);
+                    onPushed();
+                  }
+                })
+            }
+          >
+            Push
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        {action.error ? (
+          <Alert tone="danger" size="sm" onDismiss={action.clear}>
+            {action.error}
+          </Alert>
+        ) : null}
+        {events.error ? (
+          <LoadError message={events.error} onRetry={events.reload} />
+        ) : (events.data?.items ?? []).length === 0 ? (
+          <Alert tone="info" size="sm">
+            This project has no change events yet, so there is nothing to price against.
+          </Alert>
+        ) : (
+          <>
+            <Field label="Change event" required>
+              <Select value={changeEventId} onChange={(e) => setChangeEventId(e.target.value)}>
+                <option value="">Choose a change event</option>
+                {(events.data?.items ?? []).map((ev) => (
+                  <option key={ev.id} value={ev.id}>
+                    {ev.reference} — {ev.title} ({titleCase(ev.status)})
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field
+              label="Which figure"
+              hint="Estimated is the first view of the cost; latest is the current one. Both keeps them in step."
+            >
+              <Select
+                value={field}
+                onChange={(e) => setField(e.target.value as "estimated" | "latest" | "both")}
+              >
+                <option value="both">Estimated and latest</option>
+                <option value="estimated">Estimated only</option>
+                <option value="latest">Latest only</option>
+              </Select>
+            </Field>
+            <div className="rounded-md border border-border bg-surface-sunken p-3 text-2xs text-content-subtle">
+              This estimate totals {money(estimate.total, estimate.currency)} across {count(estimate.lineCount)}{" "}
+              lines.
+            </div>
+          </>
+        )}
+        {result ? <BasisList lines={result} /> : null}
+      </div>
+    </Modal>
   );
 }
 
@@ -686,8 +1070,43 @@ function GridPanel({
           <AssemblyInserter projectId={projectId} estimate={estimate} onDone={onReload} />
           <TakeoffInserter projectId={projectId} estimate={estimate} onDone={onReload} />
           <SectionCreator projectId={projectId} estimate={estimate} onDone={onReload} />
+          <BulkLineImporter projectId={projectId} estimate={estimate} onDone={onReload} />
         </div>
       )}
+
+      {editable && estimate.sections.length > 0 ? (
+        <div className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-surface-sunken px-3 py-2">
+          <span className="text-2xs uppercase tracking-wide text-content-subtle">Sections</span>
+          {estimate.sections.map((s) => (
+            <span
+              key={s.id}
+              className="inline-flex items-center gap-1 rounded border border-border bg-surface px-2 py-0.5 text-2xs text-content"
+            >
+              {s.code ? `${s.code} ${s.name}` : s.name}
+              <button
+                type="button"
+                aria-label={`Remove section ${s.name}`}
+                className="text-content-subtle hover:text-danger"
+                disabled={action.busy === `del-${s.id}`}
+                onClick={() =>
+                  void action
+                    .run(`del-${s.id}`, () =>
+                      estimatingApi.deleteSection(projectId, estimate.id, s.id),
+                    )
+                    .then((res) => {
+                      if (res) {
+                        toast.success(`${s.name} removed — its lines were unparented, not deleted`);
+                        onReload();
+                      }
+                    })
+                }
+              >
+                ×
+              </button>
+            </span>
+          ))}
+        </div>
+      ) : null}
 
       {action.error ? (
         <Alert tone="danger" size="sm" onDismiss={action.clear}>
@@ -741,6 +1160,138 @@ function GridPanel({
         }}
       />
     </div>
+  );
+}
+
+/**
+ * Paste a priced schedule straight into the grid. Every line goes through the
+ * same resolver as a typed one, so a bulk import carries the same basis and
+ * the same provenance — it is a faster keyboard, not a back door.
+ */
+function BulkLineImporter({
+  projectId,
+  estimate,
+  onDone,
+}: {
+  projectId: string;
+  estimate: EstimateDetail;
+  onDone: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [raw, setRaw] = useState("");
+  const [sectionId, setSectionId] = useState("");
+  const [costType, setCostType] = useState("other");
+  const action = useAction();
+
+  const parsed = useMemo(
+    () =>
+      raw
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0 && !line.startsWith("#"))
+        .map((line) => {
+          const [description = "", unit = "", qty = "", rate = "", costCode = ""] = line
+            .split("|")
+            .map((p) => p.trim());
+          return {
+            description,
+            unit: unit.length > 0 ? unit : null,
+            quantity: Number(qty) || 0,
+            costCode: costCode.length > 0 ? costCode : null,
+            costType,
+            rates: { [costType]: Number(rate) || 0 },
+            sectionId: sectionId.length > 0 ? sectionId : null,
+          };
+        })
+        .filter((l) => l.description.length > 0),
+    [raw, costType, sectionId],
+  );
+
+  return (
+    <>
+      <Button size="sm" variant="secondary" onClick={() => setOpen(true)}>
+        Paste lines
+      </Button>
+      <Modal
+        open={open}
+        title="Paste a priced schedule"
+        description="One line each: description | unit | quantity | rate | cost code. Every row is priced by the same engine as a typed line, so the basis and the provenance are identical."
+        onClose={() => setOpen(false)}
+        size="lg"
+        footer={
+          <div className="flex justify-end gap-2">
+            <Button variant="secondary" onClick={() => setOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              loading={action.busy === "bulk"}
+              disabled={parsed.length === 0}
+              onClick={() =>
+                void action
+                  .run("bulk", () =>
+                    estimatingApi.createLinesBulk(projectId, estimate.id, { lines: parsed }),
+                  )
+                  .then((res) => {
+                    if (res) {
+                      toast.success(
+                        `${res.created} lines added — the estimate now totals ${money(res.estimateTotals.total, estimate.currency)}`,
+                      );
+                      setOpen(false);
+                      setRaw("");
+                      onDone();
+                    }
+                  })
+              }
+            >
+              Add {parsed.length > 0 ? `${parsed.length} line${parsed.length === 1 ? "" : "s"}` : ""}
+            </Button>
+          </div>
+        }
+      >
+        <div className="space-y-3">
+          {action.error ? (
+            <Alert tone="danger" size="sm" onDismiss={action.clear}>
+              {action.error}
+            </Alert>
+          ) : null}
+          <Field label="Lines">
+            <Textarea
+              value={raw}
+              onChange={(e) => setRaw(e.target.value)}
+              rows={9}
+              placeholder={"Blockwork to core walls | m2 | 480 | 62.50 | 04-2000\nMastic pointing | m | 120 | 8.25 |"}
+            />
+          </Field>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Cost type" hint="The bucket the rate goes into for every pasted row.">
+              <Select value={costType} onChange={(e) => setCostType(e.target.value)}>
+                {COST_TYPES.map((c) => (
+                  <option key={c} value={c}>
+                    {titleCase(c)}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Section" optional>
+              <Select value={sectionId} onChange={(e) => setSectionId(e.target.value)}>
+                <option value="">No section</option>
+                {estimate.sections.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.code ? `${s.code} ${s.name}` : s.name}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          </div>
+          <div className="rounded-md border border-border bg-surface-sunken p-3 text-2xs text-content-subtle">
+            {parsed.length} row{parsed.length === 1 ? "" : "s"} parsed
+            {parsed.length > 0
+              ? ` — first: ${parsed[0]!.description} at ${num(Number(Object.values(parsed[0]!.rates)[0] ?? 0), 2)} per ${parsed[0]!.unit ?? "unit"}.`
+              : "."}
+          </div>
+        </div>
+      </Modal>
+    </>
   );
 }
 
@@ -1695,6 +2246,7 @@ function ConvertPanel({
   const [preview, setPreview] = useState<ConversionPreview | null>(null);
   const [result, setResult] = useState<ConversionResult | null>(null);
   const [proposalOpen, setProposalOpen] = useState(false);
+  const [proposalPreview, setProposalPreview] = useState<ProposalDocument | null>(null);
   const [proposalTitle, setProposalTitle] = useState(estimate.name);
   const [clientName, setClientName] = useState("");
   const [detailLevel, setDetailLevel] = useState("section");
@@ -1915,6 +2467,54 @@ function ConvertPanel({
               <Input type="date" value={validUntil} onChange={(e) => setValidUntil(e.target.value)} />
             </Field>
           </div>
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              variant="secondary"
+              loading={action.busy === "preview"}
+              onClick={() =>
+                void action
+                  .run("preview", () =>
+                    estimatingApi.proposalPreview(projectId, estimate.id, {
+                      title: proposalTitle,
+                      clientName: clientName.trim().length > 0 ? clientName : null,
+                      detailLevel,
+                      validUntil,
+                    }),
+                  )
+                  .then((res) => {
+                    if (res) setProposalPreview(res);
+                  })
+              }
+            >
+              Preview what the client would see
+            </Button>
+            <span className="text-2xs text-content-subtle">Nothing is written by a preview.</span>
+          </div>
+          {proposalPreview ? (
+            <div className="max-h-64 space-y-2 overflow-auto rounded-md border border-border bg-surface-sunken p-3">
+              <div className="text-meta font-semibold text-content">{proposalPreview.title}</div>
+              <div className="text-2xs text-content-subtle">
+                {proposalPreview.projectName} · {titleCase(proposalPreview.detailLevel)} detail
+              </div>
+              <Table dense>
+                <tbody>
+                  {proposalPreview.sections.map((s) => (
+                    <tr key={s.id}>
+                      <Td>{s.code ? `${s.code} — ${s.name}` : s.name}</Td>
+                      <Td align="right">{money(s.amount, proposalPreview.currency)}</Td>
+                    </tr>
+                  ))}
+                  <tr>
+                    <Td className="font-semibold">Total</Td>
+                    <Td align="right" className="font-semibold">
+                      {money(proposalPreview.totals.total, proposalPreview.currency)}
+                    </Td>
+                  </tr>
+                </tbody>
+              </Table>
+            </div>
+          ) : null}
         </div>
       </Modal>
     </div>

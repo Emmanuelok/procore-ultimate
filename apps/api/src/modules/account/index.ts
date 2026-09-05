@@ -966,9 +966,23 @@ export const accountModule: FastifyPluginAsync = async (app) => {
             passwordHash: newPasswordHash!,
           });
         } else if (newPasswordHash) {
+          // `isActive: true` IS THE ACCEPTANCE. The invite route creates the
+          // stub with `isActive: false` and an unusable hash precisely so the
+          // account cannot be signed into before the invitee proves they hold
+          // the mailbox; this branch runs only when THIS invitation created
+          // THAT stub (`claimable && existing`), so it is the one moment the
+          // account becomes usable. Without it the invitee is handed a session
+          // that `plugins/auth.ts` rejects on its very next request (it
+          // reloads the user row and refuses `isActive = false`), and the
+          // password they just chose is refused at the login route for ever.
           await tx
             .update(users)
-            .set({ passwordHash: newPasswordHash, name: userName, updatedAt: nowIso })
+            .set({
+              passwordHash: newPasswordHash,
+              name: userName,
+              isActive: true,
+              updatedAt: nowIso,
+            })
             .where(eq(users.id, userId));
         }
 

@@ -77,6 +77,7 @@ async function makeWorker(reference: string, rate = 20): Promise<string> {
     hourlyRate: rate,
     overtimeMultiplier: 1.5,
     currency: "GBP",
+    createdBy: owner.userId,
   });
   return id;
 }
@@ -96,7 +97,7 @@ async function makeCard(
     allocations: [{ costCodeId, budgetLineItemId: budgetLineId, regularHours: workedHours }],
     ...over,
   });
-  expect(res.statusCode).toBe(201);
+  expect(res.statusCode, res.body).toBe(201);
   return res.json() as { id: string; reference: string; totalHours: number };
 }
 
@@ -142,6 +143,8 @@ beforeAll(async () => {
     id: budgetId,
     companyId: owner.companyId,
     projectId,
+    number: 1,
+    reference: "BUD-001",
     name: "Upgrade budget",
     createdBy: owner.userId,
   });
@@ -540,26 +543,27 @@ describe("regressions", () => {
       .from(changeEvents)
       .where(eq(changeEvents.projectId, projectId));
 
-    for (const _attempt of [1, 2]) {
-      const refused = await post(`/projects/${projectId}/tm-tickets/${ticketId}/promote`, {
-        target: "potential_change_order",
-      });
-      expect(refused.statusCode).toBe(409);
-    }
+    // The PCO cannot be made, so the ticket is promoted to the change event
+    // instead — and STAMPED, which is what stops the retry loop.
+    const first = await post(`/projects/${projectId}/tm-tickets/${ticketId}/promote`, {
+      target: "potential_change_order",
+    });
+    expect(first.statusCode).toBe(201);
+    expect(first.json().potentialChangeOrder).toBeNull();
+    expect(first.json().pcoRefused).not.toBeNull();
+    expect(first.json().ticket.incorporatedChangeOrderId).toBe(first.json().changeEvent.id);
+
+    // A retry raises NO second change event; it is refused outright.
+    const second = await post(`/projects/${projectId}/tm-tickets/${ticketId}/promote`, {
+      target: "potential_change_order",
+    });
+    expect(second.statusCode).toBe(409);
 
     const after = await app.db
       .select({ id: changeEvents.id })
       .from(changeEvents)
       .where(eq(changeEvents.projectId, projectId));
-    expect(after.length).toBe(before.length);
-
-    // and the entitlement is still reachable through the change-event path,
-    // which DOES stamp the ticket.
-    const asEvent = await post(`/projects/${projectId}/tm-tickets/${ticketId}/promote`, {
-      target: "change_event",
-    });
-    expect(asEvent.statusCode).toBe(201);
-    expect(asEvent.json().ticket.incorporatedChangeOrderId).toBe(asEvent.json().changeEvent.id);
+    expect(after.length).toBe(before.length + 1);
   });
 
   it("does not price a sourced labour line at the worker's internal pay rate", async () => {

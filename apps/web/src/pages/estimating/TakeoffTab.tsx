@@ -27,7 +27,7 @@ import {
   toast,
   type DataColumns,
 } from "../../ui";
-import { IconPlus, IconRuler, IconTrash } from "../../ui/icons";
+import { IconEdit, IconPlus, IconRuler, IconTrash } from "../../ui/icons";
 import {
   BasisList,
   DASH,
@@ -402,11 +402,28 @@ function LayerPanel({
   onChanged: () => void;
 }) {
   const [adding, setAdding] = useState(false);
+  const [editing, setEditing] = useState<TakeoffLayer | null>(null);
   const [name, setName] = useState("");
   const [colour, setColour] = useState("#2563eb");
   const [costCode, setCostCode] = useState("");
   const [measurementType, setMeasurementType] = useState("");
   const action = useAction();
+
+  function startEdit(layer: TakeoffLayer) {
+    setName(layer.name);
+    setColour(layer.colour);
+    setCostCode(layer.costCode ?? "");
+    setMeasurementType(layer.measurementType ?? "");
+    setEditing(layer);
+  }
+
+  function closeForm() {
+    setAdding(false);
+    setEditing(null);
+    setName("");
+    setCostCode("");
+    setMeasurementType("");
+  }
 
   return (
     <Card>
@@ -447,6 +464,14 @@ function LayerPanel({
                 size="xs"
                 variant="ghost"
                 iconOnly
+                icon={IconEdit}
+                aria-label={`Edit ${l.name}`}
+                onClick={() => startEdit(l)}
+              />
+              <Button
+                size="xs"
+                variant="ghost"
+                iconOnly
                 icon={IconTrash}
                 aria-label={`Delete ${l.name}`}
                 onClick={() =>
@@ -463,12 +488,17 @@ function LayerPanel({
       </CardBody>
 
       <Modal
-        open={adding}
-        title="Add a takeoff layer"
-        onClose={() => setAdding(false)}
+        open={adding || editing !== null}
+        title={editing ? `Edit ${editing.name}` : "Add a takeoff layer"}
+        description={
+          editing
+            ? "Changing a layer's cost code does not re-code the measurements already drawn on it — they carry the code they inherited when they were measured."
+            : undefined
+        }
+        onClose={closeForm}
         footer={
           <div className="flex justify-end gap-2">
-            <Button variant="secondary" onClick={() => setAdding(false)}>
+            <Button variant="secondary" onClick={closeForm}>
               Cancel
             </Button>
             <Button
@@ -476,26 +506,29 @@ function LayerPanel({
               disabled={name.trim().length === 0}
               onClick={() =>
                 void action
-                  .run("add", () =>
-                    estimatingApi.createLayer(projectId, {
+                  .run("add", () => {
+                    const body = {
                       name,
                       colour,
                       costCode: costCode.trim().length > 0 ? costCode : null,
                       measurementType: measurementType.length > 0 ? measurementType : null,
-                      sortOrder: layers.length + 1,
-                    }),
-                  )
+                    };
+                    return editing
+                      ? estimatingApi.patchLayer(projectId, editing.id, body)
+                      : estimatingApi.createLayer(projectId, {
+                          ...body,
+                          sortOrder: layers.length + 1,
+                        });
+                  })
                   .then((r) => {
                     if (r) {
-                      setAdding(false);
-                      setName("");
-                      setCostCode("");
+                      closeForm();
                       onChanged();
                     }
                   })
               }
             >
-              Add
+              {editing ? "Save" : "Add"}
             </Button>
           </div>
         }

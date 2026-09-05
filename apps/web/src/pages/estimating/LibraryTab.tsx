@@ -7,7 +7,7 @@
  * it was current; the hygiene sweep moves anything older than the staleness
  * window to "review" rather than letting it be priced silently.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Alert,
   Badge,
@@ -29,7 +29,15 @@ import {
   toast,
   type DataColumns,
 } from "../../ui";
-import { IconPlus, IconRefresh } from "../../ui/icons";
+import {
+  IconArrowDown,
+  IconArrowUp,
+  IconEdit,
+  IconImport,
+  IconPlus,
+  IconRefresh,
+  IconTrash,
+} from "../../ui/icons";
 import {
   COST_TYPES,
   DASH,
@@ -41,9 +49,11 @@ import {
   money,
   num,
   titleCase,
+  todayIso,
   useAction,
   useResource,
   type Assembly,
+  type AssemblyComponent,
   type AssemblyDetail,
   type CatalogueDetail,
   type CatalogueItem,
@@ -85,6 +95,7 @@ function CataloguePane({ projectId }: { projectId: string }) {
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("");
   const [creating, setCreating] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [openId, setOpenId] = useState<string | null>(null);
 
   const params = new URLSearchParams({ page: "1", pageSize: "300", projectId });
@@ -180,6 +191,9 @@ function CataloguePane({ projectId }: { projectId: string }) {
                 <option value="review">Needs review</option>
                 <option value="retired">Retired</option>
               </Select>
+              <Button size="sm" variant="secondary" icon={IconImport} onClick={() => setImporting(true)}>
+                Import rates
+              </Button>
               <Button size="sm" icon={IconPlus} onClick={() => setCreating(true)}>
                 Add rate
               </Button>
@@ -224,8 +238,192 @@ function CataloguePane({ projectId }: { projectId: string }) {
           list.reload();
         }}
       />
+      <CatalogueImporter
+        open={importing}
+        projectId={projectId}
+        onClose={() => setImporting(false)}
+        onImported={() => list.reload()}
+      />
       <CatalogueDrawer itemId={openId} onClose={() => setOpenId(null)} onChanged={() => list.reload()} />
     </>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Rate-list import (#192)                                             */
+/* ------------------------------------------------------------------ */
+
+interface ParsedRateRow {
+  code: string;
+  description: string;
+  unit: string;
+  costType: string;
+  rate: number;
+  line: number;
+  error: string | null;
+}
+
+/** code | description | unit | cost type | rate — one per line. */
+function parseRateList(raw: string): ParsedRateRow[] {
+  return raw
+    .split(/\r?\n/)
+    .map((line, i) => ({ line: i + 1, text: line.trim() }))
+    .filter((l) => l.text.length > 0 && !l.text.startsWith("#"))
+    .map(({ line, text }) => {
+      const [code = "", description = "", unit = "", costType = "material", rateRaw = ""] = text
+        .split("|")
+        .map((p) => p.trim());
+      const rate = Number(rateRaw);
+      const error =
+        code.length === 0
+          ? "no code"
+          : description.length === 0
+            ? "no description"
+            : unit.length === 0
+              ? "no unit"
+              : !Number.isFinite(rate)
+                ? `"${rateRaw}" is not a number`
+                : !COST_TYPES.includes(costType as (typeof COST_TYPES)[number])
+                  ? `"${costType}" is not a cost type`
+                  : null;
+      return { code, description, unit, costType, rate: Number.isFinite(rate) ? rate : 0, line, error };
+    });
+}
+
+function CatalogueImporter({
+  open,
+  projectId,
+  onClose,
+  onImported,
+}: {
+  open: boolean;
+  projectId: string;
+  onClose: () => void;
+  onImported: () => void;
+}) {
+  const action = useAction();
+  const [raw, setRaw] = useState("");
+  const [upsert, setUpsert] = useState(false);
+  const [scopeToProject, setScopeToProject] = useState(false);
+  const [rateAsAt, setRateAsAt] = useState(todayIso());
+  const [result, setResult] = useState<string[] | null>(null);
+
+  const parsed = useMemo(() => parseRateList(raw), [raw]);
+  const bad = parsed.filter((r) => r.error !== null);
+  const good = parsed.filter((r) => r.error === null);
+
+  return (
+    <Modal
+      open={open}
+      title="Import a rate list"
+      description="One rate per line: code | description | unit | cost type | rate. Nothing is written until every line parses, so a half-imported library cannot happen."
+      onClose={onClose}
+      size="lg"
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="secondary" onClick={onClose}>
+            Close
+          </Button>
+          <Button
+            loading={action.busy === "import"}
+            disabled={good.length === 0 || bad.length > 0}
+            onClick={() =>
+              void action
+                .run("import", () =>
+                  estimatingApi.bulkCatalogue({
+                    upsert,
+                    items: good.map((r) => ({
+                      code: r.code,
+                      description: r.description,
+                      unit: r.unit,
+                      costType: r.costType,
+                      rateAsAt,
+                      projectId: scopeToProject ? projectId : null,
+                      rates: { [r.costType]: r.rate },
+                    })),
+                  }),
+                )
+                .then((res) => {
+                  if (res) {
+                    toast.success(`${res.created} created, ${res.updated} updated`);
+                    setResult([
+                      `${res.created} rate${res.created === 1 ? "" : "s"} created, ${res.updated} updated.`,
+                      ...res.skipped.map((s) => `Skipped ${s.code}: ${s.reason}.`),
+                    ]);
+                    onImported();
+                  }
+                })
+            }
+          >
+            Import {good.length > 0 ? `${good.length} rate${good.length === 1 ? "" : "s"}` : ""}
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        {action.error ? (
+          <Alert tone="danger" size="sm" onDismiss={action.clear}>
+            {action.error}
+          </Alert>
+        ) : null}
+        <Field
+          label="Rate list"
+          hint="Cost types: labour, material, equipment, subcontract, other. Lines starting with # are ignored."
+        >
+          <Textarea
+            value={raw}
+            onChange={(e) => setRaw(e.target.value)}
+            rows={8}
+            placeholder={"BLK-140 | 140mm dense blockwork | m2 | material | 18.40\nEXC-BULK | Bulk excavation | m3 | equipment | 9.10"}
+          />
+        </Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Current at" hint="The date every rate in this list was true.">
+            <Input value={rateAsAt} onChange={(e) => setRateAsAt(e.target.value)} type="date" />
+          </Field>
+          <div className="space-y-2 self-end pb-1">
+            <label className="flex items-center gap-2 text-meta text-content">
+              <input type="checkbox" checked={upsert} onChange={(e) => setUpsert(e.target.checked)} />
+              Overwrite a rate that already carries this code
+            </label>
+            <label className="flex items-center gap-2 text-meta text-content">
+              <input
+                type="checkbox"
+                checked={scopeToProject}
+                onChange={(e) => setScopeToProject(e.target.checked)}
+              />
+              Import as this project's override rates only
+            </label>
+          </div>
+        </div>
+        {bad.length > 0 ? (
+          <Alert tone="warning" size="sm" title={`${bad.length} line${bad.length === 1 ? "" : "s"} will not parse`}>
+            <ul className="list-disc pl-4">
+              {bad.slice(0, 8).map((r) => (
+                <li key={r.line}>
+                  Line {r.line}: {r.error}.
+                </li>
+              ))}
+            </ul>
+          </Alert>
+        ) : null}
+        {good.length > 0 ? (
+          <div className="rounded-md border border-border bg-surface-sunken p-3 text-2xs text-content-subtle">
+            {good.length} rate{good.length === 1 ? "" : "s"} ready. The first is {good[0]!.code} —{" "}
+            {good[0]!.description} at {num(good[0]!.rate, 2)} per {good[0]!.unit}.
+          </div>
+        ) : null}
+        {result ? (
+          <Alert tone="info" size="sm" title="Import result">
+            <ul className="list-disc pl-4">
+              {result.map((r, i) => (
+                <li key={i}>{r}</li>
+              ))}
+            </ul>
+          </Alert>
+        ) : null}
+      </div>
+    </Modal>
   );
 }
 
@@ -375,6 +573,23 @@ function CatalogueDrawer({
   const action = useAction();
   const item = useResource<CatalogueDetail>(itemId ? `/api/v1/estimating/catalogue/${itemId}` : null);
   const d = item.data;
+  const [amending, setAmending] = useState(false);
+  const [rates, setRates] = useState<Record<string, string>>({});
+  const [rateAsAt, setRateAsAt] = useState(todayIso());
+  const [sourceReference, setSourceReference] = useState("");
+
+  function startAmend(current: CatalogueDetail) {
+    setRates({
+      labour: String(current.labourRate),
+      material: String(current.materialRate),
+      equipment: String(current.equipmentRate),
+      subcontract: String(current.subcontractRate),
+      other: String(current.otherRate),
+    });
+    setRateAsAt(todayIso());
+    setSourceReference(current.sourceReference ?? "");
+    setAmending(true);
+  }
 
   return (
     <Drawer
@@ -383,6 +598,13 @@ function CatalogueDrawer({
       size="md"
       title={d ? `${d.code} — ${d.description}` : "Catalogue item"}
       description={d ? `${money(d.unitRate, d.currency)} per ${d.unit}` : undefined}
+      headerActions={
+        d ? (
+          <Button size="sm" variant="secondary" icon={IconEdit} onClick={() => startAmend(d)}>
+            Amend the rate
+          </Button>
+        ) : undefined
+      }
     >
       {item.error ? (
         <LoadError message={item.error} onRetry={item.reload} />
@@ -472,6 +694,89 @@ function CatalogueDrawer({
               evaporates cannot be defended.
             </span>
           </div>
+
+          <Modal
+            open={amending}
+            title={`Amend ${d.code}`}
+            description="A new rate resets the staleness clock and takes the item off review. Estimate lines already priced from it keep the rate they were priced at — this is the library, not the estimate."
+            onClose={() => setAmending(false)}
+            size="lg"
+            footer={
+              <div className="flex justify-end gap-2">
+                <Button variant="secondary" onClick={() => setAmending(false)}>
+                  Cancel
+                </Button>
+                <Button
+                  loading={action.busy === "amend"}
+                  onClick={() =>
+                    void action
+                      .run("amend", () =>
+                        estimatingApi.patchCatalogue(d.id, {
+                          rates: Object.fromEntries(
+                            COST_TYPES.map((k) => [k, Number(rates[k]) || 0]),
+                          ),
+                          rateAsAt,
+                          sourceReference:
+                            sourceReference.trim().length > 0 ? sourceReference : null,
+                        }),
+                      )
+                      .then((res) => {
+                        if (res) {
+                          toast.success(`${d.code} now ${money(res.unitRate, res.currency)}`);
+                          setAmending(false);
+                          item.reload();
+                          onChanged();
+                        }
+                      })
+                  }
+                >
+                  Save the rate
+                </Button>
+              </div>
+            }
+          >
+            <div className="space-y-3">
+              {action.error ? (
+                <Alert tone="danger" size="sm">
+                  {action.error}
+                </Alert>
+              ) : null}
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+                {COST_TYPES.map((key) => (
+                  <Field key={key} label={titleCase(key)}>
+                    <Input
+                      value={rates[key] ?? ""}
+                      onChange={(e) => setRates((prev) => ({ ...prev, [key]: e.target.value }))}
+                      inputMode="decimal"
+                    />
+                  </Field>
+                ))}
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="Current at" hint="The date this price was true. It drives the staleness sweep.">
+                  <Input value={rateAsAt} onChange={(e) => setRateAsAt(e.target.value)} type="date" />
+                </Field>
+                <Field label="Source reference" optional hint="The quote, index or invoice it came from.">
+                  <Input
+                    value={sourceReference}
+                    onChange={(e) => setSourceReference(e.target.value)}
+                    placeholder="Hanson quote 4471"
+                  />
+                </Field>
+              </div>
+              <div className="rounded-md border border-border bg-surface-sunken p-3 text-meta">
+                <span className="text-content-subtle">New unit rate </span>
+                <span className="font-semibold text-content">
+                  {num(
+                    COST_TYPES.reduce((sum, k) => sum + (Number(rates[k]) || 0), 0),
+                    2,
+                  )}{" "}
+                  {d.currency}/{d.unit}
+                </span>
+                <span className="text-content-subtle"> — was {money(d.unitRate, d.currency)}</span>
+              </div>
+            </div>
+          </Modal>
         </div>
       )}
     </Drawer>
@@ -632,6 +937,10 @@ function AssemblyDrawer({
   const action = useAction();
   const [refreshNote, setRefreshNote] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [editName, setEditName] = useState("");
+  const [editTrade, setEditTrade] = useState("");
+  const [editDescription, setEditDescription] = useState("");
   const [catalogueItemId, setCatalogueItemId] = useState("");
   const [description, setDescription] = useState("");
   const [quantityPer, setQuantityPer] = useState("");
@@ -645,29 +954,35 @@ function AssemblyDrawer({
   );
   const a = assembly.data;
 
+  /**
+   * Send an existing component back exactly as it is stored — its rates
+   * included. PUT .../components is a replace, and a component that names a
+   * catalogue item but carries no rate is re-read from the catalogue at write
+   * time. Omitting the rates would therefore make "add one component" quietly
+   * re-price every other one; refreshing from the catalogue is the button
+   * next to this, and it is meant to be a deliberate act.
+   */
+  const asSpec = (c: AssemblyComponent) => ({
+    catalogueItemId: c.catalogueItemId,
+    description: c.description,
+    unit: c.unit,
+    costType: c.costType,
+    quantityPer: c.quantityPer,
+    wastePercent: c.wastePercent,
+    costCode: c.costCode,
+    rates: {
+      labour: c.labourRate,
+      material: c.materialRate,
+      equipment: c.equipmentRate,
+      subcontract: c.subcontractRate,
+      other: c.otherRate,
+    },
+  });
+
   async function addComponent() {
     if (!a) return;
     const next = [
-      ...a.components.map((c) => ({
-        catalogueItemId: c.catalogueItemId,
-        description: c.description,
-        unit: c.unit,
-        costType: c.costType,
-        quantityPer: c.quantityPer,
-        wastePercent: c.wastePercent,
-        costCode: c.costCode,
-        ...(c.catalogueItemId
-          ? {}
-          : {
-              rates: {
-                labour: c.labourRate,
-                material: c.materialRate,
-                equipment: c.equipmentRate,
-                subcontract: c.subcontractRate,
-                other: c.otherRate,
-              },
-            }),
-      })),
+      ...a.components.map(asSpec),
       {
         catalogueItemId: catalogueItemId.length > 0 ? catalogueItemId : null,
         description:
@@ -680,11 +995,42 @@ function AssemblyDrawer({
     ];
     const res = await action.run("add", () => estimatingApi.setComponents(a.id, { components: next }));
     if (res) {
-      toast.success("Component added");
+      toast.success("Component added — the other components kept their stored rates");
       setAdding(false);
       setCatalogueItemId("");
       setDescription("");
       setQuantityPer("");
+      assembly.reload();
+      onChanged();
+    }
+  }
+
+  async function removeComponent(componentId: string) {
+    if (!a) return;
+    const next = a.components.filter((c) => c.id !== componentId).map(asSpec);
+    const res = await action.run(`del-${componentId}`, () =>
+      estimatingApi.setComponents(a.id, { components: next }),
+    );
+    if (res) {
+      toast.success("Component removed");
+      assembly.reload();
+      onChanged();
+    }
+  }
+
+  async function moveComponent(componentId: string, delta: -1 | 1) {
+    if (!a) return;
+    const list = [...a.components];
+    const index = list.findIndex((c) => c.id === componentId);
+    const target = index + delta;
+    if (index < 0 || target < 0 || target >= list.length) return;
+    const moved = list[index]!;
+    list[index] = list[target]!;
+    list[target] = moved;
+    const res = await action.run(`move-${componentId}`, () =>
+      estimatingApi.setComponents(a.id, { components: list.map(asSpec) }),
+    );
+    if (res) {
       assembly.reload();
       onChanged();
     }
@@ -699,24 +1045,47 @@ function AssemblyDrawer({
       description={a ? `${money(a.unitRate, a.currency)} per ${a.unit} · ${count(a.componentCount)} components` : undefined}
       headerActions={
         a ? (
-          <Button
-            size="sm"
-            variant="secondary"
-            icon={IconRefresh}
-            loading={action.busy === "refresh"}
-            onClick={() =>
-              void action.run("refresh", () => estimatingApi.refreshAssembly(a.id)).then((res) => {
-                if (res) {
-                  setRefreshNote(res.refresh?.reason ?? null);
-                  toast.success(`Unit rate now ${num(res.unitRate, 2)}`);
-                  assembly.reload();
-                  onChanged();
-                }
-              })
-            }
-          >
-            Refresh from catalogue
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              size="sm"
+              variant="secondary"
+              icon={IconRefresh}
+              loading={action.busy === "refresh"}
+              onClick={() =>
+                void action.run("refresh", () => estimatingApi.refreshAssembly(a.id)).then((res) => {
+                  if (res) {
+                    setRefreshNote(res.refresh?.reason ?? null);
+                    toast.success(`Unit rate now ${num(res.unitRate, 2)}`);
+                    assembly.reload();
+                    onChanged();
+                  }
+                })
+              }
+            >
+              Refresh from catalogue
+            </Button>
+            <Button size="sm" variant="ghost" icon={IconEdit} onClick={() => setEditing(true)}>
+              Edit
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={IconTrash}
+              disabled={a.status === "retired"}
+              loading={action.busy === "retire"}
+              onClick={() =>
+                void action.run("retire", () => estimatingApi.retireAssembly(a.id)).then((res) => {
+                  if (res) {
+                    toast.success(`${a.code} retired`);
+                    assembly.reload();
+                    onChanged();
+                  }
+                })
+              }
+            >
+              Retire
+            </Button>
+          </div>
         ) : undefined
       }
     >
@@ -745,19 +1114,20 @@ function AssemblyDrawer({
                 <Th align="right">Waste</Th>
                 <Th align="right">Rate</Th>
                 <Th align="right">Amount per {a.unit}</Th>
+                <Th align="right">Order</Th>
               </tr>
             </thead>
             <tbody>
               {a.components.length === 0 ? (
                 <tr>
-                  <Td colSpan={5}>
+                  <Td colSpan={6}>
                     <span className="text-content-subtle">
                       No components yet — an assembly with none prices at zero.
                     </span>
                   </Td>
                 </tr>
               ) : (
-                a.components.map((c) => (
+                a.components.map((c, i) => (
                   <tr key={c.id}>
                     <Td>
                       <div className="text-content">{c.description}</div>
@@ -774,6 +1144,37 @@ function AssemblyDrawer({
                     <Td align="right" className="font-semibold">
                       {money(c.amountPer, a.currency)}
                     </Td>
+                    <Td align="right">
+                      <div className="flex justify-end gap-1">
+                        <Button
+                          size="xs"
+                          variant="ghost"
+                          iconOnly
+                          icon={IconArrowUp}
+                          aria-label={`Move ${c.description} up`}
+                          disabled={i === 0 || action.busy !== null}
+                          onClick={() => void moveComponent(c.id, -1)}
+                        />
+                        <Button
+                          size="xs"
+                          variant="ghost"
+                          iconOnly
+                          icon={IconArrowDown}
+                          aria-label={`Move ${c.description} down`}
+                          disabled={i === a.components.length - 1 || action.busy !== null}
+                          onClick={() => void moveComponent(c.id, 1)}
+                        />
+                        <Button
+                          size="xs"
+                          variant="ghost"
+                          iconOnly
+                          icon={IconTrash}
+                          aria-label={`Remove ${c.description}`}
+                          loading={action.busy === `del-${c.id}`}
+                          onClick={() => void removeComponent(c.id)}
+                        />
+                      </div>
+                    </Td>
                   </tr>
                 ))
               )}
@@ -785,6 +1186,7 @@ function AssemblyDrawer({
                 <Td align="right" className="font-semibold">
                   {money(a.unitRate, a.currency)}
                 </Td>
+                <Td />
               </tr>
             </tbody>
           </Table>
@@ -837,6 +1239,73 @@ function AssemblyDrawer({
               </div>
             </div>
           </Modal>
+
+          <Modal
+            open={editing}
+            title={`Edit ${a.code}`}
+            description="The header only. The components, and therefore the rate, are edited in the table."
+            onClose={() => setEditing(false)}
+            footer={
+              <div className="flex justify-end gap-2">
+                <Button variant="secondary" onClick={() => setEditing(false)}>
+                  Cancel
+                </Button>
+                <Button
+                  loading={action.busy === "edit"}
+                  onClick={() =>
+                    void action
+                      .run("edit", () =>
+                        estimatingApi.patchAssembly(a.id, {
+                          name: editName.trim().length > 0 ? editName : a.name,
+                          trade: editTrade.trim().length > 0 ? editTrade : null,
+                          description: editDescription.trim().length > 0 ? editDescription : null,
+                        }),
+                      )
+                      .then((res) => {
+                        if (res) {
+                          toast.success("Saved");
+                          setEditing(false);
+                          assembly.reload();
+                          onChanged();
+                        }
+                      })
+                  }
+                >
+                  Save
+                </Button>
+              </div>
+            }
+          >
+            <div className="space-y-3">
+              {action.error ? (
+                <Alert tone="danger" size="sm">
+                  {action.error}
+                </Alert>
+              ) : null}
+              <Field label="Name">
+                <Input
+                  value={editName}
+                  onChange={(e) => setEditName(e.target.value)}
+                  placeholder={a.name}
+                />
+              </Field>
+              <Field label="Trade" optional>
+                <Input
+                  value={editTrade}
+                  onChange={(e) => setEditTrade(e.target.value)}
+                  placeholder={a.trade ?? "Masonry"}
+                />
+              </Field>
+              <Field label="Description" optional>
+                <Textarea
+                  value={editDescription}
+                  onChange={(e) => setEditDescription(e.target.value)}
+                  rows={2}
+                  placeholder={a.description ?? ""}
+                />
+              </Field>
+            </div>
+          </Modal>
         </div>
       )}
     </Drawer>
@@ -847,8 +1316,104 @@ function AssemblyDrawer({
 /* Crews and production rates                                          */
 /* ------------------------------------------------------------------ */
 
+/** One per line: label | count | hourly rate. */
+function parseCrewLines(raw: string, isEquipment: boolean) {
+  return raw
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((line) => {
+      const [label = "", countRaw = "1", rateRaw = "0"] = line.split("|").map((p) => p.trim());
+      return isEquipment
+        ? { description: label, count: Number(countRaw) || 0, hourlyRate: Number(rateRaw) || 0 }
+        : { trade: label, count: Number(countRaw) || 0, hourlyRate: Number(rateRaw) || 0 };
+    });
+}
+
+const crewLinesOf = (
+  rows: ReadonlyArray<{ trade?: string; description?: string; count: number; hourlyRate: number }>,
+): string => rows.map((r) => `${r.trade ?? r.description ?? ""} | ${r.count} | ${r.hourlyRate}`).join("\n");
+
+function CrewEditor({
+  crew,
+  onClose,
+  onSaved,
+}: {
+  crew: Crew | null;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const action = useAction();
+  const [name, setName] = useState("");
+  const [membersRaw, setMembersRaw] = useState("");
+  const [equipmentRaw, setEquipmentRaw] = useState("");
+
+  useEffect(() => {
+    if (!crew) return;
+    setName(crew.name);
+    setMembersRaw(crewLinesOf(crew.members));
+    setEquipmentRaw(crewLinesOf(crew.equipment));
+  }, [crew]);
+
+  return (
+    <Modal
+      open={crew !== null}
+      title={crew ? `Edit ${crew.code}` : "Edit crew"}
+      description="Changing the make-up re-materializes the hourly cost. Estimate lines already priced from this crew keep the rate they were priced at."
+      onClose={onClose}
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            loading={action.busy === "save"}
+            disabled={crew === null || name.trim().length === 0}
+            onClick={() =>
+              void action
+                .run("save", () =>
+                  estimatingApi.patchCrew(crew!.id, {
+                    name,
+                    members: parseCrewLines(membersRaw, false),
+                    equipment: parseCrewLines(equipmentRaw, true),
+                  }),
+                )
+                .then((res) => {
+                  if (res) {
+                    toast.success(`${res.code} — ${money(res.hourlyCost, res.currency)} per crew-hour`);
+                    onSaved();
+                  }
+                })
+            }
+          >
+            Save
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        {action.error ? (
+          <Alert tone="danger" size="sm" onDismiss={action.clear}>
+            {action.error}
+          </Alert>
+        ) : null}
+        <Field label="Name" required>
+          <Input value={name} onChange={(e) => setName(e.target.value)} />
+        </Field>
+        <Field label="Operatives" hint="One per line: trade | count | hourly rate">
+          <Textarea value={membersRaw} onChange={(e) => setMembersRaw(e.target.value)} rows={3} />
+        </Field>
+        <Field label="Plant" optional hint="One per line: description | count | hourly rate">
+          <Textarea value={equipmentRaw} onChange={(e) => setEquipmentRaw(e.target.value)} rows={2} />
+        </Field>
+      </div>
+    </Modal>
+  );
+}
+
 function CrewsPane() {
   const [creating, setCreating] = useState(false);
+  const [editing, setEditing] = useState<Crew | null>(null);
   const [code, setCode] = useState("");
   const [name, setName] = useState("");
   const [membersRaw, setMembersRaw] = useState("");
@@ -856,18 +1421,7 @@ function CrewsPane() {
   const action = useAction();
   const list = useResource<Paginated<Crew>>("/api/v1/estimating/crews?page=1&pageSize=200");
 
-  function parse(raw: string, isEquipment: boolean) {
-    return raw
-      .split(/\n+/)
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0)
-      .map((line) => {
-        const [label = "", countRaw = "1", rateRaw = "0"] = line.split("|").map((p) => p.trim());
-        return isEquipment
-          ? { description: label, count: Number(countRaw) || 0, hourlyRate: Number(rateRaw) || 0 }
-          : { trade: label, count: Number(countRaw) || 0, hourlyRate: Number(rateRaw) || 0 };
-      });
-  }
+  const parse = parseCrewLines;
 
   return (
     <Card>
@@ -898,6 +1452,7 @@ function CrewsPane() {
                 <Th align="right">Labour /hr</Th>
                 <Th align="right">Plant /hr</Th>
                 <Th align="right">Total /hr</Th>
+                <Th align="right">Actions</Th>
               </tr>
             </thead>
             <tbody>
@@ -905,7 +1460,14 @@ function CrewsPane() {
                 <tr key={c.id}>
                   <Td className="font-mono text-2xs">{c.code}</Td>
                   <Td>
-                    <div className="text-content">{c.name}</div>
+                    <div className="text-content">
+                      {c.name}
+                      {c.status === "retired" ? (
+                        <Badge tone="neutral" size="xs" className="ml-2">
+                          Retired
+                        </Badge>
+                      ) : null}
+                    </div>
                     <div className="text-2xs text-content-subtle">
                       {c.members.map((m) => `${num(m.count, 0)}× ${m.trade}`).join(", ") || DASH}
                     </div>
@@ -916,12 +1478,52 @@ function CrewsPane() {
                   <Td align="right" className="font-semibold">
                     {money(c.hourlyCost, c.currency)}
                   </Td>
+                  <Td align="right">
+                    <div className="flex justify-end gap-1">
+                      <Button
+                        size="xs"
+                        variant="ghost"
+                        iconOnly
+                        icon={IconEdit}
+                        aria-label={`Edit ${c.name}`}
+                        onClick={() => setEditing(c)}
+                      />
+                      <Button
+                        size="xs"
+                        variant="ghost"
+                        iconOnly
+                        icon={IconTrash}
+                        aria-label={`Retire ${c.name}`}
+                        disabled={c.status === "retired"}
+                        loading={action.busy === `retire-${c.id}`}
+                        onClick={() =>
+                          void action
+                            .run(`retire-${c.id}`, () => estimatingApi.retireCrew(c.id))
+                            .then((res) => {
+                              if (res) {
+                                toast.success(`${c.code} retired`);
+                                list.reload();
+                              }
+                            })
+                        }
+                      />
+                    </div>
+                  </Td>
                 </tr>
               ))}
             </tbody>
           </Table>
         )}
       </CardBody>
+
+      <CrewEditor
+        crew={editing}
+        onClose={() => setEditing(null)}
+        onSaved={() => {
+          setEditing(null);
+          list.reload();
+        }}
+      />
 
       <Modal
         open={creating}
@@ -999,8 +1601,97 @@ function CrewsPane() {
   );
 }
 
+function ProductionRateEditor({
+  rate,
+  onClose,
+  onSaved,
+}: {
+  rate: ProductionRate | null;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const action = useAction();
+  const [value, setValue] = useState("");
+  const [basis, setBasis] = useState("output_per_hour");
+  const [conditions, setConditions] = useState("");
+  const [rateAsAt, setRateAsAt] = useState(todayIso());
+
+  useEffect(() => {
+    if (!rate) return;
+    setValue(String(rate.value));
+    setBasis(rate.basis);
+    setConditions(rate.conditions ?? "");
+    setRateAsAt(rate.rateAsAt ?? todayIso());
+  }, [rate]);
+
+  return (
+    <Modal
+      open={rate !== null}
+      title={rate ? `Edit ${rate.code}` : "Edit production rate"}
+      description="The basis is stored as it was quoted. Changing it does NOT convert the value — say what the number means and leave the number alone."
+      onClose={onClose}
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            loading={action.busy === "save"}
+            disabled={rate === null}
+            onClick={() =>
+              void action
+                .run("save", () =>
+                  estimatingApi.patchProductionRate(rate!.id, {
+                    value: Number(value) || 0,
+                    basis,
+                    conditions: conditions.trim().length > 0 ? conditions : null,
+                    rateAsAt,
+                  }),
+                )
+                .then((res) => {
+                  if (res) {
+                    toast.success(`${res.code} updated`);
+                    onSaved();
+                  }
+                })
+            }
+          >
+            Save
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        {action.error ? (
+          <Alert tone="danger" size="sm" onDismiss={action.clear}>
+            {action.error}
+          </Alert>
+        ) : null}
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Value" required>
+            <Input value={value} onChange={(e) => setValue(e.target.value)} inputMode="decimal" />
+          </Field>
+          <Field label="Basis">
+            <Select value={basis} onChange={(e) => setBasis(e.target.value)}>
+              <option value="output_per_hour">Output per hour</option>
+              <option value="hours_per_unit">Hours per unit</option>
+            </Select>
+          </Field>
+        </div>
+        <Field label="Conditions" optional hint="What the rate assumes — access, weather, gang size, shift.">
+          <Textarea value={conditions} onChange={(e) => setConditions(e.target.value)} rows={2} />
+        </Field>
+        <Field label="Current at">
+          <Input value={rateAsAt} onChange={(e) => setRateAsAt(e.target.value)} type="date" />
+        </Field>
+      </div>
+    </Modal>
+  );
+}
+
 function RatesPane() {
   const [creating, setCreating] = useState(false);
+  const [editing, setEditing] = useState<ProductionRate | null>(null);
   const [code, setCode] = useState("");
   const [description, setDescription] = useState("");
   const [unit, setUnit] = useState("");
@@ -1039,6 +1730,7 @@ function RatesPane() {
                 <Th align="right">Rate</Th>
                 <Th>Basis</Th>
                 <Th>Current at</Th>
+                <Th align="right">Actions</Th>
               </tr>
             </thead>
             <tbody>
@@ -1046,7 +1738,14 @@ function RatesPane() {
                 <tr key={r.id}>
                   <Td className="font-mono text-2xs">{r.code}</Td>
                   <Td>
-                    <div className="text-content">{r.description}</div>
+                    <div className="text-content">
+                      {r.description}
+                      {r.status === "retired" ? (
+                        <Badge tone="neutral" size="xs" className="ml-2">
+                          Retired
+                        </Badge>
+                      ) : null}
+                    </div>
                     {r.conditions ? <div className="text-2xs text-content-subtle">{r.conditions}</div> : null}
                   </Td>
                   <Td>{r.unit}</Td>
@@ -1055,12 +1754,52 @@ function RatesPane() {
                   </Td>
                   <Td>{titleCase(r.basis)}</Td>
                   <Td>{r.rateAsAt ? dateOnly(r.rateAsAt) : DASH}</Td>
+                  <Td align="right">
+                    <div className="flex justify-end gap-1">
+                      <Button
+                        size="xs"
+                        variant="ghost"
+                        iconOnly
+                        icon={IconEdit}
+                        aria-label={`Edit ${r.code}`}
+                        onClick={() => setEditing(r)}
+                      />
+                      <Button
+                        size="xs"
+                        variant="ghost"
+                        iconOnly
+                        icon={IconTrash}
+                        aria-label={`Retire ${r.code}`}
+                        disabled={r.status === "retired"}
+                        loading={action.busy === `retire-${r.id}`}
+                        onClick={() =>
+                          void action
+                            .run(`retire-${r.id}`, () => estimatingApi.retireProductionRate(r.id))
+                            .then((res) => {
+                              if (res) {
+                                toast.success(`${r.code} retired`);
+                                list.reload();
+                              }
+                            })
+                        }
+                      />
+                    </div>
+                  </Td>
                 </tr>
               ))}
             </tbody>
           </Table>
         )}
       </CardBody>
+
+      <ProductionRateEditor
+        rate={editing}
+        onClose={() => setEditing(null)}
+        onSaved={() => {
+          setEditing(null);
+          list.reload();
+        }}
+      />
 
       <Modal
         open={creating}

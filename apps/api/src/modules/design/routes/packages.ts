@@ -135,7 +135,7 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
     body: Partial<z.infer<typeof packageBodySchema>>,
   ) {
     if (body.leadVendorId) await assertVendor(app.db, companyId, body.leadVendorId);
-    if (body.leadUserId) await assertUser(app.db, body.leadUserId);
+    if (body.leadUserId) await assertUser(app.db, companyId, body.leadUserId);
     if (body.consultantId) await assertConsultant(app.db, companyId, projectId, body.consultantId);
   }
 
@@ -611,7 +611,16 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
       throw badRequest("A package freeze needs packageId: a freeze that names nothing fixes nothing.");
     }
     if (body.scope === "stage" && !body.stageKey) throw badRequest("A stage freeze needs stageKey.");
-    if (body.packageId) await loadPackage(companyId, projectId, body.packageId);
+    const target = body.packageId ? await loadPackage(companyId, projectId, body.packageId) : null;
+    // A freeze fixes what has been approved. Freezing a planned or in-progress
+    // package used to flip it to "frozen", and lifting the freeze then read
+    // that as "approved" — an approved package with a null approver, counted
+    // as approved by the register and by the readiness engine.
+    if (body.scope === "package" && target && target.status !== "approved") {
+      throw conflict(
+        `${target.reference} is ${target.status}. A design freeze fixes an APPROVED package: approve it first (POST /design/packages/${target.id}/transition), then freeze it. Freezing an unapproved package would let the lift promote it to approved with nobody's name on the approval.`,
+      );
+    }
 
     const existing = await app.db
       .select({ id: designFreezes.id })
@@ -649,10 +658,19 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
         declaredBy: req.user!.id,
       })
       .returning();
-    if (body.scope === "package" && body.packageId) {
+    if (body.scope === "package" && body.packageId && target) {
       await app.db
         .update(designPackages)
-        .set({ frozenAt: effectiveFrom, frozenBy: req.user!.id, freezeId: id, status: "frozen", updatedAt: nowISO() })
+        .set({
+          frozenAt: effectiveFrom,
+          frozenBy: req.user!.id,
+          freezeId: id,
+          status: "frozen",
+          // Remember what it actually was, so the lift restores a fact rather
+          // than an assumption.
+          preFreezeStatus: target.status,
+          updatedAt: nowISO(),
+        })
         .where(eq(designPackages.id, body.packageId));
     }
     await ledger(app.db, {
@@ -696,9 +714,23 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
         .where(eq(designPackages.id, row.packageId))
         .limit(1);
       if (pkg && pkg.freezeId === freezeId) {
+        // Restore what the package actually held before the freeze. Never
+        // infer "approved": a lift is not an approval, and a package whose
+        // approval was cleared while frozen must not get it back for free.
+        const restored =
+          pkg.status === "frozen"
+            ? ((pkg.preFreezeStatus ?? (pkg.approvedBy ? "approved" : "in_progress")) as string)
+            : pkg.status;
         await app.db
           .update(designPackages)
-          .set({ frozenAt: null, frozenBy: null, freezeId: null, status: pkg.status === "frozen" ? "approved" : pkg.status, updatedAt: nowISO() })
+          .set({
+            frozenAt: null,
+            frozenBy: null,
+            freezeId: null,
+            preFreezeStatus: null,
+            status: restored,
+            updatedAt: nowISO(),
+          })
           .where(eq(designPackages.id, row.packageId));
       }
     }

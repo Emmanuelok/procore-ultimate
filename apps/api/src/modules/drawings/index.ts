@@ -684,8 +684,20 @@ export const drawingsModule: FastifyPluginAsync = async (app) => {
     const { setId } = req.params as { setId: string };
     const set = await fetchSet(req, setId);
     const ctx = await sheetContext(req, set.projectId);
+    // Column projection, not `select()`: a 300-page set's rows carry the whole
+    // extracted text layer (extractedText + textItems), and none of it is used
+    // here — loading it would pull the entire set's text into memory per call.
     const revisions = await app.db
-      .select()
+      .select({
+        id: drawingRevisions.id,
+        sheetId: drawingRevisions.sheetId,
+        pageIndex: drawingRevisions.pageIndex,
+        revision: drawingRevisions.revision,
+        detection: drawingRevisions.detection,
+        hasTextLayer: drawingRevisions.hasTextLayer,
+        changeVerdict: drawingRevisions.changeVerdict,
+        supersedesRevisionId: drawingRevisions.supersedesRevisionId,
+      })
       .from(drawingRevisions)
       .where(eq(drawingRevisions.setId, setId))
       .orderBy(asc(drawingRevisions.pageIndex));

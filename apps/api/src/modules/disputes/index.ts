@@ -2,10 +2,14 @@ import type { FastifyPluginAsync } from "fastify";
 import { and, asc, count, desc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import {
+  bundleSnapshots,
   contractEvents,
   contracts,
   delayEvents,
+  disputeBoardMembers,
+  disputeBoardVisits,
   disputeBundles,
+  disputeCosts,
   disputeSubmissions,
   disputes,
   entities,
@@ -13,13 +17,21 @@ import {
   files,
   forensicClaims,
   obligations,
+  projects,
   rfis,
+  settlementModels,
   settlementOffers,
-  signals,
 } from "@constructos/db";
 import {
+  BUNDLE_ITEM_PRIVILEGE,
+  DISPUTE_BOARD_ROLES,
+  DISPUTE_COST_CATEGORIES,
+  DISPUTE_JURISDICTIONS,
   DISPUTE_KINDS,
+  DISPUTE_ROOT_CAUSES,
   DISPUTE_STATUSES,
+  ENFORCEMENT_STATUSES,
+  SETTLEMENT_BRANCH_KINDS,
   SETTLEMENT_OFFER_BASES,
   SUBMISSION_KINDS,
   type DisputeStatus,
@@ -28,10 +40,38 @@ import { hashPayload, merkleRoot } from "@constructos/ledger";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
-import { badRequest, notFound } from "../../lib/errors.js";
+import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { isoDateSchema, todayISO } from "../field/dates.js";
-import { analyseSettlement, type OfferForAnalysis } from "./settlement.js";
+import {
+  analyseSettlement,
+  evaluateDecisionTree,
+  isOfferLive,
+  litigationProvision,
+  type CostsRules,
+  type OfferForAnalysis,
+  type TreeBranch,
+  type TreeStage,
+} from "./settlement.js";
+import {
+  REGIMES,
+  buildNominationRequest,
+  generateTimetable,
+  regimeFor,
+} from "./regimes.js";
+import {
+  draftingRecommendations,
+  outcomeAnalytics,
+  type DisputeOutcomeRow,
+  type GroupBy,
+} from "./analytics.js";
+import {
+  closeTimetableObligations,
+  registerDisputeJobs,
+  sweepExpiredOffers,
+  sweepMissedDeadlines as sweepDeadlinesShared,
+} from "./jobs.js";
+import { companyToolGate, visibleProjectIds } from "../governance/gates.js";
 
 /* ------------------------------------------------------------------ */
 /* Shapes                                                              */
@@ -46,8 +86,17 @@ interface TimetableStep {
   obligationId: string | null;
   done: boolean;
   doneAt: string | null;
-  /** set once by the lazy missed-deadline sweep (idempotency marker) */
+  /** set once by the missed-deadline sweep (idempotency marker) */
   breachedAt: string | null;
+  /* ---- provenance when the step came from a statutory regime (#322-333) ---- */
+  /** the regime step key, so a regenerated timetable can be diffed */
+  key?: string | null;
+  /** who must act: referring | responding | adjudicator | both */
+  owner?: string | null;
+  /** the statutory provision the offset comes from */
+  authority?: string | null;
+  /** the statutory extension ceiling where the regime allows one */
+  extendedDueDate?: string | null;
 }
 
 /** A bundle item; tab + sha256 are frozen at generation (#343). */
@@ -60,6 +109,12 @@ interface BundleItem {
   recordId: string | null;
   fileId: string | null;
   sha256: string | null;
+  /** BundleItemPrivilege — "none" for anything produced (#340-342) */
+  privilege?: string;
+  privilegeReason?: string | null;
+  /** page span in the produced bundle, assigned at generation */
+  startPage?: number | null;
+  endPage?: number | null;
 }
 
 interface ManifestIndexEntry {
@@ -121,8 +176,16 @@ const disputeCreateSchema = z.object({
   claimIds: z.array(z.string().min(1)).max(100).optional(),
   counterpartyEntityId: z.string().min(1).nullable().optional(),
   amountInDispute: z.number().nonnegative().nullable().optional(),
+  amountClaimed: z.number().nonnegative().nullable().optional(),
   currency: z.string().length(3).optional(),
   timetable: z.array(timetableStepCreateSchema).max(100).optional(),
+  /** generate the procedural timetable from a statutory regime (#322-333) */
+  jurisdiction: z.enum(DISPUTE_JURISDICTIONS).optional(),
+  triggerDate: isoDateSchema.optional(),
+  /** public holidays for the business-day calendar; weekends are always excluded */
+  holidays: z.array(isoDateSchema).max(60).optional(),
+  contractFamily: z.string().max(200).nullable().optional(),
+  governingClause: z.string().max(200).nullable().optional(),
 });
 
 const disputePatchSchema = z.object({
@@ -130,8 +193,119 @@ const disputePatchSchema = z.object({
   forum: z.string().max(300).nullable().optional(),
   rules: z.string().max(300).nullable().optional(),
   amountInDispute: z.number().nonnegative().nullable().optional(),
+  amountClaimed: z.number().nonnegative().nullable().optional(),
   currency: z.string().length(3).optional(),
   timetable: z.array(timetableStepPatchSchema).max(100).optional(),
+  contractFamily: z.string().max(200).nullable().optional(),
+  governingClause: z.string().max(200).nullable().optional(),
+  rootCause: z.enum(DISPUTE_ROOT_CAUSES).nullable().optional(),
+});
+
+/* ---- platform upgrade wave ---- */
+
+const timetableGenerateSchema = z.object({
+  jurisdiction: z.enum(DISPUTE_JURISDICTIONS),
+  triggerDate: isoDateSchema,
+  holidays: z.array(isoDateSchema).max(60).optional(),
+  /** true replaces the existing timetable; false appends the regime steps */
+  replace: z.boolean().default(false),
+});
+
+const outcomeSchema = z.object({
+  amountClaimed: z.number().nonnegative().nullable().optional(),
+  amountAwarded: z.number().nullable().optional(),
+  costsAwarded: z.number().nullable().optional(),
+  rootCause: z.enum(DISPUTE_ROOT_CAUSES).nullable().optional(),
+  governingClause: z.string().max(200).nullable().optional(),
+  contractFamily: z.string().max(200).nullable().optional(),
+  resolvedAt: isoDateSchema.nullable().optional(),
+  enforcementStatus: z.enum(ENFORCEMENT_STATUSES).optional(),
+  complianceDeadline: isoDateSchema.nullable().optional(),
+  nodDeadline: isoDateSchema.nullable().optional(),
+});
+
+const boardMemberSchema = z.object({
+  name: z.string().min(1).max(300),
+  boardRole: z.enum(DISPUTE_BOARD_ROLES).default("member"),
+  nominatedBy: z.enum(["employer", "contractor", "agreed", "institution"]).nullable().optional(),
+  appointedAt: isoDateSchema.nullable().optional(),
+  independenceDisclosure: z.string().max(20000).nullable().optional(),
+  conflictDeclared: z.boolean().optional(),
+  feeBasis: z.string().max(500).nullable().optional(),
+});
+
+const boardVisitSchema = z.object({
+  visitDate: isoDateSchema,
+  attendees: z.array(z.string().max(300)).max(50).optional(),
+  summary: z.string().max(50000).nullable().optional(),
+  recommendations: z.string().max(50000).nullable().optional(),
+  reportFileId: z.string().min(1).nullable().optional(),
+});
+
+const costCreateSchema = z.object({
+  category: z.enum(DISPUTE_COST_CATEGORIES),
+  supplier: z.string().max(300).nullable().optional(),
+  description: z.string().min(1).max(2000),
+  incurredAt: isoDateSchema,
+  budgetAmount: z.number().nonnegative().nullable().optional(),
+  actualAmount: z.number().nonnegative(),
+  currency: z.string().length(3).optional(),
+  recoverable: z.boolean().optional(),
+});
+
+const settlementModelSchema = z.object({
+  name: z.string().min(1).max(300),
+  currency: z.string().length(3).optional(),
+  branches: z
+    .array(
+      z.object({
+        id: z.string().max(60).optional(),
+        kind: z.enum(SETTLEMENT_BRANCH_KINDS),
+        label: z.string().min(1).max(300),
+        probability: z.number().min(0).max(1),
+        award: z.number().finite(),
+      }),
+    )
+    .min(1)
+    .max(20),
+  stages: z
+    .array(
+      z.object({
+        id: z.string().max(60).optional(),
+        name: z.string().min(1).max(300),
+        ownCosts: z.number().nonnegative(),
+        opponentCosts: z.number().nonnegative(),
+      }),
+    )
+    .max(20),
+  discountRatePercent: z.number().min(0).max(100).default(0),
+  yearsToResolution: z.number().min(0).max(50).default(0),
+  costsRules: z
+    .object({
+      enabled: z.boolean(),
+      indemnityCostsPercent: z.number().min(0).max(200).default(0),
+      enhancedInterestPercent: z.number().min(0).max(100).default(0),
+      ownOfferAmount: z.number().nonnegative().nullable(),
+    })
+    .nullable()
+    .optional(),
+});
+
+const bundleItemPrivilegeSchema = z.object({
+  itemId: z.string().min(1),
+  privilege: z.enum(BUNDLE_ITEM_PRIVILEGE),
+  reason: z.string().max(2000).nullable().optional(),
+});
+
+const privilegePutSchema = z.object({
+  entries: z.array(bundleItemPrivilegeSchema).max(500),
+});
+
+const analyticsQuery = z.object({
+  groupBy: z
+    .enum(["forum", "kind", "jurisdiction", "rootCause", "contractFamily", "governingClause"])
+    .default("rootCause"),
+  projectId: z.string().min(1).optional(),
 });
 
 const disputeListQuery = pageQuerySchema.extend({
@@ -142,6 +316,13 @@ const disputeListQuery = pageQuerySchema.extend({
 const statusChangeSchema = z.object({
   status: z.enum(DISPUTE_STATUSES),
   outcome: z.string().max(4000).optional(),
+  /* structured outcome captured at the terminal transition (#356-357) */
+  amountAwarded: z.number().nullable().optional(),
+  costsAwarded: z.number().nullable().optional(),
+  rootCause: z.enum(DISPUTE_ROOT_CAUSES).nullable().optional(),
+  /** when the decision must be complied with, and when the NOD window closes */
+  complianceDeadline: isoDateSchema.optional(),
+  nodDeadline: isoDateSchema.optional(),
 });
 
 const submissionCreateSchema = z.object({
@@ -161,6 +342,9 @@ const bundleItemSchema = z.object({
   recordType: z.enum(BUNDLE_RECORD_TYPES).optional(),
   recordId: z.string().min(1).optional(),
   fileId: z.string().min(1).optional(),
+  /** privileged items are excluded from production and listed in the privilege log (#340-342) */
+  privilege: z.enum(BUNDLE_ITEM_PRIVILEGE).default("none"),
+  privilegeReason: z.string().max(2000).nullable().optional(),
 });
 
 const bundleItemsSchema = z.object({ items: z.array(bundleItemSchema).min(1).max(500) });
@@ -224,6 +408,17 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
     app.requireCompany,
     app.requireTool("disputes", "standard"),
   ];
+  const adminGate = [
+    app.authenticate,
+    app.requireCompany,
+    app.requireTool("disputes", "admin"),
+  ];
+  const companyReadGate = [
+    app.authenticate,
+    app.requireCompany,
+    companyToolGate(app, "disputes", "read"),
+  ];
+  registerDisputeJobs(app);
 
   async function fetchDispute(disputeId: string, companyId: string, projectId: string) {
     const rows = await app.db
@@ -307,13 +502,39 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
     }
   }
 
-  async function validateFileId(companyId: string, fileId: string): Promise<void> {
+  /**
+   * A file cited in a pleadings register or a hearing bundle must belong
+   * to THIS project, not merely to the company.
+   *
+   * Checking companyId alone let a user with disputes:standard on project
+   * P attach and hash any file from any other project of the same company
+   * into P’s bundle — and the bundle manifest publishes its name to the
+   * tribunal. Files with no project (company-level documents) are allowed
+   * deliberately: a corporate insurance policy is legitimately citable.
+   */
+  async function validateFileId(
+    companyId: string,
+    projectId: string,
+    fileId: string,
+  ): Promise<{ id: string; name: string; sha256: string }> {
     const rows = await app.db
-      .select({ id: files.id })
+      .select({
+        id: files.id,
+        name: files.name,
+        sha256: files.sha256,
+        projectId: files.projectId,
+      })
       .from(files)
       .where(and(eq(files.id, fileId), eq(files.companyId, companyId)))
       .limit(1);
-    if (!rows[0]) throw badRequest("fileId does not belong to this company");
+    const row = rows[0];
+    if (!row) throw badRequest("fileId does not belong to this company");
+    if (row.projectId && row.projectId !== projectId) {
+      throw badRequest(
+        "fileId belongs to another project — a dispute record may only cite files from its own project or company-level files",
+      );
+    }
+    return { id: row.id, name: row.name, sha256: row.sha256 };
   }
 
   /**
@@ -345,72 +566,16 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
   }
 
   /**
-   * Lazy missed-deadline sweep (#338, payments-module pattern): a timetable
-   * step past its due date and not done breaches its obligation and raises
-   * a high signal — exactly once, guarded by the step's breachedAt marker.
+   * Refresh missed procedural deadlines before a read.
+   *
+   * The arithmetic moved to jobs.ts so it runs on a schedule — a platform
+   * whose product is "the deadline was missed and here is the record" cannot
+   * wait for a browser tab to notice — and so the transition is attributed
+   * to the system rather than to whoever happened to open the page. The read
+   * path still calls it so a page opened between cycles is current.
    */
-  async function sweepMissedDeadlines(
-    companyId: string,
-    projectId: string,
-    actorId: string,
-  ): Promise<void> {
-    const today = todayISO();
-    const rows = await app.db
-      .select()
-      .from(disputes)
-      .where(
-        and(
-          eq(disputes.companyId, companyId),
-          eq(disputes.projectId, projectId),
-          inArray(disputes.status, ACTIVE),
-        ),
-      );
-    for (const d of rows) {
-      const steps = d.timetable as TimetableStep[];
-      const overdue = steps.filter(
-        (s) => s.dueDate !== null && !s.done && !s.breachedAt && s.dueDate < today,
-      );
-      if (overdue.length === 0) continue;
-      const now = new Date().toISOString();
-      for (const step of overdue) {
-        step.breachedAt = now;
-        if (step.obligationId) {
-          await app.db
-            .update(obligations)
-            .set({ status: "breached" })
-            .where(and(eq(obligations.id, step.obligationId), eq(obligations.status, "open")));
-        }
-        await app.db.insert(signals).values({
-          id: newId("sig"),
-          companyId,
-          projectId,
-          detector: "dispute_deadline_missed",
-          severity: "high",
-          confidence: 1,
-          title: `Dispute timetable deadline missed — ${step.name} (dispute #${d.number})`,
-          explanation:
-            `Procedural timetable step "${step.name}" of ${d.kind} dispute #${d.number} ` +
-            `("${d.title}") was due on ${step.dueDate} and has not been completed. Missing a ` +
-            `procedural deadline can be fatal in adjudication and arbitration: the tribunal may ` +
-            `disregard late submissions or draw adverse inferences.`,
-        });
-        await appendLedger(app.db, {
-          companyId,
-          actorId,
-          action: "state_change",
-          objectType: "dispute_timetable_step",
-          objectId: step.id,
-          payload: {
-            disputeId: d.id,
-            step: step.name,
-            dueDate: step.dueDate,
-            status: "breached",
-            obligationId: step.obligationId,
-          },
-        });
-      }
-      await app.db.update(disputes).set({ timetable: steps }).where(eq(disputes.id, d.id));
-    }
+  async function sweepMissedDeadlines(companyId: string, projectId: string): Promise<void> {
+    await sweepDeadlinesShared(app.db, companyId, todayISO(), projectId);
   }
 
   /**
@@ -530,71 +695,146 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
   /* Dispute register (#321, #329, #334-337)                           */
   /* ---------------------------------------------------------------- */
 
+  /**
+   * Open a dispute (#321, #322-333).
+   *
+   * Two changes:
+   *
+   *  1. TIMETABLE FROM THE STATUTE. Give the dispute a `jurisdiction` and a
+   *     `triggerDate` and the procedural timetable is generated from the
+   *     regime's own offsets — 7 days to refer under the UK Scheme, 10
+   *     business days for a NSW payment schedule — instead of being typed in
+   *     from memory. Explicit `timetable` steps still win where they are
+   *     given, because contracts vary the statute.
+   *  2. ATOMICITY. Creating a dispute materialises one obligation per dated
+   *     step. That used to be N inserts followed by the dispute insert with
+   *     no transaction: a failure part-way left obligations with no owning
+   *     record on the assurance register and returned a 500 having partly
+   *     committed. The whole thing is now one transaction.
+   */
   app.post("/projects/:projectId/disputes", { preHandler: standardGate }, async (req, reply) => {
     const body = disputeCreateSchema.parse(req.body);
     await validateLinks(req.companyId!, req.projectId!, body);
     const number = await nextRecordNumber(app.db, req.projectId!, "dispute");
     const id = newId("dsp");
 
-    const steps: TimetableStep[] = [];
-    for (const s of body.timetable ?? []) {
-      const stepId = newId("stp");
-      let obligationId: string | null = null;
-      if (s.dueDate) {
-        obligationId = await materializeStepObligation(
-          req.companyId!,
-          req.projectId!,
-          req.user!.id,
-          { kind: body.kind, number },
-          { name: s.name, dueDate: s.dueDate },
+    // Generated regime steps first, then any explicit ones the caller gave.
+    let generated: ReturnType<typeof generateTimetable> = null;
+    if (body.jurisdiction && body.jurisdiction !== "custom") {
+      if (!body.triggerDate) {
+        throw badRequest(
+          "A statutory jurisdiction needs a triggerDate — every offset in the regime is measured from it",
         );
       }
-      steps.push({
-        id: stepId,
-        name: s.name,
-        dueDate: s.dueDate ?? null,
-        obligationId,
-        done: false,
-        doneAt: null,
-        breachedAt: null,
-      });
+      generated = generateTimetable(body.jurisdiction, body.triggerDate, body.holidays ?? []);
+      if (!generated) throw badRequest(`Unknown dispute jurisdiction ${body.jurisdiction}`);
     }
 
-    await app.db.insert(disputes).values({
-      id,
-      companyId: req.companyId!,
-      projectId: req.projectId!,
-      number,
-      title: body.title,
-      kind: body.kind,
-      forum: body.forum ?? null,
-      rules: body.rules ?? null,
-      contractId: body.contractId ?? null,
-      claimIds: body.claimIds ? [...new Set(body.claimIds)] : [],
-      counterpartyEntityId: body.counterpartyEntityId ?? null,
-      amountInDispute: body.amountInDispute ?? null,
-      currency: body.currency ?? "GBP",
-      status: "notified",
-      timetable: steps,
-      createdBy: req.user!.id,
-    });
-    await appendLedger(app.db, {
-      companyId: req.companyId!,
-      actorId: req.user!.id,
-      action: "create",
-      objectType: "dispute",
-      objectId: id,
-      payload: {
+    const planned: Array<{
+      name: string;
+      dueDate: string | null;
+      key: string | null;
+      owner: string | null;
+      authority: string | null;
+      extendedDueDate: string | null;
+    }> = [
+      ...(generated?.steps ?? []).map((s) => ({
+        name: s.name,
+        dueDate: s.dueDate,
+        key: s.key,
+        owner: s.owner,
+        authority: s.authority,
+        extendedDueDate: s.extendedDueDate,
+      })),
+      ...(body.timetable ?? []).map((s) => ({
+        name: s.name,
+        dueDate: s.dueDate ?? null,
+        key: null,
+        owner: null,
+        authority: null,
+        extendedDueDate: null,
+      })),
+    ];
+
+    await app.db.transaction(async (tx) => {
+      const steps: TimetableStep[] = [];
+      for (const s of planned) {
+        const stepId = newId("stp");
+        let obligationId: string | null = null;
+        if (s.dueDate) {
+          obligationId = newId("obl");
+          await tx.insert(obligations).values({
+            id: obligationId,
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            sourceClause: s.authority ?? `${body.kind} — ${s.name}`,
+            trigger: `Dispute #${number} procedural timetable: ${s.name}`,
+            deadline: `${s.dueDate}T23:59:59Z`,
+            warnDaysBefore: 3,
+            evidenceRequirement: "Served submission / completed procedural step",
+            status: "open",
+            createdBy: req.user!.id,
+          });
+        }
+        steps.push({
+          id: stepId,
+          name: s.name,
+          dueDate: s.dueDate,
+          obligationId,
+          done: false,
+          doneAt: null,
+          breachedAt: null,
+          key: s.key,
+          owner: s.owner,
+          authority: s.authority,
+          extendedDueDate: s.extendedDueDate,
+        });
+      }
+
+      await tx.insert(disputes).values({
+        id,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
         number,
         title: body.title,
         kind: body.kind,
         forum: body.forum ?? null,
         rules: body.rules ?? null,
+        contractId: body.contractId ?? null,
+        claimIds: body.claimIds ? [...new Set(body.claimIds)] : [],
+        counterpartyEntityId: body.counterpartyEntityId ?? null,
         amountInDispute: body.amountInDispute ?? null,
+        amountClaimed: body.amountClaimed ?? body.amountInDispute ?? null,
         currency: body.currency ?? "GBP",
-        timetable: steps.map((s) => ({ id: s.id, name: s.name, dueDate: s.dueDate })),
-      },
-      storePayload: true,
+        status: "notified",
+        timetable: steps,
+        jurisdiction: body.jurisdiction ?? null,
+        triggerDate: body.triggerDate ?? null,
+        contractFamily: body.contractFamily ?? null,
+        governingClause: body.governingClause ?? null,
+        createdBy: req.user!.id,
+      });
+      await appendLedger(tx as never, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "dispute",
+        objectId: id,
+        payload: {
+          number,
+          title: body.title,
+          kind: body.kind,
+          forum: body.forum ?? null,
+          rules: body.rules ?? null,
+          jurisdiction: body.jurisdiction ?? null,
+          triggerDate: body.triggerDate ?? null,
+          amountInDispute: body.amountInDispute ?? null,
+          currency: body.currency ?? "GBP",
+          timetable: steps.map((s) => ({ id: s.id, name: s.name, dueDate: s.dueDate })),
+        },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
     });
     const created = await fetchDispute(id, req.companyId!, req.projectId!);
     return reply.status(201).send(created);
@@ -602,7 +842,8 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/disputes", { preHandler: readGate }, async (req) => {
     const q = disputeListQuery.parse(req.query);
-    await sweepMissedDeadlines(req.companyId!, req.projectId!, req.user!.id);
+    await sweepMissedDeadlines(req.companyId!, req.projectId!);
+    await sweepExpiredOffers(app.db, req.companyId!, todayISO());
     const clauses = [eq(disputes.companyId, req.companyId!), eq(disputes.projectId, req.projectId!)];
     if (q.kind) clauses.push(eq(disputes.kind, q.kind));
     if (q.status) clauses.push(eq(disputes.status, q.status));
@@ -629,7 +870,8 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
   app.get("/projects/:projectId/disputes/:disputeId", { preHandler: readGate }, async (req) => {
     const { disputeId } = req.params as { disputeId: string };
     await fetchDispute(disputeId, req.companyId!, req.projectId!); // 404 before sweeping
-    await sweepMissedDeadlines(req.companyId!, req.projectId!, req.user!.id);
+    await sweepMissedDeadlines(req.companyId!, req.projectId!);
+    await sweepExpiredOffers(app.db, req.companyId!, todayISO());
     const d = await fetchDispute(disputeId, req.companyId!, req.projectId!);
     const claimRows =
       d.claimIds.length > 0
@@ -686,8 +928,18 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
     if (body.forum !== undefined) set["forum"] = body.forum;
     if (body.rules !== undefined) set["rules"] = body.rules;
     if (body.amountInDispute !== undefined) set["amountInDispute"] = body.amountInDispute;
+    if (body.amountClaimed !== undefined) set["amountClaimed"] = body.amountClaimed;
     if (body.currency !== undefined) set["currency"] = body.currency;
+    if (body.contractFamily !== undefined) set["contractFamily"] = body.contractFamily;
+    if (body.governingClause !== undefined) set["governingClause"] = body.governingClause;
+    if (body.rootCause !== undefined) set["rootCause"] = body.rootCause;
 
+    const extensionsCleared: Array<{
+      stepId: string;
+      from: string | null;
+      to: string;
+      obligationId: string;
+    }> = [];
     if (body.timetable !== undefined) {
       const existing = dispute.timetable as TimetableStep[];
       const byId = new Map(existing.map((s) => [s.id, s]));
@@ -709,10 +961,37 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
               { name: s.name, dueDate },
             );
           } else if (dueDate && prior.obligationId && dueDate !== prior.dueDate) {
+            // A tribunal that grants an extension has moved the deadline,
+            // not forgiven a breach that happened. When the new date is in
+            // the FUTURE the step is no longer missed: the breach marker is
+            // cleared and the obligation returns to open with the new
+            // deadline. Previously the step kept its red "Missed" badge and
+            // its breached obligation forever, with no way back short of
+            // deleting and re-adding the step.
+            const extendedIntoFuture = dueDate >= todayISO();
             await app.db
               .update(obligations)
-              .set({ deadline: `${dueDate}T23:59:59Z` })
-              .where(and(eq(obligations.id, prior.obligationId), eq(obligations.status, "open")));
+              .set({
+                deadline: `${dueDate}T23:59:59Z`,
+                ...(extendedIntoFuture ? { status: "open" as const } : {}),
+              })
+              .where(
+                and(
+                  eq(obligations.id, prior.obligationId),
+                  inArray(
+                    obligations.status,
+                    extendedIntoFuture ? ["open", "breached"] : ["open"],
+                  ),
+                ),
+              );
+            if (extendedIntoFuture && prior.breachedAt) {
+              extensionsCleared.push({
+                stepId: prior.id,
+                from: prior.dueDate,
+                to: dueDate,
+                obligationId: prior.obligationId,
+              });
+            }
           } else if (!dueDate && prior.obligationId) {
             await app.db
               .update(obligations)
@@ -720,7 +999,15 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
               .where(and(eq(obligations.id, prior.obligationId), eq(obligations.status, "open")));
             obligationId = null;
           }
-          next.push({ ...prior, name: s.name, dueDate: dueDate ?? null, obligationId });
+          const clearedBreach =
+            Boolean(dueDate) && dueDate! >= todayISO() && prior.breachedAt !== null;
+          next.push({
+            ...prior,
+            name: s.name,
+            dueDate: dueDate ?? null,
+            obligationId,
+            breachedAt: clearedBreach ? null : prior.breachedAt,
+          });
         } else {
           const stepId = newId("stp");
           let obligationId: string | null = null;
@@ -763,7 +1050,12 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
       action: "update",
       objectType: "dispute",
       objectId: disputeId,
-      payload: { changed: Object.keys(body) },
+      payload: {
+        changed: Object.keys(body),
+        ...(extensionsCleared.length > 0 ? { extensionsCleared } : {}),
+      },
+      storePayload: extensionsCleared.length > 0,
+      projectId: req.projectId!,
     });
     return fetchDispute(disputeId, req.companyId!, req.projectId!);
   });
@@ -772,6 +1064,19 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
   /* Status transitions (#325-333, #349)                               */
   /* ---------------------------------------------------------------- */
 
+  /**
+   * Move the dispute along its escalation ladder (#325-333, #349).
+   *
+   * The terminal transitions now CLOSE OUT the timetable. A settled or
+   * withdrawn dispute used to leave every not-done step's obligation open
+   * forever: the sweep only scanned ACTIVE disputes, so those rows never
+   * breached, never satisfied and never closed — orphans sitting on the
+   * assurance register that the timeline UI told users would "stay there
+   * until waived", with no waive action anywhere. On a terminal transition
+   * the remaining obligations are resolved: `satisfied` where the dispute
+   * was decided (the process ran its course) and `waived` where it settled
+   * or was withdrawn (the process stopped by agreement).
+   */
   app.post(
     "/projects/:projectId/disputes/:disputeId/status",
     { preHandler: standardGate },
@@ -802,20 +1107,71 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
       }
 
       const now = new Date().toISOString();
-      const set: Record<string, unknown> = { status: to, updatedAt: now };
-      if (body.outcome?.trim()) set["outcome"] = body.outcome.trim();
-      if (to === "decided") set["decidedAt"] = now;
-      await app.db.update(disputes).set(set).where(eq(disputes.id, disputeId));
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: req.user!.id,
-        action: "state_change",
-        objectType: "dispute",
-        objectId: disputeId,
-        payload: { from, to, outcome: body.outcome ?? null },
-        storePayload: true,
+      const terminal = TERMINAL.includes(to);
+      const steps = dispute.timetable as TimetableStep[];
+      let closed: { resolved: number; to: string } = { resolved: 0, to: "" };
+
+      await app.db.transaction(async (tx) => {
+        const set: Record<string, unknown> = { status: to, updatedAt: now };
+        if (body.outcome?.trim()) set["outcome"] = body.outcome.trim();
+        if (to === "decided") {
+          set["decidedAt"] = now;
+          set["resolvedAt"] = now.slice(0, 10);
+          if (body.complianceDeadline) set["complianceDeadline"] = body.complianceDeadline;
+          if (body.nodDeadline) set["nodDeadline"] = body.nodDeadline;
+          set["enforcementStatus"] = "awaiting_compliance";
+        }
+        if (to === "settled" || to === "withdrawn") set["resolvedAt"] = now.slice(0, 10);
+        if (body.amountAwarded !== undefined) set["amountAwarded"] = body.amountAwarded;
+        if (body.costsAwarded !== undefined) set["costsAwarded"] = body.costsAwarded;
+        if (body.rootCause !== undefined) set["rootCause"] = body.rootCause;
+        await tx.update(disputes).set(set).where(eq(disputes.id, disputeId));
+
+        if (terminal) {
+          closed = await closeTimetableObligations(tx as never, {
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            actorId: req.user!.id,
+            disputeId,
+            steps,
+            terminalStatus: to,
+          });
+          // Sibling offers on a dispute that has ended are no longer on the
+          // table either.
+          await tx
+            .update(settlementOffers)
+            .set({ status: "lapsed", updatedAt: now })
+            .where(
+              and(
+                eq(settlementOffers.disputeId, disputeId),
+                eq(settlementOffers.companyId, req.companyId!),
+                eq(settlementOffers.status, "open"),
+              ),
+            );
+        }
+
+        await appendLedger(tx as never, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "state_change",
+          objectType: "dispute",
+          objectId: disputeId,
+          payload: {
+            from,
+            to,
+            outcome: body.outcome ?? null,
+            ...(terminal
+              ? { obligationsResolved: closed.resolved, obligationStatus: closed.to }
+              : {}),
+          },
+          storePayload: true,
+          projectId: req.projectId!,
+        });
       });
-      return fetchDispute(disputeId, req.companyId!, req.projectId!);
+      return {
+        ...(await fetchDispute(disputeId, req.companyId!, req.projectId!)),
+        obligationsResolved: terminal ? closed.resolved : 0,
+      };
     },
   );
 
@@ -865,7 +1221,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
       const { disputeId } = req.params as { disputeId: string };
       const body = submissionCreateSchema.parse(req.body);
       await fetchDispute(disputeId, req.companyId!, req.projectId!);
-      if (body.fileId) await validateFileId(req.companyId!, body.fileId);
+      if (body.fileId) await validateFileId(req.companyId!, req.projectId!, body.fileId);
       const id = newId("dsb");
       await app.db.insert(disputeSubmissions).values({
         id,
@@ -1098,9 +1454,21 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
   );
 
   /**
-   * Freeze the bundle (#343): sequential tab numbers, per-item content
-   * hashes, Merkle root over the hashes — the manifest is the tamper-evident
-   * commitment to exactly what was produced to the tribunal.
+   * Freeze the bundle (#340-343).
+   *
+   * What generation now does, and why:
+   *
+   *  - CONTENT SNAPSHOTS. Each item's canonical JSON (or its file's hash
+   *    reference) is stored in `bundle_snapshots`. Without them `verify`
+   *    could not tell tampering from an ordinary lifecycle change on the
+   *    source record — an RFI answered after the bundle was served made the
+   *    bundle look forged — and a produced bundle could never be re-rendered
+   *    as it was served.
+   *  - PRIVILEGE. Items marked privileged are EXCLUDED from production and
+   *    listed in a privilege log instead. Producing a privileged document is
+   *    a waiver you cannot take back.
+   *  - PAGINATION. Every produced item is assigned a page span, so the index
+   *    can say "tab A7, page 214" rather than just naming the tab.
    */
   app.post(
     "/projects/:projectId/dispute-bundles/:bundleId/generate",
@@ -1114,48 +1482,176 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
       const items = bundle.items as BundleItem[];
       if (items.length === 0) throw badRequest("Cannot generate an empty bundle");
 
+      const produced = items.filter((i) => (i.privilege ?? "none") === "none");
+      const withheld = items.filter((i) => (i.privilege ?? "none") !== "none");
+      if (produced.length === 0) {
+        throw badRequest(
+          "Every item in this bundle is marked privileged, so there is nothing to produce",
+        );
+      }
+
       const index: ManifestIndexEntry[] = [];
-      for (const [i, item] of items.entries()) {
-        const sha256 = await itemContentHash(item, req.companyId!, req.projectId!);
-        if (!sha256) {
+      const snapshots: Array<{
+        itemId: string;
+        tab: string;
+        kind: "record" | "file";
+        sha256: string;
+        snapshot: Record<string, unknown> | null;
+        startPage: number;
+        endPage: number;
+      }> = [];
+      // Page 1 is the cover, page 2 the index; content starts at page 3.
+      let page = 3;
+      for (const [i, item] of produced.entries()) {
+        const resolved = await itemContent(item, req.companyId!, req.projectId!);
+        if (!resolved) {
           throw badRequest(
             `Item "${item.title}" no longer resolves to a file or record; remove it and retry`,
           );
         }
         item.tab = `A${i + 1}`;
-        item.sha256 = sha256;
+        item.sha256 = resolved.sha256;
+        // A record renders on one page; a file's extent is unknown to the
+        // platform, so it is reserved one page and the span is honest about
+        // being a placeholder for the real page count at print time.
+        const pages = 1;
+        item.startPage = page;
+        item.endPage = page + pages - 1;
+        page += pages;
         index.push({
           tab: item.tab,
           title: item.title,
           date: item.date,
           source: item.fileId ? `file:${item.fileId}` : `${item.recordType}:${item.recordId}`,
-          sha256,
+          sha256: resolved.sha256,
+        });
+        snapshots.push({
+          itemId: item.id,
+          tab: item.tab,
+          kind: resolved.kind,
+          sha256: resolved.sha256,
+          snapshot: resolved.snapshot,
+          startPage: item.startPage,
+          endPage: item.endPage,
         });
       }
+      // Withheld items keep no tab and no hash — they are not in the bundle.
+      for (const item of withheld) {
+        item.tab = null;
+        item.sha256 = null;
+        item.startPage = null;
+        item.endPage = null;
+      }
+
       const root = merkleRoot(index.map((e) => e.sha256));
+      const generatedAt = new Date().toISOString();
       const manifest: BundleManifest = {
-        generatedAt: new Date().toISOString(),
+        generatedAt,
         itemCount: index.length,
         merkleRoot: root,
         index,
+        privilegeLog: withheld.map((i) => ({
+          id: i.id,
+          title: i.title,
+          date: i.date,
+          privilege: i.privilege ?? "none",
+          reason: i.privilegeReason ?? null,
+        })),
+        pages: page - 1,
+        statement:
+          `${index.length} item(s) produced under Merkle root ${root}; ` +
+          (withheld.length > 0
+            ? `${withheld.length} item(s) withheld on grounds of privilege and listed in the privilege log. `
+            : "nothing withheld. ") +
+          `Each produced item's content is snapshotted at generation, so verification distinguishes ` +
+          `tampering from an ordinary later change to the source record. Page numbers assume one ` +
+          `page per item plus a cover and index; the real extent of attached files is set at print.`,
       };
+
+      await app.db.transaction(async (tx) => {
+        await tx
+          .update(disputeBundles)
+          .set({
+            items,
+            manifest: manifest as unknown as Record<string, unknown>,
+            status: "generated",
+            updatedAt: generatedAt,
+          })
+          .where(eq(disputeBundles.id, bundleId));
+        await tx.delete(bundleSnapshots).where(eq(bundleSnapshots.bundleId, bundleId));
+        if (snapshots.length > 0) {
+          await tx.insert(bundleSnapshots).values(
+            snapshots.map((snap) => ({
+              id: newId("bsn"),
+              bundleId,
+              companyId: req.companyId!,
+              projectId: req.projectId!,
+              itemId: snap.itemId,
+              tab: snap.tab,
+              kind: snap.kind,
+              sha256: snap.sha256,
+              snapshot: snap.snapshot,
+              startPage: snap.startPage,
+              endPage: snap.endPage,
+            })),
+          );
+        }
+        await appendLedger(tx as never, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "state_change",
+          objectType: "dispute_bundle",
+          objectId: bundleId,
+          payload: { from: "draft", to: "generated", manifest },
+          storePayload: true,
+          projectId: req.projectId!,
+        });
+      });
+      return fetchBundle(bundleId, req.companyId!, req.projectId!);
+    },
+  );
+
+  /**
+   * Mark items privileged before generation (#340-342). A privileged item
+   * stays in the working bundle — the team still needs to see it — but is
+   * withheld from production and listed in the privilege log instead.
+   */
+  app.put(
+    "/projects/:projectId/dispute-bundles/:bundleId/privilege",
+    { preHandler: standardGate },
+    async (req) => {
+      const { bundleId } = req.params as { bundleId: string };
+      const body = privilegePutSchema.parse(req.body);
+      const bundle = await fetchBundle(bundleId, req.companyId!, req.projectId!);
+      if (bundle.status !== "draft") {
+        throw badRequest("Privilege can only be set while the bundle is draft");
+      }
+      const items = bundle.items as BundleItem[];
+      const byId = new Map(items.map((i) => [i.id, i]));
+      for (const entry of body.entries) {
+        const item = byId.get(entry.itemId);
+        if (!item) throw badRequest(`Item ${entry.itemId} is not in this bundle`);
+        if (entry.privilege !== "none" && !entry.reason) {
+          throw badRequest(
+            `Item ${entry.itemId} is marked privileged without a reason — a privilege log entry must say why`,
+          );
+        }
+        item.privilege = entry.privilege;
+        item.privilegeReason = entry.reason ?? null;
+      }
       await app.db
         .update(disputeBundles)
-        .set({
-          items,
-          manifest: manifest as unknown as Record<string, unknown>,
-          status: "generated",
-          updatedAt: manifest.generatedAt,
-        })
+        .set({ items, updatedAt: new Date().toISOString() })
         .where(eq(disputeBundles.id, bundleId));
       await appendLedger(app.db, {
         companyId: req.companyId!,
         actorId: req.user!.id,
-        action: "state_change",
+        action: "update",
         objectType: "dispute_bundle",
         objectId: bundleId,
-        payload: { from: "draft", to: "generated", manifest },
+        payload: { privilege: body.entries },
         storePayload: true,
+        projectId: req.projectId!,
       });
       return fetchBundle(bundleId, req.companyId!, req.projectId!);
     },
@@ -1170,27 +1666,40 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
       const bundle = await fetchBundle(bundleId, req.companyId!, req.projectId!);
       const manifest = bundle.manifest as BundleManifest | null;
       if (!manifest) throw badRequest("Bundle has not been generated yet");
-      const lines = ["tab,title,date,source,sha256"];
+      const snaps = await app.db
+        .select()
+        .from(bundleSnapshots)
+        .where(eq(bundleSnapshots.bundleId, bundleId));
+      const pageByTab = new Map(snaps.map((s) => [s.tab, s.startPage]));
+      const lines = ["tab,page,title,date,source,sha256"];
       for (const e of manifest.index) {
         lines.push(
-          [csvCell(e.tab), csvCell(e.title), csvCell(e.date), csvCell(e.source), csvCell(e.sha256)].join(
-            ",",
-          ),
+          [
+            csvCell(e.tab),
+            csvCell(String(pageByTab.get(e.tab) ?? "")),
+            csvCell(e.title),
+            csvCell(e.date),
+            csvCell(e.source),
+            csvCell(e.sha256),
+          ].join(","),
         );
       }
       return reply
         .header("content-type", "text/csv; charset=utf-8")
-        .header(
-          "content-disposition",
-          `attachment; filename="bundle-${bundle.id}-manifest.csv"`,
-        )
+        .header("content-disposition", `attachment; filename="bundle-${bundle.id}-manifest.csv"`)
         .send(lines.join("\n") + "\n");
     },
   );
 
   /**
-   * Tamper-evidence check (#862-style): recompute every item's content hash
-   * from today's files/records and compare against the frozen manifest.
+   * Tamper-evidence check.
+   *
+   * Comparing today's content hash against the manifest cannot tell a forged
+   * bundle from a legitimately-updated source record. With snapshots it can:
+   * an item whose source has CHANGED is reported as `changed` with the
+   * snapshot available for comparison; an item that no longer RESOLVES is
+   * reported as `missing`; and the Merkle root still proves the manifest
+   * itself has not been rewritten.
    */
   app.post(
     "/projects/:projectId/dispute-bundles/:bundleId/verify",
@@ -1202,28 +1711,104 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
       if (!manifest) throw badRequest("Bundle has not been generated yet");
       const items = bundle.items as BundleItem[];
       const byTab = new Map(items.map((it) => [it.tab, it]));
-      const mismatches: { tab: string; title: string; expected: string; actual: string | null }[] =
-        [];
+      const snaps = await app.db
+        .select()
+        .from(bundleSnapshots)
+        .where(eq(bundleSnapshots.bundleId, bundleId));
+      const snapByTab = new Map(snaps.map((s) => [s.tab, s]));
+
+      const findings: Array<{
+        tab: string;
+        title: string;
+        state: "intact" | "changed" | "missing" | "unsnapshotted";
+        expected: string;
+        actual: string | null;
+        note: string;
+      }> = [];
       for (const entry of manifest.index) {
         const item = byTab.get(entry.tab);
-        const actual = item
-          ? await itemContentHash(item, req.companyId!, req.projectId!)
-          : null;
-        if (actual !== entry.sha256) {
-          mismatches.push({ tab: entry.tab, title: entry.title, expected: entry.sha256, actual });
+        const resolved = item ? await itemContent(item, req.companyId!, req.projectId!) : null;
+        const snap = snapByTab.get(entry.tab);
+        if (!resolved) {
+          findings.push({
+            tab: entry.tab,
+            title: entry.title,
+            state: "missing",
+            expected: entry.sha256,
+            actual: null,
+            note: snap
+              ? "The source no longer resolves, but the snapshot taken at generation is retained, so the produced content can still be reproduced."
+              : "The source no longer resolves and no snapshot was taken; this item cannot be reproduced.",
+          });
+          continue;
         }
+        if (resolved.sha256 === entry.sha256) {
+          findings.push({
+            tab: entry.tab,
+            title: entry.title,
+            state: "intact",
+            expected: entry.sha256,
+            actual: resolved.sha256,
+            note: "The source is byte-for-byte what was produced.",
+          });
+          continue;
+        }
+        findings.push({
+          tab: entry.tab,
+          title: entry.title,
+          state: snap ? "changed" : "unsnapshotted",
+          expected: entry.sha256,
+          actual: resolved.sha256,
+          note: snap
+            ? "The source record has changed since the bundle was produced. The snapshot holds what was served, so this is a lifecycle change and not necessarily tampering — compare the two."
+            : "The source has changed and no snapshot was taken, so what was produced cannot be recovered.",
+        });
       }
+
       const recomputedRoot = merkleRoot(manifest.index.map((e) => e.sha256));
-      const intact = mismatches.length === 0 && recomputedRoot === manifest.merkleRoot;
+      const manifestIntact = recomputedRoot === manifest.merkleRoot;
+      const changed = findings.filter((f) => f.state === "changed" || f.state === "unsnapshotted");
+      const missing = findings.filter((f) => f.state === "missing");
+      const intact = manifestIntact && changed.length === 0 && missing.length === 0;
       await appendLedger(app.db, {
         companyId: req.companyId!,
         actorId: req.user!.id,
         action: "access",
         objectType: "dispute_bundle",
         objectId: bundleId,
-        payload: { verify: true, intact, mismatchCount: mismatches.length },
+        payload: {
+          verify: true,
+          intact,
+          manifestIntact,
+          changed: changed.length,
+          missing: missing.length,
+        },
+        projectId: req.projectId!,
       });
-      return { intact, merkleRoot: manifest.merkleRoot, itemCount: manifest.itemCount, mismatches };
+      return {
+        intact,
+        manifestIntact,
+        merkleRoot: manifest.merkleRoot,
+        recomputedRoot,
+        itemCount: manifest.itemCount,
+        snapshotCount: snaps.length,
+        findings,
+        // kept for the existing UI: a plain mismatch list
+        mismatches: [...changed, ...missing].map((f) => ({
+          tab: f.tab,
+          title: f.title,
+          expected: f.expected,
+          actual: f.actual,
+        })),
+        statement:
+          manifestIntact
+            ? `The manifest's Merkle root recomputes to the value recorded at generation, so the ` +
+              `index itself has not been rewritten. ${changed.length} source record(s) have changed ` +
+              `since production and ${missing.length} no longer resolve; the snapshots taken at ` +
+              `generation hold what was actually served.`
+            : `The manifest's Merkle root does NOT recompute to the recorded value. The index has ` +
+              `been altered since generation and this bundle cannot be relied on.`,
+      };
     },
   );
 
@@ -1325,6 +1910,20 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
     },
   );
 
+  /**
+   * Move an offer through its lifecycle (#350-352).
+   *
+   * Three holes closed:
+   *  - An EXPIRED offer could still be accepted, settling the dispute at a
+   *    price the counterparty had withdrawn months earlier. Expiry is now
+   *    checked, and the offer is lapsed rather than accepted.
+   *  - Accepting an offer left every SIBLING offer "open" on a dispute that
+   *    had just settled, so the settlement analysis kept reporting a best
+   *    open offer on a closed matter. Siblings are now lapsed with the
+   *    acceptance.
+   *  - Any offer on a TERMINAL dispute could still be rejected or lapsed by
+   *    hand. Terminal means terminal.
+   */
   app.post(
     "/projects/:projectId/settlement-offers/:offerId/status",
     { preHandler: standardGate },
@@ -1342,47 +1941,115 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
       if (offer.status !== "open") {
         throw badRequest(`A ${offer.status} offer cannot change status`);
       }
+      if (TERMINAL.includes(dispute.status as DisputeStatus)) {
+        throw badRequest(
+          `Offers on a ${dispute.status} dispute can no longer change status — the matter has ended`,
+        );
+      }
+      const today = todayISO();
+      if (offer.expiresAt && offer.expiresAt < today) {
+        // Record the truth rather than the requested transition.
+        await app.db
+          .update(settlementOffers)
+          .set({ status: "lapsed", updatedAt: new Date().toISOString() })
+          .where(and(eq(settlementOffers.id, offerId), eq(settlementOffers.status, "open")));
+        await appendLedger(app.db, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "state_change",
+          objectType: "settlement_offer",
+          objectId: offerId,
+          payload: { from: "open", to: "lapsed", expiresAt: offer.expiresAt, requested: body.status },
+          storePayload: true,
+          projectId: req.projectId!,
+        });
+        throw conflict(
+          `This offer expired on ${offer.expiresAt} and has been marked lapsed; it cannot be ` +
+            `${body.status}. Ask the counterparty to re-offer if the price still stands.`,
+        );
+      }
       if (body.status === "accepted" && !ACTIVE.includes(dispute.status as DisputeStatus)) {
         throw badRequest(
           `Cannot accept an offer on a ${dispute.status} dispute — it is no longer live`,
         );
       }
-      const now = new Date().toISOString();
-      await app.db
-        .update(settlementOffers)
-        .set({ status: body.status, updatedAt: now })
-        .where(eq(settlementOffers.id, offerId));
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: req.user!.id,
-        action: "state_change",
-        objectType: "settlement_offer",
-        objectId: offerId,
-        payload: { from: "open", to: body.status, disputeId: offer.disputeId },
-        storePayload: true,
-      });
 
-      if (body.status === "accepted") {
-        // Acceptance settles the dispute (#350): status settled + outcome.
-        const outcome = `Settled at ${offer.currency} ${offer.amount}`;
-        await app.db
-          .update(disputes)
-          .set({ status: "settled", outcome, updatedAt: now })
-          .where(eq(disputes.id, dispute.id));
-        await appendLedger(app.db, {
+      const now = new Date().toISOString();
+      const steps = dispute.timetable as TimetableStep[];
+      let closed: { resolved: number; to: string } = { resolved: 0, to: "" };
+
+      await app.db.transaction(async (tx) => {
+        await tx
+          .update(settlementOffers)
+          .set({ status: body.status, updatedAt: now })
+          .where(and(eq(settlementOffers.id, offerId), eq(settlementOffers.status, "open")));
+        await appendLedger(tx as never, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "state_change",
-          objectType: "dispute",
-          objectId: dispute.id,
-          payload: { from: dispute.status, to: "settled", outcome, offerId },
+          objectType: "settlement_offer",
+          objectId: offerId,
+          payload: { from: "open", to: body.status, disputeId: offer.disputeId },
           storePayload: true,
+          projectId: req.projectId!,
         });
-      }
+
+        if (body.status === "accepted") {
+          // Acceptance settles the dispute (#350): status settled + outcome.
+          const outcome = `Settled at ${offer.currency} ${offer.amount}`;
+          await tx
+            .update(disputes)
+            .set({
+              status: "settled",
+              outcome,
+              resolvedAt: now.slice(0, 10),
+              amountAwarded: offer.amount,
+              updatedAt: now,
+            })
+            .where(eq(disputes.id, dispute.id));
+          // Every other open offer goes off the table with it.
+          const lapsed = await tx
+            .update(settlementOffers)
+            .set({ status: "lapsed", updatedAt: now })
+            .where(
+              and(
+                eq(settlementOffers.disputeId, dispute.id),
+                eq(settlementOffers.companyId, req.companyId!),
+                eq(settlementOffers.status, "open"),
+              ),
+            )
+            .returning({ id: settlementOffers.id });
+          closed = await closeTimetableObligations(tx as never, {
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            actorId: req.user!.id,
+            disputeId: dispute.id,
+            steps,
+            terminalStatus: "settled",
+          });
+          await appendLedger(tx as never, {
+            companyId: req.companyId!,
+            actorId: req.user!.id,
+            action: "state_change",
+            objectType: "dispute",
+            objectId: dispute.id,
+            payload: {
+              from: dispute.status,
+              to: "settled",
+              outcome,
+              offerId,
+              siblingOffersLapsed: lapsed.length,
+              obligationsResolved: closed.resolved,
+            },
+            storePayload: true,
+            projectId: req.projectId!,
+          });
+        }
+      });
       const updated = (
         await app.db.select().from(settlementOffers).where(eq(settlementOffers.id, offerId)).limit(1)
       )[0];
-      return updated;
+      return { ...updated, obligationsResolved: closed.resolved };
     },
   );
 
@@ -1394,6 +2061,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
       const { disputeId } = req.params as { disputeId: string };
       const q = settlementAnalysisQuery.parse(req.query);
       const dispute = await fetchDispute(disputeId, req.companyId!, req.projectId!);
+      await sweepExpiredOffers(app.db, req.companyId!, todayISO(), [disputeId]);
       const offers = await app.db
         .select()
         .from(settlementOffers)
@@ -1403,6 +2071,10 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
             eq(settlementOffers.companyId, req.companyId!),
           ),
         );
+      // Expired offers and offers in another currency are excluded, and
+      // the exclusions are reported: a USD 400,000 offer does not beat a
+      // GBP 350,000 expected value, and an offer that lapsed three months
+      // ago is not a price anybody is still offering.
       const analysis = analyseSettlement(
         {
           winProbability: q.winProbability,
@@ -1418,8 +2090,10 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
             currency: o.currency,
             basis: o.basis,
             offeredAt: o.offeredAt,
+            expiresAt: o.expiresAt,
           }),
         ),
+        { today: todayISO(), disputeCurrency: dispute.currency },
       );
       return { disputeId, currency: dispute.currency, ...analysis };
     },

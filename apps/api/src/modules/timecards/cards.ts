@@ -562,23 +562,42 @@ export const timecardRoutes: FastifyPluginAsync = async (app) => {
             "what they are reviewing. Raise the card on its own, or collect it into a new batch.",
         );
       }
-      assertSameCurrency(
-        [
-          { label: batch.reference, currency: batch.currency },
-          {
-            label: "this card",
-            // The same precedence resolveRates uses, so the check and the
-            // stored currency can never disagree.
-            currency: (
-              body.currency ??
-              member?.currency ??
-              worker.currency ??
-              "USD"
-            ).toUpperCase(),
-          },
-        ],
-        `Adding a card to batch ${batch.reference}`,
-      );
+      // The same precedence resolveRates uses, so the check and the stored
+      // currency can never disagree.
+      const cardCurrency = (
+        body.currency ??
+        member?.currency ??
+        worker.currency ??
+        "USD"
+      ).toUpperCase();
+      /*
+       * AN EMPTY BATCH HAS NO CURRENCY YET, it has a column default. A batch
+       * is a crew's week, and the crew's money is whatever its members are
+       * paid in; refusing the first card because the DEFAULT said USD made a
+       * GBP crew unable to open a week at all. So the first card SETS the
+       * currency, and every card after it is checked against that.
+       */
+      const [firstCard] = await app.db
+        .select({ id: timecards.id })
+        .from(timecards)
+        .where(eq(timecards.batchId, batch.id))
+        .limit(1);
+      if (!firstCard) {
+        if (batch.currency !== cardCurrency) {
+          await app.db
+            .update(timecardBatches)
+            .set({ currency: cardCurrency, updatedAt: nowIso() })
+            .where(eq(timecardBatches.id, batch.id));
+        }
+      } else {
+        assertSameCurrency(
+          [
+            { label: batch.reference, currency: batch.currency },
+            { label: "this card", currency: cardCurrency },
+          ],
+          `Adding a card to batch ${batch.reference}`,
+        );
+      }
     }
 
     const number = await nextRecordNumber(app.db, projectId, "timecard");

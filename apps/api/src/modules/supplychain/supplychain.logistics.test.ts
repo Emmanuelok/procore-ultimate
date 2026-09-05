@@ -158,7 +158,7 @@ describe("site gates and slot booking", () => {
     // planners cannot both be told the bay is free. (The embedded PGlite
     // serialises requests, so this asserts the invariant end to end rather
     // than reproducing the race — the same caveat as the expediting test.)
-    const window = { gateId, startsAt: at(day, "14:00"), endsAt: at(day, "14:30"), vehicleType: "rigid_18t" };
+    const window = { gateId, startsAt: at(day, "11:00"), endsAt: at(day, "11:30"), vehicleType: "rigid_18t" };
     const [a, b] = await Promise.all([
       post(`${lg()}/slots`, { ...window, description: "Blockwork — planner A" }),
       post(`${lg()}/slots`, { ...window, description: "Insulation — planner B" }),
@@ -166,7 +166,7 @@ describe("site gates and slot booking", () => {
     const codes = [a.statusCode, b.statusCode].sort();
     expect(codes).toEqual([201, 409]);
     const booked = await get(`${lg()}/slots?from=${day}&to=${day}&gateId=${gateId}`);
-    const inWindow = (booked.json().items as Array<{ startsAt: string }>).filter((r) => r.startsAt === at(day, "14:00"));
+    const inWindow = (booked.json().items as Array<{ startsAt: string }>).filter((r) => r.startsAt === at(day, "11:00"));
     expect(inWindow).toHaveLength(1);
     const refused = a.statusCode === 409 ? a : b;
     expect(refused.json().message).toMatch(/DEL-/);

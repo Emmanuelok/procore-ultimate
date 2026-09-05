@@ -17,13 +17,14 @@
  *    originator carry entitlement — and refuses to when they do not.
  */
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, ilike, inArray, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, ilike, inArray, notInArray, or } from "drizzle-orm";
 import { z } from "zod";
 import {
   changeEvents,
   designChangeImpacts,
   designChangeNotices,
   designPackages,
+  projects,
 } from "@constructos/db";
 import {
   DCN_AUTHORISATION_LEVELS,
@@ -51,9 +52,11 @@ import {
   alreadySignalled,
   assertPackage,
   assertVendor,
+  boolQuerySchema,
   buildGates,
   currencySchema,
   fileIdsSchema,
+  heldAuthorisation,
   idSchema,
   isoDateSchema,
   ledger,
@@ -227,11 +230,12 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
         classification: z.enum(DCN_CLASSIFICATIONS).optional(),
         originator: z.enum(DCN_ORIGINATORS).optional(),
         packageId: idSchema.optional(),
-        postFreeze: z.coerce.boolean().optional(),
-        open: z.coerce.boolean().optional(),
+        postFreeze: boolQuerySchema.optional(),
+        open: boolQuerySchema.optional(),
         q: z.string().max(120).optional(),
       })
       .parse(req.query);
+    const OPEN_DCN = ["submitted", "assessing", "approved"] as const;
     const where = and(
       eq(designChangeNotices.companyId, req.companyId!),
       eq(designChangeNotices.projectId, projectId),
@@ -239,8 +243,12 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
       q.classification ? eq(designChangeNotices.classification, q.classification) : undefined,
       q.originator ? eq(designChangeNotices.originator, q.originator) : undefined,
       q.packageId ? eq(designChangeNotices.packageId, q.packageId) : undefined,
-      q.postFreeze ? eq(designChangeNotices.isPostFreeze, 1) : undefined,
-      q.open ? inArray(designChangeNotices.status, ["submitted", "assessing", "approved"]) : undefined,
+      q.postFreeze === undefined ? undefined : eq(designChangeNotices.isPostFreeze, q.postFreeze ? 1 : 0),
+      q.open === undefined
+        ? undefined
+        : q.open
+          ? inArray(designChangeNotices.status, [...OPEN_DCN])
+          : notInArray(designChangeNotices.status, [...OPEN_DCN]),
       q.q
         ? or(ilike(designChangeNotices.title, `%${q.q}%`), ilike(designChangeNotices.reference, `%${q.q}%`))
         : undefined,
@@ -307,7 +315,7 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
     return reply.code(201).send(inserted);
   });
 
-  app.get("/projects/:projectId/design/change-notices/:noticeId", { preHandler: readGate }, async (req) => {
+  app.get("/projects/:projectId/design/change-notices/:noticeId", { preHandler: readGate }, async (req, reply) => {
     const { projectId, noticeId } = req.params as { projectId: string; noticeId: string };
     const companyId = req.companyId!;
     const row = await loadNotice(companyId, projectId, noticeId);
@@ -364,6 +372,14 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
     const [pkg] = row.packageId
       ? await app.db.select().from(designPackages).where(eq(designPackages.id, row.packageId)).limit(1)
       : [];
+    const [project] = await app.db
+      .select({ currency: projects.currency })
+      .from(projects)
+      .where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)))
+      .limit(1);
+    // What the READER may sign at, so the workspace offers only the levels
+    // they actually hold instead of inviting a refusal.
+    const held = await heldAuthorisation(app, req, reply);
     return {
       ...row,
       package: pkg ?? null,
@@ -373,6 +389,8 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
       authorisation: verdict,
       entitlement,
       thresholds: DEFAULT_THRESHOLDS,
+      projectCurrency: project?.currency ?? null,
+      heldAuthorisation: held,
     };
   });
 
@@ -640,7 +658,7 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
    * the computed authorisation level, declared on the request so the record
    * says under what authority it was signed.
    */
-  app.post("/projects/:projectId/design/change-notices/:noticeId/approve", { preHandler: standardGate }, async (req) => {
+  app.post("/projects/:projectId/design/change-notices/:noticeId/approve", { preHandler: standardGate }, async (req, reply) => {
     const { projectId, noticeId } = req.params as { projectId: string; noticeId: string };
     const body = z
       .object({
@@ -656,6 +674,15 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
     if (row.requestedBy === req.user!.id) {
       throw forbidden(
         "A design change notice is approved by someone other than the person who raised it. Segregation of duties is what makes the approval mean something.",
+      );
+    }
+    // The declared level is bound to a level the caller actually holds. Without
+    // this the whole threshold ladder (#892) would be decorative: anyone who
+    // can reach this route could sign a board-level change by typing "board".
+    const held = await heldAuthorisation(app, req, reply);
+    if (authorisationRank(body.authorisationLevel) > authorisationRank(held.level)) {
+      throw forbidden(
+        `You are signing at ${body.authorisationLevel.replace(/_/g, " ")} level but you hold ${held.level.replace(/_/g, " ")}. ${held.basis} A level you do not hold is not an authorisation.`,
       );
     }
     const required = (DCN_AUTHORISATION_LEVELS as readonly string[]).includes(row.requiredAuthorisation)
@@ -686,6 +713,8 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
       payload: {
         to: "approved",
         authorisationLevel: body.authorisationLevel,
+        heldAuthorisation: held.level,
+        heldBasis: held.basis,
         required,
         assessedCost: row.assessedCost,
         currency: row.currency,
@@ -790,6 +819,23 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
     if (row.status !== "approved") {
       throw conflict(`${row.reference} is ${row.status}; only an approved change notice can be implemented.`);
     }
+    const [project] = await app.db
+      .select({ currency: projects.currency })
+      .from(projects)
+      .where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)))
+      .limit(1);
+    if (!project) throw notFound("Project not found");
+    const noticeCurrency = (row.currency || "USD").toUpperCase();
+    const rollupCostReasons = rollupImpacts(
+      (await impactsOf(noticeId)).map((i) => ({
+        discipline: i.discipline,
+        costImpact: i.costImpact,
+        currency: i.currency,
+        timeImpactDays: i.timeImpactDays,
+        reworkHours: i.reworkHours,
+        affectedPackageIds: i.affectedPackageIds ?? [],
+      })),
+    ).costReasons;
     const entitlement = assessEntitlement({
       classification: row.classification === "design_development" ? "design_development" : "design_change",
       originator: (DCN_ORIGINATORS as readonly string[]).includes(row.originator)
@@ -798,8 +844,8 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
       isPostFreeze: row.isPostFreeze === 1,
     });
 
-    let changeEventId = row.changeEventId;
-    if (body.raiseChangeEvent && !changeEventId) {
+    const raising = body.raiseChangeEvent && !row.changeEventId;
+    if (raising) {
       if (!entitlement.raisesChangeEvent) {
         throw badRequest(
           `A change event was requested but this notice carries no entitlement: ${entitlement.reasons.join(" ")} Implement it with raiseChangeEvent=false, or reclassify the notice if that attribution is wrong.`,
@@ -811,37 +857,96 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
           `The assessed impact spans ${row.impactCurrencies.length} currencies (${row.impactCurrencies.join(", ")}). A change event carries one currency, so the impacts must be assessed in one currency before a change event can be raised.`,
         );
       }
-      const number = await nextRecordNumber(app.db, projectId, "change_event");
-      changeEventId = newId("cev");
-      await app.db.insert(changeEvents).values({
-        id: changeEventId,
-        companyId,
-        projectId,
-        number,
-        reference: `CE-${String(number).padStart(3, "0")}`,
-        title: `${row.reference} — ${row.title}`,
-        description: row.description ?? null,
-        status: "open",
-        eventType: "design_change",
-        scope: "tbd",
-        reason: changeReasonFor(row.classification, row.originator),
-        originType: "manual",
-        originId: noticeId,
-        estimatedCost: row.assessedCost ?? 0,
-        latestCost: row.assessedCost ?? 0,
-        scheduleImpactDays: row.assessedTimeDays ?? 0,
-        identifiedDate: (row.submittedAt ?? row.createdAt).slice(0, 10),
-        detail: {
-          source: "design_change_notice",
-          designChangeNoticeId: noticeId,
-          classification: row.classification,
-          originator: row.originator,
-          isPostFreeze: row.isPostFreeze === 1,
-          entitlement: entitlement.reasons,
-          currency: row.currency,
-        },
-        createdBy: req.user!.id,
-      });
+      // A change event has no currency column of its own: its money IS the
+      // project's currency. Writing a GBP assessment into a USD project would
+      // silently restate the number, so refuse rather than convert at a rate
+      // nobody recorded.
+      if (project.currency && noticeCurrency !== project.currency) {
+        throw badRequest(
+          `This notice is assessed in ${noticeCurrency} and the project's change register is kept in ${project.currency}. A change event carries no currency of its own, so raising one here would restate ${noticeCurrency} figures as ${project.currency}. Re-assess the impacts in ${project.currency}, or implement with raiseChangeEvent=false and raise the change event by hand with a recorded rate.`,
+          { noticeCurrency, projectCurrency: project.currency },
+        );
+      }
+      // An unpriced change must not land in the owner's register as 0.00.
+      if (row.assessedCost === null || !Number.isFinite(row.assessedCost)) {
+        throw badRequest(
+          `No cost has been assessed on ${row.reference}, and a change event cannot carry "not available" — it would enter the register as 0.00 exposure. ${rollupCostReasons.join(" ")} Assess a cost on at least one impact line, or implement with raiseChangeEvent=false.`,
+          { costReasons: rollupCostReasons },
+        );
+      }
+    }
+
+    const assessedCost = row.assessedCost;
+    const newEventId = raising ? newId("cev") : null;
+    let changeEventId = row.changeEventId;
+
+    // One money write, one transaction. Two concurrent /implement calls both
+    // saw "approved" and a null changeEventId before this lock existed, so both
+    // inserted a change event with the full exposure and the second update
+    // orphaned the first — the register kept money nobody could trace back.
+    const outcome = await app.db.transaction(async (tx) => {
+      const locked = await tx
+        .select({ status: designChangeNotices.status, changeEventId: designChangeNotices.changeEventId })
+        .from(designChangeNotices)
+        .where(eq(designChangeNotices.id, noticeId))
+        .for("update");
+      const current = locked[0];
+      if (!current || current.status !== "approved") {
+        throw conflict(
+          `${row.reference} is now ${current?.status ?? "gone"}; it was implemented by somebody else a moment ago.`,
+        );
+      }
+      let eventId = current.changeEventId;
+      if (newEventId && !eventId) {
+        const number = await nextRecordNumber(tx, projectId, "change_event");
+        eventId = newEventId;
+        await tx.insert(changeEvents).values({
+          id: eventId,
+          companyId,
+          projectId,
+          number,
+          reference: `CE-${String(number).padStart(3, "0")}`,
+          title: `${row.reference} — ${row.title}`,
+          description: row.description ?? null,
+          status: "open",
+          eventType: "design_change",
+          scope: "tbd",
+          reason: changeReasonFor(row.classification, row.originator),
+          originType: "manual",
+          originId: noticeId,
+          estimatedCost: assessedCost ?? 0,
+          latestCost: assessedCost ?? 0,
+          scheduleImpactDays: row.assessedTimeDays ?? 0,
+          identifiedDate: (row.submittedAt ?? row.createdAt).slice(0, 10),
+          detail: {
+            source: "design_change_notice",
+            designChangeNoticeId: noticeId,
+            classification: row.classification,
+            originator: row.originator,
+            isPostFreeze: row.isPostFreeze === 1,
+            entitlement: entitlement.reasons,
+            currency: noticeCurrency,
+            projectCurrency: project.currency,
+          },
+          createdBy: req.user!.id,
+        });
+      }
+      const [row2] = await tx
+        .update(designChangeNotices)
+        .set({
+          status: "implemented",
+          implementedBy: req.user!.id,
+          implementedAt: nowISO(),
+          changeEventId: eventId ?? null,
+          updatedAt: nowISO(),
+        })
+        .where(eq(designChangeNotices.id, noticeId))
+        .returning();
+      return { updated: row2, eventId: eventId ?? null, raised: Boolean(newEventId && eventId === newEventId) };
+    });
+    changeEventId = outcome.eventId;
+
+    if (outcome.raised && changeEventId) {
       await ledger(app.db, {
         companyId,
         projectId,
@@ -849,21 +954,9 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
         action: "create",
         objectType: "design_change_notice",
         objectId: changeEventId,
-        payload: { raisedFrom: noticeId, estimatedCost: row.assessedCost, currency: row.currency },
+        payload: { raisedFrom: noticeId, estimatedCost: assessedCost, currency: noticeCurrency },
       });
     }
-
-    const [updated] = await app.db
-      .update(designChangeNotices)
-      .set({
-        status: "implemented",
-        implementedBy: req.user!.id,
-        implementedAt: nowISO(),
-        changeEventId: changeEventId ?? null,
-        updatedAt: nowISO(),
-      })
-      .where(eq(designChangeNotices.id, noticeId))
-      .returning();
     await ledger(app.db, {
       companyId,
       projectId,
@@ -873,7 +966,7 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
       objectId: noticeId,
       payload: { to: "implemented", changeEventId: changeEventId ?? null, note: body.note ?? null },
     });
-    return { ...updated, entitlement, changeEventId: changeEventId ?? null };
+    return { ...outcome.updated, entitlement, changeEventId: changeEventId ?? null };
   });
 
   app.post("/projects/:projectId/design/change-notices/frequency", { preHandler: standardGate }, async (req) => {

@@ -356,7 +356,7 @@ export function escapeHtml(value: unknown): string {
 }
 
 const SECTION_COLUMNS: Record<string, string[]> = {
-  manpower: ["company", "workers", "hours", "notes"],
+  manpower: ["company", "trade", "workers", "hours", "notes"],
   equipment: ["name", "hoursOperating", "hoursIdle"],
   deliveries: ["supplier", "description", "trackingRef"],
   visitors: ["name", "company", "reason"],

@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import { and, desc, eq, gte, inArray, lte } from "drizzle-orm";
+import { and, count, desc, eq, gte, inArray, lte } from "drizzle-orm";
 import { z } from "zod";
 import {
   authSecurityEvents,
@@ -381,7 +381,16 @@ export function registerSecurityRoutes(app: FastifyInstance): void {
       .orderBy(desc(authSecurityEvents.at))
       .limit(page.pageSize)
       .offset(pageOffset(page));
-    const total = await app.db.select({ id: authSecurityEvents.id }).from(authSecurityEvents).where(where);
+    // COUNT IN THE DATABASE. This used to select every matching row's id and
+    // take `.length`, so paging the audit of a busy tenant loaded the whole
+    // trail into the API's heap to produce one integer — the exact "no
+    // roll-up may load an unbounded table into memory" rule the platform sets
+    // for itself, on the one table that grows by a row per sign-in attempt
+    // across every tenant.
+    const [totalRow] = await app.db
+      .select({ n: count() })
+      .from(authSecurityEvents)
+      .where(where);
     return {
       ...paginate(
         rows.map((row) => ({
@@ -398,7 +407,7 @@ export function registerSecurityRoutes(app: FastifyInstance): void {
           reason: row.reason,
           metadata: row.metadata,
         })),
-        total.length,
+        Number(totalRow?.n ?? 0),
         page,
       ),
       reasons: [
@@ -1166,10 +1175,25 @@ export function registerSecurityRoutes(app: FastifyInstance): void {
   });
 }
 
-/** RFC 4180 quoting: a comma, quote or newline inside a field breaks a CSV. */
+/**
+ * RFC 4180 quoting, plus the formula guard this file was missing.
+ *
+ * Quoting alone is not enough for THIS export. Two of its columns — `email`
+ * and `user_agent` — are written verbatim from what an UNAUTHENTICATED caller
+ * typed at the sign-in form, because a failed attempt has to be attributable
+ * to the address as typed. A spreadsheet treats a cell opening with `=`, `+`,
+ * `-` or `@` as a formula, so `=HYPERLINK(...)` or a DDE payload entered as an
+ * email address executes on the administrator's machine when they open the
+ * audit they were told to open. Prefixing an apostrophe makes the cell text.
+ *
+ * Same rule and same regex as `modules/twin/shared.ts`, which already had it
+ * (and a test for it): one export in this codebase must not be softer than
+ * another on identical data.
+ */
 export function csvCell(value: string): string {
-  if (/[",\n\r]/.test(value)) return `"${value.replace(/"/g, '""')}"`;
-  return value;
+  const neutralised = /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
+  if (/[",\n\r]/.test(neutralised)) return `"${neutralised.replace(/"/g, '""')}"`;
+  return neutralised;
 }
 
 export { emptyPolicy, rowToPolicy };

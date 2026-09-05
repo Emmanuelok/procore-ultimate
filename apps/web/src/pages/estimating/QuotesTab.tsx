@@ -28,7 +28,7 @@ import {
   toast,
   type DataColumns,
 } from "../../ui";
-import { IconImport, IconPlus } from "../../ui/icons";
+import { IconEdit, IconImport, IconPlus, IconTrash } from "../../ui/icons";
 import {
   DASH,
   LoadError,
@@ -571,6 +571,268 @@ function ImportBidModal({
   );
 }
 
+/* ------------------------------------------------------------------ */
+/* Editing a quote                                                     */
+/* ------------------------------------------------------------------ */
+
+function QuoteEditor({
+  projectId,
+  quote,
+  open,
+  onClose,
+  onSaved,
+}: {
+  projectId: string;
+  quote: SubQuoteDetail;
+  open: boolean;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const action = useAction();
+  const [vendorName, setVendorName] = useState(quote.vendorName);
+  const [tradePackage, setTradePackage] = useState(quote.tradePackage);
+  const [quotedTotal, setQuotedTotal] = useState(String(quote.quotedTotal));
+  const [adjustmentAmount, setAdjustmentAmount] = useState(String(quote.adjustmentAmount));
+  const [quoteDate, setQuoteDate] = useState(quote.quoteDate ?? "");
+  const [validUntil, setValidUntil] = useState(quote.validUntil ?? "");
+  const [exclusions, setExclusions] = useState(quote.exclusions ?? "");
+  const [qualifications, setQualifications] = useState(quote.qualifications ?? "");
+
+  useEffect(() => {
+    setVendorName(quote.vendorName);
+    setTradePackage(quote.tradePackage);
+    setQuotedTotal(String(quote.quotedTotal));
+    setAdjustmentAmount(String(quote.adjustmentAmount));
+    setQuoteDate(quote.quoteDate ?? "");
+    setValidUntil(quote.validUntil ?? "");
+    setExclusions(quote.exclusions ?? "");
+    setQualifications(quote.qualifications ?? "");
+  }, [quote, open]);
+
+  const accepted = quote.status === "accepted";
+
+  return (
+    <Modal
+      open={open}
+      title={`Edit ${quote.reference}`}
+      onClose={onClose}
+      size="lg"
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            loading={action.busy === "save"}
+            disabled={vendorName.trim().length === 0 || tradePackage.trim().length === 0}
+            onClick={() =>
+              void action
+                .run("save", () =>
+                  estimatingApi.patchQuote(projectId, quote.id, {
+                    vendorName,
+                    tradePackage,
+                    quoteDate: quoteDate.length > 0 ? quoteDate : null,
+                    validUntil: validUntil.length > 0 ? validUntil : null,
+                    exclusions: exclusions.trim().length > 0 ? exclusions : null,
+                    qualifications: qualifications.trim().length > 0 ? qualifications : null,
+                    ...(accepted
+                      ? {}
+                      : {
+                          quotedTotal: Number(quotedTotal) || 0,
+                          adjustmentAmount: Number(adjustmentAmount) || 0,
+                        }),
+                  }),
+                )
+                .then((res) => {
+                  if (res) {
+                    toast.success(`${res.reference} saved`);
+                    onSaved();
+                  }
+                })
+            }
+          >
+            Save
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        {action.error ? (
+          <Alert tone="danger" size="sm" onDismiss={action.clear}>
+            {action.error}
+          </Alert>
+        ) : null}
+        {accepted ? (
+          <Alert tone="warning" size="sm" title="This quote is priced into an estimate">
+            Its money is fixed — estimate lines cite it. Descriptive fields can still be corrected; to change
+            the price, take a fresh quote and accept that instead.
+          </Alert>
+        ) : null}
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Vendor" required>
+            <Input value={vendorName} onChange={(e) => setVendorName(e.target.value)} />
+          </Field>
+          <Field label="Trade package" required>
+            <Input value={tradePackage} onChange={(e) => setTradePackage(e.target.value)} />
+          </Field>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label={`Quoted total (${quote.currency})`}>
+            <Input
+              value={quotedTotal}
+              onChange={(e) => setQuotedTotal(e.target.value)}
+              inputMode="decimal"
+              disabled={accepted}
+            />
+          </Field>
+          <Field
+            label="Levelling adjustment"
+            hint="Scope added back to make this quote comparable with the others."
+          >
+            <Input
+              value={adjustmentAmount}
+              onChange={(e) => setAdjustmentAmount(e.target.value)}
+              inputMode="decimal"
+              disabled={accepted}
+            />
+          </Field>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Quote date" optional>
+            <Input value={quoteDate} onChange={(e) => setQuoteDate(e.target.value)} type="date" />
+          </Field>
+          <Field label="Valid until" optional hint="The validity sweep expires the quote after this date.">
+            <Input value={validUntil} onChange={(e) => setValidUntil(e.target.value)} type="date" />
+          </Field>
+        </div>
+        <Field label="Exclusions" optional>
+          <Textarea value={exclusions} onChange={(e) => setExclusions(e.target.value)} rows={2} />
+        </Field>
+        <Field label="Qualifications" optional>
+          <Textarea value={qualifications} onChange={(e) => setQualifications(e.target.value)} rows={2} />
+        </Field>
+      </div>
+    </Modal>
+  );
+}
+
+/** description | unit | quantity | rate | x(to exclude) — one row per line. */
+function parseQuoteLines(raw: string) {
+  return raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"))
+    .map((line) => {
+      const [description = "", unit = "", qty = "", rate = "", flag = ""] = line
+        .split("|")
+        .map((p) => p.trim());
+      const quantity = qty.length > 0 && Number.isFinite(Number(qty)) ? Number(qty) : null;
+      const unitRate = rate.length > 0 && Number.isFinite(Number(rate)) ? Number(rate) : null;
+      return {
+        description,
+        unit: unit.length > 0 ? unit : null,
+        quantity,
+        unitRate,
+        // a row with a quantity but no rate, or neither, is a lump sum: the
+        // amount is the rate column read as a total
+        amount: quantity !== null && unitRate !== null ? undefined : (unitRate ?? 0),
+        excluded: flag.toLowerCase() === "x" || flag.toLowerCase() === "excluded",
+      };
+    })
+    .filter((l) => l.description.length > 0);
+}
+
+function QuoteLineEditor({
+  projectId,
+  quote,
+  open,
+  onClose,
+  onSaved,
+}: {
+  projectId: string;
+  quote: SubQuoteDetail;
+  open: boolean;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const action = useAction();
+  const [raw, setRaw] = useState("");
+
+  useEffect(() => {
+    setRaw(
+      quote.lines
+        .map((l) =>
+          [
+            l.description,
+            l.unit ?? "",
+            l.quantity === null ? "" : String(l.quantity),
+            l.unitRate === null ? String(l.amount) : String(l.unitRate),
+            l.excluded === 1 ? "x" : "",
+          ].join(" | "),
+        )
+        .join("\n"),
+    );
+  }, [quote, open]);
+
+  const parsed = useMemo(() => parseQuoteLines(raw), [raw]);
+
+  return (
+    <Modal
+      open={open}
+      title={`Priced lines — ${quote.reference}`}
+      description="One scope row per line: description | unit | quantity | rate | x to exclude. Leave the quantity empty for a lump sum and put the total in the rate column. Saving replaces the whole set and re-derives the quoted total."
+      onClose={onClose}
+      size="lg"
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            loading={action.busy === "lines"}
+            onClick={() =>
+              void action
+                .run("lines", () =>
+                  estimatingApi.setQuoteLines(projectId, quote.id, { lines: parsed }),
+                )
+                .then((res) => {
+                  if (res) {
+                    toast.success(
+                      `${res.lineCount} scope rows — ${money(res.quotedTotal, res.currency)}`,
+                    );
+                    onSaved();
+                  }
+                })
+            }
+          >
+            Save the lines
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        {action.error ? (
+          <Alert tone="danger" size="sm" onDismiss={action.clear}>
+            {action.error}
+          </Alert>
+        ) : null}
+        <Field label="Scope rows">
+          <Textarea
+            value={raw}
+            onChange={(e) => setRaw(e.target.value)}
+            rows={10}
+            placeholder={"Tanking to basement | m2 | 200 | 45\nPiling mat | | | 5000"}
+          />
+        </Field>
+        <div className="rounded-md border border-border bg-surface-sunken p-3 text-2xs text-content-subtle">
+          {parsed.length} row{parsed.length === 1 ? "" : "s"} parsed. Rows with a quantity and a rate are
+          extended; the rest are taken as lump sums at the figure in the rate column.
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 function QuoteDrawer({
   projectId,
   quoteId,
@@ -583,6 +845,9 @@ function QuoteDrawer({
   onChanged: () => void;
 }) {
   const [estimateId, setEstimateId] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [editingLines, setEditingLines] = useState(false);
+  const [nextStatus, setNextStatus] = useState("");
   const action = useAction();
   const quote = useResource<SubQuoteDetail>(
     quoteId ? `/api/v1/projects/${projectId}/estimating/sub-quotes/${quoteId}` : null,
@@ -611,6 +876,68 @@ function QuoteDrawer({
               {q.validUntil ? ` · valid until ${dateOnly(q.validUntil)}` : " · no validity stated"}
             </span>
           </span>
+        ) : undefined
+      }
+      headerActions={
+        q ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <Select
+              value={nextStatus}
+              onChange={(e) => setNextStatus(e.target.value)}
+              size="sm"
+              className="w-40"
+              aria-label="Move this quote to"
+            >
+              <option value="">Move to…</option>
+              <option value="received">Received</option>
+              <option value="under_review">Under review</option>
+              <option value="levelled">Levelled</option>
+              <option value="rejected">Rejected</option>
+            </Select>
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={nextStatus.length === 0}
+              loading={action.busy === "status"}
+              onClick={() =>
+                void action
+                  .run("status", () =>
+                    estimatingApi.quoteStatus(projectId, q.id, { status: nextStatus }),
+                  )
+                  .then((res) => {
+                    if (res) {
+                      toast.success(`${res.reference} is now ${titleCase(res.status).toLowerCase()}`);
+                      setNextStatus("");
+                      quote.reload();
+                      onChanged();
+                    }
+                  })
+              }
+            >
+              Set
+            </Button>
+            <Button size="sm" variant="ghost" icon={IconEdit} onClick={() => setEditing(true)}>
+              Edit
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={IconTrash}
+              disabled={q.status === "accepted" || q.status === "withdrawn"}
+              loading={action.busy === "withdraw"}
+              onClick={() =>
+                void action.run("withdraw", () => estimatingApi.withdrawQuote(projectId, q.id)).then((res) => {
+                  if (res) {
+                    toast.success(`${q.reference} withdrawn`);
+                    quote.reload();
+                    onChanged();
+                  }
+                })
+              }
+            >
+              Withdraw
+            </Button>
+          </div>
         ) : undefined
       }
     >
@@ -682,6 +1009,35 @@ function QuoteDrawer({
               comparison.
             </Alert>
           )}
+
+          {q.status !== "accepted" ? (
+            <Button size="sm" variant="secondary" onClick={() => setEditingLines(true)}>
+              {q.lines.length > 0 ? "Edit the priced lines" : "Enter the priced lines"}
+            </Button>
+          ) : null}
+
+          <QuoteEditor
+            projectId={projectId}
+            quote={q}
+            open={editing}
+            onClose={() => setEditing(false)}
+            onSaved={() => {
+              setEditing(false);
+              quote.reload();
+              onChanged();
+            }}
+          />
+          <QuoteLineEditor
+            projectId={projectId}
+            quote={q}
+            open={editingLines}
+            onClose={() => setEditingLines(false)}
+            onSaved={() => {
+              setEditingLines(false);
+              quote.reload();
+              onChanged();
+            }}
+          />
 
           {q.status !== "accepted" ? (
             <Card>

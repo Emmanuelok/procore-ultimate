@@ -202,4 +202,19 @@ describe("CSV export quoting", () => {
     expect(csvCell('has"quote')).toBe('"has""quote"');
     expect(csvCell("has\nnewline")).toBe('"has\nnewline"');
   });
+
+  /**
+   * `email` and `user_agent` in this export are whatever an unauthenticated
+   * caller typed at the sign-in form, so a cell that opens like a formula has
+   * to be neutralised before an administrator opens the audit in a
+   * spreadsheet. Same rule as modules/twin/shared.ts.
+   */
+  it("neutralises a cell a spreadsheet would run as a formula", () => {
+    expect(csvCell('=HYPERLINK("http://evil","x")')).toBe(
+      '"\'=HYPERLINK(""http://evil"",""x"")"',
+    );
+    expect(csvCell("+1")).toBe("'+1");
+    expect(csvCell("-2")).toBe("'-2");
+    expect(csvCell("@SUM(A1)")).toBe("'@SUM(A1)");
+  });
 });

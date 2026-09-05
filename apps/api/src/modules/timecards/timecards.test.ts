@@ -18,6 +18,7 @@ import {
 } from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
 import { newId } from "../../lib/ids.js";
+import { attachAccessLinks } from "./cards.js";
 
 let built: Awaited<ReturnType<typeof buildTestApp>>;
 /** company owner — author and submitter throughout */
@@ -609,7 +610,15 @@ describe("claimed hours against site access", () => {
     expect(explain.json().message).toContain("no computed variance");
   });
 
-  it("attaches an access record that lands late, lazily on the next list read", async () => {
+  /*
+   * The link used to be made by a sweep that ran on every LIST READ, under a
+   * read-only permission: a viewer opening the register issued one UPDATE per
+   * matched card. It is now made where the evidence lands — the site-access
+   * ingest — and by the `timecards.access-links` scheduled job for anything
+   * that arrived another way. A read no longer writes, so the list response
+   * carries no `sweep` block at all.
+   */
+  it("attaches an access record that lands after the card, off the read path", async () => {
     const worker = await makeWorker("W-402", "Late Feed Worker");
     await addMember(crewId, worker, "2026-10-01");
     const card = (
@@ -619,14 +628,20 @@ describe("claimed hours against site access", () => {
 
     await access(worker, "2026-10-08", 7);
     const list = await get(`/timecards?workerId=${worker}`);
-    expect(list.json().sweep.linked).toBeGreaterThanOrEqual(1);
+    expect(list.statusCode).toBe(200);
+    expect(list.json().sweep).toBeUndefined();
+    // reading the register did NOT link it
+    expect((await get(`/timecards/${card.id}`)).json().varianceHours).toBeNull();
+
+    const linked = await attachAccessLinks(built.app.db, u1.companyId, proj, [worker]);
+    expect(linked.linked).toBeGreaterThanOrEqual(1);
     const after = await get(`/timecards/${card.id}`);
     expect(after.json().varianceHours).toBe(1);
     expect(after.json().detail.variance.linkedBy).toBe("lazy_sweep");
 
-    // the sweep is idempotent — a second read links nothing further
-    const second = await get(`/timecards?workerId=${worker}`);
-    expect(second.json().sweep.linked).toBe(0);
+    // idempotent — a second pass finds nothing left to link
+    const again = await attachAccessLinks(built.app.db, u1.companyId, proj, [worker]);
+    expect(again.linked).toBe(0);
   });
 
   it("raises an overclaim-pattern signal and a separate, low-severity access-gap signal", async () => {
@@ -1136,18 +1151,28 @@ describe("a signed ticket becomes a change", () => {
       signatureMethod: "on_device",
     });
 
+    /*
+     * Asking for a PCO on an unpriced ticket does NOT throw. Throwing after
+     * the change event had been inserted was the defect: it left an orphan
+     * CE-nnn behind that every retry duplicated, and never stamped the
+     * ticket. The route now promotes to the change event — which preserves
+     * the entitlement — stamps the ticket, and reports the PCO refusal in
+     * the body with the reasons it could not be priced.
+     */
     const asPco = await post(`/tm-tickets/${ticket.id}/promote`, h1, {
       target: "potential_change_order",
     });
-    expect(asPco.statusCode).toBe(409);
-    expect(asPco.json().message).toContain("A PCO is a cost position");
+    expect(asPco.statusCode).toBe(201);
+    expect(asPco.json().potentialChangeOrder).toBeNull();
+    expect(asPco.json().pcoRefused.message).toContain("a PCO is a cost position");
+    expect(asPco.json().total.value).toBeNull();
+    expect(asPco.json().total.reasons.length).toBeGreaterThan(0);
+    expect(asPco.json().ticket.incorporatedChangeOrderId).toBe(asPco.json().changeEvent.id);
 
-    // but the entitlement is still preserved as a change event
-    const asEvent = await post(`/tm-tickets/${ticket.id}/promote`, h1, { target: "change_event" });
-    expect(asEvent.statusCode).toBe(201);
-    expect(asEvent.json().total.value).toBeNull();
-    expect(asEvent.json().total.reasons.length).toBeGreaterThan(0);
-    expect(asEvent.json().ticket.incorporatedChangeOrderId).toBe(asEvent.json().changeEvent.id);
+    // and it is absorbed once: a second attempt raises no second event
+    const again = await post(`/tm-tickets/${ticket.id}/promote`, h1, { target: "change_event" });
+    expect(again.statusCode).toBe(409);
+    expect(again.json().message).toContain("absorbed once");
   });
 });
 

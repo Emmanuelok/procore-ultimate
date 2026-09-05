@@ -1,5 +1,5 @@
 {
-  "id": "79cafca5-d487-4274-b2fb-329f3037f0c9",
+  "id": "be792e7a-677e-42a7-b93b-8ecc73e10143",
   "prevId": "340cf323-a4ed-4b81-8d6c-8f3e94b698e3",
   "version": "7",
   "dialect": "postgresql",
@@ -83048,6 +83048,13 @@
           "notNull": true,
           "default": "'[]'::jsonb"
         },
+        "basis": {
+          "name": "basis",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "''"
+        },
         "trigger": {
           "name": "trigger",
           "type": "text",
@@ -83308,6 +83315,20 @@
           "primaryKey": false,
           "notNull": true,
           "default": 0
+        },
+        "project_rollup": {
+          "name": "project_rollup",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'::jsonb"
+        },
+        "truncated_sources": {
+          "name": "truncated_sources",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'[]'::jsonb"
         },
         "changes": {
           "name": "changes",
@@ -89829,6 +89850,18 @@
           "primaryKey": false,
           "notNull": false
         },
+        "issued_by": {
+          "name": "issued_by",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "issued_at": {
+          "name": "issued_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
         "accepted_at": {
           "name": "accepted_at",
           "type": "timestamp with time zone",
@@ -91064,6 +91097,12 @@
         },
         "freeze_id": {
           "name": "freeze_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "pre_freeze_status": {
+          "name": "pre_freeze_status",
           "type": "text",
           "primaryKey": false,
           "notNull": false

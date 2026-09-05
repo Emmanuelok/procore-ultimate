@@ -9,7 +9,7 @@
  * another, so the log cannot be a diary of one person's opinions.
  */
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, ilike, inArray, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, ilike, inArray, notInArray, or } from "drizzle-orm";
 import { z } from "zod";
 import { designComments, designDecisions, designIssues, designPackages } from "@constructos/db";
 import {
@@ -25,6 +25,7 @@ import { badRequest, conflict, forbidden, notFound } from "../../../lib/errors.j
 import { newId } from "../../../lib/ids.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.js";
 import { pushNotifications } from "../../notifications/service.js";
+import { ROLLUP_ROW_CAP } from "../service.js";
 import {
   allocateReference,
   assertBimModel,
@@ -34,6 +35,7 @@ import {
   assertSpecSection,
   assertUser,
   assertVendor,
+  boolQuerySchema,
   currencySchema,
   fileIdsSchema,
   idSchema,
@@ -122,7 +124,7 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
     body: Partial<z.infer<typeof issueBodySchema>>,
   ) {
     if (body.packageId) await assertPackage(app.db, companyId, projectId, body.packageId);
-    if (body.assignedToUserId) await assertUser(app.db, body.assignedToUserId);
+    if (body.assignedToUserId) await assertUser(app.db, companyId, body.assignedToUserId);
     if (body.assignedToVendorId) await assertVendor(app.db, companyId, body.assignedToVendorId);
     if (body.drawingSheetId) await assertDrawingSheet(app.db, projectId, body.drawingSheetId);
     if (body.specSectionId) await assertSpecSection(app.db, projectId, body.specSectionId);
@@ -143,10 +145,11 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
         issueType: z.enum(DESIGN_ISSUE_TYPES).optional(),
         packageId: idSchema.optional(),
         assignedToUserId: idSchema.optional(),
-        open: z.coerce.boolean().optional(),
+        open: boolQuerySchema.optional(),
         q: z.string().max(120).optional(),
       })
       .parse(req.query);
+    const OPEN_ISSUE = ["open", "assigned", "in_progress"] as const;
     const where = and(
       eq(designIssues.companyId, req.companyId!),
       eq(designIssues.projectId, projectId),
@@ -156,7 +159,11 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
       q.issueType ? eq(designIssues.issueType, q.issueType) : undefined,
       q.packageId ? eq(designIssues.packageId, q.packageId) : undefined,
       q.assignedToUserId ? eq(designIssues.assignedToUserId, q.assignedToUserId) : undefined,
-      q.open ? inArray(designIssues.status, ["open", "assigned", "in_progress"]) : undefined,
+      q.open === undefined
+        ? undefined
+        : q.open
+          ? inArray(designIssues.status, [...OPEN_ISSUE])
+          : notInArray(designIssues.status, [...OPEN_ISSUE]),
       q.q ? or(ilike(designIssues.title, `%${q.q}%`), ilike(designIssues.reference, `%${q.q}%`)) : undefined,
     );
     const [rows, [total]] = await Promise.all([
@@ -315,7 +322,7 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
     if (!body.assignedToUserId && !body.assignedToVendorId && !body.discipline) {
       throw badRequest("Routing needs at least a discipline, a user or a vendor.");
     }
-    if (body.assignedToUserId) await assertUser(app.db, body.assignedToUserId);
+    if (body.assignedToUserId) await assertUser(app.db, companyId, body.assignedToUserId);
     if (body.assignedToVendorId) await assertVendor(app.db, companyId, body.assignedToVendorId);
     const set: Record<string, unknown> = { updatedAt: nowISO() };
     if (body.assignedToUserId !== undefined) set["assignedToUserId"] = body.assignedToUserId;
@@ -487,10 +494,21 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
   /** Ball-in-court by discipline: the register's most-used view. */
   app.get("/projects/:projectId/design/issues-by-discipline", { preHandler: readGate }, async (req) => {
     const { projectId } = req.params as { projectId: string };
+    // Narrow columns and an explicit cap: this is a roll-up, not a register
+    // dump, and it must never pull an unbounded table into memory (PLAN §6.4).
     const rows = await app.db
-      .select()
+      .select({
+        discipline: designIssues.discipline,
+        status: designIssues.status,
+        priority: designIssues.priority,
+        dueDate: designIssues.dueDate,
+        raisedAt: designIssues.raisedAt,
+        createdAt: designIssues.createdAt,
+      })
       .from(designIssues)
-      .where(and(eq(designIssues.companyId, req.companyId!), eq(designIssues.projectId, projectId)));
+      .where(and(eq(designIssues.companyId, req.companyId!), eq(designIssues.projectId, projectId)))
+      .orderBy(desc(designIssues.createdAt))
+      .limit(ROLLUP_ROW_CAP);
     const now = Date.now();
     const buckets = new Map<
       string,

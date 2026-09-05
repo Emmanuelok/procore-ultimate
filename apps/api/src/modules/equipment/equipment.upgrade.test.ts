@@ -754,6 +754,8 @@ describe("plant cost onto the budget", () => {
       id: budgetId,
       companyId: owner.companyId,
       projectId: projectB,
+      number: 1,
+      reference: "BUD-001",
       name: "Plant budget",
       createdBy: owner.userId,
     });

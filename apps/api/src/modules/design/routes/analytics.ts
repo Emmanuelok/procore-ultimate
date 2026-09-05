@@ -8,7 +8,7 @@
  * manual triggers for every sweep the scheduler also runs.
  */
 import type { FastifyPluginAsync } from "fastify";
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, notInArray } from "drizzle-orm";
 import { z } from "zod";
 import {
   designChangeNotices,
@@ -40,6 +40,7 @@ import {
   assertBimModel,
   assertDrawingSheet,
   assertSpecSection,
+  boolQuerySchema,
   buildGates,
   idSchema,
   ledger,
@@ -137,7 +138,7 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
   app.get("/projects/:projectId/design/signals", { preHandler: readGate }, async (req) => {
     const { projectId } = req.params as { projectId: string };
     const q = pageQuerySchema
-      .extend({ detector: z.string().max(60).optional(), open: z.coerce.boolean().optional() })
+      .extend({ detector: z.string().max(60).optional(), open: boolQuerySchema.optional() })
       .parse(req.query);
     const rows = await app.db
       .select()
@@ -149,7 +150,11 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
           q.detector
             ? eq(signals.detector, q.detector)
             : inArray(signals.detector, [...DESIGN_DETECTORS_ALL]),
-          q.open ? inArray(signals.disposition, ["new", "triaged", "investigating"]) : undefined,
+          q.open === undefined
+            ? undefined
+            : q.open
+              ? inArray(signals.disposition, ["new", "triaged", "investigating"])
+              : notInArray(signals.disposition, ["new", "triaged", "investigating"]),
         ),
       )
       .orderBy(desc(signals.createdAt))

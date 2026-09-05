@@ -6,7 +6,7 @@
  * Routes
  *   GET  /pulse                                   the one read the Pulse page makes
  *   POST /pulse/refresh                           admin: recompute everything now
- *   GET  /pulse/history?days=                     portfolio health over time
+ *   GET  /pulse/history?days=                     portfolio health over time (visibility-filtered)
  *   GET  /pulse/activity                          recent agent runs + pending proposals
  *   GET  /pulse/briefing · GET /pulse/briefings   latest / recent company briefings
  *   POST /pulse/briefing                          AI (503 AiDisabled without a key)
@@ -49,6 +49,7 @@ import {
   listCompanyProjects,
   listHealthHistory,
   markProjectDirty,
+  MAX_PROJECTS_PER_COMPANY,
   pulseHistory,
   readPulse,
   refreshAttention,
@@ -492,8 +493,10 @@ export const intelligenceModule: FastifyPluginAsync = async (app) => {
     run: async ({ db, now }) =>
       forEachCompany(db, async (companyId) => {
         const projectList = await listCompanyProjects(db, companyId);
-        const attention = await refreshAttention(db, companyId, projectList, now);
-        await refreshPulse(db, companyId, now);
+        const attention = await refreshAttention(db, companyId, projectList, now, {
+          projectsTruncated: projectList.length >= MAX_PROJECTS_PER_COMPANY,
+        });
+        await refreshPulse(db, companyId, now, { truncatedSources: attention.truncatedSources });
         return attention;
       }),
   });
