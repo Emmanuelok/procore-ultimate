@@ -398,7 +398,7 @@ export function registerScimRoutes(app: FastifyInstance): void {
    * the full public path here registered every SCIM route at
    * `/api/v1/api/v1/scim/v2/...` — the documented URL 404'd, and no test
    * noticed because the SCIM tests only exercised the pure helpers. There are
-   * now route tests below it (`scim-routes.test.ts`) that call the documented
+   * now route tests (security.test.ts, "SCIM 2.0 (#21)") that call the documented
    * path and would fail again the moment the two drift apart.
    *
    * `base` is the path that goes into `meta.location` and the `Location`

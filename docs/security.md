@@ -202,6 +202,58 @@ rows an intrusion investigation needs most; they are retained platform-wide for 
 operator, and the tenant-facing audit says so rather than letting an auditor conclude
 there were none.
 
+### 1.11 MFA challenges are single-use and revocable (`mfa_challenges`)
+
+The challenge token is a MAC (`mfachal_v1.<claims>.<mac>`), purpose-separated from the JWT
+key so it cannot be presented as a bearer token; the CHALLENGE it names is a row.
+
+Consumption is an **upsert on the token's own `jti`**, not a lookup. That shape is the
+whole design: three modules mint challenges — `mfa` (`/auth/mfa/login`), `sso` (an IdP
+sign-in into a tenant that requires a second factor) and `identity` (`/auth/login`) — and
+requiring every minter to register first would have made a cross-module edit a
+precondition of every sign-in. So the first exchange either flips a live row or inserts an
+already-consumed one, and any later exchange finds a consumed row and is refused. A
+challenge minted by a module that never registered is single-use exactly like one that
+did.
+
+Registration at mint time adds what the upsert cannot: a challenge an administrator can
+revoke in flight. `POST /company/security/users/:id/mfa/reset` cuts them, because a
+challenge minted a minute before the reset is authority issued on the strength of the
+factor being removed.
+
+The store **fails open on an infrastructure error and closed on a replay**: a database
+that cannot be read is already an outage, and turning it into "nobody with a second factor
+can sign in" adds nothing to anyone's safety. The exposure under that failure is exactly
+the one the stateless design always had.
+
+Confirming a factor now also **tells the account holder** (`renderMfaEnrolled`, which
+existed and was never dispatched): the one change that most needs to reach a human is
+"a second factor now guards your account, and if it was not you, someone else holds your
+password".
+
+### 1.12 Data lifecycle for the authentication record (§0.2 #45, #46, #47)
+
+| Log | Holds | Past retention |
+|---|---|---|
+| `auth_security_events` | address, IP, user agent, kind, outcome, time | **pseudonymised** — address/IP/agent cleared, countable facts kept |
+| `email_dispatches` | recipient, subject, body preview | **deleted** — a preview of a message nobody can identify is not evidence |
+
+Three rules, in the order they override each other:
+
+1. **A legal hold beats a retention period**, always, and the sweep says it skipped the
+   tenant rather than reporting zero rows.
+2. **A tenant that has chosen nothing is not swept.** null means keep, which is what the
+   platform did before the policy existed.
+3. Otherwise the retention age applies, with a floor of 30 days — shorter than that and a
+   tenant would delete the record of the incident the audit exists to investigate.
+
+`GET /account/export` (spec #45) returns everything the authentication layer holds about
+the caller and **no credential**: no password hash, no TOTP seed, no recovery-code hash,
+no session or refresh token. An export is a file that ends up in a downloads folder, so
+putting a credential in it would turn a transparency feature into a second copy of the
+thing this platform hashes everything to avoid holding. Every export is ledgered as an
+`access` in each company the caller belongs to.
+
 ---
 
 ## 2. Authorization — the three-layer RBAC model
@@ -512,7 +564,7 @@ Ordered roughly by risk. "Spec" references are `docs/master-specification.md`.
 | 15 | No field-level visibility control on financial data (tools are all-or-nothing per level) | Vol I #18 |
 | 16 | Refresh tokens and JWTs are bearer credentials — TLS termination is the platform's job (the app sends HSTS via helmet but cannot terminate TLS itself) | per-deployment TLS documented in `docs/deployment.md` §2.6 |
 | 17 | **Evidence-pathway independence is available but not provable** — Phase 6 narrowed what was the highest-consequence gap on this list: evidence streams now have a separate machine inlet (`POST /ingestion/push/:dataset`, dataset-scoped SHA-256-stored tokens, §1.5), so payroll and site access no longer *must* share a pathway, and the record distinguishes the pathways forever. What remains: nothing attests **who operates the pushing system** — a token handed to the employer's own administrator reproduces the shared-pathway condition exactly; the workforce module's user-facing bulk route (`POST …/site-access`) stays open; and no deployment yet receives a real third-party feed. Independence became a product capability; it is still a deployment property | ADR 0004, ADR 0014, ADR 0015; `site_access_records.source` + per-run token provenance is where feed attestation attaches next (`docs/roadmap.md`, "Recommended next sequence" step 1) |
-| 18 | **Personal data of workers and affected households is now held with no lifecycle tooling** — `workers` carries date of birth, nationality, employer and pay rate; `payroll_entries` carries pay; `affected_persons` carries household composition, socio-economic baselines and **vulnerability flags** (disability, indigeneity, poverty, child-headed household). There is no data-subject export or erasure path, no retention policy, no consent record, and no field-level masking; deletion is whatever the module's routes happen to allow. Tool-level permissions are the only control, and they are all-or-nothing (see gap 15) | Vol I §0.2 data residency & compliance (#29–48) is unimplemented as a section; the schema deliberately stores verification *flags* rather than identity-document images (`workers.idVerified`/`biometricEnrolled`), which limits but does not remove the exposure |
+| 18 | **Narrowed to the domain modules.** The AUTHENTICATION record now has the full set: `GET /account/export` (a data-subject export that carries no credential), per-tenant retention that pseudonymises `auth_security_events` and deletes `email_dispatches`, a legal hold that overrides both, and a daily sweep — see §1.12. What remains is unchanged and is the larger half: personal data of workers and affected households is held with no lifecycle tooling. `workers` carries date of birth, nationality, employer and pay rate; `payroll_entries` carries pay; `affected_persons` carries household composition, socio-economic baselines and **vulnerability flags** (disability, indigeneity, poverty, child-headed household). There is no data-subject export or erasure path, no retention policy, no consent record, and no field-level masking; deletion is whatever the module's routes happen to allow. Tool-level permissions are the only control, and they are all-or-nothing (see gap 15) | Vol I §0.2 data residency & compliance (#29–48) is unimplemented as a section; the schema deliberately stores verification *flags* rather than identity-document images (`workers.idVerified`/`biometricEnrolled`), which limits but does not remove the exposure |
 | 19 | **Anonymity is structural at intake but not end-to-end** — an anonymous grievance has its complainant name and contact stripped before the row is written (not merely hidden), but the free-text `description`, the `locationId` and the linked `papId` can still identify a complainant in a small community, and nothing redacts them. Retaliation monitoring (M#691) is not built | `modules/land/grievances.ts`, intake route |
 | 20 | **No independent inspector or complainant-facing role** — welfare inspections, grievance closure verification and gate reviews are all recorded by users inside the tenant being assessed. Assurance grants give an outsider read access, never the ability to *author* the verifying record | §2.4 residual weakness; Domain M #689–692, Domain G #411 |
 | 21 | **Benchmark anonymization is aggregation + min-n, not differential privacy** — a contributed sample is protected by never returning contributor ids and by suppressing cells below n = 5, which defeats casual inference, not a determined adversary: a contributor comparing a small cell's statistics before and after another contribution can bound the newcomer's value, and `assetClass`/`region` are self-declared, so a contributor also chooses how identifying its cell is. Stated in the ADR rather than discovered later | ADR 0016; `MIN_SAMPLE_N` in `modules/benchmarks/metrics.ts` |
