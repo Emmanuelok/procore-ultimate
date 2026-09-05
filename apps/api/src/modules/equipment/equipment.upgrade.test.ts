@@ -12,6 +12,7 @@ import {
   equipment,
   equipmentCertificates,
   equipmentMaintenanceSchedules,
+  equipmentTelematicsReadings,
   materialItems,
   projectMemberships,
   projects,
@@ -577,6 +578,114 @@ describe("materials supply", () => {
       expect(row.score).toBeNull();
       expect(row.reasons.join(" ")).toContain("fewer than the 3");
     }
+  });
+});
+
+describe("telematics day hours", () => {
+  it("states a once-a-day device's hours instead of calling the plant sheet unsupported", async () => {
+    const machineId = await makeMachine({
+      name: "Once-a-day feed",
+      telematicsProvider: "generic_aemp",
+      telematicsDeviceId: "DEV-DAILY-1",
+      hireRateAmount: 40,
+      hireRateUnit: "hour",
+      operatorRateAmount: 30,
+      currency: "GBP",
+    });
+    await mobilise(projectA, machineId);
+
+    /*
+     * A device that reports ONCE a day. Within-day last-minus-first has
+     * nothing to subtract, so before the carry-in fix every day came back
+     * null: the machine looked as if it had never reported, the plant sheet
+     * had no corroboration, and the operator's honest 8 and 9 hours sat in
+     * `daysWithoutTelematics` for ever.
+     */
+    const counters: Array<[string, number]> = [
+      [daysAgo(3), 1000],
+      [daysAgo(2), 1008],
+      [daysAgo(1), 1017],
+    ];
+    for (const [date, engineHours] of counters) {
+      await app.db.insert(equipmentTelematicsReadings).values({
+        id: newId("etr"),
+        companyId: owner.companyId,
+        projectId: projectA,
+        equipmentId: machineId,
+        providerKey: "generic_aemp",
+        deviceId: "DEV-DAILY-1",
+        recordedAt: `${date}T17:00:00.000Z`,
+        engineHours,
+      });
+    }
+    for (const [date, hours] of [
+      [daysAgo(2), 8],
+      [daysAgo(1), 9],
+    ] as const) {
+      const res = await post(`/projects/${projectA}/equipment-utilisation`, {
+        equipmentId: machineId,
+        utilisationDate: date,
+        availableHours: 10,
+        workingHours: hours,
+      });
+      expect(res.statusCode).toBe(201);
+    }
+
+    const res = await get(
+      `/projects/${projectA}/equipment-telematics/reconciliation?from=${daysAgo(2)}&to=${daysAgo(1)}`,
+    );
+    expect(res.statusCode).toBe(200);
+    const row = res
+      .json()
+      .rows.find((r: { equipmentId: string }) => r.equipmentId === machineId);
+    expect(row).toBeDefined();
+    expect(row.daysCompared).toBe(2);
+    expect(row.daysWithoutTelematics).toBe(0);
+    // 1008 − 1000 = 8 on the first day, 1017 − 1008 = 9 on the second
+    expect(row.telematicsHours).toBe(17);
+    expect(row.varianceHours).toBe(0);
+    expect(row.daysUnsupported).toBe(0);
+    expect(res.json().method).toContain("before it began");
+  });
+
+  it("does not turn a day the feed never reached into zero hours", async () => {
+    const machineId = await makeMachine({
+      name: "Silent day feed",
+      telematicsProvider: "generic_aemp",
+      telematicsDeviceId: "DEV-DAILY-2",
+      hireRateAmount: 40,
+      hireRateUnit: "hour",
+      currency: "GBP",
+    });
+    await mobilise(projectA, machineId);
+    await app.db.insert(equipmentTelematicsReadings).values({
+      id: newId("etr"),
+      companyId: owner.companyId,
+      projectId: projectA,
+      equipmentId: machineId,
+      providerKey: "generic_aemp",
+      deviceId: "DEV-DAILY-2",
+      recordedAt: `${daysAgo(3)}T17:00:00.000Z`,
+      engineHours: 500,
+    });
+    const created = await post(`/projects/${projectA}/equipment-utilisation`, {
+      equipmentId: machineId,
+      utilisationDate: daysAgo(1),
+      availableHours: 10,
+      workingHours: 9,
+    });
+    expect(created.statusCode).toBe(201);
+
+    const res = await get(
+      `/projects/${projectA}/equipment-telematics/reconciliation?from=${daysAgo(1)}&to=${daysAgo(1)}`,
+    );
+    const row = res
+      .json()
+      .rows.find((r: { equipmentId: string }) => r.equipmentId === machineId);
+    expect(row.daysCompared).toBe(0);
+    expect(row.daysWithoutTelematics).toBe(1);
+    expect(row.days[0].telematicsEngineHours).toBeNull();
+    expect(row.days[0].classification).toBe("no_telematics");
   });
 });
 

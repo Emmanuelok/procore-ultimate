@@ -428,6 +428,7 @@ export default function ScreeningTab() {
         open={addOpen}
         defaultVendorId={vendorId}
         onClose={() => setAddOpen(false)}
+        onCreated={() => setVersion((n) => n + 1)}
         onDone={() => {
           setAddOpen(false);
           setVersion((n) => n + 1);
@@ -454,11 +455,14 @@ function AddFinancialsModal({
   open,
   defaultVendorId,
   onClose,
+  onCreated,
   onDone,
 }: {
   open: boolean;
   defaultVendorId: string;
   onClose: () => void;
+  /** Fired on every successful write — the register always shows what was written. */
+  onCreated: () => void;
   onDone: () => void;
 }) {
   const vendors = useVendors();
@@ -506,7 +510,15 @@ function AddFinancialsModal({
     const created = await action.run("financials", () =>
       api.post<FinancialRecord>(`${BASE}/financials`, body),
     );
-    if (created) setResult(created);
+    if (created) {
+      /*
+       * A financial record always produces a result panel (the derived limit
+       * and its basis), so `onDone` was never reached and the register behind
+       * the modal never refreshed. The write is done; the list must show it.
+       */
+      onCreated();
+      setResult(created);
+    }
   }
 
   const MONEY_FIELDS: Array<[string, string, string]> = [

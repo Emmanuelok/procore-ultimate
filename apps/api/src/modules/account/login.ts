@@ -17,9 +17,11 @@ import {
 import {
   effectivePolicyForEmail,
   evaluateIpAccess,
+  loadCompanyPolicy,
   loadUserPolicies,
   PLATFORM_DEFAULT_POLICY,
   type ResolvedSecurityPolicy,
+  type StoredSecurityPolicy,
 } from "./policy.js";
 import { hashPassword, needsRehash, passwordHashCost } from "./password.js";
 import { issueUserSession, requestContext, type IssuedSession } from "./sessions.js";
@@ -381,4 +383,75 @@ export async function loginPolicyFor(
   } catch {
     return { ...PLATFORM_DEFAULT_POLICY };
   }
+}
+
+/**
+ * #24 — THE TENANT IP ALLOWLIST, AT THE POINT THE TENANT IS CHOSEN.
+ *
+ * `guardLoginIpAllowlist` above refuses a SIGN-IN only when EVERY company the
+ * account belongs to refuses the address, which is the right answer there: a
+ * contractor who works for a strict client and a relaxed one must still be
+ * able to sign in and do the relaxed one's work. The consequence is that the
+ * strict tenant's own rule has to be applied somewhere else — on the request
+ * that names it — and this is that function.
+ *
+ * Call it from `requireCompany` (plugins/auth.ts) after membership is proved
+ * and before `req.companyId` is set, so that a session held from an
+ * unapproved network can read nothing belonging to the tenant that excluded
+ * it. Until that one-line change lands the allowlist is enforced at sign-in
+ * only, which is honest but weaker: a session opened from the office and
+ * carried home keeps working.
+ *
+ * `monitor` mode records what it WOULD have refused and allows the request —
+ * that is the whole point of the mode, and it is why an administrator can
+ * introduce an allowlist without locking their own company out on a Friday.
+ * Break-glass users are exempt in every mode.
+ *
+ * FAIL-OPEN ON A POLICY READ FAILURE is deliberate and stated: if the policy
+ * table cannot be read, refusing every request in the tenant turns a database
+ * blip into a total outage for exactly the customers who configured the most
+ * security. The failure is logged; the request proceeds.
+ */
+export async function guardCompanyIpAccess(
+  app: FastifyInstance,
+  req: FastifyRequest,
+  companyId: string,
+  userId: string,
+): Promise<void> {
+  let policy: StoredSecurityPolicy;
+  try {
+    policy = await loadCompanyPolicy(app.db, companyId);
+  } catch (err) {
+    app.log.error({ err, companyId }, "could not read the tenant security policy; allowing");
+    return;
+  }
+  if (policy.ipAllowlistMode === "off" || policy.ipAllowlist.length === 0) return;
+  const ctx = requestContext(req);
+  const verdict = evaluateIpAccess(policy, ctx.ip, userId);
+  if (!verdict.outside) return;
+  await recordAuthEvent(app.db, {
+    kind: "login_blocked_ip",
+    outcome: verdict.allowed ? "pending" : "blocked",
+    companyId,
+    userId,
+    ip: ctx.ip,
+    userAgent: ctx.userAgent,
+    reason: verdict.breakGlass
+      ? "Address outside the allowlist; admitted under the break-glass exemption."
+      : verdict.reason,
+    metadata: {
+      mode: verdict.mode,
+      breakGlass: verdict.breakGlass,
+      scope: "company_request",
+      path: req.url,
+    },
+  });
+  if (verdict.allowed) return;
+  throw new AppError(
+    403,
+    "This organisation only permits access from approved networks, and this address is not one " +
+      "of them. Connect through the corporate network or VPN, or ask an administrator to add " +
+      "this address to the allowlist.",
+    { code: "ip_not_allowed", companyId, ip: ctx.ip },
+  );
 }

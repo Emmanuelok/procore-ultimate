@@ -1533,3 +1533,38 @@ export function useEquipmentSummary(projectId: string | undefined): Loadable<Equ
     projectId ? `/api/v1/projects/${projectId}/equipment-summary` : null,
   );
 }
+
+/* ========================================================================== */
+/* Write-side reads: unmapped devices, and the projects a machine can go to    */
+/* ========================================================================== */
+
+export interface TelematicsDeviceRow {
+  providerKey: string;
+  deviceId: string;
+  readings: number;
+  firstSeen: string | null;
+  lastSeen: string | null;
+}
+
+/** Devices reporting into the company that nobody has said belong to a
+ *  machine. Their readings are kept, not dropped, which is why this list is
+ *  actionable rather than a log. */
+export function useTelematicsDevices(enabled: boolean): Loadable<
+  ListResponse<TelematicsDeviceRow> & { note?: string | null }
+> {
+  return useResource<ListResponse<TelematicsDeviceRow> & { note?: string | null }>(
+    enabled ? "/api/v1/companies/current/telematics/devices" : null,
+  );
+}
+
+export interface ProjectRef {
+  id: string;
+  name: string;
+}
+
+/** The company's projects, for a plant transfer. */
+export function useCompanyProjects(enabled: boolean): Loadable<ListResponse<ProjectRef>> {
+  return useResource<ListResponse<ProjectRef>>(
+    enabled ? "/api/v1/projects?page=1&pageSize=200" : null,
+  );
+}

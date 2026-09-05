@@ -287,6 +287,14 @@ export interface RevisionDiffSummary {
   addedTasks: { name: string }[];
   removedTasks: { name: string }[];
   durationChanges: { name: string; fromDays: number; toDays: number; deltaDays: number }[];
+  dateChanges?: {
+    name: string;
+    fromFinish: string | null;
+    toFinish: string | null;
+    finishDeltaDays: number | null;
+  }[];
+  progressChanges?: { name: string; fromPercent: number; toPercent: number }[];
+  duplicateKeys?: string[];
   logicAdded: { predecessor: string; successor: string; toType?: string }[];
   logicRemoved: { predecessor: string; successor: string; fromType?: string }[];
   logicChanged: { predecessor: string; successor: string; fromType?: string; toType?: string }[];
@@ -317,4 +325,57 @@ export function shortDate(iso: string | null | undefined): string {
   const d = new Date(`${iso}T00:00:00Z`);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
+}
+
+/* ------------------------------------------------------------------ */
+/* Resource loading (#370), revision comparison (#357), calendar view   */
+/* ------------------------------------------------------------------ */
+
+export interface ResourceTypeSummary {
+  resourceType: string;
+  budgetedUnits: number;
+  actualUnits: number;
+  budgetedCost: number;
+  actualCost: number;
+}
+
+export interface ResourcesResponse {
+  items: ResourceRow[];
+  total: number;
+  /** the project's active budget currency, or USD with a reason */
+  currency: string;
+  reasons: string[];
+  byType: ResourceTypeSummary[];
+}
+
+export interface RevisionSide {
+  id: string;
+  name: string;
+  revision?: number;
+  computedFinish: string | null;
+  dataDate: string | null;
+}
+
+export interface RevisionCompareResponse {
+  from: RevisionSide;
+  to: RevisionSide;
+  completionMovementDays: number | null;
+  diff: RevisionDiffSummary;
+}
+
+export interface CalendarViewDay {
+  date: string;
+  working: boolean;
+  starting: { id: string; name: string; isCritical: boolean }[];
+  finishing: { id: string; name: string; isCritical: boolean; isMilestone: boolean }[];
+  inProgress: number;
+}
+
+export interface CalendarViewResponse {
+  scheduleId: string;
+  from: string;
+  to: string;
+  calendarId: string | null;
+  calendarName: string | null;
+  days: CalendarViewDay[];
 }

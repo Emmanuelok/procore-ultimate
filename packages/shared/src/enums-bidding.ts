@@ -205,3 +205,50 @@ export type BidIntegrityDetector = (typeof BID_INTEGRITY_DETECTORS)[number];
 /** How hard a finding bites. Mirrors the platform's signal severities. */
 export const BID_INTEGRITY_SEVERITIES = ["critical", "high", "medium", "low", "info"] as const;
 export type BidIntegritySeverity = (typeof BID_INTEGRITY_SEVERITIES)[number];
+
+/* ------------------------------------------------------------------ */
+/* Prequalification depth: capture registers and automatic tiering      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The tier a vendor is admitted at. A buyer does not ask "what did they
+ * score", they ask "what size of package may this vendor be considered for" —
+ * so the score, the financial limit and the safety record collapse into one
+ * letter, and the letter carries its basis.
+ *
+ * `unrated` is a real answer, and the honest one wherever the inputs are
+ * missing. It is never dressed up as tier C.
+ */
+export const PREQUAL_TIERS = ["a", "b", "c", "unrated"] as const;
+export type PrequalTier = (typeof PREQUAL_TIERS)[number];
+
+export const PREQUAL_RISK_RATINGS = ["low", "medium", "high", "unrated"] as const;
+export type PrequalRiskRating = (typeof PREQUAL_RISK_RATINGS)[number];
+
+/** Where a safety figure came from. Provenance is not a footnote here. */
+export const PREQUAL_SAFETY_SOURCES = ["self_declared", "audited", "regulator"] as const;
+export type PrequalSafetySource = (typeof PREQUAL_SAFETY_SOURCES)[number];
+
+/**
+ * A licence's standing. `claimed` is the default because a vendor typing a
+ * licence number is a claim, and it stays a claim until somebody checks it.
+ */
+export const PREQUAL_LICENCE_STATUSES = [
+  "claimed",
+  "verified",
+  "expired",
+  "suspended",
+  "revoked",
+  "not_applicable",
+] as const;
+export type PrequalLicenceStatus = (typeof PREQUAL_LICENCE_STATUSES)[number];
+
+/** How a past contract ended, from the reference's point of view. */
+export const PREQUAL_REFERENCE_OUTCOMES = [
+  "delivered",
+  "delivered_late",
+  "terminated",
+  "disputed",
+  "unknown",
+] as const;
+export type PrequalReferenceOutcome = (typeof PREQUAL_REFERENCE_OUTCOMES)[number];

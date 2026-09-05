@@ -584,8 +584,15 @@ export interface BidAward extends BidAwardRow {
     approvedAt: string | null;
     segregated: boolean;
     isLowestBid: boolean;
+    /** the AS-BID contract sum — what the commitment is raised for */
+    asBidContractSum: number | null;
+    /** the figure the comparison was actually made on (levelled where levelled) */
+    recommendedComparableAmount: number | null;
     lowestBidAmount: number | null;
+    comparableAmountsNote: string | null;
     notLowestJustification: string | null;
+    integrityAcknowledgement?: unknown;
+    approvalAuthorityBasis?: unknown;
     comparisonBasis: unknown;
     recommendationBasis: string | null;
     savingAgainstEstimate: number | null;
@@ -755,6 +762,7 @@ export interface PrequalSubmission {
   suspendedReason: string | null;
   createdBy: string;
   createdAt: string;
+  updatedAt?: string | null;
   detail: Record<string, unknown>;
 }
 

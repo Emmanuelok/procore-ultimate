@@ -1079,9 +1079,17 @@ describe("resource-loaded activities", () => {
       headers: owner.headers,
     });
     expect(list.statusCode).toBe(200);
-    const body = list.json() as { total: number; byType: { resourceType: string; budgetedCost: number }[] };
+    const body = list.json() as {
+      total: number;
+      currency: string;
+      reasons: string[];
+      byType: { resourceType: string; budgetedCost: number }[];
+    };
     expect(body.total).toBe(1);
     expect(body.byType[0]).toMatchObject({ resourceType: "labour", budgetedCost: 18_000 });
+    // Money carries a currency, and where it was defaulted the caller is told why.
+    expect(body.currency).toBe("USD");
+    expect(body.reasons.some((r) => r.includes("No active budget"))).toBe(true);
 
     const quality = await app.inject({
       method: "GET",

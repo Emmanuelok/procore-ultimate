@@ -6,6 +6,8 @@ import {
   coerceTelematicsRow,
   engineHoursForDay,
   engineHoursFromCounter,
+  engineHoursSeries,
+  localDateOf,
   reconcileFuel,
   reconcileEquipment,
   reconcileTelematics,
@@ -275,6 +277,82 @@ describe("engineHoursForDay — the counter does not stop at midnight", () => {
     });
     expect(out.hours).toBeNull();
     expect(out.reasons.join(" ")).toContain("not distinguishable");
+  });
+});
+
+describe("engineHoursSeries — every day carries in from the day before", () => {
+  /** one reading a day at 17:00, a device that reports once. */
+  const daily = [
+    { recordedAt: "2026-08-02T17:00:00.000Z", engineHours: 1000 },
+    { recordedAt: "2026-08-03T17:00:00.000Z", engineHours: 1008 },
+    { recordedAt: "2026-08-04T17:00:00.000Z", engineHours: 1017 },
+  ];
+
+  it("states hours for a once-a-day device, which within-day grouping cannot", () => {
+    const series = engineHoursSeries({
+      dates: ["2026-08-03", "2026-08-04"],
+      readings: daily,
+    });
+    expect(series.map((d) => d.delta.hours)).toEqual([8, 9]);
+    // the same readings, grouped inside the calendar day, say nothing at all
+    expect(engineHoursFromCounter([daily[1]!]).hours).toBeNull();
+  });
+
+  it("counts the hours run between one day's last reading and the next day's first", () => {
+    const series = engineHoursSeries({
+      dates: ["2026-08-04"],
+      readings: [
+        { recordedAt: "2026-08-03T18:00:00.000Z", engineHours: 100 },
+        { recordedAt: "2026-08-04T08:00:00.000Z", engineHours: 104 },
+        { recordedAt: "2026-08-04T17:00:00.000Z", engineHours: 111 },
+      ],
+    });
+    // 111 - 100 = 11h, not the 7h the 08:00-17:00 window would have credited
+    expect(series[0]!.delta.hours).toBe(11);
+  });
+
+  it("says the opening is unknown for the first day of an unbacked feed", () => {
+    const series = engineHoursSeries({
+      dates: ["2026-08-03"],
+      readings: [
+        { recordedAt: "2026-08-03T08:00:00.000Z", engineHours: 50 },
+        { recordedAt: "2026-08-03T17:00:00.000Z", engineHours: 57 },
+      ],
+    });
+    expect(series[0]!.delta.hours).toBe(7);
+    expect(series[0]!.delta.reasons.join(" ")).toContain("no reading exists before this day");
+  });
+
+  it("returns null, never zero, for a day the feed never reached", () => {
+    const series = engineHoursSeries({
+      dates: ["2026-08-03", "2026-08-04", "2026-08-05"],
+      readings: daily,
+    });
+    expect(series[2]!.delta.hours).toBeNull();
+    expect(series[2]!.delta.reasons.join(" ")).toContain("did not report at all");
+  });
+
+  it("cuts the day on the site clock, so a night shift east of UTC lands on one date", () => {
+    // UTC+8. The shift runs 20:00-04:00 local = 12:00-20:00 UTC on 2026-08-03.
+    const readings = [
+      { recordedAt: "2026-08-03T10:00:00.000Z", engineHours: 200 }, // 18:00 local, before shift
+      { recordedAt: "2026-08-03T20:00:00.000Z", engineHours: 208 }, // 04:00 local NEXT day
+    ];
+    expect(localDateOf(readings[1]!.recordedAt, 480)).toBe("2026-08-04");
+    const utc = engineHoursSeries({ dates: ["2026-08-03"], readings });
+    const local = engineHoursSeries({ dates: ["2026-08-04"], readings, tzOffsetMinutes: 480 });
+    expect(utc[0]!.delta.hours).toBe(8);
+    // on the site's clock the eight hours belong to the 4th, which is the
+    // date the plant sheet for that night shift carries
+    expect(local[0]!.delta.hours).toBe(8);
+  });
+
+  it("deduplicates and orders the dates it was handed", () => {
+    const series = engineHoursSeries({
+      dates: ["2026-08-04", "2026-08-03", "2026-08-04"],
+      readings: daily,
+    });
+    expect(series.map((d) => d.date)).toEqual(["2026-08-03", "2026-08-04"]);
   });
 });
 

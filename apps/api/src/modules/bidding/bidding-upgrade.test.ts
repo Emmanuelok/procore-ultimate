@@ -1455,6 +1455,229 @@ describe("bid integrity detectors on real records", () => {
 /* NEW — scope gaps, bid board, health inputs                          */
 /* ================================================================== */
 
+/* ================================================================== */
+/* NEW — the bidder portal completes the loop                          */
+/* ================================================================== */
+
+describe("the bidder portal: manifest, questions and online submission", () => {
+  let token: string;
+  let invitationId: string;
+  let pkgId: string;
+
+  async function portal(method: "POST" | "GET", url: string, payload?: unknown) {
+    return app.inject({
+      method,
+      url: `/api/v1${url}`,
+      headers: { authorization: `Bearer ${token}` },
+      ...(method === "POST" ? { payload: payload ?? {} } : {}),
+    });
+  }
+
+  beforeAll(async () => {
+    const pkg = await createPackage(projectA, {
+      title: "Portal submission",
+      bidDueAt: isoIn(6 * HOUR),
+      questionsDueAt: isoIn(3 * HOUR),
+    });
+    pkgId = pkg.id;
+    await patch(`/projects/${projectA}/bid-packages/${pkgId}`, {
+      documentFileIds: ["fil_p_drawings", "fil_p_spec"],
+    });
+    await issuePackage(projectA, pkgId);
+    const invite = await post(`/projects/${projectA}/bid-packages/${pkgId}/invitations`, {
+      vendorId: alpha,
+    });
+    invitationId = invite.json().items[0].id;
+    await post(`/bid-invitations/${invitationId}/send`);
+    token = (await post(`/bid-invitations/${invitationId}/portal-token`)).json().token;
+  });
+
+  it("lists what was issued and names what this bidder has never opened", async () => {
+    const res = await portal("GET", "/bid-portal/documents");
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.total).toBe(2);
+    expect(body.unopened).toBe(2);
+    await portal("POST", "/bid-portal/document-access", {
+      fileId: "fil_p_drawings",
+      accessKind: "download",
+    });
+    const after = await portal("GET", "/bid-portal/documents");
+    expect(after.json().unopened).toBe(1);
+    const opened = after
+      .json()
+      .files.find((f: { fileId: string }) => f.fileId === "fil_p_drawings");
+    expect(opened.firstOpenedAt).toBeTruthy();
+  });
+
+  it("takes a tender query from the bidder and puts it in the buyer's register", async () => {
+    const asked = await portal("POST", "/bid-portal/questions", {
+      question: "Is the temporary works design in our scope?",
+      category: "scope",
+    });
+    expect(asked.statusCode).toBe(201);
+    expect(asked.json().reference).toMatch(/^TQ-/);
+    expect(asked.json().lateWarning).toBeNull();
+
+    const register = await get(`/projects/${projectA}/bid-packages/${pkgId}/questions`);
+    expect(register.statusCode).toBe(200);
+    const row = register
+      .json()
+      .items.find((q: { id: string }) => q.id === asked.json().id);
+    expect(row.vendorId).toBe(alpha);
+    expect(row.invitationId).toBe(invitationId);
+    expect(row.createdBy).toBeNull();
+
+    const entries = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(
+        and(eq(ledgerEntries.companyId, owner.companyId), eq(ledgerEntries.objectId, invitationId)),
+      );
+    const logged = entries.find(
+      (e) =>
+        ((e.payload as Record<string, unknown> | null) ?? {})["event"] === "portal_question_asked",
+    );
+    expect(logged).toBeDefined();
+    expect(logged!.actorId).toBeNull();
+  });
+
+  it("warns when the question arrives after the questions deadline", async () => {
+    await patch(`/projects/${projectA}/bid-packages/${pkgId}`, {
+      questionsDueAt: isoIn(-HOUR),
+    });
+    const asked = await portal("POST", "/bid-portal/questions", {
+      question: "Late one — is the ground water table surveyed?",
+    });
+    expect(asked.statusCode).toBe(201);
+    expect(asked.json().lateWarning).toMatch(/deadline/i);
+  });
+
+  it("records a priced bid, hashes it server-side and returns a receipt without the estimate", async () => {
+    const scope = await post(`/projects/${projectA}/bid-packages/${pkgId}/levelling/items`, {
+      items: [
+        { description: "Excavation", isMandatory: true },
+        { description: "Piling", isMandatory: true },
+      ],
+    });
+    expect(scope.statusCode).toBe(201);
+    const items = scope.json().items;
+
+    const res = await portal("POST", "/bid-portal/submission", {
+      lines: [
+        { levellingItemId: items[0].id, description: "Excavation", amount: 60_000 },
+        { levellingItemId: items[1].id, description: "Piling", amount: 90_000 },
+      ],
+      qualifications: "Rates hold for 60 days.",
+      submittedByName: "A. Bidder",
+    });
+    expect(res.statusCode).toBe(201);
+    const receipt = res.json();
+    expect(receipt.reference).toBeTruthy();
+    expect(receipt.sealedSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(receipt.lineCount).toBe(2);
+    expect(receipt.isLate).toBe(false);
+    // The receipt is a receipt: no estimate, no other bidder, no rollup.
+    expect(JSON.stringify(receipt)).not.toMatch(/engineersEstimate/);
+
+    const [row] = await app.db
+      .select()
+      .from(bidSubmissions)
+      .where(eq(bidSubmissions.id, receipt.submissionId));
+    expect(row!.totalAmount).toBe(150_000);
+    expect(row!.createdBy).toBeNull();
+    expect((row!.detail as Record<string, unknown>)["via"]).toBe("portal_token");
+
+    const invitation = await get(`/bid-invitations/${invitationId}`);
+    expect(invitation.json().status).toBe("submitted");
+    expect(invitation.json().submissionId).toBe(receipt.submissionId);
+  });
+
+  it("supersedes the bidder's own earlier revision", async () => {
+    const res = await portal("POST", "/bid-portal/submission", {
+      baseBidAmount: 148_000,
+      lines: [{ description: "Revised lump sum", amount: 148_000 }],
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().revision).toBe(1);
+    expect(res.json().supersededSubmissionIds.length).toBe(1);
+    const [prior] = await app.db
+      .select()
+      .from(bidSubmissions)
+      .where(eq(bidSubmissions.id, res.json().supersededSubmissionIds[0]));
+    expect(prior!.status).toBe("withdrawn");
+    expect(prior!.supersededById).toBe(res.json().submissionId);
+  });
+
+  it("refuses a bid with no priceable figure and a line pointing at another package", async () => {
+    const empty = await portal("POST", "/bid-portal/submission", { lines: [] });
+    expect(empty.statusCode).toBe(400);
+    expect(empty.json().message).toMatch(/no priceable figure|not a bid/i);
+
+    const other = await createPackage(projectA, { title: "Someone else's scope" });
+    const otherScope = await post(
+      `/projects/${projectA}/bid-packages/${other.id}/levelling/items`,
+      { items: [{ description: "Not ours" }] },
+    );
+    const strayId = otherScope.json().items[0].id;
+    const stray = await portal("POST", "/bid-portal/submission", {
+      lines: [{ levellingItemId: strayId, description: "Excavation", amount: 10 }],
+    });
+    expect(stray.statusCode).toBe(400);
+    expect(stray.json().details.control).toBe("levelling_item_not_on_package");
+  });
+
+  it("records a late bid, flags it, and keeps it out of the comparison", async () => {
+    const pkg = await createPackage(projectA, {
+      title: "Late through the portal",
+      bidDueAt: isoIn(2 * HOUR),
+    });
+    await issuePackage(projectA, pkg.id);
+    const invite = await post(`/projects/${projectA}/bid-packages/${pkg.id}/invitations`, {
+      vendorId: bravo,
+    });
+    const id = invite.json().items[0].id;
+    await post(`/bid-invitations/${id}/send`);
+    const theirToken = (await post(`/bid-invitations/${id}/portal-token`)).json().token;
+    // The deadline moves into the past; the token tail keeps the portal open.
+    await app.db
+      .update(bidPackages)
+      .set({ bidDueAt: isoIn(-2 * HOUR) })
+      .where(eq(bidPackages.id, pkg.id));
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/v1/bid-portal/submission",
+      headers: { authorization: `Bearer ${theirToken}` },
+      payload: { baseBidAmount: 120_000 },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().isLate).toBe(true);
+    expect(res.json().lateNote).toMatch(/accepts it in writing/i);
+
+    const detail = await get(`/projects/${projectA}/bid-packages/${pkg.id}`);
+    // Market tiles exclude an unaccepted late bid.
+    expect(detail.json().market.lowest.value).toBeNull();
+  });
+
+  it("refuses a portal bid without a token and after the invitation is disqualified", async () => {
+    const anonymous = await app.inject({
+      method: "POST",
+      url: "/api/v1/bid-portal/submission",
+      payload: { baseBidAmount: 1 },
+    });
+    expect(anonymous.statusCode).toBe(401);
+
+    const wrong = await app.inject({
+      method: "POST",
+      url: "/api/v1/bid-portal/questions",
+      headers: { authorization: "Bearer bpt_deadbeef" },
+      payload: { question: "anyone home?" },
+    });
+    expect(wrong.statusCode).toBe(401);
+  });
+});
+
 describe("scope gaps across bids", () => {
   it("names the scope nobody priced", async () => {
     const pkg = await createPackage(projectA, { title: "Scope gaps" });

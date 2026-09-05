@@ -389,6 +389,23 @@ const createUserSchema = z.object({
 });
 
 export function registerScimRoutes(app: FastifyInstance): void {
+  /**
+   * TWO BASES, AND THE DIFFERENCE MATTERS.
+   *
+   * `route` is the path these handlers are REGISTERED at. This function is
+   * called from inside `accountModule`, which app.ts registers with
+   * `{ prefix: "/api/v1" }`, so Fastify prepends that prefix itself. Passing
+   * the full public path here registered every SCIM route at
+   * `/api/v1/api/v1/scim/v2/...` — the documented URL 404'd, and no test
+   * noticed because the SCIM tests only exercised the pure helpers. There are
+   * now route tests below it (`scim-routes.test.ts`) that call the documented
+   * path and would fail again the moment the two drift apart.
+   *
+   * `base` is the path that goes into `meta.location` and the `Location`
+   * header — what an identity provider stores and calls back on. That one IS
+   * the full public path.
+   */
+  const route = "/scim/v2";
   const base = "/api/v1/scim/v2";
 
   /** The SCIM gate. Sets `req.scim` or answers 401 in SCIM's own envelope. */
@@ -488,7 +505,7 @@ export function registerScimRoutes(app: FastifyInstance): void {
 
   /* --- discovery --- */
 
-  app.get(`${base}/ServiceProviderConfig`, async (_req, reply) =>
+  app.get(`${route}/ServiceProviderConfig`, async (_req, reply) =>
     reply.type("application/scim+json").send({
       schemas: ["urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"],
       documentationUri: "https://constructos.dev/docs/security#scim",
@@ -520,7 +537,7 @@ export function registerScimRoutes(app: FastifyInstance): void {
     }),
   );
 
-  app.get(`${base}/ResourceTypes`, async (_req, reply) =>
+  app.get(`${route}/ResourceTypes`, async (_req, reply) =>
     reply.type("application/scim+json").send({
       schemas: [SCIM_LIST_SCHEMA],
       totalResults: 2,
@@ -547,7 +564,7 @@ export function registerScimRoutes(app: FastifyInstance): void {
     }),
   );
 
-  app.get(`${base}/Schemas`, async (_req, reply) =>
+  app.get(`${route}/Schemas`, async (_req, reply) =>
     reply.type("application/scim+json").send({
       schemas: [SCIM_LIST_SCHEMA],
       totalResults: 2,
@@ -580,7 +597,7 @@ export function registerScimRoutes(app: FastifyInstance): void {
 
   /* --- Users --- */
 
-  app.get(`${base}/Users`, async (req, reply) => {
+  app.get(`${route}/Users`, async (req, reply) => {
     const principal = await scimAuth(req, reply);
     if (!principal) return reply;
     const query = req.query as Record<string, string | undefined>;
@@ -623,7 +640,7 @@ export function registerScimRoutes(app: FastifyInstance): void {
     });
   });
 
-  app.get(`${base}/Users/:id`, async (req, reply) => {
+  app.get(`${route}/Users/:id`, async (req, reply) => {
     const principal = await scimAuth(req, reply);
     if (!principal) return reply;
     const { id } = req.params as { id: string };
@@ -632,7 +649,7 @@ export function registerScimRoutes(app: FastifyInstance): void {
     return reply.type("application/scim+json").send(scimUser(row, base));
   });
 
-  app.post(`${base}/Users`, async (req, reply) => {
+  app.post(`${route}/Users`, async (req, reply) => {
     const principal = await scimAuth(req, reply);
     if (!principal) return reply;
     let body: z.infer<typeof createUserSchema>;
@@ -826,7 +843,7 @@ export function registerScimRoutes(app: FastifyInstance): void {
     });
   }
 
-  app.put(`${base}/Users/:id`, async (req, reply) => {
+  app.put(`${route}/Users/:id`, async (req, reply) => {
     const principal = await scimAuth(req, reply);
     if (!principal) return reply;
     const { id } = req.params as { id: string };
@@ -864,7 +881,7 @@ export function registerScimRoutes(app: FastifyInstance): void {
       .send(after ? scimUser(after, base) : scimUser({ ...row, name, isActive: false, role: null }, base));
   });
 
-  app.patch(`${base}/Users/:id`, async (req, reply) => {
+  app.patch(`${route}/Users/:id`, async (req, reply) => {
     const principal = await scimAuth(req, reply);
     if (!principal) return reply;
     const { id } = req.params as { id: string };
@@ -902,7 +919,7 @@ export function registerScimRoutes(app: FastifyInstance): void {
     return reply.type("application/scim+json").send(body);
   });
 
-  app.delete(`${base}/Users/:id`, async (req, reply) => {
+  app.delete(`${route}/Users/:id`, async (req, reply) => {
     const principal = await scimAuth(req, reply);
     if (!principal) return reply;
     const { id } = req.params as { id: string };
@@ -914,7 +931,7 @@ export function registerScimRoutes(app: FastifyInstance): void {
 
   /* --- Groups (company roles) --- */
 
-  app.get(`${base}/Groups`, async (req, reply) => {
+  app.get(`${route}/Groups`, async (req, reply) => {
     const principal = await scimAuth(req, reply);
     if (!principal) return reply;
     const members = await loadMembers(principal.companyId);
@@ -934,7 +951,7 @@ export function registerScimRoutes(app: FastifyInstance): void {
     });
   });
 
-  app.get(`${base}/Groups/:id`, async (req, reply) => {
+  app.get(`${route}/Groups/:id`, async (req, reply) => {
     const principal = await scimAuth(req, reply);
     if (!principal) return reply;
     const { id } = req.params as { id: string };
@@ -952,7 +969,7 @@ export function registerScimRoutes(app: FastifyInstance): void {
       );
   });
 
-  app.patch(`${base}/Groups/:id`, async (req, reply) => {
+  app.patch(`${route}/Groups/:id`, async (req, reply) => {
     const principal = await scimAuth(req, reply);
     if (!principal) return reply;
     const { id } = req.params as { id: string };

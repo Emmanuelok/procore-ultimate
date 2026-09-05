@@ -367,6 +367,29 @@ describe("long-lead register", () => {
   });
 
   /*
+   * Regression: an unordered item that loses its order-by date has SATISFIED
+   * nothing. The obligation used to be closed as "satisfied" whenever the
+   * order-by date disappeared, which told the assurance layer an order had
+   * been placed when the item was still sitting at `identified`.
+   */
+  it("waives, never satisfies, the order-by obligation when an unordered item loses its need date", async () => {
+    const res = await post(`/projects/${projectId}/supply-chain/long-lead`, { name: "Roof plant", leadTimeDays: 30, requiredOnSite: addDaysISO(today, 150) });
+    expect(res.statusCode).toBe(201);
+    const itemId = res.json().id as string;
+    const oblId = (await get(`/projects/${projectId}/supply-chain/long-lead/${itemId}`)).json().obligationId as string;
+    expect(oblId).toBeTruthy();
+    const [open] = await app.db.select().from(obligations).where(eq(obligations.id, oblId));
+    expect(open?.status).toBe("open");
+
+    const cleared = await patch(`/projects/${projectId}/supply-chain/long-lead/${itemId}`, { requiredOnSite: null });
+    expect(cleared.statusCode).toBe(200);
+    expect(cleared.json().status).toBe("identified");
+    expect(cleared.json().orderByDate).toBeNull();
+    const [after] = await app.db.select().from(obligations).where(eq(obligations.id, oblId));
+    expect(after?.status).toBe("waived");
+  });
+
+  /*
    * Regression: a delivered item is not "at risk of arriving late". The float
    * rule used to fire on an item already on site whose arrival was only a
    * couple of days ahead of need, painting the register red and chasing the

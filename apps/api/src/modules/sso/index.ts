@@ -1452,8 +1452,14 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
    */
   function finishError(reply: FastifyReply, flow: SsoFlowRecord, err: Error) {
     if (flow.mode === "json") throw err;
-    const status = err instanceof AppError ? err.statusCode : 500;
     const safe = err instanceof AppError && err.statusCode < 500;
+    // A MASKED FAILURE REPORTS 500, not the upstream code. Forwarding 502
+    // would tell the browser (and its history, and every proxy log on the
+    // way) which layer failed, which is the first half of the thing the
+    // masking exists to withhold; the `reference` is how an operator finds
+    // the real status in the server log. A user-facing 4xx keeps its own
+    // status because it is the user's business.
+    const status = safe ? (err as AppError).statusCode : 500;
     const reference = safe ? null : newId("ssoerr");
     if (!safe) {
       app.log.error(
@@ -1564,7 +1570,11 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
 
     return flow.linkUserId
       ? completeLink(flow, ready, asserted, req)
-      : completeLogin(flow, ready, asserted, req);
+      // The VERIFIED claims travel with the assertion. `completeLogin` needs
+      // them for the tenant MFA gate (`amr`/`acr`), and it must never be able
+      // to reach for an unverified copy — which is why they are a parameter
+      // rather than something re-read from the token further down.
+      : completeLogin(flow, ready, asserted, req, payload);
   }
 
   /* ---------------------------------------------------------------- */
@@ -1576,6 +1586,8 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
     provider: ProviderRow,
     asserted: AssertedIdentity,
     req: FastifyRequest,
+    /** the SIGNATURE-VERIFIED id_token claims, for the MFA gate's amr/acr */
+    claims: Record<string, unknown>,
   ) {
     const nowIso = new Date().toISOString();
 
@@ -1646,15 +1658,25 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
           rawProfile: asserted.rawProfile,
         })
         .where(eq(userIdentities.id, identity.id));
+      // THE MFA GATE APPLIES TO THE RETURNING USER TOO. The first fix for the
+      // "tenant MFA policy is bypassed by SSO" finding only gated the sign-in
+      // that LINKS an identity — i.e. the first one. Every sign-in after it
+      // took this branch and went straight to a session, so the policy held
+      // for one day and then stopped, which is worse than not holding at all
+      // because the coverage figure says it holds.
+      const gate = await mfaGate(provider, user, claims, req);
+      if (gate.challenge) return { ...gate.challenge, returnTo: flow.returnTo };
       const session = await finishSignIn({
         user,
         provider,
         identityId: identity.id,
         req,
+        mfaSatisfied: gate.satisfied,
         metadata: {
           emailAtLink: identity.emailAtLink,
           assertedEmail: asserted.email,
           emailDiverged: Boolean(asserted.email && asserted.email !== identity.emailAtLink),
+          mfaViaIdp: gate.satisfied,
         },
       });
       return {
@@ -1785,7 +1807,7 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
       }
 
       const identityId = await linkIdentity(provider, existingUser.id, asserted, req, "verified_email");
-      const gate = await mfaGate(provider, existingUser, payload, req);
+      const gate = await mfaGate(provider, existingUser, claims, req);
       if (gate.challenge) return { ...gate.challenge, returnTo: flow.returnTo };
       const session = await finishSignIn({
         user: existingUser,
@@ -1880,7 +1902,7 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
     });
 
     const user = { id: userId, email: asserted.email, name: asserted.displayName ?? asserted.email };
-    const gate = await mfaGate(provider, user, payload, req);
+    const gate = await mfaGate(provider, user, claims, req);
     if (gate.challenge) return { ...gate.challenge, returnTo: flow.returnTo };
     const session = await finishSignIn({
       user,

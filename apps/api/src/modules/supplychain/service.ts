@@ -219,7 +219,13 @@ async function syncOrderByObligation(
       detail["obligationId"] = id;
     }
   } else if (existingId) {
-    const next = row.status === "cancelled" ? "waived" : "satisfied";
+    // Ordering the item is what SATISFIES the order-by duty. Cancelling waives
+    // it. An item that is still unordered but has lost its order-by date (the
+    // need date was cleared, or the task it followed lost its start) has
+    // satisfied nothing — the duty is simply no longer datable, so it is
+    // waived. Reporting it as satisfied would tell the assurance layer an
+    // order was placed when none was.
+    const next = row.status === "cancelled" || UNORDERED.has(row.status) ? "waived" : "satisfied";
     await db
       .update(obligations)
       .set({ status: next })

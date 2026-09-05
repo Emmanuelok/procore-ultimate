@@ -1,18 +1,22 @@
-import type { FastifyPluginAsync } from "fastify";
-import { and, count, desc, eq, gte, ilike, inArray, lte, or, sql } from "drizzle-orm";
+import type { FastifyPluginAsync, FastifyRequest } from "fastify";
+import { and, count, desc, eq, gte, ilike, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   companies,
   lessonApplications,
+  lessonPushes,
   lessonTriggers,
   lessons,
   obligations,
   postProjectReviews,
+  projectMemberships,
   projects,
 } from "@constructos/db";
 import {
   LESSON_CATEGORIES,
   LESSON_STATUSES,
+  LESSON_OUTCOMES,
+  LESSON_PUSH_STATUSES,
   LESSON_TRIGGER_KINDS,
   REVIEW_STATUSES,
   TOOLS,
@@ -24,6 +28,14 @@ import { nextRecordNumber } from "../../lib/numbering.js";
 import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { addDaysISO, todayISO } from "../field/dates.js";
+import { forEachCompany } from "../../lib/scheduler.js";
+import { pushNotifications } from "../notifications/service.js";
+import {
+  companyScopeOf,
+  companyToolGate,
+  scopeAllows,
+  scopeProjects,
+} from "../meetings/scope.js";
 import {
   aiEnabled,
   escapeLike,
@@ -277,6 +289,23 @@ export const learningModule: FastifyPluginAsync = async (app) => {
   ];
   const projectAdmin = [app.authenticate, app.requireCompany, app.requireTool("learning", "admin")];
   const companyRead = [app.authenticate, app.requireCompany];
+  /*
+   * COMPANY-LEVEL ROUTES ARE NOT UNGATED ROUTES.
+   *
+   * `/learning/lessons` has no `:projectId`, so `requireTool` cannot resolve
+   * a permission — and the route ran on [authenticate, requireCompany] alone,
+   * where COMPANY_ROLES includes `guest`. Every project's DRAFT and REJECTED
+   * lessons (an unvalidated account of what went wrong, naming people) were
+   * readable by any member of the tenant. The gate below resolves which
+   * projects the caller actually holds `learning` on; PUBLISHED lessons stay
+   * company-wide, because a published lesson is a tenant asset and hiding it
+   * would defeat the entire module.
+   */
+  const companyScopedRead = [
+    app.authenticate,
+    app.requireCompany,
+    companyToolGate(app, "learning", "read"),
+  ];
   const companyWrite = [
     app.authenticate,
     app.requireCompany,
@@ -414,6 +443,8 @@ export const learningModule: FastifyPluginAsync = async (app) => {
     scanned: number;
     created: number;
     alreadyOpen: number;
+    /** candidates another writer inserted first — proof the DB guard bit */
+    racedWithAnotherWriter: number;
     createdTriggerIds: string[];
     threshold: { value: number; source: string };
   }
@@ -427,7 +458,7 @@ export const learningModule: FastifyPluginAsync = async (app) => {
   async function sweepProjectTriggers(
     companyId: string,
     projectId: string,
-    actorId: string,
+    actorId: string | null,
   ): Promise<SweepResult> {
     const [project] = await app.db
       .select({ currency: projects.currency, settings: projects.settings })
@@ -462,9 +493,43 @@ export const learningModule: FastifyPluginAsync = async (app) => {
     const fresh = selectNewCandidates(candidates, existingKeys);
     const createdTriggerIds: string[] = [];
     const today = todayISO();
+    let raced = 0;
 
     for (const candidate of fresh) {
       const dueAt = addDaysISO(today, dueDaysFor(candidate.kind));
+      /*
+       * IDEMPOTENCE THAT SURVIVES CONCURRENCY.
+       *
+       * The in-memory `existingKeys` set was the only guard, so two users
+       * opening the Triggers tab at the same moment both saw "no trigger for
+       * dispute D" and both inserted one: two obligations, two triggers, and a
+       * capture-rate denominator quietly doubled with no way to tell which row
+       * was real. The trigger is now written FIRST against a unique index on
+       * (project_id, kind, source_key); the obligation follows only if that
+       * insert actually won the race. An obligation with no trigger is an
+       * un-dischargeable duty, so the order matters.
+       */
+      const sourceKey = String(candidate.sourceRef.recordId);
+      const triggerId = newId("ltr");
+      const inserted = await app.db
+        .insert(lessonTriggers)
+        .values({
+          id: triggerId,
+          companyId,
+          projectId,
+          kind: candidate.kind,
+          sourceRef: candidate.sourceRef,
+          sourceKey,
+          rationale: candidate.rationale,
+          dueAt,
+          status: "open",
+        })
+        .onConflictDoNothing()
+        .returning({ id: lessonTriggers.id });
+      if (!inserted[0]) {
+        raced += 1;
+        continue;
+      }
       const obligationId = newId("obl");
       await app.db.insert(obligations).values({
         id: obligationId,
@@ -478,20 +543,12 @@ export const learningModule: FastifyPluginAsync = async (app) => {
           "A lesson-learned record capturing what happened, the root cause and the " +
           "recommendation, validated by someone other than its author",
         status: "open",
-        createdBy: actorId,
+        createdBy: actorId ?? "system",
       });
-      const triggerId = newId("ltr");
-      await app.db.insert(lessonTriggers).values({
-        id: triggerId,
-        companyId,
-        projectId,
-        kind: candidate.kind,
-        sourceRef: candidate.sourceRef,
-        rationale: candidate.rationale,
-        dueAt,
-        obligationId,
-        status: "open",
-      });
+      await app.db
+        .update(lessonTriggers)
+        .set({ obligationId })
+        .where(eq(lessonTriggers.id, triggerId));
       createdTriggerIds.push(triggerId);
       await appendLedger(app.db, {
         companyId,
@@ -513,8 +570,9 @@ export const learningModule: FastifyPluginAsync = async (app) => {
 
     return {
       scanned: candidates.length,
-      created: fresh.length,
-      alreadyOpen: candidates.length - fresh.length,
+      created: createdTriggerIds.length,
+      alreadyOpen: candidates.length - createdTriggerIds.length,
+      racedWithAnotherWriter: raced,
       createdTriggerIds,
       threshold: { value: threshold.value, source: threshold.source },
     };
@@ -565,7 +623,15 @@ export const learningModule: FastifyPluginAsync = async (app) => {
     body: z.infer<typeof lessonCreateSchema>,
     trigger: TriggerRow | null,
   ): Promise<LessonRow> {
-    const seq = await nextRecordNumber(app.db, projectId, "lesson");
+    /*
+     * COMPANY-SCOPED, because the number is used as a COMPANY-WIDE identifier.
+     * Allocating per project produced LL-0001 on every job at once: the
+     * published register showed two different lessons under one number, the
+     * supersede picker could not tell them apart, and the AI layer's citation
+     * ("ref is the lesson number") was ambiguous by construction. The counter
+     * is keyed on the company id — the same thing insurance does for CPOL.
+     */
+    const seq = await nextRecordNumber(app.db, companyId, "lesson");
     const id = newId("lsn");
     const number = `LL-${String(seq).padStart(4, "0")}`;
     await app.db.insert(lessons).values({
@@ -844,7 +910,11 @@ export const learningModule: FastifyPluginAsync = async (app) => {
         },
         storePayload: true,
       });
-      return fetchLesson(lessonId, req.companyId!);
+      const published = await fetchLesson(lessonId, req.companyId!);
+      /* Publishing IS the push. A lesson that sits in a register waiting to be
+         searched for has not been learned by anybody but its author. */
+      const push = await pushLessonToProjects(req.companyId!, published, req.user!.id, 10);
+      return { ...published, push };
     },
   );
 
@@ -953,7 +1023,7 @@ export const learningModule: FastifyPluginAsync = async (app) => {
    * returns the deterministic results and says which mode it is in. It never
    * errors on account of AI being unavailable.
    */
-  app.post("/learning/search", { preHandler: companyRead }, async (req) => {
+  app.post("/learning/search", { preHandler: companyScopedRead }, async (req) => {
     const body = searchSchema.parse(req.body);
     const { rows, counts } = await publishedRegister(req.companyId!);
     const hits = keywordSearch(
@@ -1078,9 +1148,17 @@ export const learningModule: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/learning/triggers", { preHandler: projectRead }, async (req) => {
     const q = triggersQuery.parse(req.query);
-    // Lazy sweep on read — the established platform pattern (disputes, ESG,
-    // finance). A list of triggers that is out of date is worse than no list.
-    const sweep = await sweepProjectTriggers(req.companyId!, req.projectId!, req.user!.id);
+    /*
+     * THIS READ WRITES NOTHING.
+     *
+     * It used to run the sweep, so a read-only member — or an assurance
+     * grantee with no write permission at all — created obligations, lesson
+     * triggers and hash-chained ledger entries simply by opening the tab, all
+     * attributed to them. The test asserting that a reader gets 403 on
+     * POST /triggers/sweep was therefore cosmetic: the identical sweep ran on
+     * the GET beside it. The sweep is now the scheduled job
+     * `learning.capture-triggers`, running under a null (system) actor.
+     */
     const where = and(
       eq(lessonTriggers.companyId, req.companyId!),
       eq(lessonTriggers.projectId, req.projectId!),
@@ -1101,7 +1179,11 @@ export const learningModule: FastifyPluginAsync = async (app) => {
       ageDays: Math.max(0, Math.floor((now - Date.parse(t.raisedAt)) / MS_PER_DAY)),
       overdue: t.status === "open" && t.dueAt != null && t.dueAt < todayISO(),
     }));
-    return { ...paginate(items, Number(totalRow?.n ?? 0), q), sweep };
+    return {
+      ...paginate(items, Number(totalRow?.n ?? 0), q),
+      sweptBy:
+        "scheduler job learning.capture-triggers (system actor) — this read performs no writes",
+    };
   });
 
   app.post(
@@ -1206,9 +1288,42 @@ export const learningModule: FastifyPluginAsync = async (app) => {
   /* Company-wide register (#977, #992-993)                            */
   /* ---------------------------------------------------------------- */
 
-  app.get("/learning/lessons", { preHandler: companyRead }, async (req) => {
+  /** Lesson states that are a TENANT asset rather than one project's data. */
+  const COMPANY_WIDE_LESSON_STATES = ["published", "superseded"] as const;
+
+  /**
+   * Restrict the register to what the caller may actually see: published
+   * lessons (company-wide by design) plus unpublished ones belonging to a
+   * project they hold `learning` on. Owners, admins and tenant-wide assurance
+   * grants see everything.
+   */
+  function visibleLessons(req: FastifyRequest) {
+    const scope = companyScopeOf(req, "learning");
+    if (scope.all) return undefined;
+    const published = inArray(lessons.status, [...COMPANY_WIDE_LESSON_STATES]);
+    if (scope.projectIds.length === 0) return published;
+    return or(published, inArray(lessons.originProjectId, scope.projectIds));
+  }
+
+  /** The id-addressed form of the same rule: 404, not 403 — see scope.ts. */
+  function assertLessonVisible(req: FastifyRequest, lesson: LessonRow): void {
+    const scope = companyScopeOf(req, "learning");
+    if (scope.all) return;
+    if (COMPANY_WIDE_LESSON_STATES.includes(lesson.status as (typeof COMPANY_WIDE_LESSON_STATES)[number])) {
+      return;
+    }
+    if (lesson.originProjectId && scopeAllows(scope, lesson.originProjectId)) return;
+    throw notFound(
+      "Lesson not found. An unpublished lesson belongs to the project that raised it, and is " +
+        "readable only by people who hold learning on that project.",
+    );
+  }
+
+  app.get("/learning/lessons", { preHandler: companyScopedRead }, async (req) => {
     const q = registerQuery.parse(req.query);
     const clauses = [eq(lessons.companyId, req.companyId!)];
+    const visible = visibleLessons(req);
+    if (visible) clauses.push(visible);
     if (q.category) clauses.push(eq(lessons.category, q.category));
     if (q.status) clauses.push(eq(lessons.status, q.status));
     if (q.phase) clauses.push(eq(lessons.phase, q.phase));
@@ -1252,9 +1367,10 @@ export const learningModule: FastifyPluginAsync = async (app) => {
     );
   });
 
-  app.get("/learning/lessons/:lessonId", { preHandler: companyRead }, async (req) => {
+  app.get("/learning/lessons/:lessonId", { preHandler: companyScopedRead }, async (req) => {
     const { lessonId } = req.params as { lessonId: string };
     const lesson = await fetchLesson(lessonId, req.companyId!);
+    assertLessonVisible(req, lesson);
     const applications = await app.db
       .select()
       .from(lessonApplications)
@@ -1295,9 +1411,10 @@ export const learningModule: FastifyPluginAsync = async (app) => {
    * crossed a project boundary. A published lesson with no applications is
    * reported as exactly that — the register does not hide its own failures.
    */
-  app.get("/learning/lessons/:lessonId/impact", { preHandler: companyRead }, async (req) => {
+  app.get("/learning/lessons/:lessonId/impact", { preHandler: companyScopedRead }, async (req) => {
     const { lessonId } = req.params as { lessonId: string };
     const lesson = await fetchLesson(lessonId, req.companyId!);
+    assertLessonVisible(req, lesson);
     const rows = await app.db
       .select()
       .from(lessonApplications)
@@ -1425,7 +1542,7 @@ export const learningModule: FastifyPluginAsync = async (app) => {
    * with fifty open triggers older than ninety days does not have a learning
    * culture, whatever its lesson count says.
    */
-  app.get("/learning/summary", { preHandler: companyRead }, async (req) => {
+  app.get("/learning/summary", { preHandler: companyScopedRead }, async (req) => {
     const companyId = req.companyId!;
     const triggerRows = await app.db
       .select()
@@ -1826,4 +1943,507 @@ export const learningModule: FastifyPluginAsync = async (app) => {
       return reply.status(204).send();
     },
   );
+
+  /* ================================================================ */
+  /* APPLIED-LESSON OUTCOME MEASUREMENT (#984)                         */
+  /*                                                                   */
+  /* An application whose outcome nobody measured is `unknown`, and it  */
+  /* stays `unknown`. Counting it as a success is exactly how a lessons */
+  /* register comes to report impact it never had — and the measurement */
+  /* is a separate act, by a different person, carrying its own date.   */
+  /* ================================================================ */
+
+  const outcomeSchema = z.object({
+    outcome: z.enum(LESSON_OUTCOMES),
+    outcomeNote: z.string().max(5000).nullable().optional(),
+    /** money the application is claimed to have saved (or cost, if negative) */
+    outcomeValue: z.number().finite().nullable().optional(),
+    outcomeCurrency: z.string().min(3).max(8).nullable().optional(),
+    outcomeDays: z.number().int().min(-10_000).max(10_000).nullable().optional(),
+  });
+
+  app.post(
+    "/projects/:projectId/learning/applications/:applicationId/outcome",
+    { preHandler: projectStandard },
+    async (req) => {
+      const { applicationId } = req.params as { applicationId: string };
+      const body = outcomeSchema.parse(req.body);
+      const [row] = await app.db
+        .select()
+        .from(lessonApplications)
+        .where(
+          and(
+            eq(lessonApplications.id, applicationId),
+            eq(lessonApplications.companyId, req.companyId!),
+            eq(lessonApplications.projectId, req.projectId!),
+          ),
+        )
+        .limit(1);
+      if (!row) throw notFound("Lesson application not found on this project");
+      if (row.appliedBy === req.user!.id) {
+        throw forbidden(
+          "The person who applied the lesson may not also certify that it worked. A measured " +
+            "outcome is the second pair of eyes this whole module is built on — ask the person " +
+            "who felt the effect, or the project's reviewer.",
+        );
+      }
+      if (body.outcomeValue != null && !body.outcomeCurrency && !row.outcomeCurrency) {
+        throw badRequest(
+          "A money outcome needs its currency. A bare number would be summed against other " +
+            "currencies somewhere downstream, and this platform never does that.",
+        );
+      }
+      const now = new Date().toISOString();
+      await app.db
+        .update(lessonApplications)
+        .set({
+          outcome: body.outcome,
+          outcomeNote: body.outcomeNote ?? row.outcomeNote,
+          outcomeValue: body.outcomeValue ?? row.outcomeValue,
+          outcomeCurrency: body.outcomeCurrency ?? row.outcomeCurrency,
+          outcomeDays: body.outcomeDays ?? row.outcomeDays,
+          measuredAt: now,
+          measuredBy: req.user!.id,
+        })
+        .where(eq(lessonApplications.id, applicationId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "lesson_application",
+        objectId: applicationId,
+        payload: {
+          from: row.outcome,
+          to: body.outcome,
+          lessonId: row.lessonId,
+          appliedBy: row.appliedBy,
+          measuredBy: req.user!.id,
+          outcomeValue: body.outcomeValue ?? null,
+          outcomeCurrency: body.outcomeCurrency ?? row.outcomeCurrency,
+          outcomeDays: body.outcomeDays ?? null,
+        },
+        projectId: req.projectId!,
+        storePayload: true,
+      });
+      const [after] = await app.db
+        .select()
+        .from(lessonApplications)
+        .where(eq(lessonApplications.id, applicationId))
+        .limit(1);
+      return after ?? row;
+    },
+  );
+
+  /**
+   * OUTCOME REPORT for one lesson: what actually happened where it was
+   * applied, bucketed by currency and never summed across them, with the
+   * unmeasured share stated rather than assumed away.
+   */
+  app.get(
+    "/learning/lessons/:lessonId/outcomes",
+    { preHandler: companyScopedRead },
+    async (req) => {
+      const { lessonId } = req.params as { lessonId: string };
+      const lesson = await fetchLesson(lessonId, req.companyId!);
+      assertLessonVisible(req, lesson);
+      const rows = await app.db
+        .select()
+        .from(lessonApplications)
+        .where(
+          and(
+            eq(lessonApplications.companyId, req.companyId!),
+            eq(lessonApplications.lessonId, lessonId),
+          ),
+        )
+        .orderBy(desc(lessonApplications.appliedAt));
+      const byOutcome: Record<string, number> = {};
+      for (const o of LESSON_OUTCOMES) byOutcome[o] = 0;
+      const byCurrency = new Map<string, { value: number; applications: number }>();
+      let days = 0;
+      let daysMeasured = 0;
+      for (const r of rows) {
+        byOutcome[r.outcome] = (byOutcome[r.outcome] ?? 0) + 1;
+        if (r.outcomeValue != null && r.outcomeCurrency) {
+          const bucket = byCurrency.get(r.outcomeCurrency) ?? { value: 0, applications: 0 };
+          bucket.value += r.outcomeValue;
+          bucket.applications += 1;
+          byCurrency.set(r.outcomeCurrency, bucket);
+        }
+        if (r.outcomeDays != null) {
+          days += r.outcomeDays;
+          daysMeasured += 1;
+        }
+      }
+      const measured = rows.length - (byOutcome["unknown"] ?? 0);
+      const reasons: string[] = [];
+      if (rows.length === 0) {
+        reasons.push(
+          "This lesson has never been applied. That is a fact about the register, not a zero: " +
+            "no rate is computed.",
+        );
+      } else if (measured === 0) {
+        reasons.push(
+          `All ${rows.length} application(s) of this lesson are unmeasured. No effectiveness ` +
+            "rate is computed, because an unmeasured application is not a successful one.",
+        );
+      }
+      return {
+        lessonId,
+        number: lesson.number,
+        applications: rows.length,
+        measured,
+        unmeasured: byOutcome["unknown"] ?? 0,
+        byOutcome,
+        /* An effectiveness rate over the MEASURED applications only, with the
+           denominator stated so nobody mistakes it for a rate over all. */
+        effectiveness:
+          measured === 0
+            ? { value: null, denominator: 0, reasons }
+            : {
+                value:
+                  Math.round(
+                    (((byOutcome["avoided"] ?? 0) + 0.5 * (byOutcome["partially_avoided"] ?? 0)) /
+                      measured) *
+                      1000,
+                  ) / 1000,
+                denominator: measured,
+                reasons: [
+                  "Computed over measured applications only; a partially avoided outcome counts " +
+                    "as half.",
+                ],
+              },
+        valueByCurrency: [...byCurrency.entries()].map(([currency, v]) => ({
+          currency,
+          value: Math.round(v.value * 100) / 100,
+          applications: v.applications,
+        })),
+        daysAvoided: daysMeasured === 0 ? null : days,
+        daysMeasuredOn: daysMeasured,
+        reasons,
+        items: rows,
+      };
+    },
+  );
+
+  /* ================================================================ */
+  /* CROSS-PROJECT RELEVANCE PUSH (#985–986)                           */
+  /*                                                                   */
+  /* Retrieval that waits to be searched for is retrieval that does not */
+  /* happen. When a lesson is published, the projects it plausibly      */
+  /* applies to are computed from the deterministic ranker and the      */
+  /* lesson is PUSHED to their teams. The push is itself a record, so   */
+  /* "we told them" is checkable and the rate at which pushes become    */
+  /* applications is measurable.                                        */
+  /* ================================================================ */
+
+  /** The minimum ranker score worth interrupting a team for. */
+  const PUSH_SCORE_FLOOR = 20;
+
+  async function pushLessonToProjects(
+    companyId: string,
+    lesson: LessonRow,
+    actorId: string | null,
+    limit = 10,
+  ): Promise<{ pushed: number; considered: number; skipped: number; items: unknown[] }> {
+    if (lesson.status !== "published") return { pushed: 0, considered: 0, skipped: 0, items: [] };
+    const liveProjects = await app.db
+      .select({ id: projects.id, name: projects.name, stage: projects.stage })
+      .from(projects)
+      .where(and(eq(projects.companyId, companyId), isNull(projects.deletedAt)));
+    const counts = await applicationCounts(companyId);
+    const rankable = toRankable(lesson, counts);
+    const now = new Date().toISOString();
+    const existing = await app.db
+      .select({ projectId: lessonPushes.projectId })
+      .from(lessonPushes)
+      .where(eq(lessonPushes.lessonId, lesson.id));
+    const already = new Set(existing.map((e) => e.projectId));
+
+    const scored = liveProjects
+      .filter((p) => p.id !== lesson.originProjectId && !already.has(p.id))
+      .map((p) => {
+        const ranked = rankLessons([rankable], {
+          tool: null,
+          category: lesson.category,
+          phase: p.stage ?? null,
+          tags: lesson.tags,
+          now,
+        })[0];
+        return { project: p, score: ranked?.score ?? 0, reasons: ranked?.reasons ?? [] };
+      })
+      .filter((r) => r.score >= PUSH_SCORE_FLOOR)
+      .sort((a, b) => b.score - a.score || a.project.id.localeCompare(b.project.id))
+      .slice(0, limit);
+
+    const items: unknown[] = [];
+    let pushed = 0;
+    for (const candidate of scored) {
+      const members = await app.db
+        .select({ userId: projectMemberships.userId })
+        .from(projectMemberships)
+        .where(eq(projectMemberships.projectId, candidate.project.id));
+      const userIds = [...new Set(members.map((m) => m.userId))];
+      const id = newId("lpu");
+      const inserted = await app.db
+        .insert(lessonPushes)
+        .values({
+          id,
+          companyId,
+          lessonId: lesson.id,
+          projectId: candidate.project.id,
+          score: candidate.score,
+          reasons: candidate.reasons as unknown[],
+          status: "pushed",
+          notifiedUserIds: userIds,
+        })
+        .onConflictDoNothing()
+        .returning({ id: lessonPushes.id });
+      if (!inserted[0]) continue;
+      pushed += 1;
+      items.push({
+        pushId: id,
+        projectId: candidate.project.id,
+        projectName: candidate.project.name,
+        score: candidate.score,
+        reasons: candidate.reasons,
+        notified: userIds.length,
+      });
+      await pushNotifications(
+        app.db,
+        userIds.map((userId) => ({
+          companyId,
+          userId,
+          projectId: candidate.project.id,
+          kind: "system" as const,
+          title: `Lesson ${lesson.number} may apply here: ${lesson.title}`,
+          body: lesson.recommendation.slice(0, 400),
+          recordType: "lesson",
+          recordId: lesson.id,
+        })),
+      );
+      await appendLedger(app.db, {
+        companyId,
+        actorId,
+        action: "create",
+        objectType: "lesson_push",
+        objectId: id,
+        payload: {
+          lessonId: lesson.id,
+          lessonNumber: lesson.number,
+          projectId: candidate.project.id,
+          score: candidate.score,
+          notified: userIds.length,
+        },
+        projectId: candidate.project.id,
+        storePayload: true,
+      });
+    }
+    return {
+      pushed,
+      considered: liveProjects.length,
+      skipped: liveProjects.length - scored.length,
+      items,
+    };
+  }
+
+  app.post("/learning/lessons/:lessonId/push", { preHandler: companyWrite }, async (req) => {
+    const { lessonId } = req.params as { lessonId: string };
+    const body = z
+      .object({ limit: z.number().int().min(1).max(50).default(10) })
+      .parse(req.body ?? {});
+    const lesson = await fetchLesson(lessonId, req.companyId!);
+    if (lesson.status !== "published") {
+      throw conflict(
+        `Only a published lesson can be pushed (this one is ${lesson.status}). Pushing an ` +
+          "unvalidated account of what went wrong to other teams is how a rumour becomes policy.",
+      );
+    }
+    const result = await pushLessonToProjects(req.companyId!, lesson, req.user!.id, body.limit);
+    return {
+      ...result,
+      floor: PUSH_SCORE_FLOOR,
+      note:
+        "Projects already pushed to are never pushed to twice — the record, not a timestamp, is " +
+        "what makes that true.",
+    };
+  });
+
+  app.get("/projects/:projectId/learning/pushes", { preHandler: projectRead }, async (req) => {
+    const q = pageQuerySchema
+      .extend({ status: z.enum(LESSON_PUSH_STATUSES).optional() })
+      .parse(req.query);
+    const where = and(
+      eq(lessonPushes.companyId, req.companyId!),
+      eq(lessonPushes.projectId, req.projectId!),
+      q.status ? eq(lessonPushes.status, q.status) : undefined,
+    );
+    const [totalRow] = await app.db.select({ n: count() }).from(lessonPushes).where(where);
+    const rows = await app.db
+      .select()
+      .from(lessonPushes)
+      .where(where)
+      .orderBy(desc(lessonPushes.score), desc(lessonPushes.pushedAt))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    const lessonIds = [...new Set(rows.map((r) => r.lessonId))];
+    const lessonRows = lessonIds.length
+      ? await app.db
+          .select()
+          .from(lessons)
+          .where(and(eq(lessons.companyId, req.companyId!), inArray(lessons.id, lessonIds)))
+      : [];
+    const byId = new Map(lessonRows.map((l) => [l.id, l]));
+    return paginate(
+      rows.map((r) => {
+        const l = byId.get(r.lessonId);
+        return {
+          ...r,
+          lesson: l
+            ? {
+                id: l.id,
+                number: l.number,
+                title: l.title,
+                category: l.category,
+                recommendation: l.recommendation,
+                impactValue: l.impactValue,
+                impactCurrency: l.impactCurrency,
+              }
+            : null,
+        };
+      }),
+      Number(totalRow?.n ?? 0),
+      q,
+    );
+  });
+
+  app.post(
+    "/projects/:projectId/learning/pushes/:pushId/respond",
+    { preHandler: projectStandard },
+    async (req) => {
+      const { pushId } = req.params as { pushId: string };
+      const body = z
+        .object({
+          status: z.enum(["acknowledged", "dismissed", "applied"]),
+          reason: z.string().max(2000).nullable().optional(),
+          applicationId: z.string().max(64).nullable().optional(),
+        })
+        .parse(req.body);
+      const [row] = await app.db
+        .select()
+        .from(lessonPushes)
+        .where(
+          and(
+            eq(lessonPushes.id, pushId),
+            eq(lessonPushes.companyId, req.companyId!),
+            eq(lessonPushes.projectId, req.projectId!),
+          ),
+        )
+        .limit(1);
+      if (!row) throw notFound("Lesson push not found on this project");
+      if (body.status === "dismissed" && !body.reason) {
+        throw badRequest(
+          "A dismissal without a reason is an unrecorded decision. Say why the lesson does not " +
+            "apply here — that answer is itself worth keeping.",
+        );
+      }
+      if (body.status === "applied" && !body.applicationId) {
+        throw badRequest(
+          "Mark a push applied by naming the lesson application it produced, so the claim is " +
+            "backed by a record rather than a checkbox.",
+        );
+      }
+      if (body.applicationId) {
+        const [app_] = await app.db
+          .select({ id: lessonApplications.id })
+          .from(lessonApplications)
+          .where(
+            and(
+              eq(lessonApplications.id, body.applicationId),
+              eq(lessonApplications.companyId, req.companyId!),
+              eq(lessonApplications.lessonId, row.lessonId),
+            ),
+          )
+          .limit(1);
+        if (!app_) throw badRequest("applicationId is not an application of this lesson");
+      }
+      const now = new Date().toISOString();
+      await app.db
+        .update(lessonPushes)
+        .set({
+          status: body.status,
+          acknowledgedBy: req.user!.id,
+          acknowledgedAt: now,
+          dismissedReason: body.status === "dismissed" ? (body.reason ?? null) : row.dismissedReason,
+          applicationId: body.applicationId ?? row.applicationId,
+        })
+        .where(eq(lessonPushes.id, pushId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "lesson_push",
+        objectId: pushId,
+        payload: { from: row.status, to: body.status, reason: body.reason ?? null },
+        projectId: req.projectId!,
+        storePayload: true,
+      });
+      const [after] = await app.db
+        .select()
+        .from(lessonPushes)
+        .where(eq(lessonPushes.id, pushId))
+        .limit(1);
+      return after ?? row;
+    },
+  );
+
+  /* ================================================================ */
+  /* SCHEDULED JOBS                                                    */
+  /* ================================================================ */
+
+  app.scheduler.register({
+    name: "learning.capture-triggers",
+    description:
+      "Scan every live project for events that make lesson capture mandatory (disputes, claims, delay events, threshold variations, confirmed signals, gate reviews, closeout) and raise the trigger and its obligation — the sweep that used to run only when somebody opened the Triggers tab, under whichever reader's name",
+    everyMs: 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db }) =>
+      forEachCompany(db, async (companyId) => {
+        const live = await db
+          .select({ id: projects.id })
+          .from(projects)
+          .where(and(eq(projects.companyId, companyId), isNull(projects.deletedAt)));
+        let created = 0;
+        let scanned = 0;
+        for (const project of live) {
+          const result = await sweepProjectTriggers(companyId, project.id, null);
+          created += result.created;
+          scanned += result.scanned;
+        }
+        return { projects: live.length, scanned, created };
+      }),
+  });
+
+  app.scheduler.register({
+    name: "learning.relevance-push",
+    description:
+      "Push newly published lessons to the projects the deterministic ranker says they apply to, so retrieval does not wait to be searched for",
+    everyMs: 6 * 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db }) =>
+      forEachCompany(db, async (companyId) => {
+        const published = await db
+          .select()
+          .from(lessons)
+          .where(and(eq(lessons.companyId, companyId), eq(lessons.status, "published")))
+          .orderBy(desc(lessons.publishedAt))
+          .limit(50);
+        let pushed = 0;
+        for (const lesson of published) {
+          const result = await pushLessonToProjects(companyId, lesson, null, 10);
+          pushed += result.pushed;
+        }
+        return { lessons: published.length, pushed };
+      }),
+  });
+
 };

@@ -1,5 +1,5 @@
 {
-  "id": "13552498-a176-49a4-bfd3-08ea17eda27b",
+  "id": "566b5b10-9ca3-454d-b443-425fab720ad9",
   "prevId": "340cf323-a4ed-4b81-8d6c-8f3e94b698e3",
   "version": "7",
   "dialect": "postgresql",
@@ -22414,6 +22414,18 @@
           "primaryKey": false,
           "notNull": false
         },
+        "notice_obligation_id": {
+          "name": "notice_obligation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "notice_alerted_at": {
+          "name": "notice_alerted_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
         "evidence_ids": {
           "name": "evidence_ids",
           "type": "jsonb",
@@ -22532,6 +22544,27 @@
             },
             {
               "expression": "start_date",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "delay_events_notice_idx": {
+          "name": "delay_events_notice_idx",
+          "columns": [
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "notice_due_date",
               "isExpression": false,
               "asc": true,
               "nulls": "last"

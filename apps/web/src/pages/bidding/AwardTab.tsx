@@ -383,19 +383,24 @@ function AwardCard({
               ? "This was the lowest comparable bid."
               : "This was NOT the lowest comparable bid."}
           </p>
+          {award.audit.comparableAmountsNote ? (
+            <p className="mt-1 text-2xs leading-snug text-content-subtle">
+              {award.audit.comparableAmountsNote}
+            </p>
+          ) : null}
           <dl className="mt-1.5 grid gap-x-6 gap-y-1 text-meta sm:grid-cols-2">
+            {/*
+              THREE DIFFERENT NUMBERS, LABELLED AS THREE DIFFERENT NUMBERS.
+              The contract sum is as-bid; the comparison — and therefore
+              "lowest" — is on the levelled figure wherever the package was
+              levelled. Showing the first next to the third as though they
+              were the same kind of thing made a levelled-lowest award look
+              like an award above the lowest bid.
+            */}
             <div className="flex justify-between gap-3">
-              <dt className="text-content-subtle">Recommended amount</dt>
+              <dt className="text-content-subtle">Contract sum (as bid)</dt>
               <dd className="font-medium tabular-nums">
                 {money(award.awardAmount, award.currency)}
-              </dd>
-            </div>
-            <div className="flex justify-between gap-3">
-              <dt className="text-content-subtle">Lowest bid amount</dt>
-              <dd className="font-medium tabular-nums">
-                {award.audit.lowestBidAmount === null
-                  ? "not recorded"
-                  : money(award.audit.lowestBidAmount, award.currency)}
               </dd>
             </div>
             <div className="flex justify-between gap-3">
@@ -407,7 +412,24 @@ function AwardCard({
               </dd>
             </div>
             <div className="flex justify-between gap-3">
-              <dt className="text-content-subtle">Against the estimate</dt>
+              <dt className="text-content-subtle">Recommended, compared</dt>
+              <dd className="font-medium tabular-nums">
+                {award.audit.recommendedComparableAmount === null ||
+                award.audit.recommendedComparableAmount === undefined
+                  ? "not recorded"
+                  : money(award.audit.recommendedComparableAmount, award.currency)}
+              </dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-content-subtle">Lowest, compared</dt>
+              <dd className="font-medium tabular-nums">
+                {award.audit.lowestBidAmount === null
+                  ? "not recorded"
+                  : money(award.audit.lowestBidAmount, award.currency)}
+              </dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-content-subtle">Estimate less contract sum</dt>
               <dd className="font-medium tabular-nums">
                 {award.audit.savingAgainstEstimate === null
                   ? "no estimate on record"

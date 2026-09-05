@@ -112,6 +112,73 @@ export function portalTokenExpiry(
   return new Date(Math.max(from, now.getTime()) + tailDays * 86_400_000).toISOString();
 }
 
+/**
+ * RESOLVE A BIDDER FROM A TOKEN, AND NOTHING ELSE.
+ *
+ * `Authorization: Bearer bpt_…` verified by sha256 against the invitation —
+ * no JWT, no session, no company membership. Lifted out of the invitations
+ * plugin so every portal route in this module resolves the bidder through
+ * ONE function: a portal that authenticates in two places authenticates
+ * differently in two places, and the second one is where the expiry check
+ * gets forgotten.
+ *
+ * The four refusals, in order: not a portal token; not a live token; the
+ * invitation is finished; the token has expired; the tender is over.
+ */
+export async function resolvePortalSession(
+  db: Db,
+  rawHeader: string | undefined,
+): Promise<{ invitation: BidInvitationRow; pkg: BidPackageRow }> {
+  if (!rawHeader?.startsWith("Bearer ")) throw unauthorized("Missing bidder portal token");
+  const raw = rawHeader.slice(7).trim();
+  if (!raw.startsWith(PORTAL_TOKEN_PREFIX)) throw unauthorized("Not a bidder portal token");
+  const rows = await db
+    .select()
+    .from(bidInvitations)
+    .where(eq(bidInvitations.portalTokenHash, sha256Hex(raw)))
+    .limit(1);
+  const invitation = rows[0];
+  if (!invitation) throw unauthorized("Invalid or revoked bidder portal token");
+  if (invitation.status === "disqualified" || invitation.status === "withdrawn") {
+    throw unauthorized(`This invitation is ${invitation.status}.`);
+  }
+  if (invitation.portalTokenExpiresAt && Date.parse(invitation.portalTokenExpiresAt) < Date.now()) {
+    throw unauthorized(
+      `This bidder portal link expired on ${invitation.portalTokenExpiresAt}. A tender access ` +
+        "credential that never expires is a credential that outlives the tender; ask the " +
+        "buyer for a new one if the package is still live.",
+    );
+  }
+  const pkg = await fetchPackage(db, invitation.packageId, invitation.companyId);
+  if (pkg.status === "awarded" || pkg.status === "cancelled") {
+    throw unauthorized(
+      `${pkg.reference} is ${pkg.status}; the bidder portal for it is closed. The award and ` +
+        "the debrief are communicated directly, not through a tender portal that is still " +
+        "accepting responses.",
+    );
+  }
+  return { invitation, pkg };
+}
+
+/** Ledger an action a BIDDER took, with the pathway instead of an actor. */
+export async function ledgerPortalAction(
+  db: Db,
+  invitation: BidInvitationRow,
+  action: "access" | "create" | "update" | "state_change",
+  payload: Record<string, unknown>,
+): Promise<void> {
+  await appendLedger(db, {
+    companyId: invitation.companyId,
+    actorId: null,
+    action,
+    objectType: "bid_invitation",
+    objectId: invitation.id,
+    payload: { via: "portal_token", vendorId: invitation.vendorId, ...payload },
+    projectId: invitation.projectId,
+    storePayload: true,
+  });
+}
+
 /** Invitations never leave this module carrying the token hash. */
 export function viewInvitation(row: BidInvitationRow) {
   const { portalTokenHash, ...rest } = row;
@@ -714,58 +781,14 @@ export const invitationRoutes: FastifyPluginAsync = async (app) => {
    * Never the engineer's estimate, never another bidder's name, never a
    * price. A portal that leaks the estimate has priced the job for them.
    */
-  async function portalSession(rawHeader: string | undefined) {
-    if (!rawHeader?.startsWith("Bearer ")) throw unauthorized("Missing bidder portal token");
-    const raw = rawHeader.slice(7).trim();
-    if (!raw.startsWith(PORTAL_TOKEN_PREFIX)) throw unauthorized("Not a bidder portal token");
-    const rows = await app.db
-      .select()
-      .from(bidInvitations)
-      .where(eq(bidInvitations.portalTokenHash, sha256Hex(raw)))
-      .limit(1);
-    const invitation = rows[0];
-    if (!invitation) throw unauthorized("Invalid or revoked bidder portal token");
-    if (invitation.status === "disqualified" || invitation.status === "withdrawn") {
-      throw unauthorized(`This invitation is ${invitation.status}.`);
-    }
-    if (
-      invitation.portalTokenExpiresAt &&
-      Date.parse(invitation.portalTokenExpiresAt) < Date.now()
-    ) {
-      throw unauthorized(
-        `This bidder portal link expired on ${invitation.portalTokenExpiresAt}. A tender access ` +
-          "credential that never expires is a credential that outlives the tender; ask the " +
-          "buyer for a new one if the package is still live.",
-      );
-    }
-    const pkg = await fetchPackage(app.db, invitation.packageId, invitation.companyId);
-    if (pkg.status === "awarded" || pkg.status === "cancelled") {
-      throw unauthorized(
-        `${pkg.reference} is ${pkg.status}; the bidder portal for it is closed. The award and ` +
-          "the debrief are communicated directly, not through a tender portal that is still " +
-          "accepting responses.",
-      );
-    }
-    return { invitation, pkg };
-  }
+  const portalSession = (rawHeader: string | undefined) =>
+    resolvePortalSession(app.db, rawHeader);
 
-  /** Ledger an action a BIDDER took, with the pathway instead of an actor. */
-  async function ledgerPortal(
+  const ledgerPortal = (
     invitation: BidInvitationRow,
     action: "access" | "update" | "state_change",
     payload: Record<string, unknown>,
-  ): Promise<void> {
-    await appendLedger(app.db, {
-      companyId: invitation.companyId,
-      actorId: null,
-      action,
-      objectType: "bid_invitation",
-      objectId: invitation.id,
-      payload: { via: "portal_token", vendorId: invitation.vendorId, ...payload },
-      projectId: invitation.projectId,
-      storePayload: true,
-    });
-  }
+  ) => ledgerPortalAction(app.db, invitation, action, payload);
 
   function bidderView(invitation: BidInvitationRow, pkg: BidPackageRow) {
     const acknowledged = new Set(

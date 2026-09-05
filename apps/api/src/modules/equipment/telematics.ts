@@ -271,7 +271,7 @@ export function coerceTelematicsRow(
  *  index on the table, so a replayed push collides rather than doubling —
  *  this function exists so the in-batch dedupe uses the identical key. */
 export function telematicsKey(providerKey: string, deviceId: string, recordedAt: string): string {
-  return `${providerKey} ${deviceId} ${new Date(recordedAt).toISOString()}`;
+  return `${providerKey}\u0000${deviceId}\u0000${new Date(recordedAt).toISOString()}`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -736,6 +736,78 @@ export function engineHoursForDay(input: {
     samples: inside.length + 1,
     reasons: [],
   };
+}
+
+/**
+ * How far back the series will look for a carry-in reading before the first
+ * day of the window. Beyond this the opening is treated as unknown and the
+ * day falls back to within-day last-minus-first, saying so.
+ */
+export const CARRY_IN_LOOKBACK_DAYS = 7;
+
+/** A reading's LOCAL date, given the site's offset from UTC in minutes. */
+export function localDateOf(timestamp: string, tzOffsetMinutes = 0): IsoDate {
+  return new Date(Date.parse(timestamp) + tzOffsetMinutes * 60_000)
+    .toISOString()
+    .slice(0, 10);
+}
+
+/** The UTC instant at which a LOCAL date begins, in milliseconds. */
+export function localDayStartMs(date: IsoDate, tzOffsetMinutes = 0): number {
+  return Date.parse(`${date}T00:00:00.000Z`) - tzOffsetMinutes * 60_000;
+}
+
+export interface DayHours {
+  date: IsoDate;
+  delta: CounterDelta;
+}
+
+/**
+ * A window of days, each costed by `engineHoursForDay`, with every day's
+ * opening reading taken from the feed BEFORE that day began — which for the
+ * second day onwards is the previous day's final reading.
+ *
+ * This is the difference between a reconciliation that can be trusted and
+ * one that cannot. Grouping readings by calendar day and taking last-minus-
+ * first inside each group loses every hour the machine ran between the last
+ * reading of one day and the first of the next, yields NULL for any device
+ * that reports once a day, and credits nine hours of an eleven-hour day to a
+ * device that reports at 08:00 and 17:00. Each of those under-counts, and an
+ * under-count here is a "the plant sheet claims hours the machine did not
+ * work" finding raised against an honest foreman.
+ *
+ * `tzOffsetMinutes` is the site's offset from UTC (+480 for UTC+8). A night
+ * shift on a site east of UTC otherwise straddles two UTC days and neither
+ * of them matches the plant sheet.
+ */
+export function engineHoursSeries(input: {
+  /** the days to report on; any order, deduplicated here */
+  dates: IsoDate[];
+  /** every reading available for the machine, including before the window */
+  readings: CounterReading[];
+  tzOffsetMinutes?: number;
+}): DayHours[] {
+  const tz = input.tzOffsetMinutes ?? 0;
+  const sorted = input.readings
+    .filter((r) => r.engineHours !== null)
+    .slice()
+    .sort((a, b) => Date.parse(a.recordedAt) - Date.parse(b.recordedAt));
+  const dates = [...new Set(input.dates)].sort();
+  const out: DayHours[] = [];
+  for (const date of dates) {
+    const startMs = localDayStartMs(date, tz);
+    const endMs = startMs + 86_400_000;
+    let opening: CounterReading | null = null;
+    const dayReadings: CounterReading[] = [];
+    for (const r of sorted) {
+      const t = Date.parse(r.recordedAt);
+      if (t < startMs) opening = r;
+      else if (t < endMs) dayReadings.push(r);
+      else break;
+    }
+    out.push({ date, delta: engineHoursForDay({ openingReading: opening, dayReadings }) });
+  }
+  return out;
 }
 
 /* ----------------------------- geofence --------------------------- */

@@ -315,7 +315,15 @@ export const bidSubmissions = pgTable(
      */
     supersededById: text("superseded_by_id"),
     detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
-    createdBy: text("created_by").notNull(),
+    /**
+     * The platform user who recorded the bid — NULL where the bidder
+     * submitted it themselves through the portal, because a bidder is not a
+     * user of this platform and inventing an actor for them would put a name
+     * on the ledger that never touched the record. The pathway is on the
+     * ledger entry instead (`via: "portal_token"`), and `detail.via` says the
+     * same thing on the row.
+     */
+    createdBy: text("created_by"),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
@@ -696,6 +704,36 @@ export const prequalificationSubmissions = pgTable(
     suspendedAt: timestamp("suspended_at", { withTimezone: true, mode: "string" }),
     suspendedReason: text("suspended_reason"),
     supersedesId: text("supersedes_id"),
+    /*
+     * TIER AND RISK RATING — derived, never typed in.
+     *
+     * A tier is what a buyer actually uses: "this vendor may be considered
+     * for packages up to tier B". It is computed on decide from the score
+     * band, the financial limit and the SAFETY RECORD, and the safety record
+     * is a hard ceiling rather than one input among several — a contractor
+     * with a fatality or an EMR above 1.2 cannot be a tier A supplier
+     * whatever their balance sheet says. `tierBasis` and `riskBasis` carry
+     * the sentence, because a letter with no reasoning is a number somebody
+     * will argue with.
+     */
+    tier: text("tier"), // PrequalTier
+    tierBasis: text("tier_basis"),
+    riskRating: text("risk_rating"), // PrequalRiskRating
+    riskBasis: text("risk_basis"),
+    /*
+     * VENDOR SELF-SERVICE. sha256 of a `pq_` token, exactly as the bidder
+     * portal stores its own: the plaintext is shown once and never again, and
+     * the token dies with the assessment it was minted for.
+     */
+    portalTokenHash: text("portal_token_hash"),
+    portalTokenExpiresAt: timestamp("portal_token_expires_at", {
+      withTimezone: true,
+      mode: "string",
+    }),
+    portalLastAccessAt: timestamp("portal_last_access_at", {
+      withTimezone: true,
+      mode: "string",
+    }),
     attachmentFileIds: jsonb("attachment_file_ids").$type<string[]>().default([]).notNull(),
     detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
     createdBy: text("created_by").notNull(),
@@ -704,6 +742,7 @@ export const prequalificationSubmissions = pgTable(
   },
   (t) => [
     uniqueIndex("prequalification_submissions_uq").on(t.companyId, t.number),
+    uniqueIndex("prequalification_submissions_portal_token_uq").on(t.portalTokenHash),
     index("prequalification_submissions_vendor_idx").on(t.vendorId, t.status),
     index("prequalification_submissions_questionnaire_idx").on(t.questionnaireId),
     index("prequalification_submissions_expiry_idx").on(t.companyId, t.expiresAt),
@@ -1215,5 +1254,137 @@ export const awardDelegations = pgTable(
   (t) => [
     index("award_delegations_company_idx").on(t.companyId, t.isActive),
     index("award_delegations_subject_idx").on(t.companyId, t.subjectKind, t.subjectId),
+  ],
+);
+
+/* ==================================================================== */
+/* THE THINGS A PREQUALIFICATION ACTUALLY TURNS ON                       */
+/* ==================================================================== */
+
+/**
+ * A prequalification questionnaire is free text with a score on it. These
+ * three registers are the parts that decide the answer, held as TYPED rows
+ * rather than as sentences in a response:
+ *
+ *   safety records   an EMR, a TRIR and a fatality count are numbers that
+ *                    compare across vendors and across years. Buried in a
+ *                    free-text answer they compare with nothing, and the
+ *                    tiering rule ("a fatality caps this vendor at tier C")
+ *                    cannot be applied at all.
+ *   licences         a licence has a jurisdiction and an EXPIRY. A licence
+ *                    that expired last month is the single most common
+ *                    prequalification finding and it is invisible in prose.
+ *   references       a reference is a client, a project, a value and a
+ *                    person who was actually asked. `checkedBy` is the
+ *                    column that separates "we took up references" from "we
+ *                    have a list of names the vendor gave us".
+ *
+ * All three are per VENDOR (company-level, like the rest of
+ * prequalification) and optionally bound to the submission they arrived
+ * with, so the register survives the assessment that collected it.
+ */
+export const prequalificationSafetyRecords = pgTable(
+  "prequalification_safety_records",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    vendorId: text("vendor_id").notNull(),
+    submissionId: text("submission_id"),
+    /** the reporting year these figures describe */
+    year: integer("year").notNull(),
+    /** experience modification rate — >1.0 is worse than the industry average */
+    emr: doublePrecision("emr"),
+    /** total recordable incident rate, per 200k hours */
+    trir: doublePrecision("trir"),
+    /** days away, restricted or transferred */
+    dart: doublePrecision("dart"),
+    fatalities: integer("fatalities"),
+    lostTimeInjuries: integer("lost_time_injuries"),
+    recordableIncidents: integer("recordable_incidents"),
+    hoursWorked: doublePrecision("hours_worked"),
+    /** [{ agency, date, description, penalty, currency, status }] */
+    citations: jsonb("citations").$type<unknown[]>().default([]).notNull(),
+    /** self_declared | audited | regulator — provenance changes what it is worth */
+    source: text("source").default("self_declared").notNull(),
+    fileIds: jsonb("file_ids").$type<string[]>().default([]).notNull(),
+    verifiedBy: text("verified_by"),
+    verifiedAt: timestamp("verified_at", { withTimezone: true, mode: "string" }),
+    note: text("note"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by"),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("prequal_safety_uq").on(t.companyId, t.vendorId, t.year, t.source),
+    index("prequal_safety_vendor_idx").on(t.companyId, t.vendorId, t.year),
+    index("prequal_safety_submission_idx").on(t.submissionId),
+  ],
+);
+
+export const prequalificationLicences = pgTable(
+  "prequalification_licences",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    vendorId: text("vendor_id").notNull(),
+    submissionId: text("submission_id"),
+    /** trade licence, gas safe, asbestos, electrical contractor, … */
+    kind: text("kind").notNull(),
+    jurisdiction: text("jurisdiction"),
+    number: text("number"),
+    issuedBy: text("issued_by"),
+    issuedAt: text("issued_at"),
+    /** the column the whole register exists for */
+    expiresAt: text("expires_at"),
+    status: text("status").default("claimed").notNull(), // PrequalLicenceStatus
+    fileIds: jsonb("file_ids").$type<string[]>().default([]).notNull(),
+    verifiedBy: text("verified_by"),
+    verifiedAt: timestamp("verified_at", { withTimezone: true, mode: "string" }),
+    note: text("note"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by"),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("prequal_licences_vendor_idx").on(t.companyId, t.vendorId, t.status),
+    index("prequal_licences_expiry_idx").on(t.companyId, t.expiresAt),
+    index("prequal_licences_submission_idx").on(t.submissionId),
+  ],
+);
+
+export const prequalificationReferences = pgTable(
+  "prequalification_references",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    vendorId: text("vendor_id").notNull(),
+    submissionId: text("submission_id"),
+    clientName: text("client_name").notNull(),
+    projectName: text("project_name"),
+    contractValue: doublePrecision("contract_value"),
+    currency: text("currency").default("USD").notNull(),
+    completedAt: text("completed_at"),
+    contactName: text("contact_name"),
+    contactEmail: text("contact_email"),
+    contactPhone: text("contact_phone"),
+    /** delivered | delivered_late | terminated | disputed | unknown */
+    outcome: text("outcome").default("unknown").notNull(),
+    /** 0..5, and null until somebody actually asked */
+    rating: doublePrecision("rating"),
+    wouldUseAgain: integer("would_use_again"),
+    /** the column that separates a checked reference from a list of names */
+    checkedBy: text("checked_by"),
+    checkedAt: timestamp("checked_at", { withTimezone: true, mode: "string" }),
+    checkNote: text("check_note"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by"),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("prequal_references_vendor_idx").on(t.companyId, t.vendorId),
+    index("prequal_references_submission_idx").on(t.submissionId),
   ],
 );

@@ -1878,9 +1878,26 @@ export const scheduleModule: FastifyPluginAsync = async (app) => {
         agg.actualCost += r.actualCost;
         byType.set(r.resourceType, agg);
       }
+      /* Money needs a currency: the project's active budget decides it, and
+       * when there is none the panel is told so rather than being handed a
+       * silent default. */
+      const [activeBudget] = await app.db
+        .select({ currency: budgets.currency })
+        .from(budgets)
+        .where(and(eq(budgets.projectId, req.projectId!), eq(budgets.status, "active")))
+        .limit(1);
+      const reasons: string[] = [];
+      if (!activeBudget) {
+        reasons.push("No active budget was found — costs are reported in USD by default");
+      }
+      if (rows.length > 0 && rows.every((r) => r.unitRate === null && r.budgetedCost === 0)) {
+        reasons.push("No assignment carries a rate, so cost is not available for this programme");
+      }
       return {
         items: rows,
         total: rows.length,
+        currency: activeBudget?.currency ?? "USD",
+        reasons,
         byType: [...byType.entries()].map(([resourceType, agg]) => ({ resourceType, ...agg })),
       };
     },

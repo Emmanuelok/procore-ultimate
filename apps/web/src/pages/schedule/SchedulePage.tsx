@@ -38,12 +38,15 @@ import { formatDate, formatDateTime, humanize } from "../format";
 import GanttSvg from "./GanttSvg";
 import QualityPanel from "./QualityPanel";
 import {
+  CalendarViewPanel,
   CalendarsPanel,
   ConstraintsPanel,
   EarnedValuePanel,
   ImportPanel,
   MilestonesPanel,
   NarrativesPanel,
+  ResourcesPanel,
+  RevisionsPanel,
 } from "./ProgrammePanels";
 import {
   shortDate,
@@ -66,9 +69,12 @@ const DATED_CONSTRAINTS = ["start_no_earlier_than", "finish_no_later_than", "mus
 
 type Panel =
   | "compare"
+  | "revisions"
   | "lookahead"
+  | "calendar"
   | "health"
   | "earned-value"
+  | "resources"
   | "milestones"
   | "constraints"
   | "calendars"
@@ -878,9 +884,12 @@ export default function SchedulePage() {
 
   const panels: { key: Panel; label: string }[] = [
     { key: "compare", label: "Baseline compare" },
+    { key: "revisions", label: "Revisions" },
     { key: "lookahead", label: "Lookahead" },
+    { key: "calendar", label: "Calendar" },
     { key: "health", label: "Schedule health" },
     { key: "earned-value", label: "Earned value" },
+    { key: "resources", label: "Resources" },
     { key: "milestones", label: "Milestones" },
     { key: "constraints", label: "Constraints" },
     { key: "calendars", label: "Calendars" },
@@ -1539,8 +1548,21 @@ export default function SchedulePage() {
                 />
               ) : null}
 
+              {panel === "revisions" ? (
+                <RevisionsPanel base={base} schedules={schedules ?? []} scheduleId={selectedId} />
+              ) : null}
+              {panel === "calendar" ? (
+                <CalendarViewPanel base={base} scheduleId={selectedId} />
+              ) : null}
               {panel === "earned-value" ? (
                 <EarnedValuePanel base={base} scheduleId={selectedId} />
+              ) : null}
+              {panel === "resources" ? (
+                <ResourcesPanel
+                  base={base}
+                  scheduleId={selectedId}
+                  tasks={tasks.map((t) => ({ id: t.id, name: t.name }))}
+                />
               ) : null}
               {panel === "milestones" ? (
                 <MilestonesPanel

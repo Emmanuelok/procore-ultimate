@@ -6920,6 +6920,8 @@ ALTER TABLE "delay_events" ADD COLUMN "party" text DEFAULT 'neither' NOT NULL;--
 ALTER TABLE "delay_events" ADD COLUMN "pacing_of_event_id" text;--> statement-breakpoint
 ALTER TABLE "delay_events" ADD COLUMN "notice_due_date" text;--> statement-breakpoint
 ALTER TABLE "delay_events" ADD COLUMN "status_reason" text;--> statement-breakpoint
+ALTER TABLE "delay_events" ADD COLUMN "notice_obligation_id" text;--> statement-breakpoint
+ALTER TABLE "delay_events" ADD COLUMN "notice_alerted_at" timestamp with time zone;--> statement-breakpoint
 ALTER TABLE "forensic_claims" ADD COLUMN "currency" text DEFAULT 'USD' NOT NULL;--> statement-breakpoint
 ALTER TABLE "forensic_claims" ADD COLUMN "quantum_best" double precision;--> statement-breakpoint
 ALTER TABLE "forensic_claims" ADD COLUMN "quantum_likely" double precision;--> statement-breakpoint
@@ -7922,6 +7924,7 @@ CREATE INDEX "schedules_parent_idx" ON "schedules" USING btree ("parent_schedule
 CREATE INDEX "delay_events_status_idx" ON "delay_events" USING btree ("project_id","status");--> statement-breakpoint
 CREATE INDEX "delay_events_schedule_idx" ON "delay_events" USING btree ("schedule_id");--> statement-breakpoint
 CREATE INDEX "delay_events_start_idx" ON "delay_events" USING btree ("project_id","start_date");--> statement-breakpoint
+CREATE INDEX "delay_events_notice_idx" ON "delay_events" USING btree ("status","notice_due_date");--> statement-breakpoint
 CREATE INDEX "forensic_claims_status_idx" ON "forensic_claims" USING btree ("company_id","status");--> statement-breakpoint
 CREATE UNIQUE INDEX "payroll_entries_uq" ON "payroll_entries" USING btree ("worker_id","period_start","period_end","source_ref");--> statement-breakpoint
 CREATE INDEX "report_schedules_due_idx" ON "report_schedules" USING btree ("is_active","next_run_at");--> statement-breakpoint

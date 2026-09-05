@@ -1466,6 +1466,37 @@ describe("the tenant MFA policy applies to SSO (regression)", () => {
     }
   });
 
+  it("gates the RETURNING user too, not just the sign-in that links the identity", async () => {
+    // THE HALF THE FIRST FIX MISSED. `completeLogin` has two paths: the one
+    // that links a new identity, and the one that recognises an existing one.
+    // Only the first consulted the MFA gate, so the policy held for a user's
+    // FIRST SSO sign-in and was silently absent from every one after it —
+    // which is worse than no policy, because the coverage figure says it
+    // holds. This signs in once to create the identity, then turns the policy
+    // on and signs in again through the same identity.
+    const provider = await createProvider(owner, { displayName: "MFA policy — returning" });
+    await enableProvider(provider.id);
+    const first = await signIn(provider.slug, {
+      claims: { sub: "mfa-returning-subject", email: BOB_EMAIL, email_verified: true },
+    });
+    expect(first.res.statusCode).toBe(200);
+    expect(typeof (first.res.json() as Record<string, unknown>)["accessToken"]).toBe("string");
+
+    await requireMfa(true);
+    try {
+      const { res } = await signIn(provider.slug, {
+        claims: { sub: "mfa-returning-subject", email: BOB_EMAIL, email_verified: true },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as Record<string, any>;
+      expect(body.mfaRequired).toBe(true);
+      expect(body.accessToken).toBeUndefined();
+      expect(typeof body.challengeToken).toBe("string");
+    } finally {
+      await requireMfa(false);
+    }
+  });
+
   it("accepts the IdP's own MFA when the connection is configured to and amr proves it", async () => {
     const provider = await createProvider(owner, {
       displayName: "MFA policy — idp performs",

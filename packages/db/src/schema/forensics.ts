@@ -55,6 +55,14 @@ export const delayEvents = pgTable(
     statusReason: text("status_reason"),
     /** contract event (notice) raised for this delay, when any */
     contractEventId: text("contract_event_id"),
+    /**
+     * The obligation raised for the notice time bar, so the deadline lives in
+     * the one register the platform escalates from instead of only inside
+     * this row. Null until the sweep has seen a noticeDueDate.
+     */
+    noticeObligationId: text("notice_obligation_id"),
+    /** stamped by the time-bar sweep so an escalation is raised once, not per tick */
+    noticeAlertedAt: timestamp("notice_alerted_at", { withTimezone: true, mode: "string" }),
     /** assurance evidence ids substantiating the event (#306) */
     evidenceIds: jsonb("evidence_ids").$type<string[]>().default([]).notNull(),
     /** last TIA result for this event: { completionDeltaDays, computedAt } */
@@ -69,6 +77,7 @@ export const delayEvents = pgTable(
     index("delay_events_status_idx").on(t.projectId, t.status),
     index("delay_events_schedule_idx").on(t.scheduleId),
     index("delay_events_start_idx").on(t.projectId, t.startDate),
+    index("delay_events_notice_idx").on(t.status, t.noticeDueDate),
   ],
 );
 

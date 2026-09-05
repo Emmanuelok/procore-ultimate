@@ -13,6 +13,21 @@ import {
 import type { BuiltApp } from "../../app.js";
 import { buildTestApp } from "../../test/helpers.js";
 import { attemptDelivery, sweepSecurityWebhooks, type Fetcher } from "./webhooks.js";
+import { guardCompanyIpAccess } from "./login.js";
+
+/**
+ * How long a suite may take to boot its own embedded Postgres.
+ *
+ * `buildTestApp()` starts PGlite (WASM) and replays every migration from 0000,
+ * which is seconds of CPU on an idle machine and a great deal more on a shared
+ * one. Vitest's 30-second default hook timeout therefore fails these suites for
+ * a reason that has nothing to do with the code under test — and a suite that
+ * fails when the machine is busy teaches people to ignore red, which is the
+ * expensive failure. The assertions are unaffected: a hook that is going to
+ * succeed still succeeds, it is simply allowed to take longer.
+ */
+const HOOK_TIMEOUT_MS = 180_000;
+
 
 /**
  * The tenant security policy, the login audit, administered access, SCIM and
@@ -93,7 +108,7 @@ describe("tenant security policy", () => {
   beforeAll(async () => {
     built = await buildTestApp();
     app = built.app;
-  });
+  }, HOOK_TIMEOUT_MS);
   afterAll(async () => {
     await built.close();
   });
@@ -290,7 +305,7 @@ describe("password policy enforcement (#25)", () => {
   beforeAll(async () => {
     built = await buildTestApp();
     app = built.app;
-  });
+  }, HOOK_TIMEOUT_MS);
   afterAll(async () => {
     await built.close();
   });
@@ -447,7 +462,7 @@ describe("session lifetime from policy (#23)", () => {
   beforeAll(async () => {
     built = await buildTestApp();
     app = built.app;
-  });
+  }, HOOK_TIMEOUT_MS);
   afterAll(async () => {
     await built.close();
   });
@@ -476,6 +491,87 @@ describe("session lifetime from policy (#23)", () => {
     expect(lifetimeMs).toBeLessThanOrEqual(2 * 3600_000 + 5_000);
     expect(lifetimeMs).toBeGreaterThan(3600_000);
   });
+
+  /**
+   * THE IDLE TIMEOUT ACTUALLY BITES.
+   *
+   * `sessionIdleTimeoutMinutes` was stored, resolved and shown on the policy
+   * page, and nothing read it on the request path — a tenant that set "sign
+   * people out after 15 minutes" got a setting, not a behaviour. It is now
+   * enforced in `requireLiveSession` (modules/account/sessions.ts), before
+   * `last_seen_at` is refreshed: refreshing first would reset the very clock
+   * the check reads and the timeout would never fire for anyone with a tab
+   * open.
+   */
+  it("signs an idle session out, revokes the row, and records why", async () => {
+    const actor = await signUp(app);
+    await app.inject({
+      method: "PUT",
+      url: "/api/v1/company/security-policy",
+      headers: actor.headers,
+      payload: { sessionIdleTimeoutMinutes: 15 },
+    });
+    const login = await app.inject({
+      method: "POST",
+      url: "/api/v1/auth/mfa/login",
+      payload: { email: actor.email, password: PASSWORD },
+    });
+    expect(login.statusCode).toBe(200);
+    const body = login.json() as { sessionId: string; accessToken: string };
+    const headers = { authorization: `Bearer ${body.accessToken}` };
+
+    // Still active: the device list answers.
+    expect((await app.inject({ method: "GET", url: "/api/v1/account/sessions", headers })).statusCode)
+      .toBe(200);
+
+    // Now make it idle. Backdating `last_seen_at` is the only honest way to
+    // test a clock without faking one.
+    await app.db
+      .update(authSessions)
+      .set({ lastSeenAt: new Date(Date.now() - 40 * 60_000).toISOString() })
+      .where(eq(authSessions.id, body.sessionId));
+
+    const after = await app.inject({ method: "GET", url: "/api/v1/account/sessions", headers });
+    expect(after.statusCode).toBe(401);
+    expect((after.json() as { message: string }).message).toContain("inactivity");
+
+    const [row] = await app.db
+      .select()
+      .from(authSessions)
+      .where(eq(authSessions.id, body.sessionId));
+    expect(row!.revokedAt).toBeTruthy();
+
+    const events = await app.db
+      .select()
+      .from(authSecurityEvents)
+      .where(
+        and(
+          eq(authSecurityEvents.userId, actor.userId),
+          eq(authSecurityEvents.kind, "session_idle_timeout"),
+        ),
+      );
+    expect(events).toHaveLength(1);
+  });
+
+  it("leaves an idle session alone when no tenant asks for a timeout", async () => {
+    const actor = await signUp(app);
+    const login = await app.inject({
+      method: "POST",
+      url: "/api/v1/auth/mfa/login",
+      payload: { email: actor.email, password: PASSWORD },
+    });
+    const body = login.json() as { sessionId: string; accessToken: string };
+    await app.db
+      .update(authSessions)
+      .set({ lastSeenAt: new Date(Date.now() - 40 * 24 * 3600_000).toISOString() })
+      .where(eq(authSessions.id, body.sessionId));
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/v1/account/sessions",
+      headers: { authorization: `Bearer ${body.accessToken}` },
+    });
+    expect(res.statusCode).toBe(200);
+  });
 });
 
 describe("IP allowlisting at sign-in (#24)", () => {
@@ -485,7 +581,7 @@ describe("IP allowlisting at sign-in (#24)", () => {
   beforeAll(async () => {
     built = await buildTestApp();
     app = built.app;
-  });
+  }, HOOK_TIMEOUT_MS);
   afterAll(async () => {
     await built.close();
   });
@@ -548,6 +644,105 @@ describe("IP allowlisting at sign-in (#24)", () => {
     expect(rows[0]!.outcome).toBe("pending");
   });
 
+  /**
+   * THE PER-REQUEST HALF OF #24.
+   *
+   * Sign-in enforcement (above) refuses only when EVERY company of the account
+   * refuses the address, because a contractor working for a strict client and
+   * a relaxed one must still be able to work for the relaxed one. That leaves
+   * the strict tenant's own rule to be applied on the request that names it —
+   * `guardCompanyIpAccess`, which `requireCompany` calls (see the diff in the
+   * WP-AUTH report; plugins/auth.ts is not this package's to edit). These
+   * tests drive the guard directly so its behaviour is fixed before the wiring
+   * lands, and so the wiring cannot silently change it afterwards.
+   */
+  describe("guardCompanyIpAccess", () => {
+    const reqFrom = (ip: string) =>
+      ({ ip, headers: {}, url: "/api/v1/projects" }) as unknown as Parameters<
+        typeof guardCompanyIpAccess
+      >[1];
+
+    it("refuses a request from outside an enforced allowlist and records it", async () => {
+      const actor = await signUp(app);
+      await app.db.insert(companySecurityPolicies).values({
+        id: `secpol-req-${Date.now()}`,
+        companyId: actor.companyId,
+        ipAllowlistMode: "enforce",
+        ipAllowlist: ["198.51.100.0/24"],
+      });
+      await expect(
+        guardCompanyIpAccess(app, reqFrom("203.0.113.9"), actor.companyId, actor.userId),
+      ).rejects.toMatchObject({ statusCode: 403 });
+      await expect(
+        guardCompanyIpAccess(app, reqFrom("198.51.100.7"), actor.companyId, actor.userId),
+      ).resolves.toBeUndefined();
+      const rows = await app.db
+        .select()
+        .from(authSecurityEvents)
+        .where(
+          and(
+            eq(authSecurityEvents.companyId, actor.companyId),
+            eq(authSecurityEvents.kind, "login_blocked_ip"),
+          ),
+        );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.outcome).toBe("blocked");
+    });
+
+    it("allows and records in monitor mode, and never speaks when the mode is off", async () => {
+      const monitored = await signUp(app);
+      await app.db.insert(companySecurityPolicies).values({
+        id: `secpol-req-m-${Date.now()}`,
+        companyId: monitored.companyId,
+        ipAllowlistMode: "monitor",
+        ipAllowlist: ["198.51.100.0/24"],
+      });
+      await expect(
+        guardCompanyIpAccess(app, reqFrom("203.0.113.9"), monitored.companyId, monitored.userId),
+      ).resolves.toBeUndefined();
+      const rows = await app.db
+        .select()
+        .from(authSecurityEvents)
+        .where(
+          and(
+            eq(authSecurityEvents.companyId, monitored.companyId),
+            eq(authSecurityEvents.kind, "login_blocked_ip"),
+          ),
+        );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.outcome).toBe("pending");
+
+      const off = await signUp(app);
+      await expect(
+        guardCompanyIpAccess(app, reqFrom("203.0.113.9"), off.companyId, off.userId),
+      ).resolves.toBeUndefined();
+      const none = await app.db
+        .select()
+        .from(authSecurityEvents)
+        .where(
+          and(
+            eq(authSecurityEvents.companyId, off.companyId),
+            eq(authSecurityEvents.kind, "login_blocked_ip"),
+          ),
+        );
+      expect(none).toHaveLength(0);
+    });
+
+    it("lets a break-glass user through, so a mistyped CIDR is always fixable", async () => {
+      const actor = await signUp(app);
+      await app.db.insert(companySecurityPolicies).values({
+        id: `secpol-req-bg-${Date.now()}`,
+        companyId: actor.companyId,
+        ipAllowlistMode: "enforce",
+        ipAllowlist: ["198.51.100.0/24"],
+        ipAllowlistBreakGlassUserIds: [actor.userId],
+      });
+      await expect(
+        guardCompanyIpAccess(app, reqFrom("203.0.113.9"), actor.companyId, actor.userId),
+      ).resolves.toBeUndefined();
+    });
+  });
+
   it("a break-glass member still gets in", async () => {
     const actor = await signUp(app);
     await app.db.insert(companySecurityPolicies).values({
@@ -573,7 +768,7 @@ describe("login audit and export (§0.2)", () => {
   beforeAll(async () => {
     built = await buildTestApp();
     app = built.app;
-  });
+  }, HOOK_TIMEOUT_MS);
   afterAll(async () => {
     await built.close();
   });
@@ -662,7 +857,7 @@ describe("administering a member", () => {
   beforeAll(async () => {
     built = await buildTestApp();
     app = built.app;
-  });
+  }, HOOK_TIMEOUT_MS);
   afterAll(async () => {
     await built.close();
   });
@@ -799,7 +994,7 @@ describe("SCIM 2.0 (#21)", () => {
     });
     expect(res.statusCode).toBe(201);
     token = (res.json() as { token: string }).token;
-  });
+  }, HOOK_TIMEOUT_MS);
   afterAll(async () => {
     await built.close();
   });
@@ -821,6 +1016,19 @@ describe("SCIM 2.0 (#21)", () => {
     });
     expect(res.statusCode).toBe(401);
     expect((res.json() as { schemas: string[] }).schemas[0]).toContain("scim:api:messages:2.0:Error");
+  });
+
+  it("is mounted at the documented path, once — not behind a doubled prefix", () => {
+    // REGRESSION. `registerScimRoutes` is called from inside `accountModule`,
+    // which app.ts registers with `{ prefix: "/api/v1" }`. Passing the full
+    // public path as the registration path therefore mounted every SCIM route
+    // at `/api/v1/api/v1/scim/v2/…`: the documented URL — the one an identity
+    // provider is configured with — answered 404, and nothing noticed because
+    // the SCIM unit tests only exercised the pure helpers. This asserts the
+    // route table itself, so the two constants cannot drift apart again.
+    const tree = app.printRoutes({ commonPrefix: false });
+    expect(tree).toContain("/api/v1/scim/v2/Users");
+    expect(tree).not.toContain("/api/v1/api/v1");
   });
 
   it("publishes an honest ServiceProviderConfig", async () => {
@@ -1003,7 +1211,7 @@ describe("security event webhooks (§0.2)", () => {
   beforeAll(async () => {
     built = await buildTestApp();
     app = built.app;
-  });
+  }, HOOK_TIMEOUT_MS);
   afterAll(async () => {
     await built.close();
   });
@@ -1145,6 +1353,14 @@ describe("security event webhooks (§0.2)", () => {
       payload: { name: "Later", url: "https://later.example.com/hook" },
     });
     const webhookId = (created.json() as { id: string }).id;
+    // Creating the endpoint is itself a security event (`security_webhook_
+    // changed`), so the subscription hook has already queued a delivery that
+    // IS due. That is correct behaviour — a SIEM should learn that a new
+    // endpoint was registered — but it is not what this test is about, so the
+    // queue is emptied before the one delivery under test is planted.
+    await app.db
+      .delete(securityWebhookDeliveries)
+      .where(eq(securityWebhookDeliveries.companyId, actor.companyId));
     await app.db.insert(securityWebhookDeliveries).values({
       id: `swd-later-${Date.now()}`,
       companyId: actor.companyId,
@@ -1209,7 +1425,7 @@ describe("scheduled sweeps", () => {
   beforeAll(async () => {
     built = await buildTestApp();
     app = built.app;
-  });
+  }, HOOK_TIMEOUT_MS);
   afterAll(async () => {
     await built.close();
   });

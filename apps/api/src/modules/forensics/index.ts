@@ -1,4 +1,4 @@
-import type { FastifyPluginAsync } from "fastify";
+import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import { and, asc, count, desc, eq, gte, inArray, isNotNull, isNull, lte, ne, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
@@ -11,15 +11,19 @@ import {
   disruptionAnalyses,
   evidence,
   forensicAnalyses,
+  assuranceGrants,
   forensicClaims,
+  obligations,
   projectFloatRules,
   quantumCalculations,
   rfis,
   scheduleBaselines,
   scheduleCalendars,
   scheduleDependencies,
+  projectMemberships,
   scheduleTasks,
   schedules,
+  siteWeatherAnalyses,
   timecards,
   variations,
 } from "@constructos/db";
@@ -43,6 +47,7 @@ import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, forbidden, notFound } from "../../lib/errors.js";
+import { isExpired } from "../../lib/time.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { isoDateSchema } from "../field/dates.js";
 import {
@@ -87,6 +92,8 @@ import {
   type ChainLimbInput,
   type EventSufficiencyInput,
 } from "./sufficiency.js";
+import { NOTICE_WARN_DAYS, noticeExposure, sweepNoticeTimeBars } from "./sweeps.js";
+import { forEachCompany } from "../../lib/scheduler.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -995,7 +1002,34 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
     if (body.party !== undefined) set["party"] = body.party;
     if (body.startDate !== undefined) set["startDate"] = body.startDate;
     if (body.durationDays !== undefined) set["durationDays"] = body.durationDays;
-    if (body.noticeDueDate !== undefined) set["noticeDueDate"] = body.noticeDueDate;
+    if (body.noticeDueDate !== undefined && body.noticeDueDate !== ev.noticeDueDate) {
+      set["noticeDueDate"] = body.noticeDueDate;
+      /* Moving the bar waives the obligation raised against the old date: an
+       * obligation whose deadline no longer matches the record it came from
+       * is worse than none, because it is escalated against the wrong day. */
+      if (ev.noticeObligationId) {
+        await app.db
+          .update(obligations)
+          .set({ status: "waived" })
+          .where(and(eq(obligations.id, ev.noticeObligationId), eq(obligations.status, "open")));
+        await appendLedger(app.db, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "state_change",
+          objectType: "obligation",
+          objectId: ev.noticeObligationId,
+          projectId: req.projectId!,
+          payload: {
+            to: "waived",
+            reason: "notice due date changed",
+            from: ev.noticeDueDate,
+            toDate: body.noticeDueDate,
+          },
+        });
+      }
+      set["noticeObligationId"] = null;
+      set["noticeAlertedAt"] = null;
+    }
     if (body.startDate !== undefined || body.durationDays !== undefined) {
       // the modelled delay changed — a previously computed TIA is stale
       set["tiaResult"] = null;
@@ -1090,6 +1124,98 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
         payload: { from: ev.status, to: body.status, reason: body.reason ?? null },
       });
       return fetchDelayEvent(eventId, req.companyId!, req.projectId!);
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Weather baseline linkage                                          */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * The exceptional-weather evidence for one delay event.
+   *
+   * A weather delay is only excusable to the extent the weather was worse
+   * than the contract's baseline, and that comparison lives in the site
+   * module (`site_weather_analyses`, issued against a baseline of contractual
+   * thresholds). Forensics reads it rather than recomputing it, so the claim
+   * and the site record can never disagree.
+   *
+   * When no analysis has been issued against this event the endpoint says so
+   * — it never substitutes a zero for an absent comparison.
+   */
+  app.get(
+    "/projects/:projectId/delay-events/:eventId/weather",
+    { preHandler: readGate },
+    async (req) => {
+      const { eventId } = req.params as { eventId: string };
+      const ev = await fetchDelayEvent(eventId, req.companyId!, req.projectId!);
+      const rows = await app.db
+        .select({
+          id: siteWeatherAnalyses.id,
+          reference: siteWeatherAnalyses.reference,
+          status: siteWeatherAnalyses.status,
+          periodStart: siteWeatherAnalyses.periodStart,
+          periodEnd: siteWeatherAnalyses.periodEnd,
+          observedAdverseDays: siteWeatherAnalyses.observedAdverseDays,
+          baselineAdverseDays: siteWeatherAnalyses.baselineAdverseDays,
+          exceptionalDays: siteWeatherAnalyses.exceptionalDays,
+          hoursLost: siteWeatherAnalyses.hoursLost,
+          coveragePercent: siteWeatherAnalyses.coveragePercent,
+          byMonth: siteWeatherAnalyses.byMonth,
+          reasons: siteWeatherAnalyses.reasons,
+          issuedAt: siteWeatherAnalyses.issuedAt,
+        })
+        .from(siteWeatherAnalyses)
+        .where(
+          and(
+            eq(siteWeatherAnalyses.companyId, req.companyId!),
+            eq(siteWeatherAnalyses.projectId, req.projectId!),
+            eq(siteWeatherAnalyses.delayEventId, eventId),
+          ),
+        )
+        .orderBy(desc(siteWeatherAnalyses.periodStart))
+        .limit(50);
+
+      const reasons: string[] = [];
+      if (rows.length === 0) {
+        reasons.push(
+          ev.cause === "exceptional_weather"
+            ? "No weather analysis has been issued against this event — exceptional days are not available, " +
+              "so the excusable period cannot be evidenced from met records"
+            : "No weather analysis is linked to this event",
+        );
+      }
+      const priced = rows.filter((r) => r.exceptionalDays !== null);
+      if (rows.length > 0 && priced.length === 0) {
+        reasons.push("The linked analyses report no exceptional-day figure");
+      }
+
+      return {
+        eventId,
+        cause: ev.cause,
+        eventStart: ev.startDate,
+        eventDurationDays: ev.durationDays,
+        analyses: rows,
+        summary: {
+          analyses: rows.length,
+          exceptionalDays:
+            priced.length > 0 ? priced.reduce((sum, r) => sum + (r.exceptionalDays ?? 0), 0) : null,
+          hoursLost: rows.some((r) => r.hoursLost !== null)
+            ? rows.reduce((sum, r) => sum + (r.hoursLost ?? 0), 0)
+            : null,
+          /* Coverage is a percentage of days observed: averaging is the only
+           * honest roll-up, and it is null when nothing reported one. */
+          meanCoveragePercent:
+            rows.filter((r) => r.coveragePercent !== null).length > 0
+              ? Math.round(
+                  (rows.reduce((sum, r) => sum + (r.coveragePercent ?? 0), 0) /
+                    rows.filter((r) => r.coveragePercent !== null).length) *
+                    10,
+                ) / 10
+              : null,
+        },
+        reasons,
+      };
     },
   );
 
@@ -3280,14 +3406,68 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
   /* ---------------------------------------------------------------- */
 
   /**
+   * Plan §6.3: a company-level list over project data is limited to the
+   * projects the caller can see. `null` means "every project in the company"
+   * (owner/admin, or a company-wide assurance grant).
+   */
+  async function visibleProjectIds(req: FastifyRequest): Promise<string[] | null> {
+    if (req.companyRole === "owner" || req.companyRole === "admin") return null;
+    const nowMs = Date.now();
+    const grants = await app.db
+      .select({ projectId: assuranceGrants.projectId, expiresAt: assuranceGrants.expiresAt })
+      .from(assuranceGrants)
+      .where(
+        and(
+          eq(assuranceGrants.companyId, req.companyId!),
+          eq(assuranceGrants.userId, req.user!.id),
+        ),
+      );
+    const live = grants.filter((g) => !isExpired(g.expiresAt, nowMs));
+    if (live.some((g) => g.projectId === null)) return null;
+    const ids = new Set<string>(
+      live.map((g) => g.projectId).filter((p): p is string => typeof p === "string"),
+    );
+    const memberships = await app.db
+      .select({ projectId: projectMemberships.projectId })
+      .from(projectMemberships)
+      .where(
+        and(
+          eq(projectMemberships.companyId, req.companyId!),
+          eq(projectMemberships.userId, req.user!.id),
+        ),
+      );
+    for (const m of memberships) ids.add(m.projectId);
+    return [...ids];
+  }
+
+  /**
    * Portfolio claim exposure (#313, #320). Money is bucketed BY CURRENCY and
    * never summed across them: a single "total exposure" over GBP and USD
-   * claims would be a fabricated number.
+   * claims would be a fabricated number. A caller who is not an owner/admin
+   * sees only the projects they are a member of (or hold a grant over), and
+   * the response says how the set was scoped.
    */
   app.get("/claims/exposure", { preHandler: [app.authenticate, app.requireCompany] }, async (req) => {
     const q = z.object({ projectId: z.string().min(1).optional() }).parse(req.query);
+    const visible = await visibleProjectIds(req);
+    if (visible !== null && visible.length === 0) {
+      return {
+        generatedAt: new Date().toISOString(),
+        openClaims: 0,
+        totalClaims: 0,
+        byCurrency: [],
+        byStatus: {},
+        claims: [],
+        scope: "member_projects",
+        reasons: ["You are not a member of any project in this company, so no claims are visible"],
+      };
+    }
+    if (visible !== null && q.projectId && !visible.includes(q.projectId)) {
+      throw forbidden("You do not have access to that project");
+    }
     const clauses = [eq(forensicClaims.companyId, req.companyId!)];
     if (q.projectId) clauses.push(eq(forensicClaims.projectId, q.projectId));
+    else if (visible !== null) clauses.push(inArray(forensicClaims.projectId, visible));
     const rows = await app.db
       .select({
         id: forensicClaims.id,
@@ -3348,6 +3528,7 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
         [...new Set(rows.map((r) => r.status))].map((s) => [s, rows.filter((r) => r.status === s).length]),
       ),
       claims: open,
+      scope: visible === null ? "company" : "member_projects",
       reasons,
     };
   });
@@ -3402,6 +3583,20 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
     const withoutNotice = events.filter((e) => !e.contractEventId).length;
     if (withoutNotice > 0) reasons.push(`${withoutNotice} live delay event(s) have no notice recorded`);
 
+    /* Notice time bars are the sharpest schedule-health signal this module
+     * owns: a missed bar can extinguish an otherwise good entitlement. */
+    const exposure = await noticeExposure(
+      app.db,
+      req.companyId!,
+      req.projectId!,
+      new Date().toISOString().slice(0, 10),
+    );
+    if (exposure.missed > 0) {
+      reasons.push(
+        `${exposure.missed} delay event(s) are past their notice time bar with no notice recorded`,
+      );
+    }
+
     const sufficiencyScores = claims
       .map((c) => (c.sufficiency as { overallScore?: number } | null)?.overallScore)
       .filter((n): n is number => typeof n === "number");
@@ -3419,6 +3614,8 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
           .filter((e) => e.excusable === 1 && e.compensable !== 1 && e.status === "open")
           .reduce((s, e) => s + e.durationDays, 0),
         eventsWithoutNotice: withoutNotice,
+        noticesDueSoon: exposure.dueSoon,
+        noticeTimeBarsMissed: exposure.missed,
         eventsWithoutTia: events.filter((e) => !e.tiaResult).length,
         openClaims: openClaims.length,
         claimedValue:
@@ -3437,5 +3634,45 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
       },
       reasons,
     };
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Notice time bars: sweep, manual run, scheduler job (§6.1)          */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Manual cycle of the notice time-bar sweep for this project — the same
+   * function the scheduled job runs, so an operator (and the test suite) can
+   * trigger it without waiting an hour.
+   */
+  app.post(
+    "/projects/:projectId/forensics/notice-sweep",
+    { preHandler: standardGate },
+    async (req) => {
+      const summary = await sweepNoticeTimeBars(app.db, req.companyId!, new Date(), {
+        projectId: req.projectId!,
+      });
+      return { ...summary, warnDays: NOTICE_WARN_DAYS };
+    },
+  );
+
+  app.scheduler.register({
+    name: "forensics.notice-time-bars",
+    description:
+      "Open an obligation for every delay-event notice deadline, and raise a signal when the bar is approaching or has passed unserved",
+    everyMs: 6 * 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db, now }) => {
+      let alerted = 0;
+      let missed = 0;
+      let obligationsOpened = 0;
+      const result = await forEachCompany(db, async (companyId) => {
+        const summary = await sweepNoticeTimeBars(db, companyId, now);
+        alerted += summary.alerted;
+        missed += summary.missed;
+        obligationsOpened += summary.obligationsOpened;
+      });
+      return { ...result, alerted, missed, obligationsOpened };
+    },
   });
 };

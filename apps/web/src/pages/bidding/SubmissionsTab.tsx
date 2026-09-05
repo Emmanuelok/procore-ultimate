@@ -407,6 +407,7 @@ export default function SubmissionsTab({
         currency={currency}
         sealed={pkg?.isSealed === 1}
         onClose={() => setRecordOpen(false)}
+        onCreated={refresh}
         onDone={() => {
           setRecordOpen(false);
           refresh();
@@ -877,6 +878,7 @@ function RecordBidModal({
   currency,
   sealed,
   onClose,
+  onCreated,
   onDone,
 }: {
   open: boolean;
@@ -885,6 +887,8 @@ function RecordBidModal({
   currency: string;
   sealed: boolean;
   onClose: () => void;
+  /** Fired on every successful write, notes or no notes. */
+  onCreated: () => void;
   onDone: () => void;
 }) {
   const vendors = useVendors();
@@ -913,7 +917,14 @@ function RecordBidModal({
       ),
     );
     if (res) {
+      /*
+       * The bid IS recorded by this point. Showing the notes without
+       * refreshing the register left the buyer looking at a list that did not
+       * contain the bid they had just entered — and provisional sums alone are
+       * enough to produce a note, so it happened routinely.
+       */
       const collected = [...(res.totalsNotes ?? []), ...(res.latenessNote ? [res.latenessNote] : [])];
+      onCreated();
       if (collected.length > 0) setNotes(collected);
       else onDone();
     }

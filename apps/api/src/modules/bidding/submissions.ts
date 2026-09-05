@@ -3,12 +3,14 @@ import { and, asc, count, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import {
   bidInvitations,
+  bidLevellingItems,
   bidPackages,
   bidSubmissionLines,
   bidSubmissions,
   insuranceCertificates,
   vendors,
 } from "@constructos/db";
+import { sha256Hex } from "@constructos/ledger";
 import { BID_COMPLIANCE_STATUSES, BID_SUBMISSION_STATUSES, BOND_TYPES } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { badRequest, conflict } from "../../lib/errors.js";
@@ -39,6 +41,7 @@ import {
   type BidSubmissionRow,
 } from "./shared.js";
 import { addendaOf } from "./packages.js";
+import { ledgerPortalAction, resolvePortalSession } from "./invitations.js";
 import { computeLateness, redactSubmission, sealState } from "./sealing.js";
 import { effectiveLimit, evaluatePrequalGate, vendorPrequalStatus } from "./prequal-status.js";
 import { checkContractAgainstLimit } from "./financial-limits.js";
@@ -858,6 +861,351 @@ export const submissionRoutes: FastifyPluginAsync = async (app) => {
       });
     },
   );
+
+
+  /* ---------------------------------------------------------------- */
+  /* The bidder's own submission (#164)                                */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * A BID SUBMITTED THROUGH THE PORTAL, WITH NO PLATFORM ACCOUNT.
+   *
+   * Deliberately NARROWER than the staff route, and every narrowing is a
+   * control rather than an omission:
+   *
+   *  - THE VENDOR COMES FROM THE TOKEN. Never from the body. A bidder cannot
+   *    submit as somebody else, and cannot point their bid at another
+   *    invitation.
+   *  - THE RECEIPT TIME IS THE SERVER'S CLOCK. There is no `receivedAt` and
+   *    no backdating: lateness is measured against the published deadline
+   *    from the instant the bytes arrived. The staff route permits a stated
+   *    receipt because a bid can arrive by courier; a bid that arrives down
+   *    this wire arrived when it arrived.
+   *  - THE ENVELOPE HASH IS COMPUTED HERE. On a sealed package the bidder
+   *    supplies the priced content and the server hashes the canonical form
+   *    of it, so "the price was not altered between the deadline and the
+   *    opening" is a fact rather than the bidder's assertion.
+   *  - LINES MAP ONTO THE BUYER'S SCOPE ROWS EXACTLY. The bid form is derived
+   *    from `bid_levelling_items`, so each priced line carries the
+   *    levellingItemId it answers and auto-mapping is not a guess.
+   *
+   * A late bid is still ACCEPTED and recorded — refusing it at the door
+   * destroys the evidence that it was late. It arrives flagged, and stays out
+   * of every comparison until somebody accepts it in writing.
+   */
+  const portalLineSchema = z.object({
+    levellingItemId: z.string().min(1).max(64).nullable().optional(),
+    itemCode: z.string().max(60).nullable().optional(),
+    description: z.string().trim().min(1).max(2000),
+    unit: z.string().max(30).nullable().optional(),
+    quantity: z.number().finite().nullable().optional(),
+    unitRate: moneySchema.nullable().optional(),
+    amount: moneySchema.nullable().optional(),
+    isProvisionalSum: z.boolean().optional(),
+    isAllowance: z.boolean().optional(),
+    isAlternate: z.boolean().optional(),
+    alternateLabel: z.string().max(60).nullable().optional(),
+    isExcluded: z.boolean().optional(),
+    inclusionNote: z.string().max(2000).nullable().optional(),
+  });
+
+  const portalSubmissionSchema = z.object({
+    baseBidAmount: nonNegativeMoneySchema.nullable().optional(),
+    allowancesTotal: nonNegativeMoneySchema.nullable().optional(),
+    provisionalSumsTotal: nonNegativeMoneySchema.nullable().optional(),
+    lines: z.array(portalLineSchema).max(2000).optional(),
+    exclusions: z.string().max(20000).nullable().optional(),
+    qualifications: z.string().max(20000).nullable().optional(),
+    assumptions: z.string().max(20000).nullable().optional(),
+    proposedProgrammeWeeks: z.number().finite().min(0).max(2000).nullable().optional(),
+    validUntil: isoDateSchema.nullable().optional(),
+    paymentTermsDays: z.number().int().min(0).max(365).nullable().optional(),
+    addendaAcknowledged: z.array(z.string().min(1).max(60)).max(100).optional(),
+    submittedByName: z.string().trim().max(200).nullable().optional(),
+  });
+
+  app.post("/bid-portal/submission", async (req, reply) => {
+    const body = portalSubmissionSchema.parse(req.body ?? {});
+    const { invitation, pkg } = await resolvePortalSession(app.db, req.headers.authorization);
+    const companyId = invitation.companyId;
+    const projectId = invitation.projectId;
+
+    if (!ISSUED_FOR_BIDS.includes(pkg.status)) {
+      throw conflict(
+        `${pkg.reference} is at status "${pkg.status}" and is not taking bids through the ` +
+          "portal. Where a tender has closed, a bid is taken by the buyer with the reason it " +
+          "was accepted late written down next to it.",
+      );
+    }
+    if (invitation.status === "declined") {
+      throw conflict(
+        "You declined this invitation. Ask the buyer to reopen it before submitting a price — " +
+          "a decline that quietly becomes a bid leaves the coverage record wrong.",
+      );
+    }
+
+    const lines = (body.lines ?? []).map((l, index) => ({
+      ...l,
+      position: index,
+      resolvedAmount: resolveLineAmount(l),
+    }));
+
+    /*
+     * A LINE MAY ONLY ANSWER A SCOPE ROW ON THIS PACKAGE. The bid form is
+     * generated from the buyer's levelling items, so a levellingItemId that
+     * belongs to another package (or another tenant) is a client that has
+     * been edited, and mapping it would attach this bidder's rate to
+     * somebody else's comparison.
+     */
+    const claimed = [...new Set(lines.map((l) => l.levellingItemId).filter((x): x is string => !!x))];
+    if (claimed.length > 0) {
+      const known = await app.db
+        .select({ id: bidLevellingItems.id })
+        .from(bidLevellingItems)
+        .where(
+          and(
+            eq(bidLevellingItems.packageId, pkg.id),
+            eq(bidLevellingItems.companyId, companyId),
+            inArray(bidLevellingItems.id, claimed),
+          ),
+        );
+      const ok = new Set(known.map((k) => k.id));
+      const strays = claimed.filter((id) => !ok.has(id));
+      if (strays.length > 0) {
+        throw badRequest(
+          `${strays.length} priced line(s) reference a scope row that is not on ${pkg.reference}.`,
+          { control: "levelling_item_not_on_package", levellingItemIds: strays },
+        );
+      }
+    }
+
+    const totals = resolveSubmissionTotals({
+      baseBidAmount: body.baseBidAmount ?? null,
+      allowancesTotal: body.allowancesTotal ?? null,
+      provisionalSumsTotal: body.provisionalSumsTotal ?? null,
+      alternates: [],
+      lines: lines.map((l) => ({
+        amount: l.resolvedAmount,
+        isAlternate: l.isAlternate === true,
+        isAllowance: l.isAllowance === true,
+        isProvisionalSum: l.isProvisionalSum === true,
+      })),
+    });
+    if (totals.totalAmount === null) {
+      throw badRequest(
+        "This submission carries no priceable figure: give a base bid amount, or price the " +
+          "lines of the bid form. A bid with no number is not a bid.",
+        { control: "no_amount", notes: totals.notes },
+      );
+    }
+
+    const revisionRows = await app.db
+      .select()
+      .from(bidSubmissions)
+      .where(
+        and(
+          eq(bidSubmissions.packageId, pkg.id),
+          eq(bidSubmissions.vendorId, invitation.vendorId),
+        ),
+      );
+    const revision = revisionRows.reduce((max, r) => Math.max(max, r.revision + 1), 0);
+
+    // The server's own clock, and nothing else.
+    const receivedAt = new Date().toISOString();
+    const lateness = computeLateness(pkg.bidDueAt, receivedAt);
+
+    const vendor = await assertVendor(app.db, invitation.vendorId, companyId);
+    const id = newId("bsu");
+    const reference = `${pkg.reference}-${vendor.name.slice(0, 12).trim()}${revision > 0 ? `-R${revision}` : ""}`;
+    const currency = pkg.currency;
+
+    /*
+     * THE HASH IS OURS, NOT THEIRS. The canonical form is the priced content
+     * in a stable order; hashing it here means the envelope's integrity does
+     * not rest on a number the sender chose to send.
+     */
+    const canonical = JSON.stringify({
+      packageReference: pkg.reference,
+      vendorId: invitation.vendorId,
+      revision,
+      receivedAt,
+      baseBidAmount: totals.baseBidAmount,
+      allowancesTotal: totals.allowancesTotal,
+      provisionalSumsTotal: totals.provisionalSumsTotal,
+      totalAmount: totals.totalAmount,
+      currency,
+      lines: lines.map((l) => [
+        l.levellingItemId ?? null,
+        l.itemCode ?? null,
+        l.description,
+        l.quantity ?? null,
+        l.unitRate ?? null,
+        l.resolvedAmount,
+      ]),
+    });
+    const sealedSha256 = sha256Hex(canonical);
+
+    await app.db.insert(bidSubmissions).values({
+      id,
+      companyId,
+      projectId,
+      packageId: pkg.id,
+      invitationId: invitation.id,
+      vendorId: invitation.vendorId,
+      reference,
+      revision,
+      status: "received",
+      submittedAt: receivedAt,
+      receivedAt,
+      isLate: lateness.isLate ? 1 : 0,
+      lateByMinutes: lateness.lateByMinutes,
+      baseBidAmount: totals.baseBidAmount,
+      alternatesTotal: totals.alternatesTotal,
+      allowancesTotal: totals.allowancesTotal,
+      provisionalSumsTotal: totals.provisionalSumsTotal,
+      totalAmount: totals.totalAmount,
+      currency,
+      exclusions: body.exclusions ?? null,
+      qualifications: body.qualifications ?? null,
+      assumptions: body.assumptions ?? null,
+      proposedProgrammeWeeks: body.proposedProgrammeWeeks ?? null,
+      validUntil: body.validUntil ?? null,
+      paymentTermsDays: body.paymentTermsDays ?? null,
+      addendaAcknowledged:
+        body.addendaAcknowledged ??
+        ((invitation.addendaAcknowledged as { addendumRef?: string }[] | null) ?? [])
+          .map((a) => a.addendumRef)
+          .filter((r): r is string => typeof r === "string"),
+      sealedSha256,
+      lineCount: lines.length,
+      detail: {
+        via: "portal_token",
+        submittedByName: body.submittedByName ?? invitation.contactName ?? null,
+        totalsNotes: totals.notes,
+        statedReceiptAt: receivedAt,
+        serverReceiptAt: receivedAt,
+        envelopeHashBasis:
+          "sha256 of the canonical priced content, computed by the server at receipt.",
+      },
+      createdBy: null,
+    });
+
+    for (const line of lines) {
+      await app.db.insert(bidSubmissionLines).values({
+        id: newId("bsl"),
+        companyId,
+        projectId,
+        submissionId: id,
+        packageId: pkg.id,
+        vendorId: invitation.vendorId,
+        levellingItemId: line.levellingItemId ?? null,
+        position: line.position,
+        itemCode: line.itemCode ?? null,
+        description: line.description,
+        unit: line.unit ?? null,
+        quantity: line.quantity ?? null,
+        unitRate: line.unitRate ?? null,
+        amount: line.resolvedAmount,
+        currency,
+        isProvisionalSum: line.isProvisionalSum ? 1 : 0,
+        isAllowance: line.isAllowance ? 1 : 0,
+        isAlternate: line.isAlternate ? 1 : 0,
+        alternateLabel: line.alternateLabel ?? null,
+        isExcluded: line.isExcluded ? 1 : 0,
+        inclusionNote: line.inclusionNote ?? null,
+        detail: {},
+      });
+    }
+
+    /* The same supersession rule the staff route applies. */
+    const superseded: string[] = [];
+    for (const prior of revisionRows) {
+      if (prior.id === id) continue;
+      if (!isInContention(prior.status)) continue;
+      await app.db
+        .update(bidSubmissions)
+        .set({
+          status: "withdrawn",
+          supersededById: id,
+          evaluationNote: `Superseded by revision ${revision} (${reference}) received ${receivedAt}.`,
+          updatedAt: receivedAt,
+        })
+        .where(eq(bidSubmissions.id, prior.id));
+      superseded.push(prior.id);
+    }
+
+    await app.db
+      .update(bidInvitations)
+      .set({
+        status: "submitted",
+        submissionId: id,
+        respondedAt: receivedAt,
+        portalLastAccessAt: receivedAt,
+        updatedAt: receivedAt,
+      })
+      .where(eq(bidInvitations.id, invitation.id));
+
+    await recountSubmissions(app.db, pkg.id);
+    if (pkg.status === "invitations_sent") {
+      await app.db
+        .update(bidPackages)
+        .set({ status: "open", updatedAt: receivedAt })
+        .where(eq(bidPackages.id, pkg.id));
+    }
+
+    await ledgerPortalAction(app.db, invitation, "create", {
+      packageId: pkg.id,
+      packageReference: pkg.reference,
+      event: "portal_bid_submitted",
+      submissionId: id,
+      reference,
+      revision,
+      receivedAt,
+      bidDueAt: pkg.bidDueAt,
+      isLate: lateness.isLate,
+      lateByMinutes: lateness.lateByMinutes,
+      lineCount: lines.length,
+      sealedSha256,
+      supersededSubmissionIds: superseded,
+      // The AMOUNT never enters a stored ledger payload for a sealed package.
+      totalAmount: pkg.isSealed === 1 ? null : totals.totalAmount,
+      currency,
+    });
+
+    /*
+     * WHAT COMES BACK IS A RECEIPT, NOT THE BID. The bidder gets the
+     * reference, the time it was recorded, the hash of what the server holds
+     * and whether it was late — never the buyer's estimate, never another
+     * bidder, and on a sealed package never a total that could be read back
+     * out of the platform before the opening.
+     */
+    return reply.status(201).send({
+      submissionId: id,
+      reference,
+      revision,
+      status: "received",
+      receivedAt,
+      sealedSha256,
+      lineCount: lines.length,
+      isLate: lateness.isLate,
+      lateByMinutes: lateness.lateByMinutes,
+      lateNote: lateness.isLate
+        ? `Your bid arrived ${lateness.lateByMinutes} minute(s) after the deadline of ` +
+          `${pkg.bidDueAt}. It has been recorded and flagged. A late bid takes no part in the ` +
+          "comparison unless the buyer accepts it in writing, with a stated reason."
+        : (lateness.reason ?? null),
+      supersededSubmissionIds: superseded,
+      supersededNote:
+        superseded.length > 0
+          ? `This is revision ${revision}; your earlier submission is withdrawn from contention ` +
+            "and kept on the record."
+          : null,
+      note:
+        "Keep the hash. It is what the buyer will compare the envelope against at the opening, " +
+        "and it is computed from the priced content by this platform rather than asserted by " +
+        "either side.",
+    });
+  });
 
   /* ---------------------------------------------------------------- */
   /* Read paths — every one of them through the seal                   */

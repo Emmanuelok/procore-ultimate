@@ -119,9 +119,12 @@ import {
 } from "./stock.js";
 import {
   assessFaults,
+  CARRY_IN_LOOKBACK_DAYS,
   checkGeofence,
   coerceTelematicsRow,
   engineHoursFromCounter,
+  engineHoursSeries,
+  localDateOf,
   reconcileFuel,
   reconcileTelematics,
   TELEMATICS_DATASET,
@@ -5029,12 +5032,20 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           to: isoDateSchema.optional(),
           days: z.coerce.number().int().min(1).max(180).optional(),
           equipmentId: idRef.optional(),
+          /*
+           * The site's offset from UTC in minutes (+480 for UTC+8). A night
+           * shift east of UTC straddles two UTC days, so neither of them
+           * matches the plant sheet the foreman filled in; the caller says
+           * which clock the days are cut on and the default stays UTC.
+           */
+          tzOffsetMinutes: z.coerce.number().int().min(-840).max(840).optional(),
         })
         .parse(req.query);
       const companyId = req.companyId!;
       const projectId = req.projectId!;
       const to = q.to ?? todayISO();
       const from = q.from ?? addDaysISO(to, -((q.days ?? 14) - 1));
+      const tz = q.tzOffsetMinutes ?? 0;
 
       const utilClauses = [
         eq(equipmentUtilisation.companyId, companyId),
@@ -5100,25 +5111,45 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           and(
             eq(equipmentTelematicsReadings.companyId, companyId),
             inArray(equipmentTelematicsReadings.equipmentId, machineIds),
+            /*
+             * The window starts CARRY_IN_LOOKBACK_DAYS early on purpose. A
+             * day's engine hours are the last reading of that day minus the
+             * last reading before it began — normally the previous day's
+             * final reading — so the first day of the window needs a reading
+             * from before the window to be measurable at all.
+             */
             gte(
               equipmentTelematicsReadings.recordedAt,
-              `${from}T00:00:00.000Z`,
+              `${addDaysISO(from, -CARRY_IN_LOOKBACK_DAYS)}T00:00:00.000Z`,
             ),
             lte(equipmentTelematicsReadings.recordedAt, `${to}T23:59:59.999Z`),
           ),
         );
 
-      /* telematics engine hours per machine per calendar day (UTC) */
-      const teleByMachineDay = new Map<
+      /*
+       * Every reading per machine, INCLUDING the carry-in lookback, plus the
+       * days inside the window that the feed itself reported on. Grouping by
+       * calendar day and taking last-minus-first inside each group lost every
+       * hour run between the last reading of one day and the first of the
+       * next, and returned null for any device reporting once a day — which
+       * the 1h + 15% tolerance then turned into "hours the machine does not
+       * corroborate" against an honest plant sheet.
+       */
+      const teleByMachine = new Map<
         string,
         { recordedAt: string; engineHours: number | null }[]
       >();
+      const teleDaysByMachine = new Map<string, Set<string>>();
+      const windowStartMs = Date.parse(`${from}T00:00:00.000Z`) - tz * 60_000;
       for (const row of teleRows) {
         if (!row.equipmentId) continue;
-        const key = `${row.equipmentId}|${dateOf(row.recordedAt)}`;
-        const list = teleByMachineDay.get(key) ?? [];
+        const list = teleByMachine.get(row.equipmentId) ?? [];
         list.push({ recordedAt: row.recordedAt, engineHours: row.engineHours });
-        teleByMachineDay.set(key, list);
+        teleByMachine.set(row.equipmentId, list);
+        if (Date.parse(row.recordedAt) < windowStartMs) continue;
+        const days = teleDaysByMachine.get(row.equipmentId) ?? new Set<string>();
+        days.add(localDateOf(row.recordedAt, tz));
+        teleDaysByMachine.set(row.equipmentId, days);
       }
       /* manual hours per machine per day — shifts on the same day are summed,
          because the telematics counter does not know about shifts */
@@ -5138,22 +5169,23 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         const dates = new Set<string>();
         for (const key of manualByMachineDay.keys()) {
           const [id, date] = key.split("|");
-          if (id === machine.id && date) dates.add(date);
+          if (id === machine.id && date && date >= from && date <= to) dates.add(date);
         }
-        for (const key of teleByMachineDay.keys()) {
-          const [id, date] = key.split("|");
-          if (id === machine.id && date) dates.add(date);
+        for (const date of teleDaysByMachine.get(machine.id) ?? []) {
+          if (date >= from && date <= to) dates.add(date);
         }
-        const days: TelematicsDayInput[] = [...dates].sort().map((date) => {
-          const counter = engineHoursFromCounter(
-            teleByMachineDay.get(`${machine.id}|${date}`) ?? [],
-          );
+        const series = engineHoursSeries({
+          dates: [...dates],
+          readings: teleByMachine.get(machine.id) ?? [],
+          tzOffsetMinutes: tz,
+        });
+        const days: TelematicsDayInput[] = series.map(({ date, delta }) => {
           const manual = manualByMachineDay.get(`${machine.id}|${date}`);
           return {
             date,
             manualWorkingHours: manual ? manual.hours : null,
-            telematicsEngineHours: counter.hours,
-            telematicsReasons: counter.reasons,
+            telematicsEngineHours: delta.hours,
+            telematicsReasons: delta.reasons,
           };
         });
         return {
@@ -5253,10 +5285,18 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         ...summary,
         method:
           "engine hours are a CUMULATIVE counter, so a day's telematics hours are the last " +
-          "reading of the day minus the first. A day with one reading, or a counter that fell " +
-          "(a device reset), yields null rather than zero — 'the machine did not work' and 'the " +
-          "feed cannot say' are opposite facts. Claimed hours must exceed engine hours by more " +
-          "than 1 hour AND more than 1.15x before the day is called unsupported.",
+          "reading of that day minus the last reading BEFORE it began — normally the previous " +
+          "day's final reading, which is why the feed is read " +
+          `${CARRY_IN_LOOKBACK_DAYS} day(s) before the window. Measuring inside the calendar day ` +
+          "instead lost every hour run between one day's last reading and the next day's first, " +
+          "and gave null for any device reporting once a day. A counter that fell (a device " +
+          "reset), and a day the feed never reached at all, yield null rather than zero — 'the " +
+          "machine did not work' and 'the feed cannot say' are opposite facts. Claimed hours " +
+          "must exceed engine hours by more than 1 hour AND more than 1.15x before the day is " +
+          "called unsupported." +
+          (tz === 0
+            ? " Days are cut on UTC; pass tzOffsetMinutes to cut them on the site's clock."
+            : ` Days are cut on the site clock (UTC${tz >= 0 ? "+" : "-"}${Math.floor(Math.abs(tz) / 60)}:${String(Math.abs(tz) % 60).padStart(2, "0")}).`),
         currencyNote:
           Object.keys(summary.valueAtRiskByCurrency).length > 1
             ? "value at risk is reported per currency and never added"

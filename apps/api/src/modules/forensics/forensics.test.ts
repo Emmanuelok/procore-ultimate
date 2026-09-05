@@ -11,12 +11,15 @@ import {
   delayEvents,
   evidence,
   ledgerEntries,
+  obligations,
   projects,
   rfis,
   scheduleBaselines,
   scheduleDependencies,
   scheduleTasks,
   schedules,
+  signals,
+  siteWeatherAnalyses,
   timecards,
   variations,
 } from "@constructos/db";
@@ -2067,5 +2070,402 @@ describe("tenant isolation", () => {
     });
     expect(res.statusCode).toBe(200);
     expect((res.json() as { totalClaims: number }).totalClaims).toBe(0);
+  });
+});
+
+
+/* ------------------------------------------------------------------ */
+/* Notice time bars — the sweep, the obligation and idempotence         */
+/* ------------------------------------------------------------------ */
+
+describe("notice time bars", () => {
+  const iso = (offsetDays: number) =>
+    new Date(Date.now() + offsetDays * 86_400_000).toISOString().slice(0, 10);
+
+  // The notice sweep runs on project3 (no schedule, no BoQ), so it needs its
+  // own contract event: contract events are project-scoped.
+  let p3ContractEventId: string;
+
+  beforeAll(async () => {
+    const p3ContractId = newId("con");
+    await app.db.insert(contracts).values({
+      id: p3ContractId,
+      companyId: owner.companyId,
+      projectId: project3Id,
+      name: "Bare Project Contract",
+      form: "nec4_ecc",
+      necOption: "A",
+      createdBy: owner.userId,
+    });
+    p3ContractEventId = newId("cev");
+    await app.db.insert(contractEvents).values({
+      id: p3ContractEventId,
+      companyId: owner.companyId,
+      projectId: project3Id,
+      contractId: p3ContractId,
+      number: 1,
+      kind: "early_warning",
+      title: "Notice served",
+      eventDate: "2026-02-01",
+      noticeServedAt: "2026-02-02T09:00:00Z",
+      raisedBy: owner.userId,
+    });
+  });
+
+  async function createEvent(noticeDueDate: string | null): Promise<string> {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project3Id}/delay-events`,
+      headers: owner.headers,
+      payload: {
+        title: `Notice bar ${noticeDueDate ?? "none"} ${Math.random().toString(36).slice(2, 8)}`,
+        cause: "client_change",
+        excusable: true,
+        compensable: true,
+        startDate: "2026-02-01",
+        durationDays: 4,
+        ...(noticeDueDate ? { noticeDueDate } : {}),
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    return (res.json() as { id: string }).id;
+  }
+
+  async function sweep() {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project3Id}/forensics/notice-sweep`,
+      headers: owner.headers,
+      payload: {},
+    });
+    expect(res.statusCode).toBe(200);
+    return res.json() as {
+      scanned: number;
+      obligationsOpened: number;
+      obligationsClosed: number;
+      dueSoon: number;
+      missed: number;
+      alerted: number;
+      warnDays: number;
+    };
+  }
+
+  async function eventRow(id: string) {
+    const [row] = await app.db.select().from(delayEvents).where(eq(delayEvents.id, id)).limit(1);
+    return row!;
+  }
+
+  it("opens exactly one obligation per notice deadline and never a second", async () => {
+    const id = await createEvent(iso(20));
+    const first = await sweep();
+    expect(first.obligationsOpened).toBeGreaterThanOrEqual(1);
+
+    const row = await eventRow(id);
+    expect(row.noticeObligationId).toBeTruthy();
+    const [obl] = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, row.noticeObligationId!))
+      .limit(1);
+    expect(obl!.status).toBe("open");
+    expect(obl!.deadline?.slice(0, 10)).toBe(iso(20));
+
+    // A second cycle over unchanged data must not manufacture another.
+    const again = await sweep();
+    const rowAgain = await eventRow(id);
+    expect(rowAgain.noticeObligationId).toBe(row.noticeObligationId);
+    expect(again.obligationsOpened).toBe(0);
+  });
+
+  it("raises one critical signal for a passed bar, breaches the obligation, and does not duplicate", async () => {
+    const id = await createEvent(iso(-3));
+    const first = await sweep();
+    expect(first.missed).toBeGreaterThanOrEqual(1);
+    expect(first.alerted).toBeGreaterThanOrEqual(1);
+
+    const row = await eventRow(id);
+    expect(row.noticeAlertedAt).toBeTruthy();
+    const [obl] = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, row.noticeObligationId!))
+      .limit(1);
+    expect(obl!.status).toBe("breached");
+
+    const raised = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.projectId, project3Id),
+          eq(signals.detector, "forensics.notice_time_bar_missed"),
+        ),
+      );
+    const mine = raised.filter(
+      (sg) => (sg.evidenceRefs as { key?: string } | null)?.key === id,
+    );
+    expect(mine).toHaveLength(1);
+    expect(mine[0]!.severity).toBe("critical");
+
+    const second = await sweep();
+    expect(second.alerted).toBe(0);
+    const after = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.projectId, project3Id),
+          eq(signals.detector, "forensics.notice_time_bar_missed"),
+        ),
+      );
+    expect(after.filter((sg) => (sg.evidenceRefs as { key?: string } | null)?.key === id)).toHaveLength(1);
+  });
+
+  it("warns once for a bar inside the warning window without breaching the obligation", async () => {
+    const id = await createEvent(iso(2));
+    const res = await sweep();
+    expect(res.dueSoon).toBeGreaterThanOrEqual(1);
+    const row = await eventRow(id);
+    const [obl] = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, row.noticeObligationId!))
+      .limit(1);
+    expect(obl!.status).toBe("open");
+    const due = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(eq(signals.projectId, project3Id), eq(signals.detector, "forensics.notice_time_bar_due")),
+      );
+    expect(due.filter((sg) => (sg.evidenceRefs as { key?: string } | null)?.key === id)).toHaveLength(1);
+  });
+
+  it("satisfies the obligation once a notice is recorded against the event", async () => {
+    const id = await createEvent(iso(10));
+    await sweep();
+    const before = await eventRow(id);
+    expect(before.noticeObligationId).toBeTruthy();
+
+    const patch = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${project3Id}/delay-events/${id}`,
+      headers: owner.headers,
+      payload: { contractEventId: p3ContractEventId },
+    });
+    expect(patch.statusCode).toBe(200);
+
+    const res = await sweep();
+    expect(res.obligationsClosed).toBeGreaterThanOrEqual(1);
+    const [obl] = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, before.noticeObligationId!))
+      .limit(1);
+    expect(obl!.status).toBe("satisfied");
+    expect(obl!.satisfiedEvidenceId).toBe(p3ContractEventId);
+  });
+
+  it("waives the obligation and opens a fresh one when the deadline moves", async () => {
+    const id = await createEvent(iso(15));
+    await sweep();
+    const before = await eventRow(id);
+    const originalObligation = before.noticeObligationId!;
+
+    const patch = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${project3Id}/delay-events/${id}`,
+      headers: owner.headers,
+      payload: { noticeDueDate: iso(25) },
+    });
+    expect(patch.statusCode).toBe(200);
+
+    const [waived] = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, originalObligation))
+      .limit(1);
+    expect(waived!.status).toBe("waived");
+
+    const cleared = await eventRow(id);
+    expect(cleared.noticeObligationId).toBeNull();
+
+    await sweep();
+    const reopened = await eventRow(id);
+    expect(reopened.noticeObligationId).toBeTruthy();
+    expect(reopened.noticeObligationId).not.toBe(originalObligation);
+    const [fresh] = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, reopened.noticeObligationId!))
+      .limit(1);
+    expect(fresh!.deadline?.slice(0, 10)).toBe(iso(25));
+  });
+
+  it("waives the obligation when the event is withdrawn", async () => {
+    const id = await createEvent(iso(12));
+    await sweep();
+    const before = await eventRow(id);
+
+    const status = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project3Id}/delay-events/${id}/status`,
+      headers: owner.headers,
+      payload: { status: "withdrawn", reason: "Raised in error" },
+    });
+    expect(status.statusCode).toBe(200);
+
+    await sweep();
+    const [obl] = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, before.noticeObligationId!))
+      .limit(1);
+    expect(obl!.status).toBe("waived");
+  });
+
+  it("reports notice exposure through the health-inputs endpoint", async () => {
+    await createEvent(iso(-1));
+    await sweep();
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${project3Id}/forensics/health-inputs`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { metrics: Record<string, number | null>; reasons: string[] };
+    expect(body.metrics["noticeTimeBarsMissed"]).toBeGreaterThanOrEqual(1);
+    expect(body.reasons.some((r) => r.includes("notice time bar"))).toBe(true);
+  });
+
+  it("runs as a registered scheduler job", async () => {
+    const status = await app.scheduler.runNow("forensics.notice-time-bars");
+    expect(status.lastError ?? null).toBeNull();
+  });
+
+  it("another company cannot run the notice sweep on this project", async () => {
+    const outsider = await registerActor(app);
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project3Id}/forensics/notice-sweep`,
+      headers: outsider.headers,
+      payload: {},
+    });
+    expect([403, 404]).toContain(res.statusCode);
+  });
+});
+
+
+/* ------------------------------------------------------------------ */
+/* Weather baseline linkage (delay event <-> site weather analysis)     */
+/* ------------------------------------------------------------------ */
+
+describe("weather baseline linkage", () => {
+  let weatherEventId: string;
+  let dryEventId: string;
+
+  beforeAll(async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project2Id}/delay-events`,
+      headers: owner.headers,
+      payload: {
+        title: "Exceptional rainfall, February",
+        cause: "exceptional_weather",
+        excusable: true,
+        compensable: false,
+        startDate: "2026-02-01",
+        durationDays: 12,
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    weatherEventId = (res.json() as { id: string }).id;
+
+    const dry = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project2Id}/delay-events`,
+      headers: owner.headers,
+      payload: {
+        title: "Late design release",
+        cause: "client_change",
+        excusable: true,
+        compensable: true,
+        startDate: "2026-03-01",
+        durationDays: 5,
+      },
+    });
+    dryEventId = (dry.json() as { id: string }).id;
+
+    await app.db.insert(siteWeatherAnalyses).values({
+      id: newId("swa"),
+      companyId: owner.companyId,
+      projectId: project2Id,
+      number: 1,
+      reference: "WX-001",
+      baselineId: newId("swb"),
+      periodStart: "2026-02-01",
+      periodEnd: "2026-02-28",
+      status: "issued",
+      daysInPeriod: 28,
+      daysObserved: 26,
+      observedAdverseDays: 14,
+      baselineAdverseDays: 6,
+      exceptionalDays: 8,
+      hoursLost: 64,
+      coveragePercent: 92.9,
+      byMonth: [
+        { month: "2026-02", days: 28, observed: 14, expected: 6, exceptional: 8, reasons: ["precipitation_mm > 10"] },
+      ],
+      reasons: [],
+      delayEventId: weatherEventId,
+      generatedBy: owner.userId,
+    });
+  });
+
+  it("returns the issued weather analysis behind an exceptional-weather event", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${project2Id}/delay-events/${weatherEventId}/weather`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      analyses: { reference: string; exceptionalDays: number | null }[];
+      summary: { exceptionalDays: number | null; hoursLost: number | null; meanCoveragePercent: number | null };
+      reasons: string[];
+    };
+    expect(body.analyses).toHaveLength(1);
+    expect(body.analyses[0]!.reference).toBe("WX-001");
+    expect(body.summary.exceptionalDays).toBe(8);
+    expect(body.summary.hoursLost).toBe(64);
+    expect(body.summary.meanCoveragePercent).toBe(92.9);
+    expect(body.reasons).toHaveLength(0);
+  });
+
+  it("says exceptional days are not available rather than reporting zero", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${project2Id}/delay-events/${dryEventId}/weather`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      analyses: unknown[];
+      summary: { exceptionalDays: number | null };
+      reasons: string[];
+    };
+    expect(body.analyses).toHaveLength(0);
+    expect(body.summary.exceptionalDays).toBeNull();
+    expect(body.reasons.length).toBeGreaterThan(0);
+  });
+
+  it("another company cannot read the weather evidence of this event", async () => {
+    const outsider = await registerActor(app);
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${project2Id}/delay-events/${weatherEventId}/weather`,
+      headers: outsider.headers,
+    });
+    expect([403, 404]).toContain(res.statusCode);
   });
 });

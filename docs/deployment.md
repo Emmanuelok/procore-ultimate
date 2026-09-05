@@ -47,26 +47,39 @@ Use S3. The local driver exists for development and as an escape hatch.
 
 ---
 
-## 1.9 Production image — verified, not assumed
+## 1.9 Production image — verified by CI, not by a memory of a walkthrough
 
-The image in this repo was built and booted before this release shipped, because a
-deployment that fails at boot costs more than the check does. What was verified, on
-2026-08-26, against the exact `Dockerfile` and `railway.json` here:
+This section used to be a table of results from one hand-run walkthrough, dated, quoting
+a migration range (0000–0008) and a table count (177) that stopped being true within a
+fortnight. A verification that decays is worse than none: it invites confidence in a fact
+nobody has re-checked.
 
-| Check | Result |
-|---|---|
-| Image builds with the full dependency set (React 19, Tailwind v4, recharts, framer-motion, TanStack Table, pdf.js, three/web-ifc) | builds clean |
-| Container boots with only `AUTH_SECRET` set | `/api/v1/health` → 200, `db: pglite` |
-| Container boots against real PostgreSQL 16 via `DATABASE_URL` | `/api/v1/health` → 200, `db: postgres` |
-| Migrations 0000–0008 apply at boot on a virgin Postgres | **177 tables created**, including all 17 financial tables |
-| SPA served same-origin from the API container | `GET /` → 200 |
-| Financial API end to end inside the image | project → cost code → budget → budget line; `revisedBudget` = `originalBudget` + `approvedChanges` reconciled |
-| Hash-chained ledger inside the image | `/ledger/verify` → `{"valid": true}` |
+The check now runs on every push. `.github/workflows/ci.yml` has an `image` job that:
 
-Two refusals fired correctly during that walkthrough and are worth knowing about, because
-both look like errors and are not: creating a project with an invalid `stage` returns a
-zod validation error naming the five permitted values, and creating a budget line without
-a cost code is refused outright — budget lines bind to the project's cost-code structure
+1. builds this exact `Dockerfile`;
+2. runs the resulting container against a real PostgreSQL 16 service, in production mode,
+   with only the variables a real deployment sets (`DATABASE_URL`, `AUTH_SECRET`,
+   `APP_BASE_URL`);
+3. waits for `GET /api/v1/health/ready` to return 200 — which means migrations applied and
+   a query executed, not merely that a process is listening;
+4. asserts `GET /api/v1/health` reports `db: postgres`, so an image that silently fell
+   back to the embedded database fails rather than passing every other check;
+5. asserts the SPA is served same-origin with a CSP header and that a client route falls
+   back to `index.html`;
+6. asserts an unauthenticated SCIM call is refused **in SCIM's own error envelope** (an
+   identity provider parses that; it logs this platform's envelope as an unexplained
+   failure);
+7. registers an account end to end against the real database.
+
+The deploy workflow is gated on that run: `deploy-railway.yml` triggers on CI's
+completion and refuses to run unless the conclusion was `success`, checking out
+`workflow_run.head_sha` — the commit CI actually tested, not whatever the branch tip has
+become since.
+
+Two refusals fire during a manual walkthrough and are worth knowing about, because both
+look like errors and are not: creating a project with an invalid `stage` returns a zod
+validation error naming the five permitted values, and creating a budget line without a
+cost code is refused outright — budget lines bind to the project's cost-code structure
 rather than inventing a parallel hierarchy.
 
 ## 2. Runbook

@@ -3,6 +3,7 @@ import { and, asc, count, desc, eq, inArray, isNotNull, lte } from "drizzle-orm"
 import { z } from "zod";
 import {
   bidBonds,
+  bidDocumentAccess,
   bidInvitations,
   bidMeetingAttendees,
   bidMeetings,
@@ -21,6 +22,7 @@ import {
   BOND_TYPES,
 } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
+import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, conflict, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
@@ -44,6 +46,7 @@ import {
   type BidPackageRow,
 } from "./shared.js";
 import { addendaOf } from "./packages.js";
+import { ledgerPortalAction, resolvePortalSession } from "./invitations.js";
 
 /**
  * WHAT HAPPENS BETWEEN ISSUING A TENDER AND RECEIVING THE BIDS.
@@ -324,11 +327,15 @@ export const engagementRoutes: FastifyPluginAsync = async (app) => {
             "chance to ask for — publish the answer to everyone or refuse the query."
           : null;
 
-      const [maxRow] = await app.db
-        .select({ n: count() })
-        .from(bidQuestions)
-        .where(eq(bidQuestions.packageId, packageId));
-      const number = Number(maxRow?.n ?? 0) + 1;
+      /*
+       * ATOMIC, NOT count()+1. `bid_questions` carries a unique index on
+       * (package_id, number), so two queries logged in the same second — one
+       * by staff, one arriving through the bidder portal — computed the same
+       * number and the second insert died on the index with an unhandled 500.
+       * A tender query that vanishes because two bidders asked at once is the
+       * exact failure the register exists to prevent.
+       */
+      const number = await nextRecordNumber(app.db, packageId, "bid_question");
       const id = newId("bqn");
       await app.db.insert(bidQuestions).values({
         id,
@@ -380,6 +387,157 @@ export const engagementRoutes: FastifyPluginAsync = async (app) => {
       return reply.status(201).send({ ...created, lateWarning });
     },
   );
+
+  /**
+   * THE BIDDER'S OWN QUESTION (#182, #168).
+   *
+   * A tender query asked through the bidder portal, with no platform account:
+   * the vendor and the invitation come from the token, never from the body,
+   * so a bidder cannot log a question against somebody else's invitation.
+   *
+   * It lands in the SAME register as a query taken by phone and typed in by
+   * the buyer, at status `submitted`, and it is answered and published through
+   * the same route — because the control that matters is that every bidder
+   * ends up answering the same question, and that control cannot depend on
+   * which door the question came through.
+   */
+  app.post("/bid-portal/questions", async (req, reply) => {
+    const body = z
+      .object({
+        question: z.string().trim().min(1).max(20000),
+        category: z.enum(BID_QUESTION_CATEGORIES).default("scope"),
+        specSectionId: z.string().min(1).max(64).nullable().optional(),
+        drawingSheetId: z.string().min(1).max(64).nullable().optional(),
+        fileIds: z.array(z.string().min(1).max(64)).max(20).optional(),
+      })
+      .parse(req.body);
+    const { invitation, pkg } = await resolvePortalSession(app.db, req.headers.authorization);
+    if (pkg.status === "draft") {
+      throw conflict(
+        `${pkg.reference} has not been issued, so there is nothing to ask about yet.`,
+      );
+    }
+    const askedAt = new Date().toISOString();
+    const lateWarning =
+      pkg.questionsDueAt && (epochMs(askedAt) ?? 0) > (epochMs(pkg.questionsDueAt) ?? 0)
+        ? `The questions deadline for ${pkg.reference} passed at ${pkg.questionsDueAt}. Your ` +
+          "query is recorded, but the buyer may decline to answer it: an answer given after " +
+          "the deadline hands one bidder information the others had no chance to ask for."
+        : null;
+
+    const number = await nextRecordNumber(app.db, pkg.id, "bid_question");
+    const id = newId("bqn");
+    await app.db.insert(bidQuestions).values({
+      id,
+      companyId: invitation.companyId,
+      projectId: invitation.projectId,
+      packageId: pkg.id,
+      invitationId: invitation.id,
+      vendorId: invitation.vendorId,
+      number,
+      reference: questionReference(number),
+      category: body.category,
+      question: body.question,
+      askedAt,
+      status: "submitted",
+      specSectionId: body.specSectionId ?? null,
+      drawingSheetId: body.drawingSheetId ?? null,
+      fileIds: body.fileIds ?? [],
+      detail: { via: "portal_token" },
+      // A bidder is not a platform user; the pathway stands in for the actor.
+      createdBy: null,
+    });
+    const now = new Date().toISOString();
+    await app.db
+      .update(bidInvitations)
+      .set({
+        questionsAsked: invitation.questionsAsked + 1,
+        portalLastAccessAt: now,
+        updatedAt: now,
+      })
+      .where(eq(bidInvitations.id, invitation.id));
+    await ledgerPortalAction(app.db, invitation, "create", {
+      packageId: pkg.id,
+      packageReference: pkg.reference,
+      event: "portal_question_asked",
+      questionId: id,
+      reference: questionReference(number),
+      category: body.category,
+      askedAfterDeadline: Boolean(lateWarning),
+    });
+    return reply.status(201).send({
+      id,
+      reference: questionReference(number),
+      status: "submitted",
+      askedAt,
+      lateWarning,
+      note:
+        "Your question is with the buyer. When it is answered, the answer is published to " +
+        "every bidder on this package as an addendum — anonymised, so the fact that you asked " +
+        "it does not tell your competitors anything.",
+    });
+  });
+
+  /**
+   * What was issued with this tender, from the bidder's side: the documents,
+   * the addenda, and which of them this bidder has already recorded opening.
+   * The platform does not serve the files themselves, so what comes back is
+   * the manifest — the thing a bidder needs in order to notice that they are
+   * missing addendum 3.
+   */
+  app.get("/bid-portal/documents", async (req) => {
+    const { invitation, pkg } = await resolvePortalSession(app.db, req.headers.authorization);
+    const opened = await app.db
+      .select({ fileId: bidDocumentAccess.fileId, accessedAt: bidDocumentAccess.accessedAt })
+      .from(bidDocumentAccess)
+      .where(
+        and(
+          eq(bidDocumentAccess.packageId, pkg.id),
+          eq(bidDocumentAccess.invitationId, invitation.id),
+        ),
+      );
+    const firstSeen = new Map<string, string>();
+    for (const row of opened) {
+      const prior = firstSeen.get(row.fileId);
+      if (!prior || row.accessedAt < prior) firstSeen.set(row.fileId, row.accessedAt);
+    }
+    const acknowledged = new Set(
+      ((invitation.addendaAcknowledged as { addendumRef?: string }[]) ?? []).map(
+        (a) => a.addendumRef,
+      ),
+    );
+    const files = [
+      ...((pkg.documentFileIds as string[]) ?? []).map((fileId) => ({
+        fileId,
+        documentKind: "tender_document" as const,
+        addendumRef: null as string | null,
+        requiresAcknowledgement: false,
+        acknowledged: null as boolean | null,
+      })),
+      ...addendaOf(pkg).flatMap((a) =>
+        (a.fileIds ?? []).map((fileId) => ({
+          fileId,
+          documentKind: "addendum" as const,
+          addendumRef: a.reference,
+          requiresAcknowledgement: a.requiresAcknowledgement,
+          acknowledged: acknowledged.has(a.reference),
+        })),
+      ),
+    ].map((f) => ({ ...f, firstOpenedAt: firstSeen.get(f.fileId) ?? null }));
+    return {
+      package: { reference: pkg.reference, title: pkg.title },
+      files,
+      total: files.length,
+      unopened: files.filter((f) => f.firstOpenedAt === null).length,
+      outstandingAcknowledgements: files
+        .filter((f) => f.requiresAcknowledgement && f.acknowledged === false)
+        .map((f) => f.addendumRef)
+        .filter((r): r is string => r !== null),
+      note:
+        "Record each download through /bid-portal/document-access. The log is what answers " +
+        "'did every bidder receive the same documents' if this award is ever challenged.",
+    };
+  });
 
   app.get(
     "/projects/:projectId/bid-packages/:packageId/questions",

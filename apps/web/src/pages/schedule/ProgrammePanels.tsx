@@ -1,6 +1,7 @@
 /**
  * Programme side panels for the schedule workspace: earned value, key
- * milestones, the lookahead constraints log, work calendars, update
+ * milestones, the lookahead constraints log, work calendars, resource
+ * loading (#370), revision comparison (#357), a calendar view, update
  * narratives and P6/MSP import-export.
  *
  * Each panel owns its own fetch, loading, error and empty state so one broken
@@ -28,11 +29,14 @@ import {
 import { formatDate, formatDateTime } from "../format";
 import type {
   CalendarRow,
+  CalendarViewResponse,
   ConstraintRow,
   EarnedValueResponse,
   ImportRunRow,
   MilestoneRow,
   NarrativeRow,
+  ResourcesResponse,
+  RevisionCompareResponse,
   RevisionDiffSummary,
   ScheduleRow,
 } from "./types";
@@ -949,3 +953,610 @@ export function ImportPanel({
 }
 
 export { Value };
+
+/* ================================================================== */
+/* Resource loading (#370)                                             */
+/* ================================================================== */
+
+const RESOURCE_TYPES = ["labour", "equipment", "material", "subcontract", "other"];
+
+/**
+ * Resource-loaded activities. Units and cost are shown side by side because
+ * a programme loaded with hours but no rates still answers "who is needed
+ * when" — and the panel says so rather than showing a zero cost as if it
+ * were priced.
+ */
+export function ResourcesPanel({
+  base,
+  scheduleId,
+  tasks,
+}: {
+  base: string;
+  scheduleId: string | null;
+  tasks: { id: string; name: string }[];
+}) {
+  const { data, loading, error, reload } = useResource<ResourcesResponse>(
+    scheduleId ? `${base}/schedules/${scheduleId}/resources` : null,
+  );
+  const currency = data?.currency ?? "USD";
+  const [taskId, setTaskId] = useState("");
+  const [name, setName] = useState("");
+  const [resourceType, setResourceType] = useState("labour");
+  const [unit, setUnit] = useState("hours");
+  const [budgetedUnits, setBudgetedUnits] = useState("");
+  const [unitRate, setUnitRate] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+
+  const taskName = new Map(tasks.map((t) => [t.id, t.name] as const));
+
+  async function onCreate(e: FormEvent) {
+    e.preventDefault();
+    if (!taskId || name.trim().length === 0) {
+      setFormError("Choose an activity and name the resource.");
+      return;
+    }
+    setBusy(true);
+    setFormError(null);
+    try {
+      await api.post(`${base}/schedule-tasks/${taskId}/resources`, {
+        name: name.trim(),
+        resourceType,
+        unit: unit.trim() || null,
+        budgetedUnits: Number(budgetedUnits) || 0,
+        ...(unitRate.trim() === "" ? {} : { unitRate: Number(unitRate) }),
+      });
+      setName("");
+      setBudgetedUnits("");
+      setUnitRate("");
+      reload();
+    } catch (err) {
+      setFormError(errMessage(err, "The resource could not be assigned."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onDelete(id: string) {
+    setBusy(true);
+    setFormError(null);
+    try {
+      await api.del(`${base}/schedule-task-resources/${id}`);
+      reload();
+    } catch (err) {
+      setFormError(errMessage(err, "The assignment could not be removed."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!scheduleId) {
+    return <EmptyState title="Select a schedule" hint="Resources load onto a programme's activities." />;
+  }
+
+  const items = data?.items ?? [];
+  const byType = data?.byType ?? [];
+  const reasons = data?.reasons ?? [];
+  const anyPriced = items.some((r) => r.unitRate !== null || r.budgetedCost > 0);
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-3">
+        <Stat label="Assignments" value={String(items.length)} />
+        <Stat
+          label="Budgeted cost"
+          value={anyPriced ? money(byType.reduce((s, t) => s + t.budgetedCost, 0), currency) : "—"}
+          hint={anyPriced ? undefined : "No assignment carries a rate"}
+        />
+        <Stat
+          label="Actual cost"
+          value={anyPriced ? money(byType.reduce((s, t) => s + t.actualCost, 0), currency) : "—"}
+        />
+      </div>
+
+      {reasons.length > 0 ? (
+        <Alert tone="info" title="How these figures were produced">
+          <ul className="ml-4 list-disc space-y-1 text-xs">
+            {reasons.map((r) => (
+              <li key={r}>{r}</li>
+            ))}
+          </ul>
+        </Alert>
+      ) : null}
+
+      <Card>
+        <CardBody>
+          <form className="grid grid-cols-1 gap-2 md:grid-cols-6" onSubmit={onCreate}>
+            <Field label="Activity" className="md:col-span-2">
+              <Select value={taskId} onChange={(e) => setTaskId(e.target.value)}>
+                <option value="">Choose an activity…</option>
+                {tasks.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Resource">
+              <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Steel fixers" />
+            </Field>
+            <Field label="Class">
+              <Select value={resourceType} onChange={(e) => setResourceType(e.target.value)}>
+                {RESOURCE_TYPES.map((t) => (
+                  <option key={t} value={t}>
+                    {t}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Budgeted units">
+              <div className="flex gap-1">
+                <Input
+                  type="number"
+                  min="0"
+                  step="any"
+                  value={budgetedUnits}
+                  onChange={(e) => setBudgetedUnits(e.target.value)}
+                />
+                <Input value={unit} onChange={(e) => setUnit(e.target.value)} placeholder="hours" />
+              </div>
+            </Field>
+            <Field label={`Rate (${currency}/unit)`}>
+              <div className="flex gap-2">
+                <Input
+                  type="number"
+                  min="0"
+                  step="any"
+                  value={unitRate}
+                  onChange={(e) => setUnitRate(e.target.value)}
+                  placeholder="optional"
+                />
+                <Button type="submit" size="sm" disabled={busy}>
+                  Add
+                </Button>
+              </div>
+            </Field>
+          </form>
+          {formError ? <ErrorAlert message={formError} className="mt-2" /> : null}
+        </CardBody>
+      </Card>
+
+      {loading ? <Spinner label="Loading resource assignments…" /> : null}
+      {error ? <ErrorAlert message={error} /> : null}
+      {!loading && !error && items.length === 0 ? (
+        <EmptyState
+          title="No resources loaded"
+          hint="Load labour, plant and subcontract onto activities — a resource-loaded programme is what turns earned value and the DCMA resource check from 'not applicable' into a number."
+        />
+      ) : null}
+
+      {byType.length > 0 ? (
+        <Card>
+          <CardBody className="overflow-x-auto p-0">
+            <table className="w-full text-sm">
+              <thead>
+                <tr>
+                  <Th>Class</Th>
+                  <Th align="right">Budgeted units</Th>
+                  <Th align="right">Actual units</Th>
+                  <Th align="right">Budgeted cost</Th>
+                  <Th align="right">Actual cost</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {byType.map((t) => (
+                  <tr key={t.resourceType} className="border-t border-ink-100">
+                    <td className="px-3 py-1.5 text-ink-800">{t.resourceType}</td>
+                    <td className="px-3 py-1.5 text-right tabular-nums">
+                      <Value value={t.budgetedUnits} />
+                    </td>
+                    <td className="px-3 py-1.5 text-right tabular-nums">
+                      <Value value={t.actualUnits} />
+                    </td>
+                    <td className="px-3 py-1.5 text-right tabular-nums">
+                      {t.budgetedCost > 0 ? money(t.budgetedCost, currency) : <span className="text-ink-400">—</span>}
+                    </td>
+                    <td className="px-3 py-1.5 text-right tabular-nums">
+                      {t.actualCost > 0 ? money(t.actualCost, currency) : <span className="text-ink-400">—</span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </CardBody>
+        </Card>
+      ) : null}
+
+      {items.length > 0 ? (
+        <Card>
+          <CardBody className="overflow-x-auto p-0">
+            <table className="w-full text-sm">
+              <thead>
+                <tr>
+                  <Th>Activity</Th>
+                  <Th>Resource</Th>
+                  <Th>Class</Th>
+                  <Th align="right">Budgeted</Th>
+                  <Th align="right">Actual</Th>
+                  <Th align="right">Rate</Th>
+                  <Th />
+                </tr>
+              </thead>
+              <tbody>
+                {items.map((r) => (
+                  <tr key={r.id} className="border-t border-ink-100">
+                    <td className="px-3 py-1.5 text-ink-700">{taskName.get(r.taskId) ?? r.taskId}</td>
+                    <td className="px-3 py-1.5 text-ink-900">{r.name}</td>
+                    <td className="px-3 py-1.5 text-ink-500">{r.resourceType}</td>
+                    <td className="px-3 py-1.5 text-right tabular-nums">
+                      {r.budgetedUnits} {r.unit ?? ""}
+                    </td>
+                    <td className="px-3 py-1.5 text-right tabular-nums">
+                      {r.actualUnits} {r.unit ?? ""}
+                    </td>
+                    <td className="px-3 py-1.5 text-right tabular-nums">
+                      {r.unitRate === null ? (
+                        <span className="text-ink-400" title="No rate recorded — cost is not available">
+                          —
+                        </span>
+                      ) : (
+                        money(r.unitRate, currency)
+                      )}
+                    </td>
+                    <td className="px-3 py-1.5 text-right">
+                      <Button size="xs" variant="ghost" disabled={busy} onClick={() => void onDelete(r.id)}>
+                        Remove
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </CardBody>
+        </Card>
+      ) : null}
+    </div>
+  );
+}
+
+/* ================================================================== */
+/* Revision comparison (#357) and MSPDI export                         */
+/* ================================================================== */
+
+export function RevisionsPanel({
+  base,
+  schedules,
+  scheduleId,
+}: {
+  base: string;
+  schedules: ScheduleRow[];
+  scheduleId: string | null;
+}) {
+  const [fromId, setFromId] = useState("");
+  const [toId, setToId] = useState(scheduleId ?? "");
+  const [result, setResult] = useState<RevisionCompareResponse | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [panelError, setPanelError] = useState<string | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  /* A stale comparison headed by the previous revision pair is a lie about
+   * the current selection, so the result is dropped whenever either side
+   * changes. */
+  useEffect(() => {
+    setResult(null);
+    setPanelError(null);
+  }, [fromId, toId]);
+
+  async function run() {
+    if (!fromId || !toId || fromId === toId) {
+      setPanelError("Choose two different revisions to compare.");
+      return;
+    }
+    setBusy(true);
+    setPanelError(null);
+    try {
+      const res = await api.get<RevisionCompareResponse>(
+        `${base}/schedules-compare?fromScheduleId=${encodeURIComponent(fromId)}&toScheduleId=${encodeURIComponent(toId)}`,
+      );
+      setResult(res);
+    } catch (err) {
+      setResult(null);
+      setPanelError(errMessage(err, "The revisions could not be compared."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function exportXml() {
+    if (!scheduleId) return;
+    setExportError(null);
+    try {
+      const xml = await api.get<string>(`${base}/schedules/${scheduleId}/export?format=mspdi`);
+      const blob = new Blob([typeof xml === "string" ? xml : String(xml)], {
+        type: "application/xml;charset=utf-8",
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const name = schedules.find((s) => s.id === scheduleId)?.name ?? "schedule";
+      a.download = `${name.replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 80) || "schedule"}.xml`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    } catch (err) {
+      setExportError(errMessage(err, "The programme could not be exported."));
+    }
+  }
+
+  const diff = result?.diff ?? null;
+
+  return (
+    <div className="space-y-3">
+      <Card>
+        <CardBody className="space-y-2">
+          <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
+            <Field label="From revision">
+              <Select value={fromId} onChange={(e) => setFromId(e.target.value)}>
+                <option value="">Choose…</option>
+                {schedules.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name}
+                    {s.revision ? ` (rev ${s.revision})` : ""}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="To revision">
+              <Select value={toId} onChange={(e) => setToId(e.target.value)}>
+                <option value="">Choose…</option>
+                {schedules.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name}
+                    {s.revision ? ` (rev ${s.revision})` : ""}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <div className="flex items-end gap-2">
+              <Button size="sm" disabled={busy} onClick={() => void run()}>
+                Compare
+              </Button>
+              <Button size="sm" variant="secondary" disabled={!scheduleId} onClick={() => void exportXml()}>
+                Export MS Project XML
+              </Button>
+            </div>
+          </div>
+          {panelError ? <ErrorAlert message={panelError} /> : null}
+          {exportError ? <ErrorAlert message={exportError} /> : null}
+          <p className="text-xs text-ink-400">
+            Activities are matched on the source file id, then WBS code and name — a renamed activity
+            with no external id reads as one removed and one added, and the totals say so.
+          </p>
+        </CardBody>
+      </Card>
+
+      {result && diff ? (
+        <>
+          <div className="flex flex-wrap items-center gap-3">
+            <Stat
+              label="Completion movement"
+              value={
+                result.completionMovementDays === null
+                  ? "—"
+                  : `${result.completionMovementDays > 0 ? "+" : ""}${result.completionMovementDays} d`
+              }
+              hint={
+                result.completionMovementDays === null
+                  ? "One of the revisions has no computed finish"
+                  : `${result.from.computedFinish ?? "?"} → ${result.to.computedFinish ?? "?"}`
+              }
+              tone={
+                result.completionMovementDays !== null && result.completionMovementDays > 0
+                  ? "danger"
+                  : "neutral"
+              }
+            />
+            <Stat label="Added" value={String(diff.totals.added)} />
+            <Stat label="Removed" value={String(diff.totals.removed)} />
+            <Stat label="Duration changes" value={String(diff.totals.durationChanged)} />
+            <Stat label="Logic changes" value={String(diff.totals.logicChanged)} />
+          </div>
+
+          {diff.durationChanges.length > 0 ? (
+            <Card>
+              <CardHeaderless title="Duration changes" />
+              <CardBody className="overflow-x-auto p-0">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr>
+                      <Th>Activity</Th>
+                      <Th align="right">From</Th>
+                      <Th align="right">To</Th>
+                      <Th align="right">Delta</Th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {diff.durationChanges.slice(0, 100).map((d) => (
+                      <tr key={`${d.name}-${d.fromDays}-${d.toDays}`} className="border-t border-ink-100">
+                        <td className="px-3 py-1.5 text-ink-800">{d.name}</td>
+                        <td className="px-3 py-1.5 text-right tabular-nums">{d.fromDays}d</td>
+                        <td className="px-3 py-1.5 text-right tabular-nums">{d.toDays}d</td>
+                        <td
+                          className={`px-3 py-1.5 text-right tabular-nums ${d.deltaDays > 0 ? "text-red-600" : "text-emerald-600"}`}
+                        >
+                          {d.deltaDays > 0 ? "+" : ""}
+                          {d.deltaDays}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </CardBody>
+            </Card>
+          ) : null}
+
+          {diff.logicAdded.length > 0 || diff.logicRemoved.length > 0 || diff.logicChanged.length > 0 ? (
+            <Card>
+              <CardHeaderless title="Logic changes" />
+              <CardBody className="space-y-1 text-xs">
+                {diff.logicAdded.slice(0, 40).map((l) => (
+                  <div key={`a-${l.predecessor}-${l.successor}`} className="text-emerald-700">
+                    + {l.predecessor} → {l.successor} {l.toType ?? ""}
+                  </div>
+                ))}
+                {diff.logicRemoved.slice(0, 40).map((l) => (
+                  <div key={`r-${l.predecessor}-${l.successor}`} className="text-red-600">
+                    − {l.predecessor} → {l.successor} {l.fromType ?? ""}
+                  </div>
+                ))}
+                {diff.logicChanged.slice(0, 40).map((l) => (
+                  <div key={`c-${l.predecessor}-${l.successor}`} className="text-amber-700">
+                    ~ {l.predecessor} → {l.successor}: {l.fromType ?? "?"} → {l.toType ?? "?"}
+                  </div>
+                ))}
+              </CardBody>
+            </Card>
+          ) : null}
+
+          {diff.totals.added === 0 &&
+          diff.totals.removed === 0 &&
+          diff.totals.durationChanged === 0 &&
+          diff.totals.logicChanged === 0 ? (
+            <EmptyState
+              title="No structural differences"
+              hint="Durations, logic and the activity set are identical between these two revisions."
+            />
+          ) : null}
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+/** A minimal card title row — CardHeader is reserved for page-level cards. */
+function CardHeaderless({ title }: { title: string }) {
+  return (
+    <div className="border-b border-ink-100 px-3 py-2 text-sm font-medium text-ink-800">{title}</div>
+  );
+}
+
+/* ================================================================== */
+/* Calendar view                                                       */
+/* ================================================================== */
+
+const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+export function CalendarViewPanel({ base, scheduleId }: { base: string; scheduleId: string | null }) {
+  const [from, setFrom] = useState(() => new Date().toISOString().slice(0, 10));
+  const [weeks, setWeeks] = useState(6);
+  const query =
+    scheduleId && from
+      ? `${base}/schedules/${scheduleId}/calendar-view?from=${from}&to=${addWeeks(from, weeks)}`
+      : null;
+  const { data, loading, error } = useResource<CalendarViewResponse>(query);
+
+  if (!scheduleId) {
+    return <EmptyState title="Select a schedule" hint="The calendar renders one programme's activities." />;
+  }
+
+  const days = data?.days ?? [];
+  /* Pad to a Sunday-start grid so weeks line up with the calendar people
+   * actually use. */
+  const lead = days[0] ? new Date(`${days[0].date}T00:00:00Z`).getUTCDay() : 0;
+
+  return (
+    <div className="space-y-3">
+      <Card>
+        <CardBody>
+          <div className="grid grid-cols-1 gap-2 md:grid-cols-4">
+            <Field label="From">
+              <Input type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
+            </Field>
+            <Field label="Weeks">
+              <Select value={String(weeks)} onChange={(e) => setWeeks(Number(e.target.value))}>
+                {[2, 4, 6, 8, 12].map((w) => (
+                  <option key={w} value={w}>
+                    {w}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <div className="md:col-span-2 flex items-end text-xs text-ink-500">
+              {data?.calendarName
+                ? `Non-working days from calendar "${data.calendarName}".`
+                : "No work calendar is assigned — every day reads as working."}
+            </div>
+          </div>
+        </CardBody>
+      </Card>
+
+      {loading ? <Spinner label="Loading the calendar…" /> : null}
+      {error ? <ErrorAlert message={error} /> : null}
+      {!loading && !error && days.length === 0 ? (
+        <EmptyState title="Nothing in this window" hint="Widen the window or compute the programme." />
+      ) : null}
+
+      {days.length > 0 ? (
+        <Card>
+          <CardBody>
+            <div className="grid grid-cols-7 gap-px text-[11px]">
+              {WEEKDAY_LABELS.map((d) => (
+                <div key={d} className="px-1 pb-1 text-center font-medium text-ink-500">
+                  {d}
+                </div>
+              ))}
+              {Array.from({ length: lead }).map((_, i) => (
+                <div key={`pad-${i}`} />
+              ))}
+              {days.map((d) => (
+                <div
+                  key={d.date}
+                  className={`min-h-[64px] rounded border p-1 ${
+                    d.working ? "border-ink-200 bg-surface" : "border-ink-100 bg-ink-50 text-ink-400"
+                  }`}
+                >
+                  <div className="mb-0.5 flex items-center justify-between">
+                    <span className="tabular-nums">{d.date.slice(8)}</span>
+                    {d.inProgress > 0 ? (
+                      <span className="text-ink-400" title={`${d.inProgress} activities in progress`}>
+                        {d.inProgress}
+                      </span>
+                    ) : null}
+                  </div>
+                  {d.starting.slice(0, 2).map((t) => (
+                    <div
+                      key={`s-${t.id}`}
+                      className={`truncate ${t.isCritical ? "text-red-600" : "text-emerald-700"}`}
+                      title={`Starts: ${t.name}`}
+                    >
+                      ▶ {t.name}
+                    </div>
+                  ))}
+                  {d.finishing.slice(0, 2).map((t) => (
+                    <div
+                      key={`f-${t.id}`}
+                      className={`truncate ${t.isCritical ? "text-red-600" : "text-ink-600"}`}
+                      title={`${t.isMilestone ? "Milestone" : "Finishes"}: ${t.name}`}
+                    >
+                      {t.isMilestone ? "◆" : "◀"} {t.name}
+                    </div>
+                  ))}
+                  {d.starting.length + d.finishing.length > 4 ? (
+                    <div className="text-ink-400">+{d.starting.length + d.finishing.length - 4} more</div>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          </CardBody>
+        </Card>
+      ) : null}
+    </div>
+  );
+}
+
+function addWeeks(iso: string, weeks: number): string {
+  const d = Date.parse(`${iso}T00:00:00Z`);
+  if (Number.isNaN(d)) return iso;
+  return new Date(d + weeks * 7 * 86_400_000).toISOString().slice(0, 10);
+}

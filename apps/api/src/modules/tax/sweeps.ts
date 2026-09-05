@@ -306,6 +306,7 @@ export async function sweepWhtNotDeducted(db: Db, companyId: string, now: Date):
         .from(withholdingCertificates)
         .where(
           and(
+            eq(withholdingCertificates.companyId, companyId),
             eq(withholdingCertificates.paymentId, pay.id),
             ne(withholdingCertificates.status, "cancelled"),
           ),
