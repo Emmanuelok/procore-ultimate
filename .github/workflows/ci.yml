@@ -45,6 +45,30 @@ jobs:
       - name: Typecheck the web app
         run: pnpm --filter @constructos/web typecheck
 
+      # Schema drift. `packages/db` declares "no tests", so nothing used to
+      # notice an edited schema whose migration was never generated — the
+      # failure then appeared at boot on the first deployment, as a column the
+      # code selects and the database does not have. This asks drizzle-kit to
+      # generate a migration and fails if it produced one: a clean tree means
+      # every schema change in the commit is already in packages/db/drizzle.
+      - name: Schema drift (a schema change with no migration)
+        run: |
+          set -euo pipefail
+          before="$(ls packages/db/drizzle/*.sql | wc -l)"
+          pnpm --filter @constructos/db exec drizzle-kit generate --name ci_drift_probe >/tmp/drift.log 2>&1 || {
+            cat /tmp/drift.log; echo "::error::drizzle-kit generate failed"; exit 1;
+          }
+          after="$(ls packages/db/drizzle/*.sql | wc -l)"
+          if [ "$after" != "$before" ]; then
+            echo "::error::A schema change in this commit has no migration. Run ./scripts/regen-migration.sh and commit the result."
+            git --no-pager diff --stat -- packages/db/drizzle || true
+            for f in packages/db/drizzle/*ci_drift_probe*.sql; do
+              echo "--- $f"; cat "$f"
+            done
+            exit 1
+          fi
+          echo "no schema drift"
+
       - name: Test the API
         run: pnpm --filter @constructos/api test
 
