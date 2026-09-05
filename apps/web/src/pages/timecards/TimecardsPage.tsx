@@ -37,7 +37,13 @@ import ReconcileTab from "./ReconcileTab";
 import TicketDrawer from "./TicketDrawer";
 import TicketsTab from "./TicketsTab";
 import TimecardDrawer from "./TimecardDrawer";
-import { BatchCreateModal, TimecardCreateModal, type WorkerOption } from "./TimecardForms";
+import {
+  BatchCreateModal,
+  TicketCreateModal,
+  TicketSourceModal,
+  TimecardCreateModal,
+  type WorkerOption,
+} from "./TimecardForms";
 import {
   hoursText,
   shiftDays,
@@ -107,7 +113,7 @@ export default function TimecardsPage() {
 
   const users = useCompanyUsers();
   /** which write form is open */
-  const [form, setForm] = useState<"card" | "batch" | null>(null);
+  const [form, setForm] = useState<"card" | "batch" | "ticket" | "source" | null>(null);
   const crews = useCrews(projectId);
   const cards = useTimecards(projectId, cardFilters, tab === "cards");
   const reconciliation = useReconciliation(projectId, reconcileFrom, to, tab === "reconcile");
@@ -225,6 +231,18 @@ export default function TimecardsPage() {
         }
         actions={
           <div className="flex flex-wrap items-center gap-2">
+            {tab === "tickets" ? (
+              <>
+                <Button size="sm" variant="secondary" onClick={() => setForm("ticket")}>
+                  Raise a T&amp;M ticket
+                </Button>
+                {openTicket ? (
+                  <Button size="sm" variant="secondary" onClick={() => setForm("source")}>
+                    Source lines
+                  </Button>
+                ) : null}
+              </>
+            ) : null}
             <Button size="sm" variant="secondary" onClick={() => setForm("batch")}>
               Start a week
             </Button>
@@ -280,6 +298,7 @@ export default function TimecardsPage() {
         />
       ) : tab === "cost" ? (
         <CostReportTab
+          projectId={projectId}
           report={costReport}
           windowDays={costDays}
           onWindowDays={setCostDays}
@@ -342,6 +361,27 @@ export default function TimecardsPage() {
         onDone={refresh}
         projectId={projectId}
         crews={crews.data?.items ?? []}
+      />
+      <TicketCreateModal
+        open={form === "ticket"}
+        onClose={() => setForm(null)}
+        onDone={(ticketId) => {
+          tickets.reload();
+          openTicketDrawer(ticketId);
+        }}
+        projectId={projectId}
+        crews={crews.data?.items ?? []}
+      />
+      <TicketSourceModal
+        open={form === "source"}
+        onClose={() => setForm(null)}
+        onDone={() => {
+          tickets.reload();
+          ticketDetail.reload();
+        }}
+        projectId={projectId}
+        ticketId={openTicket}
+        ticketReference={ticketDetail.data?.reference ?? "this ticket"}
       />
     </div>
   );

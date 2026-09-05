@@ -803,6 +803,125 @@ export interface PrequalSubmissionDetail extends PrequalSubmission {
     questionCode: string | null;
     reason: string | null;
   };
+  tier?: PrequalTierBlock;
+  registers?: PrequalRegisters;
+  vendorPortal?: {
+    issued: boolean;
+    expiresAt: string | null;
+    lastAccessAt: string | null;
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* The typed capture registers and automatic tiering                    */
+/* ------------------------------------------------------------------ */
+
+export interface PrequalSafetyRecord {
+  id: string;
+  vendorId: string;
+  submissionId: string | null;
+  year: number;
+  emr: number | null;
+  trir: number | null;
+  dart: number | null;
+  fatalities: number | null;
+  lostTimeInjuries: number | null;
+  recordableIncidents: number | null;
+  hoursWorked: number | null;
+  citations: unknown[];
+  source: string;
+  fileIds: string[];
+  verifiedBy: string | null;
+  verifiedAt: string | null;
+  note: string | null;
+}
+
+export interface PrequalLicence {
+  id: string;
+  vendorId: string;
+  submissionId: string | null;
+  kind: string;
+  jurisdiction: string | null;
+  number: string | null;
+  issuedBy: string | null;
+  issuedAt: string | null;
+  expiresAt: string | null;
+  status: string;
+  fileIds: string[];
+  verifiedBy: string | null;
+  verifiedAt: string | null;
+  note: string | null;
+  /** derived on the way out: the stated expiry has passed */
+  expired?: boolean;
+}
+
+export interface PrequalReference {
+  id: string;
+  vendorId: string;
+  submissionId: string | null;
+  clientName: string;
+  projectName: string | null;
+  contractValue: number | null;
+  currency: string;
+  completedAt: string | null;
+  contactName: string | null;
+  contactEmail: string | null;
+  contactPhone: string | null;
+  outcome: string;
+  rating: number | null;
+  wouldUseAgain: boolean | null;
+  checkedBy: string | null;
+  checkedAt: string | null;
+  checkNote: string | null;
+  /** derived: somebody actually took it up */
+  checked?: boolean;
+}
+
+export interface PrequalRegisters {
+  safety: PrequalSafetyRecord[];
+  licences: PrequalLicence[];
+  references: PrequalReference[];
+}
+
+/** The letter, and everything that capped it. */
+export interface TierVerdict {
+  tier: "a" | "b" | "c" | "unrated";
+  tierBasis: string;
+  riskRating: "low" | "medium" | "high" | "unrated";
+  riskBasis: string;
+  ceilings: string[];
+  scoreBandTier: "a" | "b" | "c" | "unrated";
+  safetyYear: number | null;
+  limit: Unknowable;
+}
+
+export interface PrequalTierBlock {
+  granted: string | null;
+  grantedBasis: string | null;
+  riskRating: string | null;
+  riskBasis: string | null;
+  onCurrentEvidence: TierVerdict | null;
+  drifted?: boolean;
+}
+
+export interface VendorEvidenceView {
+  vendor: { id: string; name: string; status: string };
+  safety: PrequalSafetyRecord[];
+  licences: PrequalLicence[];
+  references: PrequalReference[];
+  financials: FinancialRecord[];
+  files: Array<{ fileId: string; source: string; sourceId: string; label: string }>;
+  fileCount: number;
+  tier: TierVerdict | null;
+  tierNote: string;
+  counts: {
+    safety: number;
+    licences: number;
+    licencesExpired: number;
+    references: number;
+    referencesChecked: number;
+    financials: number;
+  };
 }
 
 export interface PrequalSweep {

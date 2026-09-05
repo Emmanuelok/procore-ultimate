@@ -15,10 +15,16 @@ Implemented in `apps/api/src/plugins/auth.ts` (verification) and
 
 ### 1.1 Passwords
 
-- Hashed with **bcrypt, cost factor 10** (`bcryptjs`, `modules/identity/index.ts`
-  `POST /auth/register`). Plaintext is never persisted.
-- Policy: 8–128 chars enforced by zod (`registerSchema`). No complexity rules, no breach-list
-  check yet (see §8).
+- Hashed with **bcrypt**, cost from `BCRYPT_COST` — floored at 12 everywhere except
+  `NODE_ENV=test`, where it is capped at 10 so a suite is not a CPU burn
+  (`passwordHashCost`, `modules/account/password.ts`) — and rehashed transparently on the next successful
+  sign-in when the stored cost is below the current one (`completeLogin`,
+  `modules/account/login.ts`). Plaintext is never persisted.
+- Policy is no longer a zod length check: `modules/account/policy.ts` resolves the tenant
+  policy (minimum length ≥ 12, optional complexity, maximum age, history depth) and
+  `assessPasswordWithPolicy` applies it at registration, change, reset and invitation
+  acceptance. Reuse is refused against `password_history` (hashes only). See §1.9.
+  Still absent: a breach-list check (see §8).
 - Login compares with `bcrypt.compare` and returns a uniform `401 Invalid credentials` for
   unknown email, wrong password and deactivated account alike — no account enumeration via
   the login route. (The register route does reveal whether an email exists via `409`; see §8.)

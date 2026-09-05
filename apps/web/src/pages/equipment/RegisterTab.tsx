@@ -35,6 +35,7 @@ import {
   isoDate,
   labelize,
   money,
+  type AssignmentRef,
   type EquipmentRecord,
   type ListResponse,
   type Loadable,
@@ -44,7 +45,7 @@ import {
 } from "./equipmentShared";
 
 /** The union the grid renders: project rows carry an assignment, fleet rows do not. */
-type RegisterRow = EquipmentRecord & { assignment?: { status: string; assignedFrom: string } | null };
+type RegisterRow = EquipmentRecord & { assignment?: AssignmentRef | null };
 
 const BUILT_IN_VIEWS: DataView[] = [
   {
@@ -73,12 +74,19 @@ export default function RegisterTab({
   fleet,
   onOpenMachine,
   onOpenCertificates,
+  onAssignmentAction,
 }: {
   scope: Scope;
   project: Loadable<ProjectEquipmentResponse>;
   fleet: Loadable<ListResponse<EquipmentRecord>>;
   onOpenMachine: (equipmentId: string) => void;
   onOpenCertificates: () => void;
+  /** Run a transition on the machine's live assignment (project scope only). */
+  onAssignmentAction: (
+    assignmentId: string,
+    equipmentId: string,
+    action: "approve" | "mobilise" | "demobilise" | "cancel" | "transfer",
+  ) => void;
 }) {
   const [availabilityOpen, setAvailabilityOpen] = useState(false);
   const [availFrom, setAvailFrom] = useState(today());
@@ -446,6 +454,20 @@ export default function RegisterTab({
           onRowClick={({ row }) => onOpenMachine(row.id)}
           rowActions={(row) => [
             { id: "open", label: "Open the machine", onSelect: () => onOpenMachine(row.id) },
+            /*
+             * The assignment transitions, offered only where the row actually
+             * carries one and only where the transition is legal. A machine
+             * that was approved and never arrived used to have no way out at
+             * all — "cancel" is that way out, and it is why it is here rather
+             * than buried in a drawer.
+             */
+            ...(row.assignment
+              ? assignmentActionsFor(row.assignment.status).map((action) => ({
+                  id: action,
+                  label: ASSIGNMENT_ACTION_LABEL[action],
+                  onSelect: () => onAssignmentAction(row.assignment!.assignmentId, row.id, action),
+                }))
+              : []),
           ]}
           empty={{
             title: "No plant on the register",
@@ -637,6 +659,36 @@ function AvailabilityPanel({
       </CardBody>
     </Card>
   );
+}
+
+type AssignmentAction = "approve" | "mobilise" | "demobilise" | "cancel" | "transfer";
+
+const ASSIGNMENT_ACTION_LABEL: Record<AssignmentAction, string> = {
+  approve: "Approve the hire",
+  mobilise: "Mobilise to site",
+  demobilise: "Demobilise",
+  cancel: "Cancel the assignment",
+  transfer: "Transfer to another project",
+};
+
+/**
+ * Which transitions a live assignment can take from where it is. Offering an
+ * illegal one and letting the server refuse it is a worse screen than not
+ * offering it: the refusal reads as a bug to the person who clicked.
+ */
+function assignmentActionsFor(status: string): AssignmentAction[] {
+  switch (status) {
+    case "requested":
+      return ["approve", "cancel"];
+    case "approved":
+      return ["mobilise", "cancel"];
+    case "mobilising":
+      return ["mobilise", "cancel"];
+    case "on_site":
+      return ["demobilise", "transfer"];
+    default:
+      return [];
+  }
 }
 
 function registerRail(row: RegisterRow): Tone | undefined {

@@ -1829,3 +1829,99 @@ export function useCostCodes(
     enabled && projectId ? `/api/v1/projects/${projectId}/cost-codes` : null,
   );
 }
+
+
+/* ========================================================================== */
+/* Labour productivity (#615) and the posting onto the budget (#715)           */
+/* ========================================================================== */
+
+export interface ProductivityLine {
+  budgetLineItemId: string;
+  code: string | null;
+  description: string;
+  unit: string | null;
+  actualHours: number;
+  installedQuantity: number | null;
+  plannedUnitRate: number | null;
+  achievedUnitRate: number | null;
+  earnedHours: number | null;
+  productivityFactor: number | null;
+  percentComplete: number | null;
+  remainingQuantity: number | null;
+  forecastHoursAtCompletion: number | null;
+  forecastVarianceHours: number | null;
+  reasons: string[];
+}
+
+export interface ProductivityWeek {
+  weekStart: string;
+  actualHours: number;
+  earnedHours: number | null;
+  productivityFactor: number | null;
+}
+
+export interface ProductivityCrew {
+  crewId: string | null;
+  crewName: string | null;
+  actualHours: number;
+  earnedHours: number | null;
+  productivityFactor: number | null;
+}
+
+export interface ProductivityReport {
+  from: string;
+  to: string;
+  timecards: number;
+  lines: ProductivityLine[];
+  weeks: ProductivityWeek[];
+  crews: ProductivityCrew[];
+  totals: {
+    actualHours: number;
+    earnedHours: number | null;
+    productivityFactor: number | null;
+    forecastHoursAtCompletion: number | null;
+    linesMeasured: number;
+    linesUnmeasurable: number;
+  };
+  deviation: {
+    from: string;
+    to: string;
+    weeks: number;
+    worstFactor: number;
+    averageFactor: number;
+    lostHours: number;
+    explanation: string;
+  } | null;
+  reasons: string[];
+  method: string;
+  thresholds: { floor: number; minWeeks: number };
+}
+
+/** The productivity report over a window, or null while it is not asked for. */
+export function useProductivity(
+  projectId: string | undefined,
+  from: string,
+  to: string,
+  enabled: boolean,
+): Loadable<ProductivityReport> {
+  return useResource<ProductivityReport>(
+    enabled && projectId
+      ? `/api/v1/projects/${projectId}/labour-productivity?from=${from}&to=${to}`
+      : null,
+  );
+}
+
+export interface LabourPostingResult {
+  runId: string;
+  from: string;
+  to: string;
+  posted: number;
+  lines: Array<{
+    budgetLineItemId: string;
+    costCode: string;
+    labourCost: number;
+    labourHours: number;
+    currency: string;
+  }>;
+  reasons: string[];
+}

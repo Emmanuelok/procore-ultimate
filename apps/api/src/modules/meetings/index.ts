@@ -1488,6 +1488,46 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
         meeting.quorumRequired,
       ),
       minutesObjectionWindow: minutesWindow(meeting),
+      /*
+       * Objections were reachable only inside the opaque `detail` blob, so the
+       * web app could raise one and then had nothing to resolve it with — and
+       * an unresolved objection blocks /minutes/approve forever. They are a
+       * first-class part of the minutes state; the detail route returns them.
+       */
+      objections: ((detailOf(meeting)["objections"] as unknown[] | undefined) ?? []).map((o) =>
+        typeof o === "object" && o !== null ? (o as Record<string, unknown>) : { note: o },
+      ),
+      objectionHistory:
+        (detailOf(meeting)["objectionHistory"] as unknown[] | undefined) ?? [],
+      minutesDocument: meeting.minutesFileId
+        ? {
+            fileId: meeting.minutesFileId,
+            sha256: meeting.minutesSha256,
+            renderedAt: meeting.minutesRenderedAt,
+            minutesVersion: Math.max(1, meeting.minutesVersion),
+          }
+        : null,
+      agendaPack: meeting.agendaPackFileId
+        ? { fileId: meeting.agendaPackFileId, sha256: meeting.agendaPackSha256 }
+        : null,
+      deliveries: await (async () => {
+        const rows = await app.db
+          .select()
+          .from(meetingMinuteDeliveries)
+          .where(eq(meetingMinuteDeliveries.meetingId, meetingId))
+          .orderBy(
+            desc(meetingMinuteDeliveries.minutesVersion),
+            asc(meetingMinuteDeliveries.recipientName),
+          );
+        return {
+          items: rows,
+          total: rows.length,
+          delivered: rows.filter((r) => r.status === "delivered" || r.status === "acknowledged")
+            .length,
+          acknowledged: rows.filter((r) => r.status === "acknowledged").length,
+          failed: rows.filter((r) => r.status === "failed").length,
+        };
+      })(),
       carryForward: {
         carriedIn: agendaItems.filter((i) => i.carriedFromItemId != null).length,
         maxCarryCount: agendaItems.reduce((m, i) => Math.max(m, i.carryCount), 0),
@@ -4555,6 +4595,46 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
             lt(meetingActionItems.dueDate, today),
           ),
         );
+      const [meetingCountRow] = await app.db
+        .select({ n: count() })
+        .from(meetings)
+        .where(
+          and(eq(meetings.companyId, req.companyId!), eq(meetings.projectId, req.projectId!)),
+        );
+      const [heldRow] = await app.db
+        .select({ n: count() })
+        .from(meetings)
+        .where(
+          and(
+            eq(meetings.companyId, req.companyId!),
+            eq(meetings.projectId, req.projectId!),
+            inArray(meetings.status, [
+              "held",
+              "minutes_draft",
+              "minutes_issued",
+              "minutes_accepted",
+            ]),
+          ),
+        );
+      const [acceptedRow] = await app.db
+        .select({ n: count() })
+        .from(meetings)
+        .where(
+          and(
+            eq(meetings.companyId, req.companyId!),
+            eq(meetings.projectId, req.projectId!),
+            eq(meetings.status, "minutes_accepted"),
+          ),
+        );
+      const meetingCount = Number(meetingCountRow?.n ?? 0);
+      const heldCount = Number(heldRow?.n ?? 0);
+      const acceptedCount = Number(acceptedRow?.n ?? 0);
+      if (heldCount === 0) {
+        reasons.push(
+          "No meeting on this project has been held, so minutesAcceptedRatio is null rather " +
+            "than 0 — a project that has held no meeting has not failed to minute one.",
+        );
+      }
       const [carriedRow] = await app.db
         .select({ n: count() })
         .from(meetingAgendaItems)
@@ -4588,11 +4668,15 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       }
       return {
         metrics: {
+          meetings: meetingCount,
+          meetingsHeld: heldCount,
           openActionItems: open,
           overdueActionItems: overdue,
           overdueActionRatio: open === 0 ? null : Math.round((overdue / open) * 1000) / 1000,
           itemsCarriedOverThreshold: Number(carriedRow?.n ?? 0),
           heldMeetingsWithNoMinutesIssued: Number(unissuedRow?.n ?? 0),
+          minutesAcceptedRatio:
+            heldCount === 0 ? null : Math.round((acceptedCount / heldCount) * 1000) / 1000,
         },
         reasons,
         asOf: today,

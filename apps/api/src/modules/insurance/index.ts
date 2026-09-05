@@ -1,4 +1,4 @@
-import type { FastifyInstance, FastifyPluginAsync, FastifyRequest } from "fastify";
+import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import { and, asc, count, desc, eq, gt, ilike, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
@@ -429,8 +429,13 @@ const requirementListQuery = pageQuerySchema.extend({
   policyType: z.enum(POLICY_TYPES).optional(),
   status: z.enum(INSURANCE_REQUIREMENT_STATUSES).optional(),
   vendorId: z.string().max(64).optional(),
-  /** include the company-wide standards that also bind this project */
-  includeCompanyWide: z.coerce.boolean().optional(),
+  /**
+   * Include the company-wide standards that also bind this project. An enum
+   * rather than `z.coerce.boolean()`, which turns the string "false" into
+   * `true` — a filter that silently means its opposite is worse than no
+   * filter at all.
+   */
+  includeCompanyWide: z.enum(["true", "false"]).optional(),
 });
 
 const premiumCreateSchema = z.object({
@@ -3695,6 +3700,49 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
       if (r.disposition === "new" || r.disposition === "under_review") signalsOpen += Number(r.n);
     }
 
+    /*
+     * BONDING LINES (#796). Utilisation is derived from the bonds actually
+     * drawn against each facility, never stored, so it cannot drift from the
+     * bonds it summarises — and headroom is refused across currencies.
+     */
+    const facilityRows = await app.db
+      .select()
+      .from(bondFacilities)
+      .where(
+        projectId
+          ? and(
+              eq(bondFacilities.companyId, companyId),
+              or(eq(bondFacilities.projectId, projectId), isNull(bondFacilities.projectId)),
+            )
+          : eq(bondFacilities.companyId, companyId),
+      );
+    const allDrawn = await app.db
+      .select()
+      .from(bonds)
+      .where(and(eq(bonds.companyId, companyId), isNotNull(bonds.facilityId)));
+    const facilityLines = facilityRows.map((f) => {
+      const u = facilityUtilisation(
+        {
+          id: f.id,
+          number: f.number,
+          name: f.name,
+          provider: f.provider,
+          projectId: f.projectId,
+          limitAmount: f.limitAmount,
+          currency: f.currency,
+          permittedBondTypes: f.permittedBondTypes,
+          status: f.status,
+          effectiveFrom: f.effectiveFrom,
+          effectiveTo: f.effectiveTo,
+          reviewDate: f.reviewDate,
+        },
+        allDrawn,
+        (b) => bondCurrentExposure(b, asOf).currentAmount,
+        asOf,
+      );
+      return { facilityId: f.id, number: f.number, name: f.name, provider: f.provider, ...u };
+    });
+
     const notificationsOutstanding = claimRows.filter((c) => c.notifiedAt === null).length;
     const notificationsMissed = claimRows.filter(
       (c) => c.notifiedAt !== null && isNotificationLate(c.notificationDueAt, c.notifiedAt),
@@ -3741,10 +3789,16 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         note:
           "Exposure is reported per currency and never summed across currencies. `currentExposure` " +
           "applies triggered milestone reductions; `faceAmount` does not.",
+        facilities: facilityLines,
         headroomNote:
-          "Bonding line headroom (#796) is not reported: no agreed facility limit per surety is " +
-          "recorded anywhere in the data, so utilisation is shown without a denominator rather " +
-          "than against an invented one.",
+          facilityLines.length === 0
+            ? "Bonding line headroom (#796) is not reported: no agreed facility limit is " +
+              "recorded, so utilisation is shown without a denominator rather than against an " +
+              "invented one. Record the facility your surety has agreed and headroom becomes a " +
+              "figure rather than a hope."
+            : "Headroom is derived from the live bonds drawn against each facility and is " +
+              "reported per currency, never netted across two. A bond drawn against a line in " +
+              "another currency is excluded and named, because no rate is held.",
       },
       claims: {
         total: claimRows.length,
@@ -4121,7 +4175,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
     { preHandler: readGate },
     async (req) => {
       const q = requirementListQuery.parse(req.query);
-      const includeCompany = q.includeCompanyWide !== false;
+      const includeCompany = q.includeCompanyWide !== "false";
       const clauses = [
         eq(insuranceRequirements.companyId, req.companyId!),
         includeCompany

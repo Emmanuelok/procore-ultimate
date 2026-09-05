@@ -575,6 +575,71 @@ describe("configurable approval workflow (#445)", () => {
     expect(after.json().status).toBe("draft");
     expect(after.json().approvals.filter((a: { status: string }) => a.status === "pending")).toHaveLength(0);
   });
+
+  it("lets a rejected letter be corrected and resubmitted for approval", async () => {
+    const draft = await post(`/projects/${projectId}/correspondence/letters`, {
+      typeId: workflowTypeId,
+      subject: "Instruction that is rejected then fixed",
+      recipients: [{ partyType: "external", name: "Site agent" }],
+    });
+    const id = draft.json().id as string;
+    await post(`/projects/${projectId}/correspondence/letters/${id}/submit`, {});
+    const first = await get(`/projects/${projectId}/correspondence/letters/${id}`);
+    await post(
+      `/projects/${projectId}/correspondence/letters/${id}/approvals/${first.json().approvals[0].id}/decide`,
+      { decision: "rejected", comment: "Wrong clause cited." },
+      approver.headers,
+    );
+    await patch(`/projects/${projectId}/correspondence/letters/${id}`, {
+      body: "Clause corrected.",
+    });
+
+    // The rejected step is still on the record; a second round must not
+    // collide with it on (letter_id, seq).
+    const resubmitted = await post(
+      `/projects/${projectId}/correspondence/letters/${id}/submit`,
+      {},
+    );
+    expect(resubmitted.statusCode).toBe(200);
+    expect(resubmitted.json().status).toBe("pending_approval");
+
+    const detail = await get(`/projects/${projectId}/correspondence/letters/${id}`);
+    const approvals = detail.json().approvals as Array<{ id: string; seq: number; status: string }>;
+    expect(approvals).toHaveLength(2);
+    expect(approvals.filter((a) => a.status === "rejected")).toHaveLength(1);
+    const pending = approvals.filter((a) => a.status === "pending");
+    expect(pending).toHaveLength(1);
+
+    const approved = await post(
+      `/projects/${projectId}/correspondence/letters/${id}/approvals/${pending[0]!.id}/decide`,
+      { decision: "approved" },
+      approver.headers,
+    );
+    expect(approved.statusCode).toBe(200);
+    expect(approved.json().readyToIssue).toBe(true);
+    const issued = await post(`/projects/${projectId}/correspondence/letters/${id}/issue`, {});
+    expect(issued.statusCode).toBe(200);
+    expect(issued.json().status).toBe("issued");
+  });
+
+  it("refuses to delete a recipient the record says was already sent the letter", async () => {
+    const draft = await post(`/projects/${projectId}/correspondence/letters`, {
+      typeId: letterTypeId,
+      subject: "Issued, so its distribution list is frozen",
+      recipients: [{ partyType: "external", name: "Named recipient", email: "named@x.example" }],
+    });
+    const id = draft.json().id as string;
+    await post(`/projects/${projectId}/correspondence/letters/${id}/issue`, {});
+    const detail = await get(`/projects/${projectId}/correspondence/letters/${id}`);
+    const recipientId = detail.json().recipients[0].id as string;
+
+    const removed = await del(`/projects/${projectId}/correspondence/recipients/${recipientId}`);
+    expect(removed.statusCode).toBe(409);
+    expect(removed.json().message).toContain("frozen");
+
+    const after = await get(`/projects/${projectId}/correspondence/letters/${id}`);
+    expect(after.json().recipients).toHaveLength(1);
+  });
 });
 
 /* ================================================================== */

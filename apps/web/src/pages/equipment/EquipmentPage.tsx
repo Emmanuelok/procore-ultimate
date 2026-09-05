@@ -410,6 +410,12 @@ export default function EquipmentPage() {
           fleet={fleet}
           onOpenMachine={openMachineDrawer}
           onOpenCertificates={() => selectTab("certificates")}
+          onAssignmentAction={(assignment, equipmentId, action) => {
+            setAssignmentId(assignment);
+            setAssignmentAction(action);
+            openMachineDrawer(equipmentId);
+            setForm("assignment");
+          }}
         />
       ) : tab === "certificates" ? (
         <CertificatesTab

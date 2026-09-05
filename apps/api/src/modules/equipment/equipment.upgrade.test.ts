@@ -435,7 +435,7 @@ describe("regressions", () => {
       {
         name: "500 hour service",
         maintenanceType: "preventive",
-        intervalKind: "meter_hours",
+        intervalKind: "operating_hours",
         intervalValue: 250,
         lastPerformedMeter: 100,
       },
@@ -711,12 +711,13 @@ describe("scheduler", () => {
   it("runs the sweep as the system, not as whoever read the page", async () => {
     const machineId = await makeMachine({ name: "System sweep machine", isCritical: true });
     await mobilise(projectA, machineId);
-    await post(`/companies/current/equipment/${machineId}/certificates`, {
-      certificateType: "loler",
+    const cert = await post(`/companies/current/equipment/${machineId}/certificates`, {
+      certificateType: "thorough_examination",
       validFrom: daysAgo(400),
       validTo: daysAgo(2),
       result: "pass",
     });
+    expect(cert.statusCode).toBe(201);
     await app.scheduler.runNow("equipment.sweep");
     const raised = await app.db
       .select()
@@ -932,6 +933,88 @@ describe("maintenance schedule lifecycle", () => {
     const res = await patch(
       `/companies/current/equipment/${machineId}/maintenance-schedules/${scheduleId}`,
       { status: "suspended" },
+      readerHeaders,
+    );
+    expect(res.statusCode).toBe(403);
+  });
+});
+
+/* ================================================================== */
+/* Rental against owned                                                */
+/* ================================================================== */
+
+describe("rental against owned", () => {
+  it("says why it cannot compare rather than inventing a ratio", async () => {
+    const res = await get(
+      `/companies/current/equipment-ownership-comparison?from=${daysAgo(3)}&to=${today()}&category=lifting`,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.json().totals.bucketsCompared).toBe(0);
+    expect(res.json().reasons.join(" ")).toContain("capital appraisal");
+  });
+
+  it("compares hired against owned per productive hour once there is enough evidence", async () => {
+    const hired = await makeMachine({
+      name: "Comparison hired dumper",
+      category: "haulage",
+      ownership: "hired",
+      hireRateAmount: 100,
+      hireRateUnit: "hour",
+      currency: "GBP",
+    });
+    const owned = await makeMachine({
+      name: "Comparison owned dumper",
+      category: "haulage",
+      ownership: "owned",
+      hireRateAmount: null,
+      hireRateUnit: null,
+      internalRateAmount: 40,
+      currency: "GBP",
+    });
+    await mobilise(projectB, hired);
+    await mobilise(projectB, owned);
+    for (let i = 1; i <= 6; i += 1) {
+      for (const machineId of [hired, owned]) {
+        const res = await post(`/projects/${projectB}/equipment-utilisation`, {
+          equipmentId: machineId,
+          utilisationDate: daysAgo(i + 10),
+          availableHours: 10,
+          workingHours: 8,
+          idleHours: 2,
+          idleReason: "awaiting_instruction",
+        });
+        expect(res.statusCode).toBe(201);
+      }
+    }
+    const res = await get(
+      `/companies/current/equipment-ownership-comparison?from=${daysAgo(30)}&to=${today()}&category=haulage`,
+    );
+    expect(res.statusCode).toBe(200);
+    const bucket = (
+      res.json().buckets as Array<{
+        category: string;
+        currency: string;
+        verdict: string;
+        ratio: number | null;
+        hired: { costPerWorkingHour: number | null };
+        owned: { costPerWorkingHour: number | null };
+      }>
+    ).find((b) => b.category === "haulage" && b.currency === "GBP");
+    expect(bucket).toBeDefined();
+    expect(bucket!.verdict).toBe("hired_dearer");
+    expect(bucket!.hired.costPerWorkingHour).toBeGreaterThan(
+      bucket!.owned.costPerWorkingHour ?? 0,
+    );
+  });
+
+  it("refuses the fleet comparison to a company guest", async () => {
+    const res = await get("/companies/current/equipment-ownership-comparison", guestHeaders);
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("refuses a project the caller does not hold equipment on", async () => {
+    const res = await get(
+      `/companies/current/equipment-ownership-comparison?projectId=${projectB}`,
       readerHeaders,
     );
     expect(res.statusCode).toBe(403);

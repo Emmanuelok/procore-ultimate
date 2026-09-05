@@ -66,6 +66,13 @@ import type {
   QuestionnaireDetail,
 } from "./types";
 
+import {
+  LicenceRegisterView,
+  TierCard,
+  VendorEvidencePanel,
+  VendorPortalPanel,
+} from "./PrequalEvidence";
+
 const BASE = "/api/v1/companies/current/prequalification";
 
 const PREQUAL_OUTCOMES = [
@@ -75,7 +82,7 @@ const PREQUAL_OUTCOMES = [
   "rejected",
 ] as const;
 
-type View = "register" | "questionnaires";
+type View = "register" | "questionnaires" | "licences";
 
 export default function PrequalificationTab() {
   const [view, setView] = useState<View>("register");
@@ -94,10 +101,17 @@ export default function PrequalificationTab() {
           options={[
             { value: "register", label: "Supply-chain register" },
             { value: "questionnaires", label: "Questionnaires" },
+            { value: "licences", label: "Licence expiry" },
           ]}
         />
       </div>
-      {view === "register" ? <RegisterView /> : <QuestionnairesView />}
+      {view === "register" ? (
+        <RegisterView />
+      ) : view === "questionnaires" ? (
+        <QuestionnairesView />
+      ) : (
+        <LicenceRegisterView />
+      )}
     </div>
   );
 }
@@ -861,6 +875,41 @@ function PrequalDrawer({
                 ))}
               </ul>
             </section>
+
+            <section>
+              <h3 className="text-label uppercase text-content-subtle">
+                Tier — what size of package this vendor may be considered for
+              </h3>
+              <div className="mt-2">
+                <TierCard tier={sub.tier} />
+              </div>
+            </section>
+
+            <section>
+              <h3 className="text-label uppercase text-content-subtle">
+                The evidence the tier is computed from
+              </h3>
+              <div className="mt-2">
+                <VendorEvidencePanel
+                  vendorId={sub.vendorId}
+                  submissionId={sub.id}
+                  onMutated={() => {
+                    setLoadedFor(null);
+                    detail.reload();
+                    onMutated();
+                  }}
+                />
+              </div>
+            </section>
+
+            <VendorPortalPanel
+              submissionId={sub.id}
+              portal={sub.vendorPortal}
+              onMutated={() => {
+                setLoadedFor(null);
+                detail.reload();
+              }}
+            />
 
             <section>
               <h3 className="text-label uppercase text-content-subtle">

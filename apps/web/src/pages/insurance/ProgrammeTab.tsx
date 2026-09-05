@@ -6,8 +6,9 @@
  * disclosures the API returns are printed verbatim rather than designed away:
  *
  *  · `cover.note` — when the requirement set is unknown, there is no gap count;
- *  · `bonds.headroomNote` — no bonding line limit exists anywhere in the data,
- *    so utilisation is shown without a denominator and no bar implies one;
+ *  · `bonds.headroomNote` — when no bonding line is recorded, utilisation is
+ *    shown without a denominator and no bar implies one; when one IS recorded,
+ *    the derived headroom is printed per currency and never netted across two;
  *  · `byType[].limitNote` — when a total is a floor rather than the programme
  *    limit, the row says so next to the number.
  */
@@ -329,6 +330,68 @@ export default function ProgrammeTab() {
         <Disclosure label="bonds.note — returned verbatim by the API" tone="ink">
           {summary.bonds.note}
         </Disclosure>
+        {summary.bonds.facilities.length > 0 ? (
+          <div className="mt-3 space-y-2">
+            <SectionTitle hint="Derived from the bonds actually drawn against each line, per currency and never netted across two.">
+              Bonding lines
+            </SectionTitle>
+            <Table>
+              <thead>
+                <tr>
+                  <Th>Facility</Th>
+                  <Th>Provider</Th>
+                  <Th className="text-right">Limit</Th>
+                  <Th className="text-right">Drawn</Th>
+                  <Th className="text-right">Headroom</Th>
+                  <Th>State</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {summary.bonds.facilities.map((f) => (
+                  <tr key={f.facilityId}>
+                    <Td>
+                      <div className="font-medium text-ink-900">{f.number}</div>
+                      <div className="text-xs text-ink-500">{f.name}</div>
+                    </Td>
+                    <Td>{f.provider}</Td>
+                    <Td className="text-right tabular-nums">
+                      {fmtMoney(f.limitAmount, f.currency, 0)}
+                    </Td>
+                    <Td className="text-right tabular-nums">
+                      {fmtMoney(f.drawnAmount, f.currency, 0)}
+                      <div className="text-xs text-ink-400">
+                        {f.bondCount} bond{f.bondCount === 1 ? "" : "s"}
+                      </div>
+                    </Td>
+                    <Td className="text-right tabular-nums">
+                      {f.headroom === null ? (
+                        <span className="text-ink-400">—</span>
+                      ) : (
+                        <span className={f.headroom < 0 ? "font-semibold text-red-700" : ""}>
+                          {fmtMoney(f.headroom, f.currency, 0)}
+                        </span>
+                      )}
+                      <div className="text-xs text-ink-400">{fmtPct(f.utilisationPct)}</div>
+                    </Td>
+                    <Td>
+                      <Badge tone={f.inForce ? "green" : "amber"}>
+                        {f.inForce ? "in force" : "not in force"}
+                      </Badge>
+                    </Td>
+                  </tr>
+                ))}
+              </tbody>
+            </Table>
+            {summary.bonds.facilities
+              .flatMap((f) => f.reasons.map((r) => ({ id: `${f.facilityId}-${r}`, r })))
+              .map((x) => (
+                <Disclosure key={x.id} label="What this figure does not include">
+                  {x.r}
+                </Disclosure>
+              ))}
+          </div>
+        ) : null}
+
         <Disclosure label="bonds.headroomNote — returned verbatim by the API" tone="amber">
           {summary.bonds.headroomNote}
         </Disclosure>

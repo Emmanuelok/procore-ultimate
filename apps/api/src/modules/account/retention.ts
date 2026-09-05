@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNotNull, lte, or } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, lte, ne, or } from "drizzle-orm";
 import { authSecurityEvents, emailDispatches } from "@constructos/db";
 import type { Db } from "../../lib/db.js";
 import { loadCompanyPolicy } from "./policy.js";
@@ -99,9 +99,8 @@ export async function applyRetention(
   let pseudonymised = 0;
   if (policy.securityEventRetentionDays !== null) {
     const cutoff = new Date(nowMs - policy.securityEventRetentionDays * 86_400_000).toISOString();
-    // Selected first, then written by id: the predicate must not include the
-    // columns the write clears, or a retry would find nothing and a partial
-    // sweep would look complete.
+    // Selected first, then written by id, so the `limit` is a real ceiling on
+    // one sweep's work rather than a hint.
     const doomed = await db
       .select({ id: authSecurityEvents.id })
       .from(authSecurityEvents)
@@ -109,8 +108,14 @@ export async function applyRetention(
         and(
           eq(authSecurityEvents.companyId, companyId),
           lte(authSecurityEvents.at, cutoff),
+          // ALREADY-PSEUDONYMISED ROWS MUST NOT MATCH, or the sweep is not
+          // idempotent: `email` is overwritten with a sentinel rather than
+          // nulled (so the state is legible in the table), and a bare
+          // `email IS NOT NULL` therefore keeps selecting the same rows every
+          // run — which reports work that did not happen and re-writes rows
+          // for ever. Caught by the "is idempotent" test.
           or(
-            isNotNull(authSecurityEvents.email),
+            and(isNotNull(authSecurityEvents.email), ne(authSecurityEvents.email, PSEUDONYM)),
             isNotNull(authSecurityEvents.ip),
             isNotNull(authSecurityEvents.userAgent),
           ),

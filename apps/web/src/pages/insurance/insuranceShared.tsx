@@ -463,6 +463,29 @@ export interface InsuranceSummary {
     called: number;
     released: number;
     note: string;
+    /**
+     * Bonding lines (#796). Utilisation is DERIVED from the bonds drawn
+     * against each facility, never stored, and headroom is refused across
+     * currencies — a bond in another currency is excluded and named rather
+     * than converted at a rate nobody recorded.
+     */
+    facilities: {
+      facilityId: string;
+      number: string;
+      name: string;
+      provider: string;
+      currency: string;
+      limitAmount: number;
+      drawnAmount: number;
+      headroom: number | null;
+      utilisationPct: number | null;
+      bondCount: number;
+      excludedForeignCurrency: { bondId: string; currency: string; amount: number }[];
+      outsidePermittedTypes: string[];
+      inForce: boolean | null;
+      daysToReview: number | null;
+      reasons: string[];
+    }[];
     headroomNote: string;
   };
   claims: {

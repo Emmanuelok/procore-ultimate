@@ -273,7 +273,15 @@ export async function generateBriefing(
     maxTokens: 4000,
     schema: briefingOutputSchema,
   });
-  const output = result.json ?? briefingOutputSchema.parse({ headline: "Briefing", summary: result.text });
+  // Fallback when the model did not return parseable JSON: the summary field
+  // is bounded (1..4000), so clamp rather than let a ZodError 400 the request
+  // after the run has already been made and audited.
+  const output =
+    result.json ??
+    briefingOutputSchema.parse({
+      headline: "Briefing",
+      summary: (result.text.trim() || "The model returned no usable text.").slice(0, 4000),
+    });
   const reconciled = reconcileCitations(output, ctx.evidence);
 
   const briefingId = newId("brf");

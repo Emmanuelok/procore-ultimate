@@ -297,6 +297,33 @@ export interface ActionItemDetail extends ActionItem {
   } | null;
 }
 
+export interface MinutesObjection {
+  id?: string;
+  note?: string;
+  raisedBy?: string;
+  raisedAt?: string;
+  resolvedAt?: string | null;
+  resolvedBy?: string | null;
+  resolutionNote?: string | null;
+  [k: string]: unknown;
+}
+
+/** One recipient's copy of one issue of the minutes (#422, #425). */
+export interface MinuteDelivery {
+  id: string;
+  minutesVersion: number;
+  userId: string | null;
+  contactId: string | null;
+  recipientName: string;
+  email: string | null;
+  channel: string;
+  status: string;
+  deliveredAt: string | null;
+  acknowledgedAt: string | null;
+  failureReason: string | null;
+  documentSha256: string | null;
+}
+
 export interface MeetingDetail extends Meeting {
   attendees: Attendee[];
   agendaItems: AgendaItem[];
@@ -304,6 +331,24 @@ export interface MeetingDetail extends Meeting {
   actionItems: ActionItem[];
   quorum: QuorumResult;
   minutesObjectionWindow: MinutesWindow;
+  /** live objections against the current issue — unresolved ones block sign-off */
+  objections: MinutesObjection[];
+  /** objections raised against versions that were withdrawn for correction */
+  objectionHistory: unknown[];
+  minutesDocument: {
+    fileId: string;
+    sha256: string | null;
+    renderedAt: string | null;
+    minutesVersion: number;
+  } | null;
+  agendaPack: { fileId: string; sha256: string | null } | null;
+  deliveries: {
+    items: MinuteDelivery[];
+    total: number;
+    delivered: number;
+    acknowledged: number;
+    failed: number;
+  };
   carryForward: { carriedIn: number; maxCarryCount: number };
 }
 

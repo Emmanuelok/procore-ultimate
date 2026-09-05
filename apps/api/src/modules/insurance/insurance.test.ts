@@ -1432,6 +1432,21 @@ describe("insurance requirements — a requirement belongs to a scope", () => {
       `${otherProject}:${otherVendorId}:third_party_liability`,
     );
     expect(reaches).toHaveLength(1);
+
+    /* Waive it again so the rest of the suite measures its own scopes rather
+       than this one, and so the company-level waive route is exercised. */
+    const companyWideId = companyWide.json().id as string;
+    const waived = await post(`/insurance/requirements/${companyWideId}/waive`, {
+      reason: "Recorded to prove the company scope reaches every project; withdrawn afterwards",
+    });
+    expect(waived.statusCode).toBe(200);
+    expect(waived.json().status).toBe("waived");
+
+    const projectWaive = await post(
+      `/projects/${otherProject}/insurance/requirements/${companyWideId}/waive`,
+      { reason: "wrong route" },
+    );
+    expect(projectWaive.statusCode).toBe(400);
   });
 
   it("waives a requirement as a recorded decision, never as an edit", async () => {
@@ -1464,8 +1479,11 @@ describe("insurance requirements — a requirement belongs to a scope", () => {
 
   it("says the requirement set is unknown rather than reporting compliance", async () => {
     const bare = await makeProject("No requirement recorded");
-    const res = await get(`/projects/${bare}/insurance/requirements`);
+    const res = await get(
+      `/projects/${bare}/insurance/requirements?includeCompanyWide=false`,
+    );
     expect(res.statusCode).toBe(200);
+    expect(res.json().items).toEqual([]);
     expect(res.json().note).toMatch(/never 'compliant'/i);
   });
 });
@@ -1881,6 +1899,7 @@ describe("audit bug fixes", () => {
       guarantor: "Surety Co",
       amount: 400_000,
       currency: "GBP",
+      isOnDemand: true,
       issuedAt: daysFromToday(-30),
       expiryAt: daysFromToday(300),
       demandDeadline: daysFromToday(200),

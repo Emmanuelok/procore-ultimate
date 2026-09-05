@@ -522,7 +522,7 @@ function IntelligencePanel({
                         </div>
                         {machine.geofence.breaches.length === 0 ? (
                           machine.geofence.reasons.length > 0 ? (
-                            <NotComparable reasons={machine.geofence.reasons} />
+                            <NotComparable reason={machine.geofence.reasons.join(" ")} />
                           ) : (
                             <div className="text-content-muted">Worked inside the fence</div>
                           )
@@ -549,7 +549,7 @@ function IntelligencePanel({
                           Fuel
                         </div>
                         {machine.fuel.burnLitres === null ? (
-                          <NotComparable reasons={machine.fuel.reasons} />
+                          <NotComparable reason={machine.fuel.reasons.join(" ")} />
                         ) : (
                           <div>
                             <div

@@ -54,7 +54,6 @@ import {
   IconActivity,
   IconCompliance,
   IconGlobe,
-  IconLock,
   IconSecurity,
   IconSend,
   IconTrash,

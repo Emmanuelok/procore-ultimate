@@ -1,6 +1,6 @@
 import type { FastifyPluginAsync } from "fastify";
 import { randomBytes } from "node:crypto";
-import { and, asc, desc, eq, inArray, isNotNull, lte } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, isNotNull, lte } from "drizzle-orm";
 import { z } from "zod";
 import {
   prequalificationFinancials,
@@ -295,6 +295,9 @@ export async function tierForSubmission(
 /* Licence expiry sweep                                                */
 /* ------------------------------------------------------------------ */
 
+/** The detector name every licence-expiry signal carries. */
+export const PREQUAL_LICENCE_DETECTOR = "prequalification_licence_expired";
+
 export interface LicenceSweepResult {
   expired: string[];
   signalled: number;
@@ -338,14 +341,26 @@ export async function sweepPrequalLicences(
     );
   const vendorName = new Map(vendorRows.map((v) => [v.id, v.name] as const));
 
+  /*
+   * IDEMPOTENCE, BOUNDED BY THE ROWS IN HAND. The fingerprint carries the
+   * licence id, so "have we already said this" is one indexed lookup over the
+   * licences about to expire rather than a scan of every signal this company
+   * has ever raised. Raising the same lapse twice is a bug: it is the
+   * false-positive fatigue that makes people stop reading the register.
+   */
+  const fingerprints = due.map((l) => `${PREQUAL_LICENCE_DETECTOR}:${l.id}`);
   const existing = await db
-    .select({ evidenceRefs: signals.evidenceRefs })
+    .select({ fingerprint: signals.fingerprint })
     .from(signals)
-    .where(and(eq(signals.companyId, companyId), eq(signals.detector, "prequalification_licence_expired")));
+    .where(
+      and(
+        eq(signals.companyId, companyId),
+        eq(signals.detector, PREQUAL_LICENCE_DETECTOR),
+        inArray(signals.fingerprint, fingerprints),
+      ),
+    );
   const seen = new Set(
-    existing
-      .map((s) => (s.evidenceRefs as { key?: string } | null)?.key)
-      .filter((k): k is string => typeof k === "string"),
+    existing.map((s) => s.fingerprint).filter((k): k is string => typeof k === "string"),
   );
 
   const expired: string[] = [];
@@ -379,7 +394,7 @@ export async function sweepPrequalLicences(
       },
       storePayload: true,
     });
-    if (seen.has(licence.id)) continue;
+    if (seen.has(`${PREQUAL_LICENCE_DETECTOR}:${licence.id}`)) continue;
     const name = vendorName.get(licence.vendorId) ?? licence.vendorId;
     await db.insert(signals).values({
       id: newId("sig"),
@@ -388,7 +403,6 @@ export async function sweepPrequalLicences(
       detector: PREQUAL_LICENCE_DETECTOR,
       severity: "high",
       confidence: 1,
-      status: "open",
       title: `Licence expired — ${name} (${licence.kind})`,
       explanation:
         `${name}'s ${licence.kind} licence${licence.number ? ` ${licence.number}` : ""} expired ` +
@@ -402,11 +416,14 @@ export async function sweepPrequalLicences(
         kind: licence.kind,
         expiresAt: licence.expiresAt,
       },
+      fingerprint: `${PREQUAL_LICENCE_DETECTOR}:${licence.id}`,
       subjectType: "vendor",
       subjectId: licence.vendorId,
+      firstSeenAt: now,
+      lastSeenAt: now,
     });
     signalled += 1;
-    seen.add(licence.id);
+    seen.add(`${PREQUAL_LICENCE_DETECTOR}:${licence.id}`);
   }
   return { expired, signalled };
 }
@@ -1043,18 +1060,23 @@ export const prequalRegisterRoutes: FastifyPluginAsync = async (app) => {
       filters.push(isNotNull(prequalificationLicences.expiresAt));
       filters.push(lte(prequalificationLicences.expiresAt, horizon));
     }
+    const where = and(...filters);
+    const [totalRow] = await app.db
+      .select({ n: count() })
+      .from(prequalificationLicences)
+      .where(where);
     const rows = await app.db
       .select()
       .from(prequalificationLicences)
-      .where(and(...filters))
+      .where(where)
       .orderBy(asc(prequalificationLicences.expiresAt))
       .limit(query.pageSize)
       .offset(pageOffset(query));
     const today = todayIso();
     return paginate(
       rows.map((r) => ({ ...r, expired: r.expiresAt !== null && r.expiresAt <= today })),
+      Number(totalRow?.n ?? 0),
       query,
-      rows.length,
     );
   });
 
@@ -1576,6 +1598,3 @@ export const prequalRegisterRoutes: FastifyPluginAsync = async (app) => {
     };
   });
 };
-
-/** The detector name every licence-expiry signal carries. */
-export const PREQUAL_LICENCE_DETECTOR = "prequalification_licence_expired";

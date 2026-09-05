@@ -2940,35 +2940,62 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
    * matching labour risk flag against the EMPLOYER, which is what feeds the
    * vendor score. Re-running the same window changes nothing.
    */
-  app.post(
-    "/projects/:projectId/workforce/compliance/run",
-    { preHandler: standardGate },
-    async (req, reply) => {
-      const body = complianceSchema.parse(req.body);
-      const companyId = req.companyId!;
-      const projectId = req.projectId!;
+  /**
+   * Run the detectors and PERSIST what they found, idempotently.
+   *
+   * Shared by the manual route and the weekly scheduled sweep so both write
+   * exactly the same rows. The idempotence key is
+   * `(detector, workerId, periodStart, periodEnd)` on the signal's
+   * `evidenceRefs.key`: re-running a window never accuses the same person of
+   * the same thing twice, which for a labour-rights control is the difference
+   * between evidence and harassment.
+   */
+  async function persistCompliance(
+    companyId: string,
+    projectId: string,
+    body: ComplianceInput,
+    actorId: string | null,
+  ) {
       const result = await runCompliance(companyId, projectId, body);
 
-      const existing = await app.db
-        .select({ detector: signals.detector, evidenceRefs: signals.evidenceRefs })
-        .from(signals)
-        .where(
-          and(
-            eq(signals.companyId, companyId),
-            eq(signals.projectId, projectId),
-            inArray(signals.detector, [...LABOUR_COMPLIANCE_DETECTORS]),
-          ),
-        );
+      /*
+       * IDEMPOTENCE THROUGH `signals.fingerprint`, which is the platform's own
+       * indexed mechanism for exactly this — `(companyId, detector,
+       * fingerprint)` carries an index, so the lookup is bounded by the keys
+       * this run would raise rather than by every labour signal the project
+       * has ever produced. The key is
+       * `(detector, workerId, periodStart, periodEnd)`: re-running a window
+       * never accuses the same person of the same thing twice, and in a
+       * labour-rights module that is the difference between evidence and
+       * harassment.
+       */
+      const keyOf = (detector: string, workerId: string) =>
+        `${detector}|${workerId}|${body.periodStart}|${body.periodEnd}`;
+      const candidateKeys = [
+        ...new Set(result.findings.map((f) => keyOf(f.detector, f.workerId))),
+      ];
+      const existing = candidateKeys.length
+        ? await app.db
+            .select({ fingerprint: signals.fingerprint })
+            .from(signals)
+            .where(
+              and(
+                eq(signals.companyId, companyId),
+                eq(signals.projectId, projectId),
+                inArray(signals.detector, [...LABOUR_COMPLIANCE_DETECTORS]),
+                inArray(signals.fingerprint, candidateKeys),
+              ),
+            )
+        : [];
       const seen = new Set<string>();
       for (const row of existing) {
-        const ref = row.evidenceRefs as { key?: string } | null;
-        if (typeof ref?.key === "string") seen.add(ref.key);
+        if (row.fingerprint) seen.add(row.fingerprint);
       }
 
       const toInsert: (typeof signals.$inferInsert)[] = [];
       const flags: (typeof labourRiskFlags.$inferInsert)[] = [];
       for (const finding of result.findings) {
-        const key = `${finding.detector}|${finding.workerId}|${body.periodStart}|${body.periodEnd}`;
+        const key = keyOf(finding.detector, finding.workerId);
         if (seen.has(key)) continue;
         seen.add(key);
         const signalId = newId("sig");
@@ -2979,6 +3006,9 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
           detector: finding.detector,
           severity: finding.severity,
           confidence: 1,
+          fingerprint: key,
+          subjectType: "worker",
+          subjectId: finding.workerId,
           title: finding.title,
           explanation: `${finding.explanation}\n\nBasis: ${finding.citation}`,
           evidenceRefs: {
@@ -3020,7 +3050,7 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
       const runId = newId("wcr");
       await appendLedger(app.db, {
         companyId,
-        actorId: req.user!.id,
+        actorId,
         action: "create",
         objectType: "workforce_compliance_run",
         objectId: runId,
@@ -3036,7 +3066,7 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
         },
         storePayload: true,
       });
-      return reply.status(201).send({
+      return {
         runId,
         jurisdiction: jurisdictionView(result.jurisdiction),
         periodStart: body.periodStart,
@@ -3046,7 +3076,17 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
         signalsRaised: toInsert.length,
         flagsRaised: flags.length,
         reasons: result.reasons,
-      });
+      };
+  }
+
+  app.post(
+    "/projects/:projectId/workforce/compliance/run",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const body = complianceSchema.parse(req.body);
+      return reply
+        .status(201)
+        .send(await persistCompliance(req.companyId!, req.projectId!, body, req.user!.id));
     },
   );
 
@@ -3266,6 +3306,55 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
   /* ================================================================ */
   /* SCHEDULED JOBS (plan §6.1)                                        */
   /* ================================================================ */
+
+  /**
+   * WEEKLY WORKING-TIME AND WAGE SWEEP.
+   *
+   * The jurisdiction is NEVER guessed. It is taken from the project's own
+   * recorded country, and a project that records no country, or one whose
+   * country this platform holds no limits for, is SKIPPED with the reason
+   * rather than assessed against somebody else's law — a rest-day limit
+   * borrowed from another country produces findings against an employer that
+   * are simply wrong, and a wrong finding in a labour-rights module is an
+   * accusation the platform manufactured.
+   */
+  app.scheduler.register({
+    name: "workforce.labour-compliance",
+    description:
+      "Working-time and wage detectors over the last full week, per project, against the " +
+      "jurisdiction the project itself records",
+    everyMs: 24 * 60 * 60_000,
+    runOnBoot: false,
+    run: async ({ db, now }) =>
+      forEachCompany(db, async (companyId) => {
+        const today = now.toISOString().slice(0, 10);
+        const periodEnd = addDaysISO(today, -1);
+        const periodStart = addDaysISO(periodEnd, -6);
+        const projectRows = await db
+          .select({ id: projects.id, country: projects.country })
+          .from(projects)
+          .where(eq(projects.companyId, companyId));
+        let assessed = 0;
+        let skipped = 0;
+        let signalsRaised = 0;
+        for (const project of projectRows) {
+          const jurisdiction = getJurisdiction(project.country);
+          if (!jurisdiction) {
+            skipped += 1;
+            continue;
+          }
+          const run = await persistCompliance(
+            companyId,
+            project.id,
+            { jurisdiction: jurisdiction.key, periodStart, periodEnd },
+            null,
+          );
+          assessed += 1;
+          signalsRaised += run.signalsRaised;
+        }
+        return { assessed, skippedNoJurisdiction: skipped, signalsRaised, periodStart, periodEnd };
+      }),
+  });
 
   app.scheduler.register({
     name: "workforce.grievance-sla",

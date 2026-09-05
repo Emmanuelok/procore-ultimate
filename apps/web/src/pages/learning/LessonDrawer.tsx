@@ -27,10 +27,12 @@ import {
 } from "../../ui";
 import { formatDate, formatDateTime } from "../format";
 import ApplyModal from "./ApplyModal";
+import OutcomeForm from "./OutcomeForm";
 import type { ApplyOutcome } from "./ApplyModal";
 import {
   Drawer,
   KV,
+  LESSON_OUTCOME_LABELS,
   LoadError,
   NoteCard,
   Prose,
@@ -46,6 +48,7 @@ import {
   triggerStatusTone,
 } from "./learningShared";
 import type {
+  LessonApplication,
   LessonDetail,
   LessonImpact,
   LessonListRow,
@@ -75,6 +78,7 @@ export default function LessonDrawer({
   const [notice, setNotice] = useState<string | null>(null);
 
   const [applyOpen, setApplyOpen] = useState(false);
+  const [measuring, setMeasuring] = useState<LessonApplication | null>(null);
   const [supersedeOpen, setSupersedeOpen] = useState(false);
   const [candidates, setCandidates] = useState<LessonListRow[] | null>(null);
   const [replacementId, setReplacementId] = useState("");
@@ -428,11 +432,54 @@ export default function LessonDrawer({
                       </div>
                     ) : null}
                     <p className="mt-1 whitespace-pre-wrap text-sm text-ink-800">{a.action}</p>
+                    <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                      <Badge
+                        tone={
+                          a.outcome === "avoided"
+                            ? "green"
+                            : a.outcome === "partially_avoided"
+                              ? "amber"
+                              : a.outcome === "counterproductive"
+                                ? "red"
+                                : "gray"
+                        }
+                      >
+                        {LESSON_OUTCOME_LABELS[a.outcome ?? "unknown"] ?? "Not yet measured"}
+                      </Badge>
+                      {a.outcomeValue !== null ? (
+                        <span className="text-xs tabular-nums text-ink-600">
+                          {a.outcomeCurrency ?? ""} {a.outcomeValue}
+                        </span>
+                      ) : null}
+                      {a.outcomeDays !== null ? (
+                        <span className="text-xs tabular-nums text-ink-600">
+                          {a.outcomeDays} day(s)
+                        </span>
+                      ) : null}
+                      {a.measuredAt ? (
+                        <span className="text-xs text-ink-400">
+                          measured {formatDateTime(a.measuredAt)}
+                        </span>
+                      ) : null}
+                      <button
+                        type="button"
+                        onClick={() => setMeasuring(a)}
+                        className="rounded bg-white px-2 py-0.5 text-xs font-medium text-ink-700 ring-1 ring-ink-200 hover:bg-ink-50"
+                      >
+                        {a.outcome && a.outcome !== "unknown" ? "Revise" : "Record"} the outcome
+                      </button>
+                    </div>
                     {a.outcomeNote ? (
                       <p className="mt-1 whitespace-pre-wrap text-xs text-ink-600">
-                        <span className="font-medium">Outcome:</span> {a.outcomeNote}
+                        <span className="font-medium">Observed:</span> {a.outcomeNote}
                       </p>
-                    ) : null}
+                    ) : (
+                      <p className="mt-1 text-xs italic text-ink-400">
+                        No outcome has been measured, so this application counts towards the
+                        register's reach and towards nothing else. An application nobody measured
+                        is not evidence that the lesson worked.
+                      </p>
+                    )}
                   </li>
                 ))}
               </ul>
@@ -462,6 +509,19 @@ export default function LessonDrawer({
       >
         {body}
       </Drawer>
+
+      {measuring ? (
+        <OutcomeForm
+          application={measuring}
+          onClose={() => setMeasuring(null)}
+          onSaved={() => {
+            setMeasuring(null);
+            void load();
+            void loadImpact();
+            onChanged();
+          }}
+        />
+      ) : null}
 
       {lesson ? (
         <ApplyModal

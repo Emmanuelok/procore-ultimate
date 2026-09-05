@@ -34,12 +34,16 @@ import {
   Tabs,
   Textarea,
   Tooltip,
+  UserPicker,
   useConfirm,
   type DescriptionItem,
+  type UserOption,
 } from "../../ui";
 import { cx } from "../../ui/cx";
 import { IconHistory, IconMeeting, IconPlus, IconUsers } from "../../ui/icons";
 import { api } from "../../lib/api";
+import { MinutesDocumentPanel, ObjectionsPanel } from "./MinutesPanels";
+import { MeetingEditor, useCompanyUsers } from "./SeriesEditor";
 import ActionItemCard from "./ActionItemCard";
 import {
   ACTION_PRIORITIES,
@@ -90,6 +94,7 @@ export default function MeetingDrawer({
   const { busy, refusal, clear, run } = useAction();
   const { confirm, dialog } = useConfirm();
   const [carryResult, setCarryResult] = useState<CarryForwardResult | null>(null);
+  const [editOpen, setEditOpen] = useState(false);
 
   const meeting = detail.data;
 
@@ -176,13 +181,32 @@ export default function MeetingDrawer({
       }
       headerActions={
         meeting ? (
-          <Badge tone={MEETING_STATUS_TONE[meeting.status] ?? "neutral"} dot>
-            {titleCase(meeting.status)}
-          </Badge>
+          <div className="flex items-center gap-2">
+            <Badge tone={MEETING_STATUS_TONE[meeting.status] ?? "neutral"} dot>
+              {titleCase(meeting.status)}
+            </Badge>
+            {meeting.status !== "cancelled" ? (
+              <Button size="xs" variant="ghost" onClick={() => setEditOpen(true)}>
+                Edit
+              </Button>
+            ) : null}
+          </div>
         ) : null
       }
     >
       {dialog}
+      {meeting && editOpen ? (
+        <MeetingEditor
+          projectId={projectId}
+          meeting={meeting}
+          open={editOpen}
+          onClose={() => setEditOpen(false)}
+          onSaved={() => {
+            setEditOpen(false);
+            reload();
+          }}
+        />
+      ) : null}
       {detail.loading && !meeting ? (
         <div className="space-y-3 py-4">
           <Skeleton className="h-20 w-full" />
@@ -912,6 +936,7 @@ function MinutesPanel({
   );
   const [aiDrafted, setAiDrafted] = useState(meeting.aiDrafted === 1);
   const [objection, setObjection] = useState("");
+  const [correction, setCorrection] = useState("");
 
   const base = `/api/v1/projects/${projectId}/meetings/${meeting.id}/minutes`;
   const issued = meeting.minutesIssuedAt !== null;
@@ -947,6 +972,25 @@ function MinutesPanel({
     const done = await run("object", () => api.post(`${base}/object`, { note: objection.trim() }));
     if (done !== null) {
       setObjection("");
+      onMutated();
+    }
+  }
+
+  async function correct() {
+    if (!correction.trim()) return;
+    const ok = await confirm({
+      title: `Withdraw the issued minutes for ${meeting.reference}?`,
+      description:
+        "This is a ledgered re-issue, not an edit. The version is bumped, the issue stamps are cleared, live objections move into the history, and everyone who received the withdrawn version is told. The document already delivered keeps its own hash, so a later dispute compares two versions rather than one that quietly changed.",
+      confirmLabel: "Withdraw for correction",
+      tone: "warning",
+    });
+    if (!ok) return;
+    const done = await run("correct", () =>
+      api.post(`${base}/correct`, { reason: correction.trim() }),
+    );
+    if (done !== null) {
+      setCorrection("");
       onMutated();
     }
   }
@@ -1027,7 +1071,14 @@ function MinutesPanel({
           <div className="flex flex-wrap gap-2">
             <Button
               size="sm"
-              disabled={approved || body.trim().length === 0 || busy !== null}
+              /*
+               * Refused once issued. Saving a draft over issued minutes used to
+               * regress the status while minutesIssuedAt stayed set, after
+               * which neither /issue nor /approve would accept the meeting and
+               * it could never reach minutes_accepted — a deadlock this button
+               * actively invited. Correction is now an explicit, ledgered act.
+               */
+              disabled={approved || issued || body.trim().length === 0 || busy !== null}
               loading={busy === "draft"}
               onClick={() => void draft()}
             >
@@ -1058,6 +1109,44 @@ function MinutesPanel({
           </div>
         </CardBody>
       </Card>
+
+      {issued && !approved ? (
+        <Card>
+          <CardBody className="space-y-2">
+            <p className="text-sm font-semibold text-content">Withdraw and correct</p>
+            <p className="text-meta text-content-muted">
+              Issued minutes cannot be redrafted in place. A correction bumps the version, clears
+              the issue stamps, moves the live objections into the history and tells the previous
+              recipients that what they received has been withdrawn — because a correction nobody is
+              told about is a rewrite.
+            </p>
+            <Field label="Why are these minutes being withdrawn?">
+              <Textarea
+                rows={2}
+                value={correction}
+                onChange={(e) => setCorrection(e.target.value)}
+              />
+            </Field>
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={correction.trim().length === 0 || busy !== null}
+              loading={busy === "correct"}
+              onClick={() => void correct()}
+            >
+              Withdraw for correction
+            </Button>
+          </CardBody>
+        </Card>
+      ) : null}
+
+      <ObjectionsPanel
+        projectId={projectId}
+        meeting={meeting}
+        onMutated={onMutated}
+      />
+
+      <MinutesDocumentPanel projectId={projectId} meeting={meeting} onMutated={onMutated} />
 
       {issued && !approved ? (
         <Card>
@@ -1452,13 +1541,34 @@ function AddActionModal({
   onCreated: () => void;
 }) {
   const { busy, refusal, clear, run } = useAction();
+  const users = useCompanyUsers();
   const [title, setTitle] = useState("");
+  /*
+   * OWNER IS A PERSON, NOT A STRING.
+   *
+   * This form used to post `ownerName` alone, so `ownerId` was never set from
+   * the UI at all: GET /meeting-action-items/mine (which filters on ownerId)
+   * was permanently empty, the assignment notification never fired, and the
+   * overdue-by-owner report grouped typed names. Picking the user is the
+   * default; a typed name remains available for somebody outside the tenant,
+   * and the form says what that costs.
+   */
+  const [ownerId, setOwnerId] = useState<string | null>(null);
   const [ownerName, setOwnerName] = useState("");
   const [dueDate, setDueDate] = useState("");
   const [priority, setPriority] = useState("medium");
   const [agendaItemId, setAgendaItemId] = useState("");
   const [description, setDescription] = useState("");
   const [sourceClause, setSourceClause] = useState("");
+
+  /* An attendee of THIS meeting is the likely owner, so they come first. */
+  const candidates = useMemo<UserOption[]>(() => {
+    const attending = meeting.attendees
+      .filter((a) => a.userId)
+      .map((a) => ({ id: a.userId as string, name: a.name, role: a.jobTitle ?? a.organisation }));
+    const seen = new Set(attending.map((a) => a.id));
+    return [...attending, ...users.filter((u) => !seen.has(u.id))];
+  }, [meeting.attendees, users]);
 
   async function submit() {
     const done = await run("create", () =>
@@ -1468,6 +1578,7 @@ function AddActionModal({
         meetingId: meeting.id,
         agendaItemId: agendaItemId || null,
         priority,
+        ownerId,
         ownerName: ownerName.trim() || null,
         dueDate: dueDate || null,
         sourceClause: sourceClause.trim() || null,
@@ -1475,6 +1586,7 @@ function AddActionModal({
     );
     if (done !== null) {
       setTitle("");
+      setOwnerId(null);
       setOwnerName("");
       setDueDate("");
       setDescription("");
@@ -1519,12 +1631,32 @@ function AddActionModal({
           <Input value={title} onChange={(e) => setTitle(e.target.value)} autoFocus />
         </Field>
         <div className="grid gap-3 sm:grid-cols-3">
-          <Field label="Owner" required>
-            <Input
-              value={ownerName}
-              onChange={(e) => setOwnerName(e.target.value)}
-              placeholder="Name"
-            />
+          <Field
+            label="Owner"
+            required
+            className="sm:col-span-3"
+            hint={
+              ownerId
+                ? "Linked to a platform user: this action appears in their list, they are notified, and the overdue report groups by person rather than by spelling."
+                : "A typed name still appears in the minutes, but it produces no notification, never shows in the owner's own list, and groups by spelling in the overdue report."
+            }
+          >
+            <div className="grid gap-2 sm:grid-cols-2">
+              <UserPicker
+                users={candidates}
+                value={ownerId}
+                placeholder="Pick the person who owns this…"
+                onChange={(id, user) => {
+                  setOwnerId(id);
+                  if (user) setOwnerName(user.name);
+                }}
+              />
+              <Input
+                value={ownerName}
+                onChange={(e) => setOwnerName(e.target.value)}
+                placeholder="…or type a name"
+              />
+            </div>
           </Field>
           <Field label="Due">
             <Input type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} />

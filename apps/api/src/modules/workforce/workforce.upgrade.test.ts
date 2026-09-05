@@ -6,7 +6,7 @@
  * turn honest people into named overclaims.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import {
   labourRiskFlags,
@@ -17,6 +17,7 @@ import {
   workerGrievances,
   workers,
 } from "@constructos/db";
+import { LABOUR_COMPLIANCE_DETECTORS } from "@constructos/shared";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
 import { newId } from "../../lib/ids.js";
 import { addDaysISO, todayISO } from "../field/dates.js";
@@ -181,7 +182,7 @@ describe("regressions", () => {
 
     await app.db
       .update(signals)
-      .set({ disposition: "dismissed" })
+      .set({ disposition: "false_positive" })
       .where(eq(signals.id, signalId));
 
     const after = await get(`/projects/${projectId}/workforce/vendor-risk`);
@@ -483,6 +484,65 @@ describe("health inputs and jobs", () => {
     const names = app.scheduler.list().map((j) => j.name);
     expect(names).toContain("workforce.grievance-sla");
     expect(names).toContain("workforce.labour-audit-caps");
+    expect(names).toContain("workforce.labour-compliance");
+  });
+
+  it("never guesses a jurisdiction: a project with no country is skipped by the sweep", async () => {
+    // The fixture project records no country, so the weekly sweep must leave
+    // it alone rather than judge it under somebody else's working-time law.
+    await app.db
+      .update(projects)
+      .set({ country: null })
+      .where(eq(projects.id, projectId));
+    const before = await app.db
+      .select({ id: signals.id })
+      .from(signals)
+      .where(
+        and(
+          eq(signals.projectId, projectId),
+          inArray(signals.detector, [...LABOUR_COMPLIANCE_DETECTORS]),
+        ),
+      );
+    await app.scheduler.runNow("workforce.labour-compliance");
+    const after = await app.db
+      .select({ id: signals.id })
+      .from(signals)
+      .where(
+        and(
+          eq(signals.projectId, projectId),
+          inArray(signals.detector, [...LABOUR_COMPLIANCE_DETECTORS]),
+        ),
+      );
+    expect(after.length).toBe(before.length);
+  });
+
+  it("assesses a project that does record a jurisdiction, and is idempotent", async () => {
+    await app.db
+      .update(projects)
+      .set({ country: "gb" })
+      .where(eq(projects.id, projectId));
+    await app.scheduler.runNow("workforce.labour-compliance");
+    const first = await app.db
+      .select({ id: signals.id })
+      .from(signals)
+      .where(
+        and(
+          eq(signals.projectId, projectId),
+          inArray(signals.detector, [...LABOUR_COMPLIANCE_DETECTORS]),
+        ),
+      );
+    await app.scheduler.runNow("workforce.labour-compliance");
+    const second = await app.db
+      .select({ id: signals.id })
+      .from(signals)
+      .where(
+        and(
+          eq(signals.projectId, projectId),
+          inArray(signals.detector, [...LABOUR_COMPLIANCE_DETECTORS]),
+        ),
+      );
+    // Running the same window twice must never accuse the same person twice.
+    expect(second.length).toBe(first.length);
   });
 });
 

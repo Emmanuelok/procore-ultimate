@@ -373,6 +373,23 @@ export function TimecardCreateModal({
 /* Batch actions                                                               */
 /* ========================================================================== */
 
+/**
+ * The formats payroll actually asks for. The WH-347 certified payroll is
+ * offered here and NOWHERE is it pre-signed: the statement of compliance is a
+ * criminal declaration by a named person, so the export leaves the signature
+ * block empty for a human to complete.
+ */
+const PAYROLL_FORMATS = [
+  { value: "generic_csv", label: "CSV", hint: "One row per worker with the buckets as columns" },
+  { value: "daily_csv", label: "Daily CSV", hint: "One row per worker per day" },
+  {
+    value: "certified_payroll",
+    label: "WH-347",
+    hint: "US Department of Labor certified payroll. The statement of compliance is left unsigned.",
+  },
+  { value: "json", label: "JSON", hint: "With the provenance an integration needs" },
+] as const;
+
 export function BatchActions({
   projectId,
   batch,
@@ -458,14 +475,20 @@ export function BatchActions({
           </Button>
         ) : null}
         {batch.status === "exported" || batch.status === "locked" ? (
-          <a
-            className="inline-flex items-center rounded-md border border-border px-2 py-1 text-meta text-content-muted hover:bg-surface-sunken"
-            href={`/api/v1${`/projects/${projectId}/timecard-batches/${batch.id}/payroll-export?format=generic_csv`}`}
-            target="_blank"
-            rel="noreferrer"
-          >
-            Download CSV
-          </a>
+          <>
+            {PAYROLL_FORMATS.map((format) => (
+              <a
+                key={format.value}
+                className="inline-flex items-center rounded-md border border-border px-2 py-1 text-meta text-content-muted hover:bg-surface-sunken"
+                href={`/api/v1/projects/${projectId}/timecard-batches/${batch.id}/payroll-export?format=${format.value}`}
+                target="_blank"
+                rel="noreferrer"
+                title={format.hint}
+              >
+                {format.label}
+              </a>
+            ))}
+          </>
         ) : null}
       </div>
 
@@ -608,6 +631,275 @@ export function BatchCreateModal({
         <input type="checkbox" checked={collect} onChange={(e) => setCollect(e.target.checked)} />
         Pull in the period&apos;s uncollected cards for this crew now
       </label>
+    </ModalShell>
+  );
+}
+
+
+/* ========================================================================== */
+/* Raise a T&M ticket, and source its lines from hours already recorded        */
+/* ========================================================================== */
+
+/**
+ * A T&M TICKET IS EVIDENCE OF AN INSTRUCTION, not a price.
+ *
+ * Two fields on this form carry the whole commercial argument, so both are
+ * asked for plainly:
+ *
+ *  · WAS IT A VERBAL INSTRUCTION. Verbal instructions are the norm on site
+ *    and the reason daywork claims fail. Ticking it REQUIRES the name of the
+ *    person who gave it — an instruction from nobody is not an instruction —
+ *    and the API refuses the ticket without it.
+ *  · WHAT RATE BASIS. Whether these hours are claimed at contract daywork
+ *    rates, at an agreed schedule or "to be agreed" changes what the client is
+ *    being asked to sign, and a ticket that hides it is a ticket that gets
+ *    argued about later.
+ *
+ * The lines are then SOURCED from timecard allocations and plant days that
+ * already exist rather than retyped. Sourcing stamps those rows as billed on
+ * this ticket, so the same hours cannot be claimed twice — and labour lines
+ * come across WITHOUT a rate, because the worker's internal pay rate is not
+ * the contract charge-out rate and putting it on a client-facing ticket both
+ * exposes it and under-claims.
+ */
+export function TicketCreateModal({
+  open,
+  onClose,
+  onDone,
+  projectId,
+  crews,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onDone: (ticketId: string) => void;
+  projectId: string;
+  crews: CrewRecord[];
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [title, setTitle] = useState("");
+  const [ticketDate, setTicketDate] = useState(today());
+  const [scopeOfWork, setScopeOfWork] = useState("");
+  const [crewId, setCrewId] = useState("");
+  const [locationText, setLocationText] = useState("");
+  const [rateBasis, setRateBasis] = useState("contract_daywork_rates");
+  const [markupPercent, setMarkupPercent] = useState("");
+  const [wasVerbal, setWasVerbal] = useState(false);
+  const [instructedByName, setInstructedByName] = useState("");
+  const [instructionRef, setInstructionRef] = useState("");
+
+  async function submit() {
+    const created = await run("ticket", () =>
+      api.post<{ id: string; reference: string }>(`/api/v1/projects/${projectId}/tm-tickets`, {
+        title: title.trim(),
+        ticketDate,
+        scopeOfWork: scopeOfWork.trim() || null,
+        crewId: crewId || null,
+        locationText: locationText.trim() || null,
+        rateBasis,
+        markupPercent: markupPercent === "" ? null : Number(markupPercent),
+        wasVerbalInstruction: wasVerbal,
+        instructedByName: instructedByName.trim() || null,
+        instructionRef: instructionRef.trim() || null,
+      }),
+    );
+    if (created) {
+      toast.success(`${created.reference} raised`);
+      onDone(created.id);
+      onClose();
+      setTitle("");
+      setScopeOfWork("");
+      setInstructedByName("");
+      setInstructionRef("");
+    }
+  }
+
+  return (
+    <ModalShell
+      open={open}
+      onClose={onClose}
+      title="Raise a T&M ticket"
+      description="The record of what was instructed, done and presented for signature on the day. Pricing beyond this belongs to change management; nothing here restates it."
+      busy={busy !== null}
+      refusal={refusal}
+      clearRefusal={clear}
+      submitLabel="Raise the ticket"
+      disabled={title.trim() === "" || (wasVerbal && instructedByName.trim() === "")}
+      onSubmit={submit}
+    >
+      <Field label="What was done" required>
+        <Input
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          placeholder="Break out and remove unrecorded concrete obstruction, grid F/12"
+        />
+      </Field>
+      <div className="grid gap-3 md:grid-cols-2">
+        <Field label="Date of the work" required>
+          <Input type="date" value={ticketDate} onChange={(e) => setTicketDate(e.target.value)} />
+        </Field>
+        <Field label="Crew" hint="Whose hours these are, when one gang did the work.">
+          <Select value={crewId} onChange={(e) => setCrewId(e.target.value)}>
+            <option value="">Not one crew</option>
+            {crews.map((crew) => (
+              <option key={crew.id} value={crew.id}>
+                {crew.reference} — {crew.name}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      </div>
+      <Field label="Scope of work" hint="What a stranger reading this in two years needs to know.">
+        <Textarea rows={3} value={scopeOfWork} onChange={(e) => setScopeOfWork(e.target.value)} />
+      </Field>
+      <Field label="Where">
+        <Input
+          value={locationText}
+          onChange={(e) => setLocationText(e.target.value)}
+          placeholder="Grid F/12, basement slab"
+        />
+      </Field>
+      <div className="grid gap-3 md:grid-cols-2">
+        <Field
+          label="Rate basis"
+          hint="What the client is being asked to sign against. 'To be agreed' is honest and is recorded as such."
+        >
+          <Select value={rateBasis} onChange={(e) => setRateBasis(e.target.value)}>
+            <option value="contract_daywork_rates">Contract daywork rates</option>
+            <option value="schedule_of_rates">Schedule of rates</option>
+            <option value="actual_cost_plus">Actual cost plus</option>
+            <option value="agreed_lump_sum">Agreed lump sum</option>
+            <option value="star_rate">Star rate</option>
+            <option value="to_be_agreed">To be agreed</option>
+          </Select>
+        </Field>
+        <Field label="Daywork uplift %" hint="The percentage agreed on site, if any.">
+          <Input
+            type="number"
+            value={markupPercent}
+            onChange={(e) => setMarkupPercent(e.target.value)}
+            placeholder="e.g. 15"
+          />
+        </Field>
+      </div>
+      <label className="flex items-start gap-2 text-meta text-content-muted">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={wasVerbal}
+          onChange={(e) => setWasVerbal(e.target.checked)}
+        />
+        <span>
+          This was a VERBAL instruction. Verbal instructions are the norm on site and the reason
+          daywork claims fail — so the name of the person who gave it is required.
+        </span>
+      </label>
+      {wasVerbal ? (
+        <Field label="Instructed by" required>
+          <Input
+            value={instructedByName}
+            onChange={(e) => setInstructedByName(e.target.value)}
+            placeholder="Name and organisation of whoever gave the instruction"
+          />
+        </Field>
+      ) : (
+        <Field label="Instruction reference" hint="The written instruction this follows, if there is one.">
+          <Input value={instructionRef} onChange={(e) => setInstructionRef(e.target.value)} />
+        </Field>
+      )}
+    </ModalShell>
+  );
+}
+
+/**
+ * SOURCE THE TICKET'S LINES from hours and plant days already recorded.
+ *
+ * Retyping hours onto a ticket is how the same day gets claimed twice and how
+ * a ticket ends up disagreeing with the cost report. Sourcing stamps the rows
+ * it took, so a second ticket cannot take them again; the refusal naming the
+ * ticket that already has them is rendered verbatim.
+ */
+export function TicketSourceModal({
+  open,
+  onClose,
+  onDone,
+  projectId,
+  ticketId,
+  ticketReference,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onDone: () => void;
+  projectId: string;
+  ticketId: string | null;
+  ticketReference: string;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [allocationIds, setAllocationIds] = useState("");
+  const [utilisationIds, setUtilisationIds] = useState("");
+
+  if (!ticketId) return null;
+
+  const parse = (raw: string): string[] =>
+    raw
+      .split(/[\s,]+/)
+      .map((v) => v.trim())
+      .filter(Boolean);
+
+  async function submit() {
+    const done = await run("source", () =>
+      api.post(`/api/v1/projects/${projectId}/tm-tickets/${ticketId}/lines/source`, {
+        ...(parse(allocationIds).length > 0
+          ? { timecardAllocationIds: parse(allocationIds) }
+          : {}),
+        ...(parse(utilisationIds).length > 0
+          ? { equipmentUtilisationIds: parse(utilisationIds) }
+          : {}),
+      }),
+    );
+    if (done) {
+      toast.success("Lines sourced from the hours already recorded");
+      setAllocationIds("");
+      setUtilisationIds("");
+      onDone();
+      onClose();
+    }
+  }
+
+  return (
+    <ModalShell
+      open={open}
+      onClose={onClose}
+      title={`Source lines onto ${ticketReference}`}
+      description="Take hours and plant days that already exist rather than retyping them. Each row sourced is stamped as billed on this ticket, so it cannot be claimed on another."
+      busy={busy !== null}
+      refusal={refusal}
+      clearRefusal={clear}
+      submitLabel="Source the lines"
+      disabled={parse(allocationIds).length + parse(utilisationIds).length === 0}
+      onSubmit={submit}
+    >
+      <Field
+        label="Timecard allocation ids"
+        hint="From the cost report or the timecard drawer. Separate with spaces or commas. Labour lines come across WITHOUT a rate: the worker's pay rate is not the contract charge-out rate."
+      >
+        <Textarea
+          rows={3}
+          value={allocationIds}
+          onChange={(e) => setAllocationIds(e.target.value)}
+          placeholder="tca_… tca_…"
+        />
+      </Field>
+      <Field
+        label="Equipment utilisation ids"
+        hint="Plant days from the equipment workspace. The hire rate is not copied either — the plant charge on a daywork ticket is a contract rate."
+      >
+        <Textarea
+          rows={3}
+          value={utilisationIds}
+          onChange={(e) => setUtilisationIds(e.target.value)}
+          placeholder="eut_… eut_…"
+        />
+      </Field>
     </ModalShell>
   );
 }

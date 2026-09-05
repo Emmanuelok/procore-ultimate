@@ -9,6 +9,9 @@
  *   · Certificates — evidence of other people's cover, and who verified it (#780-781)
  *   · Bonds        — security, its reductions, and the demand deadline (#790-794)
  *   · Claims       — the notification clock that runs from AWARENESS (#783-789)
+ *   · Lines & requirements — the bonding line and therefore headroom (#796), what
+ *                    the contract demands, the renewal pipeline (#775) and the
+ *                    loss ratio the renewal turns on (#782)
  *   · Programme    — the same picture across the estate, company-level (#795-796)
  *
  * The page is project-scoped and renders at /projects/:projectId/insurance. The
@@ -22,6 +25,7 @@ import BondsTab from "./BondsTab";
 import CertificatesTab from "./CertificatesTab";
 import ClaimsTab from "./ClaimsTab";
 import PoliciesTab from "./PoliciesTab";
+import ProgrammeControlTab from "./ProgrammeControlTab";
 import ProgrammeTab from "./ProgrammeTab";
 import RadarTab from "./RadarTab";
 import { TabBar, type FocusRequest } from "./insuranceShared";
@@ -32,6 +36,7 @@ const TABS = [
   { key: "certificates", label: "Certificates" },
   { key: "bonds", label: "Bonds" },
   { key: "claims", label: "Claims" },
+  { key: "control", label: "Lines & requirements" },
   { key: "programme", label: "Programme" },
 ];
 
@@ -41,6 +46,7 @@ export type InsuranceTabKey =
   | "certificates"
   | "bonds"
   | "claims"
+  | "control"
   | "programme";
 
 export default function InsurancePage() {
@@ -102,6 +108,7 @@ export default function InsurancePage() {
       ) : null}
       {tab === "bonds" ? <BondsTab projectId={projectId} focus={focusFor("bonds")} /> : null}
       {tab === "claims" ? <ClaimsTab projectId={projectId} focus={focusFor("claims")} /> : null}
+      {tab === "control" ? <ProgrammeControlTab projectId={projectId} /> : null}
       {tab === "programme" ? <ProgrammeTab /> : null}
     </div>
   );

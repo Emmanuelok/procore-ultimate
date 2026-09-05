@@ -57,7 +57,10 @@ import {
   money,
   percent,
   useAction,
+  useOwnershipComparison,
   utilisationTone,
+  OWNERSHIP_VERDICT_LABEL,
+  OWNERSHIP_VERDICT_TONE,
   type ListResponse,
   type Loadable,
   type UtilisationRow,
@@ -588,6 +591,8 @@ export default function UtilisationTab({
         }}
       />
 
+      <OwnershipComparisonPanel projectId={projectId} from={data.from} to={data.to} />
+
       {chartRows.length > 0 ? (
         <ChartCard
           title="Where the paid window went"
@@ -809,6 +814,144 @@ function PostToBudget({
             <ReasonList reasons={result.reasons} />
           </div>
         ) : null}
+      </CardBody>
+    </Card>
+  );
+}
+
+/**
+ * RENTAL AGAINST OWNED, per class of machine and per currency.
+ *
+ * The comparison is cost per PRODUCTIVE hour, not cost per day: a machine that
+ * stood four days out of five did not cost a fifth of the week, and cost per
+ * day hides exactly that. The engine refuses far more often than it answers,
+ * and the refusals are rendered because they are the useful part — the
+ * commonest is owned plant carrying no internal charge-out rate, which makes
+ * the owned fleet read as free.
+ *
+ * Depreciation, financing and residual value are deliberately absent. This is
+ * an operational window, not a capital appraisal, and a screen that mixed them
+ * would present a purchase decision as a hire decision.
+ */
+function OwnershipComparisonPanel({
+  projectId,
+  from,
+  to,
+}: {
+  projectId: string | undefined;
+  from: string;
+  to: string;
+}) {
+  const [scope, setScope] = useState<"project" | "company">("project");
+  const comparison = useOwnershipComparison(
+    from,
+    to,
+    scope === "project" ? projectId : undefined,
+    Boolean(projectId),
+  );
+  const data = comparison.data;
+
+  return (
+    <Card>
+      <CardBody className="space-y-3">
+        <SectionHeading
+          title="Rental against owned"
+          hint="Is the hire desk cheaper than our own fleet, for this class of machine, in this currency? Measured per productive hour."
+          className="mb-0"
+          actions={
+            <Select
+              size="sm"
+              value={scope}
+              onChange={(event) => setScope(event.target.value === "company" ? "company" : "project")}
+              aria-label="Comparison scope"
+            >
+              <option value="project">This project</option>
+              <option value="company">Every project I can see</option>
+            </Select>
+          }
+        />
+        {comparison.error ? (
+          <LoadError message={comparison.error} onRetry={comparison.reload} />
+        ) : comparison.loading ? (
+          <SkeletonTable rows={3} />
+        ) : !data ? null : (
+          <>
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge tone="neutral" size="sm">
+                {data.totals.machineDays} machine-day{data.totals.machineDays === 1 ? "" : "s"}
+              </Badge>
+              <Badge tone="neutral" size="sm">
+                {data.totals.hiredDays} hired · {data.totals.ownedDays} owned
+              </Badge>
+              {data.totals.uncostedDays > 0 ? (
+                <Badge tone="warning" size="sm">
+                  {data.totals.uncostedDays} uncosted
+                </Badge>
+              ) : null}
+            </div>
+            {data.buckets.length === 0 ? (
+              <EmptyState
+                icon={<IconClock />}
+                title="Nothing to compare"
+                description="No plant day is recorded in this window. That is an absence of plant sheets, not an absence of plant cost."
+              />
+            ) : (
+              <Table>
+                <THead>
+                  <Tr>
+                    <Th>Class</Th>
+                    <Th>Verdict</Th>
+                    <Th align="right">Hired /productive h</Th>
+                    <Th align="right">Owned /productive h</Th>
+                    <Th align="right">Ratio</Th>
+                    <Th align="right">On the hired hours</Th>
+                    <Th>Why</Th>
+                  </Tr>
+                </THead>
+                <TBody>
+                  {data.buckets.map((bucket) => (
+                    <Tr key={`${bucket.category}|${bucket.currency}`}>
+                      <Td>
+                        {labelize(bucket.category)}
+                        <span className="ml-1 text-2xs text-content-subtle">{bucket.currency}</span>
+                      </Td>
+                      <Td>
+                        <Badge tone={OWNERSHIP_VERDICT_TONE[bucket.verdict]} size="xs" dot>
+                          {OWNERSHIP_VERDICT_LABEL[bucket.verdict]}
+                        </Badge>
+                      </Td>
+                      <Td align="right">
+                        {bucket.hired.costPerWorkingHour === null
+                          ? EM_DASH
+                          : money(bucket.hired.costPerWorkingHour, bucket.currency)}
+                      </Td>
+                      <Td align="right">
+                        {bucket.owned.costPerWorkingHour === null
+                          ? EM_DASH
+                          : money(bucket.owned.costPerWorkingHour, bucket.currency)}
+                      </Td>
+                      <Td align="right">
+                        {bucket.ratio === null ? EM_DASH : `${bucket.ratio.toFixed(2)}×`}
+                      </Td>
+                      <Td align="right">
+                        {bucket.differenceOnHiredHours === null
+                          ? EM_DASH
+                          : money(bucket.differenceOnHiredHours, bucket.currency)}
+                      </Td>
+                      <Td>
+                        <ReasonList reasons={bucket.reasons} />
+                      </Td>
+                    </Tr>
+                  ))}
+                </TBody>
+              </Table>
+            )}
+            <ReasonList reasons={data.reasons} />
+            {data.method ? (
+              <p className="text-2xs text-content-subtle">{data.method}</p>
+            ) : null}
+          </>
+        )}
       </CardBody>
     </Card>
   );

@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { companyMemberships, mfaChallenges, userMfa } from "@constructos/db";
@@ -27,7 +27,16 @@ import { consumeChallenge, liveChallengeCount, sweepExpiredChallenges } from "./
  * allow three: a suite that goes red when the machine is busy teaches people
  * to ignore red, which is the expensive failure.
  */
-const HOOK_TIMEOUT_MS = 900_000; /* TEMP-VERIFY */
+const HOOK_TIMEOUT_MS = 300_000;
+
+/**
+ * Every test here registers an account and enrols a factor — a bcrypt hash, a
+ * company, a membership and a TOTP round trip. On a loaded machine that
+ * outruns vitest's 30-second default for reasons that have nothing to do with
+ * challenges. The allowance changes no assertion.
+ */
+vi.setConfig({ testTimeout: 120_000, hookTimeout: HOOK_TIMEOUT_MS });
+
 const PASSWORD = "scaffold-tower-brick";
 let counter = 0;
 

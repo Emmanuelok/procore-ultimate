@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import {
@@ -25,7 +25,16 @@ import { applyRetention, PSEUDONYM } from "./retention.js";
  * five minutes. Isolation comes from each test registering its own tenant,
  * which is what these assertions actually depend on.
  */
-const HOOK_TIMEOUT_MS = 900_000; /* TEMP-VERIFY */
+const HOOK_TIMEOUT_MS = 300_000;
+
+/**
+ * Almost every test here registers one or two accounts, and a registration is
+ * a bcrypt hash plus a company, a membership and a project. On a loaded
+ * machine two of those alone outrun vitest's 30-second default, which fails
+ * the suite for a reason that has nothing to do with retention. The allowance
+ * changes no assertion.
+ */
+vi.setConfig({ testTimeout: 120_000, hookTimeout: HOOK_TIMEOUT_MS });
 
 let built: BuiltApp;
 let app: FastifyInstance;

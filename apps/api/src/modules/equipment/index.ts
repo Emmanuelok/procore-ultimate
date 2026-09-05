@@ -88,6 +88,7 @@ import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { isExpired } from "../../lib/time.js";
 import { addDaysISO, isoDateSchema, todayISO } from "../field/dates.js";
 import { computeTco2e, normaliseUnit, unitsMatch } from "../esg/carbon.js";
+import { compareOwnership, type OwnershipDay } from "./ownership.js";
 import {
   assessIdlePlant,
   computeDayCost,
@@ -275,6 +276,12 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     app.authenticate,
     app.requireCompany,
     app.requireTool("equipment", "standard"),
+  ];
+  /** Posting plant cost onto the cost report moves somebody's budget. */
+  const projectAdminGate = [
+    app.authenticate,
+    app.requireCompany,
+    app.requireTool("equipment", "admin"),
   ];
   /**
    * The fleet register sits ABOVE the projects, so `requireTool` (which
@@ -2666,15 +2673,16 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
    *  • Only VERIFIED days post. A utilisation row is the plant claim; the
    *    verification is the second pair of eyes, and posting unverified hours
    *    would put an unchecked claim on the cost report as fact.
-   *  • A day whose cost could not be computed in full (`totalIsComplete`
-   *    false — no hire rate, no operator rate) is NOT posted at a partial
-   *    figure. It is reported as excluded with the reason.
+   *  • A day that could not be costed AT ALL (no hire rate and no internal
+   *    charge-out rate) is reported as excluded, never posted at zero. A day
+   *    costed only in part IS posted at the figure that could be computed,
+   *    and the budget line's stamp records that it is a FLOOR.
    *  • A budget line carrying plant in two currencies is refused, not
    *    converted.
    */
   app.post(
     "/projects/:projectId/equipment-utilisation/post-to-budget",
-    { preHandler: standardGate },
+    { preHandler: projectAdminGate },
     async (req, reply) => {
       const body = z
         .object({
@@ -8217,6 +8225,114 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         note:
           "availability is computed from live assignments, the hire end date and outstanding " +
           "services. It does not know about a machine somebody has verbally promised elsewhere.",
+      };
+    },
+  );
+
+  /* ================================================================ */
+  /* RENTAL AGAINST OWNED                                              */
+  /* ================================================================ */
+
+  /**
+   * Is the hire desk cheaper than our own fleet, per class of machine, per
+   * currency? A fleet question, so it is company-scoped and narrowed to the
+   * projects the caller may see.
+   *
+   * The engine (ownership.ts) refuses far more often than it answers, and the
+   * refusals are the useful part: the commonest one is owned plant carrying no
+   * internal charge-out rate, which makes the owned fleet read as free and is
+   * the most expensive mistake a plant department makes.
+   */
+  app.get(
+    "/companies/current/equipment-ownership-comparison",
+    { preHandler: companyRead },
+    async (req) => {
+      const q = z
+        .object({
+          from: isoDateSchema.optional(),
+          to: isoDateSchema.optional(),
+          projectId: idRef.optional(),
+          category: z.enum(EQUIPMENT_CATEGORIES).optional(),
+        })
+        .parse(req.query);
+      const companyId = req.companyId!;
+      const to = q.to ?? todayISO();
+      const from = q.from ?? addDaysISO(to, -89);
+      if (to < from) throw badRequest("to must not precede from");
+      const scope = companyScopeOf(req);
+
+      const clauses = [
+        eq(equipmentUtilisation.companyId, companyId),
+        gte(equipmentUtilisation.utilisationDate, from),
+        lte(equipmentUtilisation.utilisationDate, to),
+      ];
+      if (q.projectId) {
+        await assertProject(q.projectId, companyId);
+        if (!scope.all && !scope.projectIds.includes(q.projectId)) {
+          throw forbidden("You do not hold equipment on that project.");
+        }
+        clauses.push(eq(equipmentUtilisation.projectId, q.projectId));
+      } else {
+        const projectFilter = scopeProjectFilter(scope, equipmentUtilisation.projectId);
+        if (projectFilter) clauses.push(projectFilter);
+      }
+      const rows = await app.db
+        .select()
+        .from(equipmentUtilisation)
+        .where(and(...clauses));
+      if (rows.length === 0) {
+        return { from, to, ...compareOwnership([]) };
+      }
+      const machineIds = [...new Set(rows.map((r) => r.equipmentId))];
+      const fleet = await app.db
+        .select()
+        .from(equipment)
+        .where(
+          and(eq(equipment.companyId, companyId), inArray(equipment.id, machineIds)),
+        );
+      const byId = new Map(fleet.map((m) => [m.id, m] as const));
+
+      const days: OwnershipDay[] = [];
+      for (const row of rows) {
+        const machine = byId.get(row.equipmentId);
+        if (!machine) continue;
+        if (q.category && machine.category !== q.category) continue;
+        const h = hoursOf(row);
+        const cost = computeDayCost({
+          hireRateAmount: machine.hireRateAmount,
+          hireRateUnit: machine.hireRateUnit as HireRateUnit | null,
+          idleRateAmount: machine.idleRateAmount,
+          internalRateAmount: machine.internalRateAmount,
+          ownership: machine.ownership,
+          operatorRateAmount: machine.operatorRateAmount,
+          fuelCost: row.fuelCost,
+          fuelLitres: row.fuelLitres,
+          currency: row.currency,
+          hours: h,
+        });
+        days.push({
+          equipmentId: machine.id,
+          category: machine.category,
+          ownership: machine.ownership,
+          currency: cost.currency,
+          workingHours: row.workingHours,
+          idleHours: row.idleHours,
+          standbyHours: row.standbyHours,
+          downtimeHours: row.downtimeHours,
+          availableHours: row.availableHours,
+          cost: cost.totalCost,
+          costIsComplete: cost.totalIsComplete,
+        });
+      }
+      return {
+        from,
+        to,
+        projectId: q.projectId ?? null,
+        ...compareOwnership(days),
+        method:
+          "cost per PRODUCTIVE hour, bucketed by machine category and currency. A machine that " +
+          "stood four days out of five did not cost a fifth of the week, so cost per day is not " +
+          "used. Depreciation, financing and residual value are deliberately excluded.",
       };
     },
   );

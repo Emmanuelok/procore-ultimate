@@ -1593,7 +1593,7 @@ export const SUPPLY_RISK_TONE: Record<SupplyRisk, Tone> = {
   order_now: "warning",
   order_by_date_missed: "danger",
   shortage: "danger",
-  unknown: "muted",
+  unknown: "neutral",
 };
 
 export interface SupplyItemAssessment {
@@ -1779,6 +1779,77 @@ export function useAvailability(
   return useResource(
     enabled
       ? `/api/v1/companies/current/equipment-availability?from=${from}&to=${to}`
+      : null,
+  );
+}
+
+/* ========================================================================== */
+/* Rental against owned                                                        */
+/* ========================================================================== */
+
+export interface OwnershipSide {
+  machines: number;
+  days: number;
+  workingHours: number;
+  paidHours: number;
+  cost: number | null;
+  costPerWorkingHour: number | null;
+  utilisationPercent: number | null;
+  uncostedDays: number;
+  partiallyCostedDays: number;
+}
+
+export interface OwnershipBucket {
+  category: string;
+  currency: string;
+  hired: OwnershipSide;
+  owned: OwnershipSide;
+  ratio: number | null;
+  verdict: "hired_dearer" | "owned_dearer" | "comparable" | "not_comparable";
+  differenceOnHiredHours: number | null;
+  reasons: string[];
+}
+
+export interface OwnershipComparison {
+  from: string;
+  to: string;
+  projectId?: string | null;
+  buckets: OwnershipBucket[];
+  totals: {
+    machineDays: number;
+    hiredDays: number;
+    ownedDays: number;
+    uncostedDays: number;
+    bucketsCompared: number;
+  };
+  reasons: string[];
+  method?: string;
+}
+
+export const OWNERSHIP_VERDICT_LABEL: Record<OwnershipBucket["verdict"], string> = {
+  hired_dearer: "Hiring costs more",
+  owned_dearer: "Our own costs more",
+  comparable: "The same, within 10%",
+  not_comparable: "Not comparable",
+};
+
+export const OWNERSHIP_VERDICT_TONE: Record<OwnershipBucket["verdict"], Tone> = {
+  hired_dearer: "warning",
+  owned_dearer: "warning",
+  comparable: "neutral",
+  not_comparable: "neutral",
+};
+
+export function useOwnershipComparison(
+  from: string,
+  to: string,
+  projectId: string | undefined,
+  enabled: boolean,
+): Loadable<OwnershipComparison> {
+  return useResource<OwnershipComparison>(
+    enabled
+      ? `/api/v1/companies/current/equipment-ownership-comparison?from=${from}&to=${to}` +
+          (projectId ? `&projectId=${projectId}` : "")
       : null,
   );
 }

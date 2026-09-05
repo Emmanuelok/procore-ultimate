@@ -25,7 +25,7 @@ import {
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
-import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
+import { AppError, badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { addDaysISO, todayISO } from "../field/dates.js";
 import { forEachCompany } from "../../lib/scheduler.js";
@@ -239,6 +239,13 @@ const REVIEW_TRANSITIONS: Record<ReviewStatus, ReviewStatus[]> = {
 type LessonRow = typeof lessons.$inferSelect;
 type TriggerRow = typeof lessonTriggers.$inferSelect;
 type ReviewRow = typeof postProjectReviews.$inferSelect;
+
+/** 503 with the platform-wide `AiDisabled` name, so clients degrade uniformly. */
+function aiUnavailable(message: string): AppError {
+  const err = new AppError(503, message);
+  err.name = "AiDisabled";
+  return err;
+}
 
 const MS_PER_DAY = 86_400_000;
 
@@ -1281,6 +1288,126 @@ export const learningModule: FastifyPluginAsync = async (app) => {
         lesson,
         trigger: await fetchTrigger(triggerId, req.companyId!, req.projectId!),
       });
+    },
+  );
+
+  /**
+   * DRAFT A LESSON FROM THE RECORD THAT OBLIGED IT (#978, AI-assisted).
+   *
+   * The commonest reason a mandatory capture is never captured is not that
+   * nobody agreed it mattered — it is the blank page. This reads the trigger
+   * and its source record and proposes the four fields a lesson needs, every
+   * one of them cited back to the record it came from.
+   *
+   * WHAT IT DELIBERATELY DOES NOT DO: create anything. It returns a PROPOSAL.
+   * The trigger stays open, no lesson row exists, and the capture route is
+   * still the only way one comes into being — because a lesson nobody chose
+   * to write is a lesson nobody stands behind, and the validation step that
+   * follows would then be checking a machine's work against nothing.
+   *
+   * With no ANTHROPIC_API_KEY the route answers 503 and the whole non-AI
+   * capture path is untouched.
+   */
+  const draftSchema = z.object({
+    title: z.string().nullable(),
+    whatHappened: z.string().nullable(),
+    rootCause: z.string().nullable(),
+    recommendation: z.string().nullable(),
+    category: z.string().nullable(),
+    tags: z.array(z.string()).nullable(),
+    confidence: z.number().nullable(),
+    citations: z.array(
+      z.object({ recordId: z.string(), excerpt: z.string().nullable() }),
+    ),
+  });
+
+  app.post(
+    "/projects/:projectId/learning/triggers/:triggerId/draft",
+    { preHandler: projectStandard },
+    async (req) => {
+      const { triggerId } = req.params as { triggerId: string };
+      const trigger = await fetchTrigger(triggerId, req.companyId!, req.projectId!);
+      if (trigger.status !== "open") {
+        throw conflict(
+          `This trigger is already ${trigger.status}. A draft is only useful while the capture ` +
+            "is still owed.",
+        );
+      }
+      if (!aiEnabled(app)) {
+        throw aiUnavailable(
+          "ANTHROPIC_API_KEY is not configured, so no draft can be generated. Capture the " +
+            "lesson directly — the trigger, its rationale and the source record are all on this " +
+            "page, and nothing about the mandatory-capture workflow depends on the AI layer.",
+        );
+      }
+      const sourceRef = trigger.sourceRef as TriggerSourceRef;
+      const context = [
+        `Trigger kind: ${trigger.kind}`,
+        `Why it fired: ${trigger.rationale}`,
+        `Source record: ${sourceRef.tool} ${sourceRef.recordId} — ${sourceRef.label}`,
+        ...Object.entries(sourceRef)
+          .filter(([k]) => !["tool", "recordId", "label"].includes(k))
+          .map(([k, v]) => `${k}: ${String(v).slice(0, 400)}`),
+      ].join("\n");
+      const system = [
+        "You are the ConstructOS organisational-learning agent for a construction owner.",
+        "You are given ONE record that has obliged a lesson to be captured, and nothing else.",
+        "Propose a lesson STRICTLY from that record. Never invent a cause, a cost or a party.",
+        "Where the record does not say something, return null for that field rather than guessing.",
+        'Return ONLY JSON: {"title","whatHappened","rootCause","recommendation","category","tags","confidence","citations":[{"recordId","excerpt"}]}.',
+        "Every citation's recordId must be the source record's id, copied exactly.",
+        "The recommendation must be an action a future project could actually take, not a platitude.",
+      ].join("\n");
+      try {
+        const result = await runAgent({
+          app,
+          req,
+          agentKind: "lesson_drafter",
+          projectId: req.projectId!,
+          system,
+          user: context,
+          inputRefs: [{ type: sourceRef.tool, id: sourceRef.recordId }],
+          schema: draftSchema,
+        });
+        const draft = result.json;
+        return {
+          triggerId,
+          runId: result.runId,
+          aiAvailable: true,
+          /*
+           * A PROPOSAL. Nothing is written: the trigger is still open and no
+           * lesson exists until a person captures one.
+           */
+          created: false,
+          proposal: draft
+            ? {
+                title: draft.title,
+                whatHappened: draft.whatHappened,
+                rootCause: draft.rootCause,
+                recommendation: draft.recommendation,
+                category: draft.category,
+                tags: draft.tags ?? [],
+              }
+            : null,
+          confidence: draft?.confidence ?? null,
+          citations: (draft?.citations ?? []).filter((c) => c.recordId === sourceRef.recordId),
+          evidenceRefs: [
+            { tool: sourceRef.tool, recordId: sourceRef.recordId, label: sourceRef.label },
+          ],
+          note:
+            "A proposal, not a lesson. Nothing has been written: the trigger is still open and " +
+            "no lesson exists until somebody captures one. Read the source record before " +
+            "accepting a word of this — the validation step that follows is a check on what a " +
+            "human wrote, and it is worth nothing if the human wrote nothing.",
+        };
+      } catch (err) {
+        if (err instanceof AppError) throw err;
+        const message = err instanceof Error ? err.message : String(err);
+        throw aiUnavailable(
+          `The AI layer was configured but the draft call did not succeed: ${message.slice(0, 300)}. ` +
+            "Capture the lesson directly.",
+        );
+      }
     },
   );
 
@@ -2393,6 +2520,102 @@ export const learningModule: FastifyPluginAsync = async (app) => {
         .where(eq(lessonPushes.id, pushId))
         .limit(1);
       return after ?? row;
+    },
+  );
+
+  /* ================================================================ */
+  /* HEALTH INPUTS — what WP-INTEL reads                               */
+  /* ================================================================ */
+
+  /**
+   * Organisational learning as a health dimension.
+   *
+   * The honest metric here is CAPTURE RATE — how many of the events that
+   * oblige a lesson actually produced one — and it is refused rather than
+   * reported as 100% when nothing has ever triggered. A project with no
+   * disputes, claims or delay events has not learned well; it has not been
+   * asked to learn at all, and those are different facts.
+   */
+  app.get(
+    "/projects/:projectId/learning/health-inputs",
+    { preHandler: projectRead },
+    async (req) => {
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      const triggerRows = await app.db
+        .select()
+        .from(lessonTriggers)
+        .where(
+          and(eq(lessonTriggers.companyId, companyId), eq(lessonTriggers.projectId, projectId)),
+        );
+      const lessonRows = await app.db
+        .select({ id: lessons.id, status: lessons.status, publishedAt: lessons.publishedAt })
+        .from(lessons)
+        .where(and(eq(lessons.companyId, companyId), eq(lessons.originProjectId, projectId)));
+      const applicationRows = await app.db
+        .select({ id: lessonApplications.id, outcome: lessonApplications.outcome })
+        .from(lessonApplications)
+        .where(
+          and(
+            eq(lessonApplications.companyId, companyId),
+            eq(lessonApplications.projectId, projectId),
+          ),
+        );
+      const pushRows = await app.db
+        .select({ id: lessonPushes.id, status: lessonPushes.status })
+        .from(lessonPushes)
+        .where(
+          and(eq(lessonPushes.companyId, companyId), eq(lessonPushes.projectId, projectId)),
+        );
+
+      const today = todayISO();
+      const open = triggerRows.filter((t) => t.status === "open");
+      const captured = triggerRows.filter((t) => t.status === "captured");
+      const overdue = open.filter((t) => t.dueAt !== null && t.dueAt < today);
+      const now = Date.now();
+      const oldestOpenDays = open.reduce<number | null>((max, t) => {
+        const days = Math.max(0, Math.floor((now - Date.parse(t.raisedAt)) / MS_PER_DAY));
+        return max === null || days > max ? days : max;
+      }, null);
+      const settled = triggerRows.filter(
+        (t) => t.status === "captured" || t.status === "dismissed",
+      ).length;
+
+      const reasons: string[] = [];
+      if (triggerRows.length === 0) {
+        reasons.push(
+          "No event on this project has yet obliged a lesson, so captureRate is null rather " +
+            "than 100%. A project that has never been asked to learn has not learned well.",
+        );
+      }
+      if (applicationRows.length === 0) {
+        reasons.push(
+          "No lesson has been applied on this project, so appliedLessonsMeasured is 0 and no " +
+            "outcome can be reported. An application whose outcome nobody measured must not be " +
+            "counted as a success.",
+        );
+      }
+      return {
+        metrics: {
+          triggersRaised: triggerRows.length,
+          triggersOpen: open.length,
+          triggersOverdue: overdue.length,
+          triggersCaptured: captured.length,
+          captureRate:
+            settled === 0 ? null : Math.round((captured.length / settled) * 1000) / 10,
+          oldestOpenTriggerDays: oldestOpenDays,
+          lessonsAuthored: lessonRows.length,
+          lessonsPublished: lessonRows.filter((l) => l.status === "published").length,
+          lessonsInDraft: lessonRows.filter((l) => l.status === "draft").length,
+          lessonsApplied: applicationRows.length,
+          appliedLessonsMeasured: applicationRows.filter(
+            (a) => a.outcome !== null && a.outcome !== "unknown",
+          ).length,
+          pushesReceived: pushRows.length,
+          pushesUnacknowledged: pushRows.filter((p) => p.status === "pushed").length,
+        },
+        reasons,
+      };
     },
   );
 
