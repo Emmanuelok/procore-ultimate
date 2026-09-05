@@ -1049,209 +1049,221 @@ export const tmTicketRoutes: FastifyPluginAsync = async (app) => {
        */
       const pcoUnpriced =
         body.target === "potential_change_order" && totals.total.value === null;
+      // The vendor is resolved BEFORE the change event is raised: an unknown
+      // vendor used to throw after the insert and leave the orphan behind.
+      if (body.vendorId) await requireVendor(app.db, body.vendorId, companyId);
 
-      // Attach to an existing change event, or raise one.
-      let eventId: string;
-      let eventReference: string;
+      /*
+       * EVERY WRITE HERE IS ONE TRANSACTION, and everything that can refuse
+       * has already refused above. The change event used to be inserted
+       * first: an unknown vendor, or a line the change module's own
+       * derivation rejected, then threw and left an orphan CE-nnn row that
+       * every retry duplicated.
+       */
+      let eventId = "";
+      let eventReference = "";
       let created = false;
-      if (body.changeEventId ?? ticket.changeEventId) {
-        const event = await fetchEvent(
-          app.db,
-          (body.changeEventId ?? ticket.changeEventId)!,
-          companyId,
-          projectId,
-        );
-        if (event.status === "void") {
-          throw conflict(`Change event ${event.reference} is void — nothing to incorporate into.`);
-        }
-        eventId = event.id;
-        eventReference = event.reference;
-      } else {
-        const number = await nextRecordNumber(app.db, projectId, "change_event");
-        eventId = newId("cev");
-        eventReference = `CE-${pad3(number)}`;
-        created = true;
-        await app.db.insert(changeEvents).values({
-          id: eventId,
-          companyId,
-          projectId,
-          number,
-          reference: eventReference,
-          title: body.title ?? ticket.title,
-          description:
-            body.description ??
-            [ticket.description, ticket.scopeOfWork].filter(Boolean).join("\n\n") ??
-            null,
-          status: "open",
-          eventType: body.eventType ?? "owner_change",
-          scope: "additive",
-          reason: body.reason ?? (ticket.wasVerbalInstruction === 1 ? "client_request" : null),
-          // CHANGE_EVENT_ORIGIN_KINDS holds no "tm_ticket" member, so the
-          // provenance is recorded in `detail.origin` rather than misfiled
-          // under an origin kind that means something else.
-          originType: "manual",
-          originId: null,
-          roughOrderOfMagnitude: totals.total.value ?? 0,
-          scheduleImpactDays: 0,
-          identifiedDate: ticket.ticketDate,
-          notes:
-            `Raised from T&M ticket ${ticket.reference} (${ticket.ticketDate}). ${signature.summary}` +
-            (ticket.wasVerbalInstruction === 1
-              ? ` Instructed verbally by ${ticket.instructedByName ?? "an unnamed person"}.`
-              : ""),
-          documentIds: [],
-          detail: {
-            origin: {
-              originType: "tm_ticket",
-              originId: ticket.id,
-              verified: true,
-              label: `${ticket.reference} — ${ticket.title}`,
-              reasons: [],
-            },
-            tmTicket: {
-              id: ticket.id,
-              reference: ticket.reference,
-              ticketDate: ticket.ticketDate,
-              signatureState: signature.state,
-              signatureSummary: signature.summary,
-              signedByName: ticket.signedByName,
-              signedByRole: ticket.signedByRole,
-              signedByOrganisation: ticket.signedByOrganisation,
-              wasVerbalInstruction: ticket.wasVerbalInstruction === 1,
-              instructedByName: ticket.instructedByName,
-              totalLabourHours: totals.totalLabourHours,
-              total: totals.total.value,
-              totalReasons: totals.total.reasons,
-              currency: ticket.currency,
-            },
-          },
-          createdBy: actorId,
-        });
-      }
-
       let pcoId: string | null = null;
       let pcoReference: string | null = null;
-      const pcoEstimate = totals.total.value;
-      if (body.target === "potential_change_order" && pcoEstimate !== null) {
-        if (body.vendorId) await requireVendor(app.db, body.vendorId, companyId);
-        const number = await nextRecordNumber(app.db, projectId, "potential_change_order");
-        pcoId = newId("pco");
-        pcoReference = `PCO-${pad3(number)}`;
-        const vendorId = body.vendorId ?? ticket.vendorId ?? null;
-        await app.db.insert(potentialChangeOrders).values({
-          id: pcoId,
-          companyId,
-          projectId,
-          changeEventId: eventId,
-          number,
-          reference: pcoReference,
-          title: body.title ?? ticket.title,
-          description: body.description ?? ticket.description ?? null,
-          status: "draft",
-          reason: body.reason ?? null,
-          scope: "additive",
-          commitmentId: body.commitmentId ?? ticket.commitmentId ?? null,
-          vendorId,
-          estimatedAmount: pcoEstimate,
-          quotedAmount: 0,
-          amount: 0,
-          scheduleImpactDays: 0,
-          noCharge: 0,
-          detail: {
-            tmTicketId: ticket.id,
-            tmTicketReference: ticket.reference,
-            signatureState: signature.state,
-          },
-          createdBy: actorId,
-        });
-        if (body.copyLines !== false) {
-          // buildLineRow is the changes module's own line builder — its
-          // derivation rules and its refusals, not a second implementation.
-          let sort = 0;
-          for (const line of totals.lines) {
-            sort += 10;
-            await app.db.insert(changeLineItems).values(
-              buildLineRow(
-                { companyId, projectId, changeEventId: eventId, createdBy: actorId },
-                "potential_change_order",
-                pcoId,
-                {
-                  description: `${ticket.reference} L${line.position}: ${line.description}`,
-                  costType: KIND_TO_COST_TYPE[line.lineKind],
-                  costAmount: line.amount ?? 0,
-                  ...(line.hours != null ? { quantity: line.hours, unit: "hour" } : {}),
-                  ...(line.hours != null && line.rate != null ? { unitRate: line.rate } : {}),
-                },
-                sort,
-              ),
-            );
+      let incorporatedId = "";
+      await app.db.transaction(async (tx) => {
+        // Attach to an existing change event, or raise one.
+        if (body.changeEventId ?? ticket.changeEventId) {
+          const event = await fetchEvent(
+            tx,
+            (body.changeEventId ?? ticket.changeEventId)!,
+            companyId,
+            projectId,
+          );
+          if (event.status === "void") {
+            throw conflict(`Change event ${event.reference} is void — nothing to incorporate into.`);
           }
-          // The site-agreed daywork percentage becomes a line of its own so
-          // the PCO's own estimate reconciles with the ticket that produced
-          // it. The CONTRACTUAL markup stack — overhead on cost, profit on
-          // cost-plus-overhead — is the changes module's, and is applied
-          // there when the PCO is priced; nothing here anticipates it.
-          if (totals.markupTotal.value != null && totals.markupTotal.value !== 0) {
-            sort += 10;
-            await app.db.insert(changeLineItems).values(
-              buildLineRow(
-                { companyId, projectId, changeEventId: eventId, createdBy: actorId },
-                "potential_change_order",
-                pcoId,
-                {
-                  description:
-                    `${ticket.reference}: daywork markup at ${totals.markupPercent}% on ` +
-                    `${formatMoney(totals.netTotal.value ?? 0)} ${ticket.currency}, as signed on the ticket`,
-                  costType: "other",
-                  costAmount: totals.markupTotal.value,
-                },
-                sort,
-              ),
-            );
-          }
-          await recomputePcoEstimate(app.db, pcoId);
-        }
-      }
-
-      await recomputeEventRollup(app.db, eventId);
-
-      const incorporatedId = pcoId ?? eventId;
-      await app.db
-        .update(tmTickets)
-        .set({
-          changeEventId: eventId,
-          incorporatedChangeOrderId: incorporatedId,
-          incorporatedAt: nowIso(),
-          status: "incorporated",
-          detail: {
-            ...(ticket.detail ?? {}),
-            incorporation: {
-              target: body.target,
-              changeEventId: eventId,
-              changeEventReference: eventReference,
-              changeEventCreated: created,
-              potentialChangeOrderId: pcoId,
-              potentialChangeOrderReference: pcoReference,
-              incorporatedChangeOrderId: incorporatedId,
-              signatureState: signature.state,
-              total: totals.total.value,
-              totalReasons: totals.total.reasons,
-              currency: ticket.currency,
+          eventId = event.id;
+          eventReference = event.reference;
+        } else {
+          const number = await nextRecordNumber(tx, projectId, "change_event");
+          eventId = newId("cev");
+          eventReference = `CE-${pad3(number)}`;
+          created = true;
+          await tx.insert(changeEvents).values({
+            id: eventId,
+            companyId,
+            projectId,
+            number,
+            reference: eventReference,
+            title: body.title ?? ticket.title,
+            description:
+              body.description ??
+              [ticket.description, ticket.scopeOfWork].filter(Boolean).join("\n\n") ??
+              null,
+            status: "open",
+            eventType: body.eventType ?? "owner_change",
+            scope: "additive",
+            reason: body.reason ?? (ticket.wasVerbalInstruction === 1 ? "client_request" : null),
+            // CHANGE_EVENT_ORIGIN_KINDS holds no "tm_ticket" member, so the
+            // provenance is recorded in `detail.origin` rather than misfiled
+            // under an origin kind that means something else.
+            originType: "manual",
+            originId: null,
+            roughOrderOfMagnitude: totals.total.value ?? 0,
+            scheduleImpactDays: 0,
+            identifiedDate: ticket.ticketDate,
+            notes:
+              `Raised from T&M ticket ${ticket.reference} (${ticket.ticketDate}). ${signature.summary}` +
+              (ticket.wasVerbalInstruction === 1
+                ? ` Instructed verbally by ${ticket.instructedByName ?? "an unnamed person"}.`
+                : ""),
+            documentIds: [],
+            detail: {
+              origin: {
+                originType: "tm_ticket",
+                originId: ticket.id,
+                verified: true,
+                label: `${ticket.reference} — ${ticket.title}`,
+                reasons: [],
+              },
+              tmTicket: {
+                id: ticket.id,
+                reference: ticket.reference,
+                ticketDate: ticket.ticketDate,
+                signatureState: signature.state,
+                signatureSummary: signature.summary,
+                signedByName: ticket.signedByName,
+                signedByRole: ticket.signedByRole,
+                signedByOrganisation: ticket.signedByOrganisation,
+                wasVerbalInstruction: ticket.wasVerbalInstruction === 1,
+                instructedByName: ticket.instructedByName,
+                totalLabourHours: totals.totalLabourHours,
+                total: totals.total.value,
+                totalReasons: totals.total.reasons,
+                currency: ticket.currency,
+              },
             },
-          },
-          updatedAt: nowIso(),
-        })
-        .where(eq(tmTickets.id, ticketId));
+            createdBy: actorId,
+          });
+        }
 
-      // Carry the change link down onto the timecard allocations behind the
-      // ticket, so labour spent on a change is findable from the cost side.
-      const allocIds = lines.map((l) => l.timecardAllocationId).filter((v): v is string => !!v);
-      if (allocIds.length > 0) {
-        await app.db
-          .update(timecardAllocations)
-          .set({ changeEventId: eventId, updatedAt: nowIso() })
-          .where(inArray(timecardAllocations.id, allocIds));
-      }
+        const pcoEstimate = totals.total.value;
+        if (body.target === "potential_change_order" && pcoEstimate !== null) {
+          const number = await nextRecordNumber(tx, projectId, "potential_change_order");
+          pcoId = newId("pco");
+          pcoReference = `PCO-${pad3(number)}`;
+          const vendorId = body.vendorId ?? ticket.vendorId ?? null;
+          await tx.insert(potentialChangeOrders).values({
+            id: pcoId,
+            companyId,
+            projectId,
+            changeEventId: eventId,
+            number,
+            reference: pcoReference,
+            title: body.title ?? ticket.title,
+            description: body.description ?? ticket.description ?? null,
+            status: "draft",
+            reason: body.reason ?? null,
+            scope: "additive",
+            commitmentId: body.commitmentId ?? ticket.commitmentId ?? null,
+            vendorId,
+            estimatedAmount: pcoEstimate,
+            quotedAmount: 0,
+            amount: 0,
+            scheduleImpactDays: 0,
+            noCharge: 0,
+            detail: {
+              tmTicketId: ticket.id,
+              tmTicketReference: ticket.reference,
+              signatureState: signature.state,
+            },
+            createdBy: actorId,
+          });
+          if (body.copyLines !== false) {
+            // buildLineRow is the changes module's own line builder — its
+            // derivation rules and its refusals, not a second implementation.
+            let sort = 0;
+            for (const line of totals.lines) {
+              sort += 10;
+              await tx.insert(changeLineItems).values(
+                buildLineRow(
+                  { companyId, projectId, changeEventId: eventId, createdBy: actorId },
+                  "potential_change_order",
+                  pcoId,
+                  {
+                    description: `${ticket.reference} L${line.position}: ${line.description}`,
+                    costType: KIND_TO_COST_TYPE[line.lineKind],
+                    costAmount: line.amount ?? 0,
+                    ...(line.hours != null ? { quantity: line.hours, unit: "hour" } : {}),
+                    ...(line.hours != null && line.rate != null ? { unitRate: line.rate } : {}),
+                  },
+                  sort,
+                ),
+              );
+            }
+            // The site-agreed daywork percentage becomes a line of its own so
+            // the PCO's own estimate reconciles with the ticket that produced
+            // it. The CONTRACTUAL markup stack — overhead on cost, profit on
+            // cost-plus-overhead — is the changes module's, and is applied
+            // there when the PCO is priced; nothing here anticipates it.
+            if (totals.markupTotal.value != null && totals.markupTotal.value !== 0) {
+              sort += 10;
+              await tx.insert(changeLineItems).values(
+                buildLineRow(
+                  { companyId, projectId, changeEventId: eventId, createdBy: actorId },
+                  "potential_change_order",
+                  pcoId,
+                  {
+                    description:
+                      `${ticket.reference}: daywork markup at ${totals.markupPercent}% on ` +
+                      `${formatMoney(totals.netTotal.value ?? 0)} ${ticket.currency}, as signed on the ticket`,
+                    costType: "other",
+                    costAmount: totals.markupTotal.value,
+                  },
+                  sort,
+                ),
+              );
+            }
+            await recomputePcoEstimate(tx, pcoId);
+          }
+        }
+
+        await recomputeEventRollup(tx, eventId);
+
+        incorporatedId = pcoId ?? eventId;
+        await tx
+          .update(tmTickets)
+          .set({
+            changeEventId: eventId,
+            incorporatedChangeOrderId: incorporatedId,
+            incorporatedAt: nowIso(),
+            status: "incorporated",
+            detail: {
+              ...(ticket.detail ?? {}),
+              incorporation: {
+                target: body.target,
+                changeEventId: eventId,
+                changeEventReference: eventReference,
+                changeEventCreated: created,
+                potentialChangeOrderId: pcoId,
+                potentialChangeOrderReference: pcoReference,
+                incorporatedChangeOrderId: incorporatedId,
+                signatureState: signature.state,
+                total: totals.total.value,
+                totalReasons: totals.total.reasons,
+                currency: ticket.currency,
+              },
+            },
+            updatedAt: nowIso(),
+          })
+          .where(eq(tmTickets.id, ticketId));
+
+        // Carry the change link down onto the timecard allocations behind the
+        // ticket, so labour spent on a change is findable from the cost side.
+        const allocIds = lines.map((l) => l.timecardAllocationId).filter((v): v is string => !!v);
+        if (allocIds.length > 0) {
+          await tx
+            .update(timecardAllocations)
+            .set({ changeEventId: eventId, updatedAt: nowIso() })
+            .where(inArray(timecardAllocations.id, allocIds));
+        }
+      });
 
       await ledgerTimecards(app.db, req, "state_change", "tm_ticket", ticketId, {
         reference: ticket.reference,

@@ -8,7 +8,7 @@
  * otherwise carry, so the register shows the bar's state on every row and the
  * sweep that opens the obligation can be run from here.
  */
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { CULPABLE_PARTIES, DELAY_CAUSES } from "@constructos/shared";
 import { api, ApiClientError } from "../../lib/api";
 import {
@@ -163,7 +163,14 @@ const emptyForm: CreateForm = {
   evidenceIds: [],
 };
 
-export default function DelayEventsTab({ projectId }: { projectId: string }) {
+export default function DelayEventsTab({
+  projectId,
+  focusId,
+}: {
+  projectId: string;
+  /** deep link from ⌘K search: open this event's drawer once, on arrival */
+  focusId?: string | null;
+}) {
   const base = `/api/v1/projects/${projectId}`;
 
   const [items, setItems] = useState<DelayEventRow[] | null>(null);
@@ -360,6 +367,20 @@ export default function DelayEventsTab({ projectId }: { projectId: string }) {
       setError(err instanceof Error ? err.message : "Failed to load the delay event");
     }
   }
+
+  /*
+   * Arriving from company search (or any link that names an event) opens that
+   * event rather than dropping the reader on an unfiltered register. It fires
+   * once per id: reopening after the user closes the drawer would trap them.
+   */
+  const openedFocus = useRef<string | null>(null);
+  useEffect(() => {
+    if (!focusId || openedFocus.current === focusId) return;
+    openedFocus.current = focusId;
+    void openDrawer(focusId);
+    // openDrawer is stable for a given base; the id is what drives this.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusId, base]);
 
   async function runTia() {
     if (!selected) return;

@@ -118,6 +118,7 @@ import {
   mintChallengeToken,
   type ChallengeScope,
 } from "../mfa/challenge.js";
+import { registerChallenge } from "../mfa/challenge-store.js";
 
 type ProviderRow = typeof identityProviders.$inferSelect;
 
@@ -1983,6 +1984,16 @@ export const ssoModule: FastifyPluginAsync = async (app) => {
       userId: user.id,
       scope,
       ttlMinutes: config.MFA_CHALLENGE_TTL_MINUTES,
+    });
+    // Register it, so a challenge raised by an IdP sign-in is spendable once
+    // and revocable in flight exactly like one raised by a password. The
+    // single-use guarantee does not depend on this call (challenge-store.ts
+    // consumes by upsert), but the visibility and the revocation do.
+    await registerChallenge(app.db, {
+      claims: minted.claims,
+      origin: "sso",
+      ip: req.ip,
+      userAgent: req.headers["user-agent"] ?? null,
     });
     await recordEvent({
       kind: "sso_login_success",

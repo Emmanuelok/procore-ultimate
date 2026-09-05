@@ -45,6 +45,7 @@ import {
   StatusPill,
   Tabs,
   Textarea,
+  formatNumber,
   type DataColumns,
 } from "../../ui";
 import {
@@ -81,6 +82,10 @@ interface StoredPolicy {
   ipAllowlistBreakGlassUserIds: string[];
   mfaRequired: boolean;
   mfaAcceptedAmrValues: string[];
+  securityEventRetentionDays: number | null;
+  emailDispatchRetentionDays: number | null;
+  legalHold: boolean;
+  legalHoldReason: string | null;
   updatedBy: string | null;
   updatedAt: string | null;
 }
@@ -107,6 +112,15 @@ interface PolicyResponse {
   effective: ResolvedPolicy;
   defaults: Record<string, unknown>;
   passwordRules: string[];
+  reasons: string[];
+}
+
+interface RetentionOutcome {
+  companyId: string;
+  skipped: boolean;
+  reason: string | null;
+  securityEventsPseudonymised: number;
+  emailDispatchesDeleted: number;
   reasons: string[];
 }
 
@@ -349,6 +363,10 @@ interface PolicyForm {
   ipAllowlistMode: "off" | "monitor" | "enforce";
   ipAllowlist: string;
   mfaRequired: boolean;
+  securityEventRetentionDays: string;
+  emailDispatchRetentionDays: string;
+  legalHold: boolean;
+  legalHoldReason: string;
 }
 
 function formFrom(stored: StoredPolicy): PolicyForm {
@@ -366,6 +384,10 @@ function formFrom(stored: StoredPolicy): PolicyForm {
     ipAllowlistMode: stored.ipAllowlistMode,
     ipAllowlist: stored.ipAllowlist.join("\n"),
     mfaRequired: stored.mfaRequired,
+    securityEventRetentionDays: num(stored.securityEventRetentionDays),
+    emailDispatchRetentionDays: num(stored.emailDispatchRetentionDays),
+    legalHold: stored.legalHold,
+    legalHoldReason: stored.legalHoldReason ?? "",
   };
 }
 
@@ -416,6 +438,10 @@ function PolicyTab({
           .map((s) => s.trim())
           .filter(Boolean),
         mfaRequired: form.mfaRequired,
+        securityEventRetentionDays: numberOrNull(form.securityEventRetentionDays),
+        emailDispatchRetentionDays: numberOrNull(form.emailDispatchRetentionDays),
+        legalHold: form.legalHold,
+        legalHoldReason: form.legalHoldReason.trim() === "" ? null : form.legalHoldReason.trim(),
       }),
     );
     if (res) {
@@ -618,6 +644,60 @@ function PolicyTab({
             </Alert>
           </CardBody>
         </Card>
+
+        <Card>
+          <CardHeader
+            title="Retention"
+            subtitle="§0.2 — how long the authentication record is kept about a person"
+          />
+          <CardBody className="space-y-3">
+            <Field
+              label="Sign-in audit (days)"
+              hint="Blank = kept indefinitely, which is what happens today. Past this age the address, IP and user agent are removed and the kind, outcome and time are kept, so your own counts stay answerable. Minimum 30."
+            >
+              <Input
+                inputMode="numeric"
+                placeholder="kept indefinitely"
+                value={form.securityEventRetentionDays}
+                onChange={(e) => set("securityEventRetentionDays", e.target.value)}
+              />
+            </Field>
+            <Field
+              label="Message log (days)"
+              hint="Blank = kept indefinitely. These rows are deleted rather than redacted: a preview of a message nobody can identify is not evidence. Minimum 30."
+            >
+              <Input
+                inputMode="numeric"
+                placeholder="kept indefinitely"
+                value={form.emailDispatchRetentionDays}
+                onChange={(e) => set("emailDispatchRetentionDays", e.target.value)}
+              />
+            </Field>
+            <label className="flex items-start gap-2 text-meta">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={form.legalHold}
+                onChange={(e) => set("legalHold", e.target.checked)}
+              />
+              <span>
+                <strong>Legal hold</strong> — suspend every retention sweep for this organisation.
+                A hold always beats a retention period; the sweep reports that it skipped you
+                rather than reporting that it found nothing.
+              </span>
+            </label>
+            {form.legalHold ? (
+              <Field label="Why" hint="Recorded with the policy change and shown on every skipped sweep.">
+                <Input
+                  value={form.legalHoldReason}
+                  placeholder="Adjudication 2026/114 — preserve everything"
+                  onChange={(e) => set("legalHoldReason", e.target.value)}
+                />
+              </Field>
+            ) : null}
+            <RetentionRun disabled={form.legalHold} />
+          </CardBody>
+        </Card>
       </div>
 
       <div className="flex items-center gap-3">
@@ -628,6 +708,66 @@ function PolicyTab({
           Every change is hash-chained into the company ledger and written to the sign-in audit.
         </p>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Run the retention policy now and say exactly what it did.
+ *
+ * It exists because the alternative — "save the policy and check back
+ * tomorrow" — gives an administrator no way to see the consequence of a
+ * destructive setting before it has already happened at scale. The run is
+ * ledgered server-side, including a run that removed nothing.
+ */
+function RetentionRun({ disabled }: { disabled: boolean }) {
+  const action = useAuthAction();
+  const [outcome, setOutcome] = useState<RetentionOutcome | null>(null);
+
+  return (
+    <div className="space-y-2 border-t border-border pt-3">
+      <div className="flex items-center gap-3">
+        <Button
+          variant="secondary"
+          size="sm"
+          disabled={disabled}
+          loading={action.busy === "retention"}
+          onClick={() =>
+            void action
+              .run("retention", () =>
+                api.post<RetentionOutcome>("/api/v1/company/security/retention/run", {}),
+              )
+              .then((res) => {
+                if (res) setOutcome(res);
+              })
+          }
+        >
+          Apply retention now
+        </Button>
+        <p className="text-2xs text-content-subtle">
+          {disabled
+            ? "Suspended: this organisation is on legal hold."
+            : "Runs daily on its own. This is the same sweep, on demand."}
+        </p>
+      </div>
+      <FailureAlert failure={action.failure} onDismiss={action.clear} />
+      {outcome ? (
+        <Alert
+          tone={outcome.skipped ? "info" : "success"}
+          size="sm"
+          variant="subtle"
+          title={outcome.skipped ? "Nothing was removed" : "Retention applied"}
+        >
+          {outcome.skipped ? (
+            outcome.reason
+          ) : (
+            <>
+              {formatNumber(outcome.securityEventsPseudonymised)} audit rows pseudonymised ·{" "}
+              {formatNumber(outcome.emailDispatchesDeleted)} message records deleted.
+            </>
+          )}
+        </Alert>
+      ) : null}
     </div>
   );
 }

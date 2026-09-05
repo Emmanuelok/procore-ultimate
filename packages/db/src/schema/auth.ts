@@ -811,6 +811,31 @@ export const companySecurityPolicies = pgTable(
       .default([])
       .notNull(),
 
+    /* --- §0.2 #46/#47 data lifecycle --- */
+    /**
+     * How long the authentication trail is kept in identifiable form. Past it
+     * the sweep PSEUDONYMISES rather than deletes: the address, the IP and the
+     * user agent go, the kind, outcome and timestamp stay, so the tenant's own
+     * "how many failures last quarter" remains answerable while the personal
+     * data does not. null = keep indefinitely, which is the current behaviour
+     * and therefore the default.
+     */
+    securityEventRetentionDays: integer("security_event_retention_days"),
+    /**
+     * The same for the outbound-message log, which holds a subject line and a
+     * body preview. Deleted rather than pseudonymised: a redacted preview of a
+     * message nobody can now identify is not evidence of anything.
+     */
+    emailDispatchRetentionDays: integer("email_dispatch_retention_days"),
+    /**
+     * LEGAL HOLD. While this is on, every retention sweep skips this tenant
+     * and says so in what it returns. A retention policy that quietly
+     * overrode a hold would destroy the one record somebody was ordered to
+     * preserve.
+     */
+    legalHold: boolean("legal_hold").default(false).notNull(),
+    legalHoldReason: text("legal_hold_reason"),
+
     updatedBy: text("updated_by"),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
@@ -989,4 +1014,59 @@ export const ssoTickets = pgTable(
     createdAt: createdAt(),
   },
   (t) => [index("sso_tickets_expires_idx").on(t.expiresAt)],
+);
+
+/**
+ * ONE ROW PER MFA CHALLENGE — the half-authenticated state between "the
+ * password was right" and "you are signed in", given a name the server can
+ * revoke.
+ *
+ * WHY THIS TABLE EXISTS. `modules/mfa/challenge.ts` mints a MAC'd, stateless
+ * token and says so in its own header: within its ten-minute life the same
+ * token can be presented more than once, and there is no way to revoke one in
+ * flight. That was an honest description of a schema this module did not own.
+ * It owns it now, so the gap is closed rather than described.
+ *
+ * THE SHAPE THAT MAKES IT SINGLE-USE WITHOUT COORDINATION. Three modules mint
+ * challenges — `mfa` (POST /auth/mfa/login), `sso` (an IdP sign-in into a
+ * tenant that requires a second factor) and `identity` (POST /auth/login,
+ * owned by another package). Requiring every minter to register first would
+ * have made a cross-package change a precondition of the fix, so the primary
+ * key is the token's own `jti` and CONSUMPTION IS AN UPSERT: the first
+ * exchange either flips an existing row's `consumed_at` or inserts an already
+ * consumed row, and any later exchange of the same token finds a consumed row
+ * and is refused. A challenge minted by a module that never registered it is
+ * therefore still single-use.
+ *
+ * Registration at mint time adds what the upsert alone cannot: an in-flight
+ * challenge an administrator can revoke (`admin_mfa_reset` does), and a
+ * visible count of half-finished sign-ins.
+ */
+export const mfaChallenges = pgTable(
+  "mfa_challenges",
+  {
+    /** the token's `jti` — the challenge names itself */
+    id: text("id").primaryKey(),
+    userId: text("user_id").notNull(),
+    /** ChallengeScope — verify | enrol */
+    scope: text("scope").notNull(),
+    /** how the challenge was raised: password | sso | step_up */
+    origin: text("origin").default("password").notNull(),
+    ip: text("ip"),
+    userAgent: text("user_agent"),
+    /** when the exchange happened; null while the challenge is still live */
+    consumedAt: timestamp("consumed_at", { withTimezone: true, mode: "string" }),
+    /** set when an administrator cut every in-flight challenge for this user */
+    revokedAt: timestamp("revoked_at", { withTimezone: true, mode: "string" }),
+    revokedReason: text("revoked_reason"),
+    expiresAt: timestamp("expires_at", { withTimezone: true, mode: "string" }).notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    index("mfa_challenges_user_idx").on(t.userId, t.createdAt),
+    // The sweep's predicate. Rows are short-lived and numerous — one per
+    // sign-in into an MFA tenant — so the job that deletes them must not read
+    // the table to find them.
+    index("mfa_challenges_expires_idx").on(t.expiresAt),
+  ],
 );

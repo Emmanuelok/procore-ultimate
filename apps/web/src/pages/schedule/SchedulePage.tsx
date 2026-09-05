@@ -16,7 +16,7 @@ import {
   type FormEvent,
   type KeyboardEvent,
 } from "react";
-import { useParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 import { DEPENDENCY_TYPES, TASK_CONSTRAINT_TYPES } from "@constructos/shared";
 import { api, ApiClientError } from "../../lib/api";
 import {
@@ -416,7 +416,13 @@ function varianceBadge(days: number | null) {
 
 export default function SchedulePage() {
   const { projectId } = useParams<{ projectId: string }>();
+  const [searchParams] = useSearchParams();
   const base = `/api/v1/projects/${projectId}`;
+
+  /** activity named by a deep link, consumed once it has been shown */
+  const [pendingTaskId, setPendingTaskId] = useState<string | null>(() =>
+    searchParams.get("taskId"),
+  );
 
   const [schedules, setSchedules] = useState<ScheduleRow[] | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -649,6 +655,38 @@ export default function SchedulePage() {
     () => tasks.find((t) => t.id === selectedTaskId) ?? null,
     [tasks, selectedTaskId],
   );
+
+  /*
+   * Deep link from company search (?taskId=…): resolve the activity to the
+   * programme it lives in, switch to that programme, then select and expand
+   * the row once it is on screen. Resolving happens server-side because a
+   * link only carries the activity id, not which of the project's schedules
+   * holds it. A dead link says so instead of silently doing nothing.
+   */
+  useEffect(() => {
+    if (!pendingTaskId || !projectId) return;
+    let cancelled = false;
+    api
+      .get<{ id: string; scheduleId: string }>(`${base}/schedule-tasks/${pendingTaskId}`)
+      .then((t) => {
+        if (!cancelled) setSelectedId(t.scheduleId);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setPendingTaskId(null);
+        setError(errMessage(err, "That activity is no longer in this project."));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [base, projectId, pendingTaskId]);
+
+  useEffect(() => {
+    if (!pendingTaskId || !tasks.some((t) => t.id === pendingTaskId)) return;
+    setSelectedTaskId(pendingTaskId);
+    setExpandedTaskId(pendingTaskId);
+    setPendingTaskId(null);
+  }, [pendingTaskId, tasks]);
   const predecessorDeps = useMemo(
     () => deps.filter((d) => d.successorId === selectedTaskId),
     [deps, selectedTaskId],

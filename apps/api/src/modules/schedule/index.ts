@@ -1,3 +1,32 @@
+/**
+ * Schedule module — the native CPM programme and everything a planner needs to
+ * defend it (spec Vol I §2.6).
+ *
+ * COVERS: #349-350 Primavera P6 XER and MS Project MSPDI import (with a
+ * revision diff and a dry-run preview) and #351-352 native creation/editing;
+ * #353 critical path and float; #354 typed logic (FS/SS/FF/SF with lags) with
+ * cycle refusal; #355-357 baselines, revision families and comparison; #358
+ * and #361 progress (actuals, percent complete, a data date); #359 the
+ * lookahead window and its make-ready constraints log; #360 responsible /
+ * location assignment validated against real company users and project
+ * locations; #362 key milestones tracked against contractual dates with slip
+ * alerts; #363-366 work calendars; #370 resource-loaded activities; #371 and
+ * Domain D #283 the full DCMA 14-point quality assessment (including BEI,
+ * CPLI, missed tasks and the critical-path test); earned value (PV/EV/AC,
+ * SPI/CPI, EAC) read from budget lines or per-activity budgets; MSPDI export;
+ * calendar-view data; and update narratives.
+ *
+ * The engine is ./cpm2.ts — a superset of lib/cpm.ts that adds calendars, a
+ * data date and remaining durations. lib/cpm.ts is untouched and still backs
+ * its own tests. Every recompute runs inside a transaction holding a
+ * per-schedule advisory lock, so two concurrent edits cannot persist dates
+ * computed from different views of the network.
+ *
+ * DELIBERATELY NOT HERE: resource levelling and Monte-Carlo QSRA (risk owns
+ * the latter), P6 XER *export* (P6 imports MSPDI), multi-project XER files,
+ * and the delay-forensics methods — those live in modules/forensics, which
+ * reads this module's tasks and dependencies.
+ */
 import type { FastifyPluginAsync } from "fastify";
 import { and, asc, count, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -55,6 +84,8 @@ import {
   sweepMilestoneSlips,
   untrackedMilestones,
 } from "./sweeps.js";
+import { registerSearchSource } from "../search/registry.js";
+import { likePattern } from "../search/engine.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -884,6 +915,25 @@ export const scheduleModule: FastifyPluginAsync = async (app) => {
       });
       const { task } = await fetchTask(id, req.companyId!, req.projectId!);
       return reply.status(201).send(task);
+    },
+  );
+
+  /**
+   * One activity by id. Exists so a link that names an activity — a search
+   * hit, a forensics fragnet anchor, a risk's scheduleTaskId — can resolve
+   * which programme it lives in without the caller listing every schedule.
+   */
+  app.get(
+    "/projects/:projectId/schedule-tasks/:taskId",
+    { preHandler: readGate },
+    async (req) => {
+      const { taskId } = req.params as { taskId: string };
+      const { task, schedule } = await fetchTask(taskId, req.companyId!, req.projectId!);
+      return {
+        ...task,
+        scheduleName: schedule.name,
+        scheduleIsActive: schedule.isActive === 1,
+      };
     },
   );
 
@@ -2993,6 +3043,68 @@ export const scheduleModule: FastifyPluginAsync = async (app) => {
   /* ---------------------------------------------------------------- */
   /* Scheduler jobs (§6.1 — no sweep may depend on a page being open)  */
   /* ---------------------------------------------------------------- */
+
+  /* ---------------------------------------------------------------- */
+  /* Company-wide search (contract §3.3)                               */
+  /*                                                                    */
+  /* "Where is 'Level 3 slab pour'?" is one of the most common questions */
+  /* on a live job. schedule_tasks carries no companyId of its own, so   */
+  /* this is a hand-written source that joins the schedule header for    */
+  /* the tenant filter rather than a tableSource.                        */
+  /* ---------------------------------------------------------------- */
+
+  registerSearchSource({
+    type: "schedule_task",
+    label: "Schedule activities",
+    tool: "schedule",
+    scope: "project",
+    /* An activity is a weaker hit than the record it belongs to. */
+    weight: 0.8,
+    href: (r) => (r.projectId ? `/projects/${r.projectId}/schedule?taskId=${r.id}` : "/"),
+    query: async (db, ctx) => {
+      if (ctx.terms.length === 0) return [];
+      if (ctx.projectIds !== null && ctx.projectIds.length === 0) return [];
+      const conds = [eq(schedules.companyId, ctx.companyId)];
+      if (ctx.projectId) conds.push(eq(scheduleTasks.projectId, ctx.projectId));
+      else if (ctx.projectIds !== null) conds.push(inArray(scheduleTasks.projectId, ctx.projectIds));
+      for (const term of ctx.terms) {
+        const pattern = likePattern(term);
+        conds.push(
+          or(
+            sql`${scheduleTasks.name} ilike ${pattern}`,
+            sql`${scheduleTasks.wbsCode} ilike ${pattern}`,
+          )!,
+        );
+      }
+      const rows = await db
+        .select({
+          id: scheduleTasks.id,
+          projectId: scheduleTasks.projectId,
+          name: scheduleTasks.name,
+          wbsCode: scheduleTasks.wbsCode,
+          scheduleName: schedules.name,
+          startDate: scheduleTasks.startDate,
+          finishDate: scheduleTasks.finishDate,
+          updatedAt: scheduleTasks.updatedAt,
+        })
+        .from(scheduleTasks)
+        .innerJoin(schedules, eq(schedules.id, scheduleTasks.scheduleId))
+        .where(and(...conds))
+        .limit(ctx.limit);
+      return rows.map((r) => ({
+        id: r.id,
+        projectId: r.projectId,
+        title: r.name,
+        subtitle:
+          r.startDate && r.finishDate
+            ? `${r.scheduleName} · ${r.startDate} → ${r.finishDate}`
+            : r.scheduleName,
+        reference: r.wbsCode,
+        status: null,
+        updatedAt: r.updatedAt,
+      }));
+    },
+  });
 
   app.scheduler.register({
     name: "schedule.milestone-slip",

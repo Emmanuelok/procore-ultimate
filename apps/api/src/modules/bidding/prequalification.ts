@@ -51,6 +51,7 @@ import {
   type PrequalSubmissionRow,
   type Unknowable,
 } from "./shared.js";
+import { loadVendorEvidence, tierForSubmission } from "./prequal-registers.js";
 import {
   checkContractAgainstLimit,
   contractToTurnoverRatio,
@@ -934,9 +935,12 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
       .orderBy(desc(prequalificationFinancials.financialYearEnd));
     const screening = await latestScreening(db, submission.companyId, submission.vendorId);
     const status = await vendorPrequalStatus(db, submission.companyId, submission.vendorId);
+    const evidence = await loadVendorEvidence(db, submission.companyId, submission.vendorId);
 
+    /* The token hash never leaves this module, exactly as the bidder portal's does not. */
+    const { portalTokenHash: _hash, ...safe } = submission;
     return {
-      ...submission,
+      ...safe,
       knockoutFailed: submission.knockoutFailed === 1,
       questionnaire: {
         id: questionnaire.id,
@@ -960,6 +964,36 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
         daysToExpiry: status.daysToExpiry,
         note: status.note,
         renewalWindowDays: RENEWAL_WINDOW_DAYS,
+      },
+      /*
+       * WHAT A DECISION WOULD GRANT, BEFORE ANYBODY MAKES IT. The tier is a
+       * function of evidence already on file, so an assessor should be able
+       * to see it — and see what is capping it — while there is still time to
+       * chase the missing safety return rather than after the approval.
+       */
+      tier: {
+        granted: submission.tier,
+        grantedBasis: submission.tierBasis,
+        riskRating: submission.riskRating,
+        riskBasis: submission.riskBasis,
+        onCurrentEvidence: await tierForSubmission(db, submission),
+      },
+      registers: {
+        safety: evidence.safety,
+        licences: evidence.licences.map((l) => ({
+          ...l,
+          expired: l.expiresAt !== null && l.expiresAt <= todayIso(),
+        })),
+        references: evidence.references.map((r) => ({
+          ...r,
+          wouldUseAgain: r.wouldUseAgain === null ? null : r.wouldUseAgain === 1,
+          checked: r.checkedBy !== null,
+        })),
+      },
+      vendorPortal: {
+        issued: Boolean(submission.portalTokenHash),
+        expiresAt: submission.portalTokenExpiresAt,
+        lastAccessAt: submission.portalLastAccessAt,
       },
     };
   }
@@ -1041,7 +1075,11 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
       .offset(pageOffset(q));
     return {
       ...paginate(
-        items.map((s) => ({ ...s, knockoutFailed: s.knockoutFailed === 1 })),
+        items.map(({ portalTokenHash: _hash, ...s }) => ({
+          ...s,
+          knockoutFailed: s.knockoutFailed === 1,
+          vendorPortalIssued: Boolean(_hash),
+        })),
         Number(totalRow?.n ?? 0),
         q,
       ),
@@ -1463,6 +1501,29 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
                 "No financial screening is on record for this vendor, so no single-project " +
                   "limit was derived. The approval is uncapped until one is.",
             };
+    /*
+     * THE TIER IS DERIVED, NEVER TYPED IN.
+     *
+     * A score is a number nobody uses; a buyer asks "what size of package may
+     * this firm be considered for". The letter is computed here from the
+     * score band, the derived financial limit and the SAFETY RECORD, and the
+     * safety record is a ceiling rather than one input among several — a
+     * fatality averaged into commercial answers is worth four percentage
+     * points and vanishes. `tierBasis` carries the sentence, because a letter
+     * with no reasoning is a number somebody will argue with.
+     *
+     * A REJECTION IS NOT TIERED. There is no size of package a rejected
+     * vendor may be considered for, and stamping one with a letter invites
+     * exactly the misreading the letter exists to prevent.
+     */
+    const verdict = approving
+      ? await tierForSubmission(
+          app.db,
+          submission,
+          { singleProjectLimit: cap.limit, currency: cap.currency },
+          validFrom,
+        )
+      : null;
     const now = new Date().toISOString();
     await app.db
       .update(prequalificationSubmissions)
@@ -1470,6 +1531,10 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
         outcome: body.outcome,
         conditions: body.conditions ?? null,
         rejectedReason: body.rejectedReason ?? null,
+        tier: verdict?.tier ?? null,
+        tierBasis: verdict?.tierBasis ?? null,
+        riskRating: verdict?.riskRating ?? null,
+        riskBasis: verdict?.riskBasis ?? null,
         singleProjectLimit: cap.limit,
         aggregateLimit: body.aggregateLimit ?? null,
         currency: cap.currency,
@@ -1503,6 +1568,10 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
       expiresAt: approving ? expiresAt : null,
       conditions: body.conditions ?? null,
       rejectedReason: body.rejectedReason ?? null,
+      tier: verdict?.tier ?? null,
+      tierBasis: verdict?.tierBasis ?? null,
+      riskRating: verdict?.riskRating ?? null,
+      tierCeilings: verdict?.ceilings ?? [],
     }, submission.projectId, true);
 
     // Raise the renewal obligation immediately where the approval already
@@ -1830,11 +1899,47 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
         ),
       )
       .orderBy(desc(prequalificationFinancials.financialYearEnd));
+    const evidence = await loadVendorEvidence(app.db, req.companyId!, vendorId);
+    const today = todayIso();
+    /*
+     * The tier the CURRENT evidence supports, recomputed rather than read
+     * back: a licence that lapsed after the approval was granted changes the
+     * answer, and the stored letter on the submission does not know that yet.
+     * Both are returned so the difference is visible instead of hidden.
+     */
+    const latestSubmission = submissions[0] ?? null;
+    const tierNow = latestSubmission
+      ? await tierForSubmission(app.db, latestSubmission)
+      : null;
     return {
       ...status,
       history: submissions.map((s) => ({ ...s, knockoutFailed: s.knockoutFailed === 1 })),
       financials,
       rule: DEFAULT_FINANCIAL_LIMIT_RULE,
+      tier: {
+        granted: latestSubmission?.tier ?? null,
+        grantedBasis: latestSubmission?.tierBasis ?? null,
+        riskRating: latestSubmission?.riskRating ?? null,
+        riskBasis: latestSubmission?.riskBasis ?? null,
+        onCurrentEvidence: tierNow,
+        drifted:
+          tierNow !== null &&
+          latestSubmission?.tier !== null &&
+          latestSubmission?.tier !== undefined &&
+          tierNow.tier !== latestSubmission.tier,
+      },
+      registers: {
+        safety: evidence.safety,
+        licences: evidence.licences.map((l) => ({
+          ...l,
+          expired: l.expiresAt !== null && l.expiresAt <= today,
+        })),
+        references: evidence.references.map((r) => ({
+          ...r,
+          wouldUseAgain: r.wouldUseAgain === null ? null : r.wouldUseAgain === 1,
+          checked: r.checkedBy !== null,
+        })),
+      },
     };
   });
 

@@ -12,6 +12,7 @@ import type { Db } from "../../lib/db.js";
 import { pushNotifications } from "../notifications/service.js";
 import { isInContention, todayIso } from "./shared.js";
 import { sweepPrequalification } from "./prequal-status.js";
+import { sweepPrequalLicences } from "./prequal-registers.js";
 import { sweepBidBonds } from "./engagement.js";
 import { runCompanyIntegrityAndPersist, runPackageIntegrityAndPersist } from "./integrity-service.js";
 
@@ -24,11 +25,13 @@ import { runCompanyIntegrityAndPersist, runPackageIntegrityAndPersist } from "./
  * each sweep is a scheduler job — idempotent, bounded by an index, and
  * runnable on demand (`app.scheduler.runNow(...)`) in tests and by admins.
  *
- * Five jobs:
+ * Six jobs:
  *
  *   bidding.prequalification-expiry   approvals lapsing and renewals falling
  *                                     due — the sweep that used to run on
  *                                     every list read.
+ *   bidding.licence-expiry            trade licences reaching their stated
+ *                                     expiry date, with a signal per vendor.
  *   bidding.bid-bonds                 bid bonds expiring under a live tender.
  *   bidding.tender-deadlines          packages past their bid deadline that
  *                                     nobody has closed, bid validity running
@@ -309,6 +312,18 @@ export function registerBiddingJobs(app: FastifyInstance): void {
     run: async ({ db, now }) =>
       forEachCompany(db, (companyId) =>
         sweepPrequalification(db, companyId, "system", now.toISOString().slice(0, 10)),
+      ),
+  });
+
+  app.scheduler.register({
+    name: "bidding.licence-expiry",
+    description:
+      "Expire trade licences whose stated expiry date has passed and raise a signal against the vendor — a prequalified firm working on a lapsed licence is the finding the register exists to prevent, and nothing about the vendor changes on the day it lapses",
+    everyMs: 6 * 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db, now }) =>
+      forEachCompany(db, (companyId) =>
+        sweepPrequalLicences(db, companyId, now.toISOString().slice(0, 10)),
       ),
   });
 

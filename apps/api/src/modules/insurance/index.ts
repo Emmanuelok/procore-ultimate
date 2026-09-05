@@ -1,23 +1,33 @@
-import type { FastifyPluginAsync, FastifyRequest } from "fastify";
-import { and, count, desc, eq, ilike, inArray, isNotNull, isNull, or } from "drizzle-orm";
+import type { FastifyInstance, FastifyPluginAsync, FastifyRequest } from "fastify";
+import { and, count, desc, eq, gt, ilike, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   assuranceGrants,
   bondCalls,
+  bondFacilities,
   bonds,
   files,
   insuranceCertificates,
   insuranceClaims,
   insurancePolicies,
+  insurancePremiums,
+  insuranceRequirements,
+  nonConformanceReports,
   obligations,
   projects,
+  recordLinks,
+  safetyIncidents,
   signals,
   vendors,
   workers,
 } from "@constructos/db";
 import {
+  BOND_FACILITY_STATUSES,
   BOND_TYPES,
   INSURANCE_CLAIM_STATUSES,
+  INSURANCE_PREMIUM_KINDS,
+  INSURANCE_REQUIREMENT_STATUSES,
+  POLICY_RENEWAL_STATUSES,
   POLICY_TYPES,
   type AssuranceRole,
 } from "@constructos/shared";
@@ -49,6 +59,29 @@ import {
   type PolicyLike,
   type VendorAtWork,
 } from "./expiry.js";
+import {
+  buildRenewalPipeline,
+  checkRequirement,
+  computeExperience,
+  computePeriodGaps,
+  evaluateHold,
+  facilityUtilisation,
+  findUninsuredLosses,
+  requiredTypesForProject,
+  type ClaimLike,
+  type HoldDecision,
+  type LossEventLike,
+  type RequirementLike,
+} from "./programme.js";
+import { forEachCompany } from "../../lib/scheduler.js";
+import type { Db } from "../../lib/db.js";
+import {
+  companyScopeOf,
+  companyToolGate,
+  scopeAllows,
+  scopeProjects,
+  scopeProjectsOrCompanyWide,
+} from "../meetings/scope.js";
 
 /* ------------------------------------------------------------------ */
 /* Local vocabularies (not in shared enums — kept honest here)          */
@@ -79,6 +112,10 @@ const INSURANCE_DETECTORS = [
   "bond_demand_deadline_passed",
   "policy_lapsed_during_works",
   "insurance_notification_missed",
+  /* WP-MEET upgrade: the two the engine could compute but nothing called */
+  "policy_period_gap",
+  "uninsured_loss_candidate",
+  "policy_renewal_overdue",
 ] as const;
 
 /** Obligations created here all carry this prefix so they can be counted back. */
@@ -177,7 +214,23 @@ const certificateListQuery = pageQuerySchema.extend({
 const verifySchema = z.object({
   verificationMethod: z.enum(VERIFICATION_METHODS),
   reference: z.string().max(300).nullable().optional(),
-  verifiedAt: z.string().min(4).optional(),
+  /*
+   * `z.string().min(4)` accepted "abcd" and "2026-13-45", and the route then
+   * called `new Date(...).toISOString()`, which throws RangeError and
+   * surfaced as an unhandled 500 rather than a 400. A verification is an
+   * assertion about WHEN somebody checked; a date that does not exist, or one
+   * in the future, is not that.
+   */
+  verifiedAt: z
+    .string()
+    .min(4)
+    .max(40)
+    .refine((v) => !Number.isNaN(Date.parse(v)), "verifiedAt is not a parseable date")
+    .refine(
+      (v) => Date.parse(v) <= Date.now() + 60_000,
+      "verifiedAt cannot be in the future — a verification is a record of something already done",
+    )
+    .optional(),
 });
 
 const reductionStepSchema = z.object({
@@ -364,12 +417,35 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
     app.requireTool("insurance", "standard"),
   ];
   const adminGate = [app.authenticate, app.requireCompany, app.requireTool("insurance", "admin")];
-  const companyRead = [app.authenticate, app.requireCompany];
+  /*
+   * COMPANY-LEVEL GATES.
+   *
+   * `companyRead` (authenticate + requireCompany alone) used to guard
+   * /insurance/policies, /insurance/expiring and /insurance/summary. Every
+   * company member — `COMPANY_ROLES` includes `guest` — could therefore read
+   * every project's policies, certificates, claim reserves and adjusters by
+   * choosing the URL without a project in it, which is the module's whole
+   * permission model bypassed by routing. `companyScopedRead` resolves the
+   * tool the same way `requireTool` does and restricts every row to the
+   * projects the caller actually holds `insurance` on.
+   *
+   * `companyWrite` used to admit `member`, so an ordinary user with no
+   * insurance permission anywhere could create and activate a COMPANY-LEVEL
+   * master policy — a record merged into every project's programme view that
+   * drives cover-gap signals on all of them. Owner/admin only, as learning
+   * already does.
+   */
+  const companyScopedRead = [
+    app.authenticate,
+    app.requireCompany,
+    companyToolGate(app, "insurance", "read"),
+  ];
   const companyWrite = [
     app.authenticate,
     app.requireCompany,
-    app.requireCompanyRole(["owner", "admin", "member"]),
+    app.requireCompanyRole(["owner", "admin"]),
   ];
+  const scopeOf = (req: FastifyRequest) => companyScopeOf(req, "insurance");
 
   /* ---------------------------------------------------------------- */
   /* Fetchers                                                          */
@@ -622,17 +698,60 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
       }));
   }
 
+  /** Every recorded cover requirement in a company, as the engine shape. */
+  async function loadRequirements(companyId: string): Promise<RequirementLike[]> {
+    const rows = await app.db
+      .select()
+      .from(insuranceRequirements)
+      .where(eq(insuranceRequirements.companyId, companyId));
+    return rows.map((r) => ({
+      id: r.id,
+      projectId: r.projectId,
+      vendorId: r.vendorId,
+      policyType: r.policyType,
+      requiredByClause: r.requiredByClause,
+      minimumLimit: r.minimumLimit,
+      limitBasis: r.limitBasis,
+      currency: r.currency,
+      maximumDeductible: r.maximumDeductible,
+      waiverOfSubrogation: r.waiverOfSubrogation,
+      additionalInsuredRequired: r.additionalInsuredRequired,
+      maintainMonthsAfterCompletion: r.maintainMonthsAfterCompletion,
+      territorialLimits: r.territorialLimits,
+      status: r.status,
+    }));
+  }
+
   /**
-   * Which policy types does this scope actually REQUIRE? Derived from the
-   * programme itself: a policy carrying `requiredByClause` is cover the
-   * contract demands, so its type is a requirement the supply chain must
-   * evidence too. Returns null when nothing is recorded — the caller must
-   * then say so rather than report "no gaps".
+   * Which policy types does ONE PROJECT actually require?
+   *
+   * The previous implementation unioned the policy types of every policy
+   * anywhere in the company that carried a `requiredByClause`, and applied
+   * that union to every project. A PI requirement recorded once on project A
+   * therefore raised a high-severity, ledgered, permanently-idempotent
+   * `insurance_cover_gap` signal against every vendor on project B, and those
+   * signals were counted in project B's summary. A requirement belongs to a
+   * scope: `insurance_requirements` rows for this project plus the
+   * company-wide ones, and nothing else.
+   *
+   * The legacy inference (a policy carrying `requiredByClause`) is kept ONLY
+   * as a fallback for a scope with no requirement rows at all, and only for
+   * that scope's own policies — never a tenant-wide union.
    */
-  async function derivedRequiredTypes(
+  async function requiredTypesFor(
     companyId: string,
     projectId: string | null,
+    requirements?: readonly RequirementLike[],
   ): Promise<string[] | null> {
+    const reqs = requirements ?? (await loadRequirements(companyId));
+    if (projectId) {
+      const types = requiredTypesForProject(reqs, projectId);
+      if (types.length > 0) return types;
+    } else {
+      const types = [...new Set(reqs.filter((r) => r.status === "required").map((r) => r.policyType))].sort();
+      if (types.length > 0) return types;
+    }
+    /* Fallback: policies in THIS scope that name the clause requiring them. */
     const rows = await app.db
       .select({ policyType: insurancePolicies.policyType })
       .from(insurancePolicies)
@@ -649,18 +768,39 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
           : and(
               eq(insurancePolicies.companyId, companyId),
               isNotNull(insurancePolicies.requiredByClause),
+              isNull(insurancePolicies.projectId),
             ),
       );
-    const types = [...new Set(rows.map((r) => r.policyType))];
+    const types = [...new Set(rows.map((r) => r.policyType))].sort();
     return types.length > 0 ? types : null;
   }
 
-  /** Signal keys already raised for a detector in this company. */
-  async function alreadySignalled(companyId: string, detector: string): Promise<Set<string>> {
+  /**
+   * Signal keys already raised for a detector in this company.
+   *
+   * `candidateKeys` narrows the query to the keys actually being considered.
+   * The previous version loaded EVERY signal row for the detector into a Set
+   * on every list read — up to four detectors per page load — against a table
+   * with no index on (company_id, detector), so the cost grew without bound
+   * with the tenant's signal history. `signals` belongs to another package,
+   * so the fix available here is to ask a bounded question.
+   */
+  async function alreadySignalled(
+    companyId: string,
+    detector: string,
+    candidateKeys?: readonly string[],
+  ): Promise<Set<string>> {
+    if (candidateKeys && candidateKeys.length === 0) return new Set();
     const rows = await app.db
       .select({ refs: signals.evidenceRefs })
       .from(signals)
-      .where(and(eq(signals.companyId, companyId), eq(signals.detector, detector)));
+      .where(
+        and(
+          eq(signals.companyId, companyId),
+          eq(signals.detector, detector),
+          candidateKeys ? sql`${signals.evidenceRefs} ->> 'key' in ${candidateKeys}` : undefined,
+        ),
+      );
     const keys = new Set<string>();
     for (const row of rows) {
       const refs = row.refs as { key?: unknown } | null;
@@ -679,34 +819,43 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
   }
 
   /* ---------------------------------------------------------------- */
-  /* THE LAZY SWEEP (#777, #780, #792, #794)                           */
+  /* THE EXPIRY SWEEP — a scheduled job, not a read side effect         */
+  /*                                                                    */
+  /* It used to run on EVERY insurance list and detail read. That was    */
+  /* wrong twice over. A policy nobody opened never lapsed in the        */
+  /* record — the expiry date does not wait for a browser tab — and the  */
+  /* ledger attributed the resulting status flips, obligations and       */
+  /* signals to whoever happened to open the page, including read-only   */
+  /* members and assurance grantees who hold no write permission at all. */
+  /* It now runs under the platform scheduler with a null (system)       */
+  /* actor; reads are pure, and `POST /insurance/sweep` triggers a cycle */
+  /* by hand for operators and tests.                                    */
+  /*                                                                    */
+  /* Seven detectors, each keyed in `evidenceRefs.key` so a repeated run  */
+  /* never raises the same lapse twice:                                  */
+  /*                                                                    */
+  /*  - `policy_lapsed_during_works`    key = policyId                   */
+  /*  - `insurance_certificate_expired` key = certificateId              */
+  /*  - `bond_demand_deadline_passed`   key = bondId                     */
+  /*  - `insurance_cover_gap`           key = project:vendor:policyType  */
+  /*  - `policy_period_gap`             key = project:policyType:reqId   */
+  /*  - `uninsured_loss_candidate`      key = recordType:recordId        */
+  /*  - `policy_renewal_overdue`        key = policyId:periodEnd         */
+  /*                                                                    */
+  /* Status flips (policy → expired, certificate → expired, bond →       */
+  /* expired) are a second, independent guard: a swept record leaves the */
+  /* candidate set.                                                      */
   /* ---------------------------------------------------------------- */
 
-  /**
-   * Idempotent expiry sweep, run on every insurance list/detail read — the
-   * pattern used across the platform (payments deemed liability, contract
-   * time bars, permit expiry). No cron: a record nobody reads harms nobody,
-   * and the read is the moment the answer must be true.
-   *
-   * Four detectors, each keyed in `evidenceRefs.key` so a repeated read never
-   * raises the same lapse twice:
-   *
-   *  - `policy_lapsed_during_works`  key = policyId
-   *  - `insurance_certificate_expired` key = certificateId
-   *  - `bond_demand_deadline_passed` key = bondId
-   *  - `insurance_cover_gap`         key = project:vendor:policyType
-   *
-   * Status flips (policy → expired, certificate → expired, bond → expired)
-   * are a second, independent guard: a swept record leaves the candidate set.
-   */
   async function sweepInsurance(
     companyId: string,
     projectId: string | null,
-    actorId: string,
-  ): Promise<void> {
+    actorId: string | null,
+  ): Promise<{ signals: number }> {
     const asOf = todayISO();
     const scope = await loadScope(companyId, projectId);
     const now = new Date().toISOString();
+    let raised = 0;
 
     /* (1) policies whose period ended while they were still on risk */
     const lapsed = lapsedPolicies(scope.policies, asOf);
@@ -859,21 +1008,43 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
       });
     }
 
-    /* (4) supply-chain cover gaps */
-    const requiredTypes = await derivedRequiredTypes(companyId, projectId);
-    if (requiredTypes) {
-      const vendorsAtWork = await loadVendorsAtWork(companyId, projectId, scope.bonds);
+    /*
+     * (4) SUPPLY-CHAIN COVER GAPS, EVALUATED PER PROJECT.
+     *
+     * In company scope this used to compute one tenant-wide union of required
+     * types and test every vendor on every project against it, so a PI
+     * requirement recorded on project A raised a permanent cover-gap signal
+     * for every vendor on project B. Each project is now evaluated against
+     * ITS OWN requirement set (its own requirements plus the company-wide
+     * ones), which is what a requirement actually means.
+     */
+    const requirements = await loadRequirements(companyId);
+    const vendorsAll = await loadVendorsAtWork(companyId, projectId, scope.bonds);
+    const projectBuckets = new Map<string | null, VendorAtWork[]>();
+    for (const v of vendorsAll) {
+      const list = projectBuckets.get(v.projectId) ?? [];
+      list.push(v);
+      projectBuckets.set(v.projectId, list);
+    }
+    for (const [bucketProjectId, bucketVendors] of projectBuckets) {
+      const requiredTypes = await requiredTypesFor(companyId, bucketProjectId, requirements);
+      if (!requiredTypes) continue;
       const gapResult = computeCoverGaps({
         certificates: scope.certificates,
-        vendorsAtWork,
+        vendorsAtWork: bucketVendors,
         requiredPolicyTypes: requiredTypes,
         asOf,
       });
       if (gapResult.gaps.length > 0) {
-        const seen = await alreadySignalled(companyId, "insurance_cover_gap");
+        const seen = await alreadySignalled(
+          companyId,
+          "insurance_cover_gap",
+          gapResult.gaps.map((g) => g.key),
+        );
         for (const gap of gapResult.gaps) {
           if (seen.has(gap.key)) continue;
           seen.add(gap.key);
+          raised += 1;
           const because =
             gap.reason === "no_certificate"
               ? "no certificate of that cover has ever been collected from them"
@@ -905,7 +1076,368 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         }
       }
     }
+
+    /*
+     * (5) POLICY PERIOD vs THE WORKS (#777).
+     *
+     * `policyPeriodGap` has existed in expiry.ts since the module was written
+     * and nothing ever called it. Cover that starts a month after the works
+     * or ends a month before them is not cover for those days, and those are
+     * exactly the days a loss will find.
+     */
+    const projectRows = await app.db
+      .select({
+        id: projects.id,
+        name: projects.name,
+        startDate: projects.startDate,
+        finishDate: projects.finishDate,
+        stage: projects.stage,
+      })
+      .from(projects)
+      .where(
+        projectId
+          ? and(eq(projects.companyId, companyId), eq(projects.id, projectId))
+          : and(eq(projects.companyId, companyId), isNull(projects.deletedAt)),
+      );
+    for (const project of projectRows) {
+      const gapOut = computePeriodGaps({
+        projectId: project.id,
+        worksStart: project.startDate,
+        worksEnd: project.finishDate,
+        requirements: requirements.filter(
+          (r) => r.projectId === null || r.projectId === project.id,
+        ),
+        policies: scope.policies,
+      });
+      if (gapOut.gaps.length === 0) continue;
+      const seen = await alreadySignalled(
+        companyId,
+        "policy_period_gap",
+        gapOut.gaps.map((g) => g.key),
+      );
+      for (const gap of gapOut.gaps) {
+        if (seen.has(gap.key)) continue;
+        seen.add(gap.key);
+        raised += 1;
+        await app.db.insert(signals).values({
+          id: newId("sig"),
+          companyId,
+          projectId: project.id,
+          detector: "policy_period_gap",
+          severity: "high",
+          confidence: 1,
+          title: `Policy period does not cover the works — ${gap.policyType} on ${project.name}`,
+          explanation: gap.detail,
+          evidenceRefs: {
+            key: gap.key,
+            policyType: gap.policyType,
+            requirementId: gap.requirementId,
+            requiredByClause: gap.requiredByClause,
+            policyId: gap.policyId,
+            uncoveredAtStartDays: gap.uncoveredAtStartDays,
+            uncoveredAtEndDays: gap.uncoveredAtEndDays,
+            worksStart: gap.worksStart,
+            worksEnd: gap.worksEnd,
+          },
+        });
+      }
+    }
+
+    /*
+     * (6) UNINSURED LOSS CANDIDATES (#787).
+     *
+     * Recorded losses — safety incidents with an estimated cost, NCRs with a
+     * cost impact — matched to the class of cover that would respond. The
+     * expensive case is the last one: an INSURED loss for which nobody raised
+     * a claim, because notification periods are conditions precedent and an
+     * insured loss nobody notified becomes an uninsured loss on the day the
+     * period expires. Nothing in an incident register notices that.
+     */
+    const losses = await loadLossEvents(companyId, projectId);
+    if (losses.length > 0) {
+      const claimedRecordIds = await loadClaimedRecordIds(companyId, projectId);
+      const deductibleById = new Map<string, number | null>(
+        scope.policies.map((p) => [p.id, (p as { deductible?: number | null }).deductible ?? null]),
+      );
+      const claimRows = await app.db
+        .select()
+        .from(insuranceClaims)
+        .where(
+          projectId
+            ? and(eq(insuranceClaims.companyId, companyId), eq(insuranceClaims.projectId, projectId))
+            : eq(insuranceClaims.companyId, companyId),
+        );
+      const findings = findUninsuredLosses({
+        losses,
+        policies: scope.policies,
+        deductibleById,
+        claims: claimRows.map(toClaimLike),
+        claimedRecordIds,
+      });
+      if (findings.length > 0) {
+        const seen = await alreadySignalled(
+          companyId,
+          "uninsured_loss_candidate",
+          findings.map((f) => f.key),
+        );
+        for (const f of findings) {
+          if (seen.has(f.key)) continue;
+          seen.add(f.key);
+          raised += 1;
+          await app.db.insert(signals).values({
+            id: newId("sig"),
+            companyId,
+            projectId: f.projectId,
+            detector: "uninsured_loss_candidate",
+            severity: f.reason === "no_claim_raised" ? "high" : "medium",
+            confidence: f.lossAmount === null ? 0.6 : 0.9,
+            title:
+              f.reason === "no_claim_raised"
+                ? `Insured loss with no claim raised — ${f.title}`
+                : `Uninsured loss — ${f.title}`,
+            explanation: f.detail,
+            evidenceRefs: {
+              key: f.key,
+              recordType: f.recordType,
+              recordId: f.recordId,
+              reason: f.reason,
+              policyType: f.policyType,
+              policyId: f.candidatePolicyId,
+              lossAmount: f.lossAmount,
+              currency: f.currency,
+              deductible: f.deductible,
+              occurredAt: f.occurredAt,
+            },
+          });
+        }
+      }
+    }
+
+    /*
+     * (7) RENEWALS THAT ARE ALREADY LATE (#775).
+     *
+     * Measured against a lead time rather than the expiry date, because a
+     * renewal started the week before expiry has already failed even though
+     * nothing has expired yet. Keyed on policy + period end so a renewed
+     * policy's next period raises its own signal rather than being suppressed
+     * by the last one.
+     */
+    const renewals = buildRenewalPipeline({
+      policies: scope.policies.map((p) => ({
+        ...p,
+        renewalStatus: (p as { renewalStatus?: string }).renewalStatus ?? "not_started",
+        renewalOwnerId: (p as { renewalOwnerId?: string | null }).renewalOwnerId ?? null,
+        renewalTargetDate: (p as { renewalTargetDate?: string | null }).renewalTargetDate ?? null,
+        renewedByPolicyId: (p as { renewedByPolicyId?: string | null }).renewedByPolicyId ?? null,
+      })),
+      asOf,
+    }).filter((r) => r.urgency === "critical" || r.urgency === "overdue");
+    if (renewals.length > 0) {
+      const keys = renewals.map((r) => `${r.policyId}:${r.periodEnd}`);
+      const seen = await alreadySignalled(companyId, "policy_renewal_overdue", keys);
+      for (const r of renewals) {
+        const key = `${r.policyId}:${r.periodEnd}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        raised += 1;
+        await app.db.insert(signals).values({
+          id: newId("sig"),
+          companyId,
+          projectId: r.projectId,
+          detector: "policy_renewal_overdue",
+          severity: r.urgency === "overdue" ? "critical" : "high",
+          confidence: 1,
+          title: `Renewal behind — ${r.policyType} ${r.number} (${r.insurer})`,
+          explanation: r.reason,
+          evidenceRefs: {
+            key,
+            policyId: r.policyId,
+            periodEnd: r.periodEnd,
+            renewalStatus: r.renewalStatus,
+            daysToExpiry: r.daysToExpiry,
+            behindByDays: r.behindByDays,
+          },
+        });
+      }
+    }
+
+    return { signals: raised };
   }
+
+  /* ---------------------------------------------------------------- */
+  /* Loss events — the population #787 is measured against              */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Which class of cover would respond to a safety incident.
+   *
+   * Deliberately coarse and deliberately incomplete: an incident type this
+   * map does not know returns null and is skipped rather than guessed at.
+   * A wrong mapping produces a confident false signal, which is worse than
+   * silence.
+   */
+  const INCIDENT_POLICY_TYPE: Record<string, string> = {
+    injury: "employers_liability",
+    fatality: "employers_liability",
+    lost_time: "employers_liability",
+    medical_treatment: "employers_liability",
+    occupational_illness: "employers_liability",
+    property_damage: "contractors_all_risks",
+    fire: "contractors_all_risks",
+    environmental: "environmental_liability",
+    third_party: "public_liability",
+    public_liability: "public_liability",
+    vehicle: "motor",
+    plant_damage: "plant_and_equipment",
+  };
+
+  /** NCR categories that a professional-indemnity policy would answer for. */
+  const NCR_POLICY_TYPE: Record<string, string> = {
+    design: "professional_indemnity",
+    workmanship: "contractors_all_risks",
+    material: "contractors_all_risks",
+  };
+
+  async function loadLossEvents(
+    companyId: string,
+    projectId: string | null,
+  ): Promise<LossEventLike[]> {
+    const projectCurrency = new Map<string, string>(
+      (
+        await app.db
+          .select({ id: projects.id, currency: projects.currency })
+          .from(projects)
+          .where(eq(projects.companyId, companyId))
+      ).map((p) => [p.id, p.currency] as const),
+    );
+    const incidents = await app.db
+      .select({
+        id: safetyIncidents.id,
+        projectId: safetyIncidents.projectId,
+        reference: safetyIncidents.reference,
+        title: safetyIncidents.title,
+        incidentType: safetyIncidents.incidentType,
+        occurredAt: safetyIncidents.occurredAt,
+        estimatedCost: safetyIncidents.estimatedCost,
+      })
+      .from(safetyIncidents)
+      .where(
+        and(
+          eq(safetyIncidents.companyId, companyId),
+          projectId ? eq(safetyIncidents.projectId, projectId) : undefined,
+          gt(safetyIncidents.estimatedCost, 0),
+        ),
+      )
+      .limit(500);
+    const ncrs = await app.db
+      .select({
+        id: nonConformanceReports.id,
+        projectId: nonConformanceReports.projectId,
+        reference: nonConformanceReports.reference,
+        title: nonConformanceReports.title,
+        category: nonConformanceReports.category,
+        detectedAt: nonConformanceReports.detectedAt,
+        createdAt: nonConformanceReports.createdAt,
+        costImpact: nonConformanceReports.costImpact,
+        currency: nonConformanceReports.currency,
+      })
+      .from(nonConformanceReports)
+      .where(
+        and(
+          eq(nonConformanceReports.companyId, companyId),
+          projectId ? eq(nonConformanceReports.projectId, projectId) : undefined,
+          gt(nonConformanceReports.costImpact, 0),
+        ),
+      )
+      .limit(500);
+    const out: LossEventLike[] = [];
+    for (const i of incidents) {
+      const policyType = INCIDENT_POLICY_TYPE[i.incidentType] ?? null;
+      if (!policyType) continue;
+      out.push({
+        recordType: "safety_incident",
+        recordId: i.id,
+        projectId: i.projectId,
+        title: `${i.reference} — ${i.title}`,
+        occurredAt: i.occurredAt.slice(0, 10),
+        lossAmount: i.estimatedCost,
+        currency: projectCurrency.get(i.projectId) ?? "GBP",
+        policyType,
+      });
+    }
+    for (const n of ncrs) {
+      const policyType = NCR_POLICY_TYPE[n.category] ?? null;
+      if (!policyType) continue;
+      const when = (n.detectedAt ?? n.createdAt).slice(0, 10);
+      out.push({
+        recordType: "ncr",
+        recordId: n.id,
+        projectId: n.projectId,
+        title: `${n.reference} — ${n.title}`,
+        occurredAt: when,
+        lossAmount: n.costImpact,
+        currency: n.currency,
+        policyType,
+      });
+    }
+    return out;
+  }
+
+  /** Records already tied to a claim, through record links or linkedRecords. */
+  async function loadClaimedRecordIds(
+    companyId: string,
+    projectId: string | null,
+  ): Promise<Set<string>> {
+    const out = new Set<string>();
+    const linkRows = await app.db
+      .select({ toId: recordLinks.toId, fromId: recordLinks.fromId })
+      .from(recordLinks)
+      .where(
+        and(
+          eq(recordLinks.companyId, companyId),
+          projectId ? eq(recordLinks.projectId, projectId) : undefined,
+          or(
+            eq(recordLinks.fromType, "insurance_claim"),
+            eq(recordLinks.toType, "insurance_claim"),
+          ),
+        ),
+      );
+    for (const l of linkRows) {
+      out.add(l.toId);
+      out.add(l.fromId);
+    }
+    const claimRows = await app.db
+      .select({ linkedRecords: insuranceClaims.linkedRecords })
+      .from(insuranceClaims)
+      .where(
+        projectId
+          ? and(eq(insuranceClaims.companyId, companyId), eq(insuranceClaims.projectId, projectId))
+          : eq(insuranceClaims.companyId, companyId),
+      );
+    for (const c of claimRows) {
+      const links = c.linkedRecords;
+      if (!Array.isArray(links)) continue;
+      for (const l of links) {
+        if (l && typeof l === "object" && "recordId" in l) {
+          const id = (l as { recordId?: unknown }).recordId;
+          if (typeof id === "string") out.add(id);
+        }
+      }
+    }
+    return out;
+  }
+
+  const toClaimLike = (c: typeof insuranceClaims.$inferSelect): ClaimLike => ({
+    id: c.id,
+    policyId: c.policyId,
+    projectId: c.projectId,
+    status: c.status,
+    quantum: c.quantum,
+    reserve: c.reserve,
+    settledAmount: c.settledAmount,
+    currency: c.currency,
+    incidentDate: c.incidentDate,
+  });
 
   /* ---------------------------------------------------------------- */
   /* Presentation helpers                                              */
@@ -1047,7 +1579,6 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/insurance/policies", { preHandler: readGate }, async (req) => {
     const q = policyListQuery.parse(req.query);
-    await sweepInsurance(req.companyId!, req.projectId!, req.user!.id);
     const asOf = todayISO();
     const clauses = [
       eq(insurancePolicies.companyId, req.companyId!),
@@ -1079,8 +1610,6 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
     { preHandler: readGate },
     async (req) => {
       const { policyId } = req.params as { policyId: string };
-      await fetchPolicyForProject(policyId, req.companyId!, req.projectId!); // 404 before sweeping
-      await sweepInsurance(req.companyId!, req.projectId!, req.user!.id);
       const policy = await fetchPolicyForProject(policyId, req.companyId!, req.projectId!);
       const asOf = todayISO();
       const certs = await app.db
@@ -1265,11 +1794,19 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
 
   /* ---- Company-level programme view (#771, #779) ------------------ */
 
-  app.get("/insurance/policies", { preHandler: companyRead }, async (req) => {
+  app.get("/insurance/policies", { preHandler: companyScopedRead }, async (req) => {
     const q = companyPolicyListQuery.parse(req.query);
-    await sweepInsurance(req.companyId!, null, req.user!.id);
+    const scope = scopeOf(req);
+    if (q.projectId && !scopeAllows(scope, q.projectId)) {
+      throw forbidden(
+        "You do not hold insurance on that project. This route sits above the projects and " +
+          "returns only the ones you hold the tool on.",
+      );
+    }
     const asOf = todayISO();
     const clauses = [eq(insurancePolicies.companyId, req.companyId!)];
+    const visible = scopeProjectsOrCompanyWide(scope, insurancePolicies.projectId);
+    if (visible) clauses.push(visible);
     if (q.projectId) clauses.push(eq(insurancePolicies.projectId, q.projectId));
     if (q.companyLevelOnly) clauses.push(isNull(insurancePolicies.projectId));
     if (q.policyType) clauses.push(eq(insurancePolicies.policyType, q.policyType));
@@ -1306,9 +1843,12 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
     return reply.status(201).send(decoratePolicy(created, todayISO()));
   });
 
-  app.get("/insurance/policies/:policyId", { preHandler: companyRead }, async (req) => {
+  app.get("/insurance/policies/:policyId", { preHandler: companyScopedRead }, async (req) => {
     const { policyId } = req.params as { policyId: string };
     const policy = await fetchCompanyPolicy(policyId, req.companyId!);
+    if (!scopeAllows(scopeOf(req), policy.projectId)) {
+      throw notFound("Policy not found");
+    }
     const asOf = todayISO();
     const certs = await app.db
       .select()
@@ -1340,6 +1880,9 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
       throw badRequest(`A ${policy.status} policy cannot be edited`);
     }
     assertPeriod(body.periodStart ?? policy.periodStart, body.periodEnd ?? policy.periodEnd);
+    /* The project PATCH has always checked this; the company one did not, so
+       a broker id belonging to another tenant could be stored here. */
+    if (body.brokerVendorId) await assertVendor(body.brokerVendorId, req.companyId!);
     const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
     for (const [k, v] of Object.entries(body)) {
       if (v !== undefined) set[k] = v;
@@ -1351,7 +1894,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
       action: "update",
       objectType: "insurance_policy",
       objectId: policyId,
-      payload: { changed: Object.keys(body), scope: "company" },
+      payload: { changed: Object.keys(body), scope: "company", actorRole: req.companyRole ?? null },
     });
     const updated = await fetchCompanyPolicy(policyId, req.companyId!);
     return decoratePolicy(updated, todayISO());
@@ -1444,7 +1987,6 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/insurance/certificates", { preHandler: readGate }, async (req) => {
     const q = certificateListQuery.parse(req.query);
-    await sweepInsurance(req.companyId!, req.projectId!, req.user!.id);
     const asOf = todayISO();
     const clauses = [
       eq(insuranceCertificates.companyId, req.companyId!),
@@ -1480,7 +2022,6 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
     async (req) => {
       const { certId } = req.params as { certId: string };
       await fetchCertificate(certId, req.companyId!, req.projectId!);
-      await sweepInsurance(req.companyId!, req.projectId!, req.user!.id);
       const cert = await fetchCertificate(certId, req.companyId!, req.projectId!);
       return decorateCertificate(cert, todayISO());
     },
@@ -1788,7 +2329,6 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/insurance/bonds", { preHandler: readGate }, async (req) => {
     const q = bondListQuery.parse(req.query);
-    await sweepInsurance(req.companyId!, req.projectId!, req.user!.id);
     const asOf = todayISO();
     const clauses = [eq(bonds.companyId, req.companyId!), eq(bonds.projectId, req.projectId!)];
     if (q.bondType) clauses.push(eq(bonds.bondType, q.bondType));
@@ -1815,7 +2355,6 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
     async (req) => {
       const { bondId } = req.params as { bondId: string };
       await fetchBond(bondId, req.companyId!, req.projectId!);
-      await sweepInsurance(req.companyId!, req.projectId!, req.user!.id);
       const bond = await fetchBond(bondId, req.companyId!, req.projectId!);
       const calls = await app.db
         .select()
@@ -2139,6 +2678,37 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
       if (bond.status === "draft") {
         throw badRequest("A draft bond has never been issued and cannot be released");
       }
+      /*
+       * Release used to be allowed from every other state. Releasing a
+       * `called` bond with a demand still outstanding flipped the status and
+       * hid a live recovery; releasing an `expired` bond rewrote a derived
+       * fact — the bond did not end because somebody released it, it ended
+       * because its expiry passed. Release now means only what it says:
+       * the security was given back while it was still live.
+       */
+      if (bond.status === "expired") {
+        throw conflict(
+          `Bond ${bond.number} expired on ${bond.expiryAt ?? "an unrecorded date"}. An expired ` +
+            "bond is not released — nothing was given back, the security simply ran out — and " +
+            "recording it as released would rewrite what happened.",
+        );
+      }
+      if (bond.status === "called") {
+        const calls = await app.db
+          .select({ id: bondCalls.id, outcome: bondCalls.outcome })
+          .from(bondCalls)
+          .where(and(eq(bondCalls.bondId, bondId), eq(bondCalls.companyId, req.companyId!)));
+        const outstanding = calls.filter(
+          (c) => c.outcome !== "paid" && c.outcome !== "rejected" && c.outcome !== "withdrawn",
+        );
+        if (outstanding.length > 0) {
+          throw conflict(
+            `Bond ${bond.number} has ${outstanding.length} demand(s) still outstanding. Releasing ` +
+              "it now would hide a live recovery: settle or withdraw every call first, then " +
+              "release what is left.",
+          );
+        }
+      }
       const releasedAt = body.releasedAt ?? todayISO();
       await app.db
         .update(bonds)
@@ -2300,7 +2870,6 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/insurance/claims", { preHandler: readGate }, async (req) => {
     const q = claimListQuery.parse(req.query);
-    await sweepInsurance(req.companyId!, req.projectId!, req.user!.id);
     const asOf = todayISO();
     const clauses = [
       eq(insuranceClaims.companyId, req.companyId!),
@@ -2332,7 +2901,6 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
     async (req) => {
       const { claimId } = req.params as { claimId: string };
       await fetchClaim(claimId, req.companyId!, req.projectId!);
-      await sweepInsurance(req.companyId!, req.projectId!, req.user!.id);
       const claim = await fetchClaim(claimId, req.companyId!, req.projectId!);
       const policy = await fetchPolicyForProject(
         claim.policyId,
@@ -2593,11 +3161,24 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
     projectId: string | null,
     explicitTypes: string[] | null,
     days: number,
+    /** null = every project; otherwise the ids the caller may see */
+    visibleProjectIds: readonly string[] | null = null,
   ) {
     const asOf = todayISO();
-    const scope = await loadScope(companyId, projectId);
-    const requiredTypes = explicitTypes ?? (await derivedRequiredTypes(companyId, projectId));
-    const vendorsAtWork = await loadVendorsAtWork(companyId, projectId, scope.bonds);
+    const full = await loadScope(companyId, projectId);
+    const visible = <T extends { projectId: string | null }>(rows: readonly T[]): T[] =>
+      visibleProjectIds === null
+        ? [...rows]
+        : rows.filter((r) => r.projectId === null || visibleProjectIds.includes(r.projectId));
+    const scope = {
+      policies: visible(full.policies),
+      certificates: visible(full.certificates),
+      bonds: visible(full.bonds),
+    };
+    const requiredTypes = explicitTypes ?? (await requiredTypesFor(companyId, projectId));
+    const vendorsAtWork = visible(
+      await loadVendorsAtWork(companyId, projectId, scope.bonds),
+    );
     const report = computeExpiryReport({
       asOf,
       windowDays: days,
@@ -2615,7 +3196,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
       requiredTypesSource: explicitTypes
         ? ("query" as const)
         : requiredTypes
-          ? ("policies_with_required_by_clause" as const)
+          ? ("recorded_requirements" as const)
           : ("none_recorded" as const),
       vendorsAtWork: vendorsAtWork.length,
     };
@@ -2623,7 +3204,6 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/insurance/expiring", { preHandler: readGate }, async (req) => {
     const q = windowQuery.parse(req.query);
-    await sweepInsurance(req.companyId!, req.projectId!, req.user!.id);
     return buildExpiryReport(
       req.companyId!,
       req.projectId!,
@@ -2632,26 +3212,35 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
     );
   });
 
-  app.get("/insurance/expiring", { preHandler: companyRead }, async (req) => {
+  /*
+   * The company-wide expiry radar, restricted to the projects the caller
+   * actually holds `insurance` on. Owners and admins get the whole tenant.
+   */
+  app.get("/insurance/expiring", { preHandler: companyScopedRead }, async (req) => {
     const q = windowQuery.parse(req.query);
-    await sweepInsurance(req.companyId!, null, req.user!.id);
-    return buildExpiryReport(
-      req.companyId!,
-      null,
-      parseRequiredTypesParam(q.requiredTypes),
-      q.days,
-    );
+    const scope = scopeOf(req);
+    return {
+      ...(await buildExpiryReport(
+        req.companyId!,
+        null,
+        parseRequiredTypesParam(q.requiredTypes),
+        q.days,
+        scope.all ? null : scope.projectIds,
+      )),
+      visibility: scope.all
+        ? { all: true as const, projects: null }
+        : { all: false as const, projects: scope.projectIds.length },
+    };
   });
 
   /* ================================================================ */
   /* PROGRAMME SUMMARY (#773, #778, #786, #795-796)                    */
   /* ================================================================ */
 
-  async function buildSummary(companyId: string, projectId: string | null, actorId: string) {
-    await sweepInsurance(companyId, projectId, actorId);
+  async function buildSummary(companyId: string, projectId: string | null) {
     const asOf = todayISO();
     const scope = await loadScope(companyId, projectId);
-    const requiredTypes = await derivedRequiredTypes(companyId, projectId);
+    const requiredTypes = await requiredTypesFor(companyId, projectId);
     const vendorsAtWork = await loadVendorsAtWork(companyId, projectId, scope.bonds);
     const gapResult = computeCoverGaps({
       certificates: scope.certificates,
@@ -2924,10 +3513,6 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
   }
 
   app.get("/projects/:projectId/insurance/summary", { preHandler: readGate }, async (req) =>
-    buildSummary(req.companyId!, req.projectId!, req.user!.id),
-  );
-
-  app.get("/insurance/summary", { preHandler: companyRead }, async (req) =>
-    buildSummary(req.companyId!, null, req.user!.id),
+    buildSummary(req.companyId!, req.projectId!),
   );
 };

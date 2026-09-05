@@ -3120,6 +3120,78 @@ CREATE TABLE "bid_questions" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
+CREATE TABLE "prequalification_licences" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"vendor_id" text NOT NULL,
+	"submission_id" text,
+	"kind" text NOT NULL,
+	"jurisdiction" text,
+	"number" text,
+	"issued_by" text,
+	"issued_at" text,
+	"expires_at" text,
+	"status" text DEFAULT 'claimed' NOT NULL,
+	"file_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"verified_by" text,
+	"verified_at" timestamp with time zone,
+	"note" text,
+	"detail" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"created_by" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "prequalification_references" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"vendor_id" text NOT NULL,
+	"submission_id" text,
+	"client_name" text NOT NULL,
+	"project_name" text,
+	"contract_value" double precision,
+	"currency" text DEFAULT 'USD' NOT NULL,
+	"completed_at" text,
+	"contact_name" text,
+	"contact_email" text,
+	"contact_phone" text,
+	"outcome" text DEFAULT 'unknown' NOT NULL,
+	"rating" double precision,
+	"would_use_again" integer,
+	"checked_by" text,
+	"checked_at" timestamp with time zone,
+	"check_note" text,
+	"detail" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"created_by" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "prequalification_safety_records" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"vendor_id" text NOT NULL,
+	"submission_id" text,
+	"year" integer NOT NULL,
+	"emr" double precision,
+	"trir" double precision,
+	"dart" double precision,
+	"fatalities" integer,
+	"lost_time_injuries" integer,
+	"recordable_incidents" integer,
+	"hours_worked" double precision,
+	"citations" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"source" text DEFAULT 'self_declared' NOT NULL,
+	"file_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"verified_by" text,
+	"verified_at" timestamp with time zone,
+	"note" text,
+	"detail" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"created_by" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
 CREATE TABLE "tender_costs" (
 	"id" text PRIMARY KEY NOT NULL,
 	"company_id" text NOT NULL,
@@ -3161,9 +3233,27 @@ CREATE TABLE "company_security_policies" (
 	"ip_allowlist_break_glass_user_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
 	"mfa_required" boolean DEFAULT false NOT NULL,
 	"mfa_accepted_amr_values" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"security_event_retention_days" integer,
+	"email_dispatch_retention_days" integer,
+	"legal_hold" boolean DEFAULT false NOT NULL,
+	"legal_hold_reason" text,
 	"updated_by" text,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "mfa_challenges" (
+	"id" text PRIMARY KEY NOT NULL,
+	"user_id" text NOT NULL,
+	"scope" text NOT NULL,
+	"origin" text DEFAULT 'password' NOT NULL,
+	"ip" text,
+	"user_agent" text,
+	"consumed_at" timestamp with time zone,
+	"revoked_at" timestamp with time zone,
+	"revoked_reason" text,
+	"expires_at" timestamp with time zone NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
 CREATE TABLE "password_history" (
@@ -6688,6 +6778,7 @@ DROP INDEX "auth_security_events_email_idx";--> statement-breakpoint
 ALTER TABLE "drawing_hyperlinks" ALTER COLUMN "to_sheet_id" DROP NOT NULL;--> statement-breakpoint
 ALTER TABLE "timecard_batches" ALTER COLUMN "total_cost" DROP DEFAULT;--> statement-breakpoint
 ALTER TABLE "timecard_batches" ALTER COLUMN "total_cost" DROP NOT NULL;--> statement-breakpoint
+ALTER TABLE "bid_submissions" ALTER COLUMN "created_by" DROP NOT NULL;--> statement-breakpoint
 ALTER TABLE "auth_events" ADD COLUMN "company_id" text;--> statement-breakpoint
 ALTER TABLE "contacts" ADD COLUMN "deleted_at" timestamp with time zone;--> statement-breakpoint
 ALTER TABLE "contacts" ADD COLUMN "deleted_by" text;--> statement-breakpoint
@@ -7012,6 +7103,13 @@ ALTER TABLE "bid_packages" ADD COLUMN "published_at" timestamp with time zone;--
 ALTER TABLE "bid_packages" ADD COLUMN "published_by" text;--> statement-breakpoint
 ALTER TABLE "bid_packages" ADD COLUMN "public_summary" text;--> statement-breakpoint
 ALTER TABLE "bid_submissions" ADD COLUMN "superseded_by_id" text;--> statement-breakpoint
+ALTER TABLE "prequalification_submissions" ADD COLUMN "tier" text;--> statement-breakpoint
+ALTER TABLE "prequalification_submissions" ADD COLUMN "tier_basis" text;--> statement-breakpoint
+ALTER TABLE "prequalification_submissions" ADD COLUMN "risk_rating" text;--> statement-breakpoint
+ALTER TABLE "prequalification_submissions" ADD COLUMN "risk_basis" text;--> statement-breakpoint
+ALTER TABLE "prequalification_submissions" ADD COLUMN "portal_token_hash" text;--> statement-breakpoint
+ALTER TABLE "prequalification_submissions" ADD COLUMN "portal_token_expires_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "prequalification_submissions" ADD COLUMN "portal_last_access_at" timestamp with time zone;--> statement-breakpoint
 ALTER TABLE "identity_providers" ADD COLUMN "provision_project_ids" jsonb DEFAULT '[]'::jsonb NOT NULL;--> statement-breakpoint
 ALTER TABLE "identity_providers" ADD COLUMN "idp_performs_mfa" boolean DEFAULT false NOT NULL;--> statement-breakpoint
 ALTER TABLE "identity_providers" ADD COLUMN "mfa_amr_values" jsonb DEFAULT '[]'::jsonb NOT NULL;--> statement-breakpoint
@@ -7364,10 +7462,20 @@ CREATE UNIQUE INDEX "bid_questions_uq" ON "bid_questions" USING btree ("package_
 CREATE INDEX "bid_questions_package_idx" ON "bid_questions" USING btree ("package_id","status");--> statement-breakpoint
 CREATE INDEX "bid_questions_vendor_idx" ON "bid_questions" USING btree ("vendor_id");--> statement-breakpoint
 CREATE INDEX "bid_questions_project_idx" ON "bid_questions" USING btree ("project_id");--> statement-breakpoint
+CREATE INDEX "prequal_licences_vendor_idx" ON "prequalification_licences" USING btree ("company_id","vendor_id","status");--> statement-breakpoint
+CREATE INDEX "prequal_licences_expiry_idx" ON "prequalification_licences" USING btree ("company_id","expires_at");--> statement-breakpoint
+CREATE INDEX "prequal_licences_submission_idx" ON "prequalification_licences" USING btree ("submission_id");--> statement-breakpoint
+CREATE INDEX "prequal_references_vendor_idx" ON "prequalification_references" USING btree ("company_id","vendor_id");--> statement-breakpoint
+CREATE INDEX "prequal_references_submission_idx" ON "prequalification_references" USING btree ("submission_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "prequal_safety_uq" ON "prequalification_safety_records" USING btree ("company_id","vendor_id","year","source");--> statement-breakpoint
+CREATE INDEX "prequal_safety_vendor_idx" ON "prequalification_safety_records" USING btree ("company_id","vendor_id","year");--> statement-breakpoint
+CREATE INDEX "prequal_safety_submission_idx" ON "prequalification_safety_records" USING btree ("submission_id");--> statement-breakpoint
 CREATE INDEX "tender_costs_opportunity_idx" ON "tender_costs" USING btree ("opportunity_id","incurred_on");--> statement-breakpoint
 CREATE INDEX "tender_costs_package_idx" ON "tender_costs" USING btree ("package_id","incurred_on");--> statement-breakpoint
 CREATE INDEX "tender_costs_company_idx" ON "tender_costs" USING btree ("company_id","incurred_on");--> statement-breakpoint
 CREATE UNIQUE INDEX "company_security_policies_company_uq" ON "company_security_policies" USING btree ("company_id");--> statement-breakpoint
+CREATE INDEX "mfa_challenges_user_idx" ON "mfa_challenges" USING btree ("user_id","created_at");--> statement-breakpoint
+CREATE INDEX "mfa_challenges_expires_idx" ON "mfa_challenges" USING btree ("expires_at");--> statement-breakpoint
 CREATE INDEX "password_history_user_idx" ON "password_history" USING btree ("user_id","created_at");--> statement-breakpoint
 CREATE UNIQUE INDEX "scim_tokens_hash_uq" ON "scim_tokens" USING btree ("token_hash");--> statement-breakpoint
 CREATE INDEX "scim_tokens_company_idx" ON "scim_tokens" USING btree ("company_id");--> statement-breakpoint
@@ -7959,6 +8067,7 @@ CREATE INDEX "meetings_company_status_idx" ON "meetings" USING btree ("company_i
 CREATE INDEX "equipment_telematics_readings_device_idx" ON "equipment_telematics_readings" USING btree ("company_id","device_id","recorded_at");--> statement-breakpoint
 CREATE INDEX "material_items_required_idx" ON "material_items" USING btree ("company_id","required_on_site_date");--> statement-breakpoint
 CREATE UNIQUE INDEX "bid_invitations_portal_token_uq" ON "bid_invitations" USING btree ("portal_token_hash");--> statement-breakpoint
+CREATE UNIQUE INDEX "prequalification_submissions_portal_token_uq" ON "prequalification_submissions" USING btree ("portal_token_hash");--> statement-breakpoint
 CREATE INDEX "auth_security_events_ip_at_idx" ON "auth_security_events" USING btree ("ip","created_at");--> statement-breakpoint
 CREATE INDEX "drawing_revisions_set_idx" ON "drawing_revisions" USING btree ("set_id","page_index");--> statement-breakpoint
 CREATE INDEX "auth_security_events_email_idx" ON "auth_security_events" USING btree ("email","created_at");--> statement-breakpoint

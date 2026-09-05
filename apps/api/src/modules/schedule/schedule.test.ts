@@ -1615,3 +1615,81 @@ describe("tenant isolation — upgraded routes", () => {
     expect(res.statusCode).toBe(404);
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* Activity by id + company-wide search (contract §3.3)                */
+/* ------------------------------------------------------------------ */
+
+describe("activity lookup and search", () => {
+  let searchScheduleId: string;
+  let pourTaskId: string;
+
+  beforeAll(async () => {
+    const s = await createSchedule("Search Programme");
+    searchScheduleId = s.id;
+    const t = await addTask(searchScheduleId, {
+      name: "Level 3 slab pour",
+      wbsCode: "3.2.1",
+      durationDays: 4,
+    });
+    pourTaskId = t.id;
+  });
+
+  it("returns one activity with the programme it belongs to", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/schedule-tasks/${pourTaskId}`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.id).toBe(pourTaskId);
+    expect(body.scheduleId).toBe(searchScheduleId);
+    expect(body.scheduleName).toBe("Search Programme");
+    expect(body.name).toBe("Level 3 slab pour");
+  });
+
+  it("does not resolve an activity through another project or another tenant", async () => {
+    const sibling = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${otherProjectId}/schedule-tasks/${pourTaskId}`,
+      headers: owner.headers,
+    });
+    expect(sibling.statusCode).toBe(404);
+
+    const foreign = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/schedule-tasks/${pourTaskId}`,
+      headers: outsider.headers,
+    });
+    expect([403, 404]).toContain(foreign.statusCode);
+  });
+
+  it("company search finds the activity and links straight to it", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/v1/search?q=slab%20pour&types=schedule_task",
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      items: { type: string; id: string; href: string; subtitle: string | null }[];
+      coverage: string[];
+    };
+    expect(body.coverage).toEqual(["schedule_task"]);
+    const hit = body.items.find((i) => i.id === pourTaskId);
+    expect(hit).toBeDefined();
+    expect(hit!.href).toBe(`/projects/${projectId}/schedule?taskId=${pourTaskId}`);
+    expect(hit!.subtitle).toContain("Search Programme");
+  });
+
+  it("company search never returns another tenant's activity", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/v1/search?q=slab%20pour&types=schedule_task",
+      headers: outsider.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().items).toEqual([]);
+  });
+});

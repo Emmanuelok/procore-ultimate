@@ -15,6 +15,8 @@ import {
   noteLoginFailure,
 } from "../account/login.js";
 import { recordLegacyAuthEvent } from "../account/events.js";
+import { dispatchEmail } from "../account/mailer.js";
+import { buildAppUrl, renderMfaEnrolled } from "../../lib/email.js";
 import { isPasswordLoginAllowedForUser } from "../sso/index.js";
 import {
   challengeEnvelope,
@@ -22,6 +24,12 @@ import {
   verifyChallengeToken,
   type ChallengeScope,
 } from "./challenge.js";
+import {
+  assertChallengeLive,
+  consumeChallenge,
+  registerChallenge,
+  sweepExpiredChallenges,
+} from "./challenge-store.js";
 import { deriveKey, KEY_PURPOSE, keyId, sealSecret } from "./secrets.js";
 import {
   assertFactor,
@@ -206,7 +214,7 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
 
   /** Confirm a pending factor and hand over its one and only recovery batch. */
   async function confirmFactor(
-    user: { id: string; email: string },
+    user: { id: string; email: string; name?: string },
     code: string,
     context: { ip: string | null; userAgent: string | null; purpose: string },
   ) {
@@ -250,6 +258,27 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
       objectType: "user_mfa",
       objectId: factor.id,
       payload: { event: "mfa_enrolled", method: "totp", status: "active", at: nowIso },
+    });
+    // TELL THE ACCOUNT HOLDER. `renderMfaEnrolled` has existed in lib/email.ts
+    // since the module was written and nothing ever dispatched it, so the one
+    // change that most needs to reach a human — "a second factor now guards
+    // your account, and if it was not you, someone else holds your password"
+    // — was recorded and never sent. The message never fails the enrolment:
+    // dispatchEmail records `dispatched:false` with a reason when no provider
+    // is configured, exactly as the invitation and reset paths do.
+    const rendered = renderMfaEnrolled({
+      name: user.name ?? user.email,
+      method: "authenticator app (TOTP)",
+      recoveryCodeCount: issued.codes.length,
+      at: nowIso,
+      securityUrl: buildAppUrl(cfg.APP_BASE_URL, "/account/security"),
+    });
+    await dispatchEmail(app, {
+      message: { to: { email: user.email, name: user.name ?? user.email }, ...rendered },
+      userId: user.id,
+      variables: { method: "totp", recoveryCodeCount: issued.codes.length, at: nowIso },
+      relatedType: "user_mfa",
+      relatedId: factor.id,
     });
     return { factorId: factor.id, confirmedAt: nowIso, issued };
   }
@@ -659,6 +688,15 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
         scope,
         ttlMinutes: cfg.MFA_CHALLENGE_TTL_MINUTES,
       });
+      // The server-side half. A challenge is now a row that can be spent once
+      // and revoked in flight; see challenge-store.ts for why registration is
+      // best-effort and the single-use guarantee is not.
+      await registerChallenge(app.db, {
+        claims: minted.claims,
+        origin: "password",
+        ip: context.ip,
+        userAgent: context.userAgent,
+      });
       await recordSecurityEvent(app.db, {
         kind: "login_success",
         outcome: "pending",
@@ -742,6 +780,22 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
         reasons: ["Only an `enrol` challenge may provision a new second factor."],
       });
     }
+    // A seed must not be minted against authority that has already been spent
+    // or cut. The challenge is READ here, never consumed: the same challenge
+    // has to survive to confirm the factor it is about to provision.
+    const live = await assertChallengeLive(app.db, verified.claims.jti, Date.now());
+    if (!live.ok) {
+      await recordSecurityEvent(app.db, {
+        kind: "mfa_challenge_failure",
+        outcome: "failure",
+        userId: verified.claims.uid,
+        ip: context.ip,
+        userAgent: context.userAgent,
+        reason: live.reason ?? "Challenge is no longer live",
+        metadata: { challengeId: verified.claims.jti, verdict: live.code },
+      });
+      throw unauthorized(live.reason ?? "Challenge is not valid");
+    }
     const user = await loadActiveUser(verified.claims.uid);
     const provisioned = await provisionFactor(user);
     await recordSecurityEvent(app.db, {
@@ -808,7 +862,7 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
         ...context,
         purpose: "challenge_enrol",
       });
-      const session = await completeSignIn(user, "password", claims.jti, context);
+      const session = await completeSignIn(user, "password", claims, context);
       return {
         ...session,
         mfa: {
@@ -841,7 +895,7 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
     const session = await completeSignIn(
       user,
       outcome.method === "recovery_code" ? "recovery_code" : "password",
-      claims.jti,
+      claims,
       context,
     );
     return {
@@ -868,9 +922,29 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
   async function completeSignIn(
     user: { id: string; email: string; name: string },
     authMethod: "password" | "recovery_code",
-    challengeId: string,
+    challenge: { jti: string; uid: string; scope: ChallengeScope; exp: number },
     context: { ip: string | null; userAgent: string | null },
   ) {
+    const challengeId = challenge.jti;
+    // SPEND THE CHALLENGE, and do it here — after the factor was proved and
+    // before any token exists. Consuming earlier would burn the challenge on
+    // a mistyped digit and strand a legitimate user; consuming later would
+    // leave a window in which two concurrent exchanges of one challenge both
+    // produce a session.
+    const spent = await consumeChallenge(app.db, challenge, Date.now());
+    if (!spent.ok) {
+      await recordSecurityEvent(app.db, {
+        kind: "mfa_challenge_failure",
+        outcome: "failure",
+        userId: user.id,
+        email: user.email,
+        ip: context.ip,
+        userAgent: context.userAgent,
+        reason: spent.reason ?? "Challenge could not be spent",
+        metadata: { challengeId, verdict: spent.code },
+      });
+      throw unauthorized(spent.reason ?? "Challenge is not valid");
+    }
     const session = await issueSession(app, {
       user: { id: user.id, email: user.email },
       authMethod,
@@ -973,13 +1047,26 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
         payload: { required: body.required, previous: previous.required, at: nowIso },
         storePayload: true,
       });
-      // NOTE, deliberately not a security-trail row. AUTH_EVENT_KINDS has no
-      // `mfa_policy_changed` member, and this module does not own
-      // packages/shared/src/enums.ts. Borrowing a neighbouring kind
-      // (`identity_provider_updated`) to make the row fit would put a false
-      // statement into the one log an auditor is entitled to read literally.
-      // The change IS recorded — hash-chained, above, in the company ledger —
-      // which is the stronger record of the two. See the module notes.
+      // AND a security-trail row, under its OWN name. This used to be a note
+      // explaining why the change could not be recorded here: AUTH_EVENT_KINDS
+      // had no `mfa_policy_changed` member, `enums.ts` is frozen, and
+      // borrowing a neighbouring kind would have put a false statement into
+      // the one log an auditor reads literally. `enums-auth.ts` now carries
+      // the kind and `recordSecurityEvent` accepts the widened union, so the
+      // gap is closed rather than described. The ledger entry above remains
+      // the stronger record; this one is what the tenant's SIEM receives.
+      await recordSecurityEvent(app.db, {
+        kind: "mfa_policy_changed",
+        companyId,
+        userId: user.id,
+        email: user.email,
+        ip: requestContext(req).ip,
+        userAgent: requestContext(req).userAgent,
+        reason: body.required
+          ? "Second factor is now required for every member of this company"
+          : "Second factor is no longer required for this company",
+        metadata: { required: body.required, previous: previous.required },
+      });
 
       const coverage = await enrolmentCoverage(companyId);
       return {
@@ -1021,6 +1108,21 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
     const enrolled = new Set(enrolledRows.map((r) => r.userId)).size;
     return { members: members.length, enrolled, notEnrolled: members.length - enrolled };
   }
+
+  /* ---------------------------------------------------------------- */
+  /* Scheduled work                                                    */
+  /* ---------------------------------------------------------------- */
+
+  // `mfa_challenges` gains a row per sign-in into a tenant that requires a
+  // second factor, and every one of them is dead within ten minutes. Deleting
+  // them on a read would put an unbounded DELETE on the login path; this is
+  // the job that keeps the table the size of the last hour.
+  app.scheduler.register({
+    name: "mfa.challenge-sweep",
+    description: "Delete spent and expired MFA challenges past their grace window",
+    everyMs: 15 * 60_000,
+    run: async ({ db, now }) => ({ deleted: await sweepExpiredChallenges(db, now.getTime()) }),
+  });
 };
 
 /* ------------------------------------------------------------------ */
@@ -1082,22 +1184,19 @@ export type { ChallengeEnvelope, ChallengeScope } from "./challenge.js";
  *    Both routes then speak one protocol and redeem at the same
  *    `POST /auth/mfa/challenge`.
  *
- * 2. AUTH_EVENT_KINDS (packages/shared/src/enums.ts) has no
- *    `mfa_policy_changed` member, and this module does not own that file. The
- *    tenant policy change is therefore recorded in the hash-chained company
- *    ledger (objectType `company_mfa_policy`) and NOT in
- *    `auth_security_events` — borrowing a neighbouring kind to make the row
- *    fit would put a false statement into the one log an auditor reads
- *    literally. Adding the kind is a one-line change for the enum's owner,
- *    after which `recordSecurityEvent` can carry it too.
+ * 2. RESOLVED. `mfa_policy_changed` is now a member of EXTRA_AUTH_EVENT_KINDS
+ *    (packages/shared/src/enums-auth.ts, which this package owns) and
+ *    `SecurityEventInput.kind` accepts the widened union, so the tenant policy
+ *    change is recorded in `auth_security_events` under its own name AND in
+ *    the hash-chained ledger. Nothing is written under a borrowed kind.
  *
- * 3. The challenge token is STATELESS. The schema this module builds against
- *    has no `mfa_challenges` table and this module does not own the schema, so
- *    the token carries MAC-authenticated claims instead of naming a row. See
- *    challenge.ts for the full argument; the short version is that a challenge
- *    is only ever redeemed together with a single-use factor, so replaying one
- *    inside its ten-minute life buys an attacker nothing they did not already
- *    have. What it costs is server-side revocation of a challenge in flight.
+ * 3. RESOLVED. The challenge token is still a stateless MAC — that is what
+ *    lets three modules mint one without coordinating — but it now names a row
+ *    in `mfa_challenges` (packages/db/src/schema/auth.ts). Consumption is an
+ *    upsert on the token's own `jti`, so a challenge is SINGLE-USE even when
+ *    the minting module never registered it, and an administrator can revoke
+ *    one in flight (`admin_mfa_reset` does). See challenge-store.ts for why
+ *    the store fails open on an infrastructure error and closed on a replay.
  *
  * 4. `requireStepUp` is wired to NOTHING here. The six routes that should
  *    adopt it live in modules this one does not own; STEP_UP_ACTIONS carries

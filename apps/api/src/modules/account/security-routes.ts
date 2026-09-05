@@ -35,6 +35,8 @@ import {
   rowToPolicy,
   type StoredSecurityPolicy,
 } from "./policy.js";
+import { revokeUserChallenges } from "../mfa/challenge-store.js";
+import { applyRetention } from "./retention.js";
 import { mintScimToken } from "./scim.js";
 import { requestContext, revokeAllUserSessions, revokeSessions } from "./sessions.js";
 import {
@@ -93,6 +95,14 @@ const policySchema = z.object({
   ipAllowlistBreakGlassUserIds: z.array(z.string().min(1).max(64)).max(20).optional(),
   mfaRequired: z.boolean().optional(),
   mfaAcceptedAmrValues: z.array(z.string().min(1).max(64)).max(20).optional(),
+  // §0.2 #46/#47. The floor of 30 days is not decoration: the lockout engine
+  // reads a fifteen-minute window and the login audit is the tenant's own
+  // incident evidence, so a retention shorter than a month would delete the
+  // record of the breach it was set up to investigate.
+  securityEventRetentionDays: z.number().int().min(30).max(3650).nullable().optional(),
+  emailDispatchRetentionDays: z.number().int().min(30).max(3650).nullable().optional(),
+  legalHold: z.boolean().optional(),
+  legalHoldReason: z.string().min(1).max(500).nullable().optional(),
 });
 
 function policyView(policy: StoredSecurityPolicy, companyName: string | null) {
@@ -226,6 +236,10 @@ export function registerSecurityRoutes(app: FastifyInstance): void {
       ipAllowlistBreakGlassUserIds: next.ipAllowlistBreakGlassUserIds,
       mfaRequired: next.mfaRequired,
       mfaAcceptedAmrValues: next.mfaAcceptedAmrValues,
+      securityEventRetentionDays: next.securityEventRetentionDays,
+      emailDispatchRetentionDays: next.emailDispatchRetentionDays,
+      legalHold: next.legalHold,
+      legalHoldReason: next.legalHoldReason,
       updatedBy: actor.id,
       updatedAt: nowIso,
     };
@@ -663,13 +677,23 @@ export function registerSecurityRoutes(app: FastifyInstance): void {
       actorId: req.user!.id,
       includeOrphanTokens: true,
     });
+    // AND every half-finished sign-in. A challenge minted a minute ago is
+    // authority issued on the strength of the factor being removed; leaving it
+    // exchangeable would let the person who holds the old authenticator finish
+    // a sign-in after the reset that was meant to stop exactly that.
+    const challengesRevoked = await revokeUserChallenges(
+      app.db,
+      target.id,
+      "The second factor this challenge was issued against was reset by an administrator.",
+      Date.now(),
+    );
     await appendLedger(app.db, {
       companyId,
       actorId: req.user!.id,
       action: "state_change",
       objectType: "user_mfa",
       objectId: target.id,
-      payload: { reset: true, factors: factors.length, sessionsRevoked: revoked },
+      payload: { reset: true, factors: factors.length, sessionsRevoked: revoked, challengesRevoked },
       storePayload: true,
     });
     await recordAuthEvent(app.db, {
@@ -679,9 +703,15 @@ export function registerSecurityRoutes(app: FastifyInstance): void {
       email: target.email,
       ...requestContext(req),
       reason: `Second factor reset by ${req.user!.email}`,
-      metadata: { actorId: req.user!.id, sessionsRevoked: revoked },
+      metadata: { actorId: req.user!.id, sessionsRevoked: revoked, challengesRevoked },
     });
-    return { ok: true, userId: target.id, factorsCleared: factors.length, sessionsRevoked: revoked };
+    return {
+      ok: true,
+      userId: target.id,
+      factorsCleared: factors.length,
+      sessionsRevoked: revoked,
+      challengesRevoked,
+    };
   });
 
   /* ================================================================ */
@@ -1026,6 +1056,42 @@ export function registerSecurityRoutes(app: FastifyInstance): void {
   app.post("/company/security-webhooks/run", { preHandler: companyAdmin }, async (req) => {
     const companyId = req.companyId!;
     return sweepSecurityWebhooks(app, { companyId, limit: 200 });
+  });
+
+  /* ================================================================ */
+  /* §0.2 #46/#47 — retention                                          */
+  /* ================================================================ */
+
+  /**
+   * Run this tenant's retention policy now. The scheduler runs the same
+   * function daily; this exists so an administrator who has just set a policy
+   * can see what it did instead of being told to wait a day, and so the
+   * behaviour is testable without a clock.
+   *
+   * Ledgered, because destroying records is exactly the kind of consequential
+   * act the chain exists for — including the run that destroyed nothing.
+   */
+  app.post("/company/security/retention/run", { preHandler: companyAdmin }, async (req) => {
+    const companyId = req.companyId!;
+    const outcome = await applyRetention(app.db, companyId);
+    await appendLedger(app.db, {
+      companyId,
+      actorId: req.user!.id,
+      action: "delete",
+      objectType: "auth_retention_run",
+      objectId: companyId,
+      payload: { ...outcome, manual: true },
+      storePayload: true,
+    });
+    return {
+      ...outcome,
+      reasons: outcome.skipped
+        ? [outcome.reason ?? "Nothing to do."]
+        : [
+            `${outcome.securityEventsPseudonymised} trail rows had their address, IP and user agent removed; the kind, outcome and time were kept.`,
+            `${outcome.emailDispatchesDeleted} message records were deleted.`,
+          ],
+    };
   });
 
   /* ================================================================ */

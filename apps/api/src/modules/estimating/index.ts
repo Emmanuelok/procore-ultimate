@@ -371,6 +371,9 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     const { itemId } = req.params as { itemId: string };
     const body = S.cataloguePatchSchema.parse(req.body);
     const item = await fetchCatalogueItem(itemId, req.companyId!);
+    // Same check the create path makes: a crew named here has to be ours, or
+    // the rate's labour build-up cites a crew nobody in this company can see.
+    if (body.crewId) await fetchCrew(body.crewId, req.companyId!);
     const patch: Record<string, unknown> = { updatedAt: nowIso() };
     if (body.rates !== undefined) {
       const rates = makeSplit({ ...ratesOf(item), ...body.rates });
@@ -991,6 +994,9 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
       .limit(1);
     const rate = rows[0];
     if (!rate) throw notFound("Production rate not found");
+    // Same check the create path makes — a crew from another company must not
+    // end up on one of our production rates.
+    if (body.crewId) await fetchCrew(body.crewId, req.companyId!);
     const patch: Record<string, unknown> = { updatedAt: nowIso() };
     for (const key of [
       "description",

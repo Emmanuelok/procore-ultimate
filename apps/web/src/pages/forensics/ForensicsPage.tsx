@@ -29,6 +29,13 @@ export default function ForensicsPage() {
     return TABS.some((x) => x.key === t) ? (t as string) : "events";
   });
 
+  /*
+   * A deep link may name a record as well as a tab (company search emits
+   * ?tab=events&id=… ). Switching tab by hand drops the id so the drawer does
+   * not follow the reader around.
+   */
+  const focusId = searchParams.get("id");
+
   function selectTab(key: string) {
     setTab(key);
     setSearchParams({ tab: key }, { replace: true });
@@ -43,11 +50,11 @@ export default function ForensicsPage() {
         subtitle="Delay events, the AACE method suite, concurrency and float doctrine, quantum and disruption, and the claims workspace"
       />
       <TabBar tabs={TABS} active={tab} onSelect={selectTab} />
-      {tab === "events" ? <DelayEventsTab projectId={projectId} /> : null}
+      {tab === "events" ? <DelayEventsTab projectId={projectId} focusId={focusId} /> : null}
       {tab === "analysis" ? <AnalysisTab projectId={projectId} /> : null}
       {tab === "methods" ? <MethodsTab projectId={projectId} /> : null}
       {tab === "quantum" ? <QuantumTab projectId={projectId} /> : null}
-      {tab === "claims" ? <ClaimsTab projectId={projectId} /> : null}
+      {tab === "claims" ? <ClaimsTab projectId={projectId} focusId={focusId} /> : null}
     </div>
   );
 }

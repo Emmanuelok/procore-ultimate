@@ -17,6 +17,7 @@ import { z } from "zod";
 import {
   apiTokens,
   assuranceGrants,
+  budgetLineItems,
   carbonFactors,
   equipment,
   equipmentAssignments,
@@ -2648,6 +2649,248 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
               "date, and neither belongs in a utilisation report."
             : null,
       };
+    },
+  );
+
+  /**
+   * PLANT COST ONTO THE COST REPORT (#715).
+   *
+   * `equipment_utilisation.budgetLineItemId` is the column that makes plant
+   * a cost rather than a diary entry, and until this route existed nothing
+   * ever read it: a job could stand a 30-tonne excavator for a month and the
+   * budget would show no plant spend at all. The posting mirrors the labour
+   * one in modules/timecards/reports.ts exactly — same `detail` stamp, same
+   * replace-on-re-post arithmetic — so a cost report reads one convention.
+   *
+   * DISCIPLINE, and the reason this is not a sum:
+   *  • Only VERIFIED days post. A utilisation row is the plant claim; the
+   *    verification is the second pair of eyes, and posting unverified hours
+   *    would put an unchecked claim on the cost report as fact.
+   *  • A day whose cost could not be computed in full (`totalIsComplete`
+   *    false — no hire rate, no operator rate) is NOT posted at a partial
+   *    figure. It is reported as excluded with the reason.
+   *  • A budget line carrying plant in two currencies is refused, not
+   *    converted.
+   */
+  app.post(
+    "/projects/:projectId/equipment-utilisation/post-to-budget",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const body = z
+        .object({
+          from: isoDateSchema.optional(),
+          to: isoDateSchema.optional(),
+          /** post days nobody has verified — recorded on the stamp */
+          includeUnverified: z.boolean().default(false),
+        })
+        .parse(req.body ?? {});
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      const to = body.to ?? todayISO();
+      const from = body.from ?? addDaysISO(to, -30);
+      if (to < from) throw badRequest("to must not precede from");
+
+      const rows = await app.db
+        .select()
+        .from(equipmentUtilisation)
+        .where(
+          and(
+            eq(equipmentUtilisation.companyId, companyId),
+            eq(equipmentUtilisation.projectId, projectId),
+            gte(equipmentUtilisation.utilisationDate, from),
+            lte(equipmentUtilisation.utilisationDate, to),
+          ),
+        );
+      if (rows.length === 0) {
+        return reply.status(200).send({
+          runId: null,
+          from,
+          to,
+          posted: 0,
+          lines: [],
+          reasons: [
+            "no plant day is recorded in this window, so there is nothing to post. The cost " +
+              "report shows no plant because none was booked, not because none stood.",
+          ],
+        });
+      }
+      const machineIds = [...new Set(rows.map((r) => r.equipmentId))];
+      const fleet = await app.db
+        .select()
+        .from(equipment)
+        .where(
+          and(eq(equipment.companyId, companyId), inArray(equipment.id, machineIds)),
+        );
+      const machineById = new Map(fleet.map((m) => [m.id, m] as const));
+
+      const byLine = new Map<
+        string,
+        { cost: number; hours: number; currency: string; days: number }
+      >();
+      const reasons: string[] = [];
+      let uncoded = 0;
+      let unverified = 0;
+      let incomplete = 0;
+      for (const row of rows) {
+        if (!row.budgetLineItemId) {
+          uncoded += 1;
+          continue;
+        }
+        if (row.verifiedBy === null && !body.includeUnverified) {
+          unverified += 1;
+          continue;
+        }
+        const machine = machineById.get(row.equipmentId);
+        if (!machine) continue;
+        const h = hoursOf(row);
+        const cost = computeDayCost({
+          hireRateAmount: machine.hireRateAmount,
+          hireRateUnit: machine.hireRateUnit as HireRateUnit | null,
+          idleRateAmount: machine.idleRateAmount,
+          internalRateAmount: machine.internalRateAmount,
+          ownership: machine.ownership,
+          operatorRateAmount: machine.operatorRateAmount,
+          fuelCost: row.fuelCost,
+          fuelLitres: row.fuelLitres,
+          currency: row.currency,
+          hours: h,
+        });
+        if (cost.totalCost === null || !cost.totalIsComplete) {
+          incomplete += 1;
+          continue;
+        }
+        const held = byLine.get(row.budgetLineItemId) ?? {
+          cost: 0,
+          hours: 0,
+          currency: cost.currency,
+          days: 0,
+        };
+        if (held.currency !== cost.currency) {
+          reasons.push(
+            `Budget line ${row.budgetLineItemId} carries plant in both ${held.currency} and ` +
+              `${cost.currency}. Money is never summed across currencies, so this line was not ` +
+              "posted. Split the coding by currency.",
+          );
+          byLine.delete(row.budgetLineItemId);
+          continue;
+        }
+        held.cost = round2(held.cost + cost.totalCost);
+        held.hours = round2(held.hours + h.workingHours + h.idleHours + h.standbyHours);
+        held.days += 1;
+        byLine.set(row.budgetLineItemId, held);
+      }
+      if (uncoded > 0) {
+        reasons.push(
+          `${uncoded} plant day(s) carry no budget line and were not posted. Plant coded to ` +
+            "nothing never reaches the cost report, which is how plant overspend survives to " +
+            "final account.",
+        );
+      }
+      if (unverified > 0) {
+        reasons.push(
+          `${unverified} plant day(s) have not been verified and were not posted. A utilisation ` +
+            "row is the claim; the verification is the check. Send includeUnverified to post " +
+            "them anyway — the stamp records that you did.",
+        );
+      }
+      if (incomplete > 0) {
+        reasons.push(
+          `${incomplete} plant day(s) could not be costed in full (no hire, internal or operator ` +
+            "rate) and were not posted at a partial figure.",
+        );
+      }
+
+      const lineIds = [...byLine.keys()];
+      const lines = lineIds.length
+        ? await app.db
+            .select()
+            .from(budgetLineItems)
+            .where(
+              and(
+                eq(budgetLineItems.projectId, projectId),
+                inArray(budgetLineItems.id, lineIds),
+              ),
+            )
+        : [];
+      const found = new Set(lines.map((l) => l.id));
+      for (const id of lineIds) {
+        if (!found.has(id)) {
+          reasons.push(
+            `Budget line ${id} is coded on plant days but does not exist on this project, so ` +
+              "those days were not posted.",
+          );
+        }
+      }
+      const posted: Array<{
+        budgetLineItemId: string;
+        costCode: string;
+        plantCost: number;
+        plantHours: number;
+        plantDays: number;
+        currency: string;
+      }> = [];
+      const now = new Date().toISOString();
+      await app.db.transaction(async (tx) => {
+        for (const line of lines) {
+          const held = byLine.get(line.id)!;
+          const detail = { ...(line.detail as Record<string, unknown>) };
+          const prior = (detail["plantPosting"] ?? null) as { plantCost?: number } | null;
+          const previous = typeof prior?.plantCost === "number" ? prior.plantCost : 0;
+          detail["plantPosting"] = {
+            from,
+            to,
+            plantCost: held.cost,
+            plantHours: held.hours,
+            plantDays: held.days,
+            currency: held.currency,
+            includedUnverified: body.includeUnverified,
+            postedAt: now,
+            postedBy: req.user!.id,
+            note:
+              "posted from equipment utilisation days; re-posting REPLACES this figure rather " +
+              "than adding to it",
+          };
+          await tx
+            .update(budgetLineItems)
+            .set({
+              directCosts: round2(line.directCosts - previous + held.cost),
+              jobToDateCosts: round2(line.jobToDateCosts - previous + held.cost),
+              detail,
+              updatedAt: now,
+            })
+            .where(eq(budgetLineItems.id, line.id));
+          posted.push({
+            budgetLineItemId: line.id,
+            costCode: line.costCode,
+            plantCost: held.cost,
+            plantHours: held.hours,
+            plantDays: held.days,
+            currency: held.currency,
+          });
+        }
+      });
+      const runId = newId("pcp");
+      await appendLedger(app.db, {
+        companyId,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "plant_cost_posting",
+        objectId: runId,
+        projectId,
+        payload: {
+          from,
+          to,
+          lines: posted.length,
+          days: posted.reduce((s, p) => s + p.plantDays, 0),
+          uncodedDays: uncoded,
+          unverifiedDays: unverified,
+          incompleteDays: incomplete,
+          includedUnverified: body.includeUnverified,
+        },
+      });
+      return reply
+        .status(201)
+        .send({ runId, from, to, posted: posted.length, lines: posted, reasons });
     },
   );
 

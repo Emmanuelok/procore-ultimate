@@ -51,6 +51,10 @@ export const EXTRA_AUTH_EVENT_KINDS = [
   "security_webhook_disabled",
   /** an email-address change was applied after the new address was proved */
   "email_changed",
+  /** §0.2 #45 — the account holder exported their own authentication record */
+  "account_export",
+  /** §0.2 #46/#47 — a retention sweep pseudonymised or deleted records */
+  "retention_applied",
 ] as const;
 export type ExtraAuthEventKind = (typeof EXTRA_AUTH_EVENT_KINDS)[number];
 
@@ -102,4 +106,12 @@ export const SECURITY_POLICY_DEFAULTS = {
   lockoutWindowMinutes: 15,
   lockoutDurationMinutes: 15,
   ipAllowlistMode: "off",
+  /**
+   * §0.2 #46/#47 — null means KEEP. A retention default that deleted records
+   * would opt every existing tenant into destroying evidence they never agreed
+   * to lose, which is the one direction a default must never move.
+   */
+  securityEventRetentionDays: null,
+  emailDispatchRetentionDays: null,
+  legalHold: false,
 } as const;

@@ -11,12 +11,8 @@ import {
   refreshTokens,
   userMfa,
 } from "@constructos/db";
-import type {
-  AuthEventKind,
-  AuthEventOutcome,
-  AuthMethod,
-  LedgerAction,
-} from "@constructos/shared";
+import type { AuthEventOutcome, AuthMethod, LedgerAction } from "@constructos/shared";
+import type { AnyAuthEventKind } from "../account/events.js";
 import { sha256Hex } from "@constructos/ledger";
 import { AppError, unauthorized } from "../../lib/errors.js";
 import { newId } from "../../lib/ids.js";
@@ -63,7 +59,13 @@ export const TOTP_WINDOW = 1;
 /* ------------------------------------------------------------------ */
 
 export interface SecurityEventInput {
-  kind: AuthEventKind;
+  /**
+   * `AnyAuthEventKind`, not `AuthEventKind`: `enums.ts` is frozen for this
+   * wave, and `enums-auth.ts` carries the kinds it has no member for. Widening
+   * the writer is what let `mfa_policy_changed` be recorded under its own name
+   * instead of borrowed from a neighbouring kind — see the policy route.
+   */
+  kind: AnyAuthEventKind;
   outcome?: AuthEventOutcome;
   userId?: string | null;
   companyId?: string | null;

@@ -62,6 +62,13 @@ export interface StoredSecurityPolicy {
   ipAllowlistBreakGlassUserIds: string[];
   mfaRequired: boolean;
   mfaAcceptedAmrValues: string[];
+  /* §0.2 #46/#47 — data lifecycle. null on both means "keep indefinitely",
+   * which is what the platform did before there was a policy, so a tenant
+   * that has chosen nothing is not silently opted into deletion. */
+  securityEventRetentionDays: number | null;
+  emailDispatchRetentionDays: number | null;
+  legalHold: boolean;
+  legalHoldReason: string | null;
   updatedBy: string | null;
   updatedAt: string | null;
 }
@@ -118,6 +125,10 @@ export function emptyPolicy(companyId: string): StoredSecurityPolicy {
     ipAllowlistBreakGlassUserIds: [],
     mfaRequired: false,
     mfaAcceptedAmrValues: [],
+    securityEventRetentionDays: null,
+    emailDispatchRetentionDays: null,
+    legalHold: false,
+    legalHoldReason: null,
     updatedBy: null,
     updatedAt: null,
   };
@@ -141,6 +152,10 @@ export function rowToPolicy(row: SecurityPolicyRow): StoredSecurityPolicy {
     ipAllowlistBreakGlassUserIds: row.ipAllowlistBreakGlassUserIds ?? [],
     mfaRequired: row.mfaRequired,
     mfaAcceptedAmrValues: row.mfaAcceptedAmrValues ?? [],
+    securityEventRetentionDays: row.securityEventRetentionDays,
+    emailDispatchRetentionDays: row.emailDispatchRetentionDays,
+    legalHold: row.legalHold,
+    legalHoldReason: row.legalHoldReason,
     updatedBy: row.updatedBy,
     updatedAt: row.updatedAt,
   };

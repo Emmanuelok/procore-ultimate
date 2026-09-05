@@ -3,13 +3,17 @@ import { and, desc, eq } from "drizzle-orm";
 import { z } from "zod";
 import {
   authSecurityEvents,
+  authSessions,
   companies,
   companyMemberships,
+  emailDispatches,
   emailVerifications,
   projectMemberships,
   projects,
   securityWebhookDeliveries,
+  userIdentities,
   userInvitations,
+  userMfa,
   users,
 } from "@constructos/db";
 import { newId } from "../../lib/ids.js";
@@ -68,6 +72,7 @@ import {
   type ResolvedSecurityPolicy,
 } from "./policy.js";
 import { isPasswordReused, recordPasswordHistory } from "./password-history.js";
+import { applyRetention } from "./retention.js";
 import { registerSecurityRoutes } from "./security-routes.js";
 import { registerScimRoutes } from "./scim.js";
 import { enqueueSecurityEvent, sweepSecurityWebhooks } from "./webhooks.js";
@@ -514,6 +519,194 @@ export const accountModule: FastifyPluginAsync = async (app) => {
         reason: row.reason,
         metadata: row.metadata,
       })),
+    };
+  });
+
+  /**
+   * §0.2 #45 — THE DATA-SUBJECT EXPORT.
+   *
+   * Everything this platform's authentication layer holds about the caller, in
+   * one JSON document they can keep: the account row, the tenants they belong
+   * to, every device session, every linked identity provider, the second-factor
+   * state, the full security trail, the messages sent to them and any
+   * invitation issued to their address.
+   *
+   * WHAT IS DELIBERATELY NOT IN IT, and why saying so matters more than the
+   * omission: no password hash, no TOTP seed, no recovery-code hash, no
+   * refresh token and no session token. An export is a document that will be
+   * mailed to somebody and left in a downloads folder; putting a credential in
+   * it would turn a transparency feature into a second copy of the thing the
+   * platform hashes everything to avoid holding.
+   *
+   * It is a READ, and it is ledgered as one in every company the caller
+   * belongs to: an export is the moment an account's whole history leaves the
+   * platform, and that is precisely the kind of access the chain exists to
+   * record.
+   */
+  app.get("/account/export", { preHandler: signedIn }, async (req) => {
+    const actor = req.user!;
+    const nowIso = new Date().toISOString();
+    const [account] = await app.db
+      .select({
+        id: users.id,
+        email: users.email,
+        name: users.name,
+        isActive: users.isActive,
+        createdAt: users.createdAt,
+        lastLoginAt: users.lastLoginAt,
+        emailVerifiedAt: users.emailVerifiedAt,
+      })
+      .from(users)
+      .where(eq(users.id, actor.id))
+      .limit(1);
+
+    const memberships = await app.db
+      .select({
+        companyId: companyMemberships.companyId,
+        role: companyMemberships.role,
+        createdAt: companyMemberships.createdAt,
+        companyName: companies.name,
+      })
+      .from(companyMemberships)
+      .leftJoin(companies, eq(companies.id, companyMemberships.companyId))
+      .where(eq(companyMemberships.userId, actor.id));
+
+    const sessions = await app.db
+      .select({
+        id: authSessions.id,
+        createdAt: authSessions.createdAt,
+        lastSeenAt: authSessions.lastSeenAt,
+        expiresAt: authSessions.expiresAt,
+        revokedAt: authSessions.revokedAt,
+        revokedReason: authSessions.revokedReason,
+        ip: authSessions.ip,
+        userAgent: authSessions.userAgent,
+        deviceLabel: authSessions.deviceLabel,
+        authMethod: authSessions.authMethod,
+      })
+      .from(authSessions)
+      .where(eq(authSessions.userId, actor.id))
+      .orderBy(desc(authSessions.createdAt))
+      .limit(500);
+
+    const identities = await app.db
+      .select({
+        id: userIdentities.id,
+        providerId: userIdentities.providerId,
+        externalSubject: userIdentities.externalSubject,
+        emailAtLink: userIdentities.emailAtLink,
+        linkedAt: userIdentities.linkedAt,
+        lastLoginAt: userIdentities.lastLoginAt,
+      })
+      .from(userIdentities)
+      .where(eq(userIdentities.userId, actor.id));
+
+    const factors = await app.db
+      .select({
+        id: userMfa.id,
+        method: userMfa.method,
+        status: userMfa.status,
+        confirmedAt: userMfa.confirmedAt,
+        disabledAt: userMfa.disabledAt,
+        lastUsedAt: userMfa.lastUsedAt,
+      })
+      .from(userMfa)
+      .where(eq(userMfa.userId, actor.id));
+
+    const trail = await app.db
+      .select()
+      .from(authSecurityEvents)
+      .where(eq(authSecurityEvents.userId, actor.id))
+      .orderBy(desc(authSecurityEvents.at))
+      .limit(2000);
+
+    const messages = await app.db
+      .select({
+        id: emailDispatches.id,
+        template: emailDispatches.template,
+        toEmail: emailDispatches.toEmail,
+        subject: emailDispatches.subject,
+        status: emailDispatches.status,
+        transport: emailDispatches.transport,
+        dispatchedAt: emailDispatches.dispatchedAt,
+        createdAt: emailDispatches.createdAt,
+      })
+      .from(emailDispatches)
+      .where(eq(emailDispatches.userId, actor.id))
+      .orderBy(desc(emailDispatches.createdAt))
+      .limit(500);
+
+    const invitations = account
+      ? await app.db
+          .select({
+            id: userInvitations.id,
+            companyId: userInvitations.companyId,
+            role: userInvitations.role,
+            status: userInvitations.status,
+            createdAt: userInvitations.createdAt,
+            expiresAt: userInvitations.expiresAt,
+            acceptedAt: userInvitations.acceptedAt,
+          })
+          .from(userInvitations)
+          .where(eq(userInvitations.email, account.email))
+          .limit(200)
+      : [];
+
+    for (const membership of memberships) {
+      await appendLedger(app.db, {
+        companyId: membership.companyId,
+        actorId: actor.id,
+        action: "access",
+        objectType: "account_export",
+        objectId: actor.id,
+        payload: {
+          at: nowIso,
+          sessions: sessions.length,
+          trailRows: trail.length,
+          messages: messages.length,
+        },
+        storePayload: true,
+      });
+    }
+    await recordAuthEvent(app.db, {
+      kind: "account_export",
+      userId: actor.id,
+      email: account?.email ?? actor.email,
+      ...requestContext(req),
+      reason: "The account holder exported everything the authentication layer holds about them.",
+      metadata: { trailRows: trail.length, sessions: sessions.length },
+    });
+
+    return {
+      generatedAt: nowIso,
+      subject: account ?? null,
+      memberships,
+      sessions,
+      identities,
+      mfaFactors: factors,
+      securityTrail: trail.map((row) => ({
+        id: row.id,
+        kind: row.kind,
+        outcome: row.outcome,
+        at: row.at,
+        companyId: row.companyId,
+        ip: row.ip,
+        userAgent: row.userAgent,
+        reason: row.reason,
+        metadata: row.metadata,
+      })),
+      messages,
+      invitations,
+      excluded: [
+        "Password hashes, TOTP seeds and recovery-code hashes are never exported: they are credentials, not records about you.",
+        "Session and refresh tokens are not exported; the session list describes the devices, not the tokens.",
+        "Records outside authentication — projects, documents, financials — are exported by the company data export, not this one.",
+      ],
+      truncated: {
+        securityTrail: trail.length === 2000,
+        sessions: sessions.length === 500,
+        messages: messages.length === 500,
+      },
     };
   });
 
@@ -1205,6 +1398,33 @@ export const accountModule: FastifyPluginAsync = async (app) => {
     description: "Deliver queued security events to tenant SIEM endpoints, with backoff",
     everyMs: 60_000,
     run: async () => sweepSecurityWebhooks(app, { limit: 200 }),
+  });
+
+  app.scheduler.register({
+    name: "account.trail-retention",
+    description:
+      "Apply each tenant's authentication-record retention policy: pseudonymise the trail, delete the message log, skip anyone on legal hold",
+    everyMs: 24 * 3600_000,
+    run: async ({ db, now }) => {
+      const rows = await db.select({ id: companies.id }).from(companies);
+      let pseudonymised = 0;
+      let deleted = 0;
+      let held = 0;
+      for (const row of rows) {
+        try {
+          const outcome = await applyRetention(db, row.id, { nowMs: now.getTime() });
+          if (outcome.skipped) {
+            held += 1;
+            continue;
+          }
+          pseudonymised += outcome.securityEventsPseudonymised;
+          deleted += outcome.emailDispatchesDeleted;
+        } catch {
+          /* one tenant's retention must not stop the rest */
+        }
+      }
+      return { pseudonymised, deleted, skipped: held };
+    },
   });
 
   app.scheduler.register({

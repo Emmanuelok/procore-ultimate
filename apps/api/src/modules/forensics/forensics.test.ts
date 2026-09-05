@@ -2469,3 +2469,79 @@ describe("weather baseline linkage", () => {
     expect([403, 404]).toContain(res.statusCode);
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* Company-wide search (contract §3.3)                                 */
+/* ------------------------------------------------------------------ */
+
+describe("company search covers delay events and claims", () => {
+  let stranger: TestActor;
+  let eventId: string;
+  let claimId: string;
+
+  beforeAll(async () => {
+    stranger = await registerActor(app);
+    const ev = await createDelayEvent(projectId, {
+      title: "Unforeseen ground obstruction at pier 4",
+      description: "Reinforced concrete obstruction found during piling",
+      cause: "unforeseen_ground_conditions",
+      excusable: true,
+      compensable: true,
+      startDate: "2026-05-04",
+      durationDays: 6,
+    });
+    expect(ev.statusCode).toBe(201);
+    eventId = ev.json().id;
+
+    const claim = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims`,
+      headers: owner.headers,
+      payload: {
+        title: "Pier 4 obstruction extension of time",
+        kind: "delay",
+        clauseRef: "Cl. 8.5(a)",
+      },
+    });
+    expect(claim.statusCode).toBe(201);
+    claimId = claim.json().id;
+  });
+
+  it("finds a delay event and links to its drawer", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/v1/search?q=obstruction&types=delay_event",
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { items: { id: string; href: string; status: string }[] };
+    const hit = body.items.find((i) => i.id === eventId);
+    expect(hit).toBeDefined();
+    expect(hit!.href).toBe(`/projects/${projectId}/forensics?tab=events&id=${eventId}`);
+    expect(hit!.status).toBe("open");
+  });
+
+  it("finds a claim and links to its drawer", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/v1/search?q=pier%204&types=forensic_claim",
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { items: { id: string; href: string; subtitle: string | null }[] };
+    const hit = body.items.find((i) => i.id === claimId);
+    expect(hit).toBeDefined();
+    expect(hit!.href).toBe(`/projects/${projectId}/forensics?tab=claims&id=${claimId}`);
+    expect(hit!.subtitle).toBe("Cl. 8.5(a)");
+  });
+
+  it("never returns another tenant's delay events or claims", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/v1/search?q=obstruction%20pier&types=delay_event,forensic_claim",
+      headers: stranger.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().items).toEqual([]);
+  });
+});

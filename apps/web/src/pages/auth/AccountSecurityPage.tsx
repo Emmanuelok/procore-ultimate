@@ -29,6 +29,7 @@ import {
   Button,
   Card,
   CardBody,
+  CardHeader,
   DescriptionList,
   EmptyState,
   Field,
@@ -37,6 +38,7 @@ import {
   PageHeader,
   Skeleton,
   Tabs,
+  formatNumber,
 } from "../../ui";
 import type { TimelineItem } from "../../ui";
 import type { Tone } from "../../ui/tokens";
@@ -1127,6 +1129,7 @@ function ActivityPanel({ nonce }: { nonce: number }) {
         done to PROJECT records and is anchored for dispute use; this records what happened to this
         ACCOUNT, and is what a security auditor asks to see.
       </Alert>
+      <AccountExportCard />
       {items.length === 0 ? (
         <EmptyState
           title="Nothing has been recorded against this account yet"
@@ -1136,6 +1139,70 @@ function ActivityPanel({ nonce }: { nonce: number }) {
         <ActivityFeed items={items} timeFormat="absolute" aria-label="Account security events" />
       )}
     </div>
+  );
+}
+
+/**
+ * §0.2 #45 — the data-subject export.
+ *
+ * It is HERE, next to the trail, because this is the tab where somebody is
+ * already asking "what does this platform know about me". The download is
+ * assembled in the browser from the JSON the API returns rather than being a
+ * link to a URL with a token in it: an export URL that works when pasted is an
+ * export URL that works when forwarded.
+ *
+ * The copy names what the file does NOT contain, because that is the part a
+ * reader cannot verify for themselves and the part that matters most.
+ */
+function AccountExportCard() {
+  const action = useAuthAction();
+  const [exported, setExported] = useState<{ at: string; bytes: number } | null>(null);
+
+  async function download() {
+    const data = await action.run("export", () =>
+      api.get<Record<string, unknown>>("/api/v1/account/export"),
+    );
+    if (!data) return;
+    const text = JSON.stringify(data, null, 2);
+    const blob = new Blob([text], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `constructos-account-export-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    setExported({ at: new Date().toISOString(), bytes: text.length });
+  }
+
+  return (
+    <Card>
+      <CardHeader
+        title="Export everything held about this account"
+        subtitle="Sessions, linked providers, second-factor state, the full trail, messages sent to you and any invitation to your address."
+      />
+      <CardBody className="space-y-3">
+        <FailureAlert failure={action.failure} onDismiss={action.clear} />
+        <p className="text-meta text-content-subtle">
+          The file contains no credential of any kind: no password hash, no authenticator seed, no
+          recovery-code hash and no session or refresh token. Records outside authentication —
+          projects, documents, financials — belong to the company export, not this one. The export
+          is written to the company ledger, because this is the moment an account&apos;s whole
+          history leaves the platform.
+        </p>
+        <div className="flex items-center gap-3">
+          <Button variant="secondary" loading={action.busy === "export"} onClick={() => void download()}>
+            Download JSON
+          </Button>
+          {exported ? (
+            <span className="text-2xs text-content-subtle">
+              {formatNumber(exported.bytes)} characters, exported {when(exported.at)}.
+            </span>
+          ) : null}
+        </div>
+      </CardBody>
+    </Card>
   );
 }
 

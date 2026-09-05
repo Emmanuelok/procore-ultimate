@@ -8,6 +8,7 @@ import { registerBiddingJobs } from "./jobs.js";
 import { levellingRoutes } from "./levelling.js";
 import { opportunityRoutes } from "./opportunities.js";
 import { packageRoutes } from "./packages.js";
+import { prequalRegisterRoutes } from "./prequal-registers.js";
 import { prequalificationRoutes } from "./prequalification.js";
 import { scoringRoutes } from "./scoring.js";
 import { submissionRoutes } from "./submissions.js";
@@ -105,15 +106,18 @@ import { submissionRoutes } from "./submissions.js";
  *   /bid-submissions/:submissionId/...      /bid-levelling-*  /bid-awards/...
  *   /bid-bonds/:bondId/status
  *   /companies/current/prequalification/... (questionnaires, submissions,
- *     financials, vendors)
+ *     financials, vendors, safety-records, licences, references,
+ *     vendors/:vendorId/evidence, submissions/:id/portal-token)
+ *   /prequal-portal/...                     (hashed pq_ token: session,
+ *     responses, declarations, submit)
  *   /companies/current/opportunities/...    (pipeline, bid/no-bid, outcomes)
  *   /companies/current/{bid-board, bid-coverage, bid-pricing, bid-integrity,
  *     win-rate, cost-of-sale, tender-costs, award-delegations,
  *     vendors/:vendorId/bid-history}
  *
- * Scheduled sweeps (jobs.ts): prequalification expiry, bid bond expiry,
- * tender deadlines and bid validity, the integrity detectors, and pursuits
- * whose submission date passed with no outcome.
+ * Scheduled sweeps (jobs.ts): prequalification expiry, trade licence expiry,
+ * bid bond expiry, tender deadlines and bid validity, the integrity
+ * detectors, and pursuits whose submission date passed with no outcome.
  */
 export const biddingModule: FastifyPluginAsync = async (app) => {
   await app.register(packageRoutes);
@@ -123,6 +127,7 @@ export const biddingModule: FastifyPluginAsync = async (app) => {
   await app.register(scoringRoutes);
   await app.register(awardRoutes);
   await app.register(prequalificationRoutes);
+  await app.register(prequalRegisterRoutes);
   /* platform upgrade wave */
   await app.register(engagementRoutes);
   await app.register(integrityRoutes);

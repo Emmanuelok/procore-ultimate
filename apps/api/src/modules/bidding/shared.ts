@@ -335,7 +335,10 @@ export type BiddingObjectType =
   | "bid_bond"
   | "bid_document_access"
   | "tender_cost"
-  | "award_delegation";
+  | "award_delegation"
+  | "prequalification_safety_record"
+  | "prequalification_licence"
+  | "prequalification_reference";
 
 /** Ledger append with the module's object-type vocabulary pre-bound. */
 export async function ledger(

@@ -1,3 +1,37 @@
+/**
+ * Delay & disruption forensics (spec Vol II Domain D; module M9).
+ *
+ * Delay events are the atoms; claims assemble them into a cause -> effect ->
+ * entitlement -> quantum chain with evidence, and every analysis leaves a
+ * reproducible RECORD rather than a response that vanishes.
+ *
+ * COVERS: #265-269 the delay event register with entitlement classification,
+ * a state machine and a notice time bar that opens a real obligation;
+ * #270-277 the method suite — impacted as-planned (AACE MIP 3.6), time impact
+ * analysis (3.7), windows / time-slice (3.3-3.4), collapsed as-built (3.8),
+ * retrospective longest path (3.9) and as-planned vs as-built — each stored
+ * with its MIP code, SCL Protocol reference, inputs and rationale; #278-281
+ * float ownership doctrine, concurrency and pacing with a per-project rule
+ * set the engine cites; #285-298 disruption (measured mile with an
+ * auto-suggested baseline window, earned-value, and the MCAA / Leonard / Ibbs
+ * industry curves behind a mandatory justification); #300-303 quantum
+ * (Hudson, Emden, Eichleay, site overhead, finance charge, loss of profit)
+ * with assumptions and sources kept apart from inputs; #304-320 the claims
+ * workspace — lifecycle with segregation of duties, valuation range and
+ * provision, claim-scoped chronology, record sufficiency and gap detection,
+ * Scott Schedule and submission package, and company-level exposure per
+ * currency.
+ *
+ * HONESTY RULES APPLIED HERE: a figure with no source is null with a reason,
+ * never 0; money is bucketed by currency and never summed across; a cached
+ * TIA is reported as stale once its schedule has been recomputed; withdrawn
+ * events are excluded from every aggregation and named in the count.
+ *
+ * DELIBERATELY NOT HERE: the AI claim-narrative drafter (WP-AGENTS owns
+ * agents; this module exposes the records it would cite), weather observation
+ * capture (modules/site owns it — this module reads the issued analysis), and
+ * dispute proceedings after a claim is agreed or rejected (modules/disputes).
+ */
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import { and, asc, count, desc, eq, gte, inArray, isNotNull, isNull, lte, ne, or, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -94,6 +128,7 @@ import {
 } from "./sufficiency.js";
 import { NOTICE_WARN_DAYS, noticeExposure, sweepNoticeTimeBars } from "./sweeps.js";
 import { forEachCompany } from "../../lib/scheduler.js";
+import { registerSearchSource, tableSource } from "../search/registry.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -3654,6 +3689,61 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
       });
       return { ...summary, warnDays: NOTICE_WARN_DAYS };
     },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Company-wide search (contract §3.3)                               */
+  /*                                                                    */
+  /* Delay events and claims are among the records people hunt for by   */
+  /* name ("the piling delay", "the Cl.20 claim"); until now ⌘K could   */
+  /* not find either. Registration is idempotent by type, so building   */
+  /* several apps in one test process registers these once.             */
+  /* ---------------------------------------------------------------- */
+
+  registerSearchSource(
+    tableSource({
+      type: "delay_event",
+      label: "Delay events",
+      tool: "forensics",
+      scope: "project",
+      table: delayEvents,
+      columns: {
+        id: delayEvents.id,
+        companyId: delayEvents.companyId,
+        projectId: delayEvents.projectId,
+        title: delayEvents.title,
+        subtitle: delayEvents.description,
+        reference: delayEvents.number,
+        status: delayEvents.status,
+        updatedAt: delayEvents.updatedAt,
+      },
+      searchColumns: [delayEvents.title, delayEvents.description],
+      href: (r) =>
+        r.projectId ? `/projects/${r.projectId}/forensics?tab=events&id=${r.id}` : "/",
+    }),
+  );
+
+  registerSearchSource(
+    tableSource({
+      type: "forensic_claim",
+      label: "Claims",
+      tool: "forensics",
+      scope: "project",
+      table: forensicClaims,
+      columns: {
+        id: forensicClaims.id,
+        companyId: forensicClaims.companyId,
+        projectId: forensicClaims.projectId,
+        title: forensicClaims.title,
+        subtitle: forensicClaims.clauseRef,
+        reference: forensicClaims.number,
+        status: forensicClaims.status,
+        updatedAt: forensicClaims.updatedAt,
+      },
+      searchColumns: [forensicClaims.title, forensicClaims.clauseRef],
+      href: (r) =>
+        r.projectId ? `/projects/${r.projectId}/forensics?tab=claims&id=${r.id}` : "/",
+    }),
   );
 
   app.scheduler.register({
