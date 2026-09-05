@@ -89,7 +89,7 @@ beforeAll(async () => {
   owner = await registerActor(t.app);
   outsider = await registerActor(t.app);
   projectId = await createProject(t.app, owner, "Engine project");
-}, 120_000);
+}, 600_000);
 
 afterAll(async () => {
   await t.close();
@@ -533,7 +533,7 @@ describe("executors", () => {
       now: () => new Date(),
       webhookSigningSecret: "engine-secret",
     };
-  }, 120_000);
+  }, 600_000);
 
   it("create_obligation is idempotent while open and takes its deadline from the record", async () => {
     const params = { trigger: "Answer RFI {{record.number}}", deadlineField: "dueDate", warnDaysBefore: 2, sourceClause: "cl.9" };

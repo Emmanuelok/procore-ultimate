@@ -576,16 +576,29 @@ export const groundRoutes: FastifyPluginAsync = async (app) => {
     const { projectId, id } = req.params as { projectId: string; id: string };
     const companyId = req.companyId!;
     const body = patchSchemaOf(serviceBody.omit({ serviceRef: true })).parse(req.body);
-    notFoundIfMissing(
+    const existing = notFoundIfMissing(
       (
         await app.db
-          .select({ id: siteUtilityServices.id })
+          .select()
           .from(siteUtilityServices)
           .where(and(eq(siteUtilityServices.id, id), eq(siteUtilityServices.companyId, companyId), eq(siteUtilityServices.projectId, projectId)))
           .limit(1)
       )[0],
       "Utility service",
     );
+    // The same rule the create route enforces, applied to what the record
+    // WOULD hold after this patch — otherwise "verified" is reachable in two
+    // calls instead of one, which is no rule at all.
+    const merged = {
+      confidence: body.confidence ?? existing.confidence,
+      surveyScanId: body.surveyScanId === undefined ? existing.surveyScanId : body.surveyScanId,
+      detectionMethod: body.detectionMethod ?? existing.detectionMethod,
+    };
+    if (merged.confidence === "verified" && !merged.surveyScanId && merged.detectionMethod === "records") {
+      throw badRequest(
+        "A service cannot be recorded as verified on the strength of records alone. Link the survey that verified it, or lower the confidence to `probable`.",
+      );
+    }
     const set = patchSet(body as Record<string, unknown>, [
       "utilityType",
       "ownerName",

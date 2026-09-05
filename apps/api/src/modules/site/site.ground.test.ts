@@ -294,6 +294,26 @@ describe("buried utilities and strikes", () => {
     expect((await post(`${base()}/utilities`, { serviceRef: "HV-01" })).statusCode).toBe(409);
   });
 
+  it("refuses to reach `verified` on records alone through a patch either", async () => {
+    const created = await post(`${base()}/utilities`, {
+      serviceRef: "GAS-09",
+      utilityType: "gas",
+      confidence: "probable",
+      detectionMethod: "records",
+    });
+    expect(created.statusCode).toBe(201);
+    const id = created.json().id as string;
+
+    const escalate = await patch(`${base()}/utilities/${id}`, { confidence: "verified" });
+    expect(escalate.statusCode).toBe(400);
+    expect(escalate.json().message).toContain("records alone");
+
+    // The same claim with the survey that justifies it is accepted.
+    const withSurvey = await patch(`${base()}/utilities/${id}`, { confidence: "verified", detectionMethod: "gpr" });
+    expect(withSurvey.statusCode).toBe(200);
+    expect(withSurvey.json().confidence).toBe("verified");
+  });
+
   it("records a strike, names the missing controls and raises a signal", async () => {
     const res = await post(`${base()}/strikes`, {
       occurredAt: new Date().toISOString(),

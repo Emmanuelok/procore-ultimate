@@ -25,7 +25,7 @@
  * caller runs them after the transaction commits, which is how every other
  * module on this platform orders those two things.
  */
-import { and, eq, lt, ne } from "drizzle-orm";
+import { and, eq, isNull, lt, ne } from "drizzle-orm";
 import {
   agentActions,
   aiReviewQueue,
@@ -101,10 +101,17 @@ export const OPERATIONAL_TARGET_TYPES = [
  * Called when a new proposal is created and when a guard refuses an old one:
  * duplicate pending items for one target were the mechanism by which a stale
  * proposal stayed applicable forever.
+ *
+ * Scoped by PROJECT as well as company. A `daily_log` proposal's targetId is
+ * a calendar DATE, not a record id, so without the project predicate queuing
+ * a draft on one project silently superseded another project's pending draft
+ * for the same day — and ledgered that state change against the wrong
+ * project.
  */
 export async function supersedePending(
   db: Db,
   companyId: string,
+  projectId: string | null,
   targetType: string,
   targetId: string | null,
   exceptId: string | null,
@@ -117,6 +124,9 @@ export async function supersedePending(
     .where(
       and(
         eq(aiReviewQueue.companyId, companyId),
+        projectId === null
+          ? isNull(aiReviewQueue.projectId)
+          : eq(aiReviewQueue.projectId, projectId),
         eq(aiReviewQueue.targetType, targetType),
         eq(aiReviewQueue.targetId, targetId),
         eq(aiReviewQueue.status, "pending"),

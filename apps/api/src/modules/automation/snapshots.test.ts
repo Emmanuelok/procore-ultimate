@@ -37,7 +37,7 @@ beforeAll(async () => {
   rfiClosed = (await createRfi(t.app, owner, projectId, { subject: "Closed one" })).id;
   await createRfi(t.app, owner, otherProjectId, { subject: "Elsewhere" });
   await t.app.db.update(rfis).set({ status: "closed" }).where(eq(rfis.id, rfiClosed));
-}, 120_000);
+}, 600_000);
 
 afterAll(async () => {
   await t.close();

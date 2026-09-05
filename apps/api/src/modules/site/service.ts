@@ -12,7 +12,7 @@
  * carries a dedupe key naming the record and the condition, and every status
  * change is guarded by the status it moves from.
  */
-import { and, asc, count, desc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, inArray, lt, lte, or, sql } from "drizzle-orm";
 import {
   assertions,
   evidence,
@@ -764,6 +764,10 @@ export async function sweepLoneWorkers(db: Db, companyId: string, now: Date) {
 export async function sweepAccessCredentials(db: Db, companyId: string, now: Date) {
   const today = now.toISOString().slice(0, 10);
   const nowIso = now.toISOString();
+  // `validUntil` is INCLUSIVE — a pass valid until the 4th is good all of the
+  // 4th, which is the rule the gate feed already applies (`validUntil < day`
+  // refuses). The sweep must expire strictly BEFORE today or it locks people
+  // out on their last valid day.
 
   const expiredInductions = await db
     .update(siteInductions)
@@ -773,7 +777,7 @@ export async function sweepAccessCredentials(db: Db, companyId: string, now: Dat
         eq(siteInductions.companyId, companyId),
         eq(siteInductions.status, "valid"),
         sql`${siteInductions.validUntil} is not null`,
-        lte(siteInductions.validUntil, today),
+        lt(siteInductions.validUntil, today),
       ),
     )
     .returning({ id: siteInductions.id, projectId: siteInductions.projectId, personName: siteInductions.personName });
@@ -798,7 +802,7 @@ export async function sweepAccessCredentials(db: Db, companyId: string, now: Dat
         eq(siteAccessPasses.companyId, companyId),
         eq(siteAccessPasses.status, "active"),
         sql`${siteAccessPasses.validUntil} is not null`,
-        lte(siteAccessPasses.validUntil, today),
+        lt(siteAccessPasses.validUntil, today),
       ),
     )
     .returning({ id: siteAccessPasses.id, projectId: siteAccessPasses.projectId, personName: siteAccessPasses.personName, badgeCode: siteAccessPasses.badgeCode });

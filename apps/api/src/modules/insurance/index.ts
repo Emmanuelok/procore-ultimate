@@ -3054,6 +3054,16 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         linkedRecords: body.linkedRecords ?? [],
         createdBy: req.user!.id,
       });
+      /*
+       * The linked records are also written as REAL LINKS (#784).
+       *
+       * `linkedRecords` on its own is a JSON note that looks like a link:
+       * nothing downstream can traverse it, and the uninsured-loss detector
+       * could not tell that this claim answers that incident. A record_links
+       * row is traversable from both ends, so the incident shows the claim
+       * raised from it and the detector stops flagging it.
+       */
+      await linkClaimRecords(req, id, body.linkedRecords ?? []);
       await appendLedger(app.db, {
         companyId: req.companyId!,
         actorId: req.user!.id,
@@ -3373,6 +3383,49 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
       return decorateClaim(updated, todayISO());
     },
   );
+
+  /**
+   * Write the claim's linked records as traversable links, de-duplicated.
+   *
+   * Deliberately tolerant of an id that does not resolve: the caller may be
+   * linking a record type this module does not know how to look up, and
+   * refusing the whole claim over a link would be the wrong trade. What it
+   * does NOT do is invent a link — only what was actually supplied is written.
+   */
+  async function linkClaimRecords(
+    req: FastifyRequest,
+    claimId: string,
+    links: ReadonlyArray<{ recordType: string; recordId: string; note?: string }>,
+  ): Promise<void> {
+    if (links.length === 0) return;
+    const existing = await app.db
+      .select({ toType: recordLinks.toType, toId: recordLinks.toId })
+      .from(recordLinks)
+      .where(
+        and(
+          eq(recordLinks.companyId, req.companyId!),
+          eq(recordLinks.fromType, "insurance_claim"),
+          eq(recordLinks.fromId, claimId),
+        ),
+      );
+    const seen = new Set(existing.map((e) => `${e.toType}:${e.toId}`));
+    for (const link of links) {
+      const key = `${link.recordType}:${link.recordId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      await app.db.insert(recordLinks).values({
+        id: newId("rln"),
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        fromType: "insurance_claim",
+        fromId: claimId,
+        toType: link.recordType,
+        toId: link.recordId,
+        linkKind: "evidence",
+        createdBy: req.user!.id,
+      });
+    }
+  }
 
   /* ================================================================ */
   /* EXPIRY RADAR — the pure engine, exposed                           */
@@ -3739,7 +3792,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         (b) => bondCurrentExposure(b, asOf).currentAmount,
         asOf,
       );
-      return { facilityId: f.id, number: f.number, name: f.name, provider: f.provider, ...u };
+      return u;
     });
 
     const notificationsOutstanding = claimRows.filter((c) => c.notifiedAt === null).length;
@@ -5006,9 +5059,9 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         detector: "insurance_notification_missed",
         severity: daysLeft <= 3 ? "critical" : "high",
         confidence: 1,
-        title: `Claim notification due in ${daysLeft} day(s) — ${claim.reference}`,
+        title: `Claim notification due in ${daysLeft} day(s) — ${claim.number}`,
         explanation:
-          `Claim ${claim.reference} ("${claim.title}") became known on ${claim.awareDate} and must ` +
+          `Claim ${claim.number} ("${claim.title}") became known on ${claim.awareDate} and must ` +
           `be notified to the insurer by ${claim.notificationDueAt}, which is ${daysLeft} day(s) ` +
           `away. Notification within the policy period is normally a condition precedent to ` +
           `liability: a good claim notified late is usually not a claim at all. This warning is ` +
@@ -5017,7 +5070,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         evidenceRefs: {
           key,
           claimId: claim.id,
-          reference: claim.reference,
+          reference: claim.number,
           notificationDueAt: claim.notificationDueAt,
           awareDate: claim.awareDate,
           daysLeft,

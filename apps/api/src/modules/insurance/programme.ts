@@ -34,6 +34,7 @@
  * raises a signal, or blocks a payment; it returns findings and the caller
  * (which holds the permission and the ledger) acts on them.
  */
+import type { InsuranceHoldReason } from "@constructos/shared";
 import {
   daysBetweenISO,
   isIsoDate,
@@ -1012,12 +1013,14 @@ function addDaysIso(from: IsoDate, days: number): IsoDate {
 /* 7. THE PAYMENT HOLD HOOK (WP-FIN2 calls this)                       */
 /* ================================================================== */
 
-export type HoldReason =
-  | "no_certificate"
-  | "certificate_expired"
-  | "certificate_unverified"
-  | "limit_below_requirement"
-  | "policy_lapsed";
+/**
+ * Why a payment may be held on insurance grounds.
+ *
+ * Bound to the shared enum so the reason WP-FIN2 stores against a hold is
+ * exactly the one this engine produced — a second, drifting copy of a
+ * vocabulary is how a hold reason stops matching the hold.
+ */
+export type HoldReason = InsuranceHoldReason;
 
 export interface HoldFinding {
   reason: HoldReason;

@@ -92,7 +92,7 @@ async function fileAccounts(vendorId: string) {
   const res = await post(`${BASE}/financials`, {
     vendorId,
     financialYearEnd: dateIn(-120),
-    source: "audited",
+    source: "audited_accounts",
     currency: "GBP",
     turnover: 10_000_000,
     netAssets: 2_000_000,

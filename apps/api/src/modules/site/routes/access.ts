@@ -787,6 +787,16 @@ export const accessRoutes: FastifyPluginAsync = async (app) => {
     const { projectId, id } = req.params as { projectId: string; id: string };
     const { notes } = z.object({ notes: z.string().max(4000).optional() }).parse(req.body ?? {});
     const companyId = req.companyId!;
+    notFoundIfMissing(
+      (
+        await app.db
+          .select({ id: siteMusters.id })
+          .from(siteMusters)
+          .where(and(eq(siteMusters.id, id), eq(siteMusters.companyId, companyId), eq(siteMusters.projectId, projectId)))
+          .limit(1)
+      )[0],
+      "Muster",
+    );
     const outcome = await reconcileMusterRecord(app.db, companyId, projectId, req.user!.id, id);
     if (outcome.reconciliation.unaccountedCount > 0 && !notes) {
       throw badRequest(

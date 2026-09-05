@@ -1057,7 +1057,7 @@ describe("claim notification as an obligation (#783-789)", () => {
       `/projects/${claimProject}/insurance/claims/${claimId}/status`,
       { status: "settled", settledAmount: 24_500, settledAt: today() },
     );
-    expect(settled.statusCode, JSON.stringify(settled.json())).toBe(200);
+    expect(settled.statusCode).toBe(200);
     expect(settled.json().settledAmount).toBe(24_500);
 
     // terminal: nothing moves out of settled
@@ -1930,7 +1930,7 @@ describe("audit bug fixes", () => {
       evidenceRefs: { notice: "NOT-0007", defaultDate: daysFromToday(-14) },
     });
     expect(called.statusCode).toBe(201);
-    const callId = called.json().id as string;
+    const callId = called.json().call.id as string;
 
     const blocked = await post(`/projects/${relProject}/insurance/bonds/${id}/release`, {});
     expect(blocked.statusCode).toBe(409);
@@ -1940,7 +1940,7 @@ describe("audit bug fixes", () => {
       `/projects/${relProject}/insurance/bond-calls/${callId}/outcome`,
       { outcome: "paid", proceedsAmount: 100_000, proceedsReceivedAt: daysFromToday(-1) },
     );
-    expect(settled.statusCode, JSON.stringify(settled.json())).toBe(200);
+    expect(settled.statusCode).toBe(200);
     const allowed = await post(`/projects/${relProject}/insurance/bonds/${id}/release`, {});
     expect(allowed.statusCode).toBe(200);
 

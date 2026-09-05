@@ -450,26 +450,40 @@ function ReviewDrawer({
                     </Button>
                   );
                 })}
+                {/*
+                  OFFERED TO EVERYONE, REFUSED BY THE SERVER.
+
+                  These were disabled unless the caller was a company
+                  owner/admin, but the API gates them on `learning` at ADMIN
+                  level — which a project member can hold through their
+                  permission template. The UI's guess was stricter than the
+                  real rule, so users the server would have accepted could
+                  never sign a review off, while Publish (gated the same way)
+                  was offered to everyone. The refusal is surfaced verbatim
+                  instead of pre-empted, exactly as Publish does.
+                */}
                 {from === "completed" ? (
-                  <Button size="sm" onClick={() => void signOff()} disabled={busy || !canAdmin}>
+                  <Button size="sm" onClick={() => void signOff()} disabled={busy}>
                     Sign off
                   </Button>
                 ) : null}
               </div>
             )}
-            {from === "completed" && !canAdmin ? (
+            {from === "completed" ? (
               <p className="mt-2 text-xs text-ink-400">
-                Sign-off is an admin action; the server will refuse it for anyone else.
+                Sign-off requires admin rights on the learning tool — which is not the same thing
+                as being a company admin. If you do not hold it the server will say so.
               </p>
             ) : null}
-            {(from === "scheduled" || from === "cancelled") && canAdmin ? (
+            {from === "scheduled" || from === "cancelled" ? (
               <div className="mt-3 border-t border-ink-100 pt-3">
                 <Button size="sm" variant="danger" onClick={() => void remove()} disabled={busy}>
                   Delete review
                 </Button>
                 <p className="mt-1 text-xs text-ink-400">
                   Only a scheduled or cancelled review can be deleted — once it holds findings and
-                  metrics, cancel it instead.
+                  metrics, cancel it instead. Deletion also requires admin rights on the learning
+                  tool; the server enforces that and its refusal is shown here.
                 </p>
               </div>
             ) : null}

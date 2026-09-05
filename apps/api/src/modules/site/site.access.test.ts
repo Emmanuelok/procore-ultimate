@@ -392,6 +392,52 @@ describe("musters", () => {
     const again = await post(`/projects/${projectId}/site/musters/${musterId}/reconcile`, {});
     expect(again.json().muster.status).toBe("closed");
   });
+
+  it("answers 404 rather than failing when the muster does not exist", async () => {
+    expect((await post(`/projects/${projectId}/site/musters/mus_nope/close`, {})).statusCode).toBe(404);
+    expect((await post(`/projects/${projectId}/site/musters/mus_nope/reconcile`, {})).statusCode).toBe(404);
+  });
+});
+
+describe("credential expiry sweep", () => {
+  it("treats `validUntil` as inclusive: the last valid day is still a valid day", async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+
+    const lastDay = await post(`/projects/${projectId}/site/passes`, {
+      personName: "Last Day Larsen",
+      badgeCode: "B-LASTDAY",
+      validUntil: today,
+    });
+    expect(lastDay.statusCode).toBe(201);
+    const overdue = await post(`/projects/${projectId}/site/passes`, {
+      personName: "Ran Out Rowe",
+      badgeCode: "B-RANOUT",
+      validUntil: yesterday,
+    });
+    expect(overdue.statusCode).toBe(201);
+
+    await app.scheduler.runNow("site.access-credentials");
+
+    const rows = await app.db
+      .select()
+      .from(siteAccessPasses)
+      .where(and(eq(siteAccessPasses.companyId, owner.companyId), eq(siteAccessPasses.projectId, projectId)));
+    const still = rows.find((r) => r.badgeCode === "B-LASTDAY");
+    const gone = rows.find((r) => r.badgeCode === "B-RANOUT");
+    expect(still?.status).toBe("active");
+    expect(gone?.status).toBe("expired");
+
+    // ...and the gate agrees with the sweep on the same day.
+    const read = await post(`/projects/${projectId}/site/gate-events`, {
+      badgeCode: "B-LASTDAY",
+      direction: "in",
+      occurredAt: `${today}T08:00:00.000Z`,
+      externalRef: "lastday-1",
+    });
+    expect(read.statusCode).toBe(201);
+    expect(read.json().accepted).toBe(1);
+  });
 });
 
 describe("tenant isolation and gating", () => {

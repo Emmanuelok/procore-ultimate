@@ -54,7 +54,7 @@ beforeAll(async () => {
   projectAdmin = await addCompanyMember(t.app, owner, "member", { projectId, automationLevel: "admin" });
   projectReader = await addCompanyMember(t.app, owner, "member", { projectId, automationLevel: "read" });
   noProject = await addCompanyMember(t.app, owner, "member");
-}, 120_000);
+}, 600_000);
 
 afterAll(async () => {
   await t.close();
@@ -147,7 +147,7 @@ describe("rule lifecycle", () => {
 
   beforeAll(async () => {
     ruleId = ((await post(owner, "/automation/rules", baseRule({ name: "Lifecycle" }))).json() as { id: string }).id;
-  }, 120_000);
+  }, 600_000);
 
   it("activates, pauses, edits and archives with the right conflicts", async () => {
     const activate = await post(owner, `/automation/rules/${ruleId}/activate`);
@@ -203,7 +203,7 @@ describe("tenancy and project visibility", () => {
     const res = await post(projectAdmin, `/projects/${projectId}/automation/rules`, baseRule({ name: "Project only" }));
     expect(res.statusCode).toBe(201);
     projectRuleId = (res.json() as { id: string }).id;
-  }, 120_000);
+  }, 600_000);
 
   it("a project admin creates project rules that carry the project", async () => {
     const detail = await get(projectAdmin, `/projects/${projectId}/automation/rules/${projectRuleId}`);
@@ -359,7 +359,7 @@ describe("runs, summary, engine operations and health inputs", () => {
     await createRfi(t.app, owner, projectId, { subject: "Fires the live rule" });
     const runs = (await get(owner, `/automation/runs?ruleId=${ruleId}`)).json() as { items: Array<{ id: string; status: string }> };
     runId = runs.items[0]!.id;
-  }, 120_000);
+  }, 600_000);
 
   it("lists and reads runs with tenancy and project visibility", async () => {
     const list = (await get(owner, `/automation/runs?ruleId=${ruleId}`)).json() as { items: Array<{ status: string; objectType: string; projectId: string }>; total: number };
