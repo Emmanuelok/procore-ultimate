@@ -76,6 +76,8 @@ export const ROLLUP_ROW_CAP = 5000;
 export const OPEN_DELIVERABLE_STATUSES = ["planned", "in_progress", "rejected"] as const;
 export const OPEN_ISSUE_STATUSES = ["open", "assigned", "in_progress"] as const;
 export const OPEN_REVIEW_STATUSES = ["open", "in_review", "consolidating"] as const;
+/** A comment is still open until it is closed: an answer is not a close-out. */
+export const OPEN_COMMENT_STATUSES = ["open", "responded"] as const;
 export const OPEN_DCN_STATUSES = ["submitted", "assessing", "approved"] as const;
 
 /* ================================================================== */
@@ -862,9 +864,23 @@ export async function computeReadiness(
   const packages = await db
     .select({ id: designPackages.id, status: designPackages.status, stageKey: designPackages.stageKey })
     .from(designPackages)
-    .where(and(eq(designPackages.companyId, companyId), eq(designPackages.projectId, projectId), packageWhere));
+    .where(and(eq(designPackages.companyId, companyId), eq(designPackages.projectId, projectId), packageWhere))
+    .limit(ROLLUP_ROW_CAP);
 
-  const [reviews, comments, issues, deliverables, infoRequirements, notices, freezes] = await Promise.all([
+  /**
+   * Comment close-out needs two numbers, not every comment: `design_comments`
+   * is the highest-cardinality table in this schema and readiness is computed
+   * on every package detail read and by the daily job (PLAN §6.4). Every other
+   * row load here feeds an engine that genuinely needs the rows, and each
+   * carries the same cap as the summary.
+   */
+  const commentScope = and(
+    eq(designComments.companyId, companyId),
+    eq(designComments.projectId, projectId),
+    packageId ? eq(designComments.packageId, packageId) : undefined,
+  );
+
+  const [reviews, commentTotal, commentOpen, issues, deliverables, infoRequirements, notices, freezes] = await Promise.all([
     db
       .select({ packageId: designReviews.packageId, status: designReviews.status, consolidatedCode: designReviews.consolidatedCode })
       .from(designReviews)
@@ -874,17 +890,13 @@ export async function computeReadiness(
           eq(designReviews.projectId, projectId),
           packageId ? eq(designReviews.packageId, packageId) : undefined,
         ),
-      ),
+      )
+      .limit(ROLLUP_ROW_CAP),
+    db.select({ n: count() }).from(designComments).where(commentScope),
     db
-      .select({ status: designComments.status })
+      .select({ n: count() })
       .from(designComments)
-      .where(
-        and(
-          eq(designComments.companyId, companyId),
-          eq(designComments.projectId, projectId),
-          packageId ? eq(designComments.packageId, packageId) : undefined,
-        ),
-      ),
+      .where(and(commentScope, inArray(designComments.status, [...OPEN_COMMENT_STATUSES]))),
     db
       .select({ status: designIssues.status, priority: designIssues.priority })
       .from(designIssues)
@@ -894,7 +906,8 @@ export async function computeReadiness(
           eq(designIssues.projectId, projectId),
           packageId ? eq(designIssues.packageId, packageId) : undefined,
         ),
-      ),
+      )
+      .limit(ROLLUP_ROW_CAP),
     db
       .select({ status: designDeliverables.status, slippageLevel: designDeliverables.slippageLevel })
       .from(designDeliverables)
@@ -904,7 +917,8 @@ export async function computeReadiness(
           eq(designDeliverables.projectId, projectId),
           packageId ? eq(designDeliverables.packageId, packageId) : undefined,
         ),
-      ),
+      )
+      .limit(ROLLUP_ROW_CAP),
     db
       .select({ status: designInfoRequirements.status })
       .from(designInfoRequirements)
@@ -914,7 +928,8 @@ export async function computeReadiness(
           eq(designInfoRequirements.projectId, projectId),
           packageId ? eq(designInfoRequirements.packageId, packageId) : undefined,
         ),
-      ),
+      )
+      .limit(ROLLUP_ROW_CAP),
     db
       .select({ status: designChangeNotices.status, isPostFreeze: designChangeNotices.isPostFreeze })
       .from(designChangeNotices)
@@ -924,7 +939,8 @@ export async function computeReadiness(
           eq(designChangeNotices.projectId, projectId),
           packageId ? eq(designChangeNotices.packageId, packageId) : undefined,
         ),
-      ),
+      )
+      .limit(ROLLUP_ROW_CAP),
     db
       .select({ id: designFreezes.id })
       .from(designFreezes)
@@ -935,14 +951,15 @@ export async function computeReadiness(
           eq(designFreezes.status, "active"),
           packageId ? or(eq(designFreezes.packageId, packageId), ne(designFreezes.scope, "package")) : undefined,
         ),
-      ),
+      )
+      .limit(500),
   ]);
 
   const verdict = assessReadiness({
     packages,
     reviews,
-    openComments: comments.filter((c) => c.status === "open" || c.status === "responded").length,
-    totalComments: comments.length,
+    openComments: commentOpen[0]?.n ?? 0,
+    totalComments: commentTotal[0]?.n ?? 0,
     issues,
     deliverables,
     infoRequirements,

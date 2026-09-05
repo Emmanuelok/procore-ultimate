@@ -36,6 +36,7 @@ import {
   reasonSchema,
   requireBiddingLevel,
   round2,
+  todayIso,
   type BidAwardRow,
   type BidPackageRow,
   type BidSubmissionRow,
@@ -540,6 +541,44 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
         );
       }
 
+      /*
+       * AN EXPIRED BID IS NOT AN OFFER.
+       *
+       * `validUntil` is the date the bidder said their price stood until.
+       * Past it, the number in the tabulation is one they are no longer bound
+       * by: recommending on it invites a re-price at exactly the moment the
+       * second-lowest bid has itself expired and the tender would have to be
+       * run again. The only way through is a RECORDED extension — who at the
+       * bidder confirmed it and against what — through
+       * POST /bid-submissions/:id/validity-extension.
+       */
+      const todayForValidity = todayIso();
+      if (chosen.validUntil && chosen.validUntil < todayForValidity) {
+        const extensions = Array.isArray(
+          ((chosen.detail as Record<string, unknown>) ?? {})["validityExtensions"],
+        )
+          ? (((chosen.detail as Record<string, unknown>)["validityExtensions"]) as unknown[]).length
+          : 0;
+        throw badRequest(
+          `${chosen.reference} expired on ${chosen.validUntil} and today is ` +
+            `${todayForValidity}, so there is no live offer to accept. ` +
+            (extensions > 0
+              ? `${extensions} extension(s) are on the record and the latest one has itself run ` +
+                "out. "
+              : "") +
+            "Ask the bidder to confirm an extension and record it with POST " +
+            "/bid-submissions/:submissionId/validity-extension — awarding against a lapsed bid " +
+            "is how a tender is re-priced after the competition has gone.",
+          {
+            control: "bid_validity_expired",
+            submissionId: chosen.id,
+            validUntil: chosen.validUntil,
+            today: todayForValidity,
+            extensionsRecorded: extensions,
+          },
+        );
+      }
+
       const fullComparison = buildAwardComparison(submissions);
       /*
        * A PARTIAL AWARD IS COMPARED ON ITS OWN SCOPE.
@@ -677,7 +716,7 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
       const integritySignals = await integritySignalsForPackage(app.db, companyId, packageId);
       const open = integritySignals.filter(
         (sig) =>
-          sig.disposition !== "dismissed" &&
+          sig.disposition !== "false_positive" &&
           sig.disposition !== "closed" &&
           sig.closedAt === null,
       );

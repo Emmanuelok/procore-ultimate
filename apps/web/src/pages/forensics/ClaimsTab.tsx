@@ -708,7 +708,10 @@ export default function ClaimsTab({
                   >
                     <span className="font-mono">{deLabel(ev.number)}</span>
                     <span className="max-w-40 truncate">{ev.title}</span>
-                    <TiaChip deltaDays={ev.tiaResult?.completionDeltaDays ?? null} />
+                    <TiaChip
+                      deltaDays={ev.tiaResult?.completionDeltaDays ?? null}
+                      stale={ev.tia?.stale}
+                    />
                   </span>
                 ))}
               </div>

@@ -415,11 +415,14 @@ export interface LevellingRow {
     amount: number;
     unitRate: number | null;
     excluded: boolean;
+    /** listed but left blank — not a price of nil */
+    unpriced: boolean;
     deviation: number | null;
     outlier: boolean;
   }>;
   pricedCount: number;
   excludedCount: number;
+  unpricedCount: number;
   missingVendors: string[];
   low: number | null;
   high: number | null;
@@ -445,11 +448,17 @@ export interface Levelling {
     coverage: number;
     pricedRows: number;
     excludedRows: number;
+    unpricedRows: number;
     missingRows: number;
     comparableTotal: number | null;
     comparableBasis: string;
   }>;
-  scopeGaps: Array<{ scopeKey: string; description: string; missingVendors: string[] }>;
+  scopeGaps: Array<{
+    scopeKey: string;
+    description: string;
+    missingVendors: string[];
+    unpricedVendors: string[];
+  }>;
   outliers: Array<{
     scopeKey: string;
     description: string;
@@ -950,16 +959,19 @@ export async function openAuthed(path: string): Promise<void> {
   window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
+/**
+ * The write half of the module's API surface. Reads go through `useResource`
+ * on the literal path, the way every other workspace in the app fetches, so
+ * each panel carries its own loading, error and empty state; duplicating the
+ * GETs here as wrappers nobody called was how this file grew a shelf of dead
+ * helpers that read like unbuilt features.
+ */
 export const estimatingApi = {
   /* library */
-  catalogue: (params: string) => api.get<Paginated<CatalogueItem>>(`/api/v1/estimating/catalogue?${params}`),
-  catalogueItem: (id: string) => api.get<CatalogueDetail>(`/api/v1/estimating/catalogue/${id}`),
   createCatalogue: (body: unknown) => api.post<CatalogueItem>("/api/v1/estimating/catalogue", body),
   patchCatalogue: (id: string, body: unknown) =>
     api.patch<CatalogueItem>(`/api/v1/estimating/catalogue/${id}`, body),
   retireCatalogue: (id: string) => api.del<{ id: string }>(`/api/v1/estimating/catalogue/${id}`),
-  assemblies: (params: string) => api.get<Paginated<Assembly>>(`/api/v1/estimating/assemblies?${params}`),
-  assembly: (id: string) => api.get<AssemblyDetail>(`/api/v1/estimating/assemblies/${id}`),
   bulkCatalogue: (body: unknown) =>
     api.post<{ created: number; updated: number; skipped: Array<{ code: string; reason: string }> }>(
       "/api/v1/estimating/catalogue/bulk",
@@ -973,12 +985,9 @@ export const estimatingApi = {
     api.put<AssemblyDetail>(`/api/v1/estimating/assemblies/${id}/components`, body),
   refreshAssembly: (id: string) =>
     api.post<AssemblyDetail>(`/api/v1/estimating/assemblies/${id}/refresh-rates`, {}),
-  crews: (params: string) => api.get<Paginated<Crew>>(`/api/v1/estimating/crews?${params}`),
   createCrew: (body: unknown) => api.post<Crew>("/api/v1/estimating/crews", body),
   patchCrew: (id: string, body: unknown) => api.patch<Crew>(`/api/v1/estimating/crews/${id}`, body),
   retireCrew: (id: string) => api.del<{ id: string; status: string }>(`/api/v1/estimating/crews/${id}`),
-  productionRates: (params: string) =>
-    api.get<Paginated<ProductionRate>>(`/api/v1/estimating/production-rates?${params}`),
   createProductionRate: (body: unknown) =>
     api.post<ProductionRate>("/api/v1/estimating/production-rates", body),
   patchProductionRate: (id: string, body: unknown) =>
@@ -989,8 +998,6 @@ export const estimatingApi = {
   /* estimates */
   createEstimate: (projectId: string, body: unknown) =>
     api.post<EstimateDetail>(`${p(projectId)}/estimates`, body),
-  estimate: (projectId: string, id: string) =>
-    api.get<EstimateDetail>(`${p(projectId)}/estimates/${id}`),
   patchEstimate: (projectId: string, id: string, body: unknown) =>
     api.patch<EstimateDetail>(`${p(projectId)}/estimates/${id}`, body),
   voidEstimate: (projectId: string, id: string) =>
@@ -1001,8 +1008,6 @@ export const estimatingApi = {
     api.post<EstimateDetail>(`${p(projectId)}/estimates/${id}/recalculate`, {}),
   newVersion: (projectId: string, id: string, body: unknown) =>
     api.post<EstimateDetail>(`${p(projectId)}/estimates/${id}/versions`, body),
-  compare: (projectId: string, id: string, against: string) =>
-    api.get<Comparison>(`${p(projectId)}/estimates/${id}/compare?against=${against}`),
   createSection: (projectId: string, id: string, body: unknown) =>
     api.post<EstimateSection>(`${p(projectId)}/estimates/${id}/sections`, body),
   deleteSection: (projectId: string, id: string, sectionId: string) =>
@@ -1096,8 +1101,6 @@ export const estimatingApi = {
     api.post<SubQuoteDetail>(`${p(projectId)}/estimating/sub-quotes`, body),
   patchQuote: (projectId: string, id: string, body: unknown) =>
     api.patch<SubQuoteDetail>(`${p(projectId)}/estimating/sub-quotes/${id}`, body),
-  quote: (projectId: string, id: string) =>
-    api.get<SubQuoteDetail>(`${p(projectId)}/estimating/sub-quotes/${id}`),
   setQuoteLines: (projectId: string, id: string, body: unknown) =>
     api.put<SubQuoteDetail>(`${p(projectId)}/estimating/sub-quotes/${id}/lines`, body),
   acceptQuote: (projectId: string, id: string, body: unknown) =>

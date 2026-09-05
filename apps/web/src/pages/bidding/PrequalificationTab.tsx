@@ -52,6 +52,7 @@ import {
   titleCase,
   useAction,
   useNames,
+  useReason,
   useResource,
   useVendors,
 } from "./biddingShared";
@@ -511,6 +512,7 @@ function PrequalDrawer({
     submissionId ? `${BASE}/submissions/${submissionId}` : null,
   );
   const action = useAction();
+  const reason = useReason();
   const nameOf = useNames();
   const [decideOpen, setDecideOpen] = useState(false);
   const sub = detail.data;
@@ -628,6 +630,53 @@ function PrequalDrawer({
     }
   }
 
+  /**
+   * SUSPENSION AND RENEWAL — the two things that happen to an approval after
+   * it is given, and neither was reachable from this drawer.
+   *
+   * A suspension stops a live approval NOW (a fatality, an insolvency notice,
+   * a licence pulled) and states why. A renewal is a NEW submission that
+   * supersedes this one rather than an edit of it, because "what did we know
+   * about them in 2024" is a question somebody asks.
+   */
+  async function suspend() {
+    if (!submissionId) return;
+    const text = await reason.ask({
+      title: "Suspend this prequalification",
+      description:
+        "Suspension takes the vendor out of contention immediately. The reason is what an " +
+        "auditor — and the vendor — will be shown.",
+      label: "Why the approval is being suspended",
+      confirmLabel: "Suspend",
+      destructive: true,
+      minLength: 3,
+    });
+    if (!text) return;
+    const done = await action.run("suspend", () =>
+      api.post(`${BASE}/submissions/${submissionId}/suspend`, { reason: text }),
+    );
+    if (done) {
+      setLoadedFor(null);
+      detail.reload();
+      onMutated();
+    }
+  }
+
+  async function renew() {
+    if (!submissionId) return;
+    const done = await action.run("renew", () =>
+      api.post<{ id: string; reference: string }>(
+        `${BASE}/submissions/${submissionId}/renew`,
+        {},
+      ),
+    );
+    if (done) {
+      setLoadedFor(null);
+      detail.reload();
+      onMutated();
+    }
+  }
+
   const knockoutFailures = questions.filter((q) => q.isKnockout && q.response?.isKnockoutFail === 1);
   const status = sub?.status ?? "";
   const answerable = ANSWERABLE_STATUSES.has(status);
@@ -691,6 +740,25 @@ function PrequalDrawer({
               ) : null}
               {sub.status === "assessed" && !sub.approvedBy ? (
                 <Button onClick={() => setDecideOpen(true)}>Decide</Button>
+              ) : null}
+              {sub.approvedBy && sub.status !== "suspended" ? (
+                <Button
+                  variant="secondary"
+                  loading={action.busy === "suspend"}
+                  onClick={() => void suspend()}
+                >
+                  Suspend
+                </Button>
+              ) : null}
+              {sub.approvedBy || sub.status === "expired" || sub.status === "suspended" ? (
+                <Button
+                  variant="secondary"
+                  loading={action.busy === "renew"}
+                  onClick={() => void renew()}
+                  title="Starts a new submission that supersedes this one. The old assessment is kept exactly as it was."
+                >
+                  Renew
+                </Button>
               ) : null}
             </div>
           ) : null
@@ -959,6 +1027,8 @@ function PrequalDrawer({
           </div>
         ) : null}
       </Drawer>
+
+      {reason.dialog}
 
       <DecideModal
         open={decideOpen}

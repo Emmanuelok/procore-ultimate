@@ -21,7 +21,7 @@ import {
   recordLinks,
   signals,
 } from "@constructos/db";
-import { DESIGN_LINK_TARGET_TYPES, type DesignDetector } from "@constructos/shared";
+import { DESIGN_DETECTORS, DESIGN_LINK_TARGET_TYPES, type DesignDetector } from "@constructos/shared";
 import { badRequest, notFound } from "../../../lib/errors.js";
 import { pageQuerySchema } from "../../../lib/pagination.js";
 import {
@@ -48,15 +48,7 @@ import {
   todayISO,
 } from "../shared.js";
 
-const DESIGN_DETECTORS_ALL: readonly DesignDetector[] = [
-  "design_deliverable_late",
-  "design_review_overdue",
-  "design_post_freeze_change",
-  "design_issue_stale",
-  "design_change_frequency",
-  "design_info_requirement_overdue",
-  "design_pi_inadequate",
-];
+const DESIGN_DETECTORS_ALL: readonly DesignDetector[] = DESIGN_DETECTORS;
 
 /** The design record types that may be the `from` side of a link. */
 const DESIGN_SOURCE_TYPES = [
@@ -137,8 +129,11 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/design/signals", { preHandler: readGate }, async (req) => {
     const { projectId } = req.params as { projectId: string };
+    // The detector filter is bound to THIS module's detectors. A free-string
+    // filter here would let design:read pull, say, a ghost-vendor signal out
+    // of the assurance programme through the design gate.
     const q = pageQuerySchema
-      .extend({ detector: z.string().max(60).optional(), open: boolQuerySchema.optional() })
+      .extend({ detector: z.enum(DESIGN_DETECTORS).optional(), open: boolQuerySchema.optional() })
       .parse(req.query);
     const rows = await app.db
       .select()

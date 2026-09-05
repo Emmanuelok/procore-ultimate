@@ -666,6 +666,10 @@ export const DETECTOR_LABELS: Record<string, string> = {
   bond_demand_deadline_passed: "Bond demand deadline passed",
   policy_lapsed_during_works: "Policy lapsed during works",
   insurance_notification_missed: "Claim notification missed",
+  policy_period_gap: "Policy period gap",
+  uninsured_loss_candidate: "Uninsured loss candidate",
+  policy_renewal_overdue: "Renewal overdue",
+  insurance_certificate_mismatch: "Certificate does not match the document",
 };
 
 /* --------------------------- Transition tables ---------------------------- */
@@ -1314,3 +1318,119 @@ export const CLAIM_REQUEST_KIND_LABELS: Record<string, string> = {
   interim_report: "Interim report",
   expert_appointment: "Expert appointment",
 };
+
+/* ------------------------------------------------------------------ */
+/* Certificate authenticity (#772, #781)                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Two independent claims about the same piece of paper, and neither of them
+ * comes from the party who typed the record: what the DOCUMENT says
+ * (extraction), and what the broker or insurer says (confirmation).
+ */
+export interface ExtractionMismatch {
+  field: string;
+  typed: string | number | null;
+  extracted: string | number | null;
+  severity: "high" | "medium" | "low";
+  detail: string;
+  /** the words on the document the finding rests on, when the model quoted them */
+  quote: string | null;
+}
+
+export interface CertificateExtraction {
+  insurer: string | null;
+  policyNumber: string | null;
+  insuredName: string | null;
+  policyType: string | null;
+  limitOfIndemnity: number | null;
+  currency: string | null;
+  validFrom: string | null;
+  validTo: string | null;
+  waiverOfSubrogation: boolean | null;
+  additionalInsured: boolean | null;
+  endorsements: string[];
+  citations: Array<{ field: string; quote: string }>;
+  notes: string | null;
+}
+
+export interface ExtractionResult {
+  certificateId: string;
+  runId: string;
+  extracted: CertificateExtraction;
+  mismatches: ExtractionMismatch[];
+  summary: string;
+  appliedToRecord: boolean;
+  note: string;
+}
+
+export interface StoredExtraction {
+  certificateId: string;
+  extractedAt: string | null;
+  runId: string | null;
+  extracted: CertificateExtraction | null;
+  mismatches: ExtractionMismatch[];
+  available: boolean;
+  reason: string | null;
+}
+
+export const CONFIRMATION_CHANNELS = ["broker", "insurer"] as const;
+
+export const CONFIRMATION_OUTCOME_LABELS: Record<string, string> = {
+  confirmed: "Confirmed on risk",
+  corrected: "Corrected the details",
+  not_on_risk: "Says it is NOT on risk",
+  unknown: "Could not say",
+};
+
+export interface ConfirmationRow {
+  id: string;
+  companyId: string;
+  projectId: string | null;
+  certificateId: string;
+  channel: string;
+  recipientName: string | null;
+  recipientEmail: string;
+  recipientContactId: string | null;
+  recipientVendorId: string | null;
+  /** the hash only — the bearer token is never returned after issue */
+  tokenHash: string;
+  expiresAt: string;
+  status: string;
+  responseOutcome: string | null;
+  responseNote: string | null;
+  responseSha256: string | null;
+  respondedAt: string | null;
+  assertedFields: Record<string, unknown>;
+  correctedFields: Record<string, unknown>;
+  emailMessageId: string | null;
+  sentAt: string | null;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+  overdue?: boolean;
+}
+
+/** POST returns the link ONCE, so it can be pasted if mail is not configured. */
+export interface ConfirmationCreated extends ConfirmationRow {
+  dispatched: boolean;
+  deliveryReasons: string[];
+  link: string;
+}
+
+export function confirmationTone(row: ConfirmationRow): "gray" | "green" | "amber" | "red" {
+  if (row.status === "responded") {
+    if (row.responseOutcome === "confirmed") return "green";
+    if (row.responseOutcome === "not_on_risk") return "red";
+    return "amber";
+  }
+  if (row.status === "expired") return "red";
+  if (row.status === "withdrawn") return "gray";
+  return row.overdue ? "red" : "amber";
+}
+
+export function mismatchTone(severity: string): "red" | "amber" | "gray" {
+  if (severity === "high") return "red";
+  if (severity === "medium") return "amber";
+  return "gray";
+}

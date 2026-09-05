@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, eq } from "drizzle-orm";
 import {
+  boqItems,
   boqs,
   companyMemberships,
   contracts,
@@ -17,12 +18,16 @@ import {
   projectMemberships,
   projects,
   punchItems,
+  recordLinks,
   rfis,
+  riskRealisations,
+  risks,
   scheduleBaselines,
   scheduleTasks,
   schedules,
   signals,
   stageGates,
+  valuationLines,
   valuations,
   vendors,
   variations,
@@ -1512,5 +1517,540 @@ describe("audit bug regressions", () => {
       .where(eq(obligations.projectId, projectId));
     expect(after.length).toBe(before.length);
     expect(oblAfter.length).toBe(oblBefore.length);
+  });
+});
+
+/* ================================================================== */
+/* KNOWLEDGE GRAPH, ONBOARDING PACKS AND THE LIBRARIES (#981-984, #992-994) */
+/* ================================================================== */
+
+describe("knowledge graph, onboarding packs and the feedback libraries", () => {
+  let graphDisputeId: string;
+  let libProjectA: string;
+  let libProjectB: string;
+  let realisedRiskId: string;
+
+  beforeAll(async () => {
+    graphDisputeId = newId("dsp");
+    await app.db.insert(disputes).values({
+      id: graphDisputeId,
+      companyId: owner.companyId,
+      projectId,
+      number: 90,
+      title: "Ground conditions adjudication at pier 7",
+      kind: "adjudication",
+      status: "decided",
+      currency: "GBP",
+      createdBy: owner.userId,
+    });
+
+    /* Two projects with certified valuations for the SAME element, so a rate
+       has a sample of two across a project boundary — the only shape the
+       engine will call sufficient. */
+    libProjectA = newId("prj");
+    libProjectB = newId("prj");
+    await app.db.insert(projects).values([
+      {
+        id: libProjectA,
+        companyId: owner.companyId,
+        name: "Library Source A",
+        type: "highways",
+        currency: "GBP",
+        value: 4_000_000,
+        stage: "course_of_construction",
+      },
+      {
+        id: libProjectB,
+        companyId: owner.companyId,
+        name: "Library Source B",
+        type: "highways",
+        currency: "GBP",
+        value: 5_000_000,
+        stage: "course_of_construction",
+      },
+    ]);
+
+    for (const [i, p] of [libProjectA, libProjectB].entries()) {
+      const boqId = newId("boq");
+      await app.db.insert(boqs).values({
+        id: boqId,
+        companyId: owner.companyId,
+        projectId: p,
+        name: `Works BQ ${i}`,
+        currency: "GBP",
+        status: "agreed",
+        createdBy: owner.userId,
+      });
+      const itemId = newId("bqi");
+      await app.db.insert(boqItems).values({
+        id: itemId,
+        boqId,
+        parentId: null,
+        path: itemId,
+        level: "item",
+        code: "E10",
+        description: "Excavation in made ground",
+        unit: "m3",
+        quantity: 100,
+        rate: 100,
+        amount: 10_000,
+        itemType: "measured",
+      });
+      /* A draft valuation must never reach the library: only what was
+         certified is outturn. */
+      const draftId = newId("val");
+      const certifiedId = newId("val");
+      await app.db.insert(valuations).values([
+        {
+          id: draftId,
+          companyId: owner.companyId,
+          projectId: p,
+          boqId,
+          number: 1,
+          valuationDate: "2026-01-31",
+          status: "draft",
+          currency: "GBP",
+          createdBy: owner.userId,
+        },
+        {
+          id: certifiedId,
+          companyId: owner.companyId,
+          projectId: p,
+          boqId,
+          number: 2,
+          valuationDate: "2026-02-28",
+          status: "certified",
+          currency: "GBP",
+          createdBy: owner.userId,
+        },
+      ]);
+      await app.db.insert(valuationLines).values([
+        {
+          id: newId("vln"),
+          valuationId: draftId,
+          boqItemId: itemId,
+          qtyToDate: 50,
+          amountToDate: 50_000, // a wild rate that must not reach the library
+          previousAmount: 0,
+          thisPeriod: 50_000,
+        },
+        {
+          id: newId("vln"),
+          valuationId: certifiedId,
+          boqItemId: itemId,
+          qtyToDate: 100,
+          /* A: 120/m3, B: 140/m3 → median 130 against a priced 100 */
+          amountToDate: i === 0 ? 12_000 : 14_000,
+          previousAmount: 0,
+          thisPeriod: i === 0 ? 12_000 : 14_000,
+        },
+      ]);
+
+      const schedId = newId("sch");
+      await app.db.insert(schedules).values({
+        id: schedId,
+        companyId: owner.companyId,
+        projectId: p,
+        name: `Programme ${i}`,
+        projectStart: "2025-01-01",
+        isActive: 1,
+        createdBy: owner.userId,
+      });
+      await app.db.insert(scheduleTasks).values([
+        {
+          id: newId("tsk"),
+          scheduleId: schedId,
+          projectId: p,
+          name: "Piling to pier 3",
+          wbsCode: "A100",
+          durationDays: 10,
+          /* A took 12 days, B took 16 → median 14 against a planned 10 */
+          actualStart: "2026-01-05",
+          actualFinish: i === 0 ? "2026-01-16" : "2026-01-20",
+        },
+        {
+          id: newId("tsk"),
+          scheduleId: schedId,
+          projectId: p,
+          name: "Sectional completion",
+          wbsCode: "M900",
+          taskType: "milestone",
+          durationDays: 0,
+          actualStart: "2026-02-01",
+          actualFinish: "2026-02-01",
+        },
+        {
+          id: newId("tsk"),
+          scheduleId: schedId,
+          projectId: p,
+          name: "Still running",
+          wbsCode: "A200",
+          durationDays: 20,
+          actualStart: "2026-03-01",
+          actualFinish: null,
+        },
+      ]);
+    }
+
+    realisedRiskId = newId("rsk");
+    await app.db.insert(risks).values({
+      id: realisedRiskId,
+      companyId: owner.companyId,
+      projectId,
+      number: 77,
+      title: "Made ground deeper than the SI suggested",
+      category: "technical",
+      status: "realised",
+      probabilityScore: 2,
+      impactScore: 4,
+      occurrenceProbability: 0.15,
+      costImpact: { kind: "triangular", min: 50_000, mode: 200_000, max: 500_000 },
+      createdBy: owner.userId,
+    });
+  }, 120_000);
+
+  /* ---------------- knowledge graph ---------------- */
+
+  it("verifies every evidence reference against the record it names when a lesson is published", async () => {
+    const lesson = await publishLesson({
+      title: "Probe made ground before mobilising a piling rig",
+      whatHappened:
+        "The piling rig sank in made ground that had never been probed, and the adjudication " +
+        "that followed turned on whether the SI was adequate.",
+      recommendation: "Probe made ground on the piling platform before mobilising.",
+      tags: ["ground", "piling"],
+      evidenceRefs: [
+        { tool: "disputes", recordId: graphDisputeId, label: "D-090" },
+        { tool: "disputes", recordId: "dsp_does_not_exist", label: "phantom" },
+      ],
+    });
+    expect((lesson.graph as Json).inserted).toBeGreaterThan(0);
+    const unverified = (lesson.graph as Json).unverified as Array<Json>;
+    expect(unverified).toHaveLength(1);
+    expect(unverified[0]!.targetId).toBe("dsp_does_not_exist");
+    expect(String(unverified[0]!.reason)).toContain("No record with that id");
+
+    const res = await get(`/learning/lessons/${lesson.id as string}/graph`);
+    expect(res.statusCode).toBe(200);
+    const graph = res.json() as Json;
+    const counts = graph.counts as Json;
+    expect(counts.record).toBe(2);
+    expect(counts.unverified).toBe(1);
+    expect(counts.tag).toBe(2);
+    // author and validator are different people and both are on the graph
+    expect(counts.person).toBe(2);
+    expect(String(graph.reason)).toContain("unverified");
+
+    // the verified edge is mirrored into record_links, so the DISPUTE can
+    // answer "what did we learn from this?" without knowing about lessons
+    const links = await app.db
+      .select()
+      .from(recordLinks)
+      .where(and(eq(recordLinks.fromId, lesson.id as string), eq(recordLinks.toId, graphDisputeId)));
+    expect(links).toHaveLength(1);
+    expect(links[0]!.toType).toBe("dispute");
+  });
+
+  it("answers the reverse question from the record's side", async () => {
+    const res = await get(
+      `/projects/${projectId}/learning/for-record?type=disputes&id=${graphDisputeId}`,
+    );
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Json;
+    expect(body.total).toBeGreaterThanOrEqual(1);
+    expect((body.record as Json).resolvable).toBe(true);
+    const items = body.items as Array<Json>;
+    expect(items.every((i) => i.lesson !== null)).toBe(true);
+  });
+
+  it("says plainly when no lesson cites a record", async () => {
+    const res = await get(`/projects/${projectId}/learning/for-record?type=disputes&id=nope`);
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Json;
+    expect(body.total).toBe(0);
+    expect(String(body.reason)).toContain("fact about the register");
+  });
+
+  it("is idempotent: rebuilding writes nothing the second time", async () => {
+    const lesson = await publishLesson({
+      title: "Idempotence check",
+      evidenceRefs: [{ tool: "disputes", recordId: graphDisputeId }],
+    });
+    const first = await post(`/learning/lessons/${lesson.id as string}/graph/rebuild`);
+    expect(first.statusCode).toBe(200);
+    expect((first.json() as Json).inserted).toBe(0);
+    expect((first.json() as Json).deleted).toBe(0);
+    const second = await post(`/learning/lessons/${lesson.id as string}/graph/rebuild`);
+    expect((second.json() as Json).inserted).toBe(0);
+    expect((second.json() as Json).deleted).toBe(0);
+    expect((second.json() as Json).unchanged).toBeGreaterThan(0);
+  });
+
+  it("adds an applied_to edge when the lesson is applied to a later record", async () => {
+    const lesson = await publishLesson({ title: "Applied edge check" });
+    const applied = await post(
+      `/projects/${bareProjectId}/learning/lessons/${lesson.id as string}/apply`,
+      {
+        appliedTo: { tool: "disputes", recordId: graphDisputeId, label: "D-090" },
+        action: "Checked the SI adequacy before mobilising",
+      },
+    );
+    expect(applied.statusCode).toBe(201);
+    const res = await get(`/learning/lessons/${lesson.id as string}/graph`);
+    const edges = (res.json() as Json).edges as Array<Json>;
+    expect(edges.some((e) => e.role === "applied_to" && e.targetId === graphDisputeId)).toBe(true);
+    expect(edges.some((e) => e.role === "applier")).toBe(true);
+  });
+
+  it("refuses the graph of another tenant's lesson", async () => {
+    const lesson = await publishLesson({ title: "Cross tenant graph" });
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/learning/lessons/${lesson.id as string}/graph`,
+      headers: outsider.headers,
+    });
+    expect([403, 404]).toContain(res.statusCode);
+  });
+
+  it("refuses a graph rebuild from a plain member — the projection is an admin act", async () => {
+    const lesson = await publishLesson({ title: "Rebuild permission" });
+    const res = await post(
+      `/learning/lessons/${lesson.id as string}/graph/rebuild`,
+      undefined,
+      readerHeaders,
+    );
+    expect(res.statusCode).toBe(403);
+  });
+
+  /* ---------------- semantic retrieval ---------------- */
+
+  it("surfaces a lesson whose words match the record being created, and states the similarity", async () => {
+    await publishLesson({
+      title: "Cladding fixings corroded within a year",
+      category: "quality",
+      whatHappened:
+        "Cladding fixings specified in the wrong grade corroded within a year of installation " +
+        "in a marine exposure zone.",
+      recommendation: "Check the fixing grade against the exposure category before approval.",
+      tags: ["cladding", "facade"],
+    });
+    const res = await get(
+      `/projects/${projectId}/learning/relevant?text=${encodeURIComponent(
+        "cladding fixings corroding in a marine exposure zone",
+      )}`,
+    );
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Json;
+    expect((body.query as Json).semanticMatches).toBeGreaterThan(0);
+    const items = body.items as Array<Json>;
+    const hit = items.find((i) => String((i.lesson as Json).title).includes("Cladding fixings"));
+    expect(hit).toBeDefined();
+    const reasons = hit!.reasons as Array<Json>;
+    const semantic = reasons.find((r) => r.code === "semantic_similarity");
+    expect(semantic).toBeDefined();
+    expect(String(semantic!.detail)).toMatch(/Semantic similarity: 0\.\d\d/);
+    expect(hit!.similarity).toBeGreaterThan(0);
+  });
+
+  it("adds nothing when the record's words are not in the register's vocabulary", async () => {
+    const res = await get(
+      `/projects/${projectId}/learning/relevant?text=${encodeURIComponent("quantum chromodynamics")}`,
+    );
+    const body = res.json() as Json;
+    expect((body.query as Json).semanticMatches).toBe(0);
+  });
+
+  /* ---------------- onboarding packs ---------------- */
+
+  it("selects an onboarding pack from similar projects with the reasons attached", async () => {
+    const res = await get(`/projects/${libProjectA}/learning/onboarding-pack?limit=5`);
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Json;
+    expect((body.project as Json).id).toBe(libProjectA);
+    const items = body.items as Array<Json>;
+    expect(items.length).toBeGreaterThan(0);
+    for (const item of items) {
+      expect((item.reasons as string[]).length).toBeGreaterThan(0);
+    }
+    expect(String(body.selection)).toContain("Deterministic");
+  });
+
+  it("returns the pack with an honest reason when AI is not configured, never an error", async () => {
+    const res = await post(`/projects/${libProjectA}/learning/onboarding-pack`, { limit: 3 });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Json;
+    expect(body.narrative).toBeNull();
+    expect(String(body.narrativeReason)).toContain("AI is not configured");
+    expect((body.items as Array<Json>).length).toBeGreaterThan(0);
+  });
+
+  it("refuses an onboarding pack for another tenant's project", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${libProjectA}/learning/onboarding-pack`,
+      headers: outsider.headers,
+    });
+    expect([403, 404]).toContain(res.statusCode);
+  });
+
+  /* ---------------- rate and duration libraries ---------------- */
+
+  it("builds a rate library from certified valuations only, and measures the estimate against it", async () => {
+    const res = await post(`/learning/libraries/rebuild`);
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Json;
+    expect((body.rates as Json).proposals).toBeGreaterThan(0);
+
+    const list = await get(`/learning/libraries/rates?code=E10`);
+    expect(list.statusCode).toBe(200);
+    const items = (list.json() as Json).items as Array<Json>;
+    const entry = items.find((i) => i.elementCode === "E10");
+    expect(entry).toBeDefined();
+    expect(entry!.sampleSize).toBe(2); // the draft valuation was excluded
+    expect(entry!.medianRate).toBe(130);
+    expect(entry!.estimatedRate).toBe(100);
+    expect(entry!.accuracyRatio).toBeCloseTo(0.3, 6);
+    expect(entry!.status).toBe("proposed");
+    expect((entry!.sourceProjectIds as string[]).sort()).toEqual([libProjectA, libProjectB].sort());
+    expect(String(entry!.note)).toContain("optimistic by 30%");
+  });
+
+  it("builds a duration library from completed activities only", async () => {
+    const list = await get(`/learning/libraries/durations?code=A100`);
+    const items = (list.json() as Json).items as Array<Json>;
+    const entry = items.find((i) => i.activityCode === "A100");
+    expect(entry).toBeDefined();
+    expect(entry!.sampleSize).toBe(2);
+    expect(entry!.medianDays).toBe(14); // 12 and 16 days, inclusive of both ends
+    expect(entry!.plannedDays).toBe(10);
+    expect(entry!.accuracyRatio).toBeCloseTo(0.4, 6);
+    // the milestone and the unfinished activity are not evidence about duration
+    const all = (await get(`/learning/libraries/durations`)).json() as Json;
+    const codes = (all.items as Array<Json>).map((i) => i.activityCode);
+    expect(codes).not.toContain("M900");
+    expect(codes).not.toContain("A200");
+  });
+
+  it("accepts a proposal under a named actor and ledgers the decision", async () => {
+    const list = await get(`/learning/libraries/rates?code=E10&status=proposed`);
+    const entry = ((list.json() as Json).items as Array<Json>)[0]!;
+    const res = await post(`/learning/libraries/rates/${entry.id as string}/accept`, {
+      note: "Sample reviewed against both jobs.",
+    });
+    expect(res.statusCode).toBe(200);
+    const accepted = res.json() as Json;
+    expect(accepted.status).toBe("accepted");
+    expect(accepted.acceptedBy).toBe(owner.userId);
+    const led = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(
+        and(
+          eq(ledgerEntries.objectType, "rate_library_entry"),
+          eq(ledgerEntries.objectId, entry.id as string),
+          eq(ledgerEntries.action, "state_change"),
+        ),
+      );
+    expect(led.length).toBe(1);
+  });
+
+  it("refuses to decide the same entry twice", async () => {
+    const list = await get(`/learning/libraries/rates?code=E10&status=accepted`);
+    const entry = ((list.json() as Json).items as Array<Json>)[0]!;
+    const res = await post(`/learning/libraries/rates/${entry.id as string}/reject`);
+    expect(res.statusCode).toBe(409);
+  });
+
+  it("leaves an accepted entry alone when the evidence has not moved", async () => {
+    const before = await get(`/learning/libraries/rates?code=E10`);
+    const countBefore = ((before.json() as Json).items as Array<Json>).length;
+    const res = await post(`/learning/libraries/rebuild`);
+    expect((res.json() as Json).rates).toMatchObject({ skipped: expect.any(Number) });
+    const after = await get(`/learning/libraries/rates?code=E10`);
+    expect(((after.json() as Json).items as Array<Json>).length).toBe(countBefore);
+  });
+
+  it("refuses a rebuild from a plain member and a read of another tenant's library", async () => {
+    const member = await post(`/learning/libraries/rebuild`, undefined, readerHeaders);
+    expect(member.statusCode).toBe(403);
+    const other = await app.inject({
+      method: "GET",
+      url: "/api/v1/learning/libraries/rates",
+      headers: outsider.headers,
+    });
+    expect(other.statusCode).toBe(403);
+  });
+
+  /* ---------------- risk realisation ---------------- */
+
+  it("records a realised risk with the prediction as it stood, and refuses a duplicate", async () => {
+    const res = await post(`/projects/${projectId}/learning/risk-realisations`, {
+      riskId: realisedRiskId,
+      realisedImpact: 400_000,
+      realisedCurrency: "GBP",
+      sourceType: "variation",
+      sourceId: "var_pier7",
+      note: "Settled through variation 14.",
+    });
+    expect(res.statusCode).toBe(201);
+    const row = res.json() as Json;
+    expect(row.predictedProbability).toBeCloseTo(0.15, 6);
+    expect(row.predictedImpact).toBe(200_000); // the triangular mode
+    expect(row.realisedImpact).toBe(400_000);
+
+    const dup = await post(`/projects/${projectId}/learning/risk-realisations`, {
+      riskId: realisedRiskId,
+      sourceType: "variation",
+      sourceId: "var_pier7",
+    });
+    expect(dup.statusCode).toBe(409);
+  });
+
+  it("captures realised risks on a schedule and never records the same one twice", async () => {
+    await app.scheduler.runNow("learning.libraries");
+    const rows = await app.db
+      .select()
+      .from(riskRealisations)
+      .where(eq(riskRealisations.riskId, realisedRiskId));
+    // one recorded by hand against the variation, one captured from the register
+    expect(rows.length).toBe(2);
+    await app.scheduler.runNow("learning.libraries");
+    const again = await app.db
+      .select()
+      .from(riskRealisations)
+      .where(eq(riskRealisations.riskId, realisedRiskId));
+    expect(again.length).toBe(2);
+  });
+
+  it("publishes estimate accuracy with what it could not compare, never as a clean score", async () => {
+    const res = await get(`/learning/libraries/accuracy`);
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Json;
+    const rates = body.rates as Json;
+    expect(rates.comparable).toBeGreaterThan(0);
+    expect(typeof rates.notComparable).toBe("number");
+    expect(String(rates.reason)).toContain("librar");
+    const realisation = body.riskRealisation as Array<Json>;
+    expect(realisation.length).toBeGreaterThan(0);
+    const technical = realisation.find((r) => r.category === "technical")!;
+    expect((technical.impactByCurrency as Array<Json>).every((c) => typeof c.currency === "string")).toBe(
+      true,
+    );
+    expect(String(body.basis)).toContain("median outturn");
+  });
+
+  it("keeps risk realisations inside the tenant", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/v1/learning/risk-realisations",
+      headers: outsider.headers,
+    });
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("registers the knowledge-graph and library sweeps with the platform scheduler", async () => {
+    const names = app.scheduler.list().map((j) => j.name);
+    expect(names).toContain("learning.knowledge-graph");
+    expect(names).toContain("learning.libraries");
   });
 });

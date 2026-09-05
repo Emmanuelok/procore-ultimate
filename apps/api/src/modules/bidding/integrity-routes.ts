@@ -57,7 +57,7 @@ export const integrityRoutes: FastifyPluginAsync = async (app) => {
 
   const openSignals = (rows: Array<typeof signals.$inferSelect>) =>
     rows.filter(
-      (r) => r.disposition !== "dismissed" && r.disposition !== "closed" && r.closedAt === null,
+      (r) => r.disposition !== "false_positive" && r.disposition !== "closed" && r.closedAt === null,
     );
 
   const shapeSignal = (row: typeof signals.$inferSelect) => ({
@@ -274,7 +274,7 @@ export const integrityRoutes: FastifyPluginAsync = async (app) => {
         r.detector.startsWith("bid_integrity_") &&
         (!q.detector || r.detector === q.detector) &&
         (!q.severity || r.severity === q.severity) &&
-        (!q.openOnly || (r.disposition !== "dismissed" && r.disposition !== "closed")),
+        (!q.openOnly || (r.disposition !== "false_positive" && r.disposition !== "closed")),
     );
 
     const packageIds = [
@@ -385,7 +385,7 @@ export const integrityRoutes: FastifyPluginAsync = async (app) => {
       await app.db
         .update(signals)
         .set({
-          disposition: "dismissed",
+          disposition: "false_positive",
           reviewerId: req.user!.id,
           reviewerNotes: reason,
           closedAt: now,
@@ -400,7 +400,7 @@ export const integrityRoutes: FastifyPluginAsync = async (app) => {
         objectId: signalId,
         payload: {
           detector: row.detector,
-          to: "dismissed",
+          to: "false_positive",
           reason,
           subjectType: row.subjectType,
           subjectId: row.subjectId,
@@ -409,7 +409,7 @@ export const integrityRoutes: FastifyPluginAsync = async (app) => {
       });
       return {
         id: signalId,
-        disposition: "dismissed",
+        disposition: "false_positive",
         reviewerNotes: reason,
         note:
           "Recorded. A dismissal with a stated reason is what makes this detector's precision " +
@@ -418,6 +418,148 @@ export const integrityRoutes: FastifyPluginAsync = async (app) => {
       };
     },
   );
+
+  /**
+   * CONFIRMING a finding — the other half of the feedback loop.
+   *
+   * Precision is confirmed ÷ (confirmed + false positive). A register where
+   * the only recordable outcome is "dismissed" measures nothing: every
+   * detector converges on a precision of zero regardless of how good it is.
+   * A confirmation is a reviewer saying "this one was real", with what they
+   * found, and it leaves the finding OPEN — a confirmed pattern still bears
+   * on the next recommendation.
+   */
+  app.post(
+    "/companies/current/bid-integrity/:signalId/confirm",
+    { preHandler: companyGate },
+    async (req) => {
+      const { signalId } = req.params as { signalId: string };
+      const { reason, escalate } = z
+        .object({ reason: reasonSchema, escalate: z.boolean().default(false) })
+        .parse(req.body);
+      const [row] = await app.db
+        .select()
+        .from(signals)
+        .where(and(eq(signals.id, signalId), eq(signals.companyId, req.companyId!)))
+        .limit(1);
+      if (!row) throw notFound("Signal not found");
+      if (!row.detector.startsWith("bid_integrity_")) {
+        throw badRequest(
+          "That signal was not raised by the bidding detectors, so it is not this module's to " +
+            "disposition. Use the assurance register.",
+        );
+      }
+      const disposition = escalate ? "escalated" : "confirmed";
+      await app.db
+        .update(signals)
+        .set({ disposition, reviewerId: req.user!.id, reviewerNotes: reason })
+        .where(eq(signals.id, signalId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        projectId: row.projectId,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "signal",
+        objectId: signalId,
+        payload: {
+          detector: row.detector,
+          to: disposition,
+          reason,
+          subjectType: row.subjectType,
+          subjectId: row.subjectId,
+        },
+        storePayload: true,
+      });
+      return {
+        id: signalId,
+        disposition,
+        reviewerNotes: reason,
+        note:
+          "Recorded, and the finding stays open: a confirmed pattern still has to be " +
+          "acknowledged before the next recommendation on the packages it touches." +
+          (escalate
+            ? " It is escalated — the assurance register is where an escalated signal is worked."
+            : ""),
+      };
+    },
+  );
+
+  /**
+   * MEASURED PRECISION PER DETECTOR.
+   *
+   * A detector's worth is not what it fires on, it is what survives review.
+   * This counts, per detector over the trailing window: how many findings
+   * were raised, how many a human has dispositioned, and of those how many
+   * were real. Where too few have been reviewed to say anything, precision is
+   * `null` WITH THE REASON — a precision of "1.00 from one review" is the
+   * kind of number that gets a detector trusted for the wrong reason.
+   */
+  app.get("/companies/current/bid-integrity/precision", { preHandler: companyGate }, async (req) => {
+    const MIN_REVIEWED = 5;
+    const rows = await app.db
+      .select({
+        detector: signals.detector,
+        disposition: signals.disposition,
+        severity: signals.severity,
+        createdAt: signals.createdAt,
+      })
+      .from(signals)
+      .where(eq(signals.companyId, req.companyId!));
+    const mine = rows.filter((r) => r.detector.startsWith("bid_integrity_"));
+    const byDetector = new Map<
+      string,
+      { raised: number; confirmed: number; falsePositive: number; escalated: number; open: number }
+    >();
+    for (const row of mine) {
+      const entry = byDetector.get(row.detector) ?? {
+        raised: 0,
+        confirmed: 0,
+        falsePositive: 0,
+        escalated: 0,
+        open: 0,
+      };
+      entry.raised += 1;
+      if (row.disposition === "confirmed") entry.confirmed += 1;
+      else if (row.disposition === "false_positive") entry.falsePositive += 1;
+      else if (row.disposition === "escalated") entry.escalated += 1;
+      else entry.open += 1;
+      byDetector.set(row.detector, entry);
+    }
+    const items = [...byDetector.entries()]
+      .map(([detector, e]) => {
+        const real = e.confirmed + e.escalated;
+        const reviewed = real + e.falsePositive;
+        const enough = reviewed >= MIN_REVIEWED;
+        return {
+          detector,
+          raised: e.raised,
+          open: e.open,
+          confirmed: e.confirmed,
+          escalated: e.escalated,
+          falsePositive: e.falsePositive,
+          reviewed,
+          precision: enough ? Math.round((real / reviewed) * 1000) / 1000 : null,
+          basis: enough
+            ? `${real} of ${reviewed} reviewed finding(s) were real.`
+            : reviewed === 0
+              ? "No finding from this detector has been dispositioned yet, so its precision is " +
+                "unmeasured. Confirm or dismiss findings with a reason and the figure appears."
+              : `Only ${reviewed} finding(s) have been reviewed; ${MIN_REVIEWED} are needed ` +
+                "before a precision figure means anything. A rate computed from two reviews is " +
+                "noise wearing a decimal point.",
+        };
+      })
+      .sort((a, b) => b.raised - a.raised);
+    return {
+      items,
+      total: items.length,
+      minReviewed: MIN_REVIEWED,
+      note:
+        "Precision is (confirmed + escalated) ÷ (confirmed + escalated + false positive). It is " +
+        "measured, never asserted, and it is null with a reason wherever the review history is " +
+        "too thin to support a number.",
+    };
+  });
 };
 
 export type { IntegrityFinding };

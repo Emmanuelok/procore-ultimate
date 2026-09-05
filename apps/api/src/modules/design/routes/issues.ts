@@ -25,6 +25,7 @@ import { badRequest, conflict, forbidden, notFound } from "../../../lib/errors.j
 import { newId } from "../../../lib/ids.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.js";
 import { pushNotifications } from "../../notifications/service.js";
+import { authorisationRank } from "../engines/change.js";
 import { ROLLUP_ROW_CAP } from "../service.js";
 import {
   allocateReference,
@@ -38,6 +39,7 @@ import {
   boolQuerySchema,
   currencySchema,
   fileIdsSchema,
+  heldAuthorisation,
   idSchema,
   isoDateSchema,
   ledger,
@@ -683,7 +685,7 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
   });
 
   /** Taking the decision. The proposer may not be the decider. */
-  app.post("/projects/:projectId/design/decisions/:decisionId/decide", { preHandler: standardGate }, async (req) => {
+  app.post("/projects/:projectId/design/decisions/:decisionId/decide", { preHandler: standardGate }, async (req, reply) => {
     const { projectId, decisionId } = req.params as { projectId: string; decisionId: string };
     const body = z
       .object({
@@ -702,6 +704,16 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
     if (row.proposedBy === req.user!.id) {
       throw forbidden(
         "A design decision is taken by someone other than whoever proposed it. A decision log where the proposer signs their own proposal records nothing.",
+      );
+    }
+    // The authority a decision is taken under is bound to what the decider
+    // actually holds, exactly as a change notice is: a level nobody granted is
+    // not an authorisation, and the decision log is read later as evidence of
+    // who could commit the project to this.
+    const held = await heldAuthorisation(app, req, reply);
+    if (authorisationRank(body.authorisationLevel) > authorisationRank(held.level)) {
+      throw forbidden(
+        `You are recording this decision at ${body.authorisationLevel.replace(/_/g, " ")} level but you hold ${held.level.replace(/_/g, " ")}. ${held.basis}`,
       );
     }
     if (body.chosenOptionKey) {
@@ -744,6 +756,8 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
         to: "decided",
         chosenOptionKey: body.chosenOptionKey ?? null,
         authorisationLevel: body.authorisationLevel,
+        heldAuthorisation: held.level,
+        heldBasis: held.basis,
         supersedesId: row.supersedesId,
       },
     });

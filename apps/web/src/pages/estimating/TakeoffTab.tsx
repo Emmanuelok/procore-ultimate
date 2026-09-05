@@ -2,9 +2,11 @@
  * TAKEOFF — layers, the scale calculator, and every measurement with the
  * geometry and the calibration it was taken at (#184–190).
  *
- * The record model is the product here. The SVG preview is a convenience —
- * what has to survive is the geometry, the scale, the factors and the
- * arithmetic that turned them into a quantity, and all four are on screen.
+ * The record model is the product here. The SVG sketch is a convenience — it
+ * draws the stored coordinates to their own scale so the shape behind a
+ * quantity is visible, but what has to survive is the geometry, the scale,
+ * the factors and the arithmetic that turned them into a quantity, and all
+ * four are on screen next to it.
  */
 import { useEffect, useMemo, useState } from "react";
 import {
@@ -67,6 +69,79 @@ function parsePoints(raw: string): Array<{ x: number; y: number }> {
       return { x: Number(x), y: Number(y) };
     })
     .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+}
+
+/**
+ * The recorded geometry, drawn to scale in its own box.
+ *
+ * This is a sketch of what was measured, not a viewer: there is no sheet
+ * behind it and no pan or zoom, because the sheet image is not this module's
+ * to render. It exists so a reviewer can see at a glance that the shape
+ * behind a quantity is the shape they expected — a polygon that never closed,
+ * a rectangle entered as two points, a circle with no radius — without
+ * reading the coordinate list underneath.
+ */
+function GeometrySketch({
+  geometry,
+  colour,
+}: {
+  geometry: { kind: string; points: Array<{ x: number; y: number }>; radius?: number };
+  colour: string | null;
+}) {
+  const stroke = colour && /^#[0-9a-fA-F]{6}$/.test(colour) ? colour : "currentColor";
+  const pts = geometry.points;
+  if (pts.length === 0) return null;
+
+  const r = geometry.radius ?? 0;
+  const xs = pts.map((p) => p.x);
+  const ys = pts.map((p) => p.y);
+  const minX = Math.min(...xs) - r;
+  const maxX = Math.max(...xs) + r;
+  const minY = Math.min(...ys) - r;
+  const maxY = Math.max(...ys) + r;
+  const w = Math.max(maxX - minX, 1e-6);
+  const h = Math.max(maxY - minY, 1e-6);
+  const pad = Math.max(w, h) * 0.08 + 1e-6;
+  const viewBox = `${minX - pad} ${minY - pad} ${w + pad * 2} ${h + pad * 2}`;
+  // One stroke width in USER units, so the line looks the same however big
+  // the drawing coordinates happen to be.
+  const sw = Math.max(w, h) / 120;
+
+  const closed = geometry.kind === "polygon" || geometry.kind === "rectangle";
+  const path = pts.map((p) => `${p.x},${p.y}`).join(" ");
+
+  return (
+    <svg
+      viewBox={viewBox}
+      className="h-40 w-full text-accent"
+      preserveAspectRatio="xMidYMid meet"
+      role="img"
+      aria-label={`${geometry.kind} with ${pts.length} point${pts.length === 1 ? "" : "s"}`}
+    >
+      {geometry.kind === "circle" && pts[0] ? (
+        <circle
+          cx={pts[0].x}
+          cy={pts[0].y}
+          r={geometry.radius ?? 0}
+          fill={stroke}
+          fillOpacity={0.12}
+          stroke={stroke}
+          strokeWidth={sw}
+        />
+      ) : geometry.kind === "point" || pts.length === 1 ? (
+        pts.map((p, i) => (
+          <circle key={i} cx={p.x} cy={p.y} r={sw * 3} fill={stroke} />
+        ))
+      ) : closed ? (
+        <polygon points={path} fill={stroke} fillOpacity={0.12} stroke={stroke} strokeWidth={sw} />
+      ) : (
+        <polyline points={path} fill="none" stroke={stroke} strokeWidth={sw} />
+      )}
+      {geometry.kind !== "circle" && pts.length > 1
+        ? pts.map((p, i) => <circle key={i} cx={p.x} cy={p.y} r={sw * 1.8} fill={stroke} />)
+        : null}
+    </svg>
+  );
 }
 
 export default function TakeoffTab({
@@ -877,9 +952,17 @@ function TakeoffDrawer({
           {item.geometry ? (
             <div>
               <div className="mb-1 text-2xs font-semibold uppercase tracking-wide text-content-subtle">
-                Geometry as recorded ({item.geometry.kind})
+                Geometry as recorded ({item.geometry.kind}, {item.geometry.points.length} point
+                {item.geometry.points.length === 1 ? "" : "s"})
               </div>
-              <pre className="max-h-40 overflow-auto rounded-md border border-border bg-surface-sunken p-2 text-2xs text-content">
+              <div className="rounded-md border border-border bg-surface-sunken p-2">
+                <GeometrySketch geometry={item.geometry} colour={item.colour} />
+                <p className="mt-1 text-2xs text-content-subtle">
+                  Drawn from the stored coordinates, to their own scale. There is no sheet behind it —
+                  this is the shape the quantity came from, not a view of the drawing.
+                </p>
+              </div>
+              <pre className="mt-2 max-h-40 overflow-auto rounded-md border border-border bg-surface-sunken p-2 text-2xs text-content">
                 {JSON.stringify(item.geometry, null, 2)}
               </pre>
             </div>

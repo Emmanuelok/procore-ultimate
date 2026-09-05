@@ -1585,4 +1585,190 @@ export const submissionRoutes: FastifyPluginAsync = async (app) => {
       };
     },
   );
+
+  /* ---------------------------------------------------------------- */
+  /* Bid validity: the offer has a shelf life (#166, #174)             */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * A bid is an offer, and an offer expires. `validUntil` is the date the
+   * bidder said their price stood until; past it the figure in the tabulation
+   * is one the bidder is no longer bound by, and awarding on it invites a
+   * re-price at exactly the moment the second-lowest bid is no longer
+   * available.
+   *
+   * The award route therefore refuses to recommend an expired bid, and this
+   * is the only way to make one live again: a RECORD of the extension — who
+   * at the bidder confirmed it, until when, and against what (an email, a
+   * letter, a recorded call). The extension is not a field an evaluator may
+   * quietly edit to unblock themselves; it is an event with a source, and it
+   * is ledgered.
+   */
+  app.post(
+    "/bid-submissions/:submissionId/validity-extension",
+    { preHandler: companyGate },
+    async (req, reply) => {
+      const body = z
+        .object({
+          newValidUntil: isoDateSchema,
+          /** the person AT THE BIDDER who confirmed it */
+          confirmedBy: z.string().trim().min(1).max(200),
+          /** what the confirmation was: an email, a letter, a recorded call */
+          evidenceNote: reasonSchema,
+          evidenceFileIds: z.array(z.string().min(1).max(64)).max(20).optional(),
+        })
+        .parse(req.body);
+      const { submission, pkg } = await submissionContext(req);
+      await requireBiddingLevel(app, req, reply, submission.projectId, "standard");
+      if (pkg.status === "awarded" || pkg.status === "cancelled") {
+        throw conflict(
+          `${pkg.reference} is ${pkg.status}. Extending the validity of a bid after the tender ` +
+            "is over records a fact about a decision that has already been taken.",
+        );
+      }
+      if (!isInContention(submission.status)) {
+        throw conflict(
+          `${submission.reference} is ${submission.status} and is not in contention, so there ` +
+            "is no live offer to keep alive.",
+        );
+      }
+      const today = todayIso();
+      if (body.newValidUntil <= today) {
+        throw badRequest(
+          `An extension to ${body.newValidUntil} would already have expired (today is ` +
+            `${today}). An extension has to extend.`,
+        );
+      }
+      if (submission.validUntil && body.newValidUntil <= submission.validUntil) {
+        throw badRequest(
+          `${submission.reference} is already valid until ${submission.validUntil}; an ` +
+            `extension to ${body.newValidUntil} would shorten it. Bid validity is the bidder's ` +
+            "to give, not the buyer's to take away.",
+        );
+      }
+      const detail = (submission.detail as Record<string, unknown>) ?? {};
+      const priorExtensions = Array.isArray(detail["validityExtensions"])
+        ? (detail["validityExtensions"] as unknown[])
+        : [];
+      const now = new Date().toISOString();
+      const record = {
+        from: submission.validUntil,
+        to: body.newValidUntil,
+        confirmedBy: body.confirmedBy,
+        evidenceNote: body.evidenceNote,
+        evidenceFileIds: body.evidenceFileIds ?? [],
+        recordedBy: req.user!.id,
+        recordedAt: now,
+      };
+      await app.db
+        .update(bidSubmissions)
+        .set({
+          validUntil: body.newValidUntil,
+          detail: {
+            ...detail,
+            validityExtensions: [...priorExtensions, record],
+            /* the sweep may warn again, against the new date */
+            validityWarnedAt: null,
+            validityWarnedAgainst: null,
+          },
+          updatedAt: now,
+        })
+        .where(eq(bidSubmissions.id, submission.id));
+      await ledger(
+        app.db,
+        req,
+        "update",
+        "bid_submission",
+        submission.id,
+        {
+          projectId: submission.projectId,
+          packageId: submission.packageId,
+          event: "bid_validity_extended",
+          reference: submission.reference,
+          vendorId: submission.vendorId,
+          previousValidUntil: submission.validUntil,
+          newValidUntil: body.newValidUntil,
+          confirmedBy: body.confirmedBy,
+          evidenceNote: body.evidenceNote,
+          evidenceFileIds: body.evidenceFileIds ?? [],
+        },
+        submission.projectId,
+        true,
+      );
+      const fresh = await fetchSubmission(app.db, submission.id, req.companyId!);
+      return {
+        ...(await submissionDetail(app.db, fresh, pkg)),
+        extension: record,
+        extensionCount: priorExtensions.length + 1,
+      };
+    },
+  );
+
+  /**
+   * Every contender's validity standing, so an evaluator sees the clock while
+   * there is still time to ask for an extension rather than at the moment a
+   * recommendation is refused.
+   */
+  app.get(
+    "/projects/:projectId/bid-packages/:packageId/validity",
+    { preHandler: readGate },
+    async (req) => {
+      const { packageId } = req.params as { packageId: string };
+      const pkg = await fetchPackage(app.db, packageId, req.companyId!, req.projectId!);
+      const rows = await app.db
+        .select()
+        .from(bidSubmissions)
+        .where(eq(bidSubmissions.packageId, packageId));
+      const today = todayIso();
+      const measuredAgainst = pkg.anticipatedAwardDate ?? today;
+      const items = rows
+        .filter((r) => isInContention(r.status))
+        .map((r) => {
+          const detail = (r.detail as Record<string, unknown>) ?? {};
+          const extensions = Array.isArray(detail["validityExtensions"])
+            ? (detail["validityExtensions"] as unknown[])
+            : [];
+          const state =
+            r.validUntil === null
+              ? "not_stated"
+              : r.validUntil < today
+                ? "expired"
+                : r.validUntil < measuredAgainst
+                  ? "expires_before_award"
+                  : "live";
+          return {
+            submissionId: r.id,
+            reference: r.reference,
+            vendorId: r.vendorId,
+            status: r.status,
+            validUntil: r.validUntil,
+            state,
+            extensionCount: extensions.length,
+            basis:
+              r.validUntil === null
+                ? `${r.reference} stated no validity period, so nothing can be said about ` +
+                  "whether the offer still stands. It is not assumed to be open."
+                : state === "expired"
+                  ? `${r.reference} expired on ${r.validUntil}. It cannot be recommended until ` +
+                    "an extension is recorded against a confirmation from the bidder."
+                  : state === "expires_before_award"
+                    ? `${r.reference} expires on ${r.validUntil}, before the anticipated award ` +
+                      `date of ${measuredAgainst}.`
+                    : `${r.reference} stands until ${r.validUntil}.`,
+          };
+        })
+        .sort((a, b) => (a.validUntil ?? "9999-12-31").localeCompare(b.validUntil ?? "9999-12-31"));
+      return {
+        items,
+        total: items.length,
+        today,
+        measuredAgainst,
+        bidValidityDays: pkg.bidValidityDays,
+        anticipatedAwardDate: pkg.anticipatedAwardDate,
+        expired: items.filter((i) => i.state === "expired").length,
+        expiringBeforeAward: items.filter((i) => i.state === "expires_before_award").length,
+        notStated: items.filter((i) => i.state === "not_stated").length,
+      };
+    },
+  );
 };

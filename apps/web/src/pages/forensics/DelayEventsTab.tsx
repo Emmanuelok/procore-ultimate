@@ -519,7 +519,10 @@ export default function DelayEventsTab({
                     })()}
                   </Td>
                   <Td>
-                    <TiaChip deltaDays={ev.tiaResult?.completionDeltaDays ?? null} />
+                    <TiaChip
+                      deltaDays={ev.tiaResult?.completionDeltaDays ?? null}
+                      stale={ev.tia?.stale}
+                    />
                   </Td>
                   <Td>
                     <Badge tone={delayStatusTone(ev.status)}>{humanize(ev.status)}</Badge>
@@ -886,16 +889,39 @@ export default function DelayEventsTab({
               </div>
             ) : null}
             {selected.tiaResult ? (
-              <div className="text-sm text-ink-700">
-                Last result: <TiaChip deltaDays={selected.tiaResult.completionDeltaDays} />{" "}
-                <span className="text-xs text-ink-400">
-                  {formatDate(selected.tiaResult.beforeFinish)} →{" "}
-                  {formatDate(selected.tiaResult.afterFinish)}
-                  {selected.tiaResult.computedAt
-                    ? ` · computed ${formatDate(selected.tiaResult.computedAt)}`
-                    : ""}
-                </span>
-              </div>
+              selected.tia?.stale ? (
+                /*
+                 * The programme has moved since this ran. Showing the cached
+                 * delta here as though it still described the schedule is the
+                 * exact failure the API's staleness stamp exists to prevent —
+                 * so the number is withheld, not decorated.
+                 */
+                <div className="text-sm text-ink-700">
+                  <span className="rounded bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800 ring-1 ring-amber-200">
+                    Out of date
+                  </span>{" "}
+                  <span className="text-xs text-ink-500">
+                    {selected.tia.reason ??
+                      "the schedule has been recomputed since this analysis ran"} — re-run the TIA
+                    for a current figure
+                    {selected.tia.computedAt
+                      ? ` (last run ${formatDate(selected.tia.computedAt)})`
+                      : ""}
+                    .
+                  </span>
+                </div>
+              ) : (
+                <div className="text-sm text-ink-700">
+                  Last result: <TiaChip deltaDays={selected.tiaResult.completionDeltaDays} />{" "}
+                  <span className="text-xs text-ink-400">
+                    {formatDate(selected.tiaResult.beforeFinish)} →{" "}
+                    {formatDate(selected.tiaResult.afterFinish)}
+                    {selected.tiaResult.computedAt
+                      ? ` · computed ${formatDate(selected.tiaResult.computedAt)}`
+                      : ""}
+                  </span>
+                </div>
+              )
             ) : (
               <p className="text-xs text-ink-400">No TIA computed yet.</p>
             )}

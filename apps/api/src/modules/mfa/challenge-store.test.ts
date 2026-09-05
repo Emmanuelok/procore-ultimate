@@ -80,7 +80,10 @@ function codeFor(secret: string, offsetSteps = 0): string {
   return totpForStep(paramsFor(secret), totpStep(Date.now(), 30) + offsetSteps);
 }
 
-async function enrolAndConfirm(app: FastifyInstance, actor: Actor): Promise<string> {
+async function enrolAndConfirm(
+  app: FastifyInstance,
+  actor: Actor,
+): Promise<{ secret: string; recoveryCodes: string[] }> {
   const enrolled = await app.inject({
     method: "POST",
     url: "/api/v1/auth/mfa/enrol",
@@ -96,7 +99,7 @@ async function enrolAndConfirm(app: FastifyInstance, actor: Actor): Promise<stri
     payload: { code: codeFor(secret) },
   });
   expect(confirmed.statusCode).toBe(200);
-  return secret;
+  return { secret, recoveryCodes: (confirmed.json() as { recoveryCodes: string[] }).recoveryCodes };
 }
 
 describe("MFA challenges are single-use", () => {
@@ -133,7 +136,7 @@ describe("MFA challenges are single-use", () => {
 
   it("refuses a second exchange of the same challenge token", async () => {
     const actor = await signUp(app);
-    const secret = await enrolAndConfirm(app, actor);
+    const { secret, recoveryCodes } = await enrolAndConfirm(app, actor);
     const login = await app.inject({
       method: "POST",
       url: "/api/v1/auth/mfa/login",
@@ -147,6 +150,8 @@ describe("MFA challenges are single-use", () => {
     const first = await app.inject({
       method: "POST",
       url: "/api/v1/auth/mfa/challenge",
+      // A step ahead of the one enrolment confirmed with: `last_used_step`
+      // refuses the same step twice, which is the point of that column.
       payload: { challengeToken, code: codeFor(secret, 1) },
     });
     expect(first.statusCode).toBe(200);
@@ -158,12 +163,23 @@ describe("MFA challenges are single-use", () => {
       .where(eq(mfaChallenges.id, challengeId));
     expect(row?.consumedAt).not.toBeNull();
 
-    // A replay with a DIFFERENT, still-valid code: the code is not what stops
-    // it, the spent challenge is.
+    // THE REPLAY IS PROVED WITH A RECOVERY CODE, NOT A SECOND TOTP CODE, and
+    // the difference is the whole assertion. A TOTP replay is stopped one
+    // layer earlier by `last_used_step` (totp.ts), and a code from a
+    // different step is stopped earlier still by the +/-1 window - either way
+    // the request never reaches `consumeChallenge`, so an assertion on the
+    // spent challenge would be testing the authenticator, not the store. It
+    // also made the test depend on the wall clock crossing a 30-second
+    // boundary mid-request, which is why it went red on a fast machine and
+    // green on a loaded one. A recovery code is accepted by `assertFactor`
+    // on its own merits, so the ONLY thing left that can refuse this request
+    // is the challenge having been spent.
+    const recoveryCode = recoveryCodes[0];
+    expect(typeof recoveryCode).toBe("string");
     const replay = await app.inject({
       method: "POST",
       url: "/api/v1/auth/mfa/challenge",
-      payload: { challengeToken, code: codeFor(secret, 2) },
+      payload: { challengeToken, recoveryCode: recoveryCode ?? "" },
     });
     expect(replay.statusCode).toBe(401);
     expect((replay.json() as { message: string }).message).toContain("already been used");
@@ -178,7 +194,7 @@ describe("MFA challenges are single-use", () => {
       userId: victim.userId,
       role: "member",
     });
-    const secret = await enrolAndConfirm(app, victim);
+    const { secret } = await enrolAndConfirm(app, victim);
     const login = await app.inject({
       method: "POST",
       url: "/api/v1/auth/mfa/login",

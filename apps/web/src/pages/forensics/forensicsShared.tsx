@@ -43,6 +43,8 @@ export interface DelayEventRow {
   pacingOfEventId?: string | null;
   evidenceIds: string[];
   tiaResult: TiaResult | null;
+  /** staleness verdict from the API — present on list and detail responses */
+  tia?: TiaStatus;
   raisedBy: string;
   createdAt: string;
   updatedAt: string;
@@ -67,7 +69,6 @@ export interface DelayEventDetail extends DelayEventRow {
   task: { id: string; name: string } | null;
   contractEvent: { id: string; number: number; title: string } | null;
   evidence: EvidenceLite[];
-  tia?: TiaStatus;
 }
 
 export interface ClaimChain {
@@ -352,7 +353,24 @@ export const CLAIM_NEXT_STATUSES: Record<string, string[]> = {
 /* ------------------------------ Components ---------------------------------- */
 
 /** TIA completion-delta chip: "+Nd" red when the completion moves out. */
-export function TiaChip({ deltaDays }: { deltaDays: number | null | undefined }) {
+export function TiaChip({
+  deltaDays,
+  stale,
+}: {
+  deltaDays: number | null | undefined;
+  /** the schedule moved after this delta was computed — withhold the number */
+  stale?: boolean;
+}) {
+  if (stale) {
+    return (
+      <span
+        className="inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800"
+        title="The programme has been recomputed since this analysis ran — re-run the TIA"
+      >
+        out of date
+      </span>
+    );
+  }
   if (deltaDays === null || deltaDays === undefined) {
     return <span className="text-xs text-ink-300">not run</span>;
   }

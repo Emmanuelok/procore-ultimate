@@ -1571,6 +1571,35 @@ describe("change-order estimating (#208)", () => {
     expect(entries.length).toBeGreaterThan(0);
   });
 
+  it("refuses to push an estimate denominated in another currency", async () => {
+    const eventId = newId("cev");
+    await app.db.insert(changeEvents).values({
+      id: eventId,
+      companyId: owner.companyId,
+      projectId: projectA,
+      number: 2,
+      reference: "CE-002",
+      title: "Imported plant",
+      createdBy: owner.userId,
+    });
+    const created = await post(`/projects/${projectA}/estimates`, {
+      name: "Euro-priced change",
+      estimateType: "change_order",
+      currency: "EUR",
+    });
+    const estimateId = (created.json() as { id: string }).id;
+    await addLine(estimateId, { description: "Plant hire", quantity: 1, rates: { equipment: 5000 } });
+    const res = await post(`/projects/${projectA}/estimates/${estimateId}/push-to-change-event`, {
+      changeEventId: eventId,
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({
+      message: expect.stringContaining("carry no currency of their own"),
+    });
+    const rows = await app.db.select().from(changeEvents).where(eq(changeEvents.id, eventId));
+    expect(rows[0]?.estimatedCost).toBe(0);
+  });
+
   it("refuses a change event that is not on this project", async () => {
     const estimateId = await makeEstimate("Bad push");
     await addLine(estimateId, { description: "x", quantity: 1, rates: { other: 1 } });
@@ -2457,6 +2486,69 @@ describe("sub-quote transitions and provenance", () => {
     expect((estimate.json() as { directCostTotal: number }).directCostTotal).toBe(15000);
   });
 
+  it("warns rather than staying quiet when a quote row carries no price at all", async () => {
+    const estimateId = await makeEstimate("Blank row import");
+    const created = await post(`/projects/${projectA}/estimating/sub-quotes`, {
+      vendorName: "Half Priced Ltd",
+      tradePackage: "Drainage",
+      lines: [
+        { description: "Manholes", quantity: 6, unitRate: 900 },
+        // listed, quantified, and left blank — not a price of nil
+        { description: "Connections to sewer", quantity: 3 },
+      ],
+    });
+    const id = (created.json() as { id: string }).id;
+    const accepted = await post(`/projects/${projectA}/estimating/sub-quotes/${id}/accept`, {
+      estimateId,
+    });
+    expect(accepted.statusCode).toBe(201);
+    const body = accepted.json() as { created: number; warnings: string[] };
+    expect(body.created).toBe(2);
+    expect(body.warnings.join(" ")).toContain("carry no price at all");
+    expect(body.warnings.join(" ")).toContain("Connections to sewer");
+    const lines = await get(`/projects/${projectA}/estimates/${estimateId}/lines?pageSize=100`);
+    const items = (lines.json() as { items: Array<{ description: string; amount: number }> }).items;
+    expect(items.find((l) => l.description === "Connections to sewer")?.amount).toBe(0);
+    expect(items.find((l) => l.description === "Manholes")?.amount).toBe(5400);
+  });
+
+  it("levels a blank row as unpriced rather than as a bid of nil", async () => {
+    const pack = [
+      { vendorName: "Priced It Ltd", rate: 500 },
+      { vendorName: "Also Priced Ltd", rate: 520 },
+      { vendorName: "Left It Blank Ltd", rate: null },
+    ];
+    for (const p of pack) {
+      const res = await post(`/projects/${projectA}/estimating/sub-quotes`, {
+        vendorName: p.vendorName,
+        tradePackage: "Blank row levelling",
+        lines: [
+          { description: "Site clearance", quantity: 1, unitRate: 1000 },
+          p.rate === null
+            ? { description: "Topsoil strip", quantity: 1 }
+            : { description: "Topsoil strip", quantity: 1, unitRate: p.rate },
+        ],
+      });
+      expect(res.statusCode).toBe(201);
+    }
+    const levelling = await get(
+      `/projects/${projectA}/estimating/sub-quotes/levelling?tradePackage=${encodeURIComponent("Blank row levelling")}`,
+    );
+    expect(levelling.statusCode).toBe(200);
+    const data = levelling.json() as {
+      rows: Array<{ description: string; pricedCount: number; unpricedCount: number; median: number | null }>;
+      totals: Array<{ vendorName: string; unpricedRows: number; comparableTotal: number | null }>;
+    };
+    const topsoil = data.rows.find((r) => r.description === "Topsoil strip");
+    expect(topsoil?.pricedCount).toBe(2);
+    expect(topsoil?.unpricedCount).toBe(1);
+    expect(topsoil?.median).toBe(510);
+    const blank = data.totals.find((t) => t.vendorName === "Left It Blank Ltd");
+    expect(blank?.unpricedRows).toBe(1);
+    // 1000 quoted + the pack median of 510 for the row nobody can read as nil
+    expect(blank?.comparableTotal).toBe(1510);
+  });
+
   it("raises a quote_outlier signal when one bidder is a long way from the pack", async () => {
     const pack = [
       { vendorName: "Even Handed Ltd", amount: 10000 },
@@ -2635,5 +2727,75 @@ describe("conversion and versioning under concurrency", () => {
     const [parent] = await app.db.select().from(estimates).where(eq(estimates.id, estimateId));
     const chain = await app.db.select().from(estimates).where(eq(estimates.rootId, parent!.rootId));
     expect(chain.filter((e) => e.supersededById === null)).toHaveLength(1);
+  });
+});
+
+describe("a markup narrowed both ways (#199)", () => {
+  it("applies the tier to the selected cost types INSIDE the selected sections only", async () => {
+    const estimateId = await makeEstimate("Two-way narrowed markup");
+    const groundworks = await post(`/projects/${projectA}/estimates/${estimateId}/sections`, {
+      name: "Groundworks",
+      code: "A",
+    });
+    const externals = await post(`/projects/${projectA}/estimates/${estimateId}/sections`, {
+      name: "External works",
+      code: "B",
+    });
+    const groundworksId = (groundworks.json() as { id: string }).id;
+    const externalsId = (externals.json() as { id: string }).id;
+    await addLine(estimateId, {
+      description: "Dig",
+      quantity: 1,
+      costType: "labour",
+      rates: { labour: 1000 },
+      sectionId: groundworksId,
+    });
+    await addLine(estimateId, {
+      description: "Fencing sub",
+      quantity: 1,
+      costType: "subcontract",
+      rates: { subcontract: 2000 },
+      sectionId: externalsId,
+    });
+    await addLine(estimateId, {
+      description: "Setting out",
+      quantity: 1,
+      costType: "labour",
+      rates: { labour: 500 },
+      sectionId: externalsId,
+    });
+
+    const res = await post(`/projects/${projectA}/estimates/${estimateId}/markups`, {
+      kind: "insurance",
+      name: "Sub insurance, externals only",
+      basis: "cost_type",
+      costTypes: ["subcontract"],
+      sectionIds: [externalsId],
+      rate: 10,
+      sequence: 1,
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as { baseAmount: number; amount: number };
+    // 2000 — the subcontract inside externals. NOT 2500 (the whole section)
+    // and NOT 2000 + anything from groundworks.
+    expect(body.baseAmount).toBe(2000);
+    expect(body.amount).toBe(200);
+  });
+
+  it("refuses a markup narrowed to a section on another estimate", async () => {
+    const mine = await makeEstimate("Markup section owner");
+    const other = await makeEstimate("Somebody else's estimate");
+    const foreign = await post(`/projects/${projectA}/estimates/${other}/sections`, {
+      name: "Not mine",
+    });
+    const res = await post(`/projects/${projectA}/estimates/${mine}/markups`, {
+      kind: "overhead",
+      name: "Wrong section",
+      basis: "direct_cost",
+      sectionIds: [(foreign.json() as { id: string }).id],
+      rate: 5,
+      sequence: 1,
+    });
+    expect(res.statusCode).toBe(404);
   });
 });

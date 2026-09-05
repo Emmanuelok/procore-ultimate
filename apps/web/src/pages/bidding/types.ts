@@ -1713,3 +1713,71 @@ export interface BiddingHealthInputs {
   metrics: Record<string, number | null>;
   reasons: string[];
 }
+
+/* ------------------------- Bid validity --------------------------- */
+
+export type BidValidityState = "live" | "expires_before_award" | "expired" | "not_stated";
+
+export interface BidValidityRow {
+  submissionId: string;
+  reference: string;
+  vendorId: string;
+  status: string;
+  validUntil: string | null;
+  state: BidValidityState;
+  extensionCount: number;
+  basis: string;
+}
+
+export interface BidValidityReport extends ListResponse<BidValidityRow> {
+  today: string;
+  measuredAgainst: string;
+  bidValidityDays: number | null;
+  anticipatedAwardDate: string | null;
+  expired: number;
+  expiringBeforeAward: number;
+  notStated: number;
+}
+
+/* ------------- Company-wide bid-integrity register ---------------- */
+
+export interface CompanyIntegritySignal {
+  id: string;
+  detector: string;
+  severity: string;
+  confidence: number | null;
+  title: string;
+  explanation: string;
+  disposition: string;
+  subjectType: string | null;
+  subjectId: string | null;
+  evidenceRefs: unknown;
+  firstSeenAt: string | null;
+  lastSeenAt: string | null;
+  createdAt: string;
+  package: { id: string; reference: string; title: string; projectId: string } | null;
+}
+
+export interface CompanyIntegrityRegister extends ListResponse<CompanyIntegritySignal> {
+  byDetector: Array<{ detector: string; count: number }>;
+  bySeverity: Array<{ severity: string; count: number }>;
+  windowMonths: number;
+  note: string;
+}
+
+export interface DetectorPrecisionRow {
+  detector: string;
+  raised: number;
+  open: number;
+  confirmed: number;
+  escalated: number;
+  falsePositive: number;
+  reviewed: number;
+  precision: number | null;
+  basis: string;
+}
+
+export interface DetectorPrecisionReport extends ListResponse<DetectorPrecisionRow> {
+  minReviewed: number;
+  note: string;
+}

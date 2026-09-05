@@ -658,6 +658,73 @@ function AwardCard({
             </>
           ) : null}
 
+          {["recommended", "pending_approval", "approved", "letter_of_intent"].includes(
+            award.status,
+          ) ? (
+            /*
+             * UNWINDING AN AWARD IS A RECORDED ACT.
+             *
+             * A recommendation withdrawn, or an approval reversed before the
+             * contract issued, voids the draft commitment, puts the other bids
+             * back into contention and leaves a reason in the ledger — so a
+             * later re-award is a second decision on the record rather than a
+             * quiet edit of the first. Not by the person who recommended it.
+             */
+            <Button
+              size="sm"
+              variant="danger"
+              loading={busy === `withdraw:${award.id}`}
+              onClick={() => {
+                void (async () => {
+                  const reason = await onAsk({
+                    title: "Withdraw this award",
+                    description:
+                      "The draft commitment is voided, the other bids go back into contention and the reason is ledgered. A contract that has been issued or executed is unwound through the commitment instead.",
+                    confirmLabel: "Withdraw",
+                    destructive: true,
+                  });
+                  if (reason) await onAct("withdraw", award.id, "withdraw", { reason });
+                })();
+              }}
+            >
+              Withdraw the award
+            </Button>
+          ) : null}
+
+          {["recommended", "pending_approval", "approved", "letter_of_intent"].includes(
+            award.status,
+          ) ? (
+            /*
+             * UNWINDING AN AWARD IS A RECORDED ACT.
+             *
+             * A recommendation withdrawn, or an approval reversed before the
+             * contract issued, voids the draft commitment, puts the other
+             * bids back into contention and leaves a reason in the ledger —
+             * so a later re-award is a second decision on the record rather
+             * than a quiet edit of the first. Not by the person who
+             * recommended it.
+             */
+            <Button
+              size="sm"
+              variant="danger"
+              loading={busy === `withdraw:${award.id}`}
+              onClick={() => {
+                void (async () => {
+                  const reason = await onAsk({
+                    title: "Withdraw this award",
+                    description:
+                      "The draft commitment is voided, the other bids go back into contention and the reason is ledgered. A contract that has been issued or executed is unwound through the commitment instead.",
+                    confirmLabel: "Withdraw",
+                    destructive: true,
+                  });
+                  if (reason) await onAct("withdraw", award.id, "withdraw", { reason });
+                })();
+              }}
+            >
+              Withdraw the award
+            </Button>
+          ) : null}
+
           {award.status === "approved" && !award.unsuccessfulNotifiedAt ? (
             <Button
               size="sm"

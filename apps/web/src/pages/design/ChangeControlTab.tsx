@@ -27,6 +27,7 @@ import {
   EM_DASH,
   EditPanel,
   KeyValue,
+  LinkPanel,
   LoadError,
   ReasonList,
   RefusalNotice,
@@ -684,6 +685,14 @@ function NoticeDrawer({
               ]}
             />
             {row.description ? <p className="text-meta text-content-muted">{row.description}</p> : null}
+
+            <LinkPanel
+              base={base}
+              fromType="design_change_notice"
+              fromId={row.id}
+              sheets={lookups.sheets}
+              tasks={lookups.tasks}
+            />
 
             <EditPanel
               title="Correct this notice"

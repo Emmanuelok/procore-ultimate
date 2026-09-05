@@ -130,3 +130,64 @@ export type ClaimRequestKind = (typeof CLAIM_REQUEST_KINDS)[number];
  */
 export const CLAIM_REQUEST_STATUSES = ["open", "responded", "closed", "withdrawn"] as const;
 export type ClaimRequestStatus = (typeof CLAIM_REQUEST_STATUSES)[number];
+
+/* ------------------------------------------------------------------ */
+/* Learning — the knowledge graph (#992)                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The four kinds of edge a lesson has. A closed list because each kind
+ * answers a different question and each is stored with a different guarantee:
+ * a `record` edge was checked against a real row, a `tag` edge is vocabulary,
+ * a `person` edge is provenance, a `lesson` edge is supersession.
+ */
+export const LESSON_EDGE_KINDS = ["record", "person", "tag", "lesson"] as const;
+export type LessonEdgeKind = (typeof LESSON_EDGE_KINDS)[number];
+
+/** Why an edge exists — the label on the arrow, not just its direction. */
+export const LESSON_EDGE_ROLES = [
+  "origin", // the record the lesson came out of
+  "evidence", // a record cited as evidence for it
+  "applied_to", // a record the lesson was applied to on a later project
+  "author",
+  "validator",
+  "applier",
+  "tag",
+  "supersedes",
+  "superseded_by",
+  "see_also",
+] as const;
+export type LessonEdgeRole = (typeof LESSON_EDGE_ROLES)[number];
+
+/* ------------------------------------------------------------------ */
+/* Learning — feedback into the libraries (#981–984)                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A library entry's life. `proposed` is where the sweep leaves everything:
+ * outturn data is a proposal about what a rate should be, never an
+ * instruction, and an admin who has not looked at the sample has not agreed
+ * to anything.
+ */
+export const LIBRARY_ENTRY_STATUSES = ["proposed", "accepted", "rejected", "superseded"] as const;
+export type LibraryEntryStatus = (typeof LIBRARY_ENTRY_STATUSES)[number];
+
+/* ------------------------------------------------------------------ */
+/* Insurance — certificate authenticity (#772, #781)                    */
+/* ------------------------------------------------------------------ */
+
+/** Who is being asked to confirm a certificate. */
+export const CONFIRMATION_CHANNELS = ["broker", "insurer"] as const;
+export type ConfirmationChannel = (typeof CONFIRMATION_CHANNELS)[number];
+
+/**
+ * `sent` is the honest resting state of an unanswered request: silence is not
+ * confirmation, and a certificate whose confirmation was never answered has
+ * not been verified by anybody.
+ */
+export const CONFIRMATION_STATUSES = ["sent", "responded", "expired", "withdrawn"] as const;
+export type ConfirmationStatus = (typeof CONFIRMATION_STATUSES)[number];
+
+/** What the broker or insurer said when asked. */
+export const CONFIRMATION_OUTCOMES = ["confirmed", "corrected", "not_on_risk", "unknown"] as const;
+export type ConfirmationOutcome = (typeof CONFIRMATION_OUTCOMES)[number];

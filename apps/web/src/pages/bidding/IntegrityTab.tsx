@@ -127,7 +127,7 @@ export default function IntegrityTab({
     const map = new Map<string, string>();
     for (const s of data?.signals ?? []) {
       const refs = s.evidenceRefs as { key?: string } | null;
-      if (refs?.key && s.disposition !== "dismissed" && s.disposition !== "closed") {
+      if (refs?.key && s.disposition !== "false_positive" && s.disposition !== "closed") {
         map.set(refs.key, s.id);
       }
     }
@@ -158,6 +158,30 @@ export default function IntegrityTab({
     if (!text) return;
     const res = await action.run(signalId, () =>
       api.post(`/api/v1/companies/current/bid-integrity/${signalId}/dismiss`, { reason: text }),
+    );
+    if (res) refresh();
+  }
+
+
+  /**
+   * The other half of the loop. Precision is confirmed ÷ (confirmed + false
+   * positive); a register whose only recordable outcome is a dismissal
+   * measures every detector at zero however good it is. A confirmed finding
+   * stays OPEN — a real pattern still bears on the next recommendation.
+   */
+  async function confirmFinding(signalId: string) {
+    const text = await reason.ask({
+      title: "Confirm this finding",
+      description:
+        "Confirming records that the pattern was real and what was found. The finding stays " +
+        "open: it still has to be acknowledged before a bidder on this package is recommended.",
+      label: "What was checked, and what was found",
+      confirmLabel: "Confirm",
+      minLength: 3,
+    });
+    if (!text) return;
+    const res = await action.run(`${signalId}:confirm`, () =>
+      api.post(`/api/v1/companies/current/bid-integrity/${signalId}/confirm`, { reason: text }),
     );
     if (res) refresh();
   }
@@ -302,6 +326,17 @@ export default function IntegrityTab({
                         <Button size="xs" variant="ghost" onClick={() => setOpen(f)}>
                           Evidence
                         </Button>
+                        {signalId ? (
+                          <Button
+                            size="xs"
+                            variant="secondary"
+                            loading={action.busy === `${signalId}:confirm`}
+                            onClick={() => void confirmFinding(signalId)}
+                            title="Record that the pattern was real. The finding stays open."
+                          >
+                            Confirm
+                          </Button>
+                        ) : null}
                         {signalId ? (
                           <Button
                             size="xs"

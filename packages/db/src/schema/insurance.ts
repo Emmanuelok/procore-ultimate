@@ -110,6 +110,20 @@ export const insuranceCertificates = pgTable(
     verifiedAt: timestamp("verified_at", { withTimezone: true, mode: "string" }),
     /** how verification was done — insurer confirmation beats a PDF */
     verificationMethod: text("verification_method"),
+    /*
+     * WHAT THE DOCUMENT SAYS, AS OPPOSED TO WHAT SOMEBODY TYPED.
+     *
+     * A certificate is keyed in by the party who benefits from it reading
+     * favourably. Extraction reads the uploaded document itself and the two
+     * are then diffed: `extractedFields` is the machine's reading with its
+     * citations, `extractionMismatches` the fields where the two disagree.
+     * Neither overwrites the typed value — a disagreement is a finding, not a
+     * correction to apply silently.
+     */
+    extractedFields: jsonb("extracted_fields").$type<Record<string, unknown> | null>(),
+    extractionMismatches: jsonb("extraction_mismatches").$type<unknown[]>().default([]).notNull(),
+    extractionRunId: text("extraction_run_id"),
+    extractedAt: timestamp("extracted_at", { withTimezone: true, mode: "string" }),
     status: text("status").default("active").notNull(),
     createdBy: text("created_by").notNull(),
     createdAt: createdAt(),
@@ -437,5 +451,65 @@ export const insuranceClaimRequests = pgTable(
     index("insurance_claim_requests_claim_idx").on(t.claimId, t.status),
     index("insurance_claim_requests_company_idx").on(t.companyId, t.status, t.dueDate),
     index("insurance_claim_requests_project_idx").on(t.companyId, t.projectId),
+  ],
+);
+
+/* ------------------------------------------------------------------ */
+/* AUTHENTICITY: ASKING THE PARTY WHO ISSUED IT (#772, #781)           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A certificate of insurance is a photocopy of an assertion. The party who
+ * hands it over is the party who benefits from it reading well, and a
+ * convincing forgery costs nothing to produce. `verificationMethod` already
+ * distinguished "document_review" from "insurer_confirmation" — but nothing
+ * in the platform could actually OBTAIN an insurer confirmation, so every
+ * verification was ultimately self-declared by the checker.
+ *
+ * This table is the missing channel: a tokenised request sent to the broker or
+ * insurer's own address, whose reply is recorded here with the hash of the
+ * message that carried it. The token is single-purpose, expiring and bound to
+ * one certificate; the reply sets `verificationMethod = broker_confirmation`
+ * or `insurer_confirmation` on the certificate and the response hash is the
+ * evidence. A confirmation nobody answered stays `sent`, which is a fact worth
+ * seeing: an unanswered request is not a verification.
+ */
+export const insuranceConfirmations = pgTable(
+  "insurance_confirmations",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id"),
+    certificateId: text("certificate_id").notNull(),
+    /** who was asked */
+    channel: text("channel").default("broker").notNull(), // ConfirmationChannel
+    recipientName: text("recipient_name"),
+    recipientEmail: text("recipient_email").notNull(),
+    recipientContactId: text("recipient_contact_id"),
+    recipientVendorId: text("recipient_vendor_id"),
+    /** the unguessable secret in the link; never displayed after issue */
+    token: text("token").notNull(),
+    tokenHash: text("token_hash").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true, mode: "string" }).notNull(),
+    status: text("status").default("sent").notNull(), // ConfirmationStatus
+    /** what the recipient said, and the hash of exactly those bytes */
+    responseOutcome: text("response_outcome"), // ConfirmationOutcome
+    responseNote: text("response_note"),
+    responseSha256: text("response_sha256"),
+    respondedAt: timestamp("responded_at", { withTimezone: true, mode: "string" }),
+    /** the snapshot of the certificate the recipient was asked to confirm */
+    assertedFields: jsonb("asserted_fields").$type<Record<string, unknown>>().default({}).notNull(),
+    /** whatever of that the recipient corrected */
+    correctedFields: jsonb("corrected_fields").$type<Record<string, unknown>>().default({}).notNull(),
+    emailMessageId: text("email_message_id"),
+    sentAt: timestamp("sent_at", { withTimezone: true, mode: "string" }),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("insurance_confirmations_token_uq").on(t.tokenHash),
+    index("insurance_confirmations_cert_idx").on(t.certificateId, t.status),
+    index("insurance_confirmations_company_idx").on(t.companyId, t.status),
   ],
 );

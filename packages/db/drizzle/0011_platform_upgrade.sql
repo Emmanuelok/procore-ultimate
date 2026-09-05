@@ -1833,6 +1833,33 @@ CREATE TABLE "insurance_claim_requests" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
+CREATE TABLE "insurance_confirmations" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text,
+	"certificate_id" text NOT NULL,
+	"channel" text DEFAULT 'broker' NOT NULL,
+	"recipient_name" text,
+	"recipient_email" text NOT NULL,
+	"recipient_contact_id" text,
+	"recipient_vendor_id" text,
+	"token" text NOT NULL,
+	"token_hash" text NOT NULL,
+	"expires_at" timestamp with time zone NOT NULL,
+	"status" text DEFAULT 'sent' NOT NULL,
+	"response_outcome" text,
+	"response_note" text,
+	"response_sha256" text,
+	"responded_at" timestamp with time zone,
+	"asserted_fields" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"corrected_fields" jsonb DEFAULT '{}'::jsonb NOT NULL,
+	"email_message_id" text,
+	"sent_at" timestamp with time zone,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
 CREATE TABLE "insurance_premiums" (
 	"id" text PRIMARY KEY NOT NULL,
 	"company_id" text NOT NULL,
@@ -1877,6 +1904,48 @@ CREATE TABLE "insurance_requirements" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
+CREATE TABLE "duration_library_entries" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"activity_code" text NOT NULL,
+	"description" text,
+	"unit" text DEFAULT 'days' NOT NULL,
+	"sample_size" integer NOT NULL,
+	"median_days" double precision,
+	"p80_days" double precision,
+	"mean_days" double precision,
+	"min_days" double precision,
+	"max_days" double precision,
+	"planned_days" double precision,
+	"accuracy_ratio" double precision,
+	"source_project_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"samples" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"status" text DEFAULT 'proposed' NOT NULL,
+	"note" text,
+	"supersedes_id" text,
+	"accepted_by" text,
+	"accepted_at" timestamp with time zone,
+	"computed_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "lesson_edges" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"lesson_id" text NOT NULL,
+	"edge_kind" text NOT NULL,
+	"target_type" text NOT NULL,
+	"target_id" text NOT NULL,
+	"target_label" text,
+	"target_project_id" text,
+	"role" text NOT NULL,
+	"verified" integer DEFAULT 0 NOT NULL,
+	"record_link_id" text,
+	"created_by" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
 CREATE TABLE "lesson_pushes" (
 	"id" text PRIMARY KEY NOT NULL,
 	"company_id" text NOT NULL,
@@ -1890,6 +1959,55 @@ CREATE TABLE "lesson_pushes" (
 	"acknowledged_at" timestamp with time zone,
 	"application_id" text,
 	"dismissed_reason" text,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "rate_library_entries" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"element_code" text NOT NULL,
+	"description" text,
+	"unit" text NOT NULL,
+	"currency" text NOT NULL,
+	"sample_size" integer NOT NULL,
+	"median_rate" double precision,
+	"p80_rate" double precision,
+	"mean_rate" double precision,
+	"min_rate" double precision,
+	"max_rate" double precision,
+	"estimated_rate" double precision,
+	"accuracy_ratio" double precision,
+	"source_project_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"samples" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"status" text DEFAULT 'proposed' NOT NULL,
+	"note" text,
+	"supersedes_id" text,
+	"accepted_by" text,
+	"accepted_at" timestamp with time zone,
+	"computed_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "risk_realisations" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"risk_id" text NOT NULL,
+	"risk_reference" text,
+	"category" text,
+	"title" text,
+	"predicted_probability" double precision,
+	"predicted_impact" double precision,
+	"predicted_currency" text,
+	"realised_at" text,
+	"realised_impact" double precision,
+	"realised_currency" text,
+	"realised_days" integer,
+	"source_type" text,
+	"source_id" text,
+	"note" text,
+	"created_by" text,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
@@ -7424,6 +7542,10 @@ ALTER TABLE "benchmark_samples" ADD COLUMN "superseded_by_sample_id" text;--> st
 ALTER TABLE "project_metric_snapshots" ADD COLUMN "currency" text;--> statement-breakpoint
 ALTER TABLE "project_metric_snapshots" ADD COLUMN "outlier_signal_id" text;--> statement-breakpoint
 ALTER TABLE "bonds" ADD COLUMN "facility_id" text;--> statement-breakpoint
+ALTER TABLE "insurance_certificates" ADD COLUMN "extracted_fields" jsonb;--> statement-breakpoint
+ALTER TABLE "insurance_certificates" ADD COLUMN "extraction_mismatches" jsonb DEFAULT '[]'::jsonb NOT NULL;--> statement-breakpoint
+ALTER TABLE "insurance_certificates" ADD COLUMN "extraction_run_id" text;--> statement-breakpoint
+ALTER TABLE "insurance_certificates" ADD COLUMN "extracted_at" timestamp with time zone;--> statement-breakpoint
 ALTER TABLE "insurance_claims" ADD COLUMN "loss_adjuster_contact_id" text;--> statement-breakpoint
 ALTER TABLE "insurance_claims" ADD COLUMN "pack_file_id" text;--> statement-breakpoint
 ALTER TABLE "insurance_claims" ADD COLUMN "pack_sha256" text;--> statement-breakpoint
@@ -7701,14 +7823,28 @@ CREATE INDEX "bond_facilities_review_idx" ON "bond_facilities" USING btree ("com
 CREATE INDEX "insurance_claim_requests_claim_idx" ON "insurance_claim_requests" USING btree ("claim_id","status");--> statement-breakpoint
 CREATE INDEX "insurance_claim_requests_company_idx" ON "insurance_claim_requests" USING btree ("company_id","status","due_date");--> statement-breakpoint
 CREATE INDEX "insurance_claim_requests_project_idx" ON "insurance_claim_requests" USING btree ("company_id","project_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "insurance_confirmations_token_uq" ON "insurance_confirmations" USING btree ("token_hash");--> statement-breakpoint
+CREATE INDEX "insurance_confirmations_cert_idx" ON "insurance_confirmations" USING btree ("certificate_id","status");--> statement-breakpoint
+CREATE INDEX "insurance_confirmations_company_idx" ON "insurance_confirmations" USING btree ("company_id","status");--> statement-breakpoint
 CREATE INDEX "insurance_premiums_policy_idx" ON "insurance_premiums" USING btree ("policy_id");--> statement-breakpoint
 CREATE INDEX "insurance_premiums_company_idx" ON "insurance_premiums" USING btree ("company_id","currency");--> statement-breakpoint
 CREATE INDEX "insurance_requirements_company_idx" ON "insurance_requirements" USING btree ("company_id","status");--> statement-breakpoint
 CREATE INDEX "insurance_requirements_project_idx" ON "insurance_requirements" USING btree ("company_id","project_id","policy_type");--> statement-breakpoint
 CREATE INDEX "insurance_requirements_vendor_idx" ON "insurance_requirements" USING btree ("vendor_id");--> statement-breakpoint
+CREATE INDEX "duration_library_company_idx" ON "duration_library_entries" USING btree ("company_id","status");--> statement-breakpoint
+CREATE INDEX "duration_library_activity_idx" ON "duration_library_entries" USING btree ("company_id","activity_code","status");--> statement-breakpoint
+CREATE UNIQUE INDEX "lesson_edges_uq" ON "lesson_edges" USING btree ("lesson_id","edge_kind","target_type","target_id","role");--> statement-breakpoint
+CREATE INDEX "lesson_edges_lesson_idx" ON "lesson_edges" USING btree ("lesson_id");--> statement-breakpoint
+CREATE INDEX "lesson_edges_target_idx" ON "lesson_edges" USING btree ("company_id","target_type","target_id");--> statement-breakpoint
+CREATE INDEX "lesson_edges_kind_idx" ON "lesson_edges" USING btree ("company_id","edge_kind");--> statement-breakpoint
 CREATE UNIQUE INDEX "lesson_pushes_uq" ON "lesson_pushes" USING btree ("lesson_id","project_id");--> statement-breakpoint
 CREATE INDEX "lesson_pushes_project_idx" ON "lesson_pushes" USING btree ("project_id","status");--> statement-breakpoint
 CREATE INDEX "lesson_pushes_company_idx" ON "lesson_pushes" USING btree ("company_id","status");--> statement-breakpoint
+CREATE INDEX "rate_library_company_idx" ON "rate_library_entries" USING btree ("company_id","status");--> statement-breakpoint
+CREATE INDEX "rate_library_element_idx" ON "rate_library_entries" USING btree ("company_id","element_code","status");--> statement-breakpoint
+CREATE UNIQUE INDEX "risk_realisations_uq" ON "risk_realisations" USING btree ("risk_id","source_type","source_id");--> statement-breakpoint
+CREATE INDEX "risk_realisations_company_idx" ON "risk_realisations" USING btree ("company_id","category");--> statement-breakpoint
+CREATE INDEX "risk_realisations_project_idx" ON "risk_realisations" USING btree ("project_id");--> statement-breakpoint
 CREATE INDEX "integration_export_profiles_company_idx" ON "integration_export_profiles" USING btree ("company_id","feed");--> statement-breakpoint
 CREATE UNIQUE INDEX "backcharges_uq" ON "backcharges" USING btree ("project_id","number");--> statement-breakpoint
 CREATE INDEX "backcharges_commitment_idx" ON "backcharges" USING btree ("commitment_id","status");--> statement-breakpoint

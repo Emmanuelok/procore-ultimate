@@ -688,11 +688,44 @@ export const reviewRoutes: FastifyPluginAsync = async (app) => {
     const companyId = req.companyId!;
     const review = await loadReview(companyId, projectId, reviewId);
     if (review.status === "closed") throw conflict("A closed cycle cannot be cancelled.");
+    if (review.status === "cancelled") throw conflict("This review cycle is already cancelled.");
+    const now = nowISO();
     const [updated] = await app.db
       .update(designReviews)
-      .set({ status: "cancelled", closedAt: nowISO(), closedBy: req.user!.id, notes: body.reason, updatedAt: nowISO() })
+      .set({
+        status: "cancelled",
+        closedAt: now,
+        closedBy: req.user!.id,
+        // Append rather than overwrite: the reason a cycle was withdrawn does
+        // not replace what the cycle recorded on its way there.
+        notes: [review.notes, `Cancelled ${now.slice(0, 10)}: ${body.reason}`].filter(Boolean).join("\n"),
+        updatedAt: now,
+      })
       .where(eq(designReviews.id, reviewId))
       .returning();
+
+    // Opening a cycle moves a planned/in-progress package to "in review".
+    // Cancelling the cycle has to put that back, or the package sits in review
+    // for ever with nothing under review — but only when this was the
+    // package's ONLY cycle: a package that reached "in review" through an
+    // earlier CLOSED cycle keeps the standing that cycle gave it.
+    const [otherCycles] = await app.db
+      .select({ n: count() })
+      .from(designReviews)
+      .where(
+        and(
+          eq(designReviews.packageId, review.packageId),
+          notInArray(designReviews.id, [reviewId]),
+          notInArray(designReviews.status, ["cancelled"]),
+        ),
+      );
+    if ((otherCycles?.n ?? 0) === 0) {
+      await app.db
+        .update(designPackages)
+        .set({ status: "in_progress", updatedAt: now })
+        .where(and(eq(designPackages.id, review.packageId), eq(designPackages.status, "in_review")));
+    }
+    await refreshPackageCounters(review.packageId);
     await ledger(app.db, {
       companyId,
       projectId,
@@ -700,7 +733,7 @@ export const reviewRoutes: FastifyPluginAsync = async (app) => {
       action: "state_change",
       objectType: "design_review",
       objectId: reviewId,
-      payload: { to: "cancelled", reason: body.reason },
+      payload: { to: "cancelled", reason: body.reason, packageReturnedToInProgress: (otherCycles?.n ?? 0) === 0 },
     });
     return updated;
   });

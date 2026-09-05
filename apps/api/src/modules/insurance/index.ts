@@ -1,4 +1,6 @@
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
+import { createHash, randomBytes } from "node:crypto";
+import type Anthropic from "@anthropic-ai/sdk";
 import { and, asc, count, desc, eq, gt, ilike, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
@@ -11,6 +13,7 @@ import {
   insuranceCertificates,
   insuranceClaimRequests,
   insuranceClaims,
+  insuranceConfirmations,
   insurancePolicies,
   insurancePremiums,
   insuranceRequirements,
@@ -28,6 +31,9 @@ import {
   BOND_FACILITY_STATUSES,
   BOND_TYPES,
   CLAIM_REQUEST_KINDS,
+  CONFIRMATION_CHANNELS,
+  CONFIRMATION_OUTCOMES,
+  CONFIRMATION_STATUSES,
   INSURANCE_CLAIM_STATUSES,
   INSURANCE_PREMIUM_KINDS,
   INSURANCE_REQUIREMENT_STATUSES,
@@ -92,6 +98,16 @@ import {
   scopeAllows,
   scopeProjectsOrCompanyWide,
 } from "../meetings/scope.js";
+import { aiDisabledError, aiEnabled, runAgent, streamToBuffer } from "../ai/service.js";
+import { buildAppUrl, resolveEmailTransport, type EmailTransport } from "../../lib/email.js";
+import {
+  buildExtractionSystemPrompt,
+  buildExtractionUserPrompt,
+  certificateExtractionSchema,
+  diffExtraction,
+  summariseExtraction,
+  type ExtractionSubject,
+} from "./extraction.js";
 
 /* ------------------------------------------------------------------ */
 /* Local vocabularies (not in shared enums — kept honest here)          */
@@ -126,6 +142,8 @@ const INSURANCE_DETECTORS = [
   "policy_period_gap",
   "uninsured_loss_candidate",
   "policy_renewal_overdue",
+  /* The document disagrees with the record, or the insurer says it is not on risk */
+  "insurance_certificate_mismatch",
 ] as const;
 
 /** Obligations created here all carry this prefix so they can be counted back. */
@@ -650,6 +668,17 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
     app.requireCompanyRole(["owner", "admin"]),
   ];
   const scopeOf = (req: FastifyRequest) => companyScopeOf(req, "insurance");
+
+  /*
+   * One transport per app instance: `resolveEmailTransport` builds a new one
+   * per call and the default records into memory, so a per-request transport
+   * would throw away the log that makes "was it actually sent?" answerable.
+   */
+  let transport: EmailTransport | null = null;
+  const emailTransport = (): EmailTransport => {
+    transport ??= resolveEmailTransport(app.appConfig);
+    return transport;
+  };
 
   /* ---------------------------------------------------------------- */
   /* Fetchers                                                          */
@@ -5684,6 +5713,721 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
     return { ...out, projectId: null, ranAt: new Date().toISOString() };
   });
 
+  /* ================================================================ */
+  /* AUTHENTICITY: READING THE DOCUMENT, AND ASKING THE INSURER        */
+  /* (#772, #781)                                                      */
+  /* ================================================================ */
+
+  const EXTRACTABLE_IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"] as const;
+  const MAX_EXTRACTION_BYTES = 8 * 1024 * 1024;
+
+  function extractionSubjectOf(cert: {
+    subjectName: string;
+    policyType: string;
+    certificateNumber: string | null;
+    insurer: string | null;
+    limitOfIndemnity: number | null;
+    currency: string;
+    validFrom: string;
+    validTo: string;
+  }): ExtractionSubject {
+    return {
+      subjectName: cert.subjectName,
+      policyType: cert.policyType,
+      certificateNumber: cert.certificateNumber,
+      insurer: cert.insurer,
+      limitOfIndemnity: cert.limitOfIndemnity,
+      currency: cert.currency,
+      validFrom: cert.validFrom,
+      validTo: cert.validTo,
+    };
+  }
+
+  /**
+   * Read the uploaded certificate and diff it against what was typed.
+   *
+   * WHY THIS EXISTS. Every downstream control — limit adequacy, cover gaps,
+   * expiry sweeps, invoice holds — runs on the TYPED values, which are keyed
+   * in by the party the certificate is meant to hold to account. Until now
+   * nothing ever compared them with the document sitting next to them.
+   *
+   * Nothing is overwritten. A disagreement is a finding with a severity and
+   * the quote it rests on; deciding which side is right is a person's job,
+   * and a system that silently "corrects" the record destroys the evidence
+   * that there was ever a discrepancy.
+   */
+  app.post(
+    "/projects/:projectId/insurance/certificates/:certId/extract",
+    { preHandler: standardGate },
+    async (req) => {
+      const { certId } = req.params as { certId: string };
+      const cert = await fetchCertificate(certId, req.companyId!, req.projectId!);
+      if (!cert.fileId) {
+        throw badRequest(
+          "No certificate document has been uploaded, so there is nothing to read. Upload the " +
+            "certificate first — extraction reads the paper, not the record.",
+        );
+      }
+      if (!aiEnabled(app)) throw aiDisabledError();
+
+      const [file] = await app.db
+        .select()
+        .from(files)
+        .where(and(eq(files.id, cert.fileId), eq(files.companyId, req.companyId!)))
+        .limit(1);
+      if (!file) throw notFound("The certificate document could not be found in storage");
+      if (file.sizeBytes > MAX_EXTRACTION_BYTES) {
+        throw badRequest(
+          `The document is ${Math.round(file.sizeBytes / 1_048_576)} MB, above the ${MAX_EXTRACTION_BYTES / 1_048_576} MB extraction limit. Upload a smaller scan.`,
+        );
+      }
+
+      const subject = extractionSubjectOf(cert);
+      const blocks: Anthropic.Beta.BetaContentBlockParam[] = [];
+      let buffer: Buffer;
+      try {
+        buffer = await streamToBuffer(app.storage.readStream(file.storageKey));
+      } catch {
+        throw badRequest(
+          "The certificate document could not be read from storage, so nothing was extracted.",
+        );
+      }
+      if (file.contentType === "application/pdf") {
+        blocks.push({ type: "text", text: buildExtractionUserPrompt(subject, "(see attachment)") });
+        blocks.push({
+          type: "document",
+          source: { type: "base64", media_type: "application/pdf", data: buffer.toString("base64") },
+        });
+      } else if (
+        EXTRACTABLE_IMAGE_TYPES.includes(file.contentType as (typeof EXTRACTABLE_IMAGE_TYPES)[number])
+      ) {
+        blocks.push({ type: "text", text: buildExtractionUserPrompt(subject, "(see attachment)") });
+        blocks.push({
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: file.contentType as (typeof EXTRACTABLE_IMAGE_TYPES)[number],
+            data: buffer.toString("base64"),
+          },
+        });
+      } else if (file.contentType.startsWith("text/")) {
+        blocks.push({
+          type: "text",
+          text: buildExtractionUserPrompt(subject, buffer.toString("utf8")),
+        });
+      } else {
+        throw badRequest(
+          `A ${file.contentType} document cannot be read. Upload the certificate as a PDF, an ` +
+            "image or plain text.",
+        );
+      }
+
+      const run = await runAgent({
+        app,
+        req,
+        agentKind: "insurance_certificate_extraction",
+        projectId: req.projectId!,
+        system: buildExtractionSystemPrompt(),
+        user: blocks,
+        inputRefs: [
+          { type: "insurance_certificate", id: cert.id },
+          { type: "file", id: file.id },
+        ],
+        schema: certificateExtractionSchema,
+        maxTokens: 2000,
+        dataCategories: ["insurance", "documents"],
+      });
+      if (!run.json) {
+        throw badRequest(
+          "The extraction did not return a readable answer. Nothing has been recorded against " +
+            "the certificate.",
+        );
+      }
+      const mismatches = diffExtraction(subject, run.json);
+      const summary = summariseExtraction(run.json, mismatches);
+      const now = new Date().toISOString();
+      await app.db
+        .update(insuranceCertificates)
+        .set({
+          extractedFields: run.json as unknown as Record<string, unknown>,
+          extractionMismatches: mismatches,
+          extractionRunId: run.runId,
+          extractedAt: now,
+          updatedAt: now,
+        })
+        .where(eq(insuranceCertificates.id, certId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "insurance_certificate",
+        objectId: certId,
+        projectId: req.projectId!,
+        payload: {
+          extraction: {
+            runId: run.runId,
+            fileSha256: file.sha256,
+            mismatches: mismatches.map((m) => ({ field: m.field, severity: m.severity })),
+            summary,
+          },
+        },
+        storePayload: true,
+      });
+
+      /*
+       * A cover-critical disagreement is a Signal, not a toast. The whole
+       * point is that it survives the tab being closed and appears in the
+       * assurance register beside everything else that threatens cover.
+       */
+      const high = mismatches.filter((m) => m.severity === "high");
+      if (high.length > 0) {
+        const key = `${certId}:${file.sha256}`;
+        const seen = await alreadySignalled(req.companyId!, "insurance_certificate_mismatch", [key]);
+        if (!seen.has(key)) {
+          await app.db.insert(signals).values({
+            id: newId("sig"),
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            detector: "insurance_certificate_mismatch",
+            severity: "high",
+            confidence: 0.8,
+            title: `Certificate does not say what the record says — ${cert.subjectName} (${cert.policyType})`,
+            explanation:
+              `The uploaded certificate for ${cert.subjectName} disagrees with the recorded ` +
+              `details on ${high.length} cover-critical field(s): ` +
+              high
+                .map((m) => `${m.field} (record ${String(m.typed)}, document ${String(m.extracted)})`)
+                .join("; ") +
+              ". Every adequacy, expiry and hold check on this certificate has been running " +
+              "against the typed values. Establish which is correct before relying on either; " +
+              "the extraction reads the document and does not confirm it with the insurer.",
+            fingerprint: `insurance_certificate_mismatch:${certId}:${file.sha256}`,
+            subjectType: "insurance_certificate",
+            subjectId: certId,
+            evidenceRefs: {
+              key,
+              certificateId: certId,
+              fileSha256: file.sha256,
+              runId: run.runId,
+              mismatches: high.map((m) => ({
+                field: m.field,
+                typed: m.typed,
+                extracted: m.extracted,
+                quote: m.quote,
+              })),
+            },
+          });
+        }
+      }
+
+      return {
+        certificateId: certId,
+        runId: run.runId,
+        extracted: run.json,
+        mismatches,
+        summary,
+        citations: run.grounding.citations,
+        appliedToRecord: false,
+        note:
+          "Nothing on the certificate record was changed. Extraction reads the document; it does " +
+          "not verify it. Verification still requires a person, or a reply from the broker or " +
+          "insurer through the confirmation channel.",
+      };
+    },
+  );
+
+  /** What the last extraction found, without re-running it. */
+  app.get(
+    "/projects/:projectId/insurance/certificates/:certId/extraction",
+    { preHandler: readGate },
+    async (req) => {
+      const { certId } = req.params as { certId: string };
+      const cert = await fetchCertificate(certId, req.companyId!, req.projectId!);
+      return {
+        certificateId: certId,
+        extractedAt: cert.extractedAt,
+        runId: cert.extractionRunId,
+        extracted: cert.extractedFields,
+        mismatches: cert.extractionMismatches,
+        available: cert.extractedAt !== null,
+        reason:
+          cert.extractedAt !== null
+            ? null
+            : cert.fileId
+              ? "The document has never been read. Run the extraction to compare it with the record."
+              : "No certificate document has been uploaded, so there is nothing to compare the record against.",
+      };
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Broker / insurer confirmation (#781)                              */
+  /* ---------------------------------------------------------------- */
+
+  const CONFIRMATION_TTL_DAYS = 21;
+
+  const confirmationRequestSchema = z.object({
+    channel: z.enum(CONFIRMATION_CHANNELS).default("broker"),
+    recipientEmail: z.string().email().max(320),
+    recipientName: z.string().max(200).nullable().optional(),
+    recipientContactId: z.string().max(64).nullable().optional(),
+    recipientVendorId: z.string().max(64).nullable().optional(),
+    message: z.string().max(2000).nullable().optional(),
+  });
+
+  /**
+   * Ask the party that issued the cover whether it exists.
+   *
+   * `verificationMethod = insurer_confirmation` was always in the vocabulary
+   * and never obtainable: the checker ticked a box saying they had confirmed
+   * it, which is self-declaration with extra steps. This sends a tokenised
+   * request to the broker or insurer's own address; their reply — not our
+   * assertion about their reply — sets the verification, and the hash of the
+   * reply is the evidence.
+   */
+  app.post(
+    "/projects/:projectId/insurance/certificates/:certId/confirmations",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const body = confirmationRequestSchema.parse(req.body);
+      const { certId } = req.params as { certId: string };
+      const cert = await fetchCertificate(certId, req.companyId!, req.projectId!);
+      if (cert.status === "withdrawn" || cert.status === "superseded") {
+        throw badRequest(`A ${cert.status} certificate does not need confirming`);
+      }
+      if (body.recipientVendorId) await assertVendor(body.recipientVendorId, req.companyId!);
+
+      const token = randomBytes(24).toString("hex");
+      const tokenHash = createHash("sha256").update(token).digest("hex");
+      const now = new Date().toISOString();
+      const expiresAt = new Date(
+        Date.now() + CONFIRMATION_TTL_DAYS * 86_400_000,
+      ).toISOString();
+      const id = newId("iconf");
+      const asserted = {
+        subjectName: cert.subjectName,
+        policyType: cert.policyType,
+        certificateNumber: cert.certificateNumber,
+        insurer: cert.insurer,
+        limitOfIndemnity: cert.limitOfIndemnity,
+        currency: cert.currency,
+        validFrom: cert.validFrom,
+        validTo: cert.validTo,
+      };
+      await app.db.insert(insuranceConfirmations).values({
+        id,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        certificateId: certId,
+        channel: body.channel,
+        recipientName: body.recipientName ?? null,
+        recipientEmail: body.recipientEmail,
+        recipientContactId: body.recipientContactId ?? null,
+        recipientVendorId: body.recipientVendorId ?? null,
+        token,
+        tokenHash,
+        expiresAt,
+        status: "sent",
+        assertedFields: asserted,
+        createdBy: req.user!.id,
+      });
+
+      const link = buildAppUrl(app.appConfig.APP_BASE_URL, `/insurance/confirm/${token}`);
+      const lines = [
+        `${body.recipientName ?? "Sir or Madam"},`,
+        "",
+        `We hold the following certificate of insurance for ${cert.subjectName} and are asking you, as ` +
+          `${body.channel === "insurer" ? "the insurer" : "the broker"}, to confirm that it is on risk as stated.`,
+        "",
+        `  Policy type:   ${cert.policyType}`,
+        `  Policy number: ${cert.certificateNumber ?? "(not stated)"}`,
+        `  Insurer:       ${cert.insurer ?? "(not stated)"}`,
+        `  Limit:         ${cert.limitOfIndemnity ?? "(not stated)"} ${cert.currency}`,
+        `  Period:        ${cert.validFrom} to ${cert.validTo}`,
+        "",
+        body.message ?? "",
+        "",
+        `Confirm or correct these details here: ${link}`,
+        `This link expires on ${expiresAt.slice(0, 10)}.`,
+      ]
+        .filter((l) => l !== null)
+        .join("\n");
+
+      const result = await emailTransport().send({
+        to: { email: body.recipientEmail, name: body.recipientName ?? undefined },
+        subject: `Confirmation of insurance — ${cert.subjectName} (${cert.policyType})`,
+        text: lines,
+      });
+      await app.db
+        .update(insuranceConfirmations)
+        .set({
+          sentAt: result.dispatched ? (result.at ?? now) : null,
+          emailMessageId: result.providerMessageId ?? null,
+          updatedAt: now,
+        })
+        .where(eq(insuranceConfirmations.id, id));
+
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "insurance_confirmation",
+        objectId: id,
+        projectId: req.projectId!,
+        payload: {
+          certificateId: certId,
+          channel: body.channel,
+          recipientEmail: body.recipientEmail,
+          dispatched: result.dispatched,
+          reasons: result.reasons,
+          expiresAt,
+          /* The token itself is never ledgered: it is a bearer credential. */
+          tokenHash,
+        },
+        storePayload: true,
+      });
+
+      const [row] = await app.db
+        .select()
+        .from(insuranceConfirmations)
+        .where(eq(insuranceConfirmations.id, id))
+        .limit(1);
+      return reply.status(201).send({
+        ...redactConfirmation(row!),
+        dispatched: result.dispatched,
+        deliveryReasons: result.reasons,
+        /* Returned ONCE, to the requester, so the link can be copied into a
+           reply if the transport is a no-op in this environment. */
+        link,
+      });
+    },
+  );
+
+  /** Never return the bearer token in a listing. */
+  function redactConfirmation<T extends { token: string; tokenHash: string }>(row: T) {
+    const { token: _token, ...rest } = row;
+    return rest;
+  }
+
+  app.get(
+    "/projects/:projectId/insurance/certificates/:certId/confirmations",
+    { preHandler: readGate },
+    async (req) => {
+      const { certId } = req.params as { certId: string };
+      await fetchCertificate(certId, req.companyId!, req.projectId!);
+      const rows = await app.db
+        .select()
+        .from(insuranceConfirmations)
+        .where(
+          and(
+            eq(insuranceConfirmations.companyId, req.companyId!),
+            eq(insuranceConfirmations.certificateId, certId),
+          ),
+        )
+        .orderBy(desc(insuranceConfirmations.createdAt));
+      const now = Date.now();
+      return {
+        items: rows.map((r) => ({
+          ...redactConfirmation(r),
+          overdue: r.status === "sent" && Date.parse(r.expiresAt) < now,
+        })),
+        total: rows.length,
+        reason:
+          rows.length === 0
+            ? "Nobody has been asked to confirm this certificate. Until they are, verification rests on the document alone."
+            : null,
+      };
+    },
+  );
+
+  /**
+   * THE ONLY UNAUTHENTICATED ROUTE IN THIS MODULE.
+   *
+   * A broker is not a platform user and never will be; requiring an account
+   * would guarantee the confirmation never happens, which is why every
+   * insurance module in the industry settles for self-declared verification.
+   * The token is 24 random bytes, single-use, bound to one certificate and
+   * expiring — and it grants exactly one thing: the ability to answer this
+   * question about this certificate. It is stored hashed, so a database read
+   * does not yield a usable link.
+   */
+  app.post("/insurance/confirmations/:token/respond", async (req) => {
+    const { token } = req.params as { token: string };
+    const body = z
+      .object({
+        outcome: z.enum(CONFIRMATION_OUTCOMES),
+        note: z.string().max(4000).nullable().optional(),
+        corrected: z
+          .object({
+            insurer: z.string().max(300).nullable().optional(),
+            certificateNumber: z.string().max(200).nullable().optional(),
+            limitOfIndemnity: z.number().finite().nullable().optional(),
+            currency: z.string().max(8).nullable().optional(),
+            validFrom: z.string().max(40).nullable().optional(),
+            validTo: z.string().max(40).nullable().optional(),
+          })
+          .optional(),
+        respondentName: z.string().max(200).nullable().optional(),
+      })
+      .parse(req.body);
+    if (!/^[0-9a-f]{48}$/.test(token)) throw notFound("This confirmation link is not valid");
+    const tokenHash = createHash("sha256").update(token).digest("hex");
+    const [row] = await app.db
+      .select()
+      .from(insuranceConfirmations)
+      .where(eq(insuranceConfirmations.tokenHash, tokenHash))
+      .limit(1);
+    if (!row) throw notFound("This confirmation link is not valid");
+    if (row.status === "withdrawn") throw conflict("This confirmation request was withdrawn");
+    if (row.status === "responded") {
+      throw conflict("This confirmation has already been answered and cannot be answered twice");
+    }
+    if (Date.parse(row.expiresAt) < Date.now()) {
+      await app.db
+        .update(insuranceConfirmations)
+        .set({ status: "expired", updatedAt: new Date().toISOString() })
+        .where(eq(insuranceConfirmations.id, row.id));
+      throw conflict("This confirmation link has expired. Ask for a new one.");
+    }
+
+    const now = new Date().toISOString();
+    const canonical = JSON.stringify({
+      confirmationId: row.id,
+      certificateId: row.certificateId,
+      outcome: body.outcome,
+      note: body.note ?? null,
+      corrected: body.corrected ?? {},
+      respondentName: body.respondentName ?? null,
+      respondedAt: now,
+    });
+    const responseSha256 = createHash("sha256").update(canonical).digest("hex");
+
+    await app.db
+      .update(insuranceConfirmations)
+      .set({
+        status: "responded",
+        responseOutcome: body.outcome,
+        responseNote: body.note ?? null,
+        responseSha256,
+        respondedAt: now,
+        correctedFields: (body.corrected ?? {}) as Record<string, unknown>,
+        recipientName: body.respondentName ?? row.recipientName,
+        updatedAt: now,
+      })
+      .where(eq(insuranceConfirmations.id, row.id));
+
+    /*
+     * ONLY a positive confirmation verifies. "Corrected" means the paper we
+     * hold is wrong, and "not on risk" means the certificate is worthless —
+     * neither is a verification, and recording them as one would be the exact
+     * failure this channel exists to prevent.
+     */
+    if (body.outcome === "confirmed") {
+      await app.db
+        .update(insuranceCertificates)
+        .set({
+          verificationMethod:
+            row.channel === "insurer" ? "insurer_confirmation" : "broker_confirmation",
+          verifiedAt: now,
+          /* Verified by a party outside the platform: there is no user id to
+             record, and inventing one would misattribute the act. */
+          verifiedBy: null,
+          updatedAt: now,
+        })
+        .where(eq(insuranceCertificates.id, row.certificateId));
+    }
+
+    await appendLedger(app.db, {
+      companyId: row.companyId,
+      /* An external party is not an actor in this tenant. */
+      actorId: null,
+      action: "state_change",
+      objectType: "insurance_confirmation",
+      objectId: row.id,
+      projectId: row.projectId,
+      payload: {
+        from: "sent",
+        to: "responded",
+        outcome: body.outcome,
+        channel: row.channel,
+        certificateId: row.certificateId,
+        respondentEmail: row.recipientEmail,
+        respondentName: body.respondentName ?? row.recipientName,
+        responseSha256,
+        corrected: body.corrected ?? {},
+        verificationApplied: body.outcome === "confirmed",
+      },
+      storePayload: true,
+    });
+
+    if (body.outcome === "not_on_risk") {
+      const key = `${row.certificateId}:not_on_risk`;
+      const seen = await alreadySignalled(row.companyId, "insurance_certificate_mismatch", [key]);
+      if (!seen.has(key)) {
+        await app.db.insert(signals).values({
+          id: newId("sig"),
+          companyId: row.companyId,
+          projectId: row.projectId,
+          detector: "insurance_certificate_mismatch",
+          severity: "critical",
+          confidence: 0.95,
+          title: "The insurer says this certificate is not on risk",
+          explanation:
+            `The ${row.channel} named on the certificate was asked to confirm it and answered ` +
+            "that the cover is not on risk as stated. Treat the party as uninsured for this risk " +
+            "until a valid certificate is produced: any hold, adequacy check or contractual " +
+            "confirmation relying on this certificate is unsupported. " +
+            (body.note ? `Their words: "${body.note}"` : "No further detail was given."),
+          fingerprint: `insurance_certificate_mismatch:${row.certificateId}:not_on_risk`,
+          subjectType: "insurance_certificate",
+          subjectId: row.certificateId,
+          evidenceRefs: {
+            key,
+            certificateId: row.certificateId,
+            confirmationId: row.id,
+            responseSha256,
+          },
+        });
+      }
+    }
+
+    return {
+      recorded: true,
+      outcome: body.outcome,
+      responseSha256,
+      verificationApplied: body.outcome === "confirmed",
+      note:
+        body.outcome === "confirmed"
+          ? "Thank you. The certificate is now recorded as confirmed by you, with the hash of this reply as the evidence."
+          : "Thank you. Your answer has been recorded and the certificate has NOT been marked as verified.",
+    };
+  });
+
+  /** Withdraw an unanswered request (wrong address, superseded certificate). */
+  app.post(
+    "/projects/:projectId/insurance/confirmations/:confirmationId/withdraw",
+    { preHandler: standardGate },
+    async (req) => {
+      const { confirmationId } = req.params as { confirmationId: string };
+      const body = z.object({ reason: z.string().max(1000).nullable().optional() }).parse(
+        req.body ?? {},
+      );
+      const [row] = await app.db
+        .select()
+        .from(insuranceConfirmations)
+        .where(
+          and(
+            eq(insuranceConfirmations.id, confirmationId),
+            eq(insuranceConfirmations.companyId, req.companyId!),
+            eq(insuranceConfirmations.projectId, req.projectId!),
+          ),
+        )
+        .limit(1);
+      if (!row) throw notFound("Confirmation request not found");
+      if (row.status === "responded") {
+        throw conflict(
+          "This request has been answered. Withdrawing it now would erase a reply that a " +
+            "verification rests on.",
+        );
+      }
+      const now = new Date().toISOString();
+      await app.db
+        .update(insuranceConfirmations)
+        .set({ status: "withdrawn", updatedAt: now })
+        .where(eq(insuranceConfirmations.id, confirmationId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "insurance_confirmation",
+        objectId: confirmationId,
+        projectId: req.projectId!,
+        payload: { from: row.status, to: "withdrawn", reason: body.reason ?? null },
+        storePayload: true,
+      });
+      const [updated] = await app.db
+        .select()
+        .from(insuranceConfirmations)
+        .where(eq(insuranceConfirmations.id, confirmationId))
+        .limit(1);
+      return redactConfirmation(updated!);
+    },
+  );
+
+  /** Company-wide view of who has been asked and who has not answered. */
+  app.get("/insurance/confirmations", { preHandler: companyScopedRead }, async (req) => {
+    const q = pageQuerySchema
+      .extend({ status: z.enum(CONFIRMATION_STATUSES).optional() })
+      .parse(req.query);
+    const scope = scopeOf(req);
+    const where = and(
+      eq(insuranceConfirmations.companyId, req.companyId!),
+      q.status ? eq(insuranceConfirmations.status, q.status) : undefined,
+      scopeProjectsOrCompanyWide(scope, insuranceConfirmations.projectId),
+    );
+    const [totalRow] = await app.db
+      .select({ n: count() })
+      .from(insuranceConfirmations)
+      .where(where);
+    const rows = await app.db
+      .select()
+      .from(insuranceConfirmations)
+      .where(where)
+      .orderBy(desc(insuranceConfirmations.createdAt))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    const now = Date.now();
+    return paginate(
+      rows.map((r) => ({
+        ...redactConfirmation(r),
+        overdue: r.status === "sent" && Date.parse(r.expiresAt) < now,
+      })),
+      Number(totalRow?.n ?? 0),
+      q,
+    );
+  });
+
+  /**
+   * Expire unanswered requests on a schedule rather than when somebody looks.
+   * An expired request is a fact — nobody answered — and it must show up as
+   * that rather than sitting in `sent` forever, which reads like a request
+   * still in flight.
+   */
+  async function expireConfirmations(companyId: string): Promise<number> {
+    const now = new Date().toISOString();
+    const stale = await app.db
+      .select({ id: insuranceConfirmations.id, projectId: insuranceConfirmations.projectId })
+      .from(insuranceConfirmations)
+      .where(
+        and(
+          eq(insuranceConfirmations.companyId, companyId),
+          eq(insuranceConfirmations.status, "sent"),
+          sql`${insuranceConfirmations.expiresAt} < ${now}`,
+        ),
+      )
+      .limit(500);
+    for (const row of stale) {
+      await app.db
+        .update(insuranceConfirmations)
+        .set({ status: "expired", updatedAt: now })
+        .where(eq(insuranceConfirmations.id, row.id));
+      await appendLedger(app.db, {
+        companyId,
+        actorId: null,
+        action: "state_change",
+        objectType: "insurance_confirmation",
+        objectId: row.id,
+        projectId: row.projectId,
+        payload: {
+          from: "sent",
+          to: "expired",
+          reason: "The confirmation link expired without a reply. Silence is not confirmation.",
+        },
+      });
+    }
+    return stale.length;
+  }
+
   app.scheduler.register({
     name: "insurance.expiry",
     description:
@@ -5695,6 +6439,16 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         const out = await sweepInsurance(companyId, null, null);
         return out.signals;
       }),
+  });
+
+  app.scheduler.register({
+    name: "insurance.confirmation-expiry",
+    description:
+      "Close out broker and insurer confirmation requests whose link has expired without a reply, so an unanswered request stops reading like one still in flight — silence is not confirmation",
+    everyMs: 6 * 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db }) =>
+      forEachCompany(db, async (companyId) => ({ expired: await expireConfirmations(companyId) })),
   });
 
   app.scheduler.register({

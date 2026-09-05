@@ -1317,6 +1317,187 @@ export function EditPanel({
   );
 }
 
+/* ========================================================================== */
+/* Cross-tool links                                                            */
+/* ========================================================================== */
+
+export interface RecordLinkRow {
+  id: string;
+  fromType: string;
+  fromId: string;
+  toType: string;
+  toId: string;
+  linkKind: string;
+  createdAt: string;
+}
+
+const LINK_TARGET_LABEL: Record<string, string> = {
+  drawing_sheet: "Drawing sheet",
+  bim_model: "BIM model",
+  spec_section: "Specification section",
+  document: "Document",
+  change_event: "Change event",
+  schedule_task: "Schedule task",
+  rfi: "RFI",
+  submittal: "Submittal",
+};
+
+/**
+ * The design record's ties to the rest of the platform, held in `record_links`:
+ * a package to the sheets that carry it, a change notice to the task it moves,
+ * an issue to the model it was found in. The API checks that the target exists
+ * in this project, so a link here points at something real; where the target's
+ * register has not been loaded the panel shows the id rather than inventing a
+ * name for it.
+ */
+export function LinkPanel({
+  base,
+  fromType,
+  fromId,
+  sheets,
+  tasks,
+}: {
+  base: string;
+  fromType: string;
+  fromId: string;
+  sheets: readonly SheetOption[];
+  tasks: readonly TaskOption[];
+}) {
+  const links = useResource<{ items: RecordLinkRow[]; targetTypes: readonly string[] }>(
+    `${base}/links?fromType=${fromType}&fromId=${fromId}`,
+  );
+  const action = useAction();
+  const [open, setOpen] = useState(false);
+  const [toType, setToType] = useState("drawing_sheet");
+  const [toId, setToId] = useState("");
+
+  const targetTypes = links.data?.targetTypes ?? ["drawing_sheet", "schedule_task"];
+
+  function nameFor(link: RecordLinkRow): string {
+    if (link.toType === "drawing_sheet") {
+      const sheet = sheets.find((s) => s.id === link.toId);
+      return sheet ? `${sheet.number} — ${sheet.title}` : link.toId;
+    }
+    if (link.toType === "schedule_task") {
+      const task = tasks.find((t) => t.id === link.toId);
+      return task ? task.name : link.toId;
+    }
+    return link.toId;
+  }
+
+  async function add() {
+    if (!toId.trim()) return;
+    const r = await action.run("link", () =>
+      api.post<{ created?: boolean; reason?: string }>(`${base}/links`, {
+        fromType,
+        fromId,
+        toType,
+        toId: toId.trim(),
+        linkKind: "reference",
+      }),
+    );
+    if (r) {
+      toast.success(r.created === false ? (r.reason ?? "That link already exists.") : "Linked");
+      setToId("");
+      links.reload();
+    }
+  }
+
+  async function remove(linkId: string) {
+    const r = await action.run(`unlink-${linkId}`, () => api.del<{ deleted: string }>(`${base}/links/${linkId}`));
+    if (r) {
+      toast.success("Link removed");
+      links.reload();
+    }
+  }
+
+  const options: Array<{ value: string; label: string }> =
+    toType === "drawing_sheet"
+      ? [{ value: "", label: "— pick a sheet —" }, ...sheets.map((s) => ({ value: s.id, label: `${s.number} — ${s.title}` }))]
+      : toType === "schedule_task"
+        ? [{ value: "", label: "— pick a task —" }, ...tasks.map((t) => ({ value: t.id, label: t.name }))]
+        : [];
+
+  return (
+    <div className="rounded-md border border-border-subtle p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="text-meta font-semibold text-content">Linked records</h3>
+          <p className="text-2xs text-content-muted">
+            Drawings, models, specifications, tasks and change events this record is tied to.
+          </p>
+        </div>
+        <Button size="xs" variant="secondary" onClick={() => setOpen((v) => !v)}>
+          {open ? "Close" : "Link a record"}
+        </Button>
+      </div>
+
+      {links.error ? <LoadError message={links.error} onRetry={links.reload} /> : null}
+      {action.refusal ? <RefusalNotice refusal={action.refusal} onDismiss={action.clear} /> : null}
+
+      {open ? (
+        <div className="mt-3 grid gap-2 sm:grid-cols-[10rem_1fr_auto]">
+          <Field label="Type">
+            <Select
+              value={toType}
+              onChange={(e) => {
+                setToType(e.target.value);
+                setToId("");
+              }}
+            >
+              {targetTypes.map((t) => (
+                <option key={t} value={t}>
+                  {LINK_TARGET_LABEL[t] ?? labelize(t)}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field label="Record" hint={options.length === 0 ? "No picker for this type yet — paste the record id." : undefined}>
+            {options.length > 0 ? (
+              <Select value={toId} onChange={(e) => setToId(e.target.value)}>
+                {options.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </Select>
+            ) : (
+              <Input value={toId} onChange={(e) => setToId(e.target.value)} placeholder="record id" />
+            )}
+          </Field>
+          <div className="flex items-end">
+            <Button size="sm" loading={action.busy === "link"} disabled={!toId.trim()} onClick={() => void add()}>
+              Link
+            </Button>
+          </div>
+        </div>
+      ) : null}
+
+      {links.loading && !links.data ? (
+        <p className="mt-2 text-2xs italic text-content-subtle">Loading links…</p>
+      ) : (links.data?.items ?? []).length === 0 ? (
+        <p className="mt-2 text-2xs italic text-content-subtle">Nothing is linked to this record yet.</p>
+      ) : (
+        <ul className="mt-2 divide-y divide-border-subtle">
+          {(links.data?.items ?? []).map((link) => (
+            <li key={link.id} className="flex items-center justify-between gap-3 py-1.5">
+              <div className="min-w-0">
+                <span className="text-2xs uppercase tracking-wide text-content-subtle">
+                  {LINK_TARGET_LABEL[link.toType] ?? labelize(link.toType)}
+                </span>
+                <div className="truncate text-meta text-content">{nameFor(link)}</div>
+              </div>
+              <Button size="xs" variant="ghost" loading={action.busy === `unlink-${link.id}`} onClick={() => void remove(link.id)}>
+                Remove
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 /** The engine's verdict with its basis underneath — never a bare colour. */
 export function VerdictLine({ tone, label, basis }: { tone: Tone; label: string; basis?: string | null }) {
   return (

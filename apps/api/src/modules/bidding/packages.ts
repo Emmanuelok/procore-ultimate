@@ -1527,7 +1527,7 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
       const openIntegrity = findings.filter(
         (f) =>
           f.detector.startsWith("bid_integrity_") &&
-          f.disposition !== "dismissed" &&
+          f.disposition !== "false_positive" &&
           f.disposition !== "closed",
       ).length;
       const bidders =

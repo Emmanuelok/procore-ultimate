@@ -659,6 +659,88 @@ describe("regressions", () => {
     expect(row?.totalsAreComplete).toBe(false);
     expect(row?.totalNote).toContain("cannot be stated");
   });
+
+  /*
+   * `tm_tickets.approved_by` / `approved_at` and the statuses `approved` and
+   * `rejected` existed from the start and NO ROUTE EVER WROTE THEM: a user
+   * who configured an internal approval step got no behaviour at all, and
+   * the only sign-off on a ticket was the client's own signature — which is
+   * their acknowledgement of the hours, not our decision to claim them.
+   */
+  it("records our own approval of a ticket, which is not the client's signature", async () => {
+    const ticket = await post(`/projects/${projectId}/tm-tickets`, {
+      title: "Night-shift standby",
+      ticketDate: day(47),
+      currency: "GBP",
+      lines: [{ lineKind: "labour", description: "Standby gang", hours: 8, rate: 20 }],
+    });
+    expect(ticket.statusCode).toBe(201);
+    const ticketId = ticket.json().id as string;
+
+    // Not a decision to take while it is still a draft.
+    const early = await post(
+      `/projects/${projectId}/tm-tickets/${ticketId}/approve`,
+      { decision: "approved" },
+      approver.headers,
+    );
+    expect(early.statusCode).toBe(409);
+
+    expect((await post(`/projects/${projectId}/tm-tickets/${ticketId}/submit`, {})).statusCode).toBe(
+      200,
+    );
+
+    // The person who raised and submitted it may not approve it, and the
+    // attempt is written down before it is refused.
+    const self = await post(`/projects/${projectId}/tm-tickets/${ticketId}/approve`, {
+      decision: "approved",
+    });
+    expect(self.statusCode).toBe(403);
+    expect(self.json().message).toContain("may not approve it");
+
+    const approved = await post(
+      `/projects/${projectId}/tm-tickets/${ticketId}/approve`,
+      { decision: "approved", comment: "Rates agreed with the QS" },
+      approver.headers,
+    );
+    expect(approved.statusCode, approved.body).toBe(200);
+    expect(approved.json().status).toBe("approved");
+    expect(approved.json().approvedBy).toBe(approver.userId);
+    expect(approved.json().approvedAt).not.toBeNull();
+    // Our approval is not the client's signature and does not fake one.
+    expect(approved.json().signedAt).toBeNull();
+  });
+
+  it("sends a ticket back with its reason rather than deleting it", async () => {
+    const ticket = await post(`/projects/${projectId}/tm-tickets`, {
+      title: "Disputed plant standing",
+      ticketDate: day(48),
+      currency: "GBP",
+      lines: [{ lineKind: "equipment", description: "Excavator standing", hours: 6, rate: 45 }],
+    });
+    const ticketId = ticket.json().id as string;
+    expect((await post(`/projects/${projectId}/tm-tickets/${ticketId}/submit`, {})).statusCode).toBe(
+      200,
+    );
+
+    const bare = await post(
+      `/projects/${projectId}/tm-tickets/${ticketId}/approve`,
+      { decision: "rejected" },
+      approver.headers,
+    );
+    expect(bare.statusCode).toBe(400);
+
+    const sentBack = await post(
+      `/projects/${projectId}/tm-tickets/${ticketId}/approve`,
+      { decision: "rejected", comment: "No instruction reference on the ticket" },
+      approver.headers,
+    );
+    expect(sentBack.statusCode, sentBack.body).toBe(200);
+    expect(sentBack.json().status).toBe("draft");
+    expect(sentBack.json().approvedBy).toBeNull();
+    expect(sentBack.json().disputedReason).toContain("No instruction reference");
+    // The hours are still there — a rejection is not a deletion.
+    expect((sentBack.json().lines as unknown[]).length).toBe(1);
+  });
 });
 
 /* ================================================================== */

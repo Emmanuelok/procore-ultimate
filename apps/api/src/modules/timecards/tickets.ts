@@ -25,7 +25,7 @@ import {
 } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
-import { badRequest, conflict, notFound } from "../../lib/errors.js";
+import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import type { Db } from "../../lib/db.js";
 // The changes module owns change-order pricing. This module links INTO it and
@@ -168,6 +168,11 @@ const signSchema = z.object({
 });
 
 const submitSchema = z.object({ comment: z.string().max(4000).nullable().optional() });
+
+const ticketApprovalSchema = z.object({
+  decision: z.enum(["approved", "rejected"]),
+  comment: z.string().max(4000).nullable().optional(),
+});
 
 const promoteSchema = z.object({
   target: z.enum(["change_event", "potential_change_order"]).default("change_event"),
@@ -978,6 +983,114 @@ export const tmTicketRoutes: FastifyPluginAsync = async (app) => {
         from: ticket.status,
         to: "submitted",
       });
+      return ticketView(ticketId, companyId, projectId);
+    },
+  );
+
+  /* --------------------- our own internal approval ------------------- */
+
+  /**
+   * THE INTERNAL APPROVAL, which is a different act from the client's
+   * signature and is recorded in different columns.
+   *
+   * `tm_tickets.approvedBy` / `approvedAt` and the statuses `approved` and
+   * `rejected` existed in the schema from the start and no route ever wrote
+   * them: a user who configured an approval step got no behaviour at all,
+   * and the only "approval" on a ticket was the CLIENT's signature — which
+   * is their acknowledgement of hours, not our commercial sign-off on
+   * claiming them. They are now distinct:
+   *
+   *   • `signedAt` / `signedByName`  — what the client's representative
+   *     acknowledged on site, whether or not we agree with it;
+   *   • `approvedBy` / `approvedAt`  — our own decision to stand behind the
+   *     ticket as a claim, taken by somebody who did not raise it.
+   *
+   * SEGREGATION IS RECORDED, THEN REFUSED. As everywhere else in this module
+   * an attempted self-approval is WRITTEN to the ledger before it is refused:
+   * a control that silently blocks an attempt leaves no evidence the attempt
+   * was made.
+   *
+   * A rejection does not delete anything. It returns the ticket to `draft`
+   * with the reason on the record, because the hours on it were still worked
+   * and the entitlement argument may still be live.
+   */
+  app.post(
+    "/projects/:projectId/tm-tickets/:ticketId/approve",
+    { preHandler: gates.standard },
+    async (req) => {
+      const { ticketId } = req.params as { ticketId: string };
+      const body = ticketApprovalSchema.parse(req.body ?? {});
+      const companyId = companyOf(req);
+      const projectId = projectOf(req);
+      const actorId = actorOf(req);
+      const ticket = await fetchTicket(app.db, ticketId, companyId, projectId);
+      assertTransition(
+        ticket.status,
+        ["submitted", "signed", "signed_under_protest", "disputed"],
+        "T&M ticket",
+        "approve",
+      );
+
+      if (ticket.createdBy === actorId || ticket.submittedBy === actorId) {
+        await ledgerTimecards(app.db, req, "access", "tm_ticket_approval", ticketId, {
+          reference: ticket.reference,
+          decision: body.decision,
+          refused: true,
+          isSelfApproval: true,
+          reason:
+            actorId === ticket.createdBy
+              ? "the approver raised this ticket"
+              : "the approver submitted this ticket",
+        });
+        throw forbidden(
+          `${ticket.reference} was ${
+            actorId === ticket.createdBy ? "raised" : "submitted"
+          } by you, so you may not approve it. The attempt has been recorded. A T&M claim signed ` +
+            "off by the person who raised it is one assertion wearing two hats, and it is the " +
+            "first thing a claims consultant tests.",
+        );
+      }
+
+      if (body.decision === "rejected" && !(body.comment ?? "").trim()) {
+        throw badRequest(
+          "A rejection needs its reason. The crew has to know what to fix, and a ticket sent back " +
+            "with no reason is a ticket that comes back unchanged.",
+        );
+      }
+
+      const now = nowIso();
+      const nextStatus = body.decision === "approved" ? "approved" : "draft";
+      await app.db
+        .update(tmTickets)
+        .set({
+          status: nextStatus,
+          approvedBy: body.decision === "approved" ? actorId : null,
+          approvedAt: body.decision === "approved" ? now : null,
+          disputedReason:
+            body.decision === "rejected" ? (body.comment ?? null) : ticket.disputedReason,
+          detail: {
+            ...(ticket.detail ?? {}),
+            internalApproval: {
+              decision: body.decision,
+              decidedBy: actorId,
+              decidedAt: now,
+              comment: body.comment ?? null,
+              statusWhenDecided: ticket.status,
+            },
+          },
+          updatedAt: now,
+        })
+        .where(eq(tmTickets.id, ticketId));
+
+      await ledgerTimecards(app.db, req, "state_change", "tm_ticket_approval", ticketId, {
+        reference: ticket.reference,
+        decision: body.decision,
+        from: ticket.status,
+        to: nextStatus,
+        comment: body.comment ?? null,
+        isSelfApproval: false,
+      });
+
       return ticketView(ticketId, companyId, projectId);
     },
   );

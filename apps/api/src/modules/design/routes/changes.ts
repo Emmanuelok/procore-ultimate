@@ -857,6 +857,17 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
           `The assessed impact spans ${row.impactCurrencies.length} currencies (${row.impactCurrencies.join(", ")}). A change event carries one currency, so the impacts must be assessed in one currency before a change event can be raised.`,
         );
       }
+      // An unpriced change must not land in the owner's register as 0.00.
+      // This is tested BEFORE the currency, because a notice nobody has priced
+      // has no real currency either — the column still holds whatever it was
+      // registered with, and refusing it for the wrong reason would send the
+      // assessor to re-denominate a figure that does not exist.
+      if (row.assessedCost === null || !Number.isFinite(row.assessedCost)) {
+        throw badRequest(
+          `No cost has been assessed on ${row.reference}, and a change event cannot carry "not available" — it would enter the register as 0.00 exposure. ${rollupCostReasons.join(" ")} Assess a cost on at least one impact line, or implement with raiseChangeEvent=false.`,
+          { costReasons: rollupCostReasons },
+        );
+      }
       // A change event has no currency column of its own: its money IS the
       // project's currency. Writing a GBP assessment into a USD project would
       // silently restate the number, so refuse rather than convert at a rate
@@ -865,13 +876,6 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
         throw badRequest(
           `This notice is assessed in ${noticeCurrency} and the project's change register is kept in ${project.currency}. A change event carries no currency of its own, so raising one here would restate ${noticeCurrency} figures as ${project.currency}. Re-assess the impacts in ${project.currency}, or implement with raiseChangeEvent=false and raise the change event by hand with a recorded rate.`,
           { noticeCurrency, projectCurrency: project.currency },
-        );
-      }
-      // An unpriced change must not land in the owner's register as 0.00.
-      if (row.assessedCost === null || !Number.isFinite(row.assessedCost)) {
-        throw badRequest(
-          `No cost has been assessed on ${row.reference}, and a change event cannot carry "not available" — it would enter the register as 0.00 exposure. ${rollupCostReasons.join(" ")} Assess a cost on at least one impact line, or implement with raiseChangeEvent=false.`,
-          { costReasons: rollupCostReasons },
         );
       }
     }
@@ -947,12 +951,15 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
     changeEventId = outcome.eventId;
 
     if (outcome.raised && changeEventId) {
+      // Filed as what it is: the id in this entry is a change event, so a
+      // search of the chain for it must not come back saying it is a design
+      // change notice.
       await ledger(app.db, {
         companyId,
         projectId,
         actorId: req.user!.id,
         action: "create",
-        objectType: "design_change_notice",
+        objectType: "change_event",
         objectId: changeEventId,
         payload: { raisedFrom: noticeId, estimatedCost: assessedCost, currency: noticeCurrency },
       });

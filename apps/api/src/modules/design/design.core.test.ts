@@ -22,6 +22,8 @@ let app: FastifyInstance;
 let owner: TestActor;
 let reviewerActor: TestActor;
 let designer: TestActor;
+/** design:standard on the project and no company admin role: signs at design lead. */
+let standardUser: TestActor;
 let viewerHeaders: Record<string, string>;
 let stranger: TestActor;
 let projectId: string;
@@ -75,6 +77,16 @@ beforeAll(async () => {
     headers: { authorization: third.headers["authorization"]!, "x-company-id": owner.companyId },
   };
 
+  const plain = await registerActor(app);
+  await app.db
+    .insert(companyMemberships)
+    .values({ id: newId("cm"), companyId: owner.companyId, userId: plain.userId, role: "member" });
+  standardUser = {
+    ...plain,
+    companyId: owner.companyId,
+    headers: { authorization: plain.headers["authorization"]!, "x-company-id": owner.companyId },
+  };
+
   const viewer = await registerActor(app);
   await app.db
     .insert(companyMemberships)
@@ -93,6 +105,13 @@ beforeAll(async () => {
     projectId,
     userId: viewer.userId,
     templateKey: "read_only",
+  });
+  await app.db.insert(projectMemberships).values({
+    id: newId("pm"),
+    companyId: owner.companyId,
+    projectId,
+    userId: plain.userId,
+    templateKey: "project_manager",
   });
 
   vendorId = newId("ven");
@@ -770,6 +789,36 @@ describe("decision log", () => {
     expect(edit.statusCode).toBe(409);
   });
 
+  it("refuses a decision recorded at an authority the decider does not hold", async () => {
+    // The same rule as a change notice: a level nobody granted is not an
+    // authorisation, and the decision log is read later as evidence of who
+    // could commit the project to this.
+    const created = await post(`${base()}/decisions`, {
+      title: "Roof build-up",
+      question: "Inverted or warm roof?",
+      options: [
+        { key: "inverted", label: "Inverted" },
+        { key: "warm", label: "Warm" },
+      ],
+    });
+    const id = (created.json() as { id: string }).id;
+    const overreach = await post(
+      `${base()}/decisions/${id}/decide`,
+      { decision: "Warm roof", rationale: "Buildability", chosenOptionKey: "warm", authorisationLevel: "board" },
+      standardUser.headers,
+    );
+    expect(overreach.statusCode).toBe(403);
+    expect(overreach.json().message).toContain("you hold design lead");
+
+    const proper = await post(
+      `${base()}/decisions/${id}/decide`,
+      { decision: "Warm roof", rationale: "Buildability", chosenOptionKey: "warm", authorisationLevel: "design_lead" },
+      standardUser.headers,
+    );
+    expect(proper.statusCode).toBe(200);
+    expect((proper.json() as { authorisationLevel: string }).authorisationLevel).toBe("design_lead");
+  });
+
   it("supersedes the earlier decision when the replacement is taken", async () => {
     const created = await post(`${base()}/decisions`, {
       title: "Facade cladding system — revisited",
@@ -927,15 +976,42 @@ describe("register reads and lifecycle edges", () => {
     expect(afterClose.statusCode).toBe(409);
   });
 
-  it("cancels a cycle that should never have been issued", async () => {
+  it("cancels a cycle that should never have been issued and takes the package back out of review", async () => {
     const pkg = await makePackage("Cancelled cycle");
     const review = await post(`${base()}/reviews`, { packageId: pkg.id, title: "Issued in error" });
     const reviewId = (review.json() as { id: string }).id;
+    // Opening the cycle put the package into review…
+    expect(((await get(`${base()}/packages/${pkg.id}`)).json() as { status: string }).status).toBe("in_review");
+
     const res = await post(`${base()}/reviews/${reviewId}/cancel`, { reason: "Issued against the wrong revision" });
     expect(res.statusCode).toBe(200);
-    expect((res.json() as { status: string }).status).toBe("cancelled");
+    const cancelled = res.json() as { status: string; notes: string | null };
+    expect(cancelled.status).toBe("cancelled");
+    expect(cancelled.notes).toContain("Issued against the wrong revision");
+    // …and cancelling it must take the package back out, or the register shows
+    // a package "in review" with nothing under review.
+    expect(((await get(`${base()}/packages/${pkg.id}`)).json() as { status: string }).status).toBe("in_progress");
+
     const again = await post(`${base()}/reviews/${reviewId}/close`, {});
     expect(again.statusCode).toBe(409);
+    expect((await post(`${base()}/reviews/${reviewId}/cancel`, { reason: "again" })).statusCode).toBe(409);
+  });
+
+  it("a cancelled resubmission leaves the standing an earlier closed cycle gave the package", async () => {
+    const pkg = await makePackage("Two cycle package");
+    const first = await post(`${base()}/reviews`, { packageId: pkg.id, title: "Cycle 1" });
+    const firstId = (first.json() as { id: string }).id;
+    const added = await post(`${base()}/reviews/${firstId}/reviewers`, { userId: reviewerActor.userId, isRequired: true });
+    const participantId = (added.json() as { id: string }).id;
+    await post(`${base()}/reviews/${firstId}/reviewers/${participantId}/return`, { code: "A" }, reviewerActor.headers);
+    await post(`${base()}/reviews/${firstId}/close`, {});
+    expect(((await get(`${base()}/packages/${pkg.id}`)).json() as { status: string }).status).toBe("in_review");
+
+    const second = await post(`${base()}/reviews`, { packageId: pkg.id, title: "Cycle 2", previousReviewId: firstId });
+    const secondId = (second.json() as { id: string }).id;
+    await post(`${base()}/reviews/${secondId}/cancel`, { reason: "Wrong revision issued" });
+    // The closed cycle 1 still stands, so the package keeps "in review".
+    expect(((await get(`${base()}/packages/${pkg.id}`)).json() as { status: string }).status).toBe("in_review");
   });
 
   it("rejects a stage gate with a recorded reason", async () => {

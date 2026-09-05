@@ -62,7 +62,14 @@ import {
   useResource,
   useVendors,
 } from "./biddingShared";
-import type { PackageDetail, SubmissionDetail, Tabulation, TabulationRow } from "./types";
+import type {
+  BidValidityReport,
+  BidValidityRow,
+  PackageDetail,
+  SubmissionDetail,
+  Tabulation,
+  TabulationRow,
+} from "./types";
 
 const COMPLIANCE_STATUSES = [
   "pending_review",
@@ -95,6 +102,12 @@ export default function SubmissionsTab({
   const [openingOpen, setOpeningOpen] = useState(false);
   const [recordOpen, setRecordOpen] = useState(false);
   const [openId, setOpenId] = useState<string | null>(null);
+  const [extendFor, setExtendFor] = useState<BidValidityRow | null>(null);
+  const validity = useResource<BidValidityReport>(
+    packageId
+      ? `/api/v1/projects/${projectId}/bid-packages/${packageId}/validity?_v=${version}`
+      : null,
+  );
 
   function refresh() {
     setVersion((n) => n + 1);
@@ -381,6 +394,23 @@ export default function SubmissionsTab({
         />
       )}
 
+
+      <ValidityPanel
+        report={validity.data}
+        loading={validity.loading}
+        error={validity.error}
+        onRetry={validity.reload}
+        onExtend={setExtendFor}
+      />
+
+      <ExtendValidityModal
+        row={extendFor}
+        onClose={() => setExtendFor(null)}
+        onDone={() => {
+          setExtendFor(null);
+          refresh();
+        }}
+      />
       <SubmissionDrawer
         submissionId={openId}
         onClose={() => setOpenId(null)}
@@ -1040,6 +1070,198 @@ function RecordBidModal({
             onChange={(e) => setSha(e.target.value)}
             placeholder="64 lowercase hex characters"
             className="font-mono"
+          />
+        </Field>
+      </div>
+    </Modal>
+  );
+}
+
+/* ================================================================== */
+/* Bid validity — the offer has a shelf life                           */
+/* ================================================================== */
+
+const VALIDITY_TONE: Record<BidValidityRow["state"], "success" | "warning" | "danger" | "neutral"> =
+  {
+    live: "success",
+    expires_before_award: "warning",
+    expired: "danger",
+    not_stated: "neutral",
+  };
+
+const VALIDITY_LABEL: Record<BidValidityRow["state"], string> = {
+  live: "valid",
+  expires_before_award: "expires before award",
+  expired: "expired",
+  not_stated: "no period stated",
+};
+
+/**
+ * A bid is an offer, and an offer expires. Past `validUntil` the figure in the
+ * tabulation is one the bidder is no longer bound by — the award route refuses
+ * it — so the clock belongs on the screen while there is still time to ask for
+ * an extension, not at the moment a recommendation is refused.
+ */
+function ValidityPanel({
+  report,
+  loading,
+  error,
+  onRetry,
+  onExtend,
+}: {
+  report: BidValidityReport | null;
+  loading: boolean;
+  error: string | null;
+  onRetry: () => void;
+  onExtend: (row: BidValidityRow) => void;
+}) {
+  if (error) return <LoadError message={error} onRetry={onRetry} />;
+  if (loading && !report) return <LoadingBlock rows={2} />;
+  if (!report || report.items.length === 0) return null;
+
+  const atRisk = report.expired + report.expiringBeforeAward;
+
+  return (
+    <Card>
+      <CardBody>
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <h3 className="text-sm font-semibold">Bid validity</h3>
+          <p className="text-2xs text-content-subtle">
+            Measured against{" "}
+            {report.anticipatedAwardDate
+              ? `the anticipated award date, ${report.anticipatedAwardDate}`
+              : `today, ${report.today} — no anticipated award date is set on this package`}
+            {report.bidValidityDays === null
+              ? ""
+              : ` · tender asked for ${report.bidValidityDays} days`}
+          </p>
+        </div>
+        {atRisk > 0 ? (
+          <Alert tone={report.expired > 0 ? "danger" : "warning"} className="mt-2">
+            {report.expired > 0
+              ? `${report.expired} bid(s) have expired and cannot be recommended until an extension is recorded against a written confirmation from the bidder.`
+              : `${report.expiringBeforeAward} bid(s) expire before the anticipated award date. Ask now: an extension requested after expiry is a re-price.`}
+          </Alert>
+        ) : null}
+        <ul className="mt-2 divide-y divide-border-subtle">
+          {report.items.map((row) => (
+            <li key={row.submissionId} className="flex flex-wrap items-start gap-2 py-1.5">
+              <code className="font-mono text-2xs text-content-muted">{row.reference}</code>
+              <Badge tone={VALIDITY_TONE[row.state]} size="xs" dot variant="subtle">
+                {VALIDITY_LABEL[row.state]}
+              </Badge>
+              <span className="tabular-nums text-2xs text-content-muted">
+                {row.validUntil ?? "—"}
+              </span>
+              {row.extensionCount > 0 ? (
+                <span className="text-2xs text-content-subtle">
+                  {row.extensionCount} extension{row.extensionCount === 1 ? "" : "s"} on record
+                </span>
+              ) : null}
+              <p className="min-w-[16rem] flex-1 text-2xs leading-snug text-content-subtle">
+                {row.basis}
+              </p>
+              <Button size="xs" variant="ghost" icon={IconClock} onClick={() => onExtend(row)}>
+                Record extension
+              </Button>
+            </li>
+          ))}
+        </ul>
+      </CardBody>
+    </Card>
+  );
+}
+
+/**
+ * The extension is a RECORD, not an edit: who at the bidder confirmed it, until
+ * when, and against what. Without that, "we extended it" is a sentence in a
+ * meeting nobody minuted.
+ */
+function ExtendValidityModal({
+  row,
+  onClose,
+  onDone,
+}: {
+  row: BidValidityRow | null;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const action = useAction();
+  const [newValidUntil, setNewValidUntil] = useState("");
+  const [confirmedBy, setConfirmedBy] = useState("");
+  const [evidenceNote, setEvidenceNote] = useState("");
+
+  async function submit() {
+    if (!row) return;
+    const res = await action.run("extend", () =>
+      api.post(`/api/v1/bid-submissions/${row.submissionId}/validity-extension`, {
+        newValidUntil,
+        confirmedBy,
+        evidenceNote,
+      }),
+    );
+    if (res) {
+      setNewValidUntil("");
+      setConfirmedBy("");
+      setEvidenceNote("");
+      onDone();
+    }
+  }
+
+  return (
+    <Modal
+      open={row !== null}
+      onClose={onClose}
+      title={row ? `Extend the validity of ${row.reference}` : "Extend bid validity"}
+      description="Bid validity is the bidder's to give. Record what they confirmed and where it is written down."
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            onClick={() => void submit()}
+            loading={action.busy === "extend"}
+            disabled={!newValidUntil || confirmedBy.trim() === "" || evidenceNote.trim().length < 3}
+          >
+            Record extension
+          </Button>
+        </div>
+      }
+    >
+      <RefusalPanel refusal={action.refusal} onDismiss={action.clear} />
+      <div className="space-y-3">
+        <Field
+          label="Valid until"
+          required
+          hint={
+            row?.validUntil
+              ? `Currently ${row.validUntil}. An extension has to extend: a shorter date is refused.`
+              : "No period was stated on this bid."
+          }
+        >
+          <Input
+            type="date"
+            value={newValidUntil}
+            onChange={(e) => setNewValidUntil(e.currentTarget.value)}
+          />
+        </Field>
+        <Field label="Confirmed by (at the bidder)" required hint="The person who gave the confirmation.">
+          <Input
+            value={confirmedBy}
+            onChange={(e) => setConfirmedBy(e.currentTarget.value)}
+            placeholder="e.g. R. Patel, Commercial Manager"
+          />
+        </Field>
+        <Field
+          label="What the confirmation was"
+          hint="An email, a signed letter, a recorded call — the thing an auditor would ask to see."
+        >
+          <Textarea
+            rows={3}
+            value={evidenceNote}
+            onChange={(e) => setEvidenceNote(e.currentTarget.value)}
+            placeholder="Email of 09:12 today confirming the tender sum stands for a further 60 days."
           />
         </Field>
       </div>

@@ -279,7 +279,8 @@ export interface RelevanceReason {
     | "tag_overlap"
     | "impact_magnitude"
     | "recency"
-    | "previously_applied";
+    | "previously_applied"
+    | "semantic_similarity";
   points: number;
   detail: string;
 }
@@ -289,6 +290,8 @@ export interface RelevantItem {
   applicationCount: number;
   score: number;
   reasons: RelevanceReason[];
+  /** tf-idf cosine against the record's own words, when text was supplied */
+  similarity?: number | null;
 }
 
 export interface RelevantResponse {
@@ -297,7 +300,10 @@ export interface RelevantResponse {
     category: string | null;
     phase: string | null;
     tags: string[];
+    text?: string | null;
     toolImpliesCategories: string[];
+    semanticMatches?: number;
+    semanticTerms?: string[];
   };
   registerSize: number;
   matched: number;
@@ -589,6 +595,7 @@ export const REASON_LABEL: Record<RelevanceReason["code"], string> = {
   impact_magnitude: "Impact magnitude",
   recency: "Recency",
   previously_applied: "Previously applied",
+  semantic_similarity: "Semantic similarity",
 };
 
 /** csv text field ("delay, design") → normalized tag list. */
@@ -882,4 +889,216 @@ export function scoreTone(score: number | null): string {
   if (score >= 80) return "text-emerald-700";
   if (score >= 55) return "text-amber-700";
   return "text-red-700";
+}
+
+/* ------------------------- Knowledge graph (#992) ------------------------- */
+
+export type LessonEdgeKind = "record" | "person" | "tag" | "lesson";
+
+export interface LessonEdge {
+  id: string;
+  lessonId: string;
+  edgeKind: LessonEdgeKind;
+  targetType: string;
+  targetId: string;
+  targetLabel: string | null;
+  targetProjectId: string | null;
+  role: string;
+  /** 1 when the target row was actually found at write time */
+  verified: number;
+  recordLinkId: string | null;
+  createdAt: string;
+}
+
+export interface LessonGraph {
+  lesson: { id: string; number: string; title: string; status: LessonStatus };
+  edges: LessonEdge[];
+  byKind: Record<LessonEdgeKind, LessonEdge[]>;
+  counts: {
+    total: number;
+    record: number;
+    person: number;
+    tag: number;
+    lesson: number;
+    unverified: number;
+  };
+  resolvableTypes: string[];
+  /** the server's own account of what the edges do and do not establish */
+  reason: string;
+}
+
+export const EDGE_ROLE_LABEL: Record<string, string> = {
+  origin: "Came out of",
+  evidence: "Evidence",
+  applied_to: "Applied to",
+  author: "Author",
+  validator: "Validator",
+  applier: "Applied by",
+  tag: "Tag",
+  supersedes: "Supersedes",
+  superseded_by: "Superseded by",
+  see_also: "See also",
+};
+
+/* ---------------------- Onboarding packs (#994) --------------------------- */
+
+export interface PackItem {
+  lesson: Lesson;
+  score: number;
+  reasons: string[];
+}
+
+export interface OnboardingPack {
+  project: {
+    id: string;
+    name: string;
+    type: string | null;
+    stage: string;
+    value: number | null;
+    currency: string;
+  };
+  registerSize: number;
+  items: PackItem[];
+  selection: string;
+  reason: string | null;
+  /** present only on the narrated (POST) response */
+  narrative?: string | null;
+  narrativeReason?: string | null;
+  runId?: string | null;
+}
+
+/* ------------------- Rate & duration libraries (#981-984) ----------------- */
+
+export type LibraryEntryStatus = "proposed" | "accepted" | "rejected" | "superseded";
+
+export interface RateLibraryEntry {
+  id: string;
+  elementCode: string;
+  description: string | null;
+  unit: string;
+  currency: string;
+  sampleSize: number;
+  medianRate: number | null;
+  p80Rate: number | null;
+  meanRate: number | null;
+  minRate: number | null;
+  maxRate: number | null;
+  estimatedRate: number | null;
+  /** median outturn ÷ estimate − 1; null when no estimate was recorded */
+  accuracyRatio: number | null;
+  sourceProjectIds: string[];
+  samples: unknown[];
+  status: LibraryEntryStatus;
+  note: string | null;
+  supersedesId: string | null;
+  acceptedBy: string | null;
+  acceptedAt: string | null;
+  computedAt: string;
+}
+
+export interface DurationLibraryEntry {
+  id: string;
+  activityCode: string;
+  description: string | null;
+  unit: string;
+  sampleSize: number;
+  medianDays: number | null;
+  p80Days: number | null;
+  meanDays: number | null;
+  minDays: number | null;
+  maxDays: number | null;
+  plannedDays: number | null;
+  accuracyRatio: number | null;
+  sourceProjectIds: string[];
+  samples: unknown[];
+  status: LibraryEntryStatus;
+  note: string | null;
+  supersedesId: string | null;
+  acceptedBy: string | null;
+  acceptedAt: string | null;
+  computedAt: string;
+}
+
+export interface AccuracyMetric {
+  scope: "rates" | "durations";
+  comparable: number;
+  /** entries with no estimate to compare against — counted, never assumed right */
+  notComparable: number;
+  medianBias: number | null;
+  p80Bias: number | null;
+  optimisticShare: number | null;
+  reason: string;
+}
+
+export interface RealisationStat {
+  category: string;
+  realised: number;
+  meanPredictedProbability: number | null;
+  impactByCurrency: Array<{
+    currency: string;
+    n: number;
+    medianRealised: number;
+    medianPredicted: number | null;
+    bias: number | null;
+  }>;
+  reason: string;
+}
+
+export interface LibraryAccuracy {
+  rates: AccuracyMetric;
+  durations: AccuracyMetric;
+  riskRealisation: RealisationStat[];
+  basis: string;
+}
+
+export interface LibraryRebuildResult {
+  rates: { proposals: number; inserted: number; superseded: number; skipped: number };
+  durations: { proposals: number; inserted: number; superseded: number; skipped: number };
+  reasons: string[];
+}
+
+export interface RiskRealisation {
+  id: string;
+  projectId: string;
+  riskId: string;
+  riskReference: string | null;
+  category: string | null;
+  title: string | null;
+  predictedProbability: number | null;
+  predictedImpact: number | null;
+  predictedCurrency: string | null;
+  realisedAt: string | null;
+  realisedImpact: number | null;
+  realisedCurrency: string | null;
+  realisedDays: number | null;
+  sourceType: string | null;
+  sourceId: string | null;
+  note: string | null;
+  createdAt: string;
+}
+
+export interface RiskRealisationResponse extends ListResponse<RiskRealisation> {
+  stats: RealisationStat[];
+}
+
+/** A signed percentage: +30% means the estimate was 30% optimistic. */
+export function biasLabel(ratio: number | null | undefined): string {
+  if (ratio === null || ratio === undefined || !Number.isFinite(ratio)) return "—";
+  const pct = ratio * 100;
+  const sign = pct > 0 ? "+" : "";
+  return `${sign}${pct.toFixed(0)}%`;
+}
+
+export function biasTone(ratio: number | null | undefined): string {
+  if (ratio === null || ratio === undefined || !Number.isFinite(ratio)) return "text-ink-400";
+  if (Math.abs(ratio) < 0.05) return "text-emerald-700";
+  if (Math.abs(ratio) < 0.2) return "text-amber-700";
+  return "text-red-700";
+}
+
+export function libraryStatusTone(status: string): "gray" | "blue" | "green" | "red" {
+  if (status === "accepted") return "green";
+  if (status === "rejected") return "red";
+  if (status === "superseded") return "gray";
+  return "blue";
 }

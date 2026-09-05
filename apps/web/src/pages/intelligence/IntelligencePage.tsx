@@ -48,6 +48,7 @@ import {
   LEVEL_META,
   LevelBadge,
   PanelSkeleton,
+  READ_ONLY_HINT,
   RefreshButton,
   ScoreRing,
   TrendSparkline,
@@ -315,6 +316,10 @@ export default function IntelligencePage() {
   const overdue = openItems.filter((i) => i.dueAt !== null && Date.parse(i.dueAt) < Date.now()).length;
   const aiEnabled = briefing.data?.aiEnabled ?? activity.data?.aiEnabled ?? false;
   const offTrackDims = h ? h.dimensions.filter((d) => d.level === "off_track").length : null;
+  // The project attention route resolves the caller's level once for the whole
+  // page; until it has answered we assume they may act, so the buttons do not
+  // flicker for the people who can.
+  const canAct = openAttention.data?.canAct ?? true;
 
   const tabs = useMemo(
     () => [
@@ -334,8 +339,24 @@ export default function IntelligencePage() {
         subtitle="How healthy this project is and why, what needs a decision, and what the agents have found. Every score carries its basis and inputs."
         actions={
           <>
-            <RefreshButton onClick={() => void recompute()} loading={recomputing} label="Recompute health" />
-            <Button size="sm" icon={IconAi} loading={generating} disabled={!aiEnabled} title={aiEnabled ? undefined : "AI is not configured on this server"} onClick={() => void generate()}>
+            {/* both writes need `standard` on intelligence for this project;
+                the feed answers that once, so a read-only member is told why
+                rather than handed a button that 403s. */}
+            <RefreshButton
+              onClick={() => void recompute()}
+              loading={recomputing}
+              label="Recompute health"
+              disabled={!canAct}
+              title={canAct ? undefined : READ_ONLY_HINT}
+            />
+            <Button
+              size="sm"
+              icon={IconAi}
+              loading={generating}
+              disabled={!aiEnabled || !canAct}
+              title={!canAct ? READ_ONLY_HINT : aiEnabled ? undefined : "AI is not configured on this server"}
+              onClick={() => void generate()}
+            >
               Write project briefing
             </Button>
           </>

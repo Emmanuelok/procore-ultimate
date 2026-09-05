@@ -1,11 +1,19 @@
 /**
- * Schedule workspace — native CPM scheduling (spec Vol I §2.6 subset:
- * #351 creation/editing, #353 critical path, #354 typed dependencies,
- * #355-357 baselines & comparison, #358/#361 progress, #359 lookahead,
- * #371 DCMA-style health). Left: editable task table + per-task dependency
- * editor. Right: pure-SVG Gantt with baseline ghost bars. Below: baseline
- * compare, lookahead and schedule-health panels. All mutations recompute
- * server-side; the page refetches and flashes a subtle "recomputed" note.
+ * Schedule workspace — the programme and everything a planner defends it with
+ * (spec Vol I §2.6): #349-350 P6 XER / MS Project import with a revision diff
+ * and MSPDI export, #351 creation and editing, #353 critical path and float,
+ * #354 typed dependencies with lag, #355-357 baselines, revisions and
+ * comparison, #358/#361 progress and the data date, #359 the lookahead and its
+ * make-ready constraints log, #360 responsible/location assignment, #362 key
+ * milestones against contractual dates, #363-366 work calendars, #370
+ * resource loading, #371 / Domain D #283 the full DCMA 14-point assessment,
+ * plus earned value and update narratives.
+ *
+ * Left: editable task table + per-task dependency editor. Right: pure-SVG
+ * Gantt with baseline ghost bars. Below: one panel per capability, each with
+ * its own loading, error and empty state so a failing panel never blanks the
+ * page. All mutations recompute server-side; the page refetches and flashes a
+ * subtle "recomputed" note.
  */
 import {
   useCallback,

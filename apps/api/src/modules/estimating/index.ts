@@ -3659,6 +3659,21 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
           `The ${values.length} line${values.length === 1 ? "" : "s"} written onto the estimate total ${createdTotal} ${quote.currency} against the ${quotedForAccepted} priced on the quote (difference ${round2(quotedForAccepted - createdTotal)}). Check the quantities and rates on the quote before relying on the estimate.`,
         );
       }
+      // A quote row with nothing in the rate column and nothing in the amount
+      // column was left BLANK by the bidder. It lands on the estimate as a
+      // zero line, which is a real thing to want (the scope is in the grid,
+      // waiting for a price) but never a thing to let pass silently.
+      const blank = lines.filter(
+        (l) => l.amount === 0 && (l.unitRate === null || l.unitRate === undefined),
+      );
+      if (blank.length > 0) {
+        warnings.push(
+          `${blank.length} row${blank.length === 1 ? "" : "s"} on this quote carry no price at all (${blank
+            .slice(0, 3)
+            .map((l) => `"${l.description}"`)
+            .join(", ")}${blank.length > 3 ? ", …" : ""}). They were written onto the estimate at nil so the scope is visible in the grid — price them before the estimate goes out, and do not read the quote's total as covering them.`,
+        );
+      }
       if (quote.adjustmentAmount !== 0) {
         warnings.push(
           `The quote carries a levelling adjustment of ${quote.adjustmentAmount} ${quote.currency}, which is NOT carried onto the estimate lines — it belongs to the comparison, not to the price. Add it as a line if it is part of the number.`,
@@ -3981,6 +3996,24 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
       if (!event) throw notFound("Change event not found on this project");
       if (estimate.lineCount === 0) {
         throw badRequest(`Estimate ${estimate.reference} has no priced lines to push.`);
+      }
+      // change_events.estimatedCost/latestCost carry no currency of their own:
+      // they are read as the PROJECT's currency by every cost report
+      // downstream. Writing an estimate denominated in something else into
+      // them would put a number in the cost report that means a different
+      // amount of money, with nothing on the record to say so.
+      const projectRow = (
+        await app.db
+          .select({ currency: projects.currency })
+          .from(projects)
+          .where(eq(projects.id, projectId))
+          .limit(1)
+      )[0];
+      const projectCurrency = projectRow?.currency ?? null;
+      if (projectCurrency !== null && projectCurrency !== estimate.currency) {
+        throw conflict(
+          `Estimate ${estimate.reference} is in ${estimate.currency} and this project's costs are reported in ${projectCurrency}. The change event's cost fields carry no currency of their own, so pushing would put a ${estimate.currency} figure into a ${projectCurrency} cost report. Re-price the estimate in ${projectCurrency}, or record the change event's value by hand with the rate you used.`,
+        );
       }
       const totals = await recomputeEstimate(app.db, estimate.id);
       const field = body.field ?? "both";

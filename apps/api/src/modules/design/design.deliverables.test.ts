@@ -251,7 +251,9 @@ describe("deliverable schedule", () => {
   it("refuses acceptance by the person who registered and issued it", async () => {
     const res = await post(`${base()}/deliverables/${onTrackId}/accept`, {});
     expect(res.statusCode).toBe(403);
-    expect(res.json().message).toContain("other than the person who registered");
+    // The issuer is now recorded in its own right, so the refusal names the
+    // act that matters — the issue — rather than the registration.
+    expect(res.json().message).toContain("other than the person who issued it");
     const proper = await post(`${base()}/deliverables/${onTrackId}/accept`, {}, checker.headers);
     expect(proper.statusCode).toBe(200);
     expect((proper.json() as { status: string }).status).toBe("accepted");
@@ -586,6 +588,20 @@ describe("readiness, summary and analytics", () => {
     const body = res.json() as { items: Array<{ detector: string }>; detectors: string[] };
     expect(body.detectors).toHaveLength(7);
     expect(body.items.length).toBeGreaterThan(0);
+    for (const item of body.items) expect(body.detectors).toContain(item.detector);
+  });
+
+  it("refuses to serve another programme's detector through the design gate", async () => {
+    // The design tool answers for design detectors. A free-string filter here
+    // would have handed a design:read holder the assurance programme's
+    // findings on this project.
+    const res = await get(`${base()}/signals?detector=ghost_vendor_shared_bank`);
+    expect(res.statusCode).toBe(400);
+    const ours = await get(`${base()}/signals?detector=design_deliverable_late`);
+    expect(ours.statusCode).toBe(200);
+    for (const item of (ours.json() as { items: Array<{ detector: string }> }).items) {
+      expect(item.detector).toBe("design_deliverable_late");
+    }
   });
 
   it("runs every sweep in one call", async () => {

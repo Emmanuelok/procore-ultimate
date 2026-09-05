@@ -59,7 +59,7 @@ import {
   IconTrash,
   IconUsers,
 } from "../../ui/icons";
-import { api } from "../../lib/api";
+import { api, fetchBlobUrl } from "../../lib/api";
 import { FailureAlert, Reasons, ShowOnce, useAuthAction } from "./authShared";
 
 /* ================================================================== */
@@ -788,6 +788,37 @@ function ActivityTab() {
     return params.toString();
   }, [outcome, kind, page]);
   const audit = useJson<AuditResponse>(`/api/v1/company/security-events?${query}`, 0);
+  const [exporting, setExporting] = useState<"csv" | "json" | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  /**
+   * The export is behind `[authenticate, requireCompany, requireCompanyRole]`,
+   * and the bearer token lives in localStorage — a top-level navigation to the
+   * URL carries neither it nor `x-company-id`, so `window.location.href` made
+   * both buttons answer 401 in a blank tab. `fetchBlobUrl` is the client's own
+   * download path (lib/api.ts says so in as many words) and is what every
+   * other export in this app uses.
+   */
+  async function download(format: "csv" | "json") {
+    setExporting(format);
+    setExportError(null);
+    try {
+      const url = await fetchBlobUrl(
+        `/api/v1/company/security-events/export?format=${format}&${query}`,
+      );
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `security-events-${new Date().toISOString().slice(0, 10)}.${format}`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setExportError(err instanceof Error ? err.message : "The export could not be downloaded.");
+    } finally {
+      setExporting(null);
+    }
+  }
 
   const columns = useMemo<DataColumns<AuditEvent>>(
     () => [
@@ -840,24 +871,23 @@ function ActivityTab() {
           <Button
             variant="secondary"
             size="sm"
-            onClick={() => {
-              window.location.href = `/api/v1/company/security-events/export?format=csv&${query}`;
-            }}
+            loading={exporting === "csv"}
+            onClick={() => void download("csv")}
           >
             Export CSV
           </Button>
           <Button
             variant="ghost"
             size="sm"
-            onClick={() => {
-              window.location.href = `/api/v1/company/security-events/export?format=json&${query}`;
-            }}
+            loading={exporting === "json"}
+            onClick={() => void download("json")}
           >
             Export JSON
           </Button>
         </div>
       </div>
 
+      {exportError ? <ErrorAlert message={exportError} /> : null}
       {audit.error ? <ErrorAlert message={audit.error} /> : null}
       {audit.data?.reasons.length ? <Reasons reasons={audit.data.reasons} heading="What this view cannot show" /> : null}
 

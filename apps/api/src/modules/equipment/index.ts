@@ -687,10 +687,16 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
   }
 
   /**
-   * Idempotent expiry / overdue sweep, run on every equipment, certificate
-   * and maintenance list read. The platform pattern (insurance, payments,
-   * contract time bars): no cron, because a record nobody reads harms
-   * nobody and the read is the moment the answer must be true.
+   * The idempotent expiry / overdue sweep.
+   *
+   * It is a SCHEDULED JOB (`equipment.sweep`, hourly) and a read may nudge it
+   * at most once every five minutes per company, as the system actor. It used
+   * to run in full on every equipment, certificate and maintenance list and
+   * detail read: a whole-fleet scan with per-row UPDATEs and ledger appends,
+   * under a read-only permission, so a viewer authored status flips they
+   * never made and concurrent readers raced on the same rows. Candidates are
+   * now bounded to certificates inside CERTIFICATE_HORIZON_DAYS and live
+   * schedules — a certificate expiring in two years cannot change state today.
    *
    * Three detectors, each keyed in `evidenceRefs.key`:
    *  - `equipment_certificate_expired_in_service`  key = certificateId

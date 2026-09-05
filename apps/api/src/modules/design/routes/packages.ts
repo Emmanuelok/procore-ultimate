@@ -36,7 +36,7 @@ import { badRequest, conflict, forbidden, notFound } from "../../../lib/errors.j
 import { newId } from "../../../lib/ids.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.js";
 import { gateBlockers, outOfOrderStages, stageLabel, stageLibrary } from "../engines/stages.js";
-import { computeReadiness } from "../service.js";
+import { ROLLUP_ROW_CAP, computeReadiness } from "../service.js";
 import {
   allocateReference,
   assertConsultant,
@@ -151,10 +151,13 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
       .from(designStageGates)
       .where(and(eq(designStageGates.companyId, req.companyId!), eq(designStageGates.projectId, projectId)))
       .orderBy(asc(designStageGates.stageKey));
+    // Two narrow columns and an explicit cap: the stage plan counts packages,
+    // it does not dump the register (PLAN §6.4).
     const packages = await app.db
       .select({ stageKey: designPackages.stageKey, status: designPackages.status })
       .from(designPackages)
-      .where(and(eq(designPackages.companyId, req.companyId!), eq(designPackages.projectId, projectId)));
+      .where(and(eq(designPackages.companyId, req.companyId!), eq(designPackages.projectId, projectId)))
+      .limit(ROLLUP_ROW_CAP);
     const counts: Record<string, { total: number; approved: number }> = {};
     for (const p of packages) {
       if (!p.stageKey) continue;

@@ -900,6 +900,15 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
     if (q.compensable !== undefined) {
       clauses.push(eq(delayEvents.compensable, q.compensable ? 1 : 0));
     }
+    /*
+     * The register shows withdrawn events by default — they are part of the
+     * record and carry a reason. `includeWithdrawn=false` drops them, for
+     * callers assembling a live position. The parameter was declared and then
+     * ignored, which is worse than not offering it.
+     */
+    if (q.includeWithdrawn === false && !q.status) {
+      clauses.push(ne(delayEvents.status, "withdrawn"));
+    }
     const where = and(...clauses);
     const [totalRow] = await app.db.select({ n: count() }).from(delayEvents).where(where);
     const items = await app.db
@@ -909,7 +918,26 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
       .orderBy(desc(delayEvents.number))
       .limit(q.pageSize)
       .offset(pageOffset(q));
-    return paginate(items, Number(totalRow?.n ?? 0), q);
+
+    /*
+     * A cached TIA delta on a programme that has since been recomputed is not
+     * a current figure. The register carries the same staleness verdict the
+     * detail route does, so a list chip cannot present a stale number as live.
+     */
+    const scheduleIds = [...new Set(items.map((i) => i.scheduleId).filter((s): s is string => s !== null))];
+    const computedAtById = new Map<string, string | null>();
+    if (scheduleIds.length > 0) {
+      const rows = await app.db
+        .select({ id: schedules.id, lastComputedAt: schedules.lastComputedAt })
+        .from(schedules)
+        .where(and(inArray(schedules.id, scheduleIds), eq(schedules.projectId, req.projectId!)));
+      for (const r of rows) computedAtById.set(r.id, r.lastComputedAt);
+    }
+    const withStaleness = items.map((i) => ({
+      ...i,
+      tia: tiaStaleness(i.tiaResult, i.scheduleId ? (computedAtById.get(i.scheduleId) ?? null) : null),
+    }));
+    return paginate(withStaleness, Number(totalRow?.n ?? 0), q);
   });
 
   /**
@@ -1274,17 +1302,25 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
       if (!tasks.some((t) => t.id === ev.taskId)) {
         throw badRequest("The delay event's task no longer exists in its schedule");
       }
+      /*
+       * The analysis runs on the programme as the schedule module computes it
+       * — same engine, same calendars, same data date, same remaining
+       * durations. Anything less and `beforeFinish` disagrees with the
+       * schedule's own computed finish and the delta is measured in the wrong
+       * kind of day.
+       */
+      const { specs, defaultId } = await loadCalendarSpecs(
+        req.companyId!,
+        req.projectId!,
+        ev.scheduleId,
+      );
       const result = runFragnetTia({
-        tasks: tasks.map((t) => ({
-          id: t.id,
-          duration: t.duration,
-          constraintType: t.constraintType ?? null,
-          constraintDate: t.constraintDate ?? null,
-          actualStart: t.actualStart ?? null,
-          actualFinish: t.actualFinish ?? null,
-        })),
+        tasks,
         deps,
         projectStart: schedule.projectStart,
+        dataDate: schedule.dataDate,
+        calendars: specs,
+        defaultCalendarId: schedule.defaultCalendarId ?? defaultId,
         struckTaskId: ev.taskId,
         fragnetDurationDays: ev.durationDays,
         fragnetStartDate: ev.startDate,
@@ -1298,6 +1334,8 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
         completionDeltaDays: result.completionDeltaDays,
         beforeFinish: result.beforeFinish,
         afterFinish: result.afterFinish,
+        /** the work calendar the modelled delay was worked to */
+        fragnetCalendarId: result.fragnetCalendarId,
         computedAt: new Date().toISOString(),
         // Stamp the schedule version this ran against so a later recompute
         // makes the cached figure detectably stale instead of quietly wrong.

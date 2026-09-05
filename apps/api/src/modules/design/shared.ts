@@ -169,6 +169,14 @@ export type DesignObjectType =
   | "design_info_requirement"
   | "design_readiness"
   | "design_link"
+  /**
+   * The downstream record a design change notice raises. It is not this
+   * module's table, but the ledger entry that records its creation belongs to
+   * the act that created it — and it must be filed under what it actually is,
+   * or a search of the chain for that id comes back claiming the change event
+   * is a design change notice.
+   */
+  | "change_event"
   | "obligation"
   | "signal";
 

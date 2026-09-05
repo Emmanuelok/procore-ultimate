@@ -1,10 +1,27 @@
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
-import { and, count, desc, eq, gte, ilike, inArray, isNull, lte, or, sql } from "drizzle-orm";
+import {
+  and,
+  asc,
+  count,
+  desc,
+  eq,
+  gte,
+  ilike,
+  inArray,
+  isNotNull,
+  isNull,
+  lte,
+  or,
+  sql,
+} from "drizzle-orm";
 import { z } from "zod";
 import {
+  boqItems,
   companies,
+  durationLibraryEntries,
   insuranceCertificates,
   lessonApplications,
+  lessonEdges,
   lessonPushes,
   lessonTriggers,
   lessons,
@@ -14,6 +31,14 @@ import {
   postProjectReviews,
   projectMemberships,
   projects,
+  rateLibraryEntries,
+  recordLinks,
+  riskRealisations,
+  risks,
+  scheduleTasks,
+  users,
+  valuationLines,
+  valuations,
   vendors,
 } from "@constructos/db";
 import {
@@ -22,6 +47,7 @@ import {
   LESSON_OUTCOMES,
   LESSON_PUSH_STATUSES,
   LESSON_TRIGGER_KINDS,
+  LIBRARY_ENTRY_STATUSES,
   REVIEW_STATUSES,
   TOOLS,
   type ReviewStatus,
@@ -34,7 +60,12 @@ import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { addDaysISO, todayISO } from "../field/dates.js";
 import { forEachCompany } from "../../lib/scheduler.js";
 import { pushNotifications } from "../notifications/service.js";
-import { companyScopeOf, companyToolGate, scopeAllows } from "../meetings/scope.js";
+import {
+  companyScopeOf,
+  companyToolGate,
+  scopeAllows,
+  scopeProjects,
+} from "../meetings/scope.js";
 import {
   aiEnabled,
   escapeLike,
@@ -45,12 +76,49 @@ import {
 } from "../ai/service.js";
 import { computeReviewMetrics } from "./metrics.js";
 import {
+  buildTfIdfIndex,
   keywordSearch,
   rankLessons,
+  semanticMatches,
+  similarLessons,
   toolAffinity,
   type RankableLesson,
   type SearchableLesson,
 } from "./relevance.js";
+import {
+  desiredEdges,
+  diffEdges,
+  selectOnboardingPack,
+  type GraphApplication,
+  type PackProject,
+} from "./graph.js";
+import {
+  accuracyMetric,
+  buildDurationProposals,
+  buildRateProposals,
+  centralImpact,
+  inclusiveDays,
+  realisationStats,
+  verdictFor,
+  type DurationSample,
+  type RateSample,
+} from "./libraries.js";
+import { knownTargetTypes, resolveTarget, targetEntryFor } from "./targets.js";
+
+/**
+ * The library sweep never loads a table unbounded: it reads at most this many
+ * rows per source per company. A company whose valuations exceed it gets a
+ * library built from the rows it did see, which is the same statistical
+ * position as any sample — and better than an out-of-memory error.
+ */
+const LIBRARY_SCAN_LIMIT = 20_000;
+
+/**
+ * How many lessons the nightly graph projection re-derives per company. The
+ * projection is idempotent and ordered by last change, so a busy register
+ * catches up over consecutive runs rather than loading itself into memory.
+ */
+const GRAPH_PROJECTION_BATCH = 200;
 import { scoreSuppliers } from "./suppliers.js";
 import {
   describeTriggerRules,
@@ -143,6 +211,13 @@ const relevantQuery = z.object({
   category: z.enum(LESSON_CATEGORIES).optional(),
   phase: z.string().max(60).optional(),
   tags: z.string().max(400).optional(),
+  /*
+   * The words of the record being created — an RFI's subject, a variation's
+   * description, a risk's title. Structured filters only find lessons whose
+   * metadata somebody remembered to set; this finds the lesson that describes
+   * exactly this problem and was filed under something else (#993).
+   */
+  text: z.string().max(4000).optional(),
   limit: z.coerce.number().int().min(1).max(50).default(20),
 });
 
@@ -921,7 +996,11 @@ export const learningModule: FastifyPluginAsync = async (app) => {
       /* Publishing IS the push. A lesson that sits in a register waiting to be
          searched for has not been learned by anybody but its author. */
       const push = await pushLessonToProjects(req.companyId!, published, req.user!.id, 10);
-      return { ...published, push };
+      /* Publication is also when the lesson's evidence becomes checkable: the
+         edges are derived and each target verified, so an unresolvable
+         reference is a finding on the lesson rather than a dead string. */
+      const graph = await projectLessonEdges(req.companyId!, lessonId, req.user!.id);
+      return { ...published, push, graph };
     },
   );
 
@@ -981,7 +1060,10 @@ export const learningModule: FastifyPluginAsync = async (app) => {
         .from(lessonApplications)
         .where(eq(lessonApplications.id, id))
         .limit(1);
-      return reply.status(201).send({ application: row, crossedProjectBoundary });
+      /* An application is a new edge: the lesson now points at the record it
+         was applied to, and that record can answer "what was applied here?". */
+      const graph = await projectLessonEdges(req.companyId!, lessonId, req.user!.id);
+      return reply.status(201).send({ application: row, crossedProjectBoundary, graph });
     },
   );
 
@@ -994,9 +1076,24 @@ export const learningModule: FastifyPluginAsync = async (app) => {
     const tags = q.tags ? csv(q.tags).map((t) => t.toLowerCase()) : [];
     const { rows, counts } = await publishedRegister(req.companyId!);
     const now = new Date().toISOString();
+    const semantic = new Map<string, number>();
+    let semanticTerms: string[] = [];
+    if (q.text && q.text.trim().length >= 3) {
+      const index = buildTfIdfIndex(rows.map((l) => toSearchable(l, counts)));
+      const matches = semanticMatches(index, q.text);
+      for (const m of matches) semantic.set(m.lessonId, m.similarity);
+      semanticTerms = matches[0]?.terms ?? [];
+    }
     const ranked = rankLessons(
       rows.map((l) => toRankable(l, counts)),
-      { tool: q.tool ?? null, category: q.category ?? null, phase: q.phase ?? null, tags, now },
+      {
+        tool: q.tool ?? null,
+        category: q.category ?? null,
+        phase: q.phase ?? null,
+        tags,
+        semantic,
+        now,
+      },
     );
     const byId = new Map(rows.map((l) => [l.id, l]));
     return {
@@ -1005,7 +1102,10 @@ export const learningModule: FastifyPluginAsync = async (app) => {
         category: q.category ?? null,
         phase: q.phase ?? null,
         tags,
+        text: q.text ?? null,
         toolImpliesCategories: toolAffinity(q.tool ?? null),
+        semanticMatches: semantic.size,
+        semanticTerms,
       },
       registerSize: rows.length,
       matched: ranked.length,
@@ -1014,11 +1114,13 @@ export const learningModule: FastifyPluginAsync = async (app) => {
         applicationCount: r.lesson.applicationCount,
         score: r.score,
         reasons: r.reasons,
+        similarity: semantic.get(r.lesson.id) ?? null,
       })),
       ranking:
         "Deterministic: category and phase match, tool affinity, tag overlap, recorded impact " +
-        "magnitude, recency of publication, and whether the lesson has already been applied. " +
-        "Every hit carries the reasons it scored. No model is involved.",
+        "magnitude, recency of publication, whether the lesson has already been applied, and — " +
+        "when the record's own words are supplied — tf-idf cosine similarity between those " +
+        "words and the lesson's. Every hit carries the reasons it scored. No model is involved.",
     };
   });
 
@@ -2766,6 +2868,1333 @@ export const learningModule: FastifyPluginAsync = async (app) => {
   );
 
   /* ================================================================ */
+  /* KNOWLEDGE GRAPH (#992)                                            */
+  /* ================================================================ */
+
+  /**
+   * Two lessons are only "see also" when they genuinely overlap. 0.18 is high
+   * enough that the pair share subject matter rather than a house style, and
+   * three is as many as anybody follows.
+   */
+  const SEE_ALSO_FLOOR = 0.18;
+  const SEE_ALSO_LIMIT = 3;
+
+  async function registerIndex(companyId: string) {
+    const { rows, counts } = await publishedRegister(companyId);
+    return { rows, counts, index: buildTfIdfIndex(rows.map((l) => toSearchable(l, counts))) };
+  }
+
+  async function graphApplications(
+    companyId: string,
+    lessonId: string,
+  ): Promise<GraphApplication[]> {
+    const rows = await app.db
+      .select()
+      .from(lessonApplications)
+      .where(
+        and(
+          eq(lessonApplications.companyId, companyId),
+          eq(lessonApplications.lessonId, lessonId),
+        ),
+      );
+    return rows.flatMap((r) => {
+      const to = r.appliedTo as Record<string, unknown>;
+      const tool = typeof to["tool"] === "string" ? to["tool"] : null;
+      const recordId = typeof to["recordId"] === "string" ? to["recordId"] : null;
+      if (!tool || !recordId) return [];
+      return [
+        {
+          id: r.id,
+          projectId: r.projectId,
+          tool,
+          recordId,
+          label: typeof to["label"] === "string" ? to["label"] : null,
+          appliedBy: r.appliedBy,
+        },
+      ];
+    });
+  }
+
+  /**
+   * Rebuild one lesson's edges from its own fields and store the difference.
+   *
+   * Every `record` edge is looked up in the table that owns it before it is
+   * written: an edge to a dispute that does not exist in this company is
+   * stored `verified: 0` with the reason, never silently as a link. Verified
+   * project-scoped edges are ALSO mirrored into `record_links`, which is what
+   * the rest of the platform reads — so "which lessons came out of this
+   * dispute?" is answerable from the dispute's own related-records panel
+   * without anything knowing that the learning module exists.
+   *
+   * Idempotent: running it twice writes nothing the second time.
+   */
+  async function projectLessonEdges(
+    companyId: string,
+    lessonId: string,
+    actorId: string | null,
+  ): Promise<{
+    inserted: number;
+    deleted: number;
+    unchanged: number;
+    unverified: Array<{ targetType: string; targetId: string; reason: string }>;
+  }> {
+    const lesson = await fetchLesson(lessonId, companyId);
+    const applications = await graphApplications(companyId, lessonId);
+
+    /* "See also" only makes sense between published lessons: a draft is one
+       person's account, not something to send a reader to. */
+    let seeAlso: Array<{ lessonId: string; similarity: number }> = [];
+    if (lesson.status === "published") {
+      const { index } = await registerIndex(companyId);
+      seeAlso = similarLessons(index, lessonId, {
+        floor: SEE_ALSO_FLOOR,
+        limit: SEE_ALSO_LIMIT,
+      }).map((m) => ({ lessonId: m.lessonId, similarity: m.similarity }));
+    }
+
+    const desired = desiredEdges(
+      {
+        id: lesson.id,
+        number: lesson.number,
+        title: lesson.title,
+        tags: lesson.tags,
+        originProjectId: lesson.originProjectId,
+        createdBy: lesson.createdBy,
+        submittedBy: lesson.submittedBy,
+        validatedBy: lesson.validatedBy,
+        supersededById: lesson.supersededById,
+        evidenceRefs: lesson.evidenceRefs,
+      },
+      applications,
+      seeAlso,
+    );
+
+    const stored = await app.db
+      .select()
+      .from(lessonEdges)
+      .where(and(eq(lessonEdges.companyId, companyId), eq(lessonEdges.lessonId, lessonId)));
+    const diff = diffEdges(desired, stored);
+
+    const unverified: Array<{ targetType: string; targetId: string; reason: string }> = [];
+    for (const edge of diff.toInsert) {
+      let verified = 0;
+      let label = edge.targetLabel;
+      let targetType = edge.targetType;
+      let targetProjectId = edge.targetProjectId;
+      let recordLinkId: string | null = null;
+
+      if (edge.edgeKind === "record") {
+        const resolved = await resolveTarget(app.db, companyId, edge.targetType, edge.targetId);
+        if (resolved) {
+          verified = 1;
+          targetType = resolved.recordType;
+          targetProjectId = resolved.projectId ?? edge.targetProjectId;
+          label = resolved.label ?? label;
+        } else {
+          unverified.push({
+            targetType: edge.targetType,
+            targetId: edge.targetId,
+            reason: targetEntryFor(edge.targetType)
+              ? "No record with that id exists in this company"
+              : `"${edge.targetType}" is not a record type the graph can resolve`,
+          });
+        }
+      } else if (edge.edgeKind === "person") {
+        const [user] = await app.db
+          .select({ id: users.id, name: users.name })
+          .from(users)
+          .where(eq(users.id, edge.targetId))
+          .limit(1);
+        if (user) {
+          verified = 1;
+          label = user.name ?? label;
+        }
+      } else if (edge.edgeKind === "lesson") {
+        const [other] = await app.db
+          .select({ id: lessons.id, number: lessons.number, title: lessons.title })
+          .from(lessons)
+          .where(and(eq(lessons.id, edge.targetId), eq(lessons.companyId, companyId)))
+          .limit(1);
+        if (other) {
+          verified = 1;
+          label = label ?? `${other.number} ${other.title}`;
+        }
+      } else {
+        /* A tag is vocabulary: it is verified by construction. */
+        verified = 1;
+      }
+
+      if (edge.edgeKind === "record" && verified === 1 && targetProjectId) {
+        recordLinkId = await mirrorRecordLink(
+          companyId,
+          targetProjectId,
+          lessonId,
+          targetType,
+          edge.targetId,
+          edge.role,
+          actorId,
+        );
+      }
+
+      await app.db.insert(lessonEdges).values({
+        id: newId("ledge"),
+        companyId,
+        lessonId,
+        edgeKind: edge.edgeKind,
+        targetType,
+        targetId: edge.targetId,
+        targetLabel: label,
+        targetProjectId,
+        role: edge.role,
+        verified,
+        recordLinkId,
+        createdBy: actorId,
+      });
+    }
+
+    if (diff.toDeleteIds.length > 0) {
+      const doomed = stored.filter((s) => diff.toDeleteIds.includes(s.id));
+      for (const row of doomed) {
+        if (row.recordLinkId) {
+          await app.db.delete(recordLinks).where(eq(recordLinks.id, row.recordLinkId));
+        }
+      }
+      await app.db.delete(lessonEdges).where(inArray(lessonEdges.id, diff.toDeleteIds));
+    }
+
+    return {
+      inserted: diff.toInsert.length,
+      deleted: diff.toDeleteIds.length,
+      unchanged: diff.unchanged,
+      unverified,
+    };
+  }
+
+  /** Mirror a verified edge into record_links, without duplicating one. */
+  async function mirrorRecordLink(
+    companyId: string,
+    projectId: string,
+    lessonId: string,
+    toType: string,
+    toId: string,
+    linkKind: string,
+    actorId: string | null,
+  ): Promise<string | null> {
+    const [existing] = await app.db
+      .select({ id: recordLinks.id })
+      .from(recordLinks)
+      .where(
+        and(
+          eq(recordLinks.companyId, companyId),
+          eq(recordLinks.fromType, "lesson"),
+          eq(recordLinks.fromId, lessonId),
+          eq(recordLinks.toType, toType),
+          eq(recordLinks.toId, toId),
+        ),
+      )
+      .limit(1);
+    if (existing) return existing.id;
+    const id = newId("rlink");
+    await app.db.insert(recordLinks).values({
+      id,
+      companyId,
+      projectId,
+      fromType: "lesson",
+      fromId: lessonId,
+      toType,
+      toId,
+      linkKind,
+      createdBy: actorId ?? "system:learning",
+    });
+    return id;
+  }
+
+  /**
+   * The lesson's graph, as nodes and edges. Grouped by kind because the four
+   * kinds answer four different questions and a flat edge list answers none
+   * of them well.
+   */
+  app.get("/learning/lessons/:lessonId/graph", { preHandler: companyScopedRead }, async (req) => {
+    const { lessonId } = req.params as { lessonId: string };
+    const lesson = await fetchLesson(lessonId, req.companyId!);
+    const scope = companyScopeOf(req, "learning");
+    if (!scopeAllows(scope, lesson.projectId ?? lesson.originProjectId)) {
+      throw forbidden("This lesson belongs to a project you do not hold the learning tool on");
+    }
+    const edges = await app.db
+      .select()
+      .from(lessonEdges)
+      .where(and(eq(lessonEdges.companyId, req.companyId!), eq(lessonEdges.lessonId, lessonId)))
+      .orderBy(asc(lessonEdges.edgeKind), asc(lessonEdges.role), asc(lessonEdges.targetId));
+    const byKind = {
+      record: edges.filter((e) => e.edgeKind === "record"),
+      person: edges.filter((e) => e.edgeKind === "person"),
+      tag: edges.filter((e) => e.edgeKind === "tag"),
+      lesson: edges.filter((e) => e.edgeKind === "lesson"),
+    };
+    const unverified = edges.filter((e) => e.verified === 0);
+    return {
+      lesson: { id: lesson.id, number: lesson.number, title: lesson.title, status: lesson.status },
+      edges,
+      byKind,
+      counts: {
+        total: edges.length,
+        record: byKind.record.length,
+        person: byKind.person.length,
+        tag: byKind.tag.length,
+        lesson: byKind.lesson.length,
+        unverified: unverified.length,
+      },
+      resolvableTypes: knownTargetTypes(),
+      reason:
+        edges.length === 0
+          ? "No edges have been projected for this lesson yet. Edges are written when the lesson is published, when it is applied, and by the nightly projection."
+          : unverified.length === 0
+            ? "Every edge was checked against a real record in this company at the moment it was written."
+            : `${unverified.length} edge(s) could not be resolved to a record and are marked unverified — they are shown, not hidden, because a broken pointer is a finding.`,
+    };
+  });
+
+  /** Re-derive one lesson's edges on demand. Idempotent. */
+  app.post(
+    "/learning/lessons/:lessonId/graph/rebuild",
+    { preHandler: companyWrite },
+    async (req) => {
+      const { lessonId } = req.params as { lessonId: string };
+      const lesson = await fetchLesson(lessonId, req.companyId!);
+      const result = await projectLessonEdges(req.companyId!, lessonId, req.user!.id);
+      if (result.inserted > 0 || result.deleted > 0) {
+        await appendLedger(app.db, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "update",
+          objectType: "lesson",
+          objectId: lessonId,
+          payload: { graph: result, lessonNumber: lesson.number },
+          storePayload: true,
+        });
+      }
+      return result;
+    },
+  );
+
+  /**
+   * THE REVERSE QUESTION (#992).
+   *
+   * "What did we learn from this?" asked of a record, not of the register.
+   * This is the endpoint a dispute, variation or NCR page calls to show the
+   * lessons that cite it — the direction nobody builds, and the only one a
+   * person standing in front of the record can actually use.
+   */
+  app.get("/projects/:projectId/learning/for-record", { preHandler: projectRead }, async (req) => {
+    const q = z
+      .object({ type: z.string().min(1).max(64), id: z.string().min(1).max(64) })
+      .parse(req.query);
+    const entry = targetEntryFor(q.type);
+    const edges = await app.db
+      .select()
+      .from(lessonEdges)
+      .where(
+        and(
+          eq(lessonEdges.companyId, req.companyId!),
+          eq(lessonEdges.edgeKind, "record"),
+          eq(lessonEdges.targetType, entry?.recordType ?? q.type),
+          eq(lessonEdges.targetId, q.id),
+        ),
+      );
+    const ids = [...new Set(edges.map((e) => e.lessonId))];
+    const rows = ids.length
+      ? await app.db
+          .select()
+          .from(lessons)
+          .where(and(eq(lessons.companyId, req.companyId!), inArray(lessons.id, ids)))
+      : [];
+    const byId = new Map(rows.map((l) => [l.id, l]));
+    return {
+      record: { type: entry?.recordType ?? q.type, id: q.id, resolvable: entry !== null },
+      items: edges
+        .map((e) => ({ edge: e, lesson: byId.get(e.lessonId) ?? null }))
+        .filter((i) => i.lesson !== null),
+      total: ids.length,
+      reason:
+        ids.length === 0
+          ? "No lesson cites this record. That is a fact about the register, not about the record."
+          : `${ids.length} lesson(s) cite this record as their origin, evidence, or the place they were applied.`,
+    };
+  });
+
+  /* ================================================================ */
+  /* ONBOARDING PACKS (#994)                                           */
+  /* ================================================================ */
+
+  async function buildOnboardingPack(companyId: string, projectId: string, limit: number) {
+    const [target] = await app.db
+      .select()
+      .from(projects)
+      .where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)))
+      .limit(1);
+    if (!target) throw notFound("Project not found");
+
+    const { rows, counts, index } = await registerIndex(companyId);
+    const describeTarget = [target.name, target.type ?? "", target.description ?? ""]
+      .filter(Boolean)
+      .join(". ");
+    const similarity = new Map<string, number>();
+    if (describeTarget.trim().length > 0) {
+      for (const m of semanticMatches(index, describeTarget)) similarity.set(m.lessonId, m.similarity);
+    }
+
+    const originIds = [
+      ...new Set(rows.map((l) => l.originProjectId).filter((v): v is string => Boolean(v))),
+    ];
+    const originRows = originIds.length
+      ? await app.db
+          .select()
+          .from(projects)
+          .where(and(eq(projects.companyId, companyId), inArray(projects.id, originIds)))
+      : [];
+    const origins = new Map<string, PackProject>(
+      originRows.map((p) => [
+        p.id,
+        {
+          id: p.id,
+          name: p.name,
+          projectType: p.type,
+          stage: p.stage,
+          contractValue: p.value,
+          currency: p.currency,
+        },
+      ]),
+    );
+
+    const selections = selectOnboardingPack(
+      {
+        id: target.id,
+        name: target.name,
+        projectType: target.type,
+        stage: target.stage,
+        contractValue: target.value,
+        currency: target.currency,
+      },
+      origins,
+      rows.map((l) => ({
+        lessonId: l.id,
+        originProjectId: l.originProjectId,
+        category: l.category,
+        phase: l.phase,
+        impactValue: l.impactValue,
+        impactCurrency: l.impactCurrency,
+        applicationCount: counts.get(l.id) ?? 0,
+        similarity: similarity.get(l.id) ?? null,
+      })),
+      { limit },
+    );
+
+    const byId = new Map(rows.map((l) => [l.id, l]));
+    return {
+      project: {
+        id: target.id,
+        name: target.name,
+        type: target.type,
+        stage: target.stage,
+        value: target.value,
+        currency: target.currency,
+      },
+      registerSize: rows.length,
+      items: selections.map((s) => ({
+        lesson: byId.get(s.lessonId)!,
+        score: s.score,
+        reasons: s.reasons,
+      })),
+      selection:
+        "Deterministic: same project type, same order of contract value in the same currency, " +
+        "same phase, tf-idf similarity to this project's own description, how often the lesson " +
+        "has already been applied, and its recorded impact. Every pick carries its reasons.",
+      reason:
+        rows.length === 0
+          ? "The published register is empty, so there is nothing to hand a new team. That is a gap in capture, not an absence of lessons."
+          : selections.length === 0
+            ? "No published lesson matched this project on type, value band, phase or description. Widening the pack would mean handing a new team a reading list with no reason attached."
+            : null,
+    };
+  }
+
+  /** The deterministic pack. Pure read — no AI, no writes. */
+  app.get(
+    "/projects/:projectId/learning/onboarding-pack",
+    { preHandler: projectRead },
+    async (req) => {
+      const q = z
+        .object({ limit: z.coerce.number().int().min(1).max(40).default(12) })
+        .parse(req.query);
+      return buildOnboardingPack(req.companyId!, req.projectId!, q.limit);
+    },
+  );
+
+  /**
+   * The same pack, narrated. The selection is ALWAYS the deterministic one:
+   * the model is asked to introduce lessons it was handed, with citations to
+   * their numbers, and never to choose them. With no key configured the
+   * endpoint returns the pack and says the narrative is unavailable — it does
+   * not fail, because a reading list does not need a model to be useful.
+   */
+  app.post(
+    "/projects/:projectId/learning/onboarding-pack",
+    { preHandler: projectStandard },
+    async (req) => {
+      const body = z
+        .object({
+          limit: z.coerce.number().int().min(1).max(40).default(12),
+          audience: z.string().max(200).nullable().optional(),
+        })
+        .parse(req.body ?? {});
+      const pack = await buildOnboardingPack(req.companyId!, req.projectId!, body.limit);
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "access",
+        objectType: "project",
+        objectId: req.projectId!,
+        payload: { onboardingPack: pack.items.map((i) => i.lesson.number), audience: body.audience ?? null },
+        projectId: req.projectId!,
+      });
+      if (pack.items.length === 0) {
+        return { ...pack, narrative: null, runId: null, narrativeReason: pack.reason };
+      }
+      if (!aiEnabled(app)) {
+        return {
+          ...pack,
+          narrative: null,
+          runId: null,
+          narrativeReason:
+            "AI is not configured, so the pack is the deterministic selection with its reasons. Nothing is missing from the list itself.",
+        };
+      }
+      const inputRefs: InputRef[] = pack.items.map((i) => ({ type: "lesson", id: i.lesson.id }));
+      try {
+        const run = await runAgent({
+          app,
+          req,
+          agentKind: "learning_onboarding_pack",
+          projectId: req.projectId!,
+          system:
+            "You introduce a lessons-learned pack to a team starting a project. Write two to " +
+            "four short paragraphs. Use ONLY the numbered lessons supplied; cite each by its " +
+            "number in the prose and by {\"type\":\"lesson\",\"id\":\"…\"} in a `citations` array. " +
+            "Never invent a lesson, a number or a figure. If the lessons do not cover an obvious " +
+            "risk, say that they do not rather than filling the gap.",
+          user: [
+            `Project: ${pack.project.name} (${pack.project.type ?? "type not recorded"}, stage ${pack.project.stage}).`,
+            body.audience ? `Audience: ${body.audience}.` : "",
+            "",
+            ...pack.items.map(
+              (i) =>
+                `${i.lesson.number} (type=lesson id=${i.lesson.id}) — ${i.lesson.title}\nWhy selected: ${i.reasons.join(" ")}\nRecommendation: ${i.lesson.recommendation}`,
+            ),
+          ]
+            .filter(Boolean)
+            .join("\n"),
+          inputRefs,
+          maxTokens: 1200,
+          dataCategories: ["lessons"],
+        });
+        return {
+          ...pack,
+          narrative: run.text,
+          runId: run.runId,
+          citations: run.grounding.citations,
+          narrativeReason: null,
+        };
+      } catch (err) {
+        return {
+          ...pack,
+          narrative: null,
+          runId: null,
+          narrativeReason: `The narrative could not be produced (${err instanceof Error ? err.message : "unknown error"}). The pack itself is unaffected.`,
+        };
+      }
+    },
+  );
+
+  /* ================================================================ */
+  /* FEEDBACK INTO THE LIBRARIES (#981-984)                            */
+  /* ================================================================ */
+
+  /**
+   * Collect measured rates from the CERTIFIED valuations of every live
+   * project in the company. A draft valuation is a proposal; only what was
+   * certified or paid is outturn. One observation per BQ item — the latest
+   * valuation that certified it — so a monthly application does not count the
+   * same element eight times and call it a sample of eight.
+   */
+  async function collectRateSamples(companyId: string): Promise<RateSample[]> {
+    const rows = await app.db
+      .select({
+        lineId: valuationLines.id,
+        boqItemId: valuationLines.boqItemId,
+        qtyToDate: valuationLines.qtyToDate,
+        amountToDate: valuationLines.amountToDate,
+        valuationNumber: valuations.number,
+        valuationDate: valuations.valuationDate,
+        projectId: valuations.projectId,
+        currency: valuations.currency,
+        code: boqItems.code,
+        description: boqItems.description,
+        unit: boqItems.unit,
+        rate: boqItems.rate,
+        itemType: boqItems.itemType,
+      })
+      .from(valuationLines)
+      .innerJoin(valuations, eq(valuations.id, valuationLines.valuationId))
+      .innerJoin(boqItems, eq(boqItems.id, valuationLines.boqItemId))
+      .where(
+        and(
+          eq(valuations.companyId, companyId),
+          inArray(valuations.status, ["certified", "paid"]),
+        ),
+      )
+      .limit(LIBRARY_SCAN_LIMIT);
+
+    const latestByItem = new Map<string, (typeof rows)[number]>();
+    for (const row of rows) {
+      const seen = latestByItem.get(row.boqItemId);
+      if (!seen || row.valuationNumber > seen.valuationNumber) latestByItem.set(row.boqItemId, row);
+    }
+    const samples: RateSample[] = [];
+    for (const row of latestByItem.values()) {
+      if (row.itemType !== "measured") continue;
+      if (row.qtyToDate === null || row.amountToDate === null) continue;
+      samples.push({
+        projectId: row.projectId,
+        recordId: row.lineId,
+        elementCode: row.code,
+        description: row.description,
+        unit: row.unit,
+        currency: row.currency,
+        quantity: row.qtyToDate,
+        amount: row.amountToDate,
+        estimatedRate: row.rate,
+        observedAt: row.valuationDate,
+      });
+    }
+    return samples;
+  }
+
+  /**
+   * Collect achieved durations from completed schedule activities. An
+   * activity is only a sample once it has BOTH an actual start and an actual
+   * finish: a task in progress has no duration yet, and treating today's date
+   * as its finish would teach the library that everything finishes early.
+   */
+  async function collectDurationSamples(companyId: string): Promise<DurationSample[]> {
+    const live = await app.db
+      .select({ id: projects.id })
+      .from(projects)
+      .where(and(eq(projects.companyId, companyId), isNull(projects.deletedAt)));
+    const ids = live.map((p) => p.id);
+    if (ids.length === 0) return [];
+    const rows = await app.db
+      .select({
+        id: scheduleTasks.id,
+        projectId: scheduleTasks.projectId,
+        name: scheduleTasks.name,
+        wbsCode: scheduleTasks.wbsCode,
+        durationDays: scheduleTasks.durationDays,
+        actualStart: scheduleTasks.actualStart,
+        actualFinish: scheduleTasks.actualFinish,
+        taskType: scheduleTasks.taskType,
+      })
+      .from(scheduleTasks)
+      .where(
+        and(
+          inArray(scheduleTasks.projectId, ids),
+          isNotNull(scheduleTasks.actualStart),
+          isNotNull(scheduleTasks.actualFinish),
+        ),
+      )
+      .limit(LIBRARY_SCAN_LIMIT);
+    const samples: DurationSample[] = [];
+    for (const row of rows) {
+      /* Milestones have no duration and level-of-effort tasks borrow theirs
+         from whatever they span; neither is evidence about how long work takes. */
+      if (row.taskType !== "task") continue;
+      const actualDays = inclusiveDays(row.actualStart, row.actualFinish);
+      if (actualDays === null) continue;
+      const activityCode = (row.wbsCode ?? "").trim() || normaliseActivityName(row.name);
+      if (!activityCode) continue;
+      samples.push({
+        projectId: row.projectId,
+        taskId: row.id,
+        activityCode,
+        name: row.name,
+        plannedDays: row.durationDays,
+        actualDays,
+        actualStart: row.actualStart,
+        actualFinish: row.actualFinish,
+      });
+    }
+    return samples;
+  }
+
+  /**
+   * Activities without a WBS code are grouped by their normalised name. That
+   * is a weaker key than a code and it is stated as such in the entry, but the
+   * alternative — ignoring every schedule that was not imported from P6 —
+   * would mean most companies never see a duration library at all.
+   */
+  function normaliseActivityName(name: string): string {
+    return name
+      .trim()
+      .toUpperCase()
+      .replace(/[^A-Z0-9]+/g, "-")
+      .replace(/^-|-$/g, "")
+      .slice(0, 80);
+  }
+
+  interface LibraryRebuildResult {
+    rates: { proposals: number; inserted: number; superseded: number; skipped: number };
+    durations: { proposals: number; inserted: number; superseded: number; skipped: number };
+    reasons: string[];
+  }
+
+  async function rebuildLibraries(
+    companyId: string,
+    actorId: string | null,
+  ): Promise<LibraryRebuildResult> {
+    const reasons: string[] = [];
+    const now = new Date().toISOString();
+
+    const rateSamples = await collectRateSamples(companyId);
+    const rateProposals = buildRateProposals(rateSamples);
+    if (rateSamples.length === 0) {
+      reasons.push(
+        "No certified valuation lines were found, so no rate can be measured. Rates come from " +
+          "what was certified, not from what was priced.",
+      );
+    }
+    const rateStats = { proposals: rateProposals.length, inserted: 0, superseded: 0, skipped: 0 };
+    for (const proposal of rateProposals) {
+      const [existing] = await app.db
+        .select()
+        .from(rateLibraryEntries)
+        .where(
+          and(
+            eq(rateLibraryEntries.companyId, companyId),
+            eq(rateLibraryEntries.elementCode, proposal.elementCode),
+            eq(rateLibraryEntries.unit, proposal.unit),
+            eq(rateLibraryEntries.currency, proposal.currency),
+            inArray(rateLibraryEntries.status, ["proposed", "accepted", "rejected"]),
+          ),
+        )
+        .orderBy(desc(rateLibraryEntries.computedAt))
+        .limit(1);
+      const verdict = verdictFor(proposal, existing
+        ? {
+            id: existing.id,
+            sampleSize: existing.sampleSize,
+            median: existing.medianRate,
+            status: existing.status,
+          }
+        : null);
+      if (verdict.action === "skip") {
+        rateStats.skipped += 1;
+        continue;
+      }
+      const id = newId("ratelib");
+      await app.db.insert(rateLibraryEntries).values({
+        id,
+        companyId,
+        elementCode: proposal.elementCode,
+        description: proposal.description,
+        unit: proposal.unit,
+        currency: proposal.currency,
+        sampleSize: proposal.distribution.n,
+        medianRate: proposal.distribution.median,
+        p80Rate: proposal.distribution.p80,
+        meanRate: proposal.distribution.mean,
+        minRate: proposal.distribution.min,
+        maxRate: proposal.distribution.max,
+        estimatedRate: proposal.estimatedRate,
+        accuracyRatio: proposal.accuracyRatio,
+        sourceProjectIds: proposal.sourceProjectIds,
+        samples: proposal.samples,
+        status: "proposed",
+        note: [proposal.note, ...verdict.reasons].join(" "),
+        supersedesId: existing?.id ?? null,
+        computedAt: now,
+      });
+      if (existing) {
+        await app.db
+          .update(rateLibraryEntries)
+          .set({ status: "superseded", updatedAt: now })
+          .where(eq(rateLibraryEntries.id, existing.id));
+        rateStats.superseded += 1;
+      } else {
+        rateStats.inserted += 1;
+      }
+      await appendLedger(app.db, {
+        companyId,
+        actorId,
+        action: "create",
+        objectType: "rate_library_entry",
+        objectId: id,
+        payload: {
+          elementCode: proposal.elementCode,
+          unit: proposal.unit,
+          currency: proposal.currency,
+          sampleSize: proposal.distribution.n,
+          median: proposal.distribution.median,
+          supersedes: existing?.id ?? null,
+        },
+        storePayload: true,
+      });
+    }
+
+    const durationSamples = await collectDurationSamples(companyId);
+    const durationProposals = buildDurationProposals(durationSamples);
+    if (durationSamples.length === 0) {
+      reasons.push(
+        "No schedule activity has both an actual start and an actual finish, so no duration can " +
+          "be measured. A task in progress has not taken any time yet.",
+      );
+    }
+    const durationStats = {
+      proposals: durationProposals.length,
+      inserted: 0,
+      superseded: 0,
+      skipped: 0,
+    };
+    for (const proposal of durationProposals) {
+      const [existing] = await app.db
+        .select()
+        .from(durationLibraryEntries)
+        .where(
+          and(
+            eq(durationLibraryEntries.companyId, companyId),
+            eq(durationLibraryEntries.activityCode, proposal.activityCode),
+            inArray(durationLibraryEntries.status, ["proposed", "accepted", "rejected"]),
+          ),
+        )
+        .orderBy(desc(durationLibraryEntries.computedAt))
+        .limit(1);
+      const verdict = verdictFor(proposal, existing
+        ? {
+            id: existing.id,
+            sampleSize: existing.sampleSize,
+            median: existing.medianDays,
+            status: existing.status,
+          }
+        : null);
+      if (verdict.action === "skip") {
+        durationStats.skipped += 1;
+        continue;
+      }
+      const id = newId("durlib");
+      await app.db.insert(durationLibraryEntries).values({
+        id,
+        companyId,
+        activityCode: proposal.activityCode,
+        description: proposal.description,
+        unit: "days",
+        sampleSize: proposal.distribution.n,
+        medianDays: proposal.distribution.median,
+        p80Days: proposal.distribution.p80,
+        meanDays: proposal.distribution.mean,
+        minDays: proposal.distribution.min,
+        maxDays: proposal.distribution.max,
+        plannedDays: proposal.plannedDays,
+        accuracyRatio: proposal.accuracyRatio,
+        sourceProjectIds: proposal.sourceProjectIds,
+        samples: proposal.samples,
+        status: "proposed",
+        note: [proposal.note, ...verdict.reasons].join(" "),
+        supersedesId: existing?.id ?? null,
+        computedAt: now,
+      });
+      if (existing) {
+        await app.db
+          .update(durationLibraryEntries)
+          .set({ status: "superseded", updatedAt: now })
+          .where(eq(durationLibraryEntries.id, existing.id));
+        durationStats.superseded += 1;
+      } else {
+        durationStats.inserted += 1;
+      }
+      await appendLedger(app.db, {
+        companyId,
+        actorId,
+        action: "create",
+        objectType: "duration_library_entry",
+        objectId: id,
+        payload: {
+          activityCode: proposal.activityCode,
+          sampleSize: proposal.distribution.n,
+          median: proposal.distribution.median,
+          supersedes: existing?.id ?? null,
+        },
+        storePayload: true,
+      });
+    }
+
+    return { rates: rateStats, durations: durationStats, reasons };
+  }
+
+  const libraryQuery = pageQuerySchema.extend({
+    status: z.enum(LIBRARY_ENTRY_STATUSES).optional(),
+    code: z.string().max(80).optional(),
+  });
+
+  app.get("/learning/libraries/rates", { preHandler: companyScopedRead }, async (req) => {
+    const q = libraryQuery.parse(req.query);
+    const where = and(
+      eq(rateLibraryEntries.companyId, req.companyId!),
+      q.status ? eq(rateLibraryEntries.status, q.status) : undefined,
+      q.code ? ilike(rateLibraryEntries.elementCode, `%${escapeLike(q.code)}%`) : undefined,
+    );
+    const [totalRow] = await app.db.select({ n: count() }).from(rateLibraryEntries).where(where);
+    const items = await app.db
+      .select()
+      .from(rateLibraryEntries)
+      .where(where)
+      .orderBy(asc(rateLibraryEntries.elementCode), desc(rateLibraryEntries.computedAt))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    return paginate(items, Number(totalRow?.n ?? 0), q);
+  });
+
+  app.get("/learning/libraries/durations", { preHandler: companyScopedRead }, async (req) => {
+    const q = libraryQuery.parse(req.query);
+    const where = and(
+      eq(durationLibraryEntries.companyId, req.companyId!),
+      q.status ? eq(durationLibraryEntries.status, q.status) : undefined,
+      q.code ? ilike(durationLibraryEntries.activityCode, `%${escapeLike(q.code)}%`) : undefined,
+    );
+    const [totalRow] = await app.db
+      .select({ n: count() })
+      .from(durationLibraryEntries)
+      .where(where);
+    const items = await app.db
+      .select()
+      .from(durationLibraryEntries)
+      .where(where)
+      .orderBy(asc(durationLibraryEntries.activityCode), desc(durationLibraryEntries.computedAt))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    return paginate(items, Number(totalRow?.n ?? 0), q);
+  });
+
+  app.post("/learning/libraries/rebuild", { preHandler: companyWrite }, async (req) => {
+    const result = await rebuildLibraries(req.companyId!, req.user!.id);
+    return result;
+  });
+
+  const decisionSchema = z.object({ note: z.string().max(2000).nullable().optional() });
+
+  /**
+   * ACCEPTANCE IS THE POINT.
+   *
+   * The sweep proposes; a person with the authority decides. An accepted entry
+   * is what the company will price and plan against, so accepting it is a
+   * ledgered act with a name against it — and an entry whose sample the
+   * accepter never looked at is exactly what this workflow exists to prevent
+   * being invisible.
+   */
+  app.post(
+    "/learning/libraries/rates/:entryId/:decision",
+    { preHandler: companyWrite },
+    async (req) => {
+      const { entryId, decision } = req.params as { entryId: string; decision: string };
+      if (decision !== "accept" && decision !== "reject") {
+        throw badRequest("Decision must be accept or reject");
+      }
+      const body = decisionSchema.parse(req.body ?? {});
+      const [entry] = await app.db
+        .select()
+        .from(rateLibraryEntries)
+        .where(
+          and(
+            eq(rateLibraryEntries.id, entryId),
+            eq(rateLibraryEntries.companyId, req.companyId!),
+          ),
+        )
+        .limit(1);
+      if (!entry) throw notFound("Rate library entry not found");
+      if (entry.status === "superseded") {
+        throw conflict("A superseded entry cannot be decided — decide the entry that replaced it");
+      }
+      if (entry.status !== "proposed") {
+        throw conflict(`This entry is already ${entry.status}`);
+      }
+      const now = new Date().toISOString();
+      const status = decision === "accept" ? "accepted" : "rejected";
+      await app.db
+        .update(rateLibraryEntries)
+        .set({
+          status,
+          acceptedBy: decision === "accept" ? req.user!.id : null,
+          acceptedAt: decision === "accept" ? now : null,
+          note: body.note ? `${entry.note ?? ""} ${body.note}`.trim() : entry.note,
+          updatedAt: now,
+        })
+        .where(eq(rateLibraryEntries.id, entryId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "rate_library_entry",
+        objectId: entryId,
+        payload: {
+          from: entry.status,
+          to: status,
+          elementCode: entry.elementCode,
+          sampleSize: entry.sampleSize,
+          median: entry.medianRate,
+          note: body.note ?? null,
+        },
+        storePayload: true,
+      });
+      const [updated] = await app.db
+        .select()
+        .from(rateLibraryEntries)
+        .where(eq(rateLibraryEntries.id, entryId))
+        .limit(1);
+      return updated;
+    },
+  );
+
+  app.post(
+    "/learning/libraries/durations/:entryId/:decision",
+    { preHandler: companyWrite },
+    async (req) => {
+      const { entryId, decision } = req.params as { entryId: string; decision: string };
+      if (decision !== "accept" && decision !== "reject") {
+        throw badRequest("Decision must be accept or reject");
+      }
+      const body = decisionSchema.parse(req.body ?? {});
+      const [entry] = await app.db
+        .select()
+        .from(durationLibraryEntries)
+        .where(
+          and(
+            eq(durationLibraryEntries.id, entryId),
+            eq(durationLibraryEntries.companyId, req.companyId!),
+          ),
+        )
+        .limit(1);
+      if (!entry) throw notFound("Duration library entry not found");
+      if (entry.status === "superseded") {
+        throw conflict("A superseded entry cannot be decided — decide the entry that replaced it");
+      }
+      if (entry.status !== "proposed") {
+        throw conflict(`This entry is already ${entry.status}`);
+      }
+      const now = new Date().toISOString();
+      const status = decision === "accept" ? "accepted" : "rejected";
+      await app.db
+        .update(durationLibraryEntries)
+        .set({
+          status,
+          acceptedBy: decision === "accept" ? req.user!.id : null,
+          acceptedAt: decision === "accept" ? now : null,
+          note: body.note ? `${entry.note ?? ""} ${body.note}`.trim() : entry.note,
+          updatedAt: now,
+        })
+        .where(eq(durationLibraryEntries.id, entryId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "duration_library_entry",
+        objectId: entryId,
+        payload: {
+          from: entry.status,
+          to: status,
+          activityCode: entry.activityCode,
+          sampleSize: entry.sampleSize,
+          median: entry.medianDays,
+          note: body.note ?? null,
+        },
+        storePayload: true,
+      });
+      const [updated] = await app.db
+        .select()
+        .from(durationLibraryEntries)
+        .where(eq(durationLibraryEntries.id, entryId))
+        .limit(1);
+      return updated;
+    },
+  );
+
+  /**
+   * ESTIMATE ACCURACY, PUBLISHED (#983).
+   *
+   * The company's own optimism bias, measured from its own outturn. Entries
+   * with no recorded estimate are counted separately and never treated as
+   * accurate — "we cannot tell" is the honest answer, and it is the one most
+   * companies deserve at first.
+   */
+  app.get("/learning/libraries/accuracy", { preHandler: companyScopedRead }, async (req) => {
+    const rateRows = await app.db
+      .select({ accuracyRatio: rateLibraryEntries.accuracyRatio })
+      .from(rateLibraryEntries)
+      .where(
+        and(
+          eq(rateLibraryEntries.companyId, req.companyId!),
+          inArray(rateLibraryEntries.status, ["proposed", "accepted"]),
+        ),
+      );
+    const durationRows = await app.db
+      .select({ accuracyRatio: durationLibraryEntries.accuracyRatio })
+      .from(durationLibraryEntries)
+      .where(
+        and(
+          eq(durationLibraryEntries.companyId, req.companyId!),
+          inArray(durationLibraryEntries.status, ["proposed", "accepted"]),
+        ),
+      );
+    const realisations = await app.db
+      .select()
+      .from(riskRealisations)
+      .where(eq(riskRealisations.companyId, req.companyId!))
+      .limit(1000);
+    return {
+      rates: accuracyMetric(
+        "rates",
+        rateRows.map((r) => r.accuracyRatio),
+      ),
+      durations: accuracyMetric(
+        "durations",
+        durationRows.map((r) => r.accuracyRatio),
+      ),
+      riskRealisation: realisationStats(
+        realisations.map((r) => ({
+          category: r.category,
+          predictedProbability: r.predictedProbability,
+          predictedImpact: r.predictedImpact,
+          predictedCurrency: r.predictedCurrency,
+          realisedImpact: r.realisedImpact,
+          realisedCurrency: r.realisedCurrency,
+        })),
+      ),
+      basis:
+        "Accuracy is median outturn ÷ recorded estimate − 1 per library entry. Positive means " +
+        "the estimate was optimistic. Superseded and rejected entries are excluded.",
+    };
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Risk realisation (#984)                                           */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Record what a realised risk actually cost. The prediction is copied from
+   * the register AT THE MOMENT OF REALISATION rather than read back later,
+   * because a register that gets edited after the event cannot be used to
+   * measure how well it predicted it.
+   */
+  const realisationSchema = z.object({
+    riskId: z.string().min(1).max(64),
+    realisedAt: isoDate.nullable().optional(),
+    realisedImpact: z.number().finite().nullable().optional(),
+    realisedCurrency: z.string().min(3).max(8).nullable().optional(),
+    realisedDays: z.number().int().min(-10_000).max(10_000).nullable().optional(),
+    sourceType: z.string().max(60).nullable().optional(),
+    sourceId: z.string().max(64).nullable().optional(),
+    note: z.string().max(2000).nullable().optional(),
+  });
+
+  app.post(
+    "/projects/:projectId/learning/risk-realisations",
+    { preHandler: projectStandard },
+    async (req, reply) => {
+      const body = realisationSchema.parse(req.body);
+      const [risk] = await app.db
+        .select()
+        .from(risks)
+        .where(
+          and(
+            eq(risks.id, body.riskId),
+            eq(risks.companyId, req.companyId!),
+            eq(risks.projectId, req.projectId!),
+          ),
+        )
+        .limit(1);
+      if (!risk) throw notFound("Risk not found on this project");
+      const [project] = await app.db
+        .select({ currency: projects.currency })
+        .from(projects)
+        .where(eq(projects.id, req.projectId!))
+        .limit(1);
+      const sourceType = body.sourceType ?? "manual";
+      const sourceId = body.sourceId ?? risk.id;
+      const [existing] = await app.db
+        .select({ id: riskRealisations.id })
+        .from(riskRealisations)
+        .where(
+          and(
+            eq(riskRealisations.riskId, risk.id),
+            eq(riskRealisations.sourceType, sourceType),
+            eq(riskRealisations.sourceId, sourceId),
+          ),
+        )
+        .limit(1);
+      if (existing) {
+        throw conflict(
+          "This risk has already been recorded as realised against that source. Realisation is " +
+            "a fact about one event; a second event is a second source.",
+        );
+      }
+      const id = newId("rreal");
+      await app.db.insert(riskRealisations).values({
+        id,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        riskId: risk.id,
+        riskReference: `R-${risk.number}`,
+        category: risk.category,
+        title: risk.title,
+        predictedProbability:
+          risk.occurrenceProbability ?? (risk.probabilityScore ? risk.probabilityScore / 5 : null),
+        predictedImpact: centralImpact(risk.costImpact),
+        predictedCurrency: project?.currency ?? null,
+        realisedAt: body.realisedAt ?? todayISO(),
+        realisedImpact: body.realisedImpact ?? null,
+        realisedCurrency: body.realisedCurrency ?? project?.currency ?? null,
+        realisedDays: body.realisedDays ?? null,
+        sourceType,
+        sourceId,
+        note: body.note ?? null,
+        createdBy: req.user!.id,
+      });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "risk_realisation",
+        objectId: id,
+        projectId: req.projectId!,
+        payload: {
+          riskId: risk.id,
+          category: risk.category,
+          realisedImpact: body.realisedImpact ?? null,
+          sourceType,
+          sourceId,
+        },
+        storePayload: true,
+      });
+      const [row] = await app.db
+        .select()
+        .from(riskRealisations)
+        .where(eq(riskRealisations.id, id))
+        .limit(1);
+      return reply.status(201).send(row);
+    },
+  );
+
+  app.get("/learning/risk-realisations", { preHandler: companyScopedRead }, async (req) => {
+    const q = pageQuerySchema.parse(req.query);
+    const scope = companyScopeOf(req, "learning");
+    const where = and(
+      eq(riskRealisations.companyId, req.companyId!),
+      scopeProjects(scope, riskRealisations.projectId),
+    );
+    const [totalRow] = await app.db.select({ n: count() }).from(riskRealisations).where(where);
+    const items = await app.db
+      .select()
+      .from(riskRealisations)
+      .where(where)
+      .orderBy(desc(riskRealisations.createdAt))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    return {
+      ...paginate(items, Number(totalRow?.n ?? 0), q),
+      stats: realisationStats(
+        items.map((r) => ({
+          category: r.category,
+          predictedProbability: r.predictedProbability,
+          predictedImpact: r.predictedImpact,
+          predictedCurrency: r.predictedCurrency,
+          realisedImpact: r.realisedImpact,
+          realisedCurrency: r.realisedCurrency,
+        })),
+      ),
+    };
+  });
+
+  /**
+   * Sweep risks the register itself says have been realised, so the feedback
+   * loop does not depend on somebody remembering to press a button. The
+   * prediction is captured as it stands now; the realised impact stays null
+   * until a person records it, and null is reported as null.
+   */
+  async function sweepRiskRealisations(companyId: string, actorId: string | null) {
+    const rows = await app.db
+      .select({
+        risk: risks,
+        currency: projects.currency,
+      })
+      .from(risks)
+      .innerJoin(projects, eq(projects.id, risks.projectId))
+      .where(
+        and(
+          eq(risks.companyId, companyId),
+          eq(risks.status, "realised"),
+          isNull(projects.deletedAt),
+        ),
+      )
+      .limit(500);
+    let created = 0;
+    for (const { risk, currency } of rows) {
+      const [existing] = await app.db
+        .select({ id: riskRealisations.id })
+        .from(riskRealisations)
+        .where(
+          and(
+            eq(riskRealisations.riskId, risk.id),
+            eq(riskRealisations.sourceType, "risk_status"),
+            eq(riskRealisations.sourceId, risk.id),
+          ),
+        )
+        .limit(1);
+      if (existing) continue;
+      const id = newId("rreal");
+      await app.db.insert(riskRealisations).values({
+        id,
+        companyId,
+        projectId: risk.projectId,
+        riskId: risk.id,
+        riskReference: `R-${risk.number}`,
+        category: risk.category,
+        title: risk.title,
+        predictedProbability:
+          risk.occurrenceProbability ?? (risk.probabilityScore ? risk.probabilityScore / 5 : null),
+        predictedImpact: centralImpact(risk.costImpact),
+        predictedCurrency: currency,
+        realisedAt: todayISO(),
+        realisedImpact: null,
+        realisedCurrency: currency,
+        realisedDays: null,
+        sourceType: "risk_status",
+        sourceId: risk.id,
+        note: "Captured automatically when the register marked the risk realised. The realised impact has not been recorded.",
+        createdBy: actorId,
+      });
+      await appendLedger(app.db, {
+        companyId,
+        actorId,
+        action: "create",
+        objectType: "risk_realisation",
+        objectId: id,
+        projectId: risk.projectId,
+        payload: { riskId: risk.id, category: risk.category, source: "risk_status" },
+        storePayload: true,
+      });
+      created += 1;
+    }
+    return { scanned: rows.length, created };
+  }
+
+  /* ================================================================ */
   /* SCHEDULED JOBS                                                    */
   /* ================================================================ */
 
@@ -2812,6 +4241,51 @@ export const learningModule: FastifyPluginAsync = async (app) => {
           pushed += result.pushed;
         }
         return { lessons: published.length, pushed };
+      }),
+  });
+
+  app.scheduler.register({
+    name: "learning.knowledge-graph",
+    description:
+      "Re-derive the edges of recently changed lessons: verify every evidence reference against the record it names, mirror the verified ones into record_links so a dispute can show what was learned from it, and remove edges whose target has gone",
+    everyMs: 6 * 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db }) =>
+      forEachCompany(db, async (companyId) => {
+        const recent = await db
+          .select({ id: lessons.id })
+          .from(lessons)
+          .where(eq(lessons.companyId, companyId))
+          .orderBy(desc(lessons.updatedAt))
+          .limit(GRAPH_PROJECTION_BATCH);
+        let inserted = 0;
+        let deleted = 0;
+        let unverified = 0;
+        for (const row of recent) {
+          const result = await projectLessonEdges(companyId, row.id, null);
+          inserted += result.inserted;
+          deleted += result.deleted;
+          unverified += result.unverified.length;
+        }
+        return { lessons: recent.length, inserted, deleted, unverified };
+      }),
+  });
+
+  app.scheduler.register({
+    name: "learning.libraries",
+    description:
+      "Rebuild the rate and duration libraries from certified valuations and completed schedule activities, and capture risks the register has marked realised — the feedback loop that turns finished work into the next estimate instead of leaving it in the projects that produced it",
+    everyMs: 24 * 60 * 60_000,
+    runOnBoot: false,
+    run: async ({ db }) =>
+      forEachCompany(db, async (companyId) => {
+        const realisations = await sweepRiskRealisations(companyId, null);
+        const libraries = await rebuildLibraries(companyId, null);
+        return {
+          rateProposals: libraries.rates.proposals,
+          durationProposals: libraries.durations.proposals,
+          realisationsCaptured: realisations.created,
+        };
       }),
   });
 

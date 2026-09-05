@@ -7,7 +7,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, eq } from "drizzle-orm";
-import { changeEvents, companyMemberships, projectMemberships, projects, signals } from "@constructos/db";
+import { changeEvents, companyMemberships, ledgerEntries, projectMemberships, projects, signals } from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
 import { newId } from "../../lib/ids.js";
 import { designModule } from "./index.js";
@@ -483,6 +483,16 @@ describe("implementation and entitlement", () => {
     expect(event?.eventType).toBe("design_change");
     expect(event?.reason).toBe("client_request");
     expect(event?.originId).toBe(notice.id);
+
+    // The chain must file the raised record as what it is: searching the
+    // ledger for a change event id may not answer "design change notice".
+    const chain = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(and(eq(ledgerEntries.companyId, owner.companyId), eq(ledgerEntries.objectId, body.changeEventId!)));
+    expect(chain).toHaveLength(1);
+    expect(chain[0]?.objectType).toBe("change_event");
+    expect(chain[0]?.action).toBe("create");
   });
 
   it("refuses to turn a designer's own change into an owner change event", async () => {

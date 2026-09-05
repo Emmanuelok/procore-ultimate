@@ -1092,9 +1092,24 @@ export function ActivityPanel({
    Refresh button used by both pages
 ========================================================================== */
 
-export function RefreshButton({ onClick, loading, label = "Refresh" }: { onClick: () => void; loading: boolean; label?: string }) {
+/** The hint shown on a write the caller's project level does not allow. */
+export const READ_ONLY_HINT = "Needs standard access to intelligence on this project";
+
+export function RefreshButton({
+  onClick,
+  loading,
+  label = "Refresh",
+  disabled = false,
+  title,
+}: {
+  onClick: () => void;
+  loading: boolean;
+  label?: string;
+  disabled?: boolean;
+  title?: string;
+}) {
   return (
-    <Button variant="secondary" size="sm" icon={IconRefresh} loading={loading} onClick={onClick}>
+    <Button variant="secondary" size="sm" icon={IconRefresh} loading={loading} disabled={disabled} title={title} onClick={onClick}>
       {label}
     </Button>
   );

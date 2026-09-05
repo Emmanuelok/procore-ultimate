@@ -71,7 +71,7 @@ import { timecardReportRoutes } from "./reports.js";
  *   /projects/:projectId/labour-cost-report   allocated labour by budget line
  *   /projects/:projectId/timecard-batches     (+ /collect, /submit, /approve, /lock, /export)
  *   /projects/:projectId/tm-tickets           (+ /lines, /lines/source, /sign,
- *                                                /submit, /promote)
+ *                                                /submit, /approve, /promote)
  *   /projects/:projectId/labour-progress      installed quantity per cost code
  *                                             per day (+ /:id/verify — never
  *                                             by whoever measured it)

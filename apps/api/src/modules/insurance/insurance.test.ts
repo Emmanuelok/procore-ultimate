@@ -1,11 +1,14 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, eq } from "drizzle-orm";
+import type Anthropic from "@anthropic-ai/sdk";
+import { setAiClientFactory, type AiClientLike } from "../ai/service.js";
 import {
   bonds,
   companyMemberships,
   insuranceCertificates,
   insuranceClaims,
+  insuranceConfirmations,
   insurancePolicies,
   obligations,
   projectMemberships,
@@ -2343,5 +2346,440 @@ describe("claim documentation pack and the adjuster's task list", () => {
       viewerHeaders,
     );
     expect(res.statusCode).toBe(403);
+  });
+});
+
+/* ================================================================== */
+/* CERTIFICATE AUTHENTICITY (#772, #781)                               */
+/*                                                                     */
+/* Two independent claims about the same piece of paper: what the      */
+/* DOCUMENT says (extraction), and what the party who issued the cover */
+/* says (confirmation). Neither is the party that typed the record.    */
+/* ================================================================== */
+
+describe("certificate extraction and insurer confirmation", () => {
+  let authProject: string;
+  let authCertId: string;
+  let noFileCertId: string;
+  let extractionResponse: unknown = {};
+  let extractionThrows: string | null = null;
+
+  const fakeClient = {
+    beta: {
+      messages: {
+        async create(params: { model: string }) {
+          if (extractionThrows) throw new Error(extractionThrows);
+          return {
+            id: "msg_test",
+            type: "message",
+            role: "assistant",
+            model: params.model,
+            content: [
+              { type: "text", text: JSON.stringify(extractionResponse), citations: null },
+            ],
+            stop_reason: "end_turn",
+            stop_sequence: null,
+            stop_details: null,
+            usage: {
+              input_tokens: 100,
+              output_tokens: 50,
+              cache_creation_input_tokens: null,
+              cache_read_input_tokens: null,
+              server_tool_use: null,
+              service_tier: null,
+            },
+          } as unknown as Anthropic.Beta.BetaMessage;
+        },
+      },
+    },
+  } as unknown as AiClientLike;
+
+  async function uploadCertFile(projectId: string, certId: string, content: string) {
+    const boundary = "----constructosauth";
+    const payload =
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="file"; filename="coi.txt"\r\n` +
+      `Content-Type: text/plain\r\n\r\n${content}\r\n--${boundary}--\r\n`;
+    return app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/insurance/certificates/${certId}/file`,
+      headers: { ...owner.headers, "content-type": `multipart/form-data; boundary=${boundary}` },
+      payload,
+    });
+  }
+
+  beforeAll(async () => {
+    authProject = await makeProject("Authenticity Works");
+    const withFile = await post(`/projects/${authProject}/insurance/certificates`, {
+      subjectName: "Ridgeway Groundworks Limited",
+      policyType: "public_liability",
+      certificateNumber: "PL-99881",
+      insurer: "Northgate Insurance plc",
+      limitOfIndemnity: 5_000_000,
+      validFrom: daysFromToday(-30),
+      validTo: daysFromToday(200),
+    });
+    expect(withFile.statusCode).toBe(201);
+    authCertId = withFile.json().id as string;
+    const uploaded = await uploadCertFile(
+      authProject,
+      authCertId,
+      "CERTIFICATE OF INSURANCE\nInsurer: Northgate Insurance plc\nLimit of indemnity: GBP 1,000,000",
+    );
+    expect(uploaded.statusCode).toBe(201);
+
+    const without = await post(`/projects/${authProject}/insurance/certificates`, {
+      subjectName: "Paperless Plant Hire",
+      policyType: "public_liability",
+      validFrom: daysFromToday(-10),
+      validTo: daysFromToday(100),
+    });
+    noFileCertId = without.json().id as string;
+  }, 120_000);
+
+  afterAll(() => {
+    setAiClientFactory(null);
+    delete app.appConfig.ANTHROPIC_API_KEY;
+  });
+
+  /* ---------------- extraction ---------------- */
+
+  it("refuses to extract when no document has been uploaded — there is nothing to read", async () => {
+    const res = await post(
+      `/projects/${authProject}/insurance/certificates/${noFileCertId}/extract`,
+      {},
+    );
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toMatch(/no certificate document/i);
+  });
+
+  it("returns 503 with AI unconfigured, and the rest of the certificate still works", async () => {
+    const res = await post(
+      `/projects/${authProject}/insurance/certificates/${authCertId}/extract`,
+      {},
+    );
+    expect(res.statusCode).toBe(503);
+    const detail = await get(
+      `/projects/${authProject}/insurance/certificates/${authCertId}/extraction`,
+    );
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().available).toBe(false);
+    expect(String(detail.json().reason)).toMatch(/never been read/i);
+  });
+
+  it("reads the document, diffs it against the record and changes nothing", async () => {
+    app.appConfig.ANTHROPIC_API_KEY = "test-key-not-a-real-key";
+    setAiClientFactory(() => fakeClient);
+    extractionResponse = {
+      insurer: "Northgate Insurance plc",
+      policyNumber: "PL-99881",
+      insuredName: "Ridgeway Groundworks Ltd",
+      policyType: "public liability",
+      limitOfIndemnity: 1_000_000,
+      currency: "GBP",
+      validFrom: null,
+      validTo: null,
+      waiverOfSubrogation: null,
+      additionalInsured: null,
+      endorsements: [],
+      citations: [{ field: "limitOfIndemnity", quote: "Limit of indemnity: GBP 1,000,000" }],
+      notes: null,
+    };
+    const res = await post(
+      `/projects/${authProject}/insurance/certificates/${authCertId}/extract`,
+      {},
+    );
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.appliedToRecord).toBe(false);
+    const mismatches = body.mismatches as Array<Record<string, unknown>>;
+    expect(mismatches).toHaveLength(1);
+    expect(mismatches[0]!.field).toBe("limitOfIndemnity");
+    expect(mismatches[0]!.severity).toBe("high");
+    expect(mismatches[0]!.quote).toContain("1,000,000");
+    expect(String(body.summary)).toContain("cover-critical");
+
+    // the typed value is untouched: a disagreement is a finding, not a correction
+    const [cert] = await app.db
+      .select()
+      .from(insuranceCertificates)
+      .where(eq(insuranceCertificates.id, authCertId));
+    expect(cert!.limitOfIndemnity).toBe(5_000_000);
+    expect(cert!.extractedAt).not.toBeNull();
+    expect(cert!.verificationMethod).toBeNull();
+  });
+
+  it("raises a signal for the cover-critical disagreement, once per document version", async () => {
+    const rows = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "insurance_certificate_mismatch"),
+        ),
+      );
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.subjectId).toBe(authCertId);
+    expect(String(rows[0]!.explanation)).toContain("running against the typed values");
+
+    await post(`/projects/${authProject}/insurance/certificates/${authCertId}/extract`, {});
+    const again = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "insurance_certificate_mismatch"),
+        ),
+      );
+    expect(again.length).toBe(1);
+  });
+
+  it("serves the last extraction back without re-running the model", async () => {
+    const res = await get(
+      `/projects/${authProject}/insurance/certificates/${authCertId}/extraction`,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.json().available).toBe(true);
+    expect((res.json().mismatches as unknown[]).length).toBe(1);
+    expect(res.json().runId).toBeTruthy();
+  });
+
+  it("refuses extraction from another tenant and from a read-only member", async () => {
+    const stranger$ = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${authProject}/insurance/certificates/${authCertId}/extract`,
+      headers: stranger.headers,
+      payload: {},
+    });
+    expect([403, 404]).toContain(stranger$.statusCode);
+
+    await app.db.insert(projectMemberships).values({
+      id: newId("pm"),
+      companyId: owner.companyId,
+      projectId: authProject,
+      userId: viewer.userId,
+      templateKey: "read_only",
+    });
+    const readOnly = await post(
+      `/projects/${authProject}/insurance/certificates/${authCertId}/extract`,
+      {},
+      viewerHeaders,
+    );
+    expect(readOnly.statusCode).toBe(403);
+  });
+
+  /* ---------------- broker / insurer confirmation ---------------- */
+
+  it("issues a tokenised confirmation request and never lists the token again", async () => {
+    const res = await post(
+      `/projects/${authProject}/insurance/certificates/${authCertId}/confirmations`,
+      {
+        channel: "broker",
+        recipientEmail: "broker@example.com",
+        recipientName: "A Broker",
+        message: "Please confirm the limit.",
+      },
+    );
+    expect(res.statusCode).toBe(201);
+    const body = res.json();
+    expect(body.status).toBe("sent");
+    expect(body.token).toBeUndefined();
+    expect(String(body.link)).toMatch(/\/insurance\/confirm\/[0-9a-f]{48}$/);
+
+    const list = await get(
+      `/projects/${authProject}/insurance/certificates/${authCertId}/confirmations`,
+    );
+    expect(list.statusCode).toBe(200);
+    const items = list.json().items as Array<Record<string, unknown>>;
+    expect(items).toHaveLength(1);
+    expect(items[0]!.token).toBeUndefined();
+    expect(items[0]!.tokenHash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("records the broker's confirmation, sets the verification and hashes the reply", async () => {
+    const created = await post(
+      `/projects/${authProject}/insurance/certificates/${authCertId}/confirmations`,
+      { channel: "insurer", recipientEmail: "underwriter@example.com" },
+    );
+    const token = String(created.json().link).split("/").pop()!;
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/insurance/confirmations/${token}/respond`,
+      payload: { outcome: "confirmed", respondentName: "U Writer" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().verificationApplied).toBe(true);
+    expect(res.json().responseSha256).toMatch(/^[0-9a-f]{64}$/);
+
+    const [cert] = await app.db
+      .select()
+      .from(insuranceCertificates)
+      .where(eq(insuranceCertificates.id, authCertId));
+    expect(cert!.verificationMethod).toBe("insurer_confirmation");
+    // an external party is not a user of this tenant, so nobody is credited
+    expect(cert!.verifiedBy).toBeNull();
+    expect(cert!.verifiedAt).not.toBeNull();
+  });
+
+  it("cannot be answered twice, and an unknown or malformed token is a 404", async () => {
+    const created = await post(
+      `/projects/${authProject}/insurance/certificates/${authCertId}/confirmations`,
+      { channel: "broker", recipientEmail: "broker2@example.com" },
+    );
+    const token = String(created.json().link).split("/").pop()!;
+    const first = await app.inject({
+      method: "POST",
+      url: `/api/v1/insurance/confirmations/${token}/respond`,
+      payload: { outcome: "corrected", note: "The limit is 1m, not 5m." },
+    });
+    expect(first.statusCode).toBe(200);
+    // "corrected" is not a confirmation: the record is not verified by it
+    expect(first.json().verificationApplied).toBe(false);
+
+    const replay = await app.inject({
+      method: "POST",
+      url: `/api/v1/insurance/confirmations/${token}/respond`,
+      payload: { outcome: "confirmed" },
+    });
+    expect(replay.statusCode).toBe(409);
+
+    const unknown = await app.inject({
+      method: "POST",
+      url: `/api/v1/insurance/confirmations/${"f".repeat(48)}/respond`,
+      payload: { outcome: "confirmed" },
+    });
+    expect(unknown.statusCode).toBe(404);
+
+    const malformed = await app.inject({
+      method: "POST",
+      url: `/api/v1/insurance/confirmations/not-a-token/respond`,
+      payload: { outcome: "confirmed" },
+    });
+    expect(malformed.statusCode).toBe(404);
+  });
+
+  it("treats 'not on risk' as a critical signal, never as a verification", async () => {
+    const created = await post(
+      `/projects/${authProject}/insurance/certificates/${noFileCertId}/confirmations`,
+      { channel: "insurer", recipientEmail: "underwriter2@example.com" },
+    );
+    const token = String(created.json().link).split("/").pop()!;
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/insurance/confirmations/${token}/respond`,
+      payload: { outcome: "not_on_risk", note: "No such policy on our books." },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().verificationApplied).toBe(false);
+    const rows = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "insurance_certificate_mismatch"),
+          eq(signals.subjectId, noFileCertId),
+        ),
+      );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.severity).toBe("critical");
+  });
+
+  it("withdraws an unanswered request but refuses to erase an answered one", async () => {
+    const created = await post(
+      `/projects/${authProject}/insurance/certificates/${authCertId}/confirmations`,
+      { channel: "broker", recipientEmail: "broker3@example.com" },
+    );
+    const id = created.json().id as string;
+    const withdrawn = await post(
+      `/projects/${authProject}/insurance/confirmations/${id}/withdraw`,
+      { reason: "Wrong address" },
+    );
+    expect(withdrawn.statusCode).toBe(200);
+    expect(withdrawn.json().status).toBe("withdrawn");
+
+    const answered = await app.db
+      .select()
+      .from(insuranceConfirmations)
+      .where(
+        and(
+          eq(insuranceConfirmations.companyId, owner.companyId),
+          eq(insuranceConfirmations.status, "responded"),
+        ),
+      );
+    expect(answered.length).toBeGreaterThan(0);
+    const refuse = await post(
+      `/projects/${authProject}/insurance/confirmations/${answered[0]!.id}/withdraw`,
+      {},
+    );
+    expect(refuse.statusCode).toBe(409);
+  });
+
+  it("refuses a withdrawn request's link", async () => {
+    const created = await post(
+      `/projects/${authProject}/insurance/certificates/${authCertId}/confirmations`,
+      { channel: "broker", recipientEmail: "broker4@example.com" },
+    );
+    const token = String(created.json().link).split("/").pop()!;
+    await post(
+      `/projects/${authProject}/insurance/confirmations/${created.json().id as string}/withdraw`,
+      {},
+    );
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/insurance/confirmations/${token}/respond`,
+      payload: { outcome: "confirmed" },
+    });
+    expect(res.statusCode).toBe(409);
+  });
+
+  it("expires an unanswered request on the schedule — silence is not confirmation", async () => {
+    const created = await post(
+      `/projects/${authProject}/insurance/certificates/${authCertId}/confirmations`,
+      { channel: "broker", recipientEmail: "slow@example.com" },
+    );
+    const id = created.json().id as string;
+    await app.db
+      .update(insuranceConfirmations)
+      .set({ expiresAt: new Date(Date.now() - 86_400_000).toISOString() })
+      .where(eq(insuranceConfirmations.id, id));
+    await app.scheduler.runNow("insurance.confirmation-expiry");
+    const [row] = await app.db
+      .select()
+      .from(insuranceConfirmations)
+      .where(eq(insuranceConfirmations.id, id));
+    expect(row!.status).toBe("expired");
+    const token = String(created.json().link).split("/").pop()!;
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/insurance/confirmations/${token}/respond`,
+      payload: { outcome: "confirmed" },
+    });
+    expect(res.statusCode).toBe(409);
+  });
+
+  it("keeps the company-level confirmation register inside the caller's projects", async () => {
+    const mine = await get(`/insurance/confirmations`);
+    expect(mine.statusCode).toBe(200);
+    expect((mine.json().items as unknown[]).length).toBeGreaterThan(0);
+
+    const other = await app.inject({
+      method: "GET",
+      url: "/api/v1/insurance/confirmations",
+      headers: stranger.headers,
+    });
+    expect(other.statusCode).toBe(403);
+  });
+
+  it("refuses to raise a confirmation on another tenant's certificate", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${authProject}/insurance/certificates/${authCertId}/confirmations`,
+      headers: stranger.headers,
+      payload: { channel: "broker", recipientEmail: "x@example.com" },
+    });
+    expect([403, 404]).toContain(res.statusCode);
   });
 });

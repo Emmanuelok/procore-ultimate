@@ -88,6 +88,20 @@ export default function ScreeningTab() {
   const rows = financials.data?.items ?? [];
   const rule = financials.data?.rule;
 
+  const action = useAction();
+
+  /**
+   * A second person checking the figures against the source documents. The
+   * API refuses it from the person who entered them, and until it happens the
+   * recommended limit carries a provenance haircut that says so.
+   */
+  async function verifyFigures(financialId: string) {
+    const res = await action.run(`verify:${financialId}`, () =>
+      api.post(`${BASE}/financials/${financialId}/verify`, {}),
+    );
+    if (res) setVersion((n) => n + 1);
+  }
+
   const columns: DataColumns<FinancialRecord> = useMemo(
     () => [
       {
@@ -254,8 +268,37 @@ export default function ScreeningTab() {
           );
         },
       },
+      {
+        /*
+         * INDEPENDENT VERIFICATION IS A CONTROL, NOT A DECORATION. An
+         * unverified figure carries a provenance haircut into the recommended
+         * limit, and the person who verifies may not be the person who typed
+         * the numbers in — the API refuses that, and this column is where the
+         * second person acts.
+         */
+        id: "verify",
+        header: "Verification",
+        accessor: (row) => (row.verifiedAt ? 1 : 0),
+        width: 180,
+        cell: ({ row }) =>
+          row.verifiedAt ? (
+            <Badge tone="success" size="xs" dot variant="subtle">
+              verified {isoDate(row.verifiedAt)}
+            </Badge>
+          ) : (
+            <Button
+              size="xs"
+              variant="secondary"
+              loading={action.busy === `verify:${row.id}`}
+              onClick={() => void verifyFigures(row.id)}
+              title="Records that a second person checked these figures against the source documents."
+            >
+              Verify figures
+            </Button>
+          ),
+      },
     ],
-    [vendorName],
+    [vendorName, action.busy],
   );
 
   if (financials.loading && !financials.data) return <LoadingBlock rows={5} />;
@@ -263,6 +306,8 @@ export default function ScreeningTab() {
 
   return (
     <div className="space-y-4">
+      <RefusalPanel refusal={action.refusal} onDismiss={action.clear} />
+
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div className="flex flex-wrap items-end gap-3">
           <Field label="Vendor" className="min-w-[16rem]">

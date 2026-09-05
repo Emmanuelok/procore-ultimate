@@ -488,6 +488,90 @@ describe("TIA fragnet insertion", () => {
     expect(res.statusCode).toBe(400);
     expect(res.json().message).toContain("taskId");
   });
+
+  /*
+   * REGRESSION: the TIA used to run on lib/cpm — continuous calendar, no data
+   * date — while the schedule module persists dates from CPM2. On any
+   * programme with a working-week calendar the analysis reported a
+   * `beforeFinish` that contradicted the schedule's own computed finish and
+   * measured the delay in calendar days. Both engines must now agree.
+   */
+  it("runs on the programme's own calendar, so beforeFinish matches the schedule's computed finish", async () => {
+    const cal = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/schedule-calendars`,
+      headers: owner.headers,
+      payload: { name: "TIA Mon-Fri", workdays: [0, 1, 1, 1, 1, 1, 0], hoursPerDay: 8 },
+    });
+    expect(cal.statusCode).toBe(201);
+    const calendarId = (cal.json() as { id: string }).id;
+
+    const sched = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/schedules`,
+      headers: owner.headers,
+      payload: { name: "Calendar programme (TIA)", projectStart: "2026-01-05" }, // a Monday
+    });
+    expect(sched.statusCode).toBe(201);
+    const calScheduleId = (sched.json() as { id: string }).id;
+
+    const mkTask = async (name: string, durationDays: number) => {
+      const res = await app.inject({
+        method: "POST",
+        url: `/api/v1/projects/${projectId}/schedules/${calScheduleId}/tasks`,
+        headers: owner.headers,
+        payload: { name, durationDays, calendarId },
+      });
+      expect(res.statusCode).toBe(201);
+      return (res.json() as { id: string }).id;
+    };
+    const first = await mkTask("Piling", 5);
+    const second = await mkTask("Pile caps", 5);
+    const link = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/schedules/${calScheduleId}/dependencies`,
+      headers: owner.headers,
+      payload: { predecessorId: first, successorId: second, depType: "FS", lagDays: 0 },
+    });
+    expect(link.statusCode).toBe(201);
+
+    const detail = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/schedules/${calScheduleId}`,
+      headers: owner.headers,
+    });
+    const computedFinish = (detail.json() as { computedFinish: string }).computedFinish;
+    // Mon 5 Jan + 5 working days, then 5 more: Fri 16 Jan.
+    expect(computedFinish).toBe("2026-01-16");
+
+    const create = await createDelayEvent(projectId, {
+      title: "Rig breakdown",
+      cause: "contractor_performance",
+      excusable: false,
+      compensable: false,
+      startDate: "2026-01-12",
+      durationDays: 5,
+      taskId: first,
+      scheduleId: calScheduleId,
+    });
+    expect(create.statusCode).toBe(201);
+    const eventId = (create.json() as { id: string }).id;
+
+    const tia = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/delay-events/${eventId}/tia`,
+      headers: owner.headers,
+    });
+    expect(tia.statusCode).toBe(200);
+    const body = tia.json();
+    // The analysis and the programme describe the same schedule.
+    expect(body.beforeFinish).toBe(computedFinish);
+    // Five WORKING days of delay move a five-day-week programme a full week;
+    // the old continuous-calendar engine reported five.
+    expect(body.completionDeltaDays).toBe(7);
+    expect(body.afterFinish).toBe("2026-01-23");
+    expect(body.fragnetCalendarId).toBe(calendarId);
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -1375,6 +1459,56 @@ describe("TIA staleness", () => {
     expect(after.json().tia.stale).toBe(true);
     expect(after.json().tia.deltaDays).toBeNull();
     expect(after.json().tia.reason).toMatch(/recomputed/);
+
+    // The REGISTER must carry the same verdict: a list chip that shows the
+    // cached delta while the drawer calls it stale is the same lie in a
+    // smaller font.
+    const list = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/delay-events?pageSize=100`,
+      headers: owner.headers,
+    });
+    expect(list.statusCode).toBe(200);
+    const row = (list.json() as { items: { id: string; tia: { stale: boolean } }[] }).items.find(
+      (i) => i.id === id,
+    );
+    expect(row?.tia.stale).toBe(true);
+  });
+});
+
+describe("delay event register filters", () => {
+  it("includeWithdrawn=false drops withdrawn events from the register", async () => {
+    const created = await createDelayEvent(projectId, {
+      title: "Raised in error",
+      cause: "other",
+      excusable: false,
+      compensable: false,
+      startDate: "2026-03-01",
+      durationDays: 2,
+    });
+    const id = created.json().id as string;
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/delay-events/${id}/status`,
+      headers: owner.headers,
+      payload: { status: "withdrawn", reason: "duplicate of DE-1" },
+    });
+
+    const all = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/delay-events?pageSize=200`,
+      headers: owner.headers,
+    });
+    const allIds = (all.json() as { items: { id: string }[] }).items.map((i) => i.id);
+    expect(allIds).toContain(id); // the register keeps the record
+
+    const live = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/delay-events?pageSize=200&includeWithdrawn=false`,
+      headers: owner.headers,
+    });
+    const liveIds = (live.json() as { items: { id: string }[] }).items.map((i) => i.id);
+    expect(liveIds).not.toContain(id);
   });
 });
 

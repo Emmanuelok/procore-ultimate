@@ -2456,3 +2456,318 @@ describe("permissions", () => {
     expect(res.statusCode).toBe(401);
   });
 });
+
+/* ================================================================== */
+/* BID VALIDITY — the offer has a shelf life (#166, #174)              */
+/* ================================================================== */
+
+describe("bid validity", () => {
+  it("refuses to recommend an expired bid, and accepts it once an extension is recorded", async () => {
+    const pkg = await createPackage(projectA, {
+      title: "Validity — lapsed offer",
+      anticipatedAwardDate: dateIn(30),
+    });
+    await issuePackage(projectA, pkg.id);
+    const stale = await submitBid(projectA, pkg.id, alpha, {
+      baseBidAmount: 150_000,
+      validUntil: dateIn(-3),
+    });
+    await submitBid(projectA, pkg.id, bravo, { baseBidAmount: 175_000, validUntil: dateIn(90) });
+
+    const refused = await post(`/projects/${projectA}/bid-packages/${pkg.id}/award/recommend`, {
+      submissionId: stale.id,
+      recommendationBasis:
+        "Lowest price on the only two compliant bids received for this scope.",
+    });
+    expect(refused.statusCode).toBe(400);
+    expect(refused.json().details.control).toBe("bid_validity_expired");
+    expect(refused.json().details.extensionsRecorded).toBe(0);
+    expect(refused.json().message).toMatch(/no live offer/i);
+
+    // The register says the same thing before anybody tries.
+    const standing = await get(`/projects/${projectA}/bid-packages/${pkg.id}/validity`);
+    expect(standing.statusCode).toBe(200);
+    expect(standing.json().expired).toBe(1);
+    const staleRow = standing
+      .json()
+      .items.find((i: { submissionId: string }) => i.submissionId === stale.id);
+    expect(staleRow.state).toBe("expired");
+    expect(staleRow.basis).toMatch(/cannot be recommended until an extension is recorded/i);
+
+    // An "extension" that shortens, or that has itself already run out, is not one.
+    const backwards = await post(`/bid-submissions/${stale.id}/validity-extension`, {
+      newValidUntil: dateIn(-1),
+      confirmedBy: "R. Patel, Alpha Groundworks",
+      evidenceNote: "Email of today confirming the price stands.",
+    });
+    expect(backwards.statusCode).toBe(400);
+    expect(backwards.json().message).toMatch(/already have expired/i);
+
+    const extended = await post(`/bid-submissions/${stale.id}/validity-extension`, {
+      newValidUntil: dateIn(60),
+      confirmedBy: "R. Patel, Alpha Groundworks",
+      evidenceNote: "Email of 09:12 today confirming the tender sum stands for a further 60 days.",
+    });
+    expect(extended.statusCode).toBe(200);
+    expect(extended.json().extensionCount).toBe(1);
+    expect(extended.json().extension.from).toBe(dateIn(-3));
+    expect(extended.json().extension.to).toBe(dateIn(60));
+
+    // Ledgered with the source, not silently edited into the row.
+    const entries = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(
+        and(
+          eq(ledgerEntries.companyId, owner.companyId),
+          eq(ledgerEntries.objectId, stale.id),
+        ),
+      );
+    const extension = entries.find(
+      (e) => (e.payload as Record<string, unknown> | null)?.["event"] === "bid_validity_extended",
+    );
+    expect(extension).toBeTruthy();
+    expect((extension!.payload as Record<string, unknown>)["confirmedBy"]).toMatch(/R. Patel/);
+
+    const accepted = await post(`/projects/${projectA}/bid-packages/${pkg.id}/award/recommend`, {
+      submissionId: stale.id,
+      recommendationBasis: "Lowest price, validity extended in writing.",
+    });
+    expect(accepted.statusCode).toBe(201);
+  });
+
+  it("refuses a shortening extension and one on a bid out of contention", async () => {
+    const pkg = await createPackage(projectA, { title: "Validity — guards" });
+    await issuePackage(projectA, pkg.id);
+    const bid = await submitBid(projectA, pkg.id, charlie, {
+      baseBidAmount: 210_000,
+      validUntil: dateIn(45),
+    });
+    const shorter = await post(`/bid-submissions/${bid.id}/validity-extension`, {
+      newValidUntil: dateIn(10),
+      confirmedBy: "Someone",
+      evidenceNote: "Trying to shorten the offer from the buyer's side.",
+    });
+    expect(shorter.statusCode).toBe(400);
+    expect(shorter.json().message).toMatch(/would shorten it/i);
+
+    const withdrawn = await post(`/bid-submissions/${bid.id}/withdraw`, {
+      reason: "Bidder withdrew before the deadline.",
+    });
+    expect(withdrawn.statusCode).toBe(200);
+    const afterWithdrawal = await post(`/bid-submissions/${bid.id}/validity-extension`, {
+      newValidUntil: dateIn(90),
+      confirmedBy: "Someone",
+      evidenceNote: "Nothing left to extend.",
+    });
+    expect(afterWithdrawal.statusCode).toBe(409);
+    expect(afterWithdrawal.json().message).toMatch(/not in contention/i);
+  });
+
+  it("keeps another company out of the validity register and the extension route", async () => {
+    const pkg = await createPackage(projectA, { title: "Validity — tenancy" });
+    await issuePackage(projectA, pkg.id);
+    const bid = await submitBid(projectA, pkg.id, delta, {
+      baseBidAmount: 160_000,
+      validUntil: dateIn(30),
+    });
+    const read = await get(
+      `/projects/${projectA}/bid-packages/${pkg.id}/validity`,
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(read.statusCode);
+    const write = await post(
+      `/bid-submissions/${bid.id}/validity-extension`,
+      {
+        newValidUntil: dateIn(120),
+        confirmedBy: "Intruder",
+        evidenceNote: "Should never land.",
+      },
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(write.statusCode);
+    const [row] = await app.db.select().from(bidSubmissions).where(eq(bidSubmissions.id, bid.id));
+    expect(row!.validUntil).toBe(dateIn(30));
+  });
+});
+
+/* ================================================================== */
+/* DETECTOR PRECISION — the feedback loop, measured                    */
+/* ================================================================== */
+
+describe("bid-integrity detector precision", () => {
+  it("records both outcomes in the platform's own vocabulary and measures precision", async () => {
+    // A field of three near-identical totals: the clustering detector fires.
+    const pkg = await createPackage(projectA, { title: "Precision — clustered field" });
+    await issuePackage(projectA, pkg.id);
+    await submitBid(projectA, pkg.id, alpha, { baseBidAmount: 300_000 });
+    await submitBid(projectA, pkg.id, bravo, { baseBidAmount: 301_200 });
+    await submitBid(projectA, pkg.id, charlie, { baseBidAmount: 302_100 });
+    const run = await post(`/projects/${projectA}/bid-packages/${pkg.id}/integrity/run`);
+    expect(run.statusCode).toBe(200);
+
+    const register = await get("/companies/current/bid-integrity?openOnly=true");
+    const clustering = register
+      .json()
+      .items.find((i: { detector: string }) => i.detector === "bid_integrity_price_clustering");
+    expect(clustering).toBeTruthy();
+
+    // Confirming leaves the finding OPEN — a real pattern still bears on the
+    // next recommendation — and writes a disposition the assurance register
+    // understands.
+    const confirmed = await post(`/companies/current/bid-integrity/${clustering.id}/confirm`, {
+      reason: "Three bidders share a director; referred to the integrity reviewer.",
+    });
+    expect(confirmed.statusCode).toBe(200);
+    expect(confirmed.json().disposition).toBe("confirmed");
+    const [signalRow] = await app.db
+      .select()
+      .from(signals)
+      .where(eq(signals.id, clustering.id));
+    expect(signalRow!.disposition).toBe("confirmed");
+    const stillOpen = await get("/companies/current/bid-integrity?openOnly=true");
+    expect(
+      stillOpen.json().items.some((i: { id: string }) => i.id === clustering.id),
+    ).toBe(true);
+
+    // A dismissal is a FALSE POSITIVE in the platform's vocabulary, not a
+    // module-local word the assurance precision figures cannot see.
+    const other = register
+      .json()
+      .items.find((i: { id: string }) => i.id !== clustering.id);
+    if (other) {
+      const dismissed = await post(`/companies/current/bid-integrity/${other.id}/dismiss`, {
+        reason: "Explained by a published schedule of rates; no further action.",
+      });
+      expect(dismissed.statusCode).toBe(200);
+      expect(dismissed.json().disposition).toBe("false_positive");
+    }
+
+    const precision = await get("/companies/current/bid-integrity/precision");
+    expect(precision.statusCode).toBe(200);
+    const row = precision
+      .json()
+      .items.find((i: { detector: string }) => i.detector === "bid_integrity_price_clustering");
+    expect(row.confirmed).toBeGreaterThanOrEqual(1);
+    // Too few reviews to state a rate — the figure is null WITH its reason.
+    expect(row.precision).toBeNull();
+    expect(row.basis).toMatch(/before a precision figure means anything|unmeasured/i);
+  });
+
+  it("refuses a signal that is not this module's, and keeps another company out", async () => {
+    const foreign = newId("sig");
+    await app.db.insert(signals).values({
+      id: foreign,
+      companyId: owner.companyId,
+      detector: "ghost_vendor_shared_bank",
+      severity: "high",
+      confidence: 0.5,
+      title: "Not a bidding finding",
+      explanation: "Raised by the assurance detectors.",
+    });
+    const res = await post(`/companies/current/bid-integrity/${foreign}/confirm`, {
+      reason: "Should be refused — not this module's register.",
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toMatch(/not this module's/i);
+
+    const outsider = await get("/companies/current/bid-integrity/precision", stranger.headers);
+    expect(outsider.statusCode).toBe(200);
+    expect(outsider.json().total).toBe(0);
+  });
+});
+
+/* ================================================================== */
+/* SUSPENSION — an approval stopped while it was still live            */
+/* ================================================================== */
+
+describe("prequalification suspension", () => {
+  it("takes a live approval out of contention with its reason and ledgers it", async () => {
+    const vendorId = await makeVendor("Suspendable Piling Ltd");
+    const questionnaire = await post("/companies/current/prequalification/questionnaires", {
+      name: "Suspension questionnaire",
+      validityMonths: 12,
+    });
+    const questionnaireId = questionnaire.json().id;
+    await post(
+      `/companies/current/prequalification/questionnaires/${questionnaireId}/questions`,
+      {
+        questions: [
+          {
+            text: "Do you hold current employers liability insurance?",
+            itemType: "yes_no",
+            category: "insurance",
+            required: true,
+            weight: 1,
+            maxScore: 10,
+          },
+        ],
+      },
+    );
+    await post(
+      `/companies/current/prequalification/questionnaires/${questionnaireId}/activate`,
+      {},
+      approver.headers,
+    );
+    const questions = await get(
+      `/companies/current/prequalification/questionnaires/${questionnaireId}/questions`,
+    );
+    const questionId = questions.json().items[0].id;
+
+    const created = await post("/companies/current/prequalification/submissions", {
+      questionnaireId,
+      vendorId,
+    });
+    const id = created.json().id;
+    await post(`/companies/current/prequalification/submissions/${id}/responses`, {
+      responses: [{ questionId, response: "yes" }],
+    });
+    await post(`/companies/current/prequalification/submissions/${id}/submit`);
+    await post(`/companies/current/prequalification/submissions/${id}/assess`, {
+      scores: [{ questionId, score: 9, maxScore: 10 }],
+    });
+    const decided = await post(
+      `/companies/current/prequalification/submissions/${id}/decide`,
+      { outcome: "approved", validFrom: dateIn(-1), expiresAt: dateIn(300) },
+      approver.headers,
+    );
+    expect(decided.statusCode).toBe(200);
+
+    const standing = await get(`/companies/current/prequalification/vendors/${vendorId}`);
+    expect(standing.json().state).toBe("approved");
+
+    const blank = await post(`/companies/current/prequalification/submissions/${id}/suspend`, {});
+    expect(blank.statusCode).toBe(400);
+
+    const suspended = await post(
+      `/companies/current/prequalification/submissions/${id}/suspend`,
+      { reason: "Fatality on another site; approval held pending the HSE investigation." },
+    );
+    expect(suspended.statusCode).toBe(200);
+    expect(suspended.json().status).toBe("suspended");
+
+    const after = await get(`/companies/current/prequalification/vendors/${vendorId}`);
+    expect(after.json().state).not.toBe("approved");
+
+    const entries = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(and(eq(ledgerEntries.companyId, owner.companyId), eq(ledgerEntries.objectId, id)));
+    const suspension = entries.find(
+      (e) => (e.payload as Record<string, unknown> | null)?.["to"] === "suspended",
+    );
+    expect(suspension).toBeTruthy();
+    expect((suspension!.payload as Record<string, unknown>)["reason"]).toMatch(/HSE/);
+  });
+
+  it("keeps another company out of the suspend route", async () => {
+    const list = await get("/companies/current/prequalification/submissions");
+    const first = list.json().items[0];
+    const res = await post(
+      `/companies/current/prequalification/submissions/${first.id}/suspend`,
+      { reason: "Should never land." },
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(res.statusCode);
+  });
+});

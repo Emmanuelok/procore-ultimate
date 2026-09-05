@@ -51,19 +51,22 @@ import {
   titleCase,
   useAction,
   useNames,
+  useReason,
   useResource,
   useVendors,
 } from "./biddingShared";
 import type {
   AwardDelegationList,
   BidBoard,
+  CompanyIntegrityRegister,
+  DetectorPrecisionReport,
   CoverageReport,
   PricingReport,
   VendorBidHistory,
   WinRateReport,
 } from "./types";
 
-type Section = "coverage" | "pricing" | "winRate" | "board" | "authority";
+type Section = "coverage" | "pricing" | "winRate" | "patterns" | "board" | "authority";
 
 export default function MarketTab() {
   const [section, setSection] = useState<Section>("coverage");
@@ -77,6 +80,7 @@ export default function MarketTab() {
           { value: "coverage", label: "Coverage" },
           { value: "pricing", label: "Market position" },
           { value: "winRate", label: "Win rate" },
+          { value: "patterns", label: "Patterns" },
           { value: "board", label: "Bid board" },
           { value: "authority", label: "Award authority" },
         ]}
@@ -84,6 +88,7 @@ export default function MarketTab() {
       {section === "coverage" ? <CoverageSection /> : null}
       {section === "pricing" ? <PricingSection /> : null}
       {section === "winRate" ? <WinRateSection /> : null}
+      {section === "patterns" ? <PatternsSection /> : null}
       {section === "board" ? <BoardSection /> : null}
       {section === "authority" ? <AuthoritySection /> : null}
     </div>
@@ -938,5 +943,247 @@ function DelegationModal({
         </Field>
       </div>
     </Modal>
+  );
+}
+
+/* ================================================================== */
+/* Patterns — the cross-package integrity register                     */
+/* ================================================================== */
+
+const PATTERN_SEVERITY_TONE: Record<string, "danger" | "warning" | "info" | "neutral"> = {
+  critical: "danger",
+  high: "danger",
+  medium: "warning",
+  low: "info",
+  info: "neutral",
+};
+
+/**
+ * A rigged tender is invisible inside one package: every bid is signed, every
+ * envelope sealed, every price different. It is visible ACROSS packages — one
+ * company always losing to the same winner in one trade, winners rotating
+ * with the evenness of a rota, a bidder list that never changes. This is
+ * where those findings live, together with the only honest measure of whether
+ * the detectors are any good: how many of their findings survived review.
+ */
+function PatternsSection() {
+  const [version, setVersion] = useState(0);
+  const [openOnly, setOpenOnly] = useState(true);
+  const register = useResource<CompanyIntegrityRegister>(
+    `/api/v1/companies/current/bid-integrity?openOnly=${openOnly}&_v=${version}`,
+  );
+  const precision = useResource<DetectorPrecisionReport>(
+    `/api/v1/companies/current/bid-integrity/precision?_v=${version}`,
+  );
+  const action = useAction();
+  const reason = useReason();
+
+  function refresh() {
+    setVersion((n) => n + 1);
+  }
+
+  async function run() {
+    const res = await action.run("run", () =>
+      api.post("/api/v1/companies/current/bid-integrity/run", {}),
+    );
+    if (res) refresh();
+  }
+
+  async function disposition(signalId: string, kind: "confirm" | "dismiss") {
+    const text = await reason.ask({
+      title: kind === "confirm" ? "Confirm this pattern" : "Dismiss this pattern",
+      description:
+        kind === "confirm"
+          ? "Confirming records that the pattern was real and what was found. It stays open: a real pattern still bears on the next recommendation."
+          : "A finding is a question, not an accusation, and the ordinary answer is an innocent explanation. Recording it is what makes this detector's precision measurable.",
+      label: "What was checked, and what was found",
+      confirmLabel: kind === "confirm" ? "Confirm" : "Dismiss",
+      minLength: 3,
+    });
+    if (!text) return;
+    const res = await action.run(`${signalId}:${kind}`, () =>
+      api.post(`/api/v1/companies/current/bid-integrity/${signalId}/${kind}`, { reason: text }),
+    );
+    if (res) refresh();
+  }
+
+  return (
+    <div className="space-y-4">
+      <RefusalPanel refusal={action.refusal} onDismiss={action.clear} />
+      {reason.dialog}
+
+      <Card>
+        <CardHeader
+          title="Cross-package patterns"
+          subtitle={
+            register.data
+              ? `Detectors run over the trailing ${register.data.windowMonths} months.`
+              : "Detectors run over this company's own tender history."
+          }
+          actions={
+            <div className="flex items-center gap-2">
+              <SegmentedControl
+                aria-label="Which findings"
+                size="sm"
+                value={openOnly ? "open" : "all"}
+                onChange={(v) => setOpenOnly(v === "open")}
+                options={[
+                  { value: "open", label: "Open" },
+                  { value: "all", label: "All" },
+                ]}
+              />
+              <Button size="sm" loading={action.busy === "run"} onClick={() => void run()}>
+                Run detectors
+              </Button>
+            </div>
+          }
+        />
+        <CardBody flush>
+          {register.error ? (
+            <div className="p-4">
+              <LoadError message={register.error} onRetry={register.reload} />
+            </div>
+          ) : register.loading && !register.data ? (
+            <div className="p-4">
+              <LoadingBlock rows={3} />
+            </div>
+          ) : !register.data || register.data.items.length === 0 ? (
+            <div className="p-4">
+              <EmptyState
+                icon={IconWarning}
+                title="No cross-package finding is open"
+                hint={
+                  register.data?.note ??
+                  "Cross-package patterns need several tenders in the same trade before they say anything."
+                }
+              />
+            </div>
+          ) : (
+            <ul className="divide-y divide-border-subtle">
+              {register.data.items.map((s) => (
+                <li key={s.id} className="p-3">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Badge
+                          tone={PATTERN_SEVERITY_TONE[s.severity] ?? "neutral"}
+                          size="xs"
+                          dot
+                          variant="subtle"
+                        >
+                          {titleCase(s.severity)}
+                        </Badge>
+                        <code className="font-mono text-2xs text-content-muted">{s.detector}</code>
+                        <Badge tone="neutral" size="xs" variant="subtle">
+                          {titleCase(s.disposition)}
+                        </Badge>
+                        {s.package ? (
+                          <span className="text-2xs text-content-subtle">
+                            {s.package.reference} — {s.package.title}
+                          </span>
+                        ) : null}
+                        {s.confidence === null ? null : (
+                          <span className="text-2xs text-content-subtle">
+                            confidence {pct(s.confidence * 100, 0)}
+                          </span>
+                        )}
+                      </div>
+                      <p className="mt-1 font-medium">{s.title}</p>
+                      <p className="mt-1 whitespace-pre-wrap text-meta leading-relaxed text-content-muted">
+                        {s.explanation}
+                      </p>
+                    </div>
+                    <div className="flex shrink-0 gap-2">
+                      <Button
+                        size="xs"
+                        variant="secondary"
+                        loading={action.busy === `${s.id}:confirm`}
+                        onClick={() => void disposition(s.id, "confirm")}
+                      >
+                        Confirm
+                      </Button>
+                      <Button
+                        size="xs"
+                        variant="secondary"
+                        loading={action.busy === `${s.id}:dismiss`}
+                        onClick={() => void disposition(s.id, "dismiss")}
+                      >
+                        Dismiss
+                      </Button>
+                    </div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </CardBody>
+      </Card>
+
+      <Card>
+        <CardHeader
+          title="Measured detector precision"
+          subtitle="What survived review — never asserted, and null with its reason where too few findings have been looked at."
+        />
+        <CardBody flush>
+          {precision.error ? (
+            <div className="p-4">
+              <LoadError message={precision.error} onRetry={precision.reload} />
+            </div>
+          ) : precision.loading && !precision.data ? (
+            <div className="p-4">
+              <LoadingBlock rows={3} />
+            </div>
+          ) : !precision.data || precision.data.items.length === 0 ? (
+            <div className="p-4">
+              <EmptyState
+                icon={IconTarget}
+                title="No detector has fired yet"
+                hint="Precision is measured from findings a reviewer has dispositioned. Nothing has been raised."
+              />
+            </div>
+          ) : (
+            <Table>
+              <thead>
+                <tr>
+                  <Th>Detector</Th>
+                  <Th align="right">Raised</Th>
+                  <Th align="right">Open</Th>
+                  <Th align="right">Real</Th>
+                  <Th align="right">False positive</Th>
+                  <Th align="right">Precision</Th>
+                  <Th>Basis</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {precision.data.items.map((row) => (
+                  <tr key={row.detector}>
+                    <Td>
+                      <code className="font-mono text-2xs">{row.detector}</code>
+                    </Td>
+                    <Td align="right">{row.raised}</Td>
+                    <Td align="right">{row.open}</Td>
+                    <Td align="right">{row.confirmed + row.escalated}</Td>
+                    <Td align="right">{row.falsePositive}</Td>
+                    <Td align="right">
+                      <Figure
+                        figure={{
+                          value: row.precision === null ? null : row.precision * 100,
+                          reasons: row.precision === null ? [row.basis] : [],
+                        }}
+                        render={(v) => pct(v, 0)}
+                        showReasons={false}
+                      />
+                    </Td>
+                    <Td>
+                      <span className="text-2xs leading-snug text-content-muted">{row.basis}</span>
+                    </Td>
+                  </tr>
+                ))}
+              </tbody>
+            </Table>
+          )}
+        </CardBody>
+      </Card>
+    </div>
   );
 }

@@ -11,7 +11,7 @@
  * total that silently omits the three cards with no overtime rate is worse
  * than no total at all: it is a smaller, plausible, wrong number.
  */
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import {
   Alert,
   Badge,
@@ -21,6 +21,7 @@ import {
   DescriptionList,
   EmptyState,
   SkeletonTable,
+  Input,
   Table,
   TBody,
   Td,
@@ -34,11 +35,12 @@ import {
 import { DataTable, type DataColumns } from "../../ui/data";
 import { BatchActions } from "./TimecardForms";
 import type { Tone } from "../../ui/tokens";
-import { IconCalendarCheck, IconWarning } from "../../ui/icons";
+import { IconCalendarCheck, IconDocument, IconWarning } from "../../ui/icons";
 import {
   BATCH_STATUS_TONE,
   EM_DASH,
   LoadError,
+  NOT_AVAILABLE,
   NotComparable,
   ReasonList,
   SectionHeading,
@@ -48,10 +50,15 @@ import {
   hoursText,
   labelize,
   money,
+  shiftDays,
   signedHours,
+  today,
+  useResource,
   type Approval,
   type BatchDetail,
   type BatchRecord,
+  type CertifiedPayrollReport,
+  type CertifiedPayrollRow,
   type ListResponse,
   type Loadable,
 } from "./timecardsShared";
@@ -260,6 +267,253 @@ export default function BatchesTab({
           against it.
         </p>
       ) : null}
+
+      <CertifiedPayrollPanel projectId={projectId} />
+    </div>
+  );
+}
+
+/* ========================================================================== */
+/* Certified payroll (WH-347 shape)                                            */
+/* ========================================================================== */
+
+/**
+ * The weekly certified payroll a public-works contract requires — assembled
+ * from the cards, with the payroll-side deduction and net-pay columns filled
+ * only where a payroll entry has actually been ingested.
+ *
+ * The statement of compliance is NOT signed here and there is no button that
+ * signs it. Signing it is a personal representation by a named officer that
+ * every worker on the sheet was paid the full prevailing wage with no
+ * unlawful deduction; a screen that pre-ticks that is manufacturing a false
+ * certification. This assembles the evidence and stops.
+ */
+function CertifiedPayrollPanel({ projectId }: { projectId: string }) {
+  const [weekEnding, setWeekEnding] = useState<string>(() => today());
+  const [contractorName, setContractorName] = useState("");
+  const [contractNumber, setContractNumber] = useState("");
+  const [open, setOpen] = useState(false);
+
+  const query = useMemo(() => {
+    const params = new URLSearchParams({ weekEnding });
+    if (contractorName.trim()) params.set("contractorName", contractorName.trim());
+    if (contractNumber.trim()) params.set("contractNumber", contractNumber.trim());
+    return params.toString();
+  }, [weekEnding, contractorName, contractNumber]);
+
+  const report = useResource<CertifiedPayrollReport>(
+    open ? `/api/v1/projects/${projectId}/certified-payroll?${query}` : null,
+  );
+
+  return (
+    <Card>
+      <CardBody className="space-y-3">
+        <SectionHeading
+          title="Certified payroll"
+          hint="A WH-347 style weekly return: every worker, the hours they worked on each day of the week, the rate applied and — where a payroll file has been ingested — what was actually deducted and paid."
+          className="mb-0"
+          actions={
+            <Button size="sm" variant={open ? "ghost" : "secondary"} onClick={() => setOpen(!open)}>
+              {open ? "Hide" : "Assemble a week"}
+            </Button>
+          }
+        />
+
+        {open ? (
+          <>
+            <div className="flex flex-wrap items-end gap-3">
+              <label className="flex flex-col gap-1">
+                <span className="text-label uppercase tracking-wide text-content-subtle">
+                  Week ending
+                </span>
+                <Input
+                  type="date"
+                  value={weekEnding}
+                  className="w-44"
+                  onChange={(e) => setWeekEnding(e.target.value)}
+                />
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-label uppercase tracking-wide text-content-subtle">
+                  Contractor name
+                </span>
+                <Input
+                  value={contractorName}
+                  className="w-56"
+                  placeholder="as named on the contract"
+                  onChange={(e) => setContractorName(e.target.value)}
+                />
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-label uppercase tracking-wide text-content-subtle">
+                  Contract number
+                </span>
+                <Input
+                  value={contractNumber}
+                  className="w-44"
+                  onChange={(e) => setContractNumber(e.target.value)}
+                />
+              </label>
+              <div className="text-2xs text-content-subtle">
+                {shiftDays(weekEnding, -6)} → {weekEnding}
+              </div>
+            </div>
+
+            {report.error ? (
+              <LoadError message={report.error} onRetry={report.reload} />
+            ) : report.loading && !report.data ? (
+              <SkeletonTable rows={5} columns={6} />
+            ) : report.data ? (
+              <CertifiedPayrollTable report={report.data} />
+            ) : null}
+          </>
+        ) : (
+          <p className="text-2xs text-content-subtle">
+            Assembled on demand from approved and later cards, never stored: a certified payroll is
+            a statement about a week that has closed, and a stored copy would go stale the moment a
+            dated adjustment landed.
+          </p>
+        )}
+      </CardBody>
+    </Card>
+  );
+}
+
+function CertifiedPayrollTable({ report }: { report: CertifiedPayrollReport }) {
+  const dayColumns = report.weekDates;
+
+  if (report.rows.length === 0) {
+    return (
+      <EmptyState
+        size="sm"
+        icon={IconDocument}
+        title="No hours in this week"
+        hint="No approved or later card falls in the seven days ending on this date, so there is nothing to certify. An empty return is not the same as a week with no work: check the cards were approved."
+      />
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      {report.reasons.length > 0 ? (
+        <Alert tone="warning" title="What this return cannot state" icon={IconWarning}>
+          <ReasonList reasons={report.reasons} />
+        </Alert>
+      ) : null}
+
+      <div className="overflow-x-auto">
+        <Table dense tableClassName="min-w-[880px] text-meta">
+          <THead>
+            <Tr>
+              <Th>Worker</Th>
+              <Th>Classification</Th>
+              {dayColumns.map((date) => (
+                <Th key={date} align="right">
+                  {date.slice(5)}
+                </Th>
+              ))}
+              <Th align="right">Plain</Th>
+              <Th align="right">OT</Th>
+              <Th align="right">Rate</Th>
+              <Th align="right">Gross</Th>
+              <Th align="right">Deductions</Th>
+              <Th align="right">Net</Th>
+            </Tr>
+          </THead>
+          <TBody>
+            {report.rows.map((row: CertifiedPayrollRow) => (
+              <Tr key={row.workerReference}>
+                <Td>
+                  <div className="font-medium text-content">{row.workerName}</div>
+                  <div className="font-mono text-2xs text-content-subtle">
+                    {row.workerReference}
+                  </div>
+                  {row.incomplete.length > 0 ? (
+                    <Tooltip content={row.incomplete.join(" ")}>
+                      <span>
+                        <Badge tone="warning" size="xs" variant="outline">
+                          incomplete
+                        </Badge>
+                      </span>
+                    </Tooltip>
+                  ) : null}
+                </Td>
+                <Td className="text-content-muted">
+                  {row.classification ?? (
+                    <span className="italic text-content-subtle">not stated</span>
+                  )}
+                </Td>
+                {dayColumns.map((date) => {
+                  const day = row.dayHours.find((d) => d.date === date);
+                  return (
+                    <Td key={date} align="right" numeric>
+                      {day && day.regular + day.overtime > 0 ? (
+                        <span>
+                          {hoursText(day.regular, 1)}
+                          {day.overtime > 0 ? (
+                            <span className="text-warning-fg"> +{hoursText(day.overtime, 1)}</span>
+                          ) : null}
+                        </span>
+                      ) : (
+                        <span className="text-content-subtle">{EM_DASH}</span>
+                      )}
+                    </Td>
+                  );
+                })}
+                <Td align="right" numeric>
+                  {hoursText(row.totalRegularHours, 1)}
+                </Td>
+                <Td align="right" numeric>
+                  {hoursText(row.totalOvertimeHours, 1)}
+                </Td>
+                <Td align="right">
+                  {row.regularRate === null ? (
+                    <NotComparable
+                      reason="No hourly rate is recorded for this worker in this week, so no rate can be certified. A certified payroll with an assumed rate is a false statement."
+                      label={NOT_AVAILABLE}
+                    />
+                  ) : (
+                    <span className="tabular-nums">{money(row.regularRate, row.currency)}</span>
+                  )}
+                </Td>
+                <Td align="right">
+                  {row.grossAmount === null ? (
+                    <NotComparable
+                      reason="Gross pay cannot be derived without a rate for every hour on the sheet."
+                      label={NOT_AVAILABLE}
+                    />
+                  ) : (
+                    <span className="font-medium tabular-nums">
+                      {money(row.grossAmount, row.currency)}
+                    </span>
+                  )}
+                </Td>
+                <Td align="right">
+                  {row.deductions === null ? (
+                    <NotComparable
+                      reason="No payroll entry has been ingested for this worker for this period, so what was deducted is unknown — never zero."
+                      label={EM_DASH}
+                    />
+                  ) : (
+                    <span className="tabular-nums">{money(row.deductions, row.currency)}</span>
+                  )}
+                </Td>
+                <Td align="right">
+                  {row.netPay === null ? (
+                    <span className="text-content-subtle">{EM_DASH}</span>
+                  ) : (
+                    <span className="tabular-nums">{money(row.netPay, row.currency)}</span>
+                  )}
+                </Td>
+              </Tr>
+            ))}
+          </TBody>
+        </Table>
+      </div>
+
+      <Alert tone="info" title="Statement of compliance">
+        {report.statementOfCompliance.note}
+      </Alert>
     </div>
   );
 }

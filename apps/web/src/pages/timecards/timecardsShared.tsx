@@ -674,6 +674,40 @@ export interface LabourCostReport {
   note: string;
 }
 
+/* --------------------------------------------------------------------- */
+/* Certified payroll (WH-347 shape) — GET /projects/:id/certified-payroll  */
+/* --------------------------------------------------------------------- */
+
+export interface CertifiedPayrollRow {
+  workerReference: string;
+  workerName: string;
+  classification: string | null;
+  dayHours: Array<{ date: string; regular: number; overtime: number }>;
+  totalRegularHours: number;
+  totalOvertimeHours: number;
+  regularRate: number | null;
+  overtimeRate: number | null;
+  grossAmount: number | null;
+  currency: string;
+  deductions: number | null;
+  netPay: number | null;
+  incomplete: string[];
+}
+
+export interface CertifiedPayrollReport {
+  projectName: string;
+  projectId: string;
+  contractorName: string | null;
+  contractNumber: string | null;
+  weekEnding: string;
+  periodStart: string;
+  periodEnd: string;
+  weekDates: string[];
+  rows: CertifiedPayrollRow[];
+  statementOfCompliance: { signed: false; note: string };
+  reasons: string[];
+}
+
 export interface CostCodeOption {
   id: string;
   code: string;

@@ -328,6 +328,16 @@ function LevellingPanel({
                             Not priced by {r.missingVendors.join(", ")}
                           </div>
                         ) : null}
+                        {r.entries.some((e) => e.unpriced) ? (
+                          <div className="text-2xs text-warning">
+                            Listed but left blank by{" "}
+                            {r.entries
+                              .filter((e) => e.unpriced)
+                              .map((e) => e.vendorName)
+                              .join(", ")}{" "}
+                            — counted as unpriced, not as nil
+                          </div>
+                        ) : null}
                         {r.entries.some((e) => e.outlier) ? (
                           <div className="text-2xs text-warning">
                             Outlier:{" "}
@@ -341,6 +351,7 @@ function LevellingPanel({
                       <Td align="right">
                         {count(r.pricedCount)}
                         {r.excludedCount > 0 ? ` (+${r.excludedCount} excluded)` : ""}
+                        {r.unpricedCount > 0 ? ` (+${r.unpricedCount} blank)` : ""}
                       </Td>
                       <Td align="right">{r.low === null ? DASH : num(r.low, 2)}</Td>
                       <Td align="right">{r.median === null ? DASH : num(r.median, 2)}</Td>
@@ -352,6 +363,32 @@ function LevellingPanel({
                   ))}
                 </tbody>
               </Table>
+            ) : null}
+
+            {data.scopeGaps.length > 0 ? (
+              <div className="rounded-md border border-warning/40 bg-warning/5 p-3">
+                <div className="text-meta font-semibold text-content">
+                  Scope gaps — {data.scopeGaps.length} row
+                  {data.scopeGaps.length === 1 ? "" : "s"} somebody did not price
+                </div>
+                <p className="mt-0.5 text-2xs text-content-subtle">
+                  The cheapest number on the page is usually the one that priced the least. Close these
+                  in writing before the package is let.
+                </p>
+                <ul className="mt-2 space-y-1">
+                  {data.scopeGaps.map((g) => (
+                    <li key={g.scopeKey} className="text-2xs text-content-subtle">
+                      <span className="text-content">{g.description}</span>
+                      {g.missingVendors.length > 0 ? (
+                        <> — never mentioned by {g.missingVendors.join(", ")}</>
+                      ) : null}
+                      {g.unpricedVendors.length > 0 ? (
+                        <> — listed and left blank by {g.unpricedVendors.join(", ")}</>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+              </div>
             ) : null}
           </>
         )}
@@ -480,7 +517,7 @@ function CreateQuoteModal({
         <Field
           label="Priced lines"
           optional
-          hint="One per line: description | amount | unit | quantity | rate. Only the description and amount are needed."
+          hint="One per line: description | amount | unit | quantity | rate. Only the description and amount are needed; leave the amount empty for a row the bidder listed but never priced, and it is recorded blank rather than at nil. Write excl in the amount column to record an explicit exclusion."
         >
           <Textarea
             value={linesRaw}
@@ -716,7 +753,11 @@ function QuoteEditor({
   );
 }
 
-/** description | unit | quantity | rate | x(to exclude) — one row per line. */
+/**
+ * description | unit | quantity | rate | x(to exclude) — one row per line.
+ * Leave the rate column empty to record a row the bidder listed but did not
+ * price; it is stored blank, not at nil.
+ */
 function parseQuoteLines(raw: string) {
   return raw
     .split(/\r?\n/)
@@ -733,8 +774,10 @@ function parseQuoteLines(raw: string) {
         unit: unit.length > 0 ? unit : null,
         quantity,
         unitRate,
-        // a row with a quantity but no rate, or neither, is a lump sum: the
-        // amount is the rate column read as a total
+        // A rate column with no quantity beside it is a LUMP SUM — the
+        // number is the total for the row. A row with neither is BLANK: it
+        // is stored with no price at all, and the levelling reads it as
+        // unpriced rather than as a bid of nil.
         amount: quantity !== null && unitRate !== null ? undefined : (unitRate ?? 0),
         excluded: flag.toLowerCase() === "x" || flag.toLowerCase() === "excluded",
       };
@@ -826,7 +869,12 @@ function QuoteLineEditor({
         </Field>
         <div className="rounded-md border border-border bg-surface-sunken p-3 text-2xs text-content-subtle">
           {parsed.length} row{parsed.length === 1 ? "" : "s"} parsed. Rows with a quantity and a rate are
-          extended; the rest are taken as lump sums at the figure in the rate column.
+          extended; a rate with no quantity is a lump sum. Leave the rate empty to record a row the
+          bidder listed but never priced — it is stored blank, kept out of the median and the outlier
+          test, and filled at the pack median when the totals are compared.
+          {parsed.filter((r) => r.amount === 0 && r.unitRate === null).length > 0
+            ? ` ${parsed.filter((r) => r.amount === 0 && r.unitRate === null).length} row(s) carry no price.`
+            : ""}
         </div>
       </div>
     </Modal>

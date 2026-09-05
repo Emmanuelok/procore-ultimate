@@ -1004,15 +1004,23 @@ export function registerScimRoutes(app: FastifyInstance): void {
     // The `owner` role is never taken away by a directory. An IdP mapping
     // mistake that removed every owner would leave the tenant with nobody who
     // can fix it, and no directory has enough context to make that call.
+    //
+    // BOTH DIRECTIONS, not just removal. Filtering only `toMember` left the
+    // other half of the same hole open: adding the owner to `role:admin` (or
+    // naming them in a `replace` on any other group) took the `toRole` branch
+    // below and wrote `role = admin` over `owner`, so the mapping mistake that
+    // could not remove an owner could still demote the last one. An owner is
+    // simply not a member a directory may re-grade.
     const guarded = toMember.filter((memberId) => byId.get(memberId)?.role !== "owner");
-    if (toRole.length > 0) {
+    const granted = toRole.filter((memberId) => byId.get(memberId)?.role !== "owner");
+    if (granted.length > 0) {
       await app.db
         .update(companyMemberships)
         .set({ role })
         .where(
           and(
             eq(companyMemberships.companyId, principal.companyId),
-            inArray(companyMemberships.userId, toRole),
+            inArray(companyMemberships.userId, granted),
           ),
         );
     }
@@ -1027,14 +1035,14 @@ export function registerScimRoutes(app: FastifyInstance): void {
           ),
         );
     }
-    if (toRole.length > 0 || guarded.length > 0) {
+    if (granted.length > 0 || guarded.length > 0) {
       await appendLedger(app.db, {
         companyId: principal.companyId,
         actorId: null,
         action: "state_change",
         objectType: "company_membership_role",
         objectId: `role:${role}`,
-        payload: { via: "scim", role, granted: toRole, removed: guarded, tokenId: principal.tokenId },
+        payload: { via: "scim", role, granted, removed: guarded, tokenId: principal.tokenId },
         storePayload: true,
       });
       await recordAuthEvent(app.db, {
@@ -1042,7 +1050,7 @@ export function registerScimRoutes(app: FastifyInstance): void {
         companyId: principal.companyId,
         ip: req.ip ?? null,
         reason: `SCIM changed membership of the ${role} group`,
-        metadata: { granted: toRole, removed: guarded, tokenId: principal.tokenId },
+        metadata: { granted, removed: guarded, tokenId: principal.tokenId },
       });
     }
     const after = await loadMembers(principal.companyId);

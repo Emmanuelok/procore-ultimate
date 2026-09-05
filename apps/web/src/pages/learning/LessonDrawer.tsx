@@ -27,6 +27,7 @@ import {
 } from "../../ui";
 import { formatDate, formatDateTime } from "../format";
 import ApplyModal from "./ApplyModal";
+import GraphPanel from "./GraphPanel";
 import OutcomeForm from "./OutcomeForm";
 import type { ApplyOutcome } from "./ApplyModal";
 import {
@@ -279,6 +280,9 @@ export default function LessonDrawer({
             </div>
           </CardBody>
         </Card>
+
+        {/* ------------------------- the verified edges -------------------------- */}
+        <GraphPanel lessonId={lesson.id} canRebuild={canSupersede} />
 
         {/* ---------------------------- trigger origin --------------------------- */}
         <Card>
