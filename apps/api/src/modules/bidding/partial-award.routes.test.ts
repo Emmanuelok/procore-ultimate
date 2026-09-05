@@ -457,9 +457,26 @@ describe("partial award — approval", () => {
       approver.headers,
     );
     expect(withdrawn.statusCode).toBe(200);
+    // The row is free again — and Bravo, who is DEARER on it (95,000 against
+    // Alpha's 80,000), still needs the written reason the lowest was not
+    // taken. A withdrawal frees the scope; it does not relax the control.
+    const withoutReason = await post(
+      `/projects/${projectA}/bid-packages/${pkg.id}/award/recommend`,
+      {
+        submissionId: bidB.id,
+        recommendationBasis: BASIS,
+        scopeLevellingItemIds: [row("G10")],
+      },
+    );
+    expect(withoutReason.statusCode).toBe(400);
+    expect(withoutReason.json().details.control).toBe("not_lowest_requires_justification");
+
     const again = await post(`/projects/${projectA}/bid-packages/${pkg.id}/award/recommend`, {
       submissionId: bidB.id,
       recommendationBasis: BASIS,
+      notLowestJustification:
+        "Alpha is in administration and cannot contract, so the cheaper groundworks price is no " +
+        "longer available to take.",
       scopeLevellingItemIds: [row("G10")],
     });
     expect(again.statusCode).toBe(201);
