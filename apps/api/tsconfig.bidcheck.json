@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": true },
+  "include": [
+    "src/types.ts",
+    "src/modules/bidding/**/*.ts",
+    "src/test/helpers.ts"
+  ],
+  "exclude": []
+}

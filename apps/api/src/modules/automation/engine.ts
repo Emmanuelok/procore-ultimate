@@ -726,12 +726,12 @@ export class AutomationEngine {
         )
         .orderBy(asc(automationRuns.queuedAt), asc(automationRuns.id))
         .limit(limit);
-      for (const { id } of due) {
+      for (const { id, companyId: runCompanyId } of due) {
         let row: RunRow;
         try {
           row = await this.executeRun(id);
         } catch (err) {
-          this.recordError(err, `drain ${id}`);
+          this.recordError(err, `drain ${id}`, runCompanyId);
           summary.failed += 1;
           continue;
         }
@@ -754,7 +754,7 @@ export class AutomationEngine {
 
   /** Evaluate every due schedule rule for one company. Idempotent per cooldown window. */
   async scanSchedules(companyId: string, now = this.options.now(), force = false): Promise<ScanSummary> {
-    const summary: ScanSummary = { rulesScanned: 0, candidates: 0, matched: 0, deduped: 0, executed: 0 };
+    const summary: ScanSummary = { rulesScanned: 0, candidates: 0, matched: 0, deduped: 0, executed: 0, truncated: [] };
     const rules = await this.db
       .select()
       .from(automationRules)
@@ -771,9 +771,29 @@ export class AutomationEngine {
       if (!force && rule.lastScanAt && now.getTime() - Date.parse(rule.lastScanAt) < everyMs) continue;
       summary.rulesScanned += 1;
       const cooldownMs = Math.max(1, rule.trigger.cooldownHours ?? 24) * 3_600_000;
+      let scanned = 0;
+      let truncated = false;
+      let orderedBy = "none";
       try {
-        const candidates = await scanCandidates(this.db, companyId, rule.triggerObjectType, rule.projectId);
+        const page = await scanCandidates(this.db, companyId, rule.triggerObjectType, rule.projectId);
+        const candidates = page.candidates;
+        scanned = candidates.length;
+        truncated = page.truncated;
+        orderedBy = page.orderedBy;
         summary.candidates += candidates.length;
+        if (truncated) {
+          // A capped scan is a partial answer. It is reported here, stamped on
+          // the rule, and counted in the company's health so the Engine tab
+          // can say "this rule saw 500 of N" instead of showing a silent 0.
+          summary.truncated.push({
+            ruleId: rule.id,
+            ruleName: rule.name,
+            objectType: rule.triggerObjectType,
+            limit: page.limit,
+            orderedBy: page.orderedBy,
+          });
+          this.health(companyId).scansTruncated += 1;
+        }
         for (const candidate of candidates) {
           const objectId = String(candidate.record["id"] ?? "");
           if (!objectId) continue;
@@ -827,7 +847,12 @@ export class AutomationEngine {
       }
       await this.db
         .update(automationRules)
-        .set({ lastScanAt: now.toISOString() })
+        .set({
+          lastScanAt: now.toISOString(),
+          lastScanCandidates: scanned,
+          lastScanTruncated: truncated ? 1 : 0,
+          lastScanOrderedBy: orderedBy,
+        })
         .where(eq(automationRules.id, rule.id));
     }
     return summary;
