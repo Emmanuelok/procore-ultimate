@@ -30,12 +30,7 @@ import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { addDaysISO, todayISO } from "../field/dates.js";
 import { forEachCompany } from "../../lib/scheduler.js";
 import { pushNotifications } from "../notifications/service.js";
-import {
-  companyScopeOf,
-  companyToolGate,
-  scopeAllows,
-  scopeProjects,
-} from "../meetings/scope.js";
+import { companyScopeOf, companyToolGate, scopeAllows } from "../meetings/scope.js";
 import {
   aiEnabled,
   escapeLike,

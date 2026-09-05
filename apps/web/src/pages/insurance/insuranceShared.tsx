@@ -71,6 +71,17 @@ export interface PolicyRow {
   createdBy: string;
   createdAt: string;
   updatedAt: string;
+  /*
+   * RENEWAL PIPELINE (#775). Deliberately separate from `status`: a policy is
+   * comfortably `active` right up to the day it is not, and the only useful
+   * question ninety days out is whether anyone has started.
+   */
+  renewalStatus: string;
+  renewalOwnerId: string | null;
+  renewalTargetDate: string | null;
+  renewalNotes: string | null;
+  previousPolicyId: string | null;
+  renewedByPolicyId: string | null;
   /** derived — expiry is computed from periodEnd, never typed */
   derivedStatus: string;
   daysToExpiry: number;

@@ -1756,11 +1756,21 @@ describe("uninsured loss candidates (#787)", () => {
 
 describe("the payment hold hook WP-FIN2 calls", () => {
   let holdProject: string;
+  let holdVendor: string;
 
   it("refuses to answer, rather than clearing the vendor, with no requirement recorded", async () => {
     holdProject = await makeProject("Payment holds");
+    /* A vendor of its own: certificates are collected per vendor across the
+       whole company, so a certificate another test filed for a shared vendor
+       would silently change the answer here. */
+    holdVendor = newId("ven");
+    await app.db.insert(vendors).values({
+      id: holdVendor,
+      companyId: owner.companyId,
+      name: "Payment Hold Ltd",
+    });
     const res = await get(
-      `/projects/${holdProject}/insurance/hold-check?vendorId=${vendorId}`,
+      `/projects/${holdProject}/insurance/hold-check?vendorId=${holdVendor}`,
     );
     expect(res.statusCode).toBe(200);
     expect(res.json().hold).toBe(false);
@@ -1776,14 +1786,14 @@ describe("the payment hold hook WP-FIN2 calls", () => {
       currency: "GBP",
     });
     const held = await get(
-      `/projects/${holdProject}/insurance/hold-check?vendorId=${vendorId}`,
+      `/projects/${holdProject}/insurance/hold-check?vendorId=${holdVendor}`,
     );
     expect(held.json().hold).toBe(true);
     expect(held.json().findings[0].reason).toBe("no_certificate");
 
     const cert = await post(`/projects/${holdProject}/insurance/certificates`, {
-      vendorId,
-      subjectName: "Groundworks Ltd",
+      vendorId: holdVendor,
+      subjectName: "Payment Hold Ltd",
       policyType: "employers_liability",
       limitOfIndemnity: 10_000_000,
       currency: "GBP",
@@ -1792,7 +1802,7 @@ describe("the payment hold hook WP-FIN2 calls", () => {
     });
     expect(cert.statusCode).toBe(201);
     const released = await get(
-      `/projects/${holdProject}/insurance/hold-check?vendorId=${vendorId}`,
+      `/projects/${holdProject}/insurance/hold-check?vendorId=${holdVendor}`,
     );
     expect(released.json().hold).toBe(false);
     // unverified is a warning, never a hold: the failure is on our side
@@ -1827,7 +1837,7 @@ describe("the payment hold hook WP-FIN2 calls", () => {
   });
 
   it("records the company-level hold check as an access event in the ledger", async () => {
-    const res = await get(`/insurance/hold-check?vendorId=${vendorId}`);
+    const res = await get(`/insurance/hold-check?vendorId=${holdVendor}`);
     expect(res.statusCode).toBe(200);
     const ledger = await get("/ledger?objectType=insurance_hold_check&pageSize=20");
     expect((ledger.json().items as { action: string }[]).some((e) => e.action === "access")).toBe(
@@ -1906,10 +1916,18 @@ describe("audit bug fixes", () => {
     });
     expect(created.statusCode).toBe(201);
     const id = created.json().id as string;
-    await post(`/projects/${relProject}/insurance/bonds/${id}/status`, { status: "active" });
+    expect(
+      (await post(`/projects/${relProject}/insurance/bonds/${id}/status`, { status: "issued" }))
+        .statusCode,
+    ).toBe(200);
+    expect(
+      (await post(`/projects/${relProject}/insurance/bonds/${id}/status`, { status: "active" }))
+        .statusCode,
+    ).toBe(200);
     const called = await post(`/projects/${relProject}/insurance/bonds/${id}/call`, {
       amount: 100_000,
       reason: "Failure to complete the remedial works within the period stated in the notice",
+      evidenceRefs: { notice: "NOT-0007", defaultDate: daysFromToday(-14) },
     });
     expect(called.statusCode).toBe(201);
     const callId = called.json().id as string;

@@ -229,6 +229,13 @@ export const insuranceClaims = pgTable(
     index("insurance_claims_company_idx").on(t.companyId),
     index("insurance_claims_policy_idx").on(t.policyId),
     index("insurance_claims_project_idx").on(t.companyId, t.projectId),
+    /* The warn-before-the-deadline sweep filters on exactly this: claims with
+       a notification deadline that nobody has notified yet. */
+    index("insurance_claims_notification_idx").on(
+      t.companyId,
+      t.notifiedAt,
+      t.notificationDueAt,
+    ),
   ],
 );
 

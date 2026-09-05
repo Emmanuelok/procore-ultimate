@@ -363,6 +363,11 @@ function AgendaPanel({
   const [addOpen, setAddOpen] = useState(false);
   const [closing, setClosing] = useState<AgendaItem | null>(null);
   const [discussion, setDiscussion] = useState("");
+  /** the item being raised into an RFI, change event or risk (#424) */
+  const [raising, setRaising] = useState<AgendaItem | null>(null);
+  const [raiseTarget, setRaiseTarget] = useState<"rfi" | "change_event" | "risk">("rfi");
+  const [raiseCloses, setRaiseCloses] = useState(true);
+  const [raised, setRaised] = useState<{ reference: string; target: string } | null>(null);
 
   async function close() {
     if (!closing) return;
@@ -374,6 +379,30 @@ function AgendaPanel({
     if (done !== null) {
       setClosing(null);
       setDiscussion("");
+      onMutated();
+    }
+  }
+
+  /**
+   * Raise the item into the record that actually carries it forward (#424).
+   *
+   * The linkage is validated on the server: the created record is written in
+   * this project and linked back through record_links, so the agenda row shows
+   * the RFI's live status and the RFI shows the meeting where it was tabled.
+   * A free-text "raised as RFI-014" is a note that looks like a link and
+   * nothing downstream can verify it.
+   */
+  async function raise() {
+    if (!raising) return;
+    const out = await run(`raise:${raising.id}`, () =>
+      api.post<{ reference: string; target: string }>(
+        `/api/v1/projects/${projectId}/meeting-agenda-items/${raising.id}/raise`,
+        { target: raiseTarget, closeItem: raiseCloses },
+      ),
+    );
+    if (out) {
+      setRaised(out);
+      setRaising(null);
       onMutated();
     }
   }
@@ -481,6 +510,17 @@ function AgendaPanel({
                           size="xs"
                           variant="secondary"
                           onClick={() => {
+                            setRaiseTarget("rfi");
+                            setRaiseCloses(true);
+                            setRaising(item);
+                          }}
+                        >
+                          Raise…
+                        </Button>
+                        <Button
+                          size="xs"
+                          variant="secondary"
+                          onClick={() => {
                             setClosing(item);
                             setDiscussion(item.discussion ?? "");
                           }}
@@ -518,6 +558,60 @@ function AgendaPanel({
           })}
         </ul>
       )}
+
+      {raised ? (
+        <Alert
+          tone="success"
+          size="sm"
+          title={`${raised.reference} raised`}
+          onDismiss={() => setRaised(null)}
+        >
+          The new record is linked back to this agenda item, so its live status shows on the row
+          and the record itself shows the meeting where it was tabled.
+        </Alert>
+      ) : null}
+
+      <Modal
+        open={raising !== null}
+        onClose={() => setRaising(null)}
+        title={raising ? `Raise "${raising.title}" into a record` : "Raise"}
+        footer={
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" onClick={() => setRaising(null)}>
+              Cancel
+            </Button>
+            <Button disabled={busy !== null} onClick={() => void raise()}>
+              Raise it
+            </Button>
+          </div>
+        }
+      >
+        <div className="space-y-3">
+          <p className="text-meta text-content-muted">
+            An agenda item that needs an answer, a price or a mitigation belongs in the register
+            that tracks those, not in next week's minutes. The new record is created in this
+            project, pre-filled from the item, and linked both ways.
+          </p>
+          <Field label="Raise it as">
+            <Select
+              value={raiseTarget}
+              onChange={(e) =>
+                setRaiseTarget(e.target.value as "rfi" | "change_event" | "risk")
+              }
+            >
+              <option value="rfi">An RFI — somebody must answer a question</option>
+              <option value="change_event">A change event — this may cost money or time</option>
+              <option value="risk">A risk — this may happen and we should plan for it</option>
+            </Select>
+          </Field>
+          <Checkbox
+            checked={raiseCloses}
+            onChange={(e) => setRaiseCloses(e.target.checked)}
+            label="Close the agenda item"
+            description="Closing it stops it carrying into the next occurrence — the new record is now where it lives. Leave it open to keep discussing it while the record runs."
+          />
+        </div>
+      </Modal>
 
       <Modal
         open={closing !== null}

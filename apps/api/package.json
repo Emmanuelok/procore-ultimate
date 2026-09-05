@@ -10,7 +10,6 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "db:migrate": "tsx src/scripts/migrate.ts",
-    "db:seed": "tsx src/scripts/seed.ts",
     "eval:retrodetect": "tsx src/scripts/retrodetect.ts",
     "verify:receipt": "tsx src/scripts/verify-receipt.ts"
   },

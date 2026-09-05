@@ -38,6 +38,7 @@ import {
   Prose,
   RefLine,
   SectionTitle,
+  Stat,
   TagList,
   errorMessage,
   fmtInt,
@@ -50,6 +51,7 @@ import {
 import type {
   LessonApplication,
   LessonDetail,
+  LessonOutcomes,
   LessonImpact,
   LessonListRow,
   ListResponse,
@@ -79,6 +81,7 @@ export default function LessonDrawer({
 
   const [applyOpen, setApplyOpen] = useState(false);
   const [measuring, setMeasuring] = useState<LessonApplication | null>(null);
+  const [outcomes, setOutcomes] = useState<LessonOutcomes | null>(null);
   const [supersedeOpen, setSupersedeOpen] = useState(false);
   const [candidates, setCandidates] = useState<LessonListRow[] | null>(null);
   const [replacementId, setReplacementId] = useState("");
@@ -91,6 +94,17 @@ export default function LessonDrawer({
     } catch (err) {
       setLesson(null);
       setError(errorMessage(err, "Failed to load the lesson"));
+    }
+  }, [lessonId]);
+
+  const loadOutcomes = useCallback(async () => {
+    try {
+      setOutcomes(
+        await api.get<LessonOutcomes>(`/api/v1/learning/lessons/${lessonId}/outcomes`),
+      );
+    } catch {
+      /* The outcome panel fails alone: the lesson itself still renders. */
+      setOutcomes(null);
     }
   }, [lessonId]);
 
@@ -111,6 +125,7 @@ export default function LessonDrawer({
     setActionError(null);
     void load();
     void loadImpact();
+    void loadOutcomes();
   }, [load, loadImpact]);
 
   async function openSupersede() {
@@ -158,6 +173,7 @@ export default function LessonDrawer({
     );
     void load();
     void loadImpact();
+    void loadOutcomes();
     onChanged();
   }
 
@@ -400,6 +416,66 @@ export default function LessonDrawer({
           </CardBody>
         </Card>
 
+        {/* ------------------------------- outcomes ------------------------------ */}
+        {outcomes && outcomes.applications > 0 ? (
+          <Card>
+            <CardBody>
+              <SectionTitle hint="Computed over MEASURED applications only, with the denominator stated. An unmeasured application is not a successful one.">
+                Did it work?
+              </SectionTitle>
+              <div className="grid gap-3 sm:grid-cols-4">
+                <Stat
+                  label="Applications"
+                  value={fmtInt(outcomes.applications)}
+                  hint={`${fmtInt(outcomes.measured)} measured, ${fmtInt(outcomes.unmeasured)} not`}
+                />
+                <Stat
+                  label="Effectiveness"
+                  value={
+                    outcomes.effectiveness.value === null
+                      ? "—"
+                      : `${Math.round(outcomes.effectiveness.value * 100)}%`
+                  }
+                  hint={
+                    outcomes.effectiveness.value === null
+                      ? outcomes.effectiveness.reasons[0]
+                      : `over ${fmtInt(outcomes.effectiveness.denominator)} measured`
+                  }
+                />
+                <Stat
+                  label="Days avoided"
+                  value={outcomes.daysAvoided === null ? "—" : fmtInt(outcomes.daysAvoided)}
+                  hint={
+                    outcomes.daysAvoided === null
+                      ? "no application recorded a day figure"
+                      : `measured on ${fmtInt(outcomes.daysMeasuredOn)}`
+                  }
+                />
+                <Stat
+                  label="Value avoided"
+                  value={
+                    outcomes.valueByCurrency.length === 0
+                      ? "—"
+                      : outcomes.valueByCurrency
+                          .map((v) => `${v.currency} ${fmtInt(v.value)}`)
+                          .join(" · ")
+                  }
+                  hint={
+                    outcomes.valueByCurrency.length === 0
+                      ? "no application recorded a money figure"
+                      : "per currency, never summed across"
+                  }
+                />
+              </div>
+              {outcomes.reasons.map((r) => (
+                <p key={r} className="mt-2 text-xs leading-relaxed text-amber-800">
+                  {r}
+                </p>
+              ))}
+            </CardBody>
+          </Card>
+        ) : null}
+
         {/* ----------------------------- applications ---------------------------- */}
         <Card>
           <CardBody>
@@ -518,6 +594,7 @@ export default function LessonDrawer({
             setMeasuring(null);
             void load();
             void loadImpact();
+            void loadOutcomes();
             onChanged();
           }}
         />

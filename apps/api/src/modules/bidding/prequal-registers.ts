@@ -1388,10 +1388,10 @@ export const prequalRegisterRoutes: FastifyPluginAsync = async (app) => {
     });
     if (missing.length > 0) {
       throw conflict(
-        `${missing.length} required question(s) are unanswered. A submission with gaps forces ` +
-          "the assessor to score an absence, and an unscored required question leaves the " +
-          "overall score null rather than low.",
-        { unanswered: missing.map((q) => `${q.questionCode} — ${q.text}`) },
+        `${missing.length} required question(s) are unanswered: ` +
+          missing.map((q) => q.questionCode ?? q.text).join(", ") +
+          ". A submission with gaps forces the assessor to score an absence, and an unscored " +
+          "required question leaves the overall score null rather than low.",
       );
     }
     const missingEvidence = questions.filter(
@@ -1400,8 +1400,10 @@ export const prequalRegisterRoutes: FastifyPluginAsync = async (app) => {
     );
     if (missingEvidence.length > 0) {
       throw conflict(
-        `${missingEvidence.length} question(s) require supporting evidence and none is attached.`,
-        { missingEvidence: missingEvidence.map((q) => q.questionCode) },
+        `${missingEvidence.length} question(s) require supporting evidence and none is attached: ` +
+          missingEvidence.map((q) => q.questionCode ?? q.text).join(", ") +
+          ". Evidence required means evidence supplied — a declaration with no document behind " +
+          "it is the claim the document was supposed to test.",
       );
     }
     const now = new Date().toISOString();

@@ -160,6 +160,28 @@ export interface LessonDraft {
   note: string;
 }
 
+/**
+ * Applied-lesson outcome measurement (#979, #981-984).
+ *
+ * `effectiveness` is computed over MEASURED applications only, with the
+ * denominator stated: an unmeasured application is not a successful one, and a
+ * register that reads it as one reports impact it never had.
+ */
+export interface LessonOutcomes {
+  lessonId: string;
+  number: string;
+  applications: number;
+  measured: number;
+  unmeasured: number;
+  byOutcome: Record<string, number>;
+  effectiveness: { value: number | null; denominator: number; reasons: string[] };
+  valueByCurrency: { currency: string; value: number; applications: number }[];
+  daysAvoided: number | null;
+  daysMeasuredOn: number;
+  reasons: string[];
+  items: LessonApplication[];
+}
+
 export interface LessonDetail extends Lesson {
   applicationCount: number;
   applications: LessonApplication[];

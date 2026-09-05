@@ -79,7 +79,6 @@ import {
   companyScopeOf,
   companyToolGate,
   scopeAllows,
-  scopeProjects,
   scopeProjectsOrCompanyWide,
 } from "../meetings/scope.js";
 
@@ -4858,15 +4857,16 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
       const projectId = req.projectId!;
       const asOf = todayISO();
       const scope = await loadScope(companyId, projectId);
-      const requirements = (await loadRequirements(companyId)).filter(
-        (r) => r.projectId === null || r.projectId === projectId,
-      );
-      const requiredTypes = requiredTypesForProject(requirements, projectId);
+      /* The same resolution every other route uses — recorded requirements
+         first, the legacy policy-clause inference only as a fallback for a
+         scope that has none. A different answer here would make the health
+         score disagree with the register it is scored from. */
+      const requiredTypes = await requiredTypesFor(companyId, projectId);
       const vendorsAtWork = await loadVendorsAtWork(companyId, projectId, scope.bonds);
       const gapResult = computeCoverGaps({
         certificates: scope.certificates,
         vendorsAtWork,
-        requiredPolicyTypes: requiredTypes.length > 0 ? requiredTypes : null,
+        requiredPolicyTypes: requiredTypes,
         asOf,
       });
       const claimRows = await app.db
@@ -4892,7 +4892,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         (c) => c.notifiedAt === null && c.notificationDueAt !== null && c.notificationDueAt < asOf,
       ).length;
       const reasons: string[] = [];
-      if (requiredTypes.length === 0) {
+      if (requiredTypes === null) {
         reasons.push(
           "No insurance requirement is recorded for this project, so coverGaps is reported as " +
             "null rather than 0 — the absence of a requirement is not the absence of a gap.",
