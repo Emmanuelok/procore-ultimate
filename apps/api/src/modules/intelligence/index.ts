@@ -52,12 +52,13 @@ import {
   pulseHistory,
   readPulse,
   refreshAttention,
+  refreshProjectAttention,
   refreshPulse,
   rowToAttention,
   runCompanyRefresh,
   setAttentionStatus,
 } from "./service.js";
-import { canActOnProject, canSeeProject, visibleProjectIds } from "./visibility.js";
+import { actableProjectIds, canActOnProject, canActWith, canSeeProject, visibleProjectIds } from "./visibility.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -159,7 +160,14 @@ export const intelligenceModule: FastifyPluginAsync = async (app) => {
       objectType: "pulse_snapshot",
       objectId: result.pulseId,
       storePayload: true,
-      payload: { trigger: "manual", projects: result.projects, recomputed: result.recomputed, levelChanges: result.levelChanges, attention: result.attention },
+      payload: {
+        trigger: "manual",
+        projects: result.projects,
+        recomputed: result.recomputed,
+        levelChanges: result.levelChanges,
+        attention: result.attention,
+        truncatedSources: result.truncatedSources,
+      },
     });
     return result;
   });
@@ -348,9 +356,11 @@ export const intelligenceModule: FastifyPluginAsync = async (app) => {
       storePayload: true,
       payload: { trigger: "manual", level: result.health.level, score: result.health.score, snapshotId: result.health.snapshotId, previousLevel: result.previousLevel },
     });
-    // the feed and the company snapshot follow the recompute so the Pulse agrees with the project page
-    const projectList = await listCompanyProjects(app.db, req.companyId!);
-    await refreshAttention(app.db, req.companyId!, projectList, now);
+    // This project's feed follows its recompute so the two agree — but only
+    // this project's: one person's button must not run a company-wide sweep
+    // (the scheduler owns that). The Pulse snapshot is a handful of aggregate
+    // queries, so it is refreshed here too and the company stays consistent.
+    await refreshProjectAttention(app.db, req.companyId!, req.projectId!, now);
     await refreshPulse(app.db, req.companyId!, now);
     return { ...result.health, computedOnRead: false, levelChanged: result.levelChanged, previousLevel: result.previousLevel };
   });
@@ -384,15 +394,19 @@ export const intelligenceModule: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/attention", { preHandler: readGate }, async (req) => {
     const q = projectAttentionQuery.parse(req.query);
-    return listAttention(app.db, req.companyId!, {
-      visible: null,
-      projectId: req.projectId!,
-      status: q.status,
-      kind: q.kind,
-      severity: q.severity,
-      limit: q.limit,
-      offset: q.offset,
-    });
+    const [page, canAct] = await Promise.all([
+      listAttention(app.db, req.companyId!, {
+        visible: null,
+        projectId: req.projectId!,
+        status: q.status,
+        kind: q.kind,
+        severity: q.severity,
+        limit: q.limit,
+        offset: q.offset,
+      }),
+      canActOnProject(app, req, req.projectId!),
+    ]);
+    return { ...page, canAct, items: page.items.map((i) => ({ ...i, canAct })) };
   });
 
   /* ---------------------------------------------------------------- */
