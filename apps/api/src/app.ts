@@ -79,6 +79,18 @@ import { biddingModule } from "./modules/bidding/index.js";
 import { ssoModule } from "./modules/sso/index.js";
 import { mfaModule } from "./modules/mfa/index.js";
 import { accountModule } from "./modules/account/index.js";
+import { intelligenceModule } from "./modules/intelligence/index.js";
+import { automationModule } from "./modules/automation/index.js";
+import { searchModule } from "./modules/search/index.js";
+import { correspondenceModule } from "./modules/correspondence/index.js";
+import { designModule } from "./modules/design/index.js";
+import { estimatingModule } from "./modules/estimating/index.js";
+import { portfolioModule } from "./modules/portfolio/index.js";
+import { resourcesModule } from "./modules/resources/index.js";
+import { siteModule } from "./modules/site/index.js";
+import { supplychainModule } from "./modules/supplychain/index.js";
+import { taxModule } from "./modules/tax/index.js";
+import { mcpModule } from "./modules/mcp/index.js";
 
 /**
  * sha256 CSP hashes for every inline <script> in the index.html this process
@@ -355,6 +367,22 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
   await app.register(equipmentModule, { prefix });
   await app.register(timecardsModule, { prefix });
   await app.register(biddingModule, { prefix });
+  // Cross-cutting reach: search reads projects/access.ts for the same
+  // permission scoping the project routes use, so it registers alongside them.
+  await app.register(searchModule, { prefix });
+  // The intelligence layer and the rules engine both observe every other
+  // module's ledger writes, so they mount after the modules they read.
+  await app.register(intelligenceModule, { prefix });
+  await app.register(automationModule, { prefix });
+  await app.register(correspondenceModule, { prefix });
+  await app.register(designModule, { prefix });
+  await app.register(estimatingModule, { prefix });
+  await app.register(portfolioModule, { prefix });
+  await app.register(resourcesModule, { prefix });
+  await app.register(siteModule, { prefix });
+  await app.register(supplychainModule, { prefix });
+  await app.register(taxModule, { prefix });
+  await app.register(mcpModule, { prefix });
 
   // Every module has registered its jobs; start the ticker.
   scheduler.start();
