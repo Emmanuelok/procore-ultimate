@@ -381,6 +381,13 @@ describe("runs, summary, engine operations and health inputs", () => {
     expect((await get(owner, "/automation/runs?status=nonsense")).statusCode).toBe(400);
     const detail = (await get(owner, `/automation/rules/${ruleId}`)).json() as { recentRuns: Array<{ id: string }> };
     expect(detail.recentRuns.map((r) => r.id)).toContain(runId);
+    // A company-wide rule is readable by every member, but its recent runs are
+    // project data: a member with no project must not read them through it.
+    const asNoProjectDetail = await get(noProject, `/automation/rules/${ruleId}`);
+    expect(asNoProjectDetail.statusCode).toBe(200);
+    expect((asNoProjectDetail.json() as { recentRuns: Array<{ id: string }> }).recentRuns).toEqual([]);
+    const asReaderDetail = (await get(projectReader, `/automation/rules/${ruleId}`)).json() as { recentRuns: Array<{ id: string }> };
+    expect(asReaderDetail.recentRuns.map((r) => r.id)).toContain(runId);
   });
 
   it("retries only failed, throttled or queued runs, and only for admins", async () => {

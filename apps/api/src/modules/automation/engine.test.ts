@@ -583,6 +583,10 @@ describe("executors", () => {
 
     for (const bad of [
       "http://localhost:3000/x",
+      // the DNS root dot resolves to the same host
+      "http://localhost./x",
+      "http://LOCALHOST.:3000/x",
+      "http://api.localhost./x",
       "http://127.0.0.1/x",
       "http://10.0.0.5/x",
       "http://192.168.1.1/x",

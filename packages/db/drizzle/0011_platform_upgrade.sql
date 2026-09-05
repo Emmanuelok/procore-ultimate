@@ -8045,6 +8045,7 @@ CREATE INDEX "bonds_facility_idx" ON "bonds" USING btree ("facility_id","status"
 CREATE INDEX "bonds_status_idx" ON "bonds" USING btree ("company_id","status");--> statement-breakpoint
 CREATE INDEX "insurance_certificates_project_idx" ON "insurance_certificates" USING btree ("company_id","project_id","valid_to");--> statement-breakpoint
 CREATE INDEX "insurance_claims_project_idx" ON "insurance_claims" USING btree ("company_id","project_id");--> statement-breakpoint
+CREATE INDEX "insurance_claims_notification_idx" ON "insurance_claims" USING btree ("company_id","notified_at","notification_due_at");--> statement-breakpoint
 CREATE INDEX "insurance_policies_period_idx" ON "insurance_policies" USING btree ("company_id","period_end");--> statement-breakpoint
 CREATE INDEX "insurance_policies_renewal_idx" ON "insurance_policies" USING btree ("company_id","renewal_status");--> statement-breakpoint
 CREATE INDEX "lesson_applications_outcome_idx" ON "lesson_applications" USING btree ("company_id","outcome");--> statement-breakpoint

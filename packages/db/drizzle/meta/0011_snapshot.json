@@ -1,5 +1,5 @@
 {
-  "id": "ba8cfcc4-b72a-462a-b6db-55d8ac245d12",
+  "id": "0df20a51-5065-4590-babb-8c2b94951f1e",
   "prevId": "340cf323-a4ed-4b81-8d6c-8f3e94b698e3",
   "version": "7",
   "dialect": "postgresql",
@@ -34163,6 +34163,33 @@
             },
             {
               "expression": "project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "insurance_claims_notification_idx": {
+          "name": "insurance_claims_notification_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "notified_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "notification_due_at",
               "isExpression": false,
               "asc": true,
               "nulls": "last"

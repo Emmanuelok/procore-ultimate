@@ -507,7 +507,10 @@ function isDeliverableUrl(value: string): boolean {
   try {
     const u = new URL(value);
     if (u.protocol !== "http:" && u.protocol !== "https:") return false;
-    const host = u.hostname.toLowerCase();
+    // A trailing dot is the DNS root and resolves identically ("localhost."
+    // reaches loopback), so it is stripped before every test below — without
+    // this, "http://localhost./" walked straight past the name checks.
+    const host = u.hostname.toLowerCase().replace(/\.+$/, "");
     // Refuse the obvious ways to turn a rule into an internal port scanner.
     if (host === "localhost" || host === "0.0.0.0" || host.endsWith(".localhost")) return false;
     if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host)) return false;

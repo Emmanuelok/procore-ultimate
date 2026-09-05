@@ -222,12 +222,6 @@ export const automationModule: FastifyPluginAsync = async (app) => {
     return row;
   }
 
-  async function assertRuleVisible(req: FastifyRequest, rule: RuleRow): Promise<void> {
-    if (!rule.projectId) return;
-    const visible = await visibleProjectIds(req);
-    if (visible !== null && !visible.includes(rule.projectId)) throw notFound("Automation rule not found");
-  }
-
   async function loadRun(req: FastifyRequest, id: string): Promise<RunRow> {
     const [row] = await app.db
       .select()
@@ -479,8 +473,13 @@ export const automationModule: FastifyPluginAsync = async (app) => {
   app.get("/automation/rules/:id", { preHandler: memberGate }, async (req) => {
     const { id } = req.params as { id: string };
     const rule = await loadRule(req, id);
-    await assertRuleVisible(req, rule);
-    const recent = await engine.recentRuns(rule.id, 10);
+    const visible = await visibleProjectIds(req);
+    if (rule.projectId && visible !== null && !visible.includes(rule.projectId)) throw notFound("Automation rule not found");
+    // Plan §6.3: a company-wide rule is readable by every member, but its runs
+    // are project data — a member only sees the runs on projects they can see.
+    const recent = (await engine.recentRuns(rule.id, 10)).filter(
+      (r) => visible === null || r.projectId === null || visible.includes(r.projectId),
+    );
     return { rule: serializeRule(rule), recentRuns: recent };
   });
 
