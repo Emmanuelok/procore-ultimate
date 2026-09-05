@@ -130,6 +130,17 @@ interface BundleManifest {
   itemCount: number;
   merkleRoot: string;
   index: ManifestIndexEntry[];
+  /** items withheld on grounds of privilege, listed rather than produced (#340-342) */
+  privilegeLog?: Array<{
+    id: string;
+    title: string;
+    date: string | null;
+    privilege: string;
+    reason: string | null;
+  }>;
+  /** total pages in the produced bundle including cover and index */
+  pages?: number;
+  statement?: string;
 }
 
 /** Escalation ladder (#325-338): forward-only procedural statuses. */
@@ -666,27 +677,51 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
   }
 
   /**
-   * Content hash for a bundle item. File-backed items reuse the files row's
+   * Content hash AND snapshot for a bundle item. File-backed items reuse the files row's
    * sha256 — storage is content-addressed, so that IS the content hash.
    * Record-backed items hash the record's canonical JSON. Returns null when
    * the underlying file/record no longer exists.
    */
-  async function itemContentHash(
+  async function itemContent(
     item: { fileId: string | null; recordType: string | null; recordId: string | null },
     companyId: string,
     projectId: string,
-  ): Promise<string | null> {
+  ): Promise<{
+    sha256: string;
+    kind: "record" | "file";
+    snapshot: Record<string, unknown> | null;
+  } | null> {
     if (item.fileId) {
       const rows = await app.db
-        .select({ sha256: files.sha256 })
+        .select({ sha256: files.sha256, name: files.name, projectId: files.projectId })
         .from(files)
         .where(and(eq(files.id, item.fileId), eq(files.companyId, companyId)))
         .limit(1);
-      return rows[0]?.sha256 ?? null;
+      const row = rows[0];
+      if (!row) return null;
+      if (row.projectId && row.projectId !== projectId) return null;
+      // A file is content-addressed in storage, so its sha256 IS the
+      // content hash; the snapshot records the reference, not the bytes.
+      return {
+        sha256: row.sha256,
+        kind: "file",
+        snapshot: { fileId: item.fileId, name: row.name, sha256: row.sha256 },
+      };
     }
     if (item.recordType && item.recordId) {
       const resolved = await resolveRecord(item.recordType, item.recordId, companyId, projectId);
-      return resolved ? hashPayload(resolved.row) : null;
+      if (!resolved) return null;
+      return {
+        sha256: hashPayload(resolved.row),
+        kind: "record",
+        snapshot: {
+          recordType: item.recordType,
+          recordId: item.recordId,
+          title: resolved.title,
+          date: resolved.date,
+          row: resolved.row as Record<string, unknown>,
+        },
+      };
     }
     return null;
   }
@@ -1363,15 +1398,16 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
         let title = raw.title ?? null;
         let date = raw.date ?? null;
         if (raw.fileId) {
-          const fileRows = await app.db
-            .select({ id: files.id, name: files.name })
-            .from(files)
-            .where(and(eq(files.id, raw.fileId), eq(files.companyId, req.companyId!)))
-            .limit(1);
-          if (!fileRows[0]) {
-            throw badRequest(`Item ${i + 1}: fileId does not belong to this company`);
-          }
-          if (!title) title = fileRows[0].name;
+          // Project-scoped, not merely company-scoped: a bundle manifest is
+          // served to a tribunal and publishes the file name.
+          const file = await validateFileId(req.companyId!, req.projectId!, raw.fileId).catch(
+            (err: unknown) => {
+              throw badRequest(
+                `Item ${i + 1}: ${err instanceof Error ? err.message : "invalid fileId"}`,
+              );
+            },
+          );
+          if (!title) title = file.name;
         }
         if (raw.recordType && raw.recordId) {
           const resolved = await resolveRecord(
@@ -1388,6 +1424,11 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
           if (!title) title = resolved.title;
           if (!date) date = resolved.date;
         }
+        if (raw.privilege !== "none" && !raw.privilegeReason) {
+          throw badRequest(
+            `Item ${i + 1}: an item marked privileged needs a reason for the privilege log`,
+          );
+        }
         items.push({
           id: newId("bit"),
           tab: null,
@@ -1397,6 +1438,10 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
           recordId: raw.recordId ?? null,
           fileId: raw.fileId ?? null,
           sha256: null,
+          privilege: raw.privilege,
+          privilegeReason: raw.privilegeReason ?? null,
+          startPage: null,
+          endPage: null,
         });
       }
       const now = new Date().toISOString();
