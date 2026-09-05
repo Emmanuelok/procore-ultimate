@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, eq } from "drizzle-orm";
 import {
@@ -24,6 +24,14 @@ import { listSearchSources } from "../search/registry.js";
 import { newId } from "../../lib/ids.js";
 import { addDaysISO, todayISO } from "../field/dates.js";
 import { taxModule } from "./index.js";
+
+/*
+ * This file builds a whole app against PGlite and drives ~50 route tests
+ * through it. On a shared, loaded machine the transform and boot alone can
+ * take minutes, and the project's 30s default turns that into a red build
+ * that says nothing about the code, so the whole file gets room to breathe.
+ */
+vi.setConfig({ testTimeout: 180_000, hookTimeout: 300_000 });
 
 /**
  * Tax & statutory deduction — route integration tests (spec Vol II Domain Q,
