@@ -331,6 +331,64 @@ export const timecardAllocations = pgTable(
 );
 
 /**
+ * FIELD PROGRESS — installed quantity per cost code per day (#615).
+ *
+ * `timecard_allocations.quantity` lets a foreman state, on his own timesheet,
+ * how much work his own hours produced. Both sides of the productivity ratio
+ * then come from one person through one pathway, which is the arrangement
+ * ADR 0004 forbids everywhere else on this platform. This table is the other
+ * side: a measurement of what is actually installed, made by whoever walked
+ * the work, with its own date, its own author and its own stated method.
+ *
+ * Where a budget line has entries here, THESE are the authority on installed
+ * quantity and the allocation quantities on that line are not added to them —
+ * a claim and its check are never summed.
+ *
+ * `verifiedBy` is separate from `recordedBy` for the same reason a delivery
+ * has both: a quantity that decides an interim valuation is worth a second
+ * pair of eyes, and the register shows which ones have had them.
+ */
+export const labourProgressEntries = pgTable(
+  "labour_progress_entries",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    /** the day the work was MEASURED, which is the day it is earned on */
+    progressDate: text("progress_date").notNull(),
+    costCodeId: text("cost_code_id"),
+    costCode: text("cost_code"),
+    /** the link that lets the quantity be earned against a planned rate */
+    budgetLineItemId: text("budget_line_item_id"),
+    /** the gang whose hours produced it, where it can be attributed */
+    crewId: text("crew_id"),
+    locationId: text("location_id"),
+    scheduleActivityId: text("schedule_activity_id"),
+    quantity: doublePrecision("quantity").notNull(),
+    unit: text("unit").notNull(),
+    /** how the quantity was arrived at — a count, a survey, a percentage */
+    method: text("method").default("field_measure").notNull(),
+    /** cumulative-to-date reading this entry was derived from, if any */
+    cumulativeQuantity: doublePrecision("cumulative_quantity"),
+    notes: text("notes"),
+    photoFileIds: jsonb("photo_file_ids").$type<string[]>().default([]).notNull(),
+    recordedBy: text("recorded_by").notNull(),
+    verifiedBy: text("verified_by"),
+    verifiedAt: timestamp("verified_at", { withTimezone: true, mode: "string" }),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("labour_progress_project_date_idx").on(t.projectId, t.progressDate),
+    index("labour_progress_budget_idx").on(t.budgetLineItemId, t.progressDate),
+    index("labour_progress_cost_code_idx").on(t.projectId, t.costCodeId),
+    index("labour_progress_crew_idx").on(t.crewId, t.progressDate),
+    index("labour_progress_company_idx").on(t.companyId, t.progressDate),
+  ],
+);
+
+/**
  * One act in the approval trail. A trail rather than a status column because
  * approval is usually tiered (foreman → superintendent → payroll) and because
  * `isSelfApproval` must be RECORDED, not merely refused: a control that

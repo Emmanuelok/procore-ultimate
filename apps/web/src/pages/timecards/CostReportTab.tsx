@@ -52,12 +52,16 @@ import {
   labelize,
   money,
   useAction,
+  useCostCodes,
+  useCrews,
   useProductivity,
+  useProgressEntries,
   type CostReportLine,
   type LabourCostReport,
   type LabourPostingResult,
   type Loadable,
 } from "./timecardsShared";
+import { FieldProgressModal } from "./TimecardForms";
 
 const WINDOWS = [7, 14, 30, 60, 90];
 
@@ -502,16 +506,38 @@ function ProductivityPanel({
     return d.toISOString().slice(0, 10);
   }, [to, windowDays]);
   const productivity = useProductivity(projectId, from, to, Boolean(projectId));
+  const progress = useProgressEntries(projectId, from, to, Boolean(projectId));
+  const crews = useCrews(projectId);
+  const costCodes = useCostCodes(projectId, Boolean(projectId));
+  const [progressOpen, setProgressOpen] = useState(false);
+  const { busy, refusal, clear, run } = useAction();
   const data = productivity.data;
+
+  const budgetLines = useMemo(
+    () =>
+      (data?.lines ?? []).map((l) => ({
+        id: l.budgetLineItemId,
+        costCode: l.code ?? l.budgetLineItemId.slice(0, 8),
+        description: l.description,
+        unit: l.unit,
+      })),
+    [data],
+  );
 
   return (
     <Card>
       <CardBody className="space-y-3">
-        <SectionHeading
-          title="Labour productivity"
-          hint="Earned hours against actual hours, per budget line, per crew and per week. A line that cannot be measured says so rather than reading as on plan."
-          className="mb-0"
-        />
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <SectionHeading
+            title="Labour productivity"
+            hint="Earned hours against actual hours, per budget line, per crew and per week. A line that cannot be measured says so rather than reading as on plan."
+            className="mb-0"
+          />
+          <Button size="sm" variant="secondary" onClick={() => setProgressOpen(true)}>
+            Record field progress
+          </Button>
+        </div>
+        {refusal ? <RefusalNotice refusal={refusal} onDismiss={clear} /> : null}
         {productivity.error ? (
           <LoadError message={productivity.error} onRetry={productivity.reload} />
         ) : productivity.loading ? (
@@ -597,9 +623,30 @@ function ProductivityPanel({
                       </Td>
                       <Td align="right">{hoursText(line.actualHours)}</Td>
                       <Td align="right">
-                        {line.installedQuantity === null
-                          ? "—"
-                          : `${line.installedQuantity} ${line.unit ?? ""}`}
+                        {line.installedQuantity === null ? (
+                          "—"
+                        ) : (
+                          <Tooltip
+                            content={
+                              line.quantitySource === "field_progress"
+                                ? "Measured in the field, separately from the timesheets that claimed the hours."
+                                : "Typed on the timesheets that claimed the hours — one author on both sides of the ratio. A field measurement supersedes it."
+                            }
+                          >
+                            <span className="inline-flex items-center gap-1">
+                              {line.installedQuantity} {line.unit ?? ""}
+                              <Badge
+                                size="xs"
+                                variant="outline"
+                                tone={
+                                  line.quantitySource === "field_progress" ? "success" : "warning"
+                                }
+                              >
+                                {line.quantitySource === "field_progress" ? "measured" : "claimed"}
+                              </Badge>
+                            </span>
+                          </Tooltip>
+                        )}
                       </Td>
                       <Td align="right">
                         {line.earnedHours === null ? "—" : hoursText(line.earnedHours)}
@@ -672,7 +719,100 @@ function ProductivityPanel({
             <p className="text-2xs text-content-subtle">{data.method}</p>
           </>
         )}
+
+        {/*
+          THE MEASUREMENTS THEMSELVES. A productivity factor is only as good
+          as the quantity behind it, so the entries are shown with their
+          method and whether anybody other than their author has seen them —
+          and countersigning is offered here rather than hidden in a drawer.
+        */}
+        <div>
+          <SectionHeading
+            title="Field progress"
+            hint="Installed quantity measured separately from the timesheets. Where it exists the report earns from it and ignores the quantity typed on the cards."
+          />
+          {progress.error ? (
+            <LoadError message={progress.error} onRetry={progress.reload} />
+          ) : progress.loading ? (
+            <SkeletonTable rows={2} />
+          ) : (progress.data?.items.length ?? 0) === 0 ? (
+            <EmptyState
+              icon={<IconCost />}
+              title="Nothing measured in this window"
+              description="Without a field measurement, the only quantity available is the one the person claiming the hours typed on their own timesheet — one author on both sides of the ratio."
+            />
+          ) : (
+            <Table>
+              <THead>
+                <Tr>
+                  <Th>Date</Th>
+                  <Th>Cost code</Th>
+                  <Th align="right">Quantity</Th>
+                  <Th>Method</Th>
+                  <Th>Countersigned</Th>
+                </Tr>
+              </THead>
+              <TBody>
+                {(progress.data?.items ?? []).map((entry) => (
+                  <Tr key={entry.id}>
+                    <Td>{entry.progressDate}</Td>
+                    <Td>
+                      <span className="font-mono">{entry.costCode ?? "—"}</span>
+                    </Td>
+                    <Td align="right">
+                      {entry.quantity} {entry.unit}
+                    </Td>
+                    <Td>{labelize(entry.method)}</Td>
+                    <Td>
+                      {entry.verifiedBy ? (
+                        <Badge size="xs" tone="success" variant="outline">
+                          {entry.verifiedAt?.slice(0, 10) ?? "yes"}
+                        </Badge>
+                      ) : (
+                        <Button
+                          size="xs"
+                          variant="secondary"
+                          loading={busy === entry.id}
+                          onClick={async () => {
+                            const done = await run(entry.id, () =>
+                              api.post(
+                                `/api/v1/projects/${projectId}/labour-progress/${entry.id}/verify`,
+                                {},
+                              ),
+                            );
+                            if (done) {
+                              toast.success("Measurement countersigned");
+                              progress.reload();
+                              productivity.reload();
+                            }
+                          }}
+                        >
+                          Countersign
+                        </Button>
+                      )}
+                    </Td>
+                  </Tr>
+                ))}
+              </TBody>
+            </Table>
+          )}
+        </div>
       </CardBody>
+
+      {projectId ? (
+        <FieldProgressModal
+          open={progressOpen}
+          onClose={() => setProgressOpen(false)}
+          onDone={() => {
+            progress.reload();
+            productivity.reload();
+          }}
+          projectId={projectId}
+          crews={crews.data?.items ?? []}
+          costCodes={costCodes.data?.items ?? []}
+          budgetLines={budgetLines}
+        />
+      ) : null}
     </Card>
   );
 }

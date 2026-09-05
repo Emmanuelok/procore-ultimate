@@ -6,8 +6,10 @@ import {
   bondCalls,
   bondFacilities,
   bonds,
+  companies,
   files,
   insuranceCertificates,
+  insuranceClaimRequests,
   insuranceClaims,
   insurancePolicies,
   insurancePremiums,
@@ -18,12 +20,14 @@ import {
   recordLinks,
   safetyIncidents,
   signals,
+  users,
   vendors,
   workers,
 } from "@constructos/db";
 import {
   BOND_FACILITY_STATUSES,
   BOND_TYPES,
+  CLAIM_REQUEST_KINDS,
   INSURANCE_CLAIM_STATUSES,
   INSURANCE_PREMIUM_KINDS,
   INSURANCE_REQUIREMENT_STATUSES,
@@ -31,6 +35,12 @@ import {
   POLICY_TYPES,
   type AssuranceRole,
 } from "@constructos/shared";
+import {
+  packGaps,
+  renderClaimPack,
+  type ClaimPackModel,
+  type PackItem,
+} from "./claimpack.js";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
@@ -74,6 +84,7 @@ import {
   type RequirementLike,
 } from "./programme.js";
 import { forEachCompany } from "../../lib/scheduler.js";
+import { pushNotifications } from "../notifications/service.js";
 import type { Db } from "../../lib/db.js";
 import {
   companyScopeOf,
@@ -2985,11 +2996,20 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
   /* CLAIMS (#783-789) — the notification obligation                   */
   /* ================================================================ */
 
-  app.post(
-    "/projects/:projectId/insurance/claims",
-    { preHandler: standardGate },
-    async (req, reply) => {
-      const body = claimCreateSchema.parse(req.body);
+  /**
+   * Create a claim from an already-validated body.
+   *
+   * Shared by the register route and the incident-to-claim path so that the
+   * notification obligation, the traversable record links and the ledger
+   * entry cannot differ between the two ways a claim comes into existence —
+   * a second copy of this logic is a second place for the deadline to be
+   * computed differently.
+   */
+  async function createClaim(
+    req: FastifyRequest,
+    body: z.infer<typeof claimCreateSchema>,
+  ) {
+    {
       if (daysBetweenISO(body.incidentDate, body.awareDate) < 0) {
         throw badRequest(
           `awareDate ${body.awareDate} falls before incidentDate ${body.incidentDate} — the insured ` +
@@ -3084,7 +3104,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         storePayload: true,
       });
       const created = await fetchClaim(id, req.companyId!, req.projectId!);
-      return reply.status(201).send({
+      return {
         ...decorateClaim(created, todayISO()),
         notificationRule: {
           notificationDays: window.notificationDays,
@@ -3096,8 +3116,15 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
               `from the aware date ${body.awareDate}. The deadline is carried as an obligation and is ` +
               `typically a condition precedent to liability.`,
         },
-      });
-    },
+      };
+    }
+  }
+
+  app.post(
+    "/projects/:projectId/insurance/claims",
+    { preHandler: standardGate },
+    async (req, reply) =>
+      reply.status(201).send(await createClaim(req, claimCreateSchema.parse(req.body))),
   );
 
   app.get("/projects/:projectId/insurance/claims", { preHandler: readGate }, async (req) => {
@@ -3384,6 +3411,642 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
     },
   );
 
+
+  /* ================================================================ */
+  /* CLAIM DOCUMENTATION PACK AND THE LOSS ADJUSTER (#784, #785)       */
+  /*                                                                   */
+  /* An insurer decides a claim on the pack it was given. Before this  */
+  /* the evidence was a JSON array nothing could traverse and no       */
+  /* record existed of what was actually submitted. The pack is one    */
+  /* content-addressed document; the adjuster's asks are dated         */
+  /* obligations, because a claim is more often lost on an unanswered  */
+  /* request than on its merits.                                       */
+  /* ================================================================ */
+
+  const claimRequestSchema = z.object({
+    kind: z.enum(CLAIM_REQUEST_KINDS).default("information_request"),
+    title: z.string().min(1).max(300),
+    description: z.string().max(10_000).nullable().optional(),
+    requestedBy: z.string().max(200).nullable().optional(),
+    requestedAt: isoDateSchema.nullable().optional(),
+    dueDate: isoDateSchema.nullable().optional(),
+    ownerId: z.string().max(64).nullable().optional(),
+  });
+
+  /** Overdue is derived, never stored: it cannot then disagree with the calendar. */
+  const requestOverdue = (
+    r: typeof insuranceClaimRequests.$inferSelect,
+    asOf: string,
+  ): boolean => r.status === "open" && r.dueDate !== null && r.dueDate < asOf;
+
+  const decorateRequest = (
+    r: typeof insuranceClaimRequests.$inferSelect,
+    asOf: string,
+  ) => ({
+    ...r,
+    overdue: requestOverdue(r, asOf),
+    daysToDue: r.dueDate ? daysBetweenISO(asOf, r.dueDate) : null,
+  });
+
+  async function fetchClaimRequest(requestId: string, companyId: string, projectId: string) {
+    const rows = await app.db
+      .select()
+      .from(insuranceClaimRequests)
+      .where(
+        and(
+          eq(insuranceClaimRequests.id, requestId),
+          eq(insuranceClaimRequests.companyId, companyId),
+          eq(insuranceClaimRequests.projectId, projectId),
+        ),
+      )
+      .limit(1);
+    if (!rows[0]) throw notFound("Claim request not found");
+    return rows[0];
+  }
+
+  app.post(
+    "/projects/:projectId/insurance/claims/:claimId/requests",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { claimId } = req.params as { claimId: string };
+      const body = claimRequestSchema.parse(req.body);
+      const claim = await fetchClaim(claimId, req.companyId!, req.projectId!);
+      if (["settled", "repudiated", "withdrawn"].includes(claim.status)) {
+        throw conflict(
+          `Claim ${claim.number} is ${claim.status}; a new request cannot be added to a closed claim.`,
+        );
+      }
+      /*
+       * The deadline is carried as a real Obligation, not as a date on a row
+       * nobody sweeps. That is the whole difference between a task list and
+       * the machinery the rest of the platform uses for time bars.
+       */
+      let obligationId: string | null = null;
+      if (body.dueDate) {
+        obligationId = newId("obl");
+        await app.db.insert(obligations).values({
+          id: obligationId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          sourceClause: `${OBLIGATION_PREFIX} claim ${claim.number} — ${body.kind}`,
+          trigger: `Respond to the loss adjuster: ${body.title}`,
+          deadline: `${body.dueDate}T23:59:59Z`,
+          warnDaysBefore: 3,
+          evidenceRequirement: "The information sent, with the date it was sent",
+          status: "open",
+          createdBy: req.user!.id,
+        });
+      }
+      const id = newId("icr");
+      await app.db.insert(insuranceClaimRequests).values({
+        id,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        claimId,
+        kind: body.kind,
+        title: body.title,
+        description: body.description ?? null,
+        requestedBy: body.requestedBy ?? claim.lossAdjuster ?? null,
+        requestedAt: body.requestedAt ?? todayISO(),
+        dueDate: body.dueDate ?? null,
+        obligationId,
+        ownerId: body.ownerId ?? null,
+        status: "open",
+        createdBy: req.user!.id,
+      });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "insurance_claim_request",
+        objectId: id,
+        payload: { claimId, kind: body.kind, title: body.title, dueDate: body.dueDate ?? null, obligationId },
+        projectId: req.projectId!,
+        storePayload: true,
+      });
+      if (body.ownerId) {
+        await pushNotifications(app.db, [
+          {
+            companyId: req.companyId!,
+            userId: body.ownerId,
+            projectId: req.projectId!,
+            kind: "assignment",
+            title: `Loss adjuster request on ${claim.number}: ${body.title}`,
+            body: body.dueDate
+              ? `Due ${body.dueDate}. An unanswered request is the commonest way a good claim is lost.`
+              : "No date was given for this request.",
+            recordType: "insurance_claim",
+            recordId: claimId,
+          },
+        ]);
+      }
+      const created = await fetchClaimRequest(id, req.companyId!, req.projectId!);
+      return reply.status(201).send(decorateRequest(created, todayISO()));
+    },
+  );
+
+  app.get(
+    "/projects/:projectId/insurance/claims/:claimId/requests",
+    { preHandler: readGate },
+    async (req) => {
+      const { claimId } = req.params as { claimId: string };
+      await fetchClaim(claimId, req.companyId!, req.projectId!);
+      const asOf = todayISO();
+      const rows = await app.db
+        .select()
+        .from(insuranceClaimRequests)
+        .where(
+          and(
+            eq(insuranceClaimRequests.companyId, req.companyId!),
+            eq(insuranceClaimRequests.claimId, claimId),
+          ),
+        )
+        .orderBy(asc(insuranceClaimRequests.dueDate), desc(insuranceClaimRequests.createdAt));
+      const items = rows.map((r) => decorateRequest(r, asOf));
+      return {
+        items,
+        total: items.length,
+        open: items.filter((r) => r.status === "open").length,
+        overdue: items.filter((r) => r.overdue).length,
+      };
+    },
+  );
+
+  app.post(
+    "/projects/:projectId/insurance/claim-requests/:requestId/respond",
+    { preHandler: standardGate },
+    async (req) => {
+      const { requestId } = req.params as { requestId: string };
+      const body = z
+        .object({
+          responseNote: z.string().min(1).max(10_000),
+          evidenceFileIds: z.array(z.string().max(64)).max(100).optional(),
+          close: z.boolean().default(false),
+        })
+        .parse(req.body);
+      const row = await fetchClaimRequest(requestId, req.companyId!, req.projectId!);
+      if (row.status !== "open") {
+        throw conflict(
+          `This request is already ${row.status}. Raise a new one rather than rewriting the answer given.`,
+        );
+      }
+      const now = new Date().toISOString();
+      await app.db
+        .update(insuranceClaimRequests)
+        .set({
+          status: body.close ? "closed" : "responded",
+          respondedAt: now,
+          respondedBy: req.user!.id,
+          responseNote: body.responseNote,
+          evidenceFileIds: body.evidenceFileIds ?? [],
+          updatedAt: now,
+        })
+        .where(eq(insuranceClaimRequests.id, requestId));
+      const late = row.dueDate !== null && todayISO() > row.dueDate;
+      if (row.obligationId) {
+        /* Answered late is still answered, but the obligation must say which:
+           an obligation quietly marked satisfied after its date is how a
+           register comes to report a discipline it never had. */
+        await app.db
+          .update(obligations)
+          .set({ status: late ? "breached" : "satisfied" })
+          .where(
+            and(
+              eq(obligations.id, row.obligationId),
+              eq(obligations.companyId, req.companyId!),
+              eq(obligations.status, "open"),
+            ),
+          );
+      }
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "insurance_claim_request",
+        objectId: requestId,
+        payload: {
+          from: row.status,
+          to: body.close ? "closed" : "responded",
+          claimId: row.claimId,
+          obligationId: row.obligationId,
+          late,
+        },
+        projectId: req.projectId!,
+        storePayload: true,
+      });
+      const updated = await fetchClaimRequest(requestId, req.companyId!, req.projectId!);
+      return decorateRequest(updated, todayISO());
+    },
+  );
+
+  /**
+   * Resolve the records a claim is built on, one lookup per known type.
+   *
+   * A type this module cannot look up is reported as `not_resolvable` rather
+   * than `not_found`: "we could not check" and "we checked and it is gone"
+   * are different answers, and only the second is a hole in the claim.
+   */
+  async function resolvePackItems(
+    companyId: string,
+    projectId: string,
+    claimId: string,
+  ): Promise<PackItem[]> {
+    const links = await app.db
+      .select({ toType: recordLinks.toType, toId: recordLinks.toId })
+      .from(recordLinks)
+      .where(
+        and(
+          eq(recordLinks.companyId, companyId),
+          eq(recordLinks.fromType, "insurance_claim"),
+          eq(recordLinks.fromId, claimId),
+        ),
+      );
+    if (links.length === 0) return [];
+    const incidentIds = links.filter((l) => l.toType === "safety_incident").map((l) => l.toId);
+    const ncrIds = links.filter((l) => l.toType === "ncr" || l.toType === "non_conformance").map((l) => l.toId);
+    const fileIds = links.filter((l) => l.toType === "file" || l.toType === "document").map((l) => l.toId);
+
+    const incidents = incidentIds.length
+      ? await app.db
+          .select({
+            id: safetyIncidents.id,
+            reference: safetyIncidents.reference,
+            title: safetyIncidents.title,
+            occurredAt: safetyIncidents.occurredAt,
+            estimatedCost: safetyIncidents.estimatedCost,
+          })
+          .from(safetyIncidents)
+          .where(
+            and(
+              eq(safetyIncidents.companyId, companyId),
+              eq(safetyIncidents.projectId, projectId),
+              inArray(safetyIncidents.id, incidentIds),
+            ),
+          )
+      : [];
+    const ncrs = ncrIds.length
+      ? await app.db
+          .select({
+            id: nonConformanceReports.id,
+            reference: nonConformanceReports.reference,
+            title: nonConformanceReports.title,
+            detectedAt: nonConformanceReports.detectedAt,
+          })
+          .from(nonConformanceReports)
+          .where(
+            and(
+              eq(nonConformanceReports.companyId, companyId),
+              eq(nonConformanceReports.projectId, projectId),
+              inArray(nonConformanceReports.id, ncrIds),
+            ),
+          )
+      : [];
+    const fileRows = fileIds.length
+      ? await app.db
+          .select({
+            id: files.id,
+            name: files.name,
+            sha256: files.sha256,
+            createdAt: files.createdAt,
+          })
+          .from(files)
+          .where(and(eq(files.companyId, companyId), inArray(files.id, fileIds)))
+      : [];
+
+    const incidentById = new Map(incidents.map((i) => [i.id, i]));
+    const ncrById = new Map(ncrs.map((n) => [n.id, n]));
+    const fileById = new Map(fileRows.map((f) => [f.id, f]));
+
+    return links.map((link): PackItem => {
+      if (link.toType === "safety_incident") {
+        const hit = incidentById.get(link.toId);
+        return {
+          recordType: link.toType,
+          recordId: link.toId,
+          reference: hit?.reference ?? null,
+          title: hit?.title ?? null,
+          occurredAt: hit?.occurredAt ?? null,
+          note:
+            hit && hit.estimatedCost !== null
+              ? `Estimated loss recorded: ${hit.estimatedCost}`
+              : null,
+          resolution: hit ? "resolved" : "not_found",
+        };
+      }
+      if (link.toType === "ncr" || link.toType === "non_conformance") {
+        const hit = ncrById.get(link.toId);
+        return {
+          recordType: link.toType,
+          recordId: link.toId,
+          reference: hit?.reference ?? null,
+          title: hit?.title ?? null,
+          occurredAt: hit?.detectedAt ?? null,
+          note: null,
+          resolution: hit ? "resolved" : "not_found",
+        };
+      }
+      if (link.toType === "file" || link.toType === "document") {
+        const hit = fileById.get(link.toId);
+        return {
+          recordType: link.toType,
+          recordId: link.toId,
+          reference: null,
+          title: hit?.name ?? null,
+          occurredAt: hit?.createdAt ?? null,
+          note: null,
+          resolution: hit ? "resolved" : "not_found",
+          fileId: hit?.id ?? null,
+          sha256: hit?.sha256 ?? null,
+        };
+      }
+      return {
+        recordType: link.toType,
+        recordId: link.toId,
+        reference: null,
+        title: null,
+        occurredAt: null,
+        note: null,
+        resolution: "not_resolvable",
+      };
+    });
+  }
+
+  app.post(
+    "/projects/:projectId/insurance/claims/:claimId/pack",
+    { preHandler: standardGate },
+    async (req) => {
+      const { claimId } = req.params as { claimId: string };
+      const claim = await fetchClaim(claimId, req.companyId!, req.projectId!);
+      const policy = await fetchPolicyForProject(
+        claim.policyId,
+        req.companyId!,
+        req.projectId!,
+      ).catch(() => null);
+      const asOf = todayISO();
+      const items = await resolvePackItems(req.companyId!, req.projectId!, claimId);
+      const requestRows = await app.db
+        .select()
+        .from(insuranceClaimRequests)
+        .where(
+          and(
+            eq(insuranceClaimRequests.companyId, req.companyId!),
+            eq(insuranceClaimRequests.claimId, claimId),
+          ),
+        )
+        .orderBy(asc(insuranceClaimRequests.dueDate));
+      const [company] = await app.db
+        .select({ name: companies.name })
+        .from(companies)
+        .where(eq(companies.id, req.companyId!))
+        .limit(1);
+      const [project] = await app.db
+        .select({ name: projects.name })
+        .from(projects)
+        .where(eq(projects.id, req.projectId!))
+        .limit(1);
+      const [author] = await app.db
+        .select({ name: users.name })
+        .from(users)
+        .where(eq(users.id, req.user!.id))
+        .limit(1);
+
+      const generatedAt = new Date().toISOString();
+      const base = {
+        companyName: company?.name ?? "—",
+        projectName: project?.name ?? null,
+        claim: {
+          number: claim.number,
+          title: claim.title,
+          description: claim.description,
+          incidentDate: claim.incidentDate,
+          awareDate: claim.awareDate,
+          notifiedAt: claim.notifiedAt,
+          notificationDueAt: claim.notificationDueAt,
+          status: claim.status,
+          quantum: claim.quantum,
+          reserve: claim.reserve,
+          settledAmount: claim.settledAmount,
+          currency: claim.currency,
+          insurerRef: claim.insurerRef,
+          lossAdjuster: claim.lossAdjuster,
+        },
+        policy: policy
+          ? {
+              number: policy.number,
+              policyType: policy.policyType,
+              insurer: policy.insurer,
+              policyNumber: policy.policyNumber,
+              periodStart: policy.periodStart,
+              periodEnd: policy.periodEnd,
+              notificationDays: policy.notificationDays,
+              limitOfIndemnity: policy.limitOfIndemnity,
+              limitBasis: policy.limitBasis,
+              deductible: policy.deductible,
+              currency: policy.currency,
+              territorialLimits: policy.territorialLimits,
+            }
+          : null,
+        items,
+        requests: requestRows.map((r) => ({
+          kind: r.kind,
+          title: r.title,
+          requestedBy: r.requestedBy,
+          dueDate: r.dueDate,
+          status: r.status,
+          respondedAt: r.respondedAt,
+          overdue: requestOverdue(r, asOf),
+        })),
+        generatedAt,
+        generatedByName: author?.name ?? null,
+      };
+      const model: ClaimPackModel = { ...base, gaps: packGaps(base) };
+      const { html, contentType } = renderClaimPack(model);
+      const buf = Buffer.from(html, "utf8");
+      const saved = await app.storage.saveBuffer(req.companyId!, buf);
+      const fileId = newId("fil");
+      await app.db.insert(files).values({
+        id: fileId,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        folderId: null,
+        name: `${claim.number}-claim-pack.html`,
+        contentType,
+        sizeBytes: saved.sizeBytes,
+        sha256: saved.sha256,
+        storageKey: saved.storageKey,
+        documentType: "insurance",
+        metadata: { claimId, kind: "claim_pack", generatedAt, itemCount: items.length },
+        uploadedBy: req.user!.id,
+      });
+      await app.db
+        .update(insuranceClaims)
+        .set({
+          packFileId: fileId,
+          packSha256: saved.sha256,
+          packGeneratedAt: generatedAt,
+          packItemCount: items.length,
+          updatedAt: generatedAt,
+        })
+        .where(eq(insuranceClaims.id, claimId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "insurance_claim_pack",
+        objectId: fileId,
+        payload: {
+          claimId,
+          claimNumber: claim.number,
+          sha256: saved.sha256,
+          sizeBytes: saved.sizeBytes,
+          itemCount: items.length,
+          gaps: model.gaps.length,
+        },
+        projectId: req.projectId!,
+        storePayload: true,
+      });
+      return {
+        claimId,
+        fileId,
+        sha256: saved.sha256,
+        sizeBytes: saved.sizeBytes,
+        contentType,
+        generatedAt,
+        itemCount: items.length,
+        gaps: model.gaps,
+        note:
+          "The pack indexes the evidence; it does not copy it. Each file stays in the register " +
+          "under its own hash, which is what a recipient needs in order to request and verify it. " +
+          "The sha256 above is in the hash-chained ledger, so what was submitted stays checkable.",
+      };
+    },
+  );
+
+  /** The stored bytes, never a fresh render — what it serves is what was hashed. */
+  app.get(
+    "/projects/:projectId/insurance/claims/:claimId/pack",
+    { preHandler: readGate },
+    async (req, reply) => {
+      const { claimId } = req.params as { claimId: string };
+      const claim = await fetchClaim(claimId, req.companyId!, req.projectId!);
+      if (!claim.packFileId) {
+        throw notFound(
+          "No documentation pack has been generated for this claim. Generate it first — this " +
+            "route returns the stored bytes so that what it serves is what was hashed.",
+        );
+      }
+      const [file] = await app.db
+        .select()
+        .from(files)
+        .where(and(eq(files.id, claim.packFileId), eq(files.companyId, req.companyId!)))
+        .limit(1);
+      if (!file) throw notFound("The stored pack is missing from the file register");
+      const chunks: Buffer[] = [];
+      for await (const chunk of app.storage.readStream(file.storageKey)) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
+      }
+      return reply
+        .header("content-type", file.contentType)
+        .header("x-document-sha256", file.sha256)
+        .send(Buffer.concat(chunks).toString("utf8"));
+    },
+  );
+
+  /**
+   * Raise a claim FROM a recorded loss (#787).
+   *
+   * The commonest way a notification deadline is missed is not delay, it is
+   * omission: the incident is recorded in the safety register and nobody
+   * connects it to a policy until the period has run. The aware date defaults
+   * to the date the incident was reported, because that is when the insured
+   * actually knew — not the date somebody got round to opening this page.
+   */
+  app.post(
+    "/projects/:projectId/insurance/claims/from-incident",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const body = z
+        .object({
+          incidentId: z.string().min(1).max(64),
+          policyId: z.string().min(1).max(64),
+          title: z.string().max(300).optional(),
+          awareDate: isoDateSchema.optional(),
+          reserve: z.number().finite().nonnegative().optional(),
+        })
+        .parse(req.body);
+      const [incident] = await app.db
+        .select()
+        .from(safetyIncidents)
+        .where(
+          and(
+            eq(safetyIncidents.id, body.incidentId),
+            eq(safetyIncidents.companyId, req.companyId!),
+            eq(safetyIncidents.projectId, req.projectId!),
+          ),
+        )
+        .limit(1);
+      if (!incident) throw notFound("Safety incident not found on this project");
+      const existing = await app.db
+        .select({ toId: recordLinks.fromId })
+        .from(recordLinks)
+        .where(
+          and(
+            eq(recordLinks.companyId, req.companyId!),
+            eq(recordLinks.fromType, "insurance_claim"),
+            eq(recordLinks.toType, "safety_incident"),
+            eq(recordLinks.toId, body.incidentId),
+          ),
+        )
+        .limit(1);
+      if (existing[0]) {
+        throw conflict(
+          `A claim has already been raised from incident ${incident.reference}. Raising a second ` +
+            "one would double the reserve against a single loss.",
+        );
+      }
+      const policy = await fetchPolicyForProject(body.policyId, req.companyId!, req.projectId!);
+      if (policy.status === "draft" || policy.status === "cancelled") {
+        throw badRequest(
+          `Policy ${policy.number} is ${policy.status} — record the policy that was actually on risk.`,
+        );
+      }
+      const incidentDate = (incident.occurredAt ?? "").slice(0, 10) || todayISO();
+      /* The clock runs from AWARENESS, and the insured was aware when the
+         incident was reported — not when somebody got round to opening this
+         page. Defaulting to today would silently buy back days the wording
+         does not give. */
+      const reported = (incident.reportedAt ?? incident.occurredAt ?? "").slice(0, 10);
+      const awareRaw = body.awareDate ?? (reported || incidentDate);
+      const created = await createClaim(req, {
+        policyId: policy.id,
+        title: body.title ?? `${incident.reference}: ${incident.title}`,
+        description: incident.description,
+        incidentDate,
+        awareDate: awareRaw < incidentDate ? incidentDate : awareRaw,
+        reserve: body.reserve ?? incident.estimatedCost ?? undefined,
+        linkedRecords: [
+          {
+            recordType: "safety_incident",
+            recordId: incident.id,
+            note: `Raised from ${incident.reference}`,
+          },
+        ],
+      });
+      return reply.status(201).send({
+        ...created,
+        raisedFrom: {
+          recordType: "safety_incident",
+          recordId: incident.id,
+          reference: incident.reference,
+          awareDateSource: body.awareDate
+            ? "supplied"
+            : reported
+              ? "incident report date"
+              : "incident date",
+        },
+      });
+    },
+  );
   /**
    * Write the claim's linked records as traversable links, de-duplicated.
    *

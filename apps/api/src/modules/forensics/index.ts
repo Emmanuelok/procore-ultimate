@@ -2639,13 +2639,25 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
         createdAt: forensicAnalyses.createdAt,
       })
       .from(forensicAnalyses)
-      .where(eq(forensicAnalyses.claimId, claimId))
+      .where(
+        and(
+          eq(forensicAnalyses.claimId, claimId),
+          eq(forensicAnalyses.companyId, req.companyId!),
+          eq(forensicAnalyses.projectId, req.projectId!),
+        ),
+      )
       .orderBy(desc(forensicAnalyses.createdAt))
       .limit(50);
     const quantum = await app.db
       .select()
       .from(quantumCalculations)
-      .where(eq(quantumCalculations.claimId, claimId))
+      .where(
+        and(
+          eq(quantumCalculations.claimId, claimId),
+          eq(quantumCalculations.companyId, req.companyId!),
+          eq(quantumCalculations.projectId, req.projectId!),
+        ),
+      )
       .orderBy(desc(quantumCalculations.createdAt))
       .limit(50);
     const disruption = await app.db
@@ -2659,7 +2671,13 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
         createdAt: disruptionAnalyses.createdAt,
       })
       .from(disruptionAnalyses)
-      .where(eq(disruptionAnalyses.claimId, claimId))
+      .where(
+        and(
+          eq(disruptionAnalyses.claimId, claimId),
+          eq(disruptionAnalyses.companyId, req.companyId!),
+          eq(disruptionAnalyses.projectId, req.projectId!),
+        ),
+      )
       .orderBy(desc(disruptionAnalyses.createdAt))
       .limit(50);
 
@@ -3397,19 +3415,37 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
     const analyses = await app.db
       .select()
       .from(forensicAnalyses)
-      .where(eq(forensicAnalyses.claimId, claimId))
+      .where(
+        and(
+          eq(forensicAnalyses.claimId, claimId),
+          eq(forensicAnalyses.companyId, req.companyId!),
+          eq(forensicAnalyses.projectId, req.projectId!),
+        ),
+      )
       .orderBy(asc(forensicAnalyses.createdAt))
       .limit(50);
     const quantum = await app.db
       .select()
       .from(quantumCalculations)
-      .where(eq(quantumCalculations.claimId, claimId))
+      .where(
+        and(
+          eq(quantumCalculations.claimId, claimId),
+          eq(quantumCalculations.companyId, req.companyId!),
+          eq(quantumCalculations.projectId, req.projectId!),
+        ),
+      )
       .orderBy(asc(quantumCalculations.createdAt))
       .limit(50);
     const disruption = await app.db
       .select()
       .from(disruptionAnalyses)
-      .where(eq(disruptionAnalyses.claimId, claimId))
+      .where(
+        and(
+          eq(disruptionAnalyses.claimId, claimId),
+          eq(disruptionAnalyses.companyId, req.companyId!),
+          eq(disruptionAnalyses.projectId, req.projectId!),
+        ),
+      )
       .orderBy(asc(disruptionAnalyses.createdAt))
       .limit(50);
     const missing: string[] = [];
@@ -3527,18 +3563,33 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
     const open = rows.filter((r) => !["agreed", "rejected", "withdrawn"].includes(r.status));
     const byCurrency = new Map<
       string,
-      { currency: string; claims: number; claimed: number; provision: number; unprovisioned: number }
+      {
+        currency: string;
+        claims: number;
+        claimed: number;
+        /** claims in this currency that carry no amount at all */
+        unpriced: number;
+        provision: number;
+        unprovisioned: number;
+      }
     >();
     for (const r of open) {
       const b = byCurrency.get(r.currency) ?? {
         currency: r.currency,
         claims: 0,
         claimed: 0,
+        unpriced: 0,
         provision: 0,
         unprovisioned: 0,
       };
       b.claims += 1;
-      b.claimed += r.amountClaimed ?? 0;
+      /*
+       * A claim with no amount claimed is NOT a claim worth nothing. It is
+       * counted apart so the total reads as "the sum of what has been priced",
+       * never as though the unpriced ones were zero.
+       */
+      if (r.amountClaimed !== null) b.claimed += r.amountClaimed;
+      else b.unpriced += 1;
       if (r.provisionAmount !== null) b.provision += r.provisionAmount;
       else b.unprovisioned += 1;
       byCurrency.set(r.currency, b);
@@ -3552,6 +3603,12 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
     const unvalued = open.filter((r) => r.quantumLikely === null || r.successProbability === null).length;
     if (unvalued > 0) {
       reasons.push(`${unvalued} open claim(s) have no valuation range or probability of success, so they carry no provision`);
+    }
+    const unpricedTotal = [...byCurrency.values()].reduce((n, b) => n + b.unpriced, 0);
+    if (unpricedTotal > 0) {
+      reasons.push(
+        `${unpricedTotal} open claim(s) carry no amount claimed — they are excluded from the totals rather than counted as zero`,
+      );
     }
 
     return {

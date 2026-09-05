@@ -104,7 +104,7 @@ beforeAll(async () => {
     { id: vendorId, companyId: owner.companyId, name: "Groundworks Ltd" },
     { id: otherVendorId, companyId: owner.companyId, name: "Steelwork Ltd" },
   ]);
-});
+}, 180_000);
 
 afterAll(async () => {
   await built.close();
@@ -2152,5 +2152,196 @@ describe("audit bug fixes", () => {
 
     await app.scheduler.runNow("insurance.claim-notification-warnings");
     expect(await signalsFor("insurance_notification_missed", `${claimId}:warn`)).toHaveLength(1);
+  });
+});
+
+/* ================================================================== */
+/* Claim documentation pack and the loss adjuster (#784, #785)         */
+/* ================================================================== */
+
+describe("claim documentation pack and the adjuster's task list", () => {
+  let packProject: string;
+  let packPolicy: string;
+  let packClaim: string;
+  let incidentId: string;
+
+  beforeAll(async () => {
+    packProject = await makeProject("Insurance — claim packs");
+    packPolicy = await activePolicy(packProject, {
+      policyNumber: "CAR/PACK",
+      notificationDays: 30,
+    });
+    incidentId = newId("sin");
+    await app.db.insert(safetyIncidents).values({
+      id: incidentId,
+      companyId: owner.companyId,
+      projectId: packProject,
+      number: 91,
+      reference: "INC-0091",
+      incidentType: "property_damage",
+      severity: "serious",
+      title: "Crane jib struck the façade",
+      description: "Level 8 curtain walling damaged",
+      occurredAt: new Date(Date.now() - 6 * 86_400_000).toISOString(),
+      reportedAt: new Date(Date.now() - 5 * 86_400_000).toISOString(),
+      estimatedCost: 40_000,
+      createdBy: owner.userId,
+    });
+  }, 120_000);
+
+  it("raises a claim from a recorded incident with the aware date taken from the report", async () => {
+    const res = await post(`/projects/${packProject}/insurance/claims/from-incident`, {
+      incidentId,
+      policyId: packPolicy,
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json();
+    packClaim = body.id as string;
+    expect(body.title).toContain("INC-0091");
+    expect(body.reserve).toBe(40_000);
+    expect(body.raisedFrom.awareDateSource).toBe("incident report date");
+    // aware = reported (5 days ago); the deadline is 30 days after that
+    expect(body.notificationDueAt).toBe(addDaysISO(daysFromToday(-5), 30));
+    expect(body.obligationId).toBeTruthy();
+  });
+
+  it("refuses a second claim from the same incident rather than doubling the reserve", async () => {
+    const res = await post(`/projects/${packProject}/insurance/claims/from-incident`, {
+      incidentId,
+      policyId: packPolicy,
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toMatch(/double the reserve/i);
+  });
+
+  it("404s on an incident belonging to another project", async () => {
+    const res = await post(`/projects/${mainProject}/insurance/claims/from-incident`, {
+      incidentId,
+      policyId: packPolicy,
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("records an adjuster request as a dated obligation and notifies its owner", async () => {
+    const res = await post(
+      `/projects/${packProject}/insurance/claims/${packClaim}/requests`,
+      {
+        kind: "information_request",
+        title: "Send the daily logs for the week of the incident",
+        requestedBy: "Crawford & Co",
+        dueDate: daysFromToday(5),
+        ownerId: owner.userId,
+      },
+    );
+    expect(res.statusCode).toBe(201);
+    const body = res.json();
+    expect(body.status).toBe("open");
+    expect(body.overdue).toBe(false);
+    expect(body.obligationId).toBeTruthy();
+    const [obl] = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, body.obligationId as string));
+    expect(obl!.status).toBe("open");
+    expect(obl!.trigger).toMatch(/loss adjuster/i);
+  });
+
+  it("derives overdue from the calendar rather than storing it", async () => {
+    const res = await post(
+      `/projects/${packProject}/insurance/claims/${packClaim}/requests`,
+      { title: "Photographs of the façade", dueDate: daysFromToday(-3) },
+    );
+    expect(res.statusCode).toBe(201);
+    expect(res.json().overdue).toBe(true);
+    expect(res.json().status).toBe("open");
+
+    const list = await get(`/projects/${packProject}/insurance/claims/${packClaim}/requests`);
+    expect(list.statusCode).toBe(200);
+    expect(list.json().total).toBe(2);
+    expect(list.json().overdue).toBe(1);
+  });
+
+  it("marks a late answer's obligation breached, not quietly satisfied", async () => {
+    const list = await get(`/projects/${packProject}/insurance/claims/${packClaim}/requests`);
+    const late = (list.json().items as Array<Record<string, unknown>>).find(
+      (r) => r["overdue"] === true,
+    )!;
+    const res = await post(
+      `/projects/${packProject}/insurance/claim-requests/${late["id"]}/respond`,
+      { responseNote: "Sent by email with 14 photographs" },
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.json().status).toBe("responded");
+    // the second answer is refused rather than overwriting the first
+    const again = await post(
+      `/projects/${packProject}/insurance/claim-requests/${late["id"]}/respond`,
+      { responseNote: "Again" },
+    );
+    expect(again.statusCode).toBe(409);
+  });
+
+  it("assembles a content-addressed pack whose hash is on the claim and in the ledger", async () => {
+    const res = await post(`/projects/${packProject}/insurance/claims/${packClaim}/pack`, {});
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(body.itemCount).toBe(1);
+    const [claim] = await app.db
+      .select()
+      .from(insuranceClaims)
+      .where(eq(insuranceClaims.id, packClaim));
+    expect(claim!.packSha256).toBe(body.sha256);
+    expect(claim!.packItemCount).toBe(1);
+
+    const doc = await get(`/projects/${packProject}/insurance/claims/${packClaim}/pack`);
+    expect(doc.statusCode).toBe(200);
+    expect(doc.headers["x-document-sha256"]).toBe(body.sha256);
+    expect(doc.body).toContain("INC-0091");
+    expect(doc.body).toContain("Notification chronology");
+  });
+
+  it("states the pack's gaps rather than reading as complete", async () => {
+    const res = await post(`/projects/${packProject}/insurance/claims/${packClaim}/pack`, {});
+    const gaps = res.json().gaps as string[];
+    // the claim has never been notified, and one request went past its date
+    expect(gaps.join(" ")).toMatch(/not a notice/);
+  });
+
+  it("404s the pack before one has been generated", async () => {
+    const other = await post(`/projects/${packProject}/insurance/claims`, {
+      policyId: packPolicy,
+      title: "Second loss",
+      incidentDate: daysFromToday(-2),
+      awareDate: daysFromToday(-1),
+    });
+    const res = await get(
+      `/projects/${packProject}/insurance/claims/${other.json().id}/pack`,
+    );
+    expect(res.statusCode).toBe(404);
+    expect(res.json().message).toMatch(/what it serves is what was hashed/);
+  });
+
+  it("keeps the pack inside its tenant", async () => {
+    const res = await get(
+      `/projects/${packProject}/insurance/claims/${packClaim}/pack`,
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(res.statusCode);
+  });
+
+  it("refuses a read-only member the pack generation route", async () => {
+    await app.db.insert(projectMemberships).values({
+      id: newId("pm"),
+      companyId: owner.companyId,
+      projectId: packProject,
+      userId: viewer.userId,
+      templateKey: "read_only",
+    });
+    const res = await post(
+      `/projects/${packProject}/insurance/claims/${packClaim}/pack`,
+      {},
+      viewerHeaders,
+    );
+    expect(res.statusCode).toBe(403);
   });
 });

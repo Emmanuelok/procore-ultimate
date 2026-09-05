@@ -1842,6 +1842,9 @@ export interface ProductivityLine {
   unit: string | null;
   actualHours: number;
   installedQuantity: number | null;
+  /** whether the quantity was MEASURED in the field or asserted on the
+   *  timesheet that claimed the hours — the two are never added together */
+  quantitySource: "field_progress" | "timecard_allocation" | "none";
   plannedUnitRate: number | null;
   achievedUnitRate: number | null;
   earnedHours: number | null;
@@ -1895,6 +1898,37 @@ export interface ProductivityReport {
   reasons: string[];
   method: string;
   thresholds: { floor: number; minWeeks: number };
+}
+
+/** A field measurement of installed quantity — the independent side of the
+ *  productivity ratio. */
+export interface ProgressEntry {
+  id: string;
+  progressDate: string;
+  costCodeId: string | null;
+  costCode: string | null;
+  budgetLineItemId: string | null;
+  crewId: string | null;
+  quantity: number;
+  unit: string;
+  method: string;
+  notes: string | null;
+  recordedBy: string;
+  verifiedBy: string | null;
+  verifiedAt: string | null;
+}
+
+export function useProgressEntries(
+  projectId: string | undefined,
+  from: string,
+  to: string,
+  enabled: boolean,
+): Loadable<ListResponse<ProgressEntry>> {
+  return useResource<ListResponse<ProgressEntry>>(
+    enabled && projectId
+      ? `/api/v1/projects/${projectId}/labour-progress?from=${from}&to=${to}&page=1&pageSize=100`
+      : null,
+  );
 }
 
 /** The productivity report over a window, or null while it is not asked for. */

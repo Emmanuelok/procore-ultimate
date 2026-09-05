@@ -5,7 +5,7 @@
  * with the reason attached to each — so a supervisor sees WHY a permit cannot
  * go active before they try.
  */
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { toast } from "sonner";
 import { Alert, Badge, Button, Card, CardBody, Drawer, Field, Input, Select, Textarea } from "../../ui";
 import { DataTable, type DataColumns } from "../../ui/data";
@@ -361,14 +361,22 @@ function PermitDrawer({
   const action = useAction();
   const [entryName, setEntryName] = useState("");
   const [entryMinutes, setEntryMinutes] = useState("30");
+  // What the issuer has ticked in this drawer, keyed by precaution. Nothing is
+  // ticked on their behalf: the whole point of the control is that a person
+  // confirms each precaution is actually in place before the permit goes live.
+  const [ticked, setTicked] = useState<Record<string, boolean>>({});
   const p = detail.data;
+
+  useEffect(() => {
+    setTicked({});
+  }, [permitId]);
 
   async function transition(kind: string) {
     const needsReason = kind === "reject" || kind === "suspend";
     const reason = needsReason ? window.prompt(`Why is this permit being ${kind === "reject" ? "rejected" : "suspended"}?`) : undefined;
     if (needsReason && !reason) return;
     const body: Record<string, unknown> = reason ? { reason } : {};
-    if (kind === "activate" && p) body["precautions"] = p.precautions.map((x) => ({ ...x, done: true }));
+    if (kind === "activate" && p) body["precautions"] = p.precautions.map((x) => ({ ...x, done: ticked[x.item] ?? x.done }));
     const r = await action.run(kind, () => api.post<PermitRow>(`${base}/permits/${permitId}/${kind}`, body));
     if (r) {
       toast.success(`${r.reference} is now ${labelize(r.status).toLowerCase()}`);
@@ -468,20 +476,34 @@ function PermitDrawer({
           ) : null}
 
           <div>
-            <SectionHeading title="Precautions" hint="Required precautions must all be ticked before the permit goes active." />
+            <SectionHeading
+              title="Precautions"
+              hint="Tick each one you have confirmed on site. Every required precaution must be ticked before the permit can go active — the platform will not tick them for you."
+            />
             <ul className="space-y-1 text-meta">
               {p.precautions.length === 0 ? <li className="text-content-muted">None recorded.</li> : null}
-              {p.precautions.map((c, i) => (
-                <li key={i} className="flex items-center justify-between gap-2 rounded-md border border-border-subtle px-3 py-1.5">
-                  <span className="text-content">{c.item}</span>
-                  <span className="flex gap-1">
-                    {c.required ? <Badge tone="neutral" size="xs">required</Badge> : <Badge tone="neutral" size="xs">advisory</Badge>}
-                    <Badge tone={c.done ? "success" : "warning"} size="xs">
-                      {c.done ? "done" : "outstanding"}
-                    </Badge>
-                  </span>
-                </li>
-              ))}
+              {p.precautions.map((c, i) => {
+                const isDone = ticked[c.item] ?? c.done;
+                return (
+                  <li key={i} className="flex items-center justify-between gap-2 rounded-md border border-border-subtle px-3 py-1.5">
+                    <label className="flex flex-1 items-center gap-2">
+                      <input
+                        type="checkbox"
+                        className="size-3.5 accent-accent-solid"
+                        checked={isDone}
+                        onChange={(e) => setTicked((current) => ({ ...current, [c.item]: e.target.checked }))}
+                      />
+                      <span className="text-content">{c.item}</span>
+                    </label>
+                    <span className="flex gap-1">
+                      {c.required ? <Badge tone="neutral" size="xs">required</Badge> : <Badge tone="neutral" size="xs">advisory</Badge>}
+                      <Badge tone={isDone ? "success" : "warning"} size="xs">
+                        {isDone ? "done" : "outstanding"}
+                      </Badge>
+                    </span>
+                  </li>
+                );
+              })}
             </ul>
           </div>
 

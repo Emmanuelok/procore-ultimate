@@ -4,6 +4,7 @@ import {
   detectProductivityDeviation,
   type ProductivityAllocation,
   type ProductivityBudgetLine,
+  type ProductivityProgress,
 } from "./productivity.js";
 
 const line = (over: Partial<ProductivityBudgetLine> = {}): ProductivityBudgetLine => ({
@@ -109,6 +110,111 @@ describe("computeProductivity", () => {
     const b = out.crews.find((c) => c.crewId === "crw_2")!;
     expect(a.productivityFactor).toBe(1);
     expect(b.productivityFactor).toBe(0.6);
+  });
+});
+
+describe("field progress supersedes the quantity the timesheet asserted", () => {
+  const progress = (over: Partial<ProductivityProgress> = {}): ProductivityProgress => ({
+    budgetLineItemId: "bli_1",
+    costCodeId: "cc_1",
+    progressDate: "2026-03-02",
+    crewId: "crw_1",
+    crewName: "Concrete gang",
+    quantity: 10,
+    unit: "m3",
+    ...over,
+  });
+
+  it("earns from the measurement and does NOT add the timesheet quantity to it", () => {
+    // The card claims 20 m3 for its own 40 hours; the field measured 10.
+    const out = computeProductivity([alloc({ hours: 40, quantity: 20 })], [line()], {
+      progress: [progress({ quantity: 10 })],
+    });
+    const l = out.lines[0]!;
+    expect(l.quantitySource).toBe("field_progress");
+    expect(l.installedQuantity).toBe(10); // not 30, and not 20
+    expect(l.earnedHours).toBe(20); // 10 m3 × 2 h/m3
+    expect(l.productivityFactor).toBe(0.5);
+    expect(l.reasons.join(" ")).toContain("deliberately NOT added");
+  });
+
+  it("names the timesheet as the source when nobody measured anything", () => {
+    const out = computeProductivity([alloc()], [line()]);
+    expect(out.lines[0]!.quantitySource).toBe("timecard_allocation");
+    expect(out.lines[0]!.reasons.join(" ")).toContain("the same person stated the hours");
+  });
+
+  it("makes a line measurable that carried no quantity on its cards at all", () => {
+    const out = computeProductivity([alloc({ quantity: null })], [line()], {
+      progress: [progress({ quantity: 20 })],
+    });
+    expect(out.lines[0]!.installedQuantity).toBe(20);
+    expect(out.lines[0]!.earnedHours).toBe(40);
+    expect(out.lines[0]!.productivityFactor).toBe(1);
+  });
+
+  it("earns a week from the measurement made in that week, not the hours' own claim", () => {
+    const out = computeProductivity(
+      [
+        alloc({ workDate: "2026-03-02", hours: 40, quantity: 20 }),
+        alloc({ workDate: "2026-03-09", hours: 40, quantity: 20 }),
+      ],
+      [line()],
+      {
+        progress: [
+          progress({ progressDate: "2026-03-03", quantity: 20 }),
+          progress({ progressDate: "2026-03-10", quantity: 10 }),
+        ],
+      },
+    );
+    expect(out.weeks.map((w) => w.weekStart)).toEqual(["2026-03-02", "2026-03-09"]);
+    expect(out.weeks[0]!.productivityFactor).toBe(1);
+    expect(out.weeks[1]!.productivityFactor).toBe(0.5);
+  });
+
+  it("reports a week nobody measured as UNKNOWN, never as a factor of zero", () => {
+    const out = computeProductivity(
+      [
+        alloc({ workDate: "2026-03-02", hours: 40, quantity: 20 }),
+        alloc({ workDate: "2026-03-09", hours: 40, quantity: 20 }),
+      ],
+      [line()],
+      { progress: [progress({ progressDate: "2026-03-03", quantity: 20 })] },
+    );
+    const second = out.weeks.find((w) => w.weekStart === "2026-03-09")!;
+    expect(second.actualHours).toBe(40);
+    expect(second.productivityFactor).toBeNull();
+    expect(second.earnedHours).toBeNull();
+  });
+
+  it("abstains on the crew comparison when the measurement names no crew", () => {
+    const out = computeProductivity([alloc({ hours: 40, quantity: 20 })], [line()], {
+      progress: [progress({ crewId: null, quantity: 20 })],
+    });
+    const gang = out.crews.find((c) => c.crewId === "crw_1")!;
+    expect(gang.actualHours).toBe(40);
+    expect(gang.productivityFactor).toBeNull();
+  });
+
+  it("does not forecast a line at zero hours when only the quantity has landed", () => {
+    // Progress measured on a line nobody has coded hours to yet: 0 hours ÷ a
+    // real quantity is not "infinitely productive", it is not measurable.
+    const out = computeProductivity([], [line()], { progress: [progress({ quantity: 20 })] });
+    const l = out.lines[0]!;
+    expect(l.actualHours).toBe(0);
+    expect(l.installedQuantity).toBe(20);
+    expect(l.earnedHours).toBe(40);
+    expect(l.achievedUnitRate).toBeNull();
+    expect(l.forecastHoursAtCompletion).toBeNull();
+    expect(l.productivityFactor).toBeNull();
+    expect(l.reasons.join(" ")).toContain("no hours are coded to it");
+  });
+
+  it("says so when a measurement is coded to nothing", () => {
+    const out = computeProductivity([alloc()], [line()], {
+      progress: [progress({ budgetLineItemId: null })],
+    });
+    expect(out.reasons.join(" ")).toContain("no budget line");
   });
 });
 

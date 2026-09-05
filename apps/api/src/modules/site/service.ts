@@ -1368,6 +1368,8 @@ export interface SiteSummary {
   register: {
     headcount: number;
     windowFrom: string;
+    /** gate reads folded to produce this register — 0 means no feed, not an empty site */
+    eventsConsidered: number;
     overstays: number;
     anomalies: number;
     refusedEvents: number;
@@ -1557,6 +1559,7 @@ export async function siteSummary(
     register: {
       headcount: register.headcount,
       windowFrom: register.windowFrom,
+      eventsConsidered: register.eventsConsidered,
       overstays: register.overstays.length,
       anomalies: register.anomalyCount,
       refusedEvents: register.refusedEvents,
@@ -1639,7 +1642,10 @@ export async function siteHealthInputs(
 ): Promise<HealthInputs> {
   const summary = await siteSummary(db, companyId, projectId, asOf);
   const reasons: string[] = [...summary.register.reasons];
-  const hasGateFeed = summary.register.headcount > 0 || summary.register.refusedEvents > 0 || summary.register.anomalies > 0;
+  // A feed exists when reads were folded, NOT when somebody is still inside:
+  // a site everybody has gone home from has a headcount of 0, and reporting
+  // that as "unknown, there is no gate feed" would be a false reason.
+  const hasGateFeed = summary.register.eventsConsidered > 0;
 
   const metrics: Record<string, number | null> = {
     siteHeadcount: hasGateFeed ? summary.register.headcount : null,
@@ -1661,7 +1667,9 @@ export async function siteHealthInputs(
   };
 
   if (!hasGateFeed) {
-    reasons.push("Headcount and overstay figures are not available: this project has no gate feed.");
+    reasons.push(
+      "Headcount and overstay figures are not available: this project has no gate feed to fold — no read at all was recorded inside the register window.",
+    );
   }
   if (summary.progress.observations === 0) {
     reasons.push("No independent progress observation has been recorded, so claimed progress is untested here.");

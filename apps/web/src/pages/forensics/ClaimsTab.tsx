@@ -8,6 +8,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 import { CLAIM_KINDS } from "@constructos/shared";
 import { api, ApiClientError } from "../../lib/api";
 import {
+  Alert,
   Badge,
   Button,
   EmptyState,
@@ -77,6 +78,8 @@ export default function ClaimsTab({
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [error, setError] = useState<string | null>(null);
+  /** bumped on every successful list load so the exposure strip refollows it */
+  const [exposureKey, setExposureKey] = useState(0);
 
   const load = useCallback(async () => {
     setError(null);
@@ -85,6 +88,7 @@ export default function ClaimsTab({
       const res = await api.get<ListResponse<ClaimRow>>(`${base}/claims?${params}`);
       setItems(res.items);
       setTotal(res.total);
+      setExposureKey((k) => k + 1);
     } catch (err) {
       setItems([]);
       setError(err instanceof Error ? err.message : "Failed to load claims");
@@ -434,6 +438,8 @@ export default function ClaimsTab({
       </div>
 
       <ErrorAlert message={error} />
+
+      <ExposureStrip projectId={projectId} reloadKey={exposureKey} />
 
       {items === null ? (
         <Spinner />
@@ -1109,6 +1115,119 @@ export default function ClaimsTab({
           </div>
         </form>
       </Modal>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Exposure strip (#313, #320)                                         */
+/* ------------------------------------------------------------------ */
+
+interface ExposureBucket {
+  currency: string;
+  claims: number;
+  claimed: number;
+  /** claims in this currency with no amount claimed — excluded from `claimed` */
+  unpriced: number;
+  provision: number;
+  unprovisioned: number;
+}
+
+interface ExposureResponse {
+  generatedAt: string;
+  openClaims: number;
+  totalClaims: number;
+  byCurrency: ExposureBucket[];
+  reasons: string[];
+}
+
+/**
+ * Open claim exposure and the provision carried against it, per currency.
+ *
+ * Reads the company-level endpoint narrowed to this project, so the figure a
+ * commercial manager sees here is the same figure that rolls into the
+ * portfolio. Currencies are never added together and a claim with no
+ * valuation range is counted as unprovisioned rather than as zero exposure.
+ */
+function ExposureStrip({ projectId, reloadKey }: { projectId: string; reloadKey: number }) {
+  const [data, setData] = useState<ExposureResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setError(null);
+    api
+      .get<ExposureResponse>(`/api/v1/claims/exposure?projectId=${encodeURIComponent(projectId)}`)
+      .then((res) => {
+        if (!cancelled) setData(res);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        /*
+         * The endpoint is company-level and narrows to the projects the caller
+         * can see. A reader who holds the forensics tool on this project but
+         * no company-wide visibility gets a 403; that is not an error worth
+         * shouting about on a page they may legitimately read, so the strip
+         * simply does not appear.
+         */
+        if (err instanceof ApiClientError && (err.status === 403 || err.status === 404)) return;
+        setError(
+          err instanceof ApiClientError ? err.message : "Claim exposure could not be loaded.",
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, reloadKey]);
+
+  if (error) {
+    return (
+      <Alert tone="warning" title="Exposure unavailable" className="mb-4">
+        {error}
+      </Alert>
+    );
+  }
+  if (!data || data.openClaims === 0) return null;
+
+  return (
+    <div className="mb-4 rounded border border-ink-200 bg-ink-50/40 p-3">
+      <SectionTitle>
+        Open exposure — {data.openClaims} of {data.totalClaims} claim
+        {data.totalClaims === 1 ? "" : "s"}
+      </SectionTitle>
+      <div className="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+        {data.byCurrency.map((b) => (
+          <div key={b.currency} className="rounded border border-ink-200 bg-white p-3">
+            <div className="flex items-baseline justify-between">
+              <span className="font-mono text-xs uppercase text-ink-500">{b.currency}</span>
+              <span className="text-xs text-ink-500">
+                {b.claims} claim{b.claims === 1 ? "" : "s"}
+              </span>
+            </div>
+            <div className="mt-1 text-lg font-semibold tabular-nums text-ink-900">
+              {formatMoney(b.claimed, b.currency)}
+            </div>
+            <div className="mt-1 text-xs text-ink-500">
+              Provision {formatMoney(b.provision, b.currency)}
+              {b.unprovisioned > 0 ? (
+                <span className="text-amber-700"> · {b.unprovisioned} unvalued</span>
+              ) : null}
+            </div>
+            {b.unpriced > 0 ? (
+              <div className="mt-1 text-xs text-amber-700">
+                {b.unpriced} claim{b.unpriced === 1 ? "" : "s"} carry no amount — not counted above
+              </div>
+            ) : null}
+          </div>
+        ))}
+      </div>
+      {data.reasons.length > 0 ? (
+        <ul className="mt-2 list-disc pl-5 text-xs text-ink-500">
+          {data.reasons.map((r) => (
+            <li key={r}>{r}</li>
+          ))}
+        </ul>
+      ) : null}
     </div>
   );
 }

@@ -10,6 +10,7 @@ import { and, eq } from "drizzle-orm";
 import {
   budgetLineItems,
   budgets,
+  changeEvents,
   companyMemberships,
   costCodes,
   crewMembers,
@@ -510,6 +511,57 @@ describe("regressions", () => {
     expect(res.statusCode).toBe(400);
   });
 
+  /*
+   * The PCO precondition used to be checked AFTER the change event was
+   * inserted, so every refused promote left another orphan CE-nnn row behind
+   * and the ticket was never stamped. Two refusals must leave the register
+   * exactly as it was, and the fallback must still preserve the entitlement.
+   */
+  it("leaves no orphan change event behind when a PCO promote is refused", async () => {
+    const ticket = await post(`/projects/${projectId}/tm-tickets`, {
+      title: "Hand-dig around live services",
+      ticketDate: day(43),
+      currency: "GBP",
+      rateBasis: "to_be_agreed",
+      lines: [{ lineKind: "labour", description: "Two labourers", hours: 16, rate: null }],
+    });
+    expect(ticket.statusCode).toBe(201);
+    const ticketId = ticket.json().id as string;
+    await post(`/projects/${projectId}/tm-tickets/${ticketId}/sign`, {
+      outcome: "signed",
+      signedByName: "R. Bell",
+      signedByRole: "Resident Engineer",
+      signedByOrganisation: "Owner's Representative",
+      signatureMethod: "on_device",
+    });
+
+    const before = await app.db
+      .select({ id: changeEvents.id })
+      .from(changeEvents)
+      .where(eq(changeEvents.projectId, projectId));
+
+    for (const _attempt of [1, 2]) {
+      const refused = await post(`/projects/${projectId}/tm-tickets/${ticketId}/promote`, {
+        target: "potential_change_order",
+      });
+      expect(refused.statusCode).toBe(409);
+    }
+
+    const after = await app.db
+      .select({ id: changeEvents.id })
+      .from(changeEvents)
+      .where(eq(changeEvents.projectId, projectId));
+    expect(after.length).toBe(before.length);
+
+    // and the entitlement is still reachable through the change-event path,
+    // which DOES stamp the ticket.
+    const asEvent = await post(`/projects/${projectId}/tm-tickets/${ticketId}/promote`, {
+      target: "change_event",
+    });
+    expect(asEvent.statusCode).toBe(201);
+    expect(asEvent.json().ticket.incorporatedChangeOrderId).toBe(asEvent.json().changeEvent.id);
+  });
+
   it("does not price a sourced labour line at the worker's internal pay rate", async () => {
     const card = await makeCard(workerIds[0]!, day(42), 8);
     const allocations = await app.db
@@ -695,6 +747,111 @@ describe("labour cost onto the budget", () => {
       .from(budgetLineItems)
       .where(eq(budgetLineItems.id, budgetLineId));
     expect(after?.directCosts).toBe(first);
+  });
+});
+
+/* ================================================================== */
+/* Field progress — the independent side of the productivity ratio     */
+/* ================================================================== */
+
+describe("field progress", () => {
+  it("refuses a measurement coded to nothing", async () => {
+    const res = await post(`/projects/${projectId}/labour-progress`, {
+      progressDate: day(70),
+      quantity: 10,
+      unit: "m3",
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("cannot be earned against anything");
+  });
+
+  it("refuses a unit the budget line is not measured in, rather than converting it", async () => {
+    const res = await post(`/projects/${projectId}/labour-progress`, {
+      progressDate: day(70),
+      quantity: 10,
+      unit: "m2",
+      budgetLineItemId: budgetLineId,
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("never converted here");
+  });
+
+  it("records a measurement and lets the report earn hours from it", async () => {
+    await makeCard(workerIds[0]!, day(71), 8);
+    const created = await post(`/projects/${projectId}/labour-progress`, {
+      progressDate: day(71),
+      quantity: 4,
+      unit: "m3",
+      budgetLineItemId: budgetLineId,
+      costCodeId,
+      crewId,
+      method: "field_measure",
+    });
+    expect(created.statusCode).toBe(201);
+    expect(created.json().verifiedBy).toBeNull();
+
+    const report = await get(
+      `/projects/${projectId}/labour-productivity?from=${day(71)}&to=${day(71)}`,
+    );
+    expect(report.statusCode).toBe(200);
+    const line = (report.json().lines as Array<{
+      budgetLineItemId: string;
+      quantitySource: string;
+      installedQuantity: number | null;
+    }>).find((l) => l.budgetLineItemId === budgetLineId)!;
+    expect(line.quantitySource).toBe("field_progress");
+    expect(line.installedQuantity).toBe(4);
+    expect((report.json().reasons as string[]).join(" ")).toContain("not been countersigned");
+  });
+
+  it("refuses to let the person who measured it countersign their own measurement", async () => {
+    const created = await post(`/projects/${projectId}/labour-progress`, {
+      progressDate: day(72),
+      quantity: 3,
+      unit: "m3",
+      budgetLineItemId: budgetLineId,
+    });
+    const id = created.json().id as string;
+    const own = await post(`/projects/${projectId}/labour-progress/${id}/verify`, {});
+    expect(own.statusCode).toBe(403);
+    expect(own.json().message).toContain("ADR 0004");
+
+    const other = await post(
+      `/projects/${projectId}/labour-progress/${id}/verify`,
+      { note: "walked it with the sub" },
+      approver.headers,
+    );
+    expect(other.statusCode).toBe(200);
+    const again = await post(
+      `/projects/${projectId}/labour-progress/${id}/verify`,
+      {},
+      approver.headers,
+    );
+    expect(again.statusCode).toBe(409);
+  });
+
+  it("lists the register and filters it to the unverified", async () => {
+    const all = await get(`/projects/${projectId}/labour-progress?from=${day(70)}&to=${day(73)}`);
+    expect(all.statusCode).toBe(200);
+    expect(all.json().total).toBeGreaterThanOrEqual(2);
+    const unverified = await get(
+      `/projects/${projectId}/labour-progress?from=${day(70)}&to=${day(73)}&unverifiedOnly=true`,
+    );
+    expect(unverified.json().items.every((r: { verifiedBy: string | null }) => !r.verifiedBy)).toBe(
+      true,
+    );
+  });
+
+  it("keeps another company out of the progress register", async () => {
+    const stranger = await registerActor(app);
+    const read = await get(`/projects/${projectId}/labour-progress`, stranger.headers);
+    expect(read.statusCode).toBe(403);
+    const write = await post(
+      `/projects/${projectId}/labour-progress`,
+      { progressDate: day(70), quantity: 1, unit: "m3", budgetLineItemId: budgetLineId },
+      stranger.headers,
+    );
+    expect(write.statusCode).toBe(403);
   });
 });
 

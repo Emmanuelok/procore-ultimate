@@ -34,12 +34,15 @@ import {
   DeviceMapModal,
   MaintenanceRecordModal,
   MaintenanceScheduleModal,
+  MaterialItemModal,
   OffHireModal,
   ReadingModal,
   ReceiveDeliveryModal,
   RegisterPlantModal,
   StockMovementModal,
   UtilisationModal,
+  VerifyModal,
+  type VerifyTarget,
 } from "./EquipmentForms";
 import EquipmentDrawer from "./EquipmentDrawer";
 import IdleTab from "./IdleTab";
@@ -137,8 +140,17 @@ export default function EquipmentPage() {
     | "receive"
     | "offhire"
     | "assignment"
+    | "material"
+    | "verify"
+    | "editMachine"
     | null
   >(null);
+  /** what the VerifyModal is about to countersign, and which record */
+  const [verify, setVerify] = useState<{
+    target: VerifyTarget;
+    id: string;
+    label: string | null;
+  } | null>(null);
   /** which assignment transition the AssignmentActionModal is running */
   const [assignmentAction, setAssignmentAction] = useState<
     "approve" | "mobilise" | "demobilise" | "cancel" | "transfer" | null
@@ -311,6 +323,9 @@ export default function EquipmentPage() {
             ) : null}
             {tab === "materials" ? (
               <>
+                <Button size="sm" variant="secondary" onClick={() => setForm("material")}>
+                  Add a material
+                </Button>
                 <Button size="sm" variant="secondary" onClick={() => setForm("delivery")}>
                   Book a delivery
                 </Button>
@@ -341,12 +356,33 @@ export default function EquipmentPage() {
             ) : null}
             {openMachine ? (
               <>
+                <Button size="sm" variant="secondary" onClick={() => setForm("editMachine")}>
+                  Edit machine
+                </Button>
                 <Button size="sm" variant="secondary" onClick={() => setForm("reading")}>
                   Add a reading
                 </Button>
                 <Button size="sm" variant="secondary" onClick={() => setForm("offhire")}>
                   Off-hire
                 </Button>
+                {machineDetail.data && !machineDetail.data.verifiedAt ? (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => {
+                      setVerify({
+                        target: "equipment",
+                        id: openMachine,
+                        label: `${machineDetail.data?.reference ?? openMachine} · ${
+                          machineDetail.data?.name ?? ""
+                        }`.trim(),
+                      });
+                      setForm("verify");
+                    }}
+                  >
+                    Accept machine
+                  </Button>
+                ) : null}
               </>
             ) : null}
             {tab === "utilisation" || tab === "idle" ? (
@@ -423,6 +459,10 @@ export default function EquipmentPage() {
           inServiceOnly={inServiceOnly}
           onInServiceOnly={setInServiceOnly}
           onOpenMachine={openMachineDrawer}
+          onVerify={(certificateId, label) => {
+            setVerify({ target: "certificate", id: certificateId, label });
+            setForm("verify");
+          }}
         />
       ) : tab === "maintenance" ? (
         <MaintenanceTab
@@ -439,6 +479,10 @@ export default function EquipmentPage() {
           windowDays={utilisationDays}
           onWindowDays={setUtilisationDays}
           onOpenMachine={openMachineDrawer}
+          onVerify={(utilisationId, label) => {
+            setVerify({ target: "utilisation", id: utilisationId, label });
+            setForm("verify");
+          }}
         />
       ) : tab === "telematics" ? (
         <TelematicsTab
@@ -462,6 +506,14 @@ export default function EquipmentPage() {
           deliveryDetail={deliveryDetail}
           supply={supply}
           scorecard={scorecard}
+          onVerifyDelivery={(id, label) => {
+            setVerify({ target: "delivery", id, label });
+            setForm("verify");
+          }}
+          onVerifyMovement={(id, label) => {
+            setVerify({ target: "movement", id, label });
+            setForm("verify");
+          }}
         />
       )}
 
@@ -471,10 +523,13 @@ export default function EquipmentPage() {
         onClose={() => openMachineDrawer(null)}
       />
 
+      {/* keyed so the edit form re-seeds when a different machine is opened */}
       <RegisterPlantModal
-        open={form === "register"}
+        key={form === "editMachine" ? (openMachine ?? "edit") : "new"}
+        open={form === "register" || form === "editMachine"}
         onClose={() => setForm(null)}
         onDone={refresh}
+        machine={form === "editMachine" ? machineDetail.data : null}
       />
       <AssignPlantModal
         open={form === "assign"}
@@ -561,6 +616,24 @@ export default function EquipmentPage() {
           delivery={deliveryDetail.data}
         />
       ) : null}
+      <MaterialItemModal
+        open={form === "material"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        projectId={projectId}
+      />
+      <VerifyModal
+        open={form === "verify"}
+        onClose={() => {
+          setForm(null);
+          setVerify(null);
+        }}
+        onDone={refresh}
+        projectId={projectId}
+        target={verify?.target ?? null}
+        recordId={verify?.id ?? null}
+        recordLabel={verify?.label ?? null}
+      />
       <AssignmentActionModal
         open={form === "assignment"}
         action={assignmentAction}

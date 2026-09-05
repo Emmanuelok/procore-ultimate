@@ -484,6 +484,13 @@ export default function SchedulePage() {
   const [lookaheadLoading, setLookaheadLoading] = useState(false);
   const [quality, setQuality] = useState<QualityReport | null>(null);
   const [qualityLoading, setQualityLoading] = useState(false);
+  /**
+   * Which baseline BEI, missed tasks and the critical-path test are measured
+   * against. Empty = the earliest baseline, which is what the API picks when
+   * no id is given; naming it here lets a planner test the programme against
+   * a re-baselined position instead of the original contract programme.
+   */
+  const [qualityBaselineId, setQualityBaselineId] = useState("");
 
   const bump = useCallback(() => setVersion((v) => v + 1), []);
 
@@ -552,6 +559,9 @@ export default function SchedulePage() {
   }, [base, selectedId, version]);
 
   useEffect(() => {
+    // A baseline belongs to one programme; carrying the selection across would
+    // ask the server for a baseline of a schedule it does not belong to.
+    setQualityBaselineId("");
     if (!selectedId) {
       setBaselines(null);
       return;
@@ -628,8 +638,9 @@ export default function SchedulePage() {
     if (!selectedId || panel !== "health") return;
     let cancelled = false;
     setQualityLoading(true);
+    const qs = qualityBaselineId ? `?baselineId=${encodeURIComponent(qualityBaselineId)}` : "";
     api
-      .get<QualityReport>(`${base}/schedules/${selectedId}/quality`)
+      .get<QualityReport>(`${base}/schedules/${selectedId}/quality${qs}`)
       .then((res) => {
         if (!cancelled) setQuality(res);
       })
@@ -642,7 +653,7 @@ export default function SchedulePage() {
     return () => {
       cancelled = true;
     };
-  }, [base, selectedId, panel, version]);
+  }, [base, selectedId, panel, version, qualityBaselineId]);
 
   /* ------------------------------ derived ------------------------------ */
 
@@ -1574,16 +1585,41 @@ export default function SchedulePage() {
 
               {/* ------------------------------ health ------------------------------ */}
               {panel === "health" ? (
-                <QualityPanel
-                  report={quality}
-                  loading={qualityLoading}
-                  tasks={tasks}
-                  deps={deps}
-                  onSelectTask={(id) => {
-                    setSelectedTaskId(id);
-                    setExpandedTaskId(id);
-                  }}
-                />
+                <>
+                  {baselines && baselines.length > 1 ? (
+                    <div className="mb-3 flex items-center gap-2">
+                      <label
+                        htmlFor="quality-baseline"
+                        className="text-xs font-medium text-ink-600"
+                      >
+                        Measure BEI and missed tasks against
+                      </label>
+                      <Select
+                        id="quality-baseline"
+                        value={qualityBaselineId}
+                        onChange={(e) => setQualityBaselineId(e.target.value)}
+                        className="w-64 py-1 text-xs"
+                      >
+                        <option value="">Earliest baseline</option>
+                        {baselines.map((b) => (
+                          <option key={b.id} value={b.id}>
+                            {b.name}
+                          </option>
+                        ))}
+                      </Select>
+                    </div>
+                  ) : null}
+                  <QualityPanel
+                    report={quality}
+                    loading={qualityLoading}
+                    tasks={tasks}
+                    deps={deps}
+                    onSelectTask={(id) => {
+                      setSelectedTaskId(id);
+                      setExpandedTaskId(id);
+                    }}
+                  />
+                </>
               ) : null}
 
               {panel === "revisions" ? (

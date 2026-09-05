@@ -139,36 +139,50 @@ export function RegisterPlantModal({
   open,
   onClose,
   onDone,
+  machine,
 }: {
   open: boolean;
   onClose: () => void;
   onDone: () => void;
+  /** when supplied the form EDITS that machine instead of registering one —
+   *  the same fields, the same refusals, one component */
+  machine?: EquipmentRecord | null;
 }) {
   const { busy, refusal, clear, run } = useAction();
-  const [name, setName] = useState("");
-  const [category, setCategory] = useState("earthmoving");
-  const [ownership, setOwnership] = useState("hired");
-  const [assetTag, setAssetTag] = useState("");
-  const [manufacturer, setManufacturer] = useState("");
-  const [model, setModel] = useState("");
-  const [serialNumber, setSerialNumber] = useState("");
-  const [currency, setCurrency] = useState("GBP");
-  const [hireRateAmount, setHireRateAmount] = useState("");
-  const [hireRateUnit, setHireRateUnit] = useState("day");
-  const [idleRateAmount, setIdleRateAmount] = useState("");
-  const [internalRateAmount, setInternalRateAmount] = useState("");
-  const [meterType, setMeterType] = useState("hours");
-  const [currentMeterReading, setCurrentMeterReading] = useState("");
-  const [hireStartDate, setHireStartDate] = useState("");
-  const [hireEndDate, setHireEndDate] = useState("");
-  const [isCritical, setIsCritical] = useState(false);
-  const [requiresCertification, setRequiresCertification] = useState(false);
+  const editing = Boolean(machine);
+  const [name, setName] = useState(machine?.name ?? "");
+  const [category, setCategory] = useState(machine?.category ?? "earthmoving");
+  const [ownership, setOwnership] = useState(machine?.ownership ?? "hired");
+  const [assetTag, setAssetTag] = useState(machine?.assetTag ?? "");
+  const [manufacturer, setManufacturer] = useState(machine?.manufacturer ?? "");
+  const [model, setModel] = useState(machine?.model ?? "");
+  const [serialNumber, setSerialNumber] = useState(machine?.serialNumber ?? "");
+  const [currency, setCurrency] = useState(machine?.currency ?? "GBP");
+  const [hireRateAmount, setHireRateAmount] = useState(
+    machine?.hireRateAmount != null ? String(machine.hireRateAmount) : "",
+  );
+  const [hireRateUnit, setHireRateUnit] = useState(machine?.hireRateUnit ?? "day");
+  const [idleRateAmount, setIdleRateAmount] = useState(
+    machine?.idleRateAmount != null ? String(machine.idleRateAmount) : "",
+  );
+  const [internalRateAmount, setInternalRateAmount] = useState(
+    machine?.internalRateAmount != null ? String(machine.internalRateAmount) : "",
+  );
+  const [meterType, setMeterType] = useState(machine?.meterType ?? "hours");
+  const [currentMeterReading, setCurrentMeterReading] = useState(
+    machine?.currentMeterReading != null ? String(machine.currentMeterReading) : "",
+  );
+  const [hireStartDate, setHireStartDate] = useState(machine?.hireStartDate ?? "");
+  const [hireEndDate, setHireEndDate] = useState(machine?.hireEndDate ?? "");
+  const [isCritical, setIsCritical] = useState(machine?.isCritical ?? false);
+  const [requiresCertification, setRequiresCertification] = useState(
+    machine?.requiresCertification ?? false,
+  );
 
   const hired = ownership !== "owned";
 
   async function submit() {
-    const done = await run("create", () =>
-      api.post("/api/v1/companies/current/equipment", {
+    const payload = {
         name: name.trim(),
         category,
         ownership,
@@ -187,11 +201,15 @@ export function RegisterPlantModal({
         hireEndDate: hireEndDate || null,
         isCritical,
         requiresCertification,
-      }),
+      };
+    const done = await run("create", () =>
+      machine
+        ? api.patch(`/api/v1/companies/current/equipment/${machine.id}`, payload)
+        : api.post("/api/v1/companies/current/equipment", payload),
     );
     if (done) {
-      toast.success("Plant registered");
-      setName("");
+      toast.success(editing ? "Machine updated" : "Plant registered");
+      if (!editing) setName("");
       onDone();
       onClose();
     }
@@ -201,12 +219,12 @@ export function RegisterPlantModal({
     <ModalShell
       open={open}
       onClose={onClose}
-      title="Register plant"
+      title={editing ? `Edit ${machine?.reference ?? "this machine"}` : "Register plant"}
       description="The fleet is company-wide; a machine visits projects. Its certificates and service history follow the machine, not the job."
       busy={busy === "create"}
       refusal={refusal}
       clearRefusal={clear}
-      submitLabel="Register"
+      submitLabel={editing ? "Save" : "Register"}
       disabled={name.trim() === ""}
       onSubmit={submit}
     >
@@ -2014,6 +2032,424 @@ export function ReceiveDeliveryModal({
           );
         })}
       </div>
+    </ModalShell>
+  );
+}
+
+/* ========================================================================== */
+/* Add a material to the project                                               */
+/* ========================================================================== */
+
+const MATERIAL_STATUSES = [
+  "planned",
+  "specified",
+  "approved",
+  "ordered",
+  "partially_delivered",
+  "delivered",
+  "installed",
+  "cancelled",
+];
+
+/**
+ * A MATERIAL ITEM IS THE THING A DELIVERY LINE AND A STOCK MOVEMENT POINT AT.
+ * Without one, neither can be raised at all, which is why this form exists
+ * before anything more elaborate.
+ *
+ * Two fields carry consequences the form states rather than hides:
+ *
+ *  · LEAD TIME. It is what turns a required-on-site date into an ORDER-BY
+ *    date, and the supply engine refuses to compute one without it — it does
+ *    not assume a fortnight. An item with no lead time is reported as having
+ *    no order-by date, not an order-by date of today.
+ *  · HAZARDOUS. Flagging it without attaching a COSHH assessment is allowed,
+ *    and the API says plainly that the material cannot lawfully be issued to
+ *    anybody until one exists. The form repeats that back.
+ *
+ * The item is created ON THE PROJECT. Company catalogue items — the product
+ * as specified, with no stock — are deliberately not creatable here, because
+ * a balance shared by every project is the bug this module refuses to have.
+ */
+export function MaterialItemModal({
+  open,
+  onClose,
+  onDone,
+  projectId,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onDone: () => void;
+  projectId: string;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [name, setName] = useState("");
+  const [code, setCode] = useState("");
+  const [unit, setUnit] = useState("");
+  const [category, setCategory] = useState("");
+  const [manufacturer, setManufacturer] = useState("");
+  const [modelNumber, setModelNumber] = useState("");
+  const [unitCost, setUnitCost] = useState("");
+  const [currency, setCurrency] = useState("USD");
+  const [quantityRequired, setQuantityRequired] = useState("0");
+  const [reorderLevel, setReorderLevel] = useState("");
+  const [leadTimeDays, setLeadTimeDays] = useState("");
+  const [status, setStatus] = useState("planned");
+  const [isHazardous, setIsHazardous] = useState(false);
+  const [isTracked, setIsTracked] = useState(true);
+  const [storageRequirements, setStorageRequirements] = useState("");
+  const [hazardNote, setHazardNote] = useState<string | null>(null);
+
+  const num = (v: string) => (v === "" ? null : Number(v));
+
+  async function submit() {
+    const done = await run("save", () =>
+      api.post<{ hazardNote: string | null }>(`/api/v1/projects/${projectId}/materials`, {
+        name: name.trim(),
+        code: code.trim() || null,
+        unit: unit.trim(),
+        category: category.trim() || null,
+        manufacturer: manufacturer.trim() || null,
+        modelNumber: modelNumber.trim() || null,
+        unitCost: num(unitCost),
+        currency: currency.toUpperCase(),
+        quantityRequired: Number(quantityRequired || 0),
+        reorderLevel: num(reorderLevel),
+        leadTimeDays: num(leadTimeDays),
+        storageRequirements: storageRequirements.trim() || null,
+        isHazardous,
+        isTracked,
+        status,
+      }),
+    );
+    if (done) {
+      toast.success("Material added");
+      onDone();
+      if (done.hazardNote) setHazardNote(done.hazardNote);
+      else onClose();
+    }
+  }
+
+  return (
+    <ModalShell
+      open={open}
+      onClose={onClose}
+      title="Add a material"
+      description="On this project, with a balance of its own. A delivery line and a stock movement both point at one of these."
+      busy={busy === "save"}
+      refusal={refusal}
+      clearRefusal={clear}
+      submitLabel="Add it"
+      disabled={name.trim() === "" || unit.trim() === ""}
+      onSubmit={submit}
+    >
+      {hazardNote ? <Alert tone="warning" title="Recorded, with a condition">{hazardNote}</Alert> : null}
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label="Name" required>
+          <Input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="C32/40 ready-mix concrete"
+          />
+        </Field>
+        <Field label="Unit" required hint="The unit every quantity on this item is counted in">
+          <Input value={unit} onChange={(e) => setUnit(e.target.value)} placeholder="m3" />
+        </Field>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-3">
+        <Field label="Code" optional>
+          <Input value={code} onChange={(e) => setCode(e.target.value)} />
+        </Field>
+        <Field label="Category" optional>
+          <Input value={category} onChange={(e) => setCategory(e.target.value)} />
+        </Field>
+        <Field label="Status">
+          <Select value={status} onChange={(e) => setStatus(e.target.value)}>
+            {MATERIAL_STATUSES.map((s) => (
+              <option key={s} value={s}>
+                {s.replace(/_/g, " ")}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label="Manufacturer" optional>
+          <Input value={manufacturer} onChange={(e) => setManufacturer(e.target.value)} />
+        </Field>
+        <Field label="Model / product reference" optional>
+          <Input value={modelNumber} onChange={(e) => setModelNumber(e.target.value)} />
+        </Field>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-3">
+        <Field label="Unit cost" optional hint="Left empty, the item is valued as unknown — never as zero">
+          <Input
+            type="number"
+            step="0.01"
+            value={unitCost}
+            onChange={(e) => setUnitCost(e.target.value)}
+          />
+        </Field>
+        <Field label="Currency">
+          <Input value={currency} maxLength={3} onChange={(e) => setCurrency(e.target.value)} />
+        </Field>
+        <Field label="Quantity required">
+          <Input
+            type="number"
+            value={quantityRequired}
+            onChange={(e) => setQuantityRequired(e.target.value)}
+          />
+        </Field>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field
+          label="Lead time (days)"
+          optional
+          hint="What turns a need date into an ORDER-BY date. Without it the supply view states no order-by date rather than assuming one."
+        >
+          <Input
+            type="number"
+            value={leadTimeDays}
+            onChange={(e) => setLeadTimeDays(e.target.value)}
+          />
+        </Field>
+        <Field label="Reorder level" optional>
+          <Input
+            type="number"
+            value={reorderLevel}
+            onChange={(e) => setReorderLevel(e.target.value)}
+          />
+        </Field>
+      </div>
+      <Field label="Storage requirements" optional>
+        <Textarea
+          rows={2}
+          value={storageRequirements}
+          onChange={(e) => setStorageRequirements(e.target.value)}
+        />
+      </Field>
+      <label className="flex items-start gap-2 text-meta">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={isHazardous}
+          onChange={(e) => setIsHazardous(e.target.checked)}
+        />
+        <span>
+          Hazardous. Until a COSHH assessment is attached the platform will say this material
+          cannot lawfully be issued to anybody.
+        </span>
+      </label>
+      <label className="flex items-start gap-2 text-meta">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={isTracked}
+          onChange={(e) => setIsTracked(e.target.checked)}
+        />
+        <span>Keep a stock balance for it. Untracked materials are costed but never counted.</span>
+      </label>
+    </ModalShell>
+  );
+}
+
+/* ========================================================================== */
+/* Verify — the second actor                                                   */
+/* ========================================================================== */
+
+/** The five things in this module a SECOND person signs off, and the path
+ *  each verification posts to. `company` routes hang off the fleet, project
+ *  ones off the job. */
+export type VerifyTarget =
+  | "equipment"
+  | "certificate"
+  | "maintenance"
+  | "utilisation"
+  | "delivery"
+  | "movement";
+
+const VERIFY_SPEC: Record<
+  VerifyTarget,
+  { title: string; noun: string; scope: "company" | "project"; path: (id: string) => string; why: string }
+> = {
+  equipment: {
+    title: "Accept this machine",
+    noun: "machine",
+    scope: "company",
+    path: (id) => `/companies/current/equipment/${id}/verify`,
+    why: "Acceptance records that somebody other than whoever registered the machine has actually looked at it, and in what condition.",
+  },
+  certificate: {
+    title: "Verify this certificate",
+    noun: "certificate",
+    scope: "company",
+    path: (id) => `/companies/current/equipment-certificates/${id}/verify`,
+    why: "A certificate is a claim by a third party. Verification records HOW that claim was tested — the strongest method available is the one to state, and 'document only' is an honest answer that reads as weaker evidence for ever after.",
+  },
+  maintenance: {
+    title: "Verify this service",
+    noun: "maintenance record",
+    scope: "company",
+    path: (id) => `/companies/current/equipment-maintenance-records/${id}/verify`,
+    why: "Whoever did the work does not get to sign that it was done. Returning the machine to service is a separate, deliberate act.",
+  },
+  utilisation: {
+    title: "Verify these hours",
+    noun: "plant day",
+    scope: "project",
+    path: (id) => `/equipment-utilisation/${id}/verify`,
+    why: "Verified plant days are the only ones the budget poster will write to the cost report, and the only ones the hire invoice can be checked against.",
+  },
+  delivery: {
+    title: "Verify this delivery",
+    noun: "delivery",
+    scope: "project",
+    path: (id) => `/material-deliveries/${id}/verify`,
+    why: "The person who received the load off the lorry is not the person who confirms what was on it. That separation is what makes the three-way match evidence rather than paperwork.",
+  },
+  movement: {
+    title: "Verify this movement",
+    noun: "stock movement",
+    scope: "project",
+    path: (id) => `/material-stock-movements/${id}/verify`,
+    why: "A stock balance nobody independently checked is a number people order against.",
+  },
+};
+
+const VERIFICATION_METHODS = [
+  { value: "issuer_confirmation", label: "Confirmed with the issuer" },
+  { value: "accreditation_register", label: "Checked against the accreditation register" },
+  { value: "physical_inspection", label: "Physically inspected" },
+  { value: "document_only", label: "Document only — nothing independent was checked" },
+];
+
+/**
+ * ONE COMPONENT FOR EVERY VERIFICATION, because they share the refusal that
+ * matters: the API will not let the actor who created a record verify it
+ * (ADR 0004), and it says so in words this form renders verbatim rather than
+ * paraphrasing. An integrity reviewer may override it knowingly, and when
+ * that happens the response says the override was used — so the form reports
+ * that too, instead of quietly showing a green tick.
+ */
+export function VerifyModal({
+  open,
+  onClose,
+  onDone,
+  projectId,
+  target,
+  recordId,
+  recordLabel,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onDone: () => void;
+  projectId: string;
+  target: VerifyTarget | null;
+  recordId: string | null;
+  recordLabel?: string | null;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [note, setNote] = useState("");
+  const [method, setMethod] = useState("issuer_confirmation");
+  const [condition, setCondition] = useState("");
+  const [returnToService, setReturnToService] = useState(false);
+  const [overrideNote, setOverrideNote] = useState<string | null>(null);
+
+  const spec = target ? VERIFY_SPEC[target] : null;
+
+  async function submit() {
+    if (!spec || !recordId) return;
+    const body: Record<string, unknown> = { note: note.trim() || undefined };
+    if (target === "certificate") body["verificationMethod"] = method;
+    if (target === "maintenance") body["returnToService"] = returnToService;
+    if (target === "equipment" && condition) body["condition"] = condition;
+    const url =
+      spec.scope === "company"
+        ? `/api/v1${spec.path(recordId)}`
+        : `/api/v1/projects/${projectId}${spec.path(recordId)}`;
+    // Every verify route returns `independentVerification`; it is FALSE only
+    // when an integrity reviewer knowingly signed their own record.
+    const done = await run("verify", () =>
+      api.post<{ independentVerification?: boolean }>(url, body),
+    );
+    if (done) {
+      if (done.independentVerification === false) {
+        setOverrideNote(
+          "Recorded — but as an INTEGRITY REVIEWER OVERRIDE, because you created this record " +
+            "yourself. The verification carries that fact permanently.",
+        );
+        onDone();
+        return;
+      }
+      toast.success("Verified");
+      setNote("");
+      onDone();
+      onClose();
+    }
+  }
+
+  return (
+    <ModalShell
+      open={open}
+      onClose={onClose}
+      title={spec?.title ?? "Verify"}
+      {...(spec ? { description: spec.why } : {})}
+      busy={busy === "verify"}
+      refusal={refusal}
+      clearRefusal={clear}
+      submitLabel="Record the verification"
+      disabled={!spec || !recordId}
+      onSubmit={submit}
+    >
+      {overrideNote ? (
+        <Alert tone="warning" title="Verified under an override">
+          {overrideNote}
+        </Alert>
+      ) : null}
+      {recordLabel ? (
+        <p className="text-meta text-content-muted">
+          {spec?.noun ?? "Record"}: <span className="font-medium">{recordLabel}</span>
+        </p>
+      ) : null}
+      {target === "certificate" ? (
+        <Field label="How was it checked?" required>
+          <Select value={method} onChange={(e) => setMethod(e.target.value)}>
+            {VERIFICATION_METHODS.map((m) => (
+              <option key={m.value} value={m.value}>
+                {m.label}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      ) : null}
+      {target === "equipment" ? (
+        <Field label="Condition on acceptance" optional>
+          <Select value={condition} onChange={(e) => setCondition(e.target.value)}>
+            <option value="">— leave as recorded —</option>
+            {CONDITIONS.map((c) => (
+              <option key={c} value={c}>
+                {c}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      ) : null}
+      <Field label="Note" optional>
+        <Textarea rows={3} value={note} onChange={(e) => setNote(e.target.value)} />
+      </Field>
+      {target === "maintenance" ? (
+        <label className="flex items-start gap-2 text-meta">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            checked={returnToService}
+            onChange={(e) => setReturnToService(e.target.checked)}
+          />
+          <span>
+            Return the machine to service. Verifying the paperwork and putting the machine back to
+            work are two decisions, so this one is asked for separately.
+          </span>
+        </label>
+      ) : null}
     </ModalShell>
   );
 }

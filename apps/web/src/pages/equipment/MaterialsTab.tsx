@@ -84,6 +84,8 @@ export default function MaterialsTab({
   deliveryDetail,
   supply,
   scorecard,
+  onVerifyDelivery,
+  onVerifyMovement,
 }: {
   deliveries: Loadable<ListResponse<DeliveryRow>>;
   invoiceMatch: Loadable<InvoiceMatchReport>;
@@ -97,6 +99,11 @@ export default function MaterialsTab({
   deliveryDetail: Loadable<DeliveryDetail>;
   supply: Loadable<SupplyReport>;
   scorecard: Loadable<{ items: SupplierScore[]; total: number; method: string }>;
+  /** Countersign a received delivery — never the person who signed for it. */
+  onVerifyDelivery?: (deliveryId: string, label: string) => void;
+  /** Countersign a stock movement — a balance nobody checked is a number
+   *  people order against. */
+  onVerifyMovement?: (movementId: string, label: string) => void;
 }) {
   const [view, setView] = useState<View>("deliveries");
 
@@ -142,6 +149,7 @@ export default function MaterialsTab({
           selectedDeliveryId={selectedDeliveryId}
           onSelectDelivery={onSelectDelivery}
           detail={deliveryDetail}
+          {...(onVerifyDelivery ? { onVerify: onVerifyDelivery } : {})}
         />
       ) : view === "match" ? (
         <InvoiceMatchView report={invoiceMatch} />
@@ -154,6 +162,7 @@ export default function MaterialsTab({
           onSelectItem={onSelectItem}
           ledger={ledger}
           movements={movements}
+          {...(onVerifyMovement ? { onVerify: onVerifyMovement } : {})}
         />
       )}
     </div>
@@ -171,6 +180,7 @@ function DeliveriesView({
   selectedDeliveryId,
   onSelectDelivery,
   detail,
+  onVerify,
 }: {
   deliveries: Loadable<ListResponse<DeliveryRow>>;
   discrepant: number;
@@ -178,6 +188,7 @@ function DeliveriesView({
   selectedDeliveryId: string | null;
   onSelectDelivery: (deliveryId: string | null) => void;
   detail: Loadable<DeliveryDetail>;
+  onVerify?: (deliveryId: string, label: string) => void;
 }) {
   const rows = useMemo(() => deliveries.data?.items ?? [], [deliveries.data]);
 
@@ -342,14 +353,30 @@ function DeliveriesView({
             <Badge tone="success" size="xs" variant="outline">
               checked
             </Badge>
+          ) : onVerify && row.receivedAt ? (
+            <Button
+              size="xs"
+              variant="secondary"
+              onClick={(e) => {
+                e.stopPropagation();
+                onVerify(
+                  row.id,
+                  `${row.reference}${
+                    row.deliveryNoteNumber ? ` · note ${row.deliveryNoteNumber}` : ""
+                  }`,
+                );
+              }}
+            >
+              Verify
+            </Button>
           ) : (
             <Badge tone="warning" size="xs">
-              unchecked
+              {row.receivedAt ? "unchecked" : "not received"}
             </Badge>
           ),
       },
     ],
-    [],
+    [onVerify],
   );
 
   if (deliveries.error) return <LoadError message={deliveries.error} onRetry={deliveries.reload} />;
@@ -714,12 +741,14 @@ function StockView({
   onSelectItem,
   ledger,
   movements,
+  onVerify,
 }: {
   materials: Loadable<ListResponse<MaterialRow>>;
   selectedItemId: string | null;
   onSelectItem: (itemId: string | null) => void;
   ledger: Loadable<StockLedger>;
   movements: Loadable<ListResponse<StockMovementRow>>;
+  onVerify?: (movementId: string, label: string) => void;
 }) {
   const rows = useMemo(
     () => (materials.data?.items ?? []).filter((row) => row.isTracked),
@@ -883,6 +912,7 @@ function StockView({
           ledger={ledger}
           movements={movements}
           onClose={() => onSelectItem(null)}
+          {...(onVerify ? { onVerify } : {})}
         />
       ) : rows.length > 0 ? (
         <p className="text-2xs text-content-subtle">
@@ -899,10 +929,12 @@ function StockLedgerPanel({
   ledger,
   movements,
   onClose,
+  onVerify,
 }: {
   ledger: Loadable<StockLedger>;
   movements: Loadable<ListResponse<StockMovementRow>>;
   onClose: () => void;
+  onVerify?: (movementId: string, label: string) => void;
 }) {
   if (ledger.error) return <LoadError message={ledger.error} onRetry={ledger.reload} />;
   if (ledger.loading && !ledger.data) return <SkeletonTable rows={6} columns={5} />;
@@ -1080,6 +1112,22 @@ function StockLedgerPanel({
                           <Badge tone="success" size="xs" variant="outline">
                             checked
                           </Badge>
+                        ) : onVerify ? (
+                          <Button
+                            size="xs"
+                            variant="secondary"
+                            onClick={() =>
+                              onVerify(
+                                movement.id,
+                                `${labelize(movement.movementType)} of ${quantity(
+                                  movement.quantity,
+                                  movement.unit ?? data.unit,
+                                )} on ${isoDate(movement.movedAt)}`,
+                              )
+                            }
+                          >
+                            Verify
+                          </Button>
                         ) : (
                           <span className="text-2xs text-content-subtle">
                             {isoDate(movement.movedAt)}

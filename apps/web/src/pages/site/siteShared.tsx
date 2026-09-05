@@ -542,7 +542,7 @@ export interface SignalRow {
 
 export interface Summary {
   asOf: string;
-  register: { headcount: number; windowFrom: string; overstays: number; anomalies: number; refusedEvents: number; reasons: string[] };
+  register: { headcount: number; windowFrom: string; eventsConsidered: number; overstays: number; anomalies: number; refusedEvents: number; reasons: string[] };
   access: { activePasses: number; validInductions: number; expiringPasses: number };
   permits: { open: number; active: number; expired: number; byType: Record<string, number> };
   entries: { inside: number; overdue: number };

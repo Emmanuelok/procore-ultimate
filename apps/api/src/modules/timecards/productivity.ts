@@ -40,6 +40,28 @@ export interface ProductivityAllocation {
   unit: string | null;
 }
 
+/**
+ * A FIELD PROGRESS ENTRY — installed quantity per cost code per day, measured
+ * by whoever walked the work rather than inferred from a timesheet.
+ *
+ * It exists because `allocation.quantity` is a foreman's note on his own
+ * hours: the same person states both sides of the productivity ratio, which
+ * is the one arrangement this platform refuses everywhere else. A progress
+ * entry is a separate record with its own author, its own date and its own
+ * method, and where one exists it is the AUTHORITY on what was installed —
+ * the allocation quantities on that line are then not added to it, because
+ * adding a claim to its own check double-counts the work.
+ */
+export interface ProductivityProgress {
+  budgetLineItemId: string | null;
+  costCodeId: string | null;
+  progressDate: string;
+  crewId: string | null;
+  crewName?: string | null;
+  quantity: number;
+  unit: string | null;
+}
+
 /** The planned side: a budget line's hours and quantity. */
 export interface ProductivityBudgetLine {
   id: string;
@@ -60,6 +82,8 @@ export interface ProductivityLine {
   unit: string | null;
   actualHours: number;
   installedQuantity: number | null;
+  /** where `installedQuantity` came from — the two are never mixed */
+  quantitySource: "field_progress" | "timecard_allocation" | "none";
   plannedUnitRate: number | null;
   achievedUnitRate: number | null;
   earnedHours: number | null;
@@ -116,36 +140,103 @@ function weekStartOf(iso: string, weekStartsOn: number): string {
 export function computeProductivity(
   allocations: ProductivityAllocation[],
   budgetLines: ProductivityBudgetLine[],
-  options: { weekStartsOn?: number } = {},
+  options: { weekStartsOn?: number; progress?: ProductivityProgress[] } = {},
 ): ProductivityReport {
   const weekStartsOn = options.weekStartsOn ?? 1;
+  const progressRows = (options.progress ?? []).filter(
+    (p) => p.budgetLineItemId !== null && p.quantity > 0,
+  );
   const byLine = new Map<string, ProductivityBudgetLine>(budgetLines.map((b) => [b.id, b]));
   const reasons: string[] = [];
+
+  /* --------- which lines are measured in the field, not inferred ----- */
+  const measuredInField = new Set(
+    progressRows.map((p) => p.budgetLineItemId).filter((v): v is string => v !== null),
+  );
+  let uncodedProgress = 0;
+  for (const p of options.progress ?? []) {
+    if (p.budgetLineItemId === null && p.quantity > 0) uncodedProgress += 1;
+  }
+  if (uncodedProgress > 0) {
+    reasons.push(
+      `${uncodedProgress} field progress entr${uncodedProgress === 1 ? "y" : "ies"} carr${
+        uncodedProgress === 1 ? "ies" : "y"
+      } no budget line, so nothing can be earned against them. Code progress to the line the ` +
+        "hours are booked to, or the two sides of the ratio never meet.",
+    );
+  }
+
+  /**
+   * The quantity events for a line, in the order they happened. Where the
+   * field measured the work, those rows ARE the events and the allocation
+   * quantities on that line are dropped — a claim and its check are never
+   * added together.
+   */
+  const quantityEvents = new Map<
+    string,
+    Array<{ date: string; crewId: string | null; quantity: number }>
+  >();
+  const pushEvent = (
+    lineId: string,
+    event: { date: string; crewId: string | null; quantity: number },
+  ) => {
+    const held = quantityEvents.get(lineId) ?? [];
+    held.push(event);
+    quantityEvents.set(lineId, held);
+  };
 
   /* ------------------------- per budget line ------------------------ */
   const grouped = new Map<
     string,
-    { hours: number; quantity: number; units: Set<string>; quantityRows: number }
+    {
+      hours: number;
+      quantity: number;
+      units: Set<string>;
+      quantityRows: number;
+      source: ProductivityLine["quantitySource"];
+    }
   >();
+  const emptyAgg = () => ({
+    hours: 0,
+    quantity: 0,
+    units: new Set<string>(),
+    quantityRows: 0,
+    source: "none" as ProductivityLine["quantitySource"],
+  });
   let uncodedHours = 0;
   for (const a of allocations) {
     if (!a.budgetLineItemId) {
       uncodedHours = round2(uncodedHours + a.hours);
       continue;
     }
-    const held = grouped.get(a.budgetLineItemId) ?? {
-      hours: 0,
-      quantity: 0,
-      units: new Set<string>(),
-      quantityRows: 0,
-    };
+    const held = grouped.get(a.budgetLineItemId) ?? emptyAgg();
     held.hours = round2(held.hours + a.hours);
-    if (a.quantity !== null && a.quantity > 0) {
+    if (
+      !measuredInField.has(a.budgetLineItemId) &&
+      a.quantity !== null &&
+      a.quantity > 0
+    ) {
       held.quantity = round3(held.quantity + a.quantity);
       held.quantityRows += 1;
+      held.source = "timecard_allocation";
       if (a.unit) held.units.add(a.unit.trim().toLowerCase());
+      pushEvent(a.budgetLineItemId, {
+        date: a.workDate,
+        crewId: a.crewId,
+        quantity: a.quantity,
+      });
     }
     grouped.set(a.budgetLineItemId, held);
+  }
+  for (const p of progressRows) {
+    const lineId = p.budgetLineItemId!;
+    const held = grouped.get(lineId) ?? emptyAgg();
+    held.quantity = round3(held.quantity + p.quantity);
+    held.quantityRows += 1;
+    held.source = "field_progress";
+    if (p.unit) held.units.add(p.unit.trim().toLowerCase());
+    grouped.set(lineId, held);
+    pushEvent(lineId, { date: p.progressDate, crewId: p.crewId, quantity: p.quantity });
   }
   if (uncodedHours > 0) {
     reasons.push(
@@ -195,12 +286,38 @@ export function computeProductivity(
         "No installed quantity was recorded against these hours, so nothing has been earned yet. " +
           "Record progress per cost code per day to make this line measurable.",
       );
+    } else if (agg.source === "field_progress") {
+      lineReasons.push(
+        `Installed quantity is taken from ${agg.quantityRows} field progress entr` +
+          `${agg.quantityRows === 1 ? "y" : "ies"}, measured separately from the timecards. Any ` +
+          "quantity typed on the timecards themselves is deliberately NOT added to it — that " +
+          "would let the same hours claim their own output twice.",
+      );
+    } else {
+      lineReasons.push(
+        "Installed quantity is taken from the quantities entered on the timecards, so the same " +
+          "person stated the hours and the output. A field progress entry, measured by somebody " +
+          "who walked the work, supersedes this.",
+      );
     }
 
+    /*
+     * NO HOURS MEANS NO ACHIEVED RATE. A field measurement can land on a line
+     * before any timecard is coded to it, and dividing zero hours by a real
+     * quantity gives an achieved rate of 0 h/unit — which then forecasts the
+     * whole remaining line at zero hours. That is not "very productive", it
+     * is "not yet measurable", and the two must not read the same.
+     */
     const achievedUnitRate =
-      installedQuantity !== null && installedQuantity > 0
+      installedQuantity !== null && installedQuantity > 0 && agg.hours > 0
         ? round3(agg.hours / installedQuantity)
         : null;
+    if (installedQuantity !== null && installedQuantity > 0 && agg.hours === 0) {
+      lineReasons.push(
+        "Quantity has been measured against this line but no hours are coded to it in this " +
+          "window, so there is no achieved rate and no forecast — only earned hours.",
+      );
+    }
     const earnedHours =
       plannedUnitRate !== null && installedQuantity !== null
         ? round2(installedQuantity * plannedUnitRate)
@@ -233,6 +350,7 @@ export function computeProductivity(
       unit,
       actualHours: agg.hours,
       installedQuantity,
+      quantitySource: agg.source,
       plannedUnitRate,
       achievedUnitRate,
       earnedHours,
@@ -248,18 +366,44 @@ export function computeProductivity(
   lines.sort((a, b) => b.actualHours - a.actualHours);
 
   /* --------------------------- weekly trend ------------------------- */
+  /*
+   * A week's earned hours come from the quantity events that fall IN THAT
+   * WEEK, and the week is only reported when every hour worked in it sits on
+   * a line that also produced a quantity event in the same week. Otherwise a
+   * week in which the gang worked and nobody measured anything would report
+   * zero earned hours and a productivity factor of 0 — a wrong number that
+   * reads as a catastrophe, when the truth is that the week was never
+   * measured.
+   */
+  const weeksWithQuantity = new Set<string>();
+  for (const [lineId, events] of quantityEvents) {
+    for (const e of events) {
+      weeksWithQuantity.add(`${lineId}|${weekStartOf(e.date, weekStartsOn)}`);
+    }
+  }
   const weekMap = new Map<string, { hours: number; earned: number; complete: boolean }>();
   for (const a of allocations) {
     const key = weekStartOf(a.workDate, weekStartsOn);
     const held = weekMap.get(key) ?? { hours: 0, earned: 0, complete: true };
     held.hours = round2(held.hours + a.hours);
     const rate = a.budgetLineItemId ? earnedRatePerLine.get(a.budgetLineItemId) : undefined;
-    if (rate !== undefined && a.quantity !== null && a.quantity > 0) {
-      held.earned = round2(held.earned + a.quantity * rate);
-    } else if (a.hours > 0) {
+    if (
+      a.hours > 0 &&
+      (rate === undefined || !weeksWithQuantity.has(`${a.budgetLineItemId}|${key}`))
+    ) {
       held.complete = false;
     }
     weekMap.set(key, held);
+  }
+  for (const [lineId, events] of quantityEvents) {
+    const rate = earnedRatePerLine.get(lineId);
+    if (rate === undefined) continue;
+    for (const e of events) {
+      const key = weekStartOf(e.date, weekStartsOn);
+      const held = weekMap.get(key) ?? { hours: 0, earned: 0, complete: true };
+      held.earned = round2(held.earned + e.quantity * rate);
+      weekMap.set(key, held);
+    }
   }
   const weeks: ProductivityWeek[] = [...weekMap.entries()]
     .map(([weekStart, v]) => ({
@@ -275,6 +419,10 @@ export function computeProductivity(
     string,
     { name: string | null; hours: number; earned: number; complete: boolean }
   >();
+  const crewsWithQuantity = new Set<string>();
+  for (const [lineId, events] of quantityEvents) {
+    for (const e of events) crewsWithQuantity.add(`${lineId}|${e.crewId ?? "__none__"}`);
+  }
   for (const a of allocations) {
     const key = a.crewId ?? "__none__";
     const held = crewMap.get(key) ?? {
@@ -286,12 +434,25 @@ export function computeProductivity(
     if (!held.name && a.crewName) held.name = a.crewName;
     held.hours = round2(held.hours + a.hours);
     const rate = a.budgetLineItemId ? earnedRatePerLine.get(a.budgetLineItemId) : undefined;
-    if (rate !== undefined && a.quantity !== null && a.quantity > 0) {
-      held.earned = round2(held.earned + a.quantity * rate);
-    } else if (a.hours > 0) {
+    if (
+      a.hours > 0 &&
+      (rate === undefined || !crewsWithQuantity.has(`${a.budgetLineItemId}|${key}`))
+    ) {
+      // Progress measured without naming a crew cannot be attributed to one:
+      // the crew comparison abstains rather than crediting the nearest gang.
       held.complete = false;
     }
     crewMap.set(key, held);
+  }
+  for (const [lineId, events] of quantityEvents) {
+    const rate = earnedRatePerLine.get(lineId);
+    if (rate === undefined) continue;
+    for (const e of events) {
+      const key = e.crewId ?? "__none__";
+      const held = crewMap.get(key) ?? { name: null, hours: 0, earned: 0, complete: true };
+      held.earned = round2(held.earned + e.quantity * rate);
+      crewMap.set(key, held);
+    }
   }
   const crews: ProductivityCrew[] = [...crewMap.entries()]
     .map(([key, v]) => ({

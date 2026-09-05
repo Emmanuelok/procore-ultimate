@@ -167,6 +167,52 @@ describe("permit lifecycle and segregation of duties", () => {
   });
 });
 
+describe("the activation body may tick precautions but never rewrite them", () => {
+  it("refuses an activation that drops or downgrades the approved precautions", async () => {
+    const created = await post(`${base()}/permits`, {
+      permitType: "hot_work",
+      title: "Cutting to L4 handrail",
+      validFrom: ago(10),
+      validTo: ahead(600),
+      precautions: [
+        { item: "Extinguisher present", required: true, done: false },
+        { item: "Combustibles removed", required: true, done: false },
+      ],
+    });
+    const id = created.json().id;
+    await post(`${base()}/permits/${id}/request`, {});
+    await post(`${base()}/permits/${id}/approve`, {}, approver.headers);
+
+    // An empty list must not walk past the control, and must not erase the
+    // list the approver signed off.
+    const emptied = await post(`${base()}/permits/${id}/activate`, { precautions: [] });
+    expect(emptied.statusCode).toBe(409);
+    expect(emptied.json().message).toContain("outstanding");
+
+    // Neither may a required precaution be re-sent as optional.
+    const downgraded = await post(`${base()}/permits/${id}/activate`, {
+      precautions: [
+        { item: "Extinguisher present", required: false, done: false },
+        { item: "Combustibles removed", required: false, done: false },
+      ],
+    });
+    expect(downgraded.statusCode).toBe(409);
+
+    const still = await get(`${base()}/permits/${id}`);
+    expect(still.json().precautions).toHaveLength(2);
+    expect(still.json().precautions.every((p: { required: boolean }) => p.required)).toBe(true);
+
+    const activated = await post(`${base()}/permits/${id}/activate`, {
+      precautions: [
+        { item: "Extinguisher present", required: true, done: true },
+        { item: "Combustibles removed", required: true, done: true },
+      ],
+    });
+    expect(activated.statusCode).toBe(200);
+    expect(activated.json().status).toBe("active");
+  });
+});
+
 describe("excavation permits require a utility survey", () => {
   it("refuses activation without one and allows it with one", async () => {
     const created = await post(`${base()}/permits`, {

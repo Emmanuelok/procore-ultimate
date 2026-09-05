@@ -58,7 +58,7 @@ import type { Db } from "../../lib/db.js";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
-import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
+import { AppError, badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { forEachCompany } from "../../lib/scheduler.js";
 import { pushNotifications } from "../notifications/service.js";
@@ -86,6 +86,18 @@ import {
   scopeProjects,
   scopeProjectsOrCompanyWide,
 } from "./scope.js";
+import {
+  TRANSCRIPT_LIMIT,
+  buildDraftSystemPrompt,
+  buildDraftUserPrompt,
+  buildProposal,
+  minutesDraftSchema,
+  proposalToMinutesBody,
+  type DraftAgendaItem,
+  type DraftAttendee,
+  type DraftInput,
+} from "./aiminutes.js";
+import { aiEnabled, runAgent } from "../ai/service.js";
 
 /**
  * MEETINGS (M20, spec Vol I §2.9) — tool key `meetings`.
@@ -4211,6 +4223,198 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       return { ...after, minutesObjectionWindow: minutesWindow(after) };
     },
   );
+
+  /* ================================================================ */
+  /* 11b. AI MINUTES DRAFTING (#418-421)                               */
+  /*                                                                   */
+  /* A PROPOSAL, never an issue. The model reads a transcript and the   */
+  /* meeting's own structure and proposes discussion per agenda item,   */
+  /* decisions and actions with a suggested owner from the roll; a      */
+  /* person accepts them item by item through the routes that already   */
+  /* exist. Nothing here writes minutes, and nothing here can start a   */
+  /* deemed-acceptance clock — that is an act against real people and   */
+  /* it stays a human one.                                             */
+  /* ================================================================ */
+
+  /** 503 with the name the platform uses everywhere for "AI is off". */
+  function aiUnavailable(message: string): AppError {
+    const err = new AppError(503, message);
+    err.name = "AiDisabled";
+    return err;
+  }
+
+  /**
+   * Assemble everything the draft is grounded in: the agenda (with each
+   * carried item's previous discussion, so "what changed" is answerable) and
+   * the attendance roll (the only names an action may be owed by).
+   */
+  async function buildDraftInput(
+    req: FastifyRequest,
+    meeting: typeof meetings.$inferSelect,
+    transcript: string,
+  ): Promise<DraftInput> {
+    const items = await app.db
+      .select()
+      .from(meetingAgendaItems)
+      .where(eq(meetingAgendaItems.meetingId, meeting.id))
+      .orderBy(asc(meetingAgendaItems.position));
+    const carriedFrom = items
+      .map((i) => i.carriedFromItemId)
+      .filter((v): v is string => Boolean(v));
+    const previous = carriedFrom.length
+      ? await app.db
+          .select({
+            id: meetingAgendaItems.id,
+            discussion: meetingAgendaItems.discussion,
+            status: meetingAgendaItems.status,
+          })
+          .from(meetingAgendaItems)
+          .where(
+            and(
+              eq(meetingAgendaItems.companyId, req.companyId!),
+              inArray(meetingAgendaItems.id, carriedFrom),
+            ),
+          )
+      : [];
+    const priorById = new Map(previous.map((p) => [p.id, p]));
+    const agendaItems: DraftAgendaItem[] = items.map((i) => {
+      const prior = i.carriedFromItemId ? priorById.get(i.carriedFromItemId) : undefined;
+      return {
+        id: i.id,
+        itemNumber: i.itemNumber,
+        position: i.position,
+        title: i.title,
+        category: i.category,
+        description: i.description,
+        discussion: i.discussion,
+        carryCount: i.carryCount,
+        previousDiscussion: prior?.discussion ?? null,
+        previousStatus: prior?.status ?? null,
+      };
+    });
+    const rows = await app.db
+      .select()
+      .from(meetingAttendees)
+      .where(eq(meetingAttendees.meetingId, meeting.id))
+      .orderBy(asc(meetingAttendees.name));
+    const attendees: DraftAttendee[] = rows.map((a) => ({
+      userId: a.userId,
+      contactId: a.contactId,
+      name: a.name,
+      organisation: a.organisation,
+      attendance: a.attendance,
+    }));
+    return {
+      meeting: {
+        reference: meeting.reference,
+        title: meeting.title,
+        meetingType: meeting.meetingType,
+        scheduledStart: meeting.scheduledStart,
+        occurrenceNumber: meeting.occurrenceNumber,
+      },
+      agendaItems,
+      attendees,
+      transcript,
+    };
+  }
+
+  app.post(
+    "/projects/:projectId/meetings/:meetingId/minutes/draft-ai",
+    { preHandler: standardGate },
+    async (req) => {
+      const { meetingId } = req.params as { meetingId: string };
+      const body = z
+        .object({
+          transcript: z.string().min(50).max(400_000),
+        })
+        .parse(req.body);
+      const meeting = await fetchMeeting(req, meetingId);
+      if (meeting.status === "cancelled") {
+        throw badRequest("A cancelled meeting has no minutes to draft");
+      }
+      if (meeting.minutesIssuedAt) {
+        throw conflict(
+          "These minutes have been issued. A draft over an issued record would rewrite what " +
+            "recipients are relying on: withdraw them with POST /minutes/correct first.",
+        );
+      }
+      if (!aiEnabled(app)) {
+        throw aiUnavailable(
+          "ANTHROPIC_API_KEY is not configured, so no draft can be generated. Write the minutes " +
+            "directly — the agenda, the roll and the carried items are all on this page, and " +
+            "nothing about issuing, objecting to or approving minutes depends on the AI layer.",
+        );
+      }
+      const input = await buildDraftInput(req, meeting, body.transcript);
+      try {
+        const result = await runAgent({
+          app,
+          req,
+          agentKind: "minutes_drafter",
+          projectId: req.projectId!,
+          system: buildDraftSystemPrompt(),
+          user: buildDraftUserPrompt(input),
+          inputRefs: [
+            { type: "meeting", id: meeting.id },
+            ...input.agendaItems.map((i) => ({ type: "meeting_agenda_item", id: i.id })),
+          ],
+          schema: minutesDraftSchema,
+          contextChars: Math.min(body.transcript.length, TRANSCRIPT_LIMIT),
+          maxTokens: 4096,
+        });
+        const draft = result.json;
+        if (!draft) {
+          return {
+            meetingId,
+            runId: result.runId,
+            aiAvailable: true,
+            applied: false,
+            proposal: null,
+            note:
+              "The model answered, but not in the shape the minutes proposal requires, so nothing " +
+              "is offered. The raw run is in the AI console under this run id.",
+          };
+        }
+        const proposal = buildProposal(draft, input);
+        return {
+          meetingId,
+          runId: result.runId,
+          aiAvailable: true,
+          /* NOTHING IS WRITTEN. The meeting is untouched; the minute taker
+             accepts items through the routes that already enforce the rules. */
+          applied: false,
+          proposal,
+          suggestedMinutesBody: proposaltoBodySafe(proposal, input),
+          grounding: result.grounding,
+          note:
+            `A proposal, not minutes. ${proposal.ungroundedCitations} citation(s) could not be ` +
+            `found in the transcript, ${proposal.unmatchedOwners} proposed owner(s) are not on ` +
+            "the attendance roll, and nothing has been written. Accept it item by item: " +
+            "PATCH the agenda item to keep its discussion, POST a decision, POST an action. " +
+            "Issuing minutes remains a human act because it starts a clock against real people.",
+        };
+      } catch (err) {
+        if (err instanceof AppError) throw err;
+        const message = err instanceof Error ? err.message : String(err);
+        throw aiUnavailable(
+          `The AI layer was configured but the drafting call did not succeed: ${message.slice(0, 300)}. ` +
+            "Write the minutes directly.",
+        );
+      }
+    },
+  );
+
+  /** Never let a rendering slip fail the whole draft — the proposal is the value. */
+  function proposaltoBodySafe(
+    proposal: ReturnType<typeof buildProposal>,
+    input: DraftInput,
+  ): string | null {
+    try {
+      return proposalToMinutesBody(proposal, input);
+    } catch {
+      return null;
+    }
+  }
 
   /* ================================================================ */
   /* 12. RAISING A REAL RECORD FROM AN AGENDA ITEM (#424)               */

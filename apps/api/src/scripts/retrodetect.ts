@@ -46,7 +46,7 @@ interface PlantedScheme {
 }
 
 /**
- * The 17 planted schemes.
+ * The 24 planted schemes.
  *
  * Schemes 1-3 deliberately share one fabricated cost-assertion population: a
  * manually invented payment book is exactly the kind of dataset that trips the

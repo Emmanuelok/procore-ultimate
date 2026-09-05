@@ -839,3 +839,47 @@ export function Prose({ text }: { text: string | null | undefined }) {
   if (!text || !text.trim()) return <p className="text-xs text-ink-300">—</p>;
   return <p className="whitespace-pre-wrap text-sm leading-relaxed text-ink-700">{text}</p>;
 }
+
+/* ------------------ Cross-project supplier performance -------------------- */
+
+export interface SupplierDimension {
+  /** null when there is nothing to score — never 0 */
+  score: number | null;
+  observations: number;
+  basis: string;
+  counts: Record<string, number>;
+}
+
+export interface SupplierScore {
+  vendorId: string;
+  vendorName: string;
+  certificateDiscipline: SupplierDimension;
+  commitmentSlippage: SupplierDimension;
+  quality: SupplierDimension;
+  composite: number | null;
+  observations: number;
+  reasons: string[];
+}
+
+export interface SupplierPerformanceResponse {
+  asOf: string;
+  items: SupplierScore[];
+  total: number;
+  scope: "company" | "restricted";
+  sources?: string[];
+  note?: string;
+}
+
+export const SUPPLIER_DIMENSIONS = [
+  { key: "certificateDiscipline", label: "Certificate discipline" },
+  { key: "commitmentSlippage", label: "Commitment slippage" },
+  { key: "quality", label: "Quality" },
+] as const;
+
+/** A colour for a 0-100 score. Null is grey — an unknown is not a good score. */
+export function scoreTone(score: number | null): string {
+  if (score === null) return "text-ink-400";
+  if (score >= 80) return "text-emerald-700";
+  if (score >= 55) return "text-amber-700";
+  return "text-red-700";
+}

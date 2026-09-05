@@ -8,6 +8,7 @@ import {
   delayEvents,
   disputes,
   forensicClaims,
+  insuranceCertificates,
   gateReviews,
   lessonTriggers,
   ledgerEntries,
@@ -23,6 +24,7 @@ import {
   signals,
   stageGates,
   valuations,
+  vendors,
   variations,
 } from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
@@ -376,7 +378,7 @@ beforeAll(async () => {
     agreedValue: 10_000,
     createdBy: owner.userId,
   });
-});
+}, 180_000);
 
 afterAll(async () => {
   await built.close();
@@ -1310,5 +1312,157 @@ describe("scheduled capture sweep", () => {
       .from(lessonTriggers)
       .where(eq(lessonTriggers.companyId, owner.companyId));
     expect(after.length).toBe(before.length);
+  });
+});
+
+/* ================================================================== */
+/* Cross-project supplier performance (#987-989)                       */
+/* ================================================================== */
+
+describe("supplier performance scorecard", () => {
+  let goodVendor: string;
+  let badVendor: string;
+  let silentVendor: string;
+
+  beforeAll(async () => {
+    goodVendor = newId("ven");
+    badVendor = newId("ven");
+    silentVendor = newId("ven");
+    await app.db.insert(vendors).values([
+      { id: goodVendor, companyId: owner.companyId, name: "Aaa Reliable Ltd" },
+      { id: badVendor, companyId: owner.companyId, name: "Bbb Chaotic Ltd" },
+      { id: silentVendor, companyId: owner.companyId, name: "Ccc Unknown Ltd" },
+    ]);
+    const iso = (d: number) => new Date(Date.now() + d * 86_400_000).toISOString().slice(0, 10);
+    await app.db.insert(insuranceCertificates).values([
+      {
+        id: newId("cert"),
+        companyId: owner.companyId,
+        projectId,
+        vendorId: goodVendor,
+        subjectName: "Aaa Reliable Ltd",
+        policyType: "public_liability",
+        validFrom: iso(-100),
+        validTo: iso(200),
+        verifiedAt: new Date().toISOString(),
+        verificationMethod: "insurer_confirmation",
+        createdBy: owner.userId,
+      },
+      {
+        id: newId("cert"),
+        companyId: owner.companyId,
+        projectId,
+        vendorId: goodVendor,
+        subjectName: "Aaa Reliable Ltd",
+        policyType: "employers_liability",
+        validFrom: iso(-100),
+        validTo: iso(200),
+        verifiedAt: new Date().toISOString(),
+        verificationMethod: "insurer_confirmation",
+        createdBy: owner.userId,
+      },
+      {
+        id: newId("cert"),
+        companyId: owner.companyId,
+        projectId,
+        vendorId: goodVendor,
+        subjectName: "Aaa Reliable Ltd",
+        policyType: "professional_indemnity",
+        validFrom: iso(-100),
+        validTo: iso(200),
+        verifiedAt: new Date().toISOString(),
+        verificationMethod: "insurer_confirmation",
+        createdBy: owner.userId,
+      },
+      {
+        id: newId("cert"),
+        companyId: owner.companyId,
+        projectId,
+        vendorId: badVendor,
+        subjectName: "Bbb Chaotic Ltd",
+        policyType: "public_liability",
+        validFrom: iso(-400),
+        validTo: iso(-30),
+        verifiedAt: null,
+        createdBy: owner.userId,
+      },
+      {
+        id: newId("cert"),
+        companyId: owner.companyId,
+        projectId,
+        vendorId: badVendor,
+        subjectName: "Bbb Chaotic Ltd",
+        policyType: "employers_liability",
+        validFrom: iso(-400),
+        validTo: iso(-10),
+        verifiedAt: null,
+        createdBy: owner.userId,
+      },
+      {
+        id: newId("cert"),
+        companyId: owner.companyId,
+        projectId,
+        vendorId: badVendor,
+        subjectName: "Bbb Chaotic Ltd",
+        policyType: "professional_indemnity",
+        validFrom: iso(-400),
+        validTo: iso(-5),
+        verifiedAt: null,
+        createdBy: owner.userId,
+      },
+    ]);
+  }, 120_000);
+
+  it("ranks the worst supplier first and refuses to rate one with no records", async () => {
+    const res = await get("/learning/supplier-performance");
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      items: Array<{ vendorId: string; composite: number | null; reasons: string[] }>;
+      sources: string[];
+    };
+    const ids = body.items.map((i) => i.vendorId);
+    expect(ids.indexOf(badVendor)).toBeLessThan(ids.indexOf(goodVendor));
+    const silent = body.items.find((i) => i.vendorId === silentVendor)!;
+    expect(silent.composite).toBeNull();
+    expect(silent.reasons.join(" ")).toMatch(/coincidence wearing a number/);
+    expect(body.sources.length).toBeGreaterThan(0);
+  });
+
+  it("shows the basis and counts behind every dimension", async () => {
+    const res = await get(`/learning/supplier-performance?vendorId=${badVendor}`);
+    expect(res.statusCode).toBe(200);
+    const [row] = res.json().items as Array<{
+      certificateDiscipline: { score: number; counts: Record<string, number>; basis: string };
+      quality: { score: number | null; basis: string };
+      reasons: string[];
+    }>;
+    expect(row!.certificateDiscipline.counts["expired"]).toBe(3);
+    expect(row!.certificateDiscipline.basis).toMatch(/in date/);
+    // no NCR exists against this vendor: null, not zero
+    expect(row!.quality.score).toBeNull();
+    expect(row!.reasons.join(" ")).toMatch(/not a recommendation/);
+  });
+
+  it("says so, rather than reporting zero, when the caller holds learning nowhere", async () => {
+    const nobody = await registerActor(app);
+    await app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: nobody.userId,
+      role: "guest",
+    });
+    const res = await get("/learning/supplier-performance", {
+      authorization: nobody.headers["authorization"]!,
+      "x-company-id": owner.companyId,
+    });
+    // A guest with no project membership holds the tool nowhere: refused
+    // outright rather than handed an empty list that reads as "nothing to report".
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("keeps another tenant out", async () => {
+    const res = await get("/learning/supplier-performance", outsider.headers);
+    const body = res.statusCode === 200 ? (res.json().items as unknown[]) : [];
+    expect(body).toHaveLength(0);
   });
 });

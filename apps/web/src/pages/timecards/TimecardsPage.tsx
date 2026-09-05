@@ -39,6 +39,8 @@ import TicketsTab from "./TicketsTab";
 import TimecardDrawer from "./TimecardDrawer";
 import {
   BatchCreateModal,
+  CrewCreateModal,
+  CrewMemberModal,
   TicketCreateModal,
   TicketSourceModal,
   TimecardCreateModal,
@@ -113,7 +115,9 @@ export default function TimecardsPage() {
 
   const users = useCompanyUsers();
   /** which write form is open */
-  const [form, setForm] = useState<"card" | "batch" | "ticket" | "source" | null>(null);
+  const [form, setForm] = useState<
+    "card" | "batch" | "ticket" | "source" | "crew" | "member" | null
+  >(null);
   const crews = useCrews(projectId);
   const cards = useTimecards(projectId, cardFilters, tab === "cards");
   const reconciliation = useReconciliation(projectId, reconcileFrom, to, tab === "reconcile");
@@ -127,7 +131,7 @@ export default function TimecardsPage() {
   const costCodes = useCostCodes(projectId, openCard !== null || form !== null);
   /** the worker register this module reads from and never duplicates */
   const workerList = useResource<{ items: WorkerOption[] }>(
-    form === "card" && projectId
+    (form === "card" || form === "crew" || form === "member") && projectId
       ? `/api/v1/projects/${projectId}/workers?page=1&pageSize=500&status=active`
       : null,
   );
@@ -231,6 +235,18 @@ export default function TimecardsPage() {
         }
         actions={
           <div className="flex flex-wrap items-center gap-2">
+            {tab === "crews" ? (
+              <>
+                <Button size="sm" variant="secondary" onClick={() => setForm("crew")}>
+                  Form a crew
+                </Button>
+                {crewId ? (
+                  <Button size="sm" variant="secondary" onClick={() => setForm("member")}>
+                    Add a member
+                  </Button>
+                ) : null}
+              </>
+            ) : null}
             {tab === "tickets" ? (
               <>
                 <Button size="sm" variant="secondary" onClick={() => setForm("ticket")}>
@@ -371,6 +387,26 @@ export default function TimecardsPage() {
         }}
         projectId={projectId}
         crews={crews.data?.items ?? []}
+      />
+      <CrewCreateModal
+        open={form === "crew"}
+        onClose={() => setForm(null)}
+        onDone={() => crews.reload()}
+        projectId={projectId}
+        workers={workerList.data?.items ?? []}
+        costCodes={costCodes.data?.items ?? []}
+      />
+      <CrewMemberModal
+        open={form === "member"}
+        onClose={() => setForm(null)}
+        onDone={() => {
+          crews.reload();
+          crewDetail.reload();
+        }}
+        projectId={projectId}
+        crew={(crews.data?.items ?? []).find((c) => c.id === crewId) ?? null}
+        workers={workerList.data?.items ?? []}
+        costCodes={costCodes.data?.items ?? []}
       />
       <TicketSourceModal
         open={form === "source"}

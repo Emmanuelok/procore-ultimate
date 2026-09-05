@@ -93,6 +93,7 @@ export default function UtilisationTab({
   windowDays,
   onWindowDays,
   onOpenMachine,
+  onVerify,
 }: {
   projectId: string | undefined;
   summary: Loadable<UtilisationSummary>;
@@ -100,6 +101,9 @@ export default function UtilisationTab({
   windowDays: number;
   onWindowDays: (days: number) => void;
   onOpenMachine: (equipmentId: string) => void;
+  /** Countersign a plant day. Only verified days are posted to the budget,
+   *  so this is the act that lets the hours reach the cost report. */
+  onVerify?: (utilisationId: string, label: string) => void;
 }) {
   const data = summary.data;
   const items = useMemo(() => data?.items ?? [], [data]);
@@ -522,6 +526,20 @@ export default function UtilisationTab({
             <Badge tone="success" size="xs" variant="outline">
               {isoDate(row.verifiedAt)}
             </Badge>
+          ) : onVerify ? (
+            <Button
+              size="xs"
+              variant="secondary"
+              onClick={(e) => {
+                e.stopPropagation();
+                onVerify(
+                  row.id,
+                  `${row.equipmentReference ?? row.equipmentId} on ${row.utilisationDate}`,
+                );
+              }}
+            >
+              Verify
+            </Button>
           ) : (
             <Badge tone="warning" size="xs">
               unchecked
@@ -529,7 +547,7 @@ export default function UtilisationTab({
           ),
       },
     ],
-    [],
+    [onVerify],
   );
 
   if (summary.error) return <LoadError message={summary.error} onRetry={summary.reload} />;

@@ -549,6 +549,8 @@ export interface BidAwardRow {
   isLowestBid: number | boolean;
   notLowestJustification: string | null;
   lowestBidAmount: number | null;
+  /** partial award: the levelling rows this award covers. Empty = whole package. */
+  scopeLevellingItemIds?: string[];
   savingAgainstEstimate: number | null;
   recommendedBy: string | null;
   recommendedAt: string | null;
@@ -604,6 +606,15 @@ export interface BidAward extends BidAwardRow {
   };
   comparison?: AwardComparison;
   warnings?: string[];
+  /** returned by POST award/recommend — what this award bought and what is left */
+  scope?: {
+    partial: boolean;
+    scopeLevellingItemIds: string[];
+    scopeLabels: string[];
+    remaining: Array<{ id: string; itemCode: string | null; description: string }>;
+    packageStatusAfterApproval: "awarded" | "partially_awarded";
+    note: string;
+  };
 }
 
 /* ================================================================== */

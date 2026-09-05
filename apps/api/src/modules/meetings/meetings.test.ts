@@ -1860,3 +1860,87 @@ describe("meetings health-inputs", () => {
     expect([403, 404]).toContain(res.statusCode);
   });
 });
+
+/* ================================================================== */
+/* AI minutes drafting (#418-421) — the degraded path                   */
+/* ================================================================== */
+
+describe("AI minutes drafting", () => {
+  let draftMeeting: string;
+
+  beforeAll(async () => {
+    const res = await inject("POST", `/api/v1/projects/${projectId}/meetings`, chair.headers, {
+      title: "Drafting test",
+      meetingType: "progress",
+    });
+    draftMeeting = res.json().id as string;
+  });
+
+  it("answers 503 AiDisabled with no key, and says the workflow does not depend on it", async () => {
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${draftMeeting}/minutes/draft-ai`,
+      chair.headers,
+      { transcript: "Chair: the crane arrives on the fourteenth. Bob will issue the lift plan." },
+    );
+    expect(res.statusCode).toBe(503);
+    expect(res.json().error).toBe("AiDisabled");
+    expect(res.json().message).toMatch(/nothing about issuing, objecting to or approving/i);
+  });
+
+  it("rejects a transcript too short to minute", async () => {
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${draftMeeting}/minutes/draft-ai`,
+      chair.headers,
+      { transcript: "hello" },
+    );
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("refuses a read-only member before it ever reaches the AI layer", async () => {
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${draftMeeting}/minutes/draft-ai`,
+      hRead,
+      { transcript: "Chair: the crane arrives on the fourteenth. Bob will issue the lift plan." },
+    );
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("is refused to another tenant", async () => {
+    const stranger = await registerActor(built.app);
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${draftMeeting}/minutes/draft-ai`,
+      stranger.headers,
+      { transcript: "Chair: the crane arrives on the fourteenth. Bob will issue the lift plan." },
+    );
+    expect([403, 404]).toContain(res.statusCode);
+  });
+
+  it("refuses to redraft over issued minutes before consulting the model", async () => {
+    const saved = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${draftMeeting}/minutes`,
+      chair.headers,
+      { minutesBody: "As recorded.", objectionPeriodDays: 7 },
+    );
+    expect(saved.statusCode).toBe(200);
+    const issued = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${draftMeeting}/minutes/issue`,
+      chair.headers,
+      { sendEmail: false },
+    );
+    expect(issued.statusCode).toBe(200);
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${draftMeeting}/minutes/draft-ai`,
+      chair.headers,
+      { transcript: "Chair: the crane arrives on the fourteenth. Bob will issue the lift plan." },
+    );
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toMatch(/minutes\/correct/);
+  });
+});

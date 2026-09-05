@@ -118,6 +118,31 @@ const zoneBody = z
     },
   );
 
+type PermitPrecaution = { item: string; required: boolean; done: boolean; note?: string };
+
+/**
+ * Apply a submitted precaution list to the one recorded on the permit.
+ *
+ * Ticking a precaution at the point of issue is legitimate; REWRITING the list
+ * the approver signed off is not. Recorded entries keep their `item` and their
+ * `required` flag — only `done` and the note may change — so an activation body
+ * can tick a precaution but can never delete one or turn a required precaution
+ * into an optional one. Genuinely new items are appended.
+ */
+function mergePrecautions(
+  recorded: readonly PermitPrecaution[],
+  submitted: readonly PermitPrecaution[],
+): PermitPrecaution[] {
+  const remaining = new Map(submitted.map((p) => [p.item, p]));
+  const merged = recorded.map((p) => {
+    const update = remaining.get(p.item);
+    remaining.delete(p.item);
+    if (!update) return p;
+    return { ...p, done: update.done, ...(update.note === undefined ? {} : { note: update.note }) };
+  });
+  return [...merged, ...remaining.values()];
+}
+
 export const permitRoutes: FastifyPluginAsync = async (app) => {
   const { readGate, standardGate, adminGate } = buildGates(app);
   const base = "/projects/:projectId/site";
@@ -357,15 +382,23 @@ export const permitRoutes: FastifyPluginAsync = async (app) => {
       const { row, openEntries } = await loadPermit(companyId, projectId, id);
       const at = nowISO();
 
+      // A transition body may tick the recorded precautions; it may not replace
+      // them. Without the merge, `activate` with `precautions: []` would clear
+      // the approved list and walk straight past the outstanding-precaution
+      // refusal that is the whole point of the control.
+      const precautions = body.precautions
+        ? mergePrecautions(row.precautions ?? [], body.precautions)
+        : undefined;
+
       const state = toState(row, openEntries);
-      if (action === "activate" && body.precautions) state.precautions = body.precautions;
+      if (action === "activate" && precautions) state.precautions = precautions;
       const verdict = canTransition(state, action, { userId: req.user!.id }, at);
       if (!verdict.allowed) throw conflict(verdict.reason);
       if (action === "reject" && !body.reason) throw badRequest("A rejection must carry a reason.");
       if (action === "suspend" && !body.reason) throw badRequest("A suspension must carry a reason.");
 
       const set: Record<string, unknown> = { updatedAt: at };
-      if (body.precautions) set["precautions"] = body.precautions;
+      if (precautions) set["precautions"] = precautions;
       switch (action) {
         case "request":
           set["status"] = "requested";

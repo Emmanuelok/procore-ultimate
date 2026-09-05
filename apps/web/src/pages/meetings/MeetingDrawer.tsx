@@ -1121,6 +1121,17 @@ function MinutesPanel({
         </Alert>
       ) : null}
 
+      {!issued && !approved ? (
+        <AiDraftPanel
+          projectId={projectId}
+          meeting={meeting}
+          onAccept={(text) => {
+            setBody(text);
+            setAiDrafted(true);
+          }}
+        />
+      ) : null}
+
       <Card>
         <CardBody className="space-y-3">
           <Field
@@ -1795,5 +1806,250 @@ function AddActionModal({
         </Field>
       </div>
     </Modal>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* AI MINUTES DRAFTING (#418-421)                                      */
+/*                                                                     */
+/* A PROPOSAL, never an issue. The model reads a transcript and         */
+/* proposes discussion per agenda item, decisions and actions with an   */
+/* owner drawn from the attendance roll; the minute taker reads it      */
+/* against the transcript and accepts what is right. Every weakness the */
+/* API counted — citations the transcript does not contain, owners not  */
+/* on the roll, agenda ids that do not exist — is printed rather than   */
+/* smoothed over, because a draft that reads as finished is the danger. */
+/* ------------------------------------------------------------------ */
+
+interface DraftCitation {
+  ref: string;
+  excerpt: string;
+  grounded: boolean;
+}
+interface DraftProposal {
+  summary: string | null;
+  items: Array<{
+    agendaItemId: string;
+    known: boolean;
+    title: string | null;
+    discussion: string;
+    movedSinceLast: boolean | null;
+    whatChanged: string | null;
+    carryCount: number;
+    citations: DraftCitation[];
+  }>;
+  decisions: Array<{
+    title: string;
+    decision: string;
+    impactsCost: boolean;
+    impactsSchedule: boolean;
+    citations: DraftCitation[];
+  }>;
+  actions: Array<{
+    title: string;
+    owner: { ownerId: string | null; ownerName: string | null; matched: boolean };
+    dueDate: string | null;
+    priority: string;
+    citations: DraftCitation[];
+  }>;
+  confidence: number | null;
+  ungroundedCitations: number;
+  unknownAgendaItems: number;
+  unmatchedOwners: number;
+  stalledCarriedItems: string[];
+}
+interface DraftResponse {
+  runId: string;
+  proposal: DraftProposal | null;
+  suggestedMinutesBody: string | null;
+  note: string;
+}
+
+function AiDraftPanel({
+  projectId,
+  meeting,
+  onAccept,
+}: {
+  projectId: string;
+  meeting: MeetingDetail;
+  onAccept: (minutesBody: string) => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [open, setOpen] = useState(false);
+  const [transcript, setTranscript] = useState("");
+  const [result, setResult] = useState<DraftResponse | null>(null);
+
+  async function draftIt() {
+    const res = await run("ai-draft", () =>
+      api.post<DraftResponse>(
+        `/api/v1/projects/${projectId}/meetings/${meeting.id}/minutes/draft-ai`,
+        { transcript },
+      ),
+    );
+    if (res !== null) setResult(res);
+  }
+
+  const p = result?.proposal ?? null;
+
+  return (
+    <Card>
+      <CardBody className="space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <p className="text-sm font-semibold text-content">Draft from a transcript</p>
+            <p className="text-meta text-content-muted">
+              The model proposes; it never issues. Nothing is written until you accept it, and
+              issuing minutes stays a human act because it starts a clock against real people.
+            </p>
+          </div>
+          <Button size="sm" variant="secondary" onClick={() => setOpen((v) => !v)}>
+            {open ? "Hide" : "Open"}
+          </Button>
+        </div>
+
+        {open ? (
+          <>
+            <RefusalPanel refusal={refusal} onDismiss={clear} />
+            <Field
+              label="Transcript or meeting notes"
+              hint="Every proposed sentence must quote this. Quotes that are not in it are flagged below rather than trusted."
+            >
+              <Textarea
+                rows={6}
+                value={transcript}
+                onChange={(e) => setTranscript(e.target.value)}
+              />
+            </Field>
+            <Button
+              size="sm"
+              disabled={transcript.trim().length < 50 || busy !== null}
+              loading={busy === "ai-draft"}
+              onClick={() => void draftIt()}
+            >
+              Propose minutes
+            </Button>
+
+            {result && p === null ? (
+              <Alert tone="warning" variant="subtle" size="sm" title="Nothing usable came back">
+                {result.note}
+              </Alert>
+            ) : null}
+
+            {p ? (
+              <div className="space-y-3">
+                <div className="flex flex-wrap gap-2">
+                  <Badge tone={p.ungroundedCitations > 0 ? "danger" : "success"}>
+                    {p.ungroundedCitations} quote(s) not found in the transcript
+                  </Badge>
+                  <Badge tone={p.unmatchedOwners > 0 ? "warning" : "success"}>
+                    {p.unmatchedOwners} owner(s) not on the roll
+                  </Badge>
+                  <Badge tone={p.unknownAgendaItems > 0 ? "warning" : "neutral"}>
+                    {p.unknownAgendaItems} unknown agenda item(s)
+                  </Badge>
+                  <Badge tone="neutral">
+                    confidence{" "}
+                    {p.confidence === null ? "—" : `${Math.round(p.confidence * 100)}%`}
+                  </Badge>
+                </div>
+
+                {p.stalledCarriedItems.length > 0 ? (
+                  <Alert
+                    tone="warning"
+                    variant="subtle"
+                    size="sm"
+                    title="Carried items the draft says did not move"
+                  >
+                    {p.stalledCarriedItems.join("; ")}. An item carried repeatedly without movement
+                    is an undecided question, not an agenda item.
+                  </Alert>
+                ) : null}
+
+                <div className="space-y-2">
+                  {p.items.map((item, i) => (
+                    <div key={i} className="rounded-md border border-line p-2">
+                      <p className="text-sm font-medium text-content">
+                        {item.title ?? item.agendaItemId}
+                        {item.known ? null : (
+                          <Badge tone="warning" size="xs" className="ml-2">
+                            unknown item
+                          </Badge>
+                        )}
+                      </p>
+                      <p className="whitespace-pre-wrap text-meta text-content-muted">
+                        {item.discussion}
+                      </p>
+                      {item.citations.map((c, j) => (
+                        <p
+                          key={j}
+                          className={cx(
+                            "mt-1 text-[11px] italic",
+                            c.grounded ? "text-content-muted" : "text-red-600",
+                          )}
+                        >
+                          {c.grounded ? "“" : "NOT IN THE TRANSCRIPT: “"}
+                          {c.excerpt}”
+                        </p>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+
+                {p.decisions.length > 0 ? (
+                  <div>
+                    <p className="text-sm font-semibold text-content">Proposed decisions</p>
+                    <ul className="list-disc pl-4 text-meta text-content-muted">
+                      {p.decisions.map((d, i) => (
+                        <li key={i}>
+                          <span className="font-medium">{d.title}</span>: {d.decision}
+                          {d.impactsCost ? " (cost impact)" : ""}
+                          {d.impactsSchedule ? " (schedule impact)" : ""}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+
+                {p.actions.length > 0 ? (
+                  <div>
+                    <p className="text-sm font-semibold text-content">Proposed actions</p>
+                    <ul className="list-disc pl-4 text-meta text-content-muted">
+                      {p.actions.map((a, i) => (
+                        <li key={i}>
+                          {a.title} —{" "}
+                          {a.owner.matched ? (
+                            a.owner.ownerName
+                          ) : (
+                            <span className="text-amber-700">
+                              {a.owner.ownerName ?? "unassigned"} (not on the roll — add them
+                              yourself)
+                            </span>
+                          )}
+                          {a.dueDate ? ` by ${a.dueDate}` : " with no date"}
+                        </li>
+                      ))}
+                    </ul>
+                    <p className="mt-1 text-[11px] text-content-muted">
+                      Decisions and actions are proposals only. Add the ones you accept on the
+                      Decisions and Actions tabs, where the segregation rules apply.
+                    </p>
+                  </div>
+                ) : null}
+
+                {result?.suggestedMinutesBody ? (
+                  <Button
+                    size="sm"
+                    onClick={() => onAccept(result.suggestedMinutesBody as string)}
+                  >
+                    Put this in the minutes box
+                  </Button>
+                ) : null}
+                <p className="text-[11px] text-content-muted">{result?.note}</p>
+              </div>
+            ) : null}
+          </>
+        ) : null}
+      </CardBody>
+    </Card>
   );
 }

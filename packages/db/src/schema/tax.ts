@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   doublePrecision,
   index,
@@ -213,6 +214,17 @@ export const withholdingCertificates = pgTable(
     index("withholding_certificates_project_idx").on(t.projectId, t.status),
     index("withholding_certificates_vendor_idx").on(t.vendorId),
     index("withholding_certificates_payment_idx").on(t.paymentId),
+    /**
+     * One live deduction statement per payment. The create route checks for a
+     * duplicate before inserting, but a check-then-insert is a race: two
+     * concurrent payment runs would both pass it and the payee would hold two
+     * statements for one payment (and the period would double-count the
+     * deduction). The constraint is what actually decides; the route turns the
+     * violation back into its 409.
+     */
+    uniqueIndex("withholding_certificates_payment_uq")
+      .on(t.companyId, t.paymentId)
+      .where(sql`${t.paymentId} is not null and ${t.status} <> 'cancelled'`),
     index("withholding_certificates_period_idx").on(t.companyId, t.paymentDate),
   ],
 );

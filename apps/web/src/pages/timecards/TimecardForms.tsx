@@ -20,12 +20,40 @@ import { Button, Field, Input, Modal, Select, Textarea } from "../../ui";
 import { api } from "../../lib/api";
 import {
   RefusalNotice,
+  labelize,
   today,
   useAction,
   type BatchRecord,
   type CostCodeOption,
   type CrewRecord,
 } from "./timecardsShared";
+
+/** Mirrors SHIFTS / CREW_STATUSES / CREW_ROLES in @constructos/shared — the
+ *  web package does not import the API's enum module, so the option lists are
+ *  restated here and the server remains the authority that refuses. */
+const SHIFT_OPTIONS = ["day", "night", "swing", "weekend", "split"] as const;
+const CREW_STATUS_OPTIONS = ["forming", "active", "inactive", "disbanded"] as const;
+const CREW_ROLE_OPTIONS = [
+  "foreman",
+  "leading_hand",
+  "operative",
+  "apprentice",
+  "operator",
+  "banksman",
+  "supervisor",
+  "specialist",
+  "labourer",
+] as const;
+/** index 0 = Sunday, matching `crewConfig.weekStartsOn` */
+const WEEKDAYS = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+] as const;
 
 function ModalShell({
   open,
@@ -899,6 +927,603 @@ export function TicketSourceModal({
           onChange={(e) => setUtilisationIds(e.target.value)}
           placeholder="eut_… eut_…"
         />
+      </Field>
+    </ModalShell>
+  );
+}
+
+/* ========================================================================== */
+/* Form a crew, and put people in it for a dated period                        */
+/* ========================================================================== */
+
+/**
+ * A CREW IS A PAY RULE WITH PEOPLE ATTACHED.
+ *
+ * The rule is asked for first and asked for plainly, because it decides what
+ * every hour the crew works costs. There is no platform default and this form
+ * offers none: `daily` wants a threshold, `weekly` wants a weekly threshold
+ * and a week start, `none` says outright that no hour will ever be classified
+ * as overtime. A crew saved with `daily` and no threshold is allowed — an
+ * agreement is often not known on the day a gang is formed — but the crew list
+ * then shows it as unable to classify hours, which is the honest state.
+ *
+ * `approvalLevels` is here too, because a two-tier crew whose second tier
+ * nobody configured is a crew whose cards sit submitted for ever.
+ */
+export function CrewCreateModal({
+  open,
+  onClose,
+  onDone,
+  projectId,
+  workers,
+  costCodes,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onDone: () => void;
+  projectId: string;
+  workers: WorkerOption[];
+  costCodes: CostCodeOption[];
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [name, setName] = useState("");
+  const [trade, setTrade] = useState("");
+  const [defaultShift, setDefaultShift] = useState("day");
+  const [status, setStatus] = useState("active");
+  const [foremanWorkerId, setForemanWorkerId] = useState("");
+  const [defaultCostCodeId, setDefaultCostCodeId] = useState("");
+  const [overtimeRule, setOvertimeRule] = useState<"daily" | "weekly" | "none">("daily");
+  const [dailyThreshold, setDailyThreshold] = useState("8");
+  const [dailyDouble, setDailyDouble] = useState("");
+  const [weeklyThreshold, setWeeklyThreshold] = useState("40");
+  const [weekStartsOn, setWeekStartsOn] = useState("1");
+  const [approvalLevels, setApprovalLevels] = useState("1");
+  const [tolerance, setTolerance] = useState("0.5");
+  const [activeFrom, setActiveFrom] = useState(today());
+
+  const num = (v: string) => (v === "" ? null : Number(v));
+
+  async function submit() {
+    const config =
+      overtimeRule === "daily"
+        ? {
+            overtimeRule,
+            doubleTimeThresholdHours: num(dailyDouble),
+            approvalLevels: Number(approvalLevels),
+            varianceToleranceHours: Number(tolerance),
+          }
+        : overtimeRule === "weekly"
+          ? {
+              overtimeRule,
+              weeklyOvertimeThresholdHours: num(weeklyThreshold),
+              weekStartsOn: Number(weekStartsOn),
+              approvalLevels: Number(approvalLevels),
+              varianceToleranceHours: Number(tolerance),
+            }
+          : {
+              overtimeRule,
+              approvalLevels: Number(approvalLevels),
+              varianceToleranceHours: Number(tolerance),
+            };
+    const done = await run("create", () =>
+      api.post(`/api/v1/projects/${projectId}/crews`, {
+        name: name.trim(),
+        trade: trade.trim() || null,
+        defaultShift,
+        status,
+        foremanWorkerId: foremanWorkerId || null,
+        defaultCostCodeId: defaultCostCodeId || null,
+        overtimeThresholdHours: overtimeRule === "daily" ? num(dailyThreshold) : null,
+        activeFrom: activeFrom || null,
+        config,
+      }),
+    );
+    if (done) {
+      toast.success("Crew formed");
+      onDone();
+      onClose();
+    }
+  }
+
+  return (
+    <ModalShell
+      open={open}
+      onClose={onClose}
+      title="Form a crew"
+      description="The overtime rule is asked for first because it decides what every hour this gang works costs. Leave it unset and the crew cannot classify hours at all — which the register will say."
+      busy={busy === "create"}
+      refusal={refusal}
+      clearRefusal={clear}
+      submitLabel="Form the crew"
+      disabled={name.trim() === ""}
+      onSubmit={submit}
+    >
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label="Crew name" required>
+          <Input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Groundworks gang 1"
+          />
+        </Field>
+        <Field label="Trade">
+          <Input value={trade} onChange={(e) => setTrade(e.target.value)} placeholder="Groundworks" />
+        </Field>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-3">
+        <Field label="Default shift">
+          <Select value={defaultShift} onChange={(e) => setDefaultShift(e.target.value)}>
+            {SHIFT_OPTIONS.map((s) => (
+              <option key={s} value={s}>
+                {labelize(s)}
+              </option>
+            ))}
+          </Select>
+        </Field>
+        <Field label="Status">
+          <Select value={status} onChange={(e) => setStatus(e.target.value)}>
+            {CREW_STATUS_OPTIONS.map((s) => (
+              <option key={s} value={s}>
+                {labelize(s)}
+              </option>
+            ))}
+          </Select>
+        </Field>
+        <Field label="Active from">
+          <Input type="date" value={activeFrom} onChange={(e) => setActiveFrom(e.target.value)} />
+        </Field>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label="Foreman" hint="From the worker register — this module keeps no second person list">
+          <Select value={foremanWorkerId} onChange={(e) => setForemanWorkerId(e.target.value)}>
+            <option value="">— none recorded —</option>
+            {workers.map((w) => (
+              <option key={w.id} value={w.id}>
+                {w.reference} · {w.fullName}
+              </option>
+            ))}
+          </Select>
+        </Field>
+        <Field label="Default cost code">
+          <Select value={defaultCostCodeId} onChange={(e) => setDefaultCostCodeId(e.target.value)}>
+            <option value="">— none —</option>
+            {costCodes.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.code} · {c.title}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      </div>
+
+      <Field
+        label="Overtime rule"
+        hint="8 hours a day is Californian, 40 a week is federal, 48 a week is the Working Time Directive. Pick the one this crew's agreement actually says."
+        required
+      >
+        <Select
+          value={overtimeRule}
+          onChange={(e) => setOvertimeRule(e.target.value as "daily" | "weekly" | "none")}
+        >
+          <option value="daily">Daily threshold</option>
+          <option value="weekly">Weekly threshold</option>
+          <option value="none">No overtime — every hour is plain time</option>
+        </Select>
+      </Field>
+      {overtimeRule === "daily" ? (
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Overtime after (hours/day)">
+            <Input
+              type="number"
+              step="0.25"
+              value={dailyThreshold}
+              onChange={(e) => setDailyThreshold(e.target.value)}
+            />
+          </Field>
+          <Field label="Double time after (hours/day)" hint="Leave empty if the agreement has none">
+            <Input
+              type="number"
+              step="0.25"
+              value={dailyDouble}
+              onChange={(e) => setDailyDouble(e.target.value)}
+            />
+          </Field>
+        </div>
+      ) : overtimeRule === "weekly" ? (
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Overtime after (hours/week)">
+            <Input
+              type="number"
+              step="0.5"
+              value={weeklyThreshold}
+              onChange={(e) => setWeeklyThreshold(e.target.value)}
+            />
+          </Field>
+          <Field label="Pay week starts">
+            <Select value={weekStartsOn} onChange={(e) => setWeekStartsOn(e.target.value)}>
+              {WEEKDAYS.map((d, i) => (
+                <option key={d} value={String(i)}>
+                  {d}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        </div>
+      ) : null}
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field
+          label="Approval tiers"
+          hint="How many DISTINCT approvers a card needs. Two tiers means two people, at two levels."
+        >
+          <Select value={approvalLevels} onChange={(e) => setApprovalLevels(e.target.value)}>
+            <option value="1">1 — one approver</option>
+            <option value="2">2 — supervisor then manager</option>
+            <option value="3">3</option>
+          </Select>
+        </Field>
+        <Field
+          label="Variance tolerance (hours)"
+          hint="Claimed against present, per day, before an explanation is required"
+        >
+          <Input
+            type="number"
+            step="0.25"
+            value={tolerance}
+            onChange={(e) => setTolerance(e.target.value)}
+          />
+        </Field>
+      </div>
+    </ModalShell>
+  );
+}
+
+/**
+ * MEMBERSHIP IS A DATED RANGE, never a flag. The API refuses a membership
+ * that overlaps another crew for the same worker and names the clash, and
+ * that refusal is rendered verbatim: two gangs claiming the same person on
+ * the same day is exactly the condition that makes a week's hours
+ * unauditable a year later.
+ *
+ * The rate asked for here is the worker's PAY rate. It costs the timecard;
+ * it is deliberately NOT what a T&M ticket bills the client at.
+ */
+export function CrewMemberModal({
+  open,
+  onClose,
+  onDone,
+  projectId,
+  crew,
+  workers,
+  costCodes,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onDone: () => void;
+  projectId: string;
+  crew: CrewRecord | null;
+  workers: WorkerOption[];
+  costCodes: CostCodeOption[];
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [workerId, setWorkerId] = useState("");
+  const [roleInCrew, setRoleInCrew] = useState("operative");
+  const [fromDate, setFromDate] = useState(today());
+  const [toDate, setToDate] = useState("");
+  const [classification, setClassification] = useState("");
+  const [hourlyRate, setHourlyRate] = useState("");
+  const [overtimeMultiplier, setOvertimeMultiplier] = useState("1.5");
+  const [doubleTimeMultiplier, setDoubleTimeMultiplier] = useState("2");
+  const [burdenRate, setBurdenRate] = useState("");
+  const [currency, setCurrency] = useState("USD");
+  const [defaultCostCodeId, setDefaultCostCodeId] = useState("");
+
+  const num = (v: string) => (v === "" ? null : Number(v));
+
+  async function submit() {
+    if (!crew) return;
+    const done = await run("add", () =>
+      api.post(`/api/v1/projects/${projectId}/crews/${crew.id}/members`, {
+        workerId,
+        roleInCrew,
+        fromDate,
+        toDate: toDate || null,
+        classification: classification.trim() || null,
+        hourlyRate: num(hourlyRate),
+        overtimeMultiplier: num(overtimeMultiplier),
+        doubleTimeMultiplier: num(doubleTimeMultiplier),
+        burdenRate: num(burdenRate),
+        currency: currency.toUpperCase(),
+        defaultCostCodeId: defaultCostCodeId || null,
+      }),
+    );
+    if (done) {
+      toast.success("Added to the crew");
+      onDone();
+      onClose();
+    }
+  }
+
+  return (
+    <ModalShell
+      open={open}
+      onClose={onClose}
+      title={crew ? `Add somebody to ${crew.reference}` : "Add a crew member"}
+      description="Membership is a dated range. It is how 'who was in this gang on the day of the incident' stays answerable a year later, so the platform refuses a range that overlaps another crew."
+      busy={busy === "add"}
+      refusal={refusal}
+      clearRefusal={clear}
+      submitLabel="Add to the crew"
+      disabled={!crew || workerId === "" || fromDate === ""}
+      onSubmit={submit}
+    >
+      {!crew ? (
+        <p className="text-meta text-ink-500">Choose a crew on the register first.</p>
+      ) : null}
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label="Worker" required>
+          <Select value={workerId} onChange={(e) => setWorkerId(e.target.value)}>
+            <option value="">— choose —</option>
+            {workers.map((w) => (
+              <option key={w.id} value={w.id}>
+                {w.reference} · {w.fullName}
+              </option>
+            ))}
+          </Select>
+        </Field>
+        <Field label="Role in the crew">
+          <Select value={roleInCrew} onChange={(e) => setRoleInCrew(e.target.value)}>
+            {CREW_ROLE_OPTIONS.map((r) => (
+              <option key={r} value={r}>
+                {labelize(r)}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label="From" required>
+          <Input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} />
+        </Field>
+        <Field label="To" hint="Leave empty while the membership is open">
+          <Input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} />
+        </Field>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-3">
+        <Field label="Classification" hint="Trade grade as the agreement names it">
+          <Input
+            value={classification}
+            onChange={(e) => setClassification(e.target.value)}
+            placeholder="Skilled operative"
+          />
+        </Field>
+        <Field label="Pay rate / hour" hint="What the hour COSTS — not the T&M charge-out rate">
+          <Input
+            type="number"
+            step="0.01"
+            value={hourlyRate}
+            onChange={(e) => setHourlyRate(e.target.value)}
+          />
+        </Field>
+        <Field label="Currency">
+          <Input
+            value={currency}
+            maxLength={3}
+            onChange={(e) => setCurrency(e.target.value)}
+          />
+        </Field>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-3">
+        <Field label="Overtime multiplier">
+          <Input
+            type="number"
+            step="0.05"
+            value={overtimeMultiplier}
+            onChange={(e) => setOvertimeMultiplier(e.target.value)}
+          />
+        </Field>
+        <Field label="Double-time multiplier">
+          <Input
+            type="number"
+            step="0.05"
+            value={doubleTimeMultiplier}
+            onChange={(e) => setDoubleTimeMultiplier(e.target.value)}
+          />
+        </Field>
+        <Field label="Burden rate" hint="On-costs as a fraction, e.g. 0.28">
+          <Input
+            type="number"
+            step="0.01"
+            value={burdenRate}
+            onChange={(e) => setBurdenRate(e.target.value)}
+          />
+        </Field>
+      </div>
+      <Field label="Default cost code for this person">
+        <Select value={defaultCostCodeId} onChange={(e) => setDefaultCostCodeId(e.target.value)}>
+          <option value="">— none —</option>
+          {costCodes.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.code} · {c.title}
+            </option>
+          ))}
+        </Select>
+      </Field>
+    </ModalShell>
+  );
+}
+
+/* ========================================================================== */
+/* Record field progress                                                       */
+/* ========================================================================== */
+
+const PROGRESS_METHOD_OPTIONS = [
+  { value: "field_measure", label: "Measured on site" },
+  { value: "count", label: "Counted" },
+  { value: "survey", label: "Surveyed" },
+  { value: "percentage_assessment", label: "Percentage assessment" },
+  { value: "supplier_docket", label: "From a supplier docket" },
+  { value: "import", label: "Imported" },
+];
+
+/**
+ * WHAT WAS INSTALLED, MEASURED BY SOMEBODY WHO WALKED IT.
+ *
+ * The quantity box on a timecard lets the person claiming the hours also
+ * state what those hours produced — one author, both sides of the ratio.
+ * This form is the other side. Where an entry exists for a budget line, the
+ * report earns hours from THESE quantities and ignores the ones typed on the
+ * timesheets, because adding a claim to its own check counts the work twice.
+ *
+ * The unit is not converted. If the line is measured in m3 and somebody
+ * measured m2, the server refuses rather than guessing a factor that would
+ * silently become an earned-value figure.
+ */
+export function FieldProgressModal({
+  open,
+  onClose,
+  onDone,
+  projectId,
+  crews,
+  costCodes,
+  budgetLines,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onDone: () => void;
+  projectId: string;
+  crews: CrewRecord[];
+  costCodes: CostCodeOption[];
+  budgetLines: Array<{ id: string; costCode: string; description: string; unit: string | null }>;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [progressDate, setProgressDate] = useState(today());
+  const [budgetLineItemId, setBudgetLineItemId] = useState("");
+  const [costCodeId, setCostCodeId] = useState("");
+  const [crewId, setCrewId] = useState("");
+  const [quantity, setQuantity] = useState("");
+  const [unit, setUnit] = useState("");
+  const [method, setMethod] = useState("field_measure");
+  const [notes, setNotes] = useState("");
+
+  const line = budgetLines.find((b) => b.id === budgetLineItemId);
+
+  async function submit() {
+    const done = await run("save", () =>
+      api.post(`/api/v1/projects/${projectId}/labour-progress`, {
+        progressDate,
+        budgetLineItemId: budgetLineItemId || null,
+        costCodeId: costCodeId || null,
+        crewId: crewId || null,
+        quantity: Number(quantity),
+        unit: unit.trim(),
+        method,
+        notes: notes.trim() || null,
+      }),
+    );
+    if (done) {
+      toast.success("Progress recorded");
+      setQuantity("");
+      setNotes("");
+      onDone();
+      onClose();
+    }
+  }
+
+  return (
+    <ModalShell
+      open={open}
+      onClose={onClose}
+      title="Record field progress"
+      description="Installed quantity per cost code per day, measured separately from the timesheets. Where this exists the report earns hours from it and ignores the quantity typed on the cards."
+      busy={busy === "save"}
+      refusal={refusal}
+      clearRefusal={clear}
+      submitLabel="Record it"
+      disabled={
+        quantity === "" ||
+        unit.trim() === "" ||
+        (budgetLineItemId === "" && costCodeId === "")
+      }
+      onSubmit={submit}
+    >
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label="Date measured" required hint="The day it is earned on, not the day it was typed">
+          <Input
+            type="date"
+            value={progressDate}
+            onChange={(e) => setProgressDate(e.target.value)}
+          />
+        </Field>
+        <Field label="Method">
+          <Select value={method} onChange={(e) => setMethod(e.target.value)}>
+            {PROGRESS_METHOD_OPTIONS.map((m) => (
+              <option key={m.value} value={m.value}>
+                {m.label}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      </div>
+      <Field
+        label="Budget line"
+        hint="Without one the quantity cannot be earned against a planned rate — it is recorded, but it measures nothing."
+      >
+        <Select
+          value={budgetLineItemId}
+          onChange={(e) => {
+            setBudgetLineItemId(e.target.value);
+            const chosen = budgetLines.find((b) => b.id === e.target.value);
+            if (chosen?.unit) setUnit(chosen.unit);
+          }}
+        >
+          <option value="">— none —</option>
+          {budgetLines.map((b) => (
+            <option key={b.id} value={b.id}>
+              {b.costCode} · {b.description}
+              {b.unit ? ` (${b.unit})` : ""}
+            </option>
+          ))}
+        </Select>
+      </Field>
+      <Field label="Cost code">
+        <Select value={costCodeId} onChange={(e) => setCostCodeId(e.target.value)}>
+          <option value="">— none —</option>
+          {costCodes.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.code} · {c.title}
+            </option>
+          ))}
+        </Select>
+      </Field>
+      <div className="grid gap-3 sm:grid-cols-3">
+        <Field label="Quantity installed" required>
+          <Input
+            type="number"
+            step="0.001"
+            value={quantity}
+            onChange={(e) => setQuantity(e.target.value)}
+          />
+        </Field>
+        <Field
+          label="Unit"
+          required
+          {...(line?.unit ? { hint: `The budget line is measured in ${line.unit}` } : {})}
+        >
+          <Input value={unit} onChange={(e) => setUnit(e.target.value)} placeholder="m3" />
+        </Field>
+        <Field label="Crew" hint="Leave empty and the per-crew comparison abstains rather than guessing">
+          <Select value={crewId} onChange={(e) => setCrewId(e.target.value)}>
+            <option value="">— not attributed —</option>
+            {crews.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.reference} · {c.name}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      </div>
+      <Field label="Notes" optional>
+        <Textarea rows={2} value={notes} onChange={(e) => setNotes(e.target.value)} />
       </Field>
     </ModalShell>
   );

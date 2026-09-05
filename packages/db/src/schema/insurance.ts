@@ -219,6 +219,18 @@ export const insuranceClaims = pgTable(
     repudiationReason: text("repudiation_reason"),
     settledAmount: doublePrecision("settled_amount"),
     settledAt: text("settled_at"),
+    /** the adjuster as a directory contact, when they are one (#785) */
+    lossAdjusterContactId: text("loss_adjuster_contact_id"),
+    /**
+     * The assembled claim documentation (#784), content-addressed. An insurer
+     * decides a claim on the pack it was given; recording WHICH bytes were
+     * given is the difference between "we sent everything" and being able to
+     * show it. Regenerating produces a new hash rather than mutating this one.
+     */
+    packFileId: text("pack_file_id"),
+    packSha256: text("pack_sha256"),
+    packGeneratedAt: timestamp("pack_generated_at", { withTimezone: true, mode: "string" }),
+    packItemCount: integer("pack_item_count").default(0).notNull(),
     /** links to the platform records this claim arises from */
     linkedRecords: jsonb("linked_records").$type<unknown[]>().default([]).notNull(),
     createdBy: text("created_by").notNull(),
@@ -377,5 +389,53 @@ export const insurancePremiums = pgTable(
   (t) => [
     index("insurance_premiums_policy_idx").on(t.policyId),
     index("insurance_premiums_company_idx").on(t.companyId, t.currency),
+  ],
+);
+
+/**
+ * THE LOSS ADJUSTER'S TASK LIST (#785).
+ *
+ * A claim is rarely lost on its merits; it is lost because the adjuster asked
+ * for six things and two were never sent. Each request is a dated ask with an
+ * owner, carried as an Obligation so it is subject to the same deadline
+ * machinery as every other time bar on the platform — an information request
+ * that quietly runs past its date is exactly the failure this table exists to
+ * make visible.
+ *
+ * Site visits and interim reports live here too: they are the same shape (a
+ * dated event the claim's progress depends on) and separating them would only
+ * scatter the adjuster's diary across three registers.
+ */
+export const insuranceClaimRequests = pgTable(
+  "insurance_claim_requests",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id"),
+    claimId: text("claim_id").notNull(),
+    kind: text("kind").default("information_request").notNull(), // ClaimRequestKind
+    title: text("title").notNull(),
+    description: text("description"),
+    /** who asked — the adjuster, the insurer, the broker */
+    requestedBy: text("requested_by"),
+    requestedAt: text("requested_at"),
+    dueDate: text("due_date"),
+    /** the deadline carried as a real obligation, when there is one */
+    obligationId: text("obligation_id"),
+    /** the platform user who owes the answer */
+    ownerId: text("owner_id"),
+    status: text("status").default("open").notNull(), // ClaimRequestStatus
+    respondedAt: timestamp("responded_at", { withTimezone: true, mode: "string" }),
+    respondedBy: text("responded_by"),
+    responseNote: text("response_note"),
+    evidenceFileIds: jsonb("evidence_file_ids").$type<string[]>().default([]).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("insurance_claim_requests_claim_idx").on(t.claimId, t.status),
+    index("insurance_claim_requests_company_idx").on(t.companyId, t.status, t.dueDate),
+    index("insurance_claim_requests_project_idx").on(t.companyId, t.projectId),
   ],
 );

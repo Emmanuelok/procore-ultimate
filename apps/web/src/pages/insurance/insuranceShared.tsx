@@ -264,6 +264,10 @@ export interface ClaimRow {
   createdBy: string;
   createdAt: string;
   updatedAt: string;
+  packFileId: string | null;
+  packSha256: string | null;
+  packGeneratedAt: string | null;
+  packItemCount: number;
   /** derived */
   daysToNotificationDue: number | null;
   notificationOutstanding: boolean;
@@ -1261,3 +1265,52 @@ export function Pager({
     </div>
   );
 }
+
+/* --------------------- Claim pack and the loss adjuster -------------------- */
+
+/** One entry on the adjuster's task list (#785). `overdue` is derived server-side. */
+export interface ClaimRequest {
+  id: string;
+  claimId: string;
+  kind: string;
+  title: string;
+  description: string | null;
+  requestedBy: string | null;
+  requestedAt: string | null;
+  dueDate: string | null;
+  obligationId: string | null;
+  ownerId: string | null;
+  status: string;
+  respondedAt: string | null;
+  respondedBy: string | null;
+  responseNote: string | null;
+  overdue: boolean;
+  daysToDue: number | null;
+}
+
+export interface ClaimRequestList {
+  items: ClaimRequest[];
+  total: number;
+  open: number;
+  overdue: number;
+}
+
+/** POST /claims/:id/pack — the assembled, content-addressed documentation. */
+export interface ClaimPackResult {
+  claimId: string;
+  fileId: string;
+  sha256: string;
+  sizeBytes: number;
+  contentType: string;
+  generatedAt: string;
+  itemCount: number;
+  gaps: string[];
+  note: string;
+}
+
+export const CLAIM_REQUEST_KIND_LABELS: Record<string, string> = {
+  information_request: "Information request",
+  site_visit: "Site visit",
+  interim_report: "Interim report",
+  expert_appointment: "Expert appointment",
+};

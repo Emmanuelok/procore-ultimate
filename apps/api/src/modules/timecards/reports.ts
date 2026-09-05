@@ -21,12 +21,13 @@
  * be summed.
  */
 import type { FastifyPluginAsync } from "fastify";
-import { and, eq, gte, inArray, isNull, lte, ne, sql } from "drizzle-orm";
+import { and, count, desc, eq, gte, inArray, isNull, lte, ne, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   budgetLineItems,
   costCodes,
   crews,
+  labourProgressEntries,
   payrollEntries,
   projects,
   signals,
@@ -38,7 +39,8 @@ import {
 } from "@constructos/db";
 import { PAYROLL_EXPORT_FORMATS } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
-import { badRequest, notFound } from "../../lib/errors.js";
+import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
+import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { forEachCompany } from "../../lib/scheduler.js";
 import {
   computeProductivity,
@@ -47,6 +49,7 @@ import {
   PRODUCTIVITY_MIN_WEEKS,
   type ProductivityAllocation,
   type ProductivityBudgetLine,
+  type ProductivityProgress,
 } from "./productivity.js";
 import {
   buildCertifiedPayroll,
@@ -79,8 +82,232 @@ const windowQuery = z.object({
 /** Statuses whose hours are a real claim on the job. */
 const LIVE_STATUSES = ["draft", "submitted", "approved", "locked", "exported"];
 
+const PROGRESS_METHODS = [
+  "field_measure",
+  "count",
+  "survey",
+  "percentage_assessment",
+  "supplier_docket",
+  "import",
+] as const;
+
+const progressCreateSchema = z.object({
+  progressDate: isoDateSchema,
+  quantity: z.number().finite().gt(0),
+  unit: z.string().min(1).max(40),
+  costCodeId: z.string().min(1).max(64).nullable().optional(),
+  budgetLineItemId: z.string().min(1).max(64).nullable().optional(),
+  crewId: z.string().min(1).max(64).nullable().optional(),
+  locationId: z.string().min(1).max(64).nullable().optional(),
+  scheduleActivityId: z.string().min(1).max(64).nullable().optional(),
+  method: z.enum(PROGRESS_METHODS).default("field_measure"),
+  cumulativeQuantity: z.number().finite().min(0).nullable().optional(),
+  notes: z.string().max(4000).nullable().optional(),
+  photoFileIds: z.array(z.string().min(1).max(64)).max(50).optional(),
+});
+
+const progressListQuery = pageQuerySchema.extend({
+  from: isoDateSchema.optional(),
+  to: isoDateSchema.optional(),
+  budgetLineItemId: z.string().min(1).max(64).optional(),
+  crewId: z.string().min(1).max(64).optional(),
+  unverifiedOnly: z.enum(["true", "false"]).optional(),
+});
+
 export const timecardReportRoutes: FastifyPluginAsync = async (app) => {
   const gates = timecardGates(app);
+
+  /* ---------------------------------------------------------------- */
+  /* Field progress — the other side of the productivity ratio         */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Record what is actually installed, per cost code, per day.
+   *
+   * This exists because `allocation.quantity` lets the person claiming the
+   * hours also state what those hours produced. An entry here is a separate
+   * record with its own author and its own method, and it SUPERSEDES the
+   * allocation quantities on the same budget line rather than adding to them.
+   */
+  app.post(
+    "/projects/:projectId/labour-progress",
+    { preHandler: gates.standard },
+    async (req, reply) => {
+      const body = progressCreateSchema.parse(req.body);
+      const companyId = companyOf(req);
+      const projectId = projectOf(req);
+      if (!body.costCodeId && !body.budgetLineItemId) {
+        throw badRequest(
+          "A progress entry that names neither a cost code nor a budget line cannot be earned " +
+            "against anything, and cannot be compared with the hours. Code it.",
+        );
+      }
+      let costCode: string | null = null;
+      if (body.costCodeId) {
+        const rows = await app.db
+          .select({ id: costCodes.id, code: costCodes.code })
+          .from(costCodes)
+          .where(and(eq(costCodes.id, body.costCodeId), eq(costCodes.companyId, companyId)))
+          .limit(1);
+        if (!rows[0]) throw notFound(`Cost code ${body.costCodeId} not found`);
+        costCode = rows[0].code;
+      }
+      if (body.budgetLineItemId) {
+        const rows = await app.db
+          .select({ id: budgetLineItems.id, unit: budgetLineItems.unit })
+          .from(budgetLineItems)
+          .where(
+            and(
+              eq(budgetLineItems.id, body.budgetLineItemId),
+              eq(budgetLineItems.companyId, companyId),
+              eq(budgetLineItems.projectId, projectId),
+            ),
+          )
+          .limit(1);
+        const line = rows[0];
+        if (!line) throw notFound(`Budget line ${body.budgetLineItemId} not found on this project`);
+        if (
+          line.unit &&
+          line.unit.trim().toLowerCase() !== body.unit.trim().toLowerCase()
+        ) {
+          throw badRequest(
+            `This progress is measured in ${body.unit} and the budget line is measured in ` +
+              `${line.unit}. Quantities in different units are never converted here, because a ` +
+              "guessed conversion factor becomes an earned-value figure nobody can trace.",
+          );
+        }
+      }
+      if (body.crewId) {
+        const rows = await app.db
+          .select({ id: crews.id })
+          .from(crews)
+          .where(
+            and(
+              eq(crews.id, body.crewId),
+              eq(crews.companyId, companyId),
+              eq(crews.projectId, projectId),
+            ),
+          )
+          .limit(1);
+        if (!rows[0]) throw notFound(`Crew ${body.crewId} not found on this project`);
+      }
+
+      const id = newId("lpr");
+      await app.db.insert(labourProgressEntries).values({
+        id,
+        companyId,
+        projectId,
+        progressDate: body.progressDate,
+        costCodeId: body.costCodeId ?? null,
+        costCode,
+        budgetLineItemId: body.budgetLineItemId ?? null,
+        crewId: body.crewId ?? null,
+        locationId: body.locationId ?? null,
+        scheduleActivityId: body.scheduleActivityId ?? null,
+        quantity: body.quantity,
+        unit: body.unit,
+        method: body.method,
+        cumulativeQuantity: body.cumulativeQuantity ?? null,
+        notes: body.notes ?? null,
+        photoFileIds: body.photoFileIds ?? [],
+        recordedBy: req.user!.id,
+      });
+      await ledgerTimecards(app.db, req, "create", "labour_progress_entry", id, {
+        progressDate: body.progressDate,
+        quantity: body.quantity,
+        unit: body.unit,
+        budgetLineItemId: body.budgetLineItemId ?? null,
+        costCodeId: body.costCodeId ?? null,
+        method: body.method,
+      });
+      const [created] = await app.db
+        .select()
+        .from(labourProgressEntries)
+        .where(eq(labourProgressEntries.id, id))
+        .limit(1);
+      return reply.status(201).send(created);
+    },
+  );
+
+  app.get("/projects/:projectId/labour-progress", { preHandler: gates.read }, async (req) => {
+    const q = progressListQuery.parse(req.query);
+    const clauses = [
+      eq(labourProgressEntries.companyId, companyOf(req)),
+      eq(labourProgressEntries.projectId, projectOf(req)),
+    ];
+    if (q.from) clauses.push(gte(labourProgressEntries.progressDate, q.from));
+    if (q.to) clauses.push(lte(labourProgressEntries.progressDate, q.to));
+    if (q.budgetLineItemId)
+      clauses.push(eq(labourProgressEntries.budgetLineItemId, q.budgetLineItemId));
+    if (q.crewId) clauses.push(eq(labourProgressEntries.crewId, q.crewId));
+    if (q.unverifiedOnly === "true") clauses.push(isNull(labourProgressEntries.verifiedBy));
+    const where = and(...clauses);
+    const [totalRow] = await app.db
+      .select({ n: count() })
+      .from(labourProgressEntries)
+      .where(where);
+    const rows = await app.db
+      .select()
+      .from(labourProgressEntries)
+      .where(where)
+      .orderBy(desc(labourProgressEntries.progressDate), desc(labourProgressEntries.createdAt))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    return paginate(rows, Number(totalRow?.n ?? 0), q);
+  });
+
+  /**
+   * Countersign a measurement. Never the person who took it: a quantity that
+   * decides an interim valuation is exactly the number a second pair of eyes
+   * exists for, and ADR 0004 applies to it as it does to everything else.
+   */
+  app.post(
+    "/projects/:projectId/labour-progress/:progressId/verify",
+    { preHandler: gates.standard },
+    async (req) => {
+      const { progressId } = req.params as { progressId: string };
+      const body = z.object({ note: z.string().max(2000).optional() }).parse(req.body ?? {});
+      const companyId = companyOf(req);
+      const projectId = projectOf(req);
+      const [row] = await app.db
+        .select()
+        .from(labourProgressEntries)
+        .where(
+          and(
+            eq(labourProgressEntries.id, progressId),
+            eq(labourProgressEntries.companyId, companyId),
+            eq(labourProgressEntries.projectId, projectId),
+          ),
+        )
+        .limit(1);
+      if (!row) throw notFound("Progress entry not found");
+      if (row.verifiedBy) throw conflict("this measurement has already been verified");
+      if (row.recordedBy === req.user!.id) {
+        throw forbidden(
+          "A measurement is not verified by whoever took it (ADR 0004). The whole point of a " +
+            "field progress entry is that it is an independent check on the hours; a self-signed " +
+            "one is the timesheet quantity with a longer audit trail.",
+        );
+      }
+      const now = nowIso();
+      await app.db
+        .update(labourProgressEntries)
+        .set({
+          verifiedBy: req.user!.id,
+          verifiedAt: now,
+          detail: { ...(row.detail ?? {}), verificationNote: body.note ?? null },
+          updatedAt: now,
+        })
+        .where(eq(labourProgressEntries.id, progressId));
+      await ledgerTimecards(app.db, req, "state_change", "labour_progress_entry", progressId, {
+        verified: true,
+        quantity: row.quantity,
+        unit: row.unit,
+        note: body.note ?? null,
+      });
+      return { id: progressId, verifiedBy: req.user!.id, verifiedAt: now };
+    },
+  );
 
   /* ---------------------------------------------------------------- */
   /* Productivity and earned value                                     */
@@ -103,30 +330,66 @@ export const timecardReportRoutes: FastifyPluginAsync = async (app) => {
     ];
     if (crewId) clauses.push(eq(timecards.crewId, crewId));
     const cards = await app.db.select().from(timecards).where(and(...clauses));
-    if (cards.length === 0) {
+
+    /*
+     * FIELD PROGRESS, WHERE ANYBODY HAS MEASURED ANY. Loaded before the
+     * early return, because a window with measured quantity and no coded
+     * hours is a real state — the work is done and nobody has booked the
+     * labour — and reporting nothing at all for it hides exactly that.
+     */
+    const progressRows = await app.db
+      .select()
+      .from(labourProgressEntries)
+      .where(
+        and(
+          eq(labourProgressEntries.companyId, companyId),
+          eq(labourProgressEntries.projectId, projectId),
+          gte(labourProgressEntries.progressDate, from),
+          lte(labourProgressEntries.progressDate, to),
+          ...(crewId ? [eq(labourProgressEntries.crewId, crewId)] : []),
+        ),
+      );
+
+    if (cards.length === 0 && progressRows.length === 0) {
       return {
         report: computeProductivity([], []),
         cards: 0,
       };
     }
-    const allocations = await app.db
-      .select()
-      .from(timecardAllocations)
-      .where(
-        inArray(
-          timecardAllocations.timecardId,
-          cards.map((c) => c.id),
-        ),
-      );
+    const allocations = cards.length
+      ? await app.db
+          .select()
+          .from(timecardAllocations)
+          .where(
+            inArray(
+              timecardAllocations.timecardId,
+              cards.map((c) => c.id),
+            ),
+          )
+      : [];
     const cardById = new Map(cards.map((c) => [c.id, c] as const));
-    const crewIds = [...new Set(cards.map((c) => c.crewId).filter((v): v is string => !!v))];
+    const crewIds = [
+      ...new Set(
+        [...cards.map((c) => c.crewId), ...progressRows.map((p) => p.crewId)].filter(
+          (v): v is string => !!v,
+        ),
+      ),
+    ];
     const crewRows = crewIds.length
       ? await app.db.select().from(crews).where(inArray(crews.id, crewIds))
       : [];
     const crewById = new Map(crewRows.map((c) => [c.id, c] as const));
 
+    // Both sides of the ratio name budget lines; a line that only field
+    // progress reached still has to be looked up, or it reports as "no
+    // budget line found" when one plainly exists.
     const budgetIds = [
-      ...new Set(allocations.map((a) => a.budgetLineItemId).filter((v): v is string => !!v)),
+      ...new Set(
+        [
+          ...allocations.map((a) => a.budgetLineItemId),
+          ...progressRows.map((p) => p.budgetLineItemId),
+        ].filter((v): v is string => !!v),
+      ),
     ];
     const budgetRows = budgetIds.length
       ? await app.db
@@ -168,9 +431,30 @@ export const timecardReportRoutes: FastifyPluginAsync = async (app) => {
 
     // The pay week the crews actually run on, where they all agree.
     const weekStarts = [...new Set(crewRows.map((c) => crewConfig(c).weekStartsOn))];
+    const progress: ProductivityProgress[] = progressRows.map((p) => {
+      const crew = p.crewId ? crewById.get(p.crewId) : undefined;
+      return {
+        budgetLineItemId: p.budgetLineItemId,
+        costCodeId: p.costCodeId,
+        progressDate: p.progressDate,
+        crewId: p.crewId,
+        crewName: crew ? `${crew.reference} ${crew.name}` : null,
+        quantity: p.quantity,
+        unit: p.unit,
+      };
+    });
     const report = computeProductivity(inputs, lines, {
       ...(weekStarts.length === 1 ? { weekStartsOn: weekStarts[0]! } : {}),
+      progress,
     });
+    const unverified = progressRows.filter((p) => !p.verifiedBy).length;
+    if (unverified > 0) {
+      report.reasons.push(
+        `${unverified} of ${progressRows.length} field progress entr` +
+          `${progressRows.length === 1 ? "y has" : "ies have"} not been countersigned by a second ` +
+          "person. The figures below stand on measurements only their author has seen.",
+      );
+    }
     if (weekStarts.length > 1) {
       report.reasons.push(
         `The crews on this project start their pay week on ${weekStarts.length} different days, ` +

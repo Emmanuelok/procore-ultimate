@@ -3,14 +3,18 @@ import { and, count, desc, eq, gte, ilike, inArray, isNull, lte, or, sql } from 
 import { z } from "zod";
 import {
   companies,
+  insuranceCertificates,
   lessonApplications,
   lessonPushes,
   lessonTriggers,
   lessons,
+  meetingActionItems,
+  nonConformanceReports,
   obligations,
   postProjectReviews,
   projectMemberships,
   projects,
+  vendors,
 } from "@constructos/db";
 import {
   LESSON_CATEGORIES,
@@ -47,6 +51,7 @@ import {
   type RankableLesson,
   type SearchableLesson,
 } from "./relevance.js";
+import { scoreSuppliers } from "./suppliers.js";
 import {
   describeTriggerRules,
   dueDaysFor,
@@ -1811,6 +1816,153 @@ export const learningModule: FastifyPluginAsync = async (app) => {
         total: applicationRows.length,
         crossProject: crossProjectApplications,
       },
+    };
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* CROSS-PROJECT SUPPLIER PERFORMANCE (#987-989)                     */
+  /*                                                                   */
+  /* A vendor's record on one job is an anecdote; the same record       */
+  /* across eleven is knowledge, and knowledge that crosses a project   */
+  /* boundary is what this module holds. Deterministic, sourced from    */
+  /* acts the platform already recorded, and scoped to the projects the */
+  /* caller may actually see — a scorecard assembled from projects      */
+  /* somebody cannot open is a disclosure, not a report.                */
+  /* ---------------------------------------------------------------- */
+
+  app.get("/learning/supplier-performance", { preHandler: companyScopedRead }, async (req) => {
+    const q = z
+      .object({
+        vendorId: z.string().max(64).optional(),
+        limit: z.coerce.number().int().min(1).max(200).default(50),
+      })
+      .parse(req.query ?? {});
+    const companyId = req.companyId!;
+    const scope = companyScopeOf(req, "learning");
+    const asOf = todayISO();
+
+    /* The project restriction, expressed once. `null` project (a company-wide
+       certificate) is a tenant asset and stays visible; a project record is
+       visible only where the caller holds the tool. */
+    const visible = scope.all ? null : scope.projectIds;
+    if (visible !== null && visible.length === 0) {
+      return {
+        asOf,
+        items: [],
+        total: 0,
+        scope: "restricted" as const,
+        note:
+          "You hold learning on no project, so no supplier record can be assembled. This is not " +
+          "the same as there being nothing to report.",
+      };
+    }
+
+    const vendorRows = await app.db
+      .select({ id: vendors.id, name: vendors.name })
+      .from(vendors)
+      .where(
+        and(
+          eq(vendors.companyId, companyId),
+          q.vendorId ? eq(vendors.id, q.vendorId) : undefined,
+        ),
+      )
+      .orderBy(vendors.name)
+      .limit(q.limit);
+    if (vendorRows.length === 0) {
+      return {
+        asOf,
+        items: [],
+        total: 0,
+        scope: visible === null ? ("company" as const) : ("restricted" as const),
+        note: "No vendor is recorded in this company's directory.",
+      };
+    }
+    const vendorIds = vendorRows.map((v) => v.id);
+
+    const certRows = await app.db
+      .select({
+        vendorId: insuranceCertificates.vendorId,
+        validTo: insuranceCertificates.validTo,
+        verifiedAt: insuranceCertificates.verifiedAt,
+        status: insuranceCertificates.status,
+        projectId: insuranceCertificates.projectId,
+      })
+      .from(insuranceCertificates)
+      .where(
+        and(
+          eq(insuranceCertificates.companyId, companyId),
+          inArray(insuranceCertificates.vendorId, vendorIds),
+          visible === null
+            ? undefined
+            : or(
+                isNull(insuranceCertificates.projectId),
+                inArray(insuranceCertificates.projectId, visible),
+              ),
+        ),
+      );
+
+    const actionRows = await app.db
+      .select({
+        ownerVendorId: meetingActionItems.ownerVendorId,
+        status: meetingActionItems.status,
+        dueDate: meetingActionItems.dueDate,
+        completedAt: meetingActionItems.completedAt,
+        carryCount: meetingActionItems.carryCount,
+      })
+      .from(meetingActionItems)
+      .where(
+        and(
+          eq(meetingActionItems.companyId, companyId),
+          inArray(meetingActionItems.ownerVendorId, vendorIds),
+          visible === null ? undefined : inArray(meetingActionItems.projectId, visible),
+        ),
+      );
+
+    const ncrRows = await app.db
+      .select({
+        raisedAgainstVendorId: nonConformanceReports.raisedAgainstVendorId,
+        status: nonConformanceReports.status,
+        severity: nonConformanceReports.severity,
+      })
+      .from(nonConformanceReports)
+      .where(
+        and(
+          eq(nonConformanceReports.companyId, companyId),
+          inArray(nonConformanceReports.raisedAgainstVendorId, vendorIds),
+          visible === null ? undefined : inArray(nonConformanceReports.projectId, visible),
+        ),
+      );
+
+    const items = scoreSuppliers({
+      asOf,
+      vendors: vendorRows,
+      certificates: certRows.flatMap((c) =>
+        c.vendorId ? [{ ...c, vendorId: c.vendorId }] : [],
+      ),
+      actions: actionRows.flatMap((a) =>
+        a.ownerVendorId ? [{ ...a, ownerVendorId: a.ownerVendorId }] : [],
+      ),
+      ncrs: ncrRows.flatMap((n) =>
+        n.raisedAgainstVendorId
+          ? [{ ...n, raisedAgainstVendorId: n.raisedAgainstVendorId }]
+          : [],
+      ),
+    });
+
+    return {
+      asOf,
+      items,
+      total: items.length,
+      scope: visible === null ? ("company" as const) : ("restricted" as const),
+      sources: [
+        "insurance certificates (in date, and independently verified)",
+        "meeting action items owned by the vendor (overdue, closed late, carried)",
+        "non-conformance reports raised against the vendor (count, severity, still open)",
+      ],
+      note:
+        "Every figure names the records it came from and a dimension with no records scores " +
+        "null rather than zero. Nothing here is a recommendation: it reports what happened, " +
+        "and whether that disqualifies a supplier is a human judgement they may answer.",
     };
   });
 

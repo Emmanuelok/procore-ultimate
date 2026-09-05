@@ -108,3 +108,25 @@ export const INSURANCE_HOLD_REASONS = [
   "policy_lapsed",
 ] as const;
 export type InsuranceHoldReason = (typeof INSURANCE_HOLD_REASONS)[number];
+
+/**
+ * What the adjuster's task list holds (#785). Information requests dominate,
+ * but a site visit and an interim report are the same shape — a dated thing
+ * the claim's progress depends on — and splitting them across registers only
+ * makes the diary harder to read.
+ */
+export const CLAIM_REQUEST_KINDS = [
+  "information_request",
+  "site_visit",
+  "interim_report",
+  "expert_appointment",
+] as const;
+export type ClaimRequestKind = (typeof CLAIM_REQUEST_KINDS)[number];
+
+/**
+ * `overdue` is deliberately NOT a stored state: it is derived from the due
+ * date, so it can never disagree with the calendar. What is stored is what
+ * somebody did.
+ */
+export const CLAIM_REQUEST_STATUSES = ["open", "responded", "closed", "withdrawn"] as const;
+export type ClaimRequestStatus = (typeof CLAIM_REQUEST_STATUSES)[number];

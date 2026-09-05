@@ -1981,7 +1981,7 @@ export async function attachAccessLinks(
   companyId: string,
   projectId: string,
   workerIds?: string[],
-): Promise<{ examined: number; linked: number; skippedAdjustments: number }> {
+): Promise<{ examined: number; linked: number }> {
   const clauses = [
     eq(timecards.companyId, companyId),
     eq(timecards.projectId, projectId),
@@ -2007,7 +2007,7 @@ export async function attachAccessLinks(
     .from(timecards)
     .where(and(...clauses))
     .limit(500);
-  if (orphans.length === 0) return { examined: 0, linked: 0, skippedAdjustments: 0 };
+  if (orphans.length === 0) return { examined: 0, linked: 0 };
   const access = await db
     .select()
     .from(siteAccessRecords)
@@ -2067,6 +2067,6 @@ export async function attachAccessLinks(
       .where(eq(timecards.id, card.id));
     linked += 1;
   }
-  return { examined: orphans.length, linked, skippedAdjustments: 0 };
+  return { examined: orphans.length, linked };
 }
 

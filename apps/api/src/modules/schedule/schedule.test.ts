@@ -594,7 +594,11 @@ describe("quality checks", () => {
       passed: number;
       total: number;
       score: number;
-      checks: Record<string, { count: number; ids: string[]; ratio: number | null; pass: boolean }>;
+      notApplicable: string[];
+      checks: Record<
+        string,
+        { count: number; ids: string[]; ratio: number | null; pass: boolean; applicable: boolean }
+      >;
     };
     expect(q.taskCount).toBe(6);
     expect(q.dependencyCount).toBe(2);

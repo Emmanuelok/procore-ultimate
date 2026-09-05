@@ -1524,6 +1524,29 @@ CREATE TABLE "bond_facilities" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
+CREATE TABLE "insurance_claim_requests" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text,
+	"claim_id" text NOT NULL,
+	"kind" text DEFAULT 'information_request' NOT NULL,
+	"title" text NOT NULL,
+	"description" text,
+	"requested_by" text,
+	"requested_at" text,
+	"due_date" text,
+	"obligation_id" text,
+	"owner_id" text,
+	"status" text DEFAULT 'open' NOT NULL,
+	"responded_at" timestamp with time zone,
+	"responded_by" text,
+	"response_note" text,
+	"evidence_file_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
 CREATE TABLE "insurance_premiums" (
 	"id" text PRIMARY KEY NOT NULL,
 	"company_id" text NOT NULL,
@@ -2906,6 +2929,31 @@ CREATE TABLE "welds" (
 	"photo_file_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
 	"detail" jsonb DEFAULT '{}'::jsonb NOT NULL,
 	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "labour_progress_entries" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"progress_date" text NOT NULL,
+	"cost_code_id" text,
+	"cost_code" text,
+	"budget_line_item_id" text,
+	"crew_id" text,
+	"location_id" text,
+	"schedule_activity_id" text,
+	"quantity" double precision NOT NULL,
+	"unit" text NOT NULL,
+	"method" text DEFAULT 'field_measure' NOT NULL,
+	"cumulative_quantity" double precision,
+	"notes" text,
+	"photo_file_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"recorded_by" text NOT NULL,
+	"verified_by" text,
+	"verified_at" timestamp with time zone,
+	"detail" jsonb DEFAULT '{}'::jsonb NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
@@ -7052,6 +7100,11 @@ ALTER TABLE "benchmark_samples" ADD COLUMN "superseded_by_sample_id" text;--> st
 ALTER TABLE "project_metric_snapshots" ADD COLUMN "currency" text;--> statement-breakpoint
 ALTER TABLE "project_metric_snapshots" ADD COLUMN "outlier_signal_id" text;--> statement-breakpoint
 ALTER TABLE "bonds" ADD COLUMN "facility_id" text;--> statement-breakpoint
+ALTER TABLE "insurance_claims" ADD COLUMN "loss_adjuster_contact_id" text;--> statement-breakpoint
+ALTER TABLE "insurance_claims" ADD COLUMN "pack_file_id" text;--> statement-breakpoint
+ALTER TABLE "insurance_claims" ADD COLUMN "pack_sha256" text;--> statement-breakpoint
+ALTER TABLE "insurance_claims" ADD COLUMN "pack_generated_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "insurance_claims" ADD COLUMN "pack_item_count" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
 ALTER TABLE "insurance_policies" ADD COLUMN "renewal_status" text DEFAULT 'not_started' NOT NULL;--> statement-breakpoint
 ALTER TABLE "insurance_policies" ADD COLUMN "renewal_owner_id" text;--> statement-breakpoint
 ALTER TABLE "insurance_policies" ADD COLUMN "renewal_target_date" text;--> statement-breakpoint
@@ -7288,6 +7341,9 @@ CREATE UNIQUE INDEX "chain_watermarks_company_uq" ON "chain_watermarks" USING bt
 CREATE UNIQUE INDEX "bond_facilities_uq" ON "bond_facilities" USING btree ("company_id","number");--> statement-breakpoint
 CREATE INDEX "bond_facilities_company_idx" ON "bond_facilities" USING btree ("company_id","status");--> statement-breakpoint
 CREATE INDEX "bond_facilities_review_idx" ON "bond_facilities" USING btree ("company_id","review_date");--> statement-breakpoint
+CREATE INDEX "insurance_claim_requests_claim_idx" ON "insurance_claim_requests" USING btree ("claim_id","status");--> statement-breakpoint
+CREATE INDEX "insurance_claim_requests_company_idx" ON "insurance_claim_requests" USING btree ("company_id","status","due_date");--> statement-breakpoint
+CREATE INDEX "insurance_claim_requests_project_idx" ON "insurance_claim_requests" USING btree ("company_id","project_id");--> statement-breakpoint
 CREATE INDEX "insurance_premiums_policy_idx" ON "insurance_premiums" USING btree ("policy_id");--> statement-breakpoint
 CREATE INDEX "insurance_premiums_company_idx" ON "insurance_premiums" USING btree ("company_id","currency");--> statement-breakpoint
 CREATE INDEX "insurance_requirements_company_idx" ON "insurance_requirements" USING btree ("company_id","status");--> statement-breakpoint
@@ -7439,6 +7495,11 @@ CREATE INDEX "welds_project_idx" ON "welds" USING btree ("project_id","status");
 CREATE INDEX "welds_welder_idx" ON "welds" USING btree ("project_id","welder_qualification_id");--> statement-breakpoint
 CREATE INDEX "welds_wps_idx" ON "welds" USING btree ("wps_id");--> statement-breakpoint
 CREATE INDEX "welds_system_idx" ON "welds" USING btree ("system_id");--> statement-breakpoint
+CREATE INDEX "labour_progress_project_date_idx" ON "labour_progress_entries" USING btree ("project_id","progress_date");--> statement-breakpoint
+CREATE INDEX "labour_progress_budget_idx" ON "labour_progress_entries" USING btree ("budget_line_item_id","progress_date");--> statement-breakpoint
+CREATE INDEX "labour_progress_cost_code_idx" ON "labour_progress_entries" USING btree ("project_id","cost_code_id");--> statement-breakpoint
+CREATE INDEX "labour_progress_crew_idx" ON "labour_progress_entries" USING btree ("crew_id","progress_date");--> statement-breakpoint
+CREATE INDEX "labour_progress_company_idx" ON "labour_progress_entries" USING btree ("company_id","progress_date");--> statement-breakpoint
 CREATE INDEX "award_delegations_company_idx" ON "award_delegations" USING btree ("company_id","is_active");--> statement-breakpoint
 CREATE INDEX "award_delegations_subject_idx" ON "award_delegations" USING btree ("company_id","subject_kind","subject_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "bid_bonds_uq" ON "bid_bonds" USING btree ("package_id","vendor_id","bond_type");--> statement-breakpoint
@@ -7526,6 +7587,7 @@ CREATE UNIQUE INDEX "withholding_certificates_uq" ON "withholding_certificates" 
 CREATE INDEX "withholding_certificates_project_idx" ON "withholding_certificates" USING btree ("project_id","status");--> statement-breakpoint
 CREATE INDEX "withholding_certificates_vendor_idx" ON "withholding_certificates" USING btree ("vendor_id");--> statement-breakpoint
 CREATE INDEX "withholding_certificates_payment_idx" ON "withholding_certificates" USING btree ("payment_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "withholding_certificates_payment_uq" ON "withholding_certificates" USING btree ("company_id","payment_id") WHERE "withholding_certificates"."payment_id" is not null and "withholding_certificates"."status" <> 'cancelled';--> statement-breakpoint
 CREATE INDEX "withholding_certificates_period_idx" ON "withholding_certificates" USING btree ("company_id","payment_date");--> statement-breakpoint
 CREATE UNIQUE INDEX "delivery_slots_uq" ON "delivery_slots" USING btree ("project_id","number");--> statement-breakpoint
 CREATE INDEX "delivery_slots_gate_idx" ON "delivery_slots" USING btree ("gate_id","starts_at");--> statement-breakpoint

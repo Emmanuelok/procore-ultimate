@@ -1708,6 +1708,57 @@ describe("claim valuation and portfolio exposure (#312-313, #320)", () => {
     expect(body.byCurrency.length).toBeGreaterThan(1);
     expect(body.reasons.join(" ")).toMatch(/never summed across them/);
   });
+
+  it("narrows exposure to one project when asked, and refuses an unknown one", async () => {
+    // A claim with no amount claimed must be reported apart, never as zero.
+    const unpricedClaim = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project3Id}/claims`,
+      headers: owner.headers,
+      payload: { title: "Unpriced claim", kind: "disruption", currency: "GBP" },
+    });
+    expect(unpricedClaim.statusCode).toBe(201);
+
+    // The claims workspace renders this endpoint narrowed to the project it is
+    // showing, so the figure on the page has to be that project's alone.
+    const scoped = await app.inject({
+      method: "GET",
+      url: `/api/v1/claims/exposure?projectId=${project3Id}`,
+      headers: owner.headers,
+    });
+    expect(scoped.statusCode).toBe(200);
+    const scopedBody = scoped.json() as {
+      totalClaims: number;
+      claims: { projectId: string }[];
+      byCurrency: { currency: string; claimed: number; unpriced: number }[];
+      reasons: string[];
+    };
+    expect(scopedBody.claims.every((c) => c.projectId === project3Id)).toBe(true);
+    const gbpBucket = scopedBody.byCurrency.find((c) => c.currency === "GBP")!;
+    expect(gbpBucket.unpriced).toBe(1);
+    expect(gbpBucket.claimed).toBe(0);
+    expect(scopedBody.reasons.join(" ")).toMatch(/counted as zero/);
+
+    const whole = await app.inject({
+      method: "GET",
+      url: `/api/v1/claims/exposure`,
+      headers: owner.headers,
+    });
+    const wholeBody = whole.json() as { totalClaims: number };
+    expect(wholeBody.totalClaims).toBeGreaterThan(scopedBody.totalClaims);
+
+    // Another tenant's project id must not act as a window into their claims.
+    const stranger = await registerActor(app);
+    const foreign = await app.inject({
+      method: "GET",
+      url: `/api/v1/claims/exposure?projectId=${projectId}`,
+      headers: stranger.headers,
+    });
+    expect([200, 403]).toContain(foreign.statusCode);
+    if (foreign.statusCode === 200) {
+      expect((foreign.json() as { totalClaims: number }).totalClaims).toBe(0);
+    }
+  });
 });
 
 describe("disruption (#290-293)", () => {

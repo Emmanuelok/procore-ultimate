@@ -4,6 +4,8 @@ import { z } from "zod";
 import {
   awardDelegations,
   bidAwards,
+  bidLevellingEntries,
+  bidLevellingItems,
   bidPackages,
   bidSubmissions,
   budgetLineItems,
@@ -48,6 +50,18 @@ import {
 } from "./integrity-service.js";
 import { effectiveLimit, evaluatePrequalGate, vendorPrequalStatus } from "./prequal-status.js";
 import { checkContractAgainstLimit } from "./financial-limits.js";
+import {
+  buildScopedComparison,
+  planAwardScope,
+  scopedLevelledAmount,
+  type ScopedAmount,
+} from "./partial-award.js";
+
+/**
+ * Award statuses that hold no scope: a rejected, withdrawn or cancelled award
+ * is history, and the work it named is available to be awarded again.
+ */
+export const TERMINAL_AWARD_STATUSES: readonly string[] = ["rejected", "withdrawn", "cancelled"];
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -443,19 +457,55 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
       const pkg = await fetchPackage(app.db, packageId, companyId, projectId);
       assertUnsealedForAnalysis(pkg, "Recommending an award");
 
+      /*
+       * WHICH SCOPE IS BEING BOUGHT, AND HAS ANY OF IT BEEN BOUGHT ALREADY?
+       *
+       * A package is often split between winners. The scope of a partial
+       * award is named in the buyer's own levelling rows — the only neutral
+       * description of scope on the package — and two awards may never hold
+       * the same row, or the project commits the same work twice.
+       */
       const existing = await app.db
         .select()
         .from(bidAwards)
         .where(eq(bidAwards.packageId, packageId));
-      const live = existing.find(
-        (a) => !["rejected", "withdrawn", "cancelled"].includes(a.status),
-      );
-      if (live) {
-        throw conflict(
-          `${pkg.reference} already carries award ${live.reference} at status "${live.status}". ` +
-            "Reject or withdraw it before recommending a different bidder.",
+      const scopeItems = await app.db
+        .select()
+        .from(bidLevellingItems)
+        .where(eq(bidLevellingItems.packageId, packageId))
+        .orderBy(asc(bidLevellingItems.position));
+      const scopeLabel = (id: string) => {
+        const row = scopeItems.find((i) => i.id === id);
+        return row ? (row.itemCode ?? row.description) : id;
+      };
+      const scoped = planAwardScope({
+        items: scopeItems.map((i) => ({
+          id: i.id,
+          position: i.position,
+          itemCode: i.itemCode,
+          description: i.description,
+          isMandatory: i.isMandatory === 1,
+        })),
+        liveAwards: existing
+          .filter((a) => !TERMINAL_AWARD_STATUSES.includes(a.status))
+          .map((a) => ({
+            awardId: a.id,
+            reference: a.reference,
+            status: a.status,
+            scopeLevellingItemIds: (a.scopeLevellingItemIds as string[] | null) ?? [],
+          })),
+        requested: body.scopeLevellingItemIds,
+      });
+      if (!scoped.ok) {
+        // `conflict()` carries no details, and the details are the point here:
+        // the caller has to know WHICH rows clashed and which award holds them.
+        throw new AppError(
+          scoped.code === "unknown_scope_rows" || scoped.code === "empty_scope" ? 400 : 409,
+          scoped.message,
+          { control: scoped.code, ...scoped.detail },
         );
       }
+      const plan = scoped.plan;
 
       const submissions = await app.db
         .select()
@@ -477,7 +527,97 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
         );
       }
 
-      const comparison = buildAwardComparison(submissions);
+      const fullComparison = buildAwardComparison(submissions);
+      /*
+       * A PARTIAL AWARD IS COMPARED ON ITS OWN SCOPE.
+       *
+       * "The lowest bid for the package" is not "the lowest bid for the
+       * frame": a bidder who is dearest overall is frequently cheapest on one
+       * trade, which is the entire reason for splitting the award. So when
+       * scope rows are named, every bid in contention is re-priced over
+       * exactly those rows from the levelling grid, and `isLowestBid` — the
+       * column the audit asks for — is decided on that subset.
+       */
+      let comparison = fullComparison;
+      let scopedAward: ScopedAmount | null = null;
+      if (plan.partial) {
+        const cells = await app.db
+          .select()
+          .from(bidLevellingEntries)
+          .where(eq(bidLevellingEntries.packageId, packageId));
+        const levelledCells = cells.map((c) => ({
+          levellingItemId: c.levellingItemId,
+          submissionId: c.submissionId,
+          levelledAmount: c.levelledAmount,
+          currency: c.currency,
+          includedStatus: c.includedStatus,
+        }));
+        const scopedComparison = buildScopedComparison(
+          submissions.map((s) => ({
+            id: s.id,
+            reference: s.reference,
+            vendorId: s.vendorId,
+            status: s.status,
+          })),
+          plan.scopeItemIds,
+          levelledCells,
+          scopeLabel,
+          isInContention,
+        );
+        scopedAward = scopedLevelledAmount(chosen.id, plan.scopeItemIds, levelledCells, scopeLabel);
+        if (scopedAward.amount === null) {
+          throw badRequest(
+            `${chosen.reference} has no levelled figure for every row in this partial award, so ` +
+              "its value cannot be summed and there is nothing to commit. " +
+              scopedAward.reasons.join(" "),
+            {
+              control: "partial_award_amount_unknowable",
+              submissionId: chosen.id,
+              missing: scopedAward.missing,
+            },
+          );
+        }
+        comparison = {
+          basis: "levelled",
+          basisNote:
+            `Compared on the ${plan.scopeItemIds.length} levelling row(s) this partial award ` +
+            "covers, not on the package total: a bid that is dearest overall may still be the " +
+            "cheapest for this scope, and that is why the package is being split.",
+          candidates: scopedComparison.candidates.map((c) => ({
+            submissionId: c.submissionId,
+            reference: c.reference,
+            vendorId: c.vendorId,
+            comparableAmount: c.amount,
+            asBidAmount:
+              fullComparison.candidates.find((f) => f.submissionId === c.submissionId)
+                ?.asBidAmount ?? null,
+            currency: c.currency ?? pkg.currency,
+            totalScore:
+              fullComparison.candidates.find((f) => f.submissionId === c.submissionId)
+                ?.totalScore ?? null,
+            rank: c.rank,
+          })),
+          lowest: (() => {
+            const low = scopedComparison.lowest;
+            if (!low) return null;
+            return {
+              submissionId: low.submissionId,
+              reference: low.reference,
+              vendorId: low.vendorId,
+              comparableAmount: low.amount,
+              asBidAmount:
+                fullComparison.candidates.find((f) => f.submissionId === low.submissionId)
+                  ?.asBidAmount ?? null,
+              currency: low.currency ?? pkg.currency,
+              totalScore:
+                fullComparison.candidates.find((f) => f.submissionId === low.submissionId)
+                  ?.totalScore ?? null,
+              rank: low.rank,
+            };
+          })(),
+          currency: scopedComparison.currency ?? pkg.currency,
+        };
+      }
       const chosenCandidate = comparison.candidates.find((c) => c.submissionId === chosen.id)!;
       if (chosenCandidate.comparableAmount === null) {
         throw conflict(
@@ -607,8 +747,22 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
       const reference = awardReference(number);
       const id = newId("bwd");
       const now = new Date().toISOString();
+      /*
+       * The award value. For a whole-package award it is the bidder's as-bid
+       * contract sum. For a PARTIAL award it is the sum of that bidder's
+       * levelled amounts on the rows the award covers — the headline total
+       * priced work this award is not buying.
+       */
+      const awardValue = plan.partial ? scopedAward!.amount! : chosen.totalAmount;
+      /*
+       * The engineer's estimate is for the WHOLE package. Comparing a subset
+       * of the scope against it would be an invented number, so a partial
+       * award records no saving rather than a wrong one.
+       */
       const saving =
-        pkg.engineersEstimate === null ? null : round2(pkg.engineersEstimate - chosen.totalAmount);
+        plan.partial || pkg.engineersEstimate === null
+          ? null
+          : round2(pkg.engineersEstimate - chosen.totalAmount);
 
       await app.db.insert(bidAwards).values({
         id,
@@ -619,9 +773,15 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
         vendorId: chosen.vendorId,
         number,
         reference,
-        awardAmount: chosen.totalAmount,
+        awardAmount: awardValue,
         currency: chosen.currency,
-        scopeSummary: body.scopeSummary ?? pkg.scopeDescription ?? pkg.title,
+        scopeSummary:
+          body.scopeSummary ??
+          (plan.partial
+            ? `Partial award over ${plan.scopeItemIds.length} scope row(s) of ${pkg.reference}: ` +
+              plan.scopeItemIds.map(scopeLabel).slice(0, 12).join(", ") +
+              (plan.scopeItemIds.length > 12 ? ", …" : "")
+            : (pkg.scopeDescription ?? pkg.title)),
         status: "recommended",
         recommendationBasis: body.recommendationBasis,
         evaluationSummary: comparison.candidates.map((c) => ({
@@ -649,7 +809,7 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
          */
         recommendedComparableAmount: chosenCandidate.comparableAmount,
         comparisonBasis: comparison.basis,
-        scopeLevellingItemIds: body.scopeLevellingItemIds ?? [],
+        scopeLevellingItemIds: plan.scopeItemIds,
         savingAgainstEstimate: saving,
         recommendedBy: req.user!.id,
         recommendedAt: now,
@@ -666,6 +826,16 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
           prequalificationAtRecommendation: prequal.state,
           prequalificationFlag: gate.message,
           capacity,
+          partialAward: plan.partial,
+          partialScopeNote: plan.note,
+          partialScopeLabels: plan.scopeItemIds.map(scopeLabel),
+          remainingScopeItemIds: plan.remaining.map((r) => r.id),
+          partialAwardBasis: plan.partial
+            ? [
+                `Sum of this bidder's levelled amounts on ${plan.scopeItemIds.length} scope ` +
+                  "row(s); the as-bid package total is not the value of a partial award.",
+              ]
+            : null,
         },
         createdBy: req.user!.id,
       });
@@ -673,7 +843,13 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
       await app.db
         .update(bidPackages)
         .set({ status: "under_evaluation", updatedAt: now })
-        .where(and(eq(bidPackages.id, packageId), ne(bidPackages.status, "awarded")));
+        .where(
+          and(
+            eq(bidPackages.id, packageId),
+            ne(bidPackages.status, "awarded"),
+            ne(bidPackages.status, "partially_awarded"),
+          ),
+        );
 
       await ledger(
         app.db,
@@ -688,7 +864,11 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
           reference,
           submissionId: chosen.id,
           vendorId: chosen.vendorId,
-          awardAmount: chosen.totalAmount,
+          awardAmount: awardValue,
+          asBidPackageTotal: chosen.totalAmount,
+          partialAward: plan.partial,
+          scopeLevellingItemIds: plan.scopeItemIds,
+          remainingMandatoryScopeRows: plan.remaining.length,
           currency: chosen.currency,
           comparisonBasis: comparison.basis,
           isLowestBid: isLowest,
@@ -710,6 +890,18 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
       return reply.status(201).send({
         ...(await awardDetail(app.db, created)),
         comparison,
+        scope: {
+          partial: plan.partial,
+          scopeLevellingItemIds: plan.scopeItemIds,
+          scopeLabels: plan.scopeItemIds.map(scopeLabel),
+          remaining: plan.remaining.map((r) => ({
+            id: r.id,
+            itemCode: r.itemCode,
+            description: r.description,
+          })),
+          packageStatusAfterApproval: plan.packageStatusAfterApproval,
+          note: plan.note,
+        },
         warnings: [
           ...(gate.message ? [gate.message] : []),
           ...(capacity.exceeds || capacity.exceeds === null ? [capacity.message] : []),
@@ -832,6 +1024,40 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
         );
       }
     }
+
+    /*
+     * IS THE PACKAGE FINISHED, OR ONLY PART OF IT?
+     *
+     * The coverage is recomputed at APPROVAL time rather than trusted from
+     * the recommendation: another partial award may have been approved in
+     * between, and it is the state now that decides whether the package is
+     * fully awarded, whether the losing bids are out of contention, and
+     * whether the remaining scope still needs a winner.
+     */
+    const awardScope = ((award.scopeLevellingItemIds as string[] | null) ?? []);
+    const partialAward = awardScope.length > 0;
+    const scopeItemsAtApproval = await app.db
+      .select()
+      .from(bidLevellingItems)
+      .where(eq(bidLevellingItems.packageId, pkg.id))
+      .orderBy(asc(bidLevellingItems.position));
+    const siblingAwards = await app.db
+      .select()
+      .from(bidAwards)
+      .where(eq(bidAwards.packageId, pkg.id));
+    const coveredAtApproval = new Set<string>(awardScope);
+    for (const other of siblingAwards) {
+      if (other.id === award.id) continue;
+      if (TERMINAL_AWARD_STATUSES.includes(other.status)) continue;
+      for (const itemId of ((other.scopeLevellingItemIds as string[] | null) ?? [])) {
+        coveredAtApproval.add(itemId);
+      }
+    }
+    const remainingAtApproval = partialAward
+      ? scopeItemsAtApproval.filter((i) => i.isMandatory === 1 && !coveredAtApproval.has(i.id))
+      : [];
+    const packageStatusAfter =
+      partialAward && remainingAtApproval.length > 0 ? "partially_awarded" : "awarded";
 
     const kind = pkg.packageKind === "supply_only" ? "purchase_order" : "subcontract";
     const standstillDays =
@@ -961,14 +1187,33 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
         .where(eq(bidAwards.id, award.id));
 
       /* ---- the package and the bidders ---- */
+      /*
+       * A PARTIAL AWARD DOES NOT CLOSE THE PACKAGE OR THE OTHER BIDS.
+       *
+       * The package-level `awardedSubmissionId`/`awardedAmount` describe ONE
+       * winner for the whole scope; writing them from a partial award would
+       * assert that this bidder won everything. They are set only when the
+       * last of the scope is placed. And the losing bidders stay in
+       * contention while mandatory scope rows are still unawarded — they are
+       * the field the remaining scope will be placed from, and telling them
+       * they were unsuccessful before that decision is made is both wrong and
+       * irreversible.
+       */
+      const fullyAwarded = packageStatusAfter === "awarded";
       await db
         .update(bidPackages)
         .set({
-          status: "awarded",
-          awardedSubmissionId: award.submissionId,
-          awardedVendorId: award.vendorId,
-          awardedAmount: award.awardAmount,
-          awardedAt: now,
+          status: packageStatusAfter,
+          ...(fullyAwarded && !partialAward
+            ? {
+                awardedSubmissionId: award.submissionId,
+                awardedVendorId: award.vendorId,
+                awardedAmount: award.awardAmount,
+                awardedAt: now,
+              }
+            : fullyAwarded
+              ? { awardedAt: now }
+              : {}),
           updatedAt: now,
         })
         .where(eq(bidPackages.id, pkg.id));
@@ -976,17 +1221,27 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
         .update(bidSubmissions)
         .set({ status: "awarded", updatedAt: now })
         .where(eq(bidSubmissions.id, award.submissionId));
-      const others = await db
-        .select()
-        .from(bidSubmissions)
-        .where(eq(bidSubmissions.packageId, pkg.id));
-      for (const other of others) {
-        if (other.id === award.submissionId) continue;
-        if (!isInContention(other.status)) continue;
-        await db
-          .update(bidSubmissions)
-          .set({ status: "unsuccessful", updatedAt: now })
-          .where(eq(bidSubmissions.id, other.id));
+      if (fullyAwarded) {
+        // A bidder holding a live award on part of this package has WON
+        // something and is never marked unsuccessful.
+        const winners = new Set(
+          siblingAwards
+            .filter((a) => !TERMINAL_AWARD_STATUSES.includes(a.status))
+            .map((a) => a.submissionId),
+        );
+        winners.add(award.submissionId);
+        const others = await db
+          .select()
+          .from(bidSubmissions)
+          .where(eq(bidSubmissions.packageId, pkg.id));
+        for (const other of others) {
+          if (winners.has(other.id)) continue;
+          if (!isInContention(other.status)) continue;
+          await db
+            .update(bidSubmissions)
+            .set({ status: "unsuccessful", updatedAt: now })
+            .where(eq(bidSubmissions.id, other.id));
+        }
       }
     });
 

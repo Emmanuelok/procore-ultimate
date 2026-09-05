@@ -48,7 +48,14 @@ import {
   useReason,
   useResource,
 } from "./biddingShared";
-import type { BidAward, ListResponse, PackageDetail, Tabulation, TabulationRow } from "./types";
+import type {
+  BidAward,
+  LevellingGrid,
+  ListResponse,
+  PackageDetail,
+  Tabulation,
+  TabulationRow,
+} from "./types";
 
 interface Candidate {
   submissionId: string;
@@ -60,6 +67,16 @@ interface Candidate {
   basis: "levelled" | "as_bid";
   inContention: boolean;
   blockedReason: string | null;
+}
+
+/** One levelling scope row, as a partial award may name it. */
+interface ScopeRow {
+  id: string;
+  itemCode: string | null;
+  description: string;
+  isMandatory: boolean;
+  /** the id of a live award already holding this row, if any */
+  heldBy: string | null;
 }
 
 export default function AwardTab({
@@ -82,6 +99,17 @@ export default function AwardTab({
   const tabulation = useResource<Tabulation>(
     packageId
       ? `/api/v1/projects/${projectId}/bid-packages/${packageId}/tabulation?_v=${version}`
+      : null,
+  );
+  /*
+   * The buyer's own scope rows. A partial award is defined by them and by
+   * nothing else, so the modal needs them before it can offer a split. The
+   * grid failing does not fail the tab: the award simply becomes
+   * whole-package only, and says so.
+   */
+  const grid = useResource<LevellingGrid>(
+    packageId
+      ? `/api/v1/projects/${projectId}/bid-packages/${packageId}/levelling/grid?_v=${version}`
       : null,
   );
   const action = useAction();
@@ -145,9 +173,26 @@ export default function AwardTab({
   if (awards.error) return <LoadError message={awards.error} onRetry={awards.reload} />;
 
   const items = awards.data?.items ?? [];
-  const live = items.find(
+  const liveAwards = items.filter(
     (a) => !["rejected", "withdrawn", "cancelled"].includes(a.status),
   );
+  /*
+   * A package with a live PARTIAL award is not finished: the remaining scope
+   * still needs a winner, so the Recommend button stays available. Only a
+   * whole-package award closes the door.
+   */
+  const live = liveAwards.find((a) => (a.scopeLevellingItemIds ?? []).length === 0) ?? null;
+  const heldRows = new Map<string, string>();
+  for (const award of liveAwards) {
+    for (const id of award.scopeLevellingItemIds ?? []) heldRows.set(id, award.reference);
+  }
+  const scopeItems: ScopeRow[] = (grid.data?.items ?? []).map((i) => ({
+    id: i.id,
+    itemCode: i.itemCode,
+    description: i.description,
+    isMandatory: i.isMandatory,
+    heldBy: heldRows.get(i.id) ?? null,
+  }));
 
   if (seal?.amountsWithheld) {
     return (
@@ -261,6 +306,24 @@ export default function AwardTab({
         </Card>
       ) : null}
 
+      {liveAwards.some((a) => (a.scopeLevellingItemIds ?? []).length > 0) ? (
+        <Alert tone="info" title="This package is being awarded in parts">
+          <p>
+            {liveAwards
+              .filter((a) => (a.scopeLevellingItemIds ?? []).length > 0)
+              .map(
+                (a) =>
+                  `${a.reference} holds ${(a.scopeLevellingItemIds ?? []).length} scope row(s)`,
+              )
+              .join("; ")}
+            .{" "}
+            {scopeItems.filter((i) => i.isMandatory && !i.heldBy).length > 0
+              ? `${scopeItems.filter((i) => i.isMandatory && !i.heldBy).length} mandatory scope row(s) still have no winner. The other bids stay in contention until they do.`
+              : "Every mandatory scope row now has a winner."}
+          </p>
+        </Alert>
+      ) : null}
+
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="max-w-3xl text-meta leading-relaxed text-content-muted">
           A recommendation that is not the lowest comparable bid requires a written justification.
@@ -311,6 +374,7 @@ export default function AwardTab({
         candidates={comparison.candidates}
         lowest={comparison.lowest}
         basis={comparison.basis}
+        scopeItems={scopeItems}
         onClose={() => setRecommendOpen(false)}
         onDone={() => {
           setRecommendOpen(false);
@@ -398,7 +462,11 @@ function AwardCard({
               like an award above the lowest bid.
             */}
             <div className="flex justify-between gap-3">
-              <dt className="text-content-subtle">Contract sum (as bid)</dt>
+              <dt className="text-content-subtle">
+                {(award.scopeLevellingItemIds ?? []).length > 0
+                  ? "Contract sum (levelled, this scope)"
+                  : "Contract sum (as bid)"}
+              </dt>
               <dd className="font-medium tabular-nums">
                 {money(award.awardAmount, award.currency)}
               </dd>
@@ -448,6 +516,24 @@ function AwardCard({
             </div>
           ) : null}
         </div>
+
+        {(award.scopeLevellingItemIds ?? []).length > 0 ? (
+          <div className="rounded-md border border-border bg-surface-raised p-2">
+            <p className="text-label uppercase text-content-subtle">
+              A partial award — {(award.scopeLevellingItemIds ?? []).length} scope row(s)
+            </p>
+            <p className="mt-0.5 text-2xs leading-snug text-content-muted">
+              {typeof award.detail["partialScopeNote"] === "string"
+                ? (award.detail["partialScopeNote"] as string)
+                : "This award covers part of the package's levelling scope only."}
+            </p>
+            {Array.isArray(award.detail["partialScopeLabels"]) ? (
+              <p className="mt-1 font-mono text-2xs text-content-subtle">
+                {(award.detail["partialScopeLabels"] as string[]).join(" · ")}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
 
         {award.recommendationBasis ? (
           <div>
@@ -677,6 +763,7 @@ function RecommendModal({
   candidates,
   lowest,
   basis,
+  scopeItems,
   onClose,
   onDone,
 }: {
@@ -686,6 +773,7 @@ function RecommendModal({
   candidates: Candidate[];
   lowest: Candidate | null;
   basis: "levelled" | "as_bid";
+  scopeItems: ScopeRow[];
   onClose: () => void;
   onDone: () => void;
 }) {
@@ -695,6 +783,16 @@ function RecommendModal({
   const [justification, setJustification] = useState("");
   const [standstillDays, setStandstillDays] = useState("10");
   const [authority, setAuthority] = useState("");
+  const [integrityAck, setIntegrityAck] = useState("");
+  /**
+   * PARTIAL AWARDS. Empty selection = the whole package, which is the
+   * ordinary case and stays one click. Naming rows turns this into an award
+   * over that scope only: the value becomes the winner's levelled sum over
+   * those rows and the lowest-bid test is re-run on the same subset, because
+   * the cheapest bidder for the frame is rarely the cheapest for the package.
+   */
+  const [partial, setPartial] = useState(false);
+  const [scopeIds, setScopeIds] = useState<string[]>([]);
 
   const chosen = candidates.find((c) => c.submissionId === submissionId) ?? null;
   const isLowest =
@@ -703,7 +801,11 @@ function RecommendModal({
     chosen.comparableAmount !== null &&
     lowest.comparableAmount !== null &&
     chosen.comparableAmount <= lowest.comparableAmount + 0.005;
-  const needsJustification = chosen !== null && !isLowest;
+  // With a scope subset the server decides the comparison, so the modal does
+  // not pretend to know whether this is the lowest for it: the justification
+  // field is offered rather than demanded, and the refusal (if any) is shown
+  // in the API's own words.
+  const needsJustification = chosen !== null && !isLowest && !partial;
 
   async function submit() {
     const body: Record<string, unknown> = {
@@ -711,8 +813,10 @@ function RecommendModal({
       recommendationBasis: recommendationBasis.trim(),
       standstillDays: Number(standstillDays) || 0,
     };
-    if (needsJustification) body["notLowestJustification"] = justification.trim();
+    if (justification.trim().length >= 20) body["notLowestJustification"] = justification.trim();
     if (authority.trim()) body["approvalAuthority"] = authority.trim();
+    if (integrityAck.trim().length >= 20) body["integrityAcknowledgement"] = integrityAck.trim();
+    if (partial && scopeIds.length > 0) body["scopeLevellingItemIds"] = scopeIds;
     const done = await action.run("recommend", () =>
       api.post(
         `/api/v1/projects/${projectId}/bid-packages/${packageId}/award/recommend`,
@@ -725,7 +829,8 @@ function RecommendModal({
   const blocked =
     !submissionId ||
     recommendationBasis.trim().length < 20 ||
-    (needsJustification && justification.trim().length < 20);
+    (needsJustification && justification.trim().length < 20) ||
+    (partial && scopeIds.length === 0);
 
   return (
     <Modal
@@ -814,6 +919,83 @@ function RecommendModal({
           </Alert>
         )}
 
+        {/* ------------------------ partial award ------------------------ */}
+        {scopeItems.length > 0 ? (
+          <div className="rounded-lg border border-border p-3">
+            <label className="flex items-start gap-2 text-sm">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={partial}
+                onChange={(e) => {
+                  setPartial(e.target.checked);
+                  if (!e.target.checked) setScopeIds([]);
+                }}
+              />
+              <span>
+                <span className="font-semibold">Award part of this package only</span>
+                <span className="mt-0.5 block text-2xs text-content-muted">
+                  Name the scope rows this award buys. Its value becomes this bidder&rsquo;s
+                  levelled sum over those rows — not their package total — and the lowest-bid test
+                  is re-run on the same subset. A row already held by a live award cannot be
+                  awarded again.
+                </span>
+              </span>
+            </label>
+            {partial ? (
+              <div className="mt-3 max-h-56 space-y-1 overflow-y-auto rounded-md border border-border p-2">
+                {scopeItems.map((row) => {
+                  const taken = row.heldBy !== null;
+                  return (
+                    <label
+                      key={row.id}
+                      className={cx(
+                        "flex items-center gap-2 rounded px-2 py-1.5 text-sm",
+                        taken ? "opacity-60" : "cursor-pointer hover:bg-surface-hover",
+                      )}
+                    >
+                      <input
+                        type="checkbox"
+                        disabled={taken}
+                        checked={scopeIds.includes(row.id)}
+                        onChange={() =>
+                          setScopeIds((prev) =>
+                            prev.includes(row.id)
+                              ? prev.filter((x) => x !== row.id)
+                              : [...prev, row.id],
+                          )
+                        }
+                      />
+                      <span className="flex-1 truncate">
+                        {row.itemCode ? (
+                          <span className="font-mono text-2xs text-content-subtle">
+                            {row.itemCode}{" "}
+                          </span>
+                        ) : null}
+                        {row.description}
+                      </span>
+                      {taken ? (
+                        <Badge tone="neutral" size="xs">
+                          held by {row.heldBy}
+                        </Badge>
+                      ) : row.isMandatory ? null : (
+                        <Badge tone="neutral" size="xs">
+                          optional
+                        </Badge>
+                      )}
+                    </label>
+                  );
+                })}
+              </div>
+            ) : null}
+            {partial && scopeIds.length === 0 ? (
+              <p className="mt-2 text-2xs text-warning-fg">
+                Choose at least one scope row, or turn the split off to award the whole package.
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+
         <Field
           label="Why this bid"
           required
@@ -849,6 +1031,38 @@ function RecommendModal({
             </Field>
           </div>
         ) : null}
+
+        {partial ? (
+          <Field
+            label="Why the lowest bid for this scope was not taken"
+            optional
+            hint="Only needed if this bidder is not the cheapest for the rows named above. The API will say so and refuse without it."
+          >
+            <Textarea
+              rows={3}
+              value={justification}
+              onChange={(e) => setJustification(e.target.value)}
+            />
+          </Field>
+        ) : null}
+
+        {/*
+          THE INTEGRITY FINDINGS ARE ANSWERED HERE, NOT AFTERWARDS. The API
+          refuses a recommendation while an open high or critical bid-integrity
+          finding bears on the package and nothing has been written about it.
+          Without this field the refusal was a dead end in the browser.
+        */}
+        <Field
+          label="Bid-integrity acknowledgement"
+          optional
+          hint="Required when an open high or critical finding bears on this package (the Integrity tab lists them). Say what was checked and what the explanation was — a finding is a question, and the ordinary answer is an innocent one recorded next to it."
+        >
+          <Textarea
+            rows={3}
+            value={integrityAck}
+            onChange={(e) => setIntegrityAck(e.target.value)}
+          />
+        </Field>
 
         <div className="grid gap-3 sm:grid-cols-2">
           <Field
