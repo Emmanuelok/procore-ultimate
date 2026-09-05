@@ -9,6 +9,7 @@ import { and, eq } from "drizzle-orm";
 import {
   companyMemberships,
   contacts,
+  correspondenceLetters,
   drawingRevisions,
   drawingSets,
   drawingSheets,
@@ -249,12 +250,83 @@ describe("transmittals (#442)", () => {
     );
     expect(items.statusCode).toBe(409);
 
+    const before = (
+      await app.db.select().from(transmittals).where(eq(transmittals.id, transmittalId))
+    )[0];
     const extended = await patch(
       `/projects/${projectId}/correspondence/transmittals/${transmittalId}`,
       { ackDueDate: addDaysISO(today, 10) },
     );
     expect(extended.statusCode).toBe(200);
     expect(extended.json().ackDueDate).toBe(addDaysISO(today, 10));
+
+    // Regression: the obligation opened at issue IS the deadline as far as the
+    // assurance register is concerned, so it has to move with it. Two dates for
+    // one promise is how a register starts lying.
+    expect(before?.obligationId).toBeTruthy();
+    const obligation = (
+      await app.db.select().from(obligations).where(eq(obligations.id, before!.obligationId!))
+    )[0];
+    expect(obligation?.deadline?.slice(0, 10)).toBe(addDaysISO(today, 10));
+  });
+
+  it("refuses to drop the acknowledgement date off an issued transmittal that asks for one", async () => {
+    const res = await patch(
+      `/projects/${projectId}/correspondence/transmittals/${transmittalId}`,
+      { ackDueDate: null },
+    );
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("date they can be late against");
+  });
+
+  it("refuses to issue a transmittal that asks for acknowledgement with no date", async () => {
+    const created = await post(`/projects/${projectId}/correspondence/transmittals`, {
+      subject: "Asks for acknowledgement, names no date",
+      purpose: "for_review",
+      items: [{ itemType: "other", title: "A drawing set" }],
+      recipients: [{ partyType: "external", name: "Someone", acknowledgementRequired: true }],
+    });
+    expect(created.statusCode).toBe(201);
+    const id = created.json().id as string;
+    const res = await post(`/projects/${projectId}/correspondence/transmittals/${id}/issue`, {});
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("names no date");
+
+    // giving it a date at issue is enough; the obligation is opened then
+    const ok = await post(`/projects/${projectId}/correspondence/transmittals/${id}/issue`, {
+      ackDueDate: addDaysISO(today, 7),
+    });
+    expect(ok.statusCode).toBe(200);
+    const row = (await app.db.select().from(transmittals).where(eq(transmittals.id, id)))[0];
+    expect(row?.obligationId).toBeTruthy();
+  });
+
+  it("records the cover letter on both sides of the link", async () => {
+    const types = await get("/correspondence/types");
+    const letterType = types.json().items.find((t: { key: string }) => t.key === "letter");
+    const letter = await post(`/projects/${projectId}/correspondence/letters`, {
+      typeId: letterType.id,
+      subject: "Cover note for the cladding package",
+    });
+    expect(letter.statusCode).toBe(201);
+    const created = await post(`/projects/${projectId}/correspondence/transmittals`, {
+      subject: "Cladding package, covered by a letter",
+      letterId: letter.json().id,
+      items: [{ itemType: "other", title: "Cladding drawings" }],
+      recipients: [{ partyType: "external", name: "Cladding sub" }],
+    });
+    expect(created.statusCode).toBe(201);
+    expect(created.json().letterId).toBe(letter.json().id);
+
+    // Regression: the back-link used to be write-only on the transmittal, so a
+    // letter opened on its own could not say what it covered.
+    const back = (
+      await app.db
+        .select()
+        .from(correspondenceLetters)
+        .where(eq(correspondenceLetters.id, letter.json().id))
+    )[0];
+    expect(back?.transmittalId).toBe(created.json().id);
   });
 
   it("tracks acknowledgement per recipient and walks the status", async () => {

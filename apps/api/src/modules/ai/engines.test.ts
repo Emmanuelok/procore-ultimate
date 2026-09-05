@@ -524,6 +524,33 @@ describe("bias assessment (#1025)", () => {
     expect(biasSubject(null)).toBeNull();
   });
 
+  // REGRESSION. Both reports capped their window and published rates as if
+  // computed over all of it. A partial denominator now produces no figure.
+  it("states no rate at all when the window was truncated", () => {
+    const obs = Array.from({ length: 12 }, (_, i) => ({
+      reviewId: `r${i}`,
+      agentKind: "risk_monitor",
+      targetType: "risk_finding",
+      subjectId: "ven_hot",
+      adverse: i % 2 === 0,
+      status: "pending",
+      confidence: 0.7,
+    }));
+    const whole = summariseBias(obs, new Date(), "2026-08-01T00:00:00.000Z");
+    expect(whole.overallAdverseRate).toBe(0.5);
+    expect(whole.truncated).toBe(false);
+    expect(whole.reasons).toEqual([]);
+
+    const partial = summariseBias(obs, new Date(), "2026-08-01T00:00:00.000Z", 12);
+    expect(partial.truncated).toBe(true);
+    expect(partial.overallAdverseRate).toBeNull();
+    expect(partial.groups[0]!.adverseRate).toBeNull();
+    expect(partial.groups[0]!.reason).toContain("truncated");
+    expect(partial.disparity).toBeNull();
+    expect(partial.reasons[0]).toContain("truncated");
+    expect(partial.verdict).toContain("partial read");
+  });
+
   it("recognises the adverse outputs", () => {
     expect(isAdverse("risk_finding", { severity: "critical" })).toBe(true);
     expect(isAdverse("spec_compliance", { compliant: "no" })).toBe(true);
@@ -576,6 +603,37 @@ describe("model validation (#1027)", () => {
     expect(agent.superseded).toBe(1);
     expect(agent.promptVersions).toEqual(["abc123"]);
     expect(report.totals.runs).toBe(10);
+    expect(report.truncated).toBe(false);
+    expect(report.reasons).toEqual([]);
+  });
+
+  // REGRESSION. buildValidationReport capped each source at 2,000 rows and
+  // said nothing; successRate over 40% of a window is not the window's rate.
+  it("withholds every rate when the window was truncated, and says which half", () => {
+    const runs = Array.from({ length: 10 }, () => run());
+    const reviews = [
+      ...Array.from({ length: 4 }, () => ({ agentKind: "risk_monitor", status: "approved" })),
+      ...Array.from({ length: 2 }, () => ({ agentKind: "risk_monitor", status: "rejected" })),
+    ];
+    const report = summariseValidation(runs, reviews, new Date(), "2026-08-01T00:00:00.000Z", {
+      runs: true,
+      limit: 2000,
+    });
+    const agent = report.agents[0]!;
+    expect(report.truncated).toBe(true);
+    expect(agent.successRate).toBeNull();
+    expect(agent.fabricationRate).toBeNull();
+    // only the RUN side was truncated, so the human-agreement rate survives
+    expect(agent.humanAgreementRate).toBeCloseTo(0.67, 2);
+    expect(agent.reasons.some((r) => r.includes("2000 run(s)"))).toBe(true);
+    expect(report.reasons).toHaveLength(1);
+
+    const both = summariseValidation(runs, reviews, new Date(), "2026-08-01T00:00:00.000Z", {
+      runs: true,
+      reviews: true,
+    });
+    expect(both.agents[0]!.humanAgreementRate).toBeNull();
+    expect(both.reasons).toHaveLength(2);
   });
 });
 

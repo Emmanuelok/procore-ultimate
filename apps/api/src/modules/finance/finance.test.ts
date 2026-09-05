@@ -683,12 +683,10 @@ describe("disbursement conditionality gate", () => {
       }[];
     };
     // single-currency project: the headline figure is allowed
-    expect(s.committedTotal).toMatchObject({ value: 100000, currency: "USD" });
-    expect(s.disbursedTotal).toMatchObject({ value: 40000, currency: "USD" });
-    expect(s.undisbursedTotal).toMatchObject({ value: 60000, currency: "USD" });
-    expect(s.committedByCurrency).toEqual([
-      { currency: "USD", amount: 100000, recordCount: 1 },
-    ]);
+    expect(s.committedTotal).toMatchObject({ value: 100000, currency: "GBP" });
+    expect(s.disbursedTotal).toMatchObject({ value: 40000, currency: "GBP" });
+    expect(s.undisbursedTotal).toMatchObject({ value: 60000, currency: "GBP" });
+    expect(s.committedByCurrency).toEqual([{ currency: "GBP", amount: 100000, recordCount: 1 }]);
     expect(s.pendingRequests).toBe(1);
     expect(s.openConditions).toBe(1);
     expect(s.covenantStatus).toBe("compliant");
@@ -710,6 +708,43 @@ describe("disbursement conditionality gate", () => {
       headers: owner.headers,
     });
     expect((after.json() as { covenantStatus: string }).covenantStatus).toBe("breached");
+  });
+
+  /* REGRESSION (audit: "Finance summary reports wrong money when facilities
+   * differ in currency"). A USD loan next to a EUR grant must never produce a
+   * single headline total labelled with the first facility's currency. */
+  it("refuses a cross-currency headline total and buckets money per currency (#740)", async () => {
+    const pid = await makeProject("Blended Currency Project");
+    await createFacility(pid, {
+      name: "USD Loan",
+      currency: "USD",
+      committedAmount: 100_000_000,
+    });
+    await createFacility(pid, {
+      name: "EUR Grant",
+      instrument: "grant",
+      currency: "EUR",
+      committedAmount: 50_000_000,
+    });
+
+    const s = (
+      await app.inject({
+        method: "GET",
+        url: `/api/v1/projects/${pid}/finance/summary`,
+        headers: owner.headers,
+      })
+    ).json() as {
+      committedByCurrency: { currency: string; amount: number }[];
+      committedTotal: { value: number | null; reasons?: string[] };
+      currencies: string[];
+    };
+    expect(s.committedByCurrency).toEqual([
+      { currency: "EUR", amount: 50_000_000, recordCount: 1 },
+      { currency: "USD", amount: 100_000_000, recordCount: 1 },
+    ]);
+    expect(s.committedTotal.value).toBeNull();
+    expect(s.committedTotal.reasons!.join(" ")).toContain("2 currencies");
+    expect(s.currencies).toEqual(["EUR", "USD"]);
   });
 });
 
