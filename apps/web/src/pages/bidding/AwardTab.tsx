@@ -462,7 +462,7 @@ function AwardCard({
               like an award above the lowest bid.
             */}
             <div className="flex justify-between gap-3">
-              <dt className="text-content-subtle">
+              <dt className="text-content-subtle" title={award.audit.awardAmountBasis ?? undefined}>
                 {(award.scopeLevellingItemIds ?? []).length > 0
                   ? "Contract sum (levelled, this scope)"
                   : "Contract sum (as bid)"}

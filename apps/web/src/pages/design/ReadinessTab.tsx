@@ -16,6 +16,7 @@ import { IconPlus, IconRefresh } from "../../ui/icons";
 import { api } from "../../lib/api";
 import {
   EM_DASH,
+  EditPanel,
   FigureCell,
   INFO_STATUS_TONE,
   LoadError,
@@ -55,6 +56,7 @@ export default function ReadinessTab({
   if (statusFilter) query.set("status", statusFilter);
   const requirements = useResource<ListResponse<InfoRequirementRow>>(`${base}/information-requirements?${query.toString()}`);
   const [createOpen, setCreateOpen] = useState(false);
+  const [editing, setEditing] = useState<InfoRequirementRow | null>(null);
   const action = useAction();
 
   function changed() {
@@ -170,6 +172,11 @@ export default function ReadinessTab({
           {row.status !== "verified" && row.status !== "waived" ? (
             <Button size="xs" variant="ghost" loading={action.busy === `waive-${row.id}`} onClick={() => void waive(row.id)}>
               Waive
+            </Button>
+          ) : null}
+          {row.status !== "verified" ? (
+            <Button size="xs" variant="ghost" onClick={() => setEditing(row)}>
+              Edit
             </Button>
           ) : null}
         </span>
@@ -356,6 +363,38 @@ export default function ReadinessTab({
           changed();
         }}
       />
+
+      <Drawer
+        open={editing !== null}
+        onClose={() => setEditing(null)}
+        size="md"
+        title={editing ? `${editing.reference} — ${editing.title}` : "Information requirement"}
+        description="A verified requirement is a record; correct it before it is verified."
+      >
+        {editing ? (
+          <EditPanel
+            title="Correct this requirement"
+            hint="Moving the due date moves the obligation with it."
+            path={`${base}/information-requirements/${editing.id}`}
+            initial={editing as unknown as Record<string, unknown>}
+            onSaved={() => {
+              setEditing(null);
+              changed();
+            }}
+            fields={[
+              { key: "title", label: "Title", kind: "text", maxLength: 200, nullable: false, wide: true },
+              {
+                key: "kind",
+                label: "Kind",
+                kind: "select",
+                options: DESIGN_INFO_REQUIREMENT_KINDS.map((k) => ({ value: k, label: k.toUpperCase() })),
+              },
+              { key: "dueDate", label: "Due", kind: "date" },
+              { key: "requirement", label: "Requirement", kind: "textarea" },
+            ]}
+          />
+        ) : null}
+      </Drawer>
     </div>
   );
 }

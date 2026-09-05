@@ -282,7 +282,7 @@ describe("regressions", () => {
       decision: "approved",
     });
     expect(refused.statusCode).toBe(403);
-    expect(refused.json().message).toContain("own");
+    expect(refused.json().message).toContain("may not approve it");
 
     const cards = await app.db
       .select()
@@ -322,8 +322,7 @@ describe("regressions", () => {
       name: "Two tier gang",
       trade: "groundworks",
       overtimeThresholdHours: 8,
-      currency: "GBP",
-      detail: { approvalLevels: 2, overtimeRule: "daily" },
+      config: { approvalLevels: 2, overtimeRule: "daily" },
     });
     expect(twoTier.statusCode).toBe(201);
     const twoTierCrewId = twoTier.json().id as string;
@@ -338,6 +337,7 @@ describe("regressions", () => {
       hourlyRate: 20,
       overtimeMultiplier: 1.5,
       currency: "GBP",
+      createdBy: owner.userId,
     });
     const batch = await post(`/projects/${projectId}/timecard-batches`, {
       crewId: twoTierCrewId,
@@ -379,10 +379,9 @@ describe("regressions", () => {
     const weekly = await post(`/projects/${projectId}/crews`, {
       name: "Weekly rule gang",
       trade: "groundworks",
-      currency: "GBP",
-      overtimeThresholdHours: 40,
-      detail: { overtimeRule: "weekly", weeklyOvertimeThresholdHours: 40, weekStartsOn: 1 },
+      config: { overtimeRule: "weekly", weeklyOvertimeThresholdHours: 40, weekStartsOn: 1 },
     });
+    expect(weekly.statusCode, weekly.body).toBe(201);
     const weeklyCrewId = weekly.json().id as string;
     const workerId = newId("wkr");
     await app.db.insert(workers).values({
@@ -404,6 +403,7 @@ describe("regressions", () => {
       hourlyRate: 20,
       overtimeMultiplier: 1.5,
       currency: "GBP",
+      createdBy: owner.userId,
     });
 
     const days = [35, 36, 37, 38, 39];
@@ -454,10 +454,23 @@ describe("regressions", () => {
       hourlyRate: 20,
       overtimeMultiplier: 1.5,
       currency: "GBP",
+      createdBy: owner.userId,
     });
     const original = await makeCard(workerId, day(45), 8);
-    // The worker was on site 8 h TODAY (the adjustment date), not on the
-    // original work date.
+    // An adjustment only exists for a card that can no longer be edited, so
+    // the original has to be submitted and independently approved first.
+    expect(
+      (await post(`/projects/${projectId}/timecards/${original.id}/submit`, {})).statusCode,
+    ).toBe(200);
+    const approved = await post(
+      `/projects/${projectId}/timecards/${original.id}/approve`,
+      { decision: "approved" },
+      approver.headers,
+    );
+    expect(approved.statusCode, approved.body).toBe(200);
+
+    // The worker was on site 8 h on the ADJUSTMENT date, not on the original
+    // work date.
     await app.db.insert(siteAccessRecords).values({
       id: newId("sac"),
       companyId: owner.companyId,

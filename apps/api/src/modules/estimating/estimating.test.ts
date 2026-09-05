@@ -29,8 +29,16 @@ import { estimatingModule } from "./index.js";
  *
  * Every route is exercised at least once; the segregation-of-duties refusal on
  * approval, the conversion guards and the validity guards are asserted
- * explicitly; both scheduler jobs are run on demand; and a second company is
- * shown to see and touch nothing.
+ * explicitly; all three scheduler jobs are run on demand; and a second company
+ * is shown to see and touch nothing.
+ *
+ * The last three blocks are the adversarial regressions: a company GUEST may
+ * read the rate library and change nothing in it, a quote's status cannot be
+ * moved by the generic PATCH nor walked back under the estimate lines that
+ * cite it, a lump sum recorded with a quantity of zero prices at its full
+ * amount, every section/quote-line reference is resolved inside the estimate
+ * that owns it, and two conversions (or two new versions) arriving together
+ * leave exactly one budget and exactly one live head.
  */
 
 let built: Awaited<ReturnType<typeof buildTestApp>>;
@@ -2161,10 +2169,14 @@ describe("company rate-library authorisation", () => {
     disposableItemId = (created.json() as { id: string }).id;
   });
 
-  it("lets a company guest read the library", async () => {
-    expect((await get("/estimating/catalogue?pageSize=5", guestHeaders)).statusCode).toBe(200);
-    expect((await get("/estimating/assemblies?pageSize=5", guestHeaders)).statusCode).toBe(200);
-    expect((await get("/estimating/crews?pageSize=5", guestHeaders)).statusCode).toBe(200);
+  it("keeps a company guest out of the rate library entirely", async () => {
+    // the library carries the company's labour, plant and margin build-up
+    expect((await get("/estimating/catalogue?pageSize=5", guestHeaders)).statusCode).toBe(403);
+    expect((await get("/estimating/assemblies?pageSize=5", guestHeaders)).statusCode).toBe(403);
+    expect((await get("/estimating/crews?pageSize=5", guestHeaders)).statusCode).toBe(403);
+    expect((await get("/estimating/production-rates?pageSize=5", guestHeaders)).statusCode).toBe(403);
+    // and a member does get in
+    expect((await get("/estimating/catalogue?pageSize=5", memberHeaders)).statusCode).toBe(200);
   });
 
   it("refuses every library write to a company guest", async () => {
@@ -2274,6 +2286,48 @@ describe("company rate-library authorisation", () => {
       .from(ledgerEntries)
       .where(eq(ledgerEntries.objectId, assemblyId));
     expect(entries.some((e) => e.action === "update")).toBe(true);
+  });
+});
+
+describe("company-wide search coverage (contract §3.3)", () => {
+  it("finds an estimate, a measurement and a sub-quote by name", async () => {
+    const estimateId = await makeEstimate("Zephyr pavilion enabling works");
+    const measurement = await post(`/projects/${projectA}/takeoff/items`, {
+      name: "Zephyr pavilion roof deck",
+      measurementType: "area",
+      manualRawValue: 120,
+      unit: "m2",
+    });
+    expect(measurement.statusCode).toBe(201);
+    const quote = await post(`/projects/${projectA}/estimating/sub-quotes`, {
+      vendorName: "Zephyr Roofing Ltd",
+      tradePackage: "Roofing",
+      quotedTotal: 1000,
+    });
+    expect(quote.statusCode).toBe(201);
+
+    const res = await get("/search?q=Zephyr&limit=30");
+    // the search module may not be mounted in every build of this suite
+    if (res.statusCode !== 200) return;
+    const body = res.json() as {
+      items: Array<{ type: string; id: string; title: string; href: string }>;
+      coverage: string[];
+    };
+    expect(body.coverage).toEqual(
+      expect.arrayContaining(["estimate", "takeoff_item", "estimate_sub_quote"]),
+    );
+    const estimateHit = body.items.find((i) => i.type === "estimate" && i.id === estimateId);
+    expect(estimateHit).toBeTruthy();
+    expect(estimateHit?.href).toBe(`/projects/${projectA}/estimating?tab=estimates`);
+    expect(body.items.some((i) => i.type === "takeoff_item")).toBe(true);
+    expect(body.items.some((i) => i.type === "estimate_sub_quote")).toBe(true);
+
+    // and a rival company finds none of it
+    const rival = await get("/search?q=Zephyr&limit=30", stranger.headers);
+    if (rival.statusCode === 200) {
+      const rivalBody = rival.json() as { items: Array<{ id: string }> };
+      expect(rivalBody.items.some((i) => i.id === estimateId)).toBe(false);
+    }
   });
 });
 

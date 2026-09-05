@@ -20,9 +20,10 @@
  * GATES. Every project route is `/projects/:projectId/...` so `requireTool`
  * resolves the project and enforces the `estimating` tool level. The rate
  * library is a COMPANY asset with no project for `requireTool` to resolve, so
- * it is gated on company role instead: every member may READ it, owner/admin/
- * member may write to it, and only owner/admin may retire from it or import
- * over it — a guest membership is not authority to re-rate the company.
+ * it is gated on company role instead: owner/admin/member read and maintain
+ * it, only owner/admin retire from it or import over it, and a `guest`
+ * membership reaches none of it — the library is the company's margin
+ * structure, not reference data.
  */
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import { and, asc, count, desc, eq, ilike, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
@@ -80,6 +81,7 @@ import {
 import { buildProposalDocument, renderProposalHtml, type ProposalDetailLevel } from "./proposal.js";
 import { levelQuotes, normaliseScopeKey, type QuoteInput } from "./quotes.js";
 import * as S from "./schemas.js";
+import { registerEstimatingSearch } from "./search.js";
 import {
   addDays,
   assertEditable,
@@ -140,16 +142,19 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
   ];
   const adminGate = [app.authenticate, app.requireCompany, app.requireTool("estimating", "admin")];
   // The rate library is a company asset with no :projectId for `requireTool`
-  // to resolve, so it is gated on company role instead (plan §1). Reading it
-  // is open to every member; writing to it is not, because a guest with a
-  // company membership would otherwise be able to re-rate the whole library,
-  // and retiring a rate an estimate cites is an administrator's act.
-  const companyGate = [app.authenticate, app.requireCompany];
-  const companyWriteGate = [
+  // to resolve, so it is gated on company ROLE instead (plan §1), in two
+  // tiers. A `guest` membership reaches none of it: the library carries the
+  // company's labour, plant and material build-ups — its margin structure —
+  // and a guest is by definition somebody from outside. A member maintains
+  // it; retiring a rate an estimate cites, or importing over the whole list,
+  // is an owner's or administrator's act.
+  const companyGate = [
     app.authenticate,
     app.requireCompany,
     app.requireCompanyRole(["owner", "admin", "member"]),
   ];
+  /** Same roles as reading today; named separately so the two can diverge. */
+  const companyWriteGate = companyGate;
   const companyAdminGate = [
     app.authenticate,
     app.requireCompany,
@@ -157,6 +162,7 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
   ];
 
   registerEstimatingJobs(app);
+  registerEstimatingSearch();
 
   async function ledger(
     req: FastifyRequest,

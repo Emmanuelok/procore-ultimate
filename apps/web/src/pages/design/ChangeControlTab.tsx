@@ -25,11 +25,13 @@ import {
   CurrencyRail,
   DCN_STATUS_TONE,
   EM_DASH,
+  EditPanel,
   KeyValue,
   LoadError,
   ReasonList,
   RefusalNotice,
   SectionHeading,
+  authorisationRank,
   dateTime,
   isoDate,
   labelize,
@@ -633,6 +635,34 @@ function NoticeDrawer({
 
   const packageName = new Map(lookups.packages.map((p) => [p.id, `${p.reference} — ${p.name}`]));
 
+  /** The ceiling the server will actually accept from this reader. */
+  const heldRank = authorisationRank(row?.heldAuthorisation?.level ?? "design_lead");
+
+  /**
+   * What would stop a change event being raised, computed from the same facts
+   * the server checks so the refusal is shown before the click rather than
+   * after it. A change event carries no currency of its own and cannot carry
+   * "not available", so both are hard stops.
+   */
+  const eventBlockers: string[] = [];
+  if (row) {
+    if (row.impactCurrencies.length > 1) {
+      eventBlockers.push(
+        `The assessed impact spans ${row.impactCurrencies.join(", ")}. A change event carries one currency, so the impacts have to be assessed in one before one can be raised.`,
+      );
+    } else if (row.projectCurrency && (row.currency || "").toUpperCase() !== row.projectCurrency) {
+      eventBlockers.push(
+        `This notice is assessed in ${row.currency} and the project's change register is kept in ${row.projectCurrency}. Raising a change event here would restate the figure, because a change event has no currency of its own.`,
+      );
+    }
+    if (row.assessedCost === null) {
+      eventBlockers.push(
+        `No cost has been assessed, and a change event cannot carry "not available" — it would enter the register as zero exposure. ${row.rollup.costReasons.join(" ")}`,
+      );
+    }
+  }
+  const canRaiseEvent = eventBlockers.length === 0;
+
   return (
     <Drawer open={noticeId !== null} onClose={onClose} size="lg" title={row ? `${row.reference} — ${row.title}` : "Design change notice"}>
       <div className="space-y-4">
@@ -654,6 +684,49 @@ function NoticeDrawer({
               ]}
             />
             {row.description ? <p className="text-meta text-content-muted">{row.description}</p> : null}
+
+            <EditPanel
+              title="Correct this notice"
+              hint="Only while it is still being assessed. A submitted notice is corrected by withdrawing it and raising a new one, so the freeze position it was stamped with stays true."
+              path={`${base}/change-notices/${row.id}`}
+              initial={row as unknown as Record<string, unknown>}
+              disabled={row.status !== "draft" && row.status !== "assessing"}
+              disabledReason={`${row.reference} is ${labelize(row.status).toLowerCase()}. Withdraw it and raise a new notice rather than editing what was authorised.`}
+              onSaved={onChanged}
+              fields={[
+                { key: "title", label: "Title", kind: "text", maxLength: 200, nullable: false, wide: true },
+                { key: "description", label: "Description", kind: "textarea" },
+                {
+                  key: "classification",
+                  label: "Classification",
+                  kind: "select",
+                  options: DCN_CLASSIFICATIONS.map((c) => ({ value: c, label: labelize(c) })),
+                  hint: "Design development carries no entitlement; a design change does.",
+                },
+                {
+                  key: "originator",
+                  label: "Originator",
+                  kind: "select",
+                  options: DCN_ORIGINATORS.map((o) => ({ value: o, label: labelize(o) })),
+                  hint: "Who the cost is attributed to.",
+                },
+                {
+                  key: "discipline",
+                  label: "Discipline",
+                  kind: "select",
+                  options: DESIGN_DISCIPLINES.map((d) => ({ value: d, label: labelize(d) })),
+                },
+                { key: "needByDate", label: "Needed by", kind: "date" },
+                {
+                  key: "currency",
+                  label: "Currency",
+                  kind: "text",
+                  maxLength: 3,
+                  hint: row.projectCurrency ? `The change register for this project is kept in ${row.projectCurrency}.` : undefined,
+                },
+                { key: "notes", label: "Notes", kind: "textarea" },
+              ]}
+            />
 
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="rounded-lg border border-border-subtle bg-surface-sunken p-3">
@@ -801,18 +874,33 @@ function NoticeDrawer({
               ) : null}
               {row.status === "submitted" || row.status === "assessing" ? (
                 <>
-                  <Field label="Approving at">
+                  <Field
+                    label="Approving at"
+                    hint={row.heldAuthorisation ? row.heldAuthorisation.basis : undefined}
+                  >
                     <Select value={approveLevel || row.requiredAuthorisation} onChange={(e) => setApproveLevel(e.target.value)}>
-                      {DCN_AUTHORISATION_LEVELS.map((l) => (
+                      {DCN_AUTHORISATION_LEVELS.filter((l) => authorisationRank(l) <= heldRank).map((l) => (
                         <option key={l} value={l}>
                           {labelize(l)}
                         </option>
                       ))}
                     </Select>
                   </Field>
-                  <Button size="sm" loading={action.busy === "approve"} onClick={() => void approve()}>
+                  <Button
+                    size="sm"
+                    loading={action.busy === "approve"}
+                    disabled={heldRank < authorisationRank(row.requiredAuthorisation)}
+                    onClick={() => void approve()}
+                  >
                     Approve
                   </Button>
+                  {heldRank < authorisationRank(row.requiredAuthorisation) ? (
+                    <p className="w-full text-2xs text-warning-fg">
+                      This change needs {labelize(row.requiredAuthorisation).toLowerCase()} authorisation and you sign at{" "}
+                      {labelize(row.heldAuthorisation?.level ?? "design_lead").toLowerCase()}. Send it to someone who holds that level —
+                      the ladder is checked against what you hold, not what you type.
+                    </p>
+                  ) : null}
                   <Button size="sm" variant="ghost" loading={action.busy === "reject"} onClick={() => void reject()}>
                     Reject
                   </Button>
@@ -823,13 +911,21 @@ function NoticeDrawer({
               ) : null}
               {row.status === "approved" ? (
                 <>
-                  <Button size="sm" loading={action.busy === "implement"} onClick={() => void implement(row.entitlement.raisesChangeEvent)}>
+                  <Button
+                    size="sm"
+                    loading={action.busy === "implement"}
+                    disabled={row.entitlement.raisesChangeEvent && !canRaiseEvent}
+                    onClick={() => void implement(row.entitlement.raisesChangeEvent)}
+                  >
                     {row.entitlement.raisesChangeEvent ? "Implement and raise a change event" : "Implement (no change event)"}
                   </Button>
                   {row.entitlement.raisesChangeEvent ? (
                     <Button size="sm" variant="ghost" onClick={() => void implement(false)}>
                       Implement without a change event
                     </Button>
+                  ) : null}
+                  {row.entitlement.raisesChangeEvent && !canRaiseEvent ? (
+                    <ReasonList reasons={eventBlockers} className="w-full" tone="danger" />
                   ) : null}
                 </>
               ) : null}

@@ -395,8 +395,21 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
           award.approvedBy && award.recommendedBy && award.approvedBy !== award.recommendedBy,
         ),
         isLowestBid: award.isLowestBid === 1,
-        /** the AS-BID contract sum — what the commitment will be raised for */
+        /**
+         * What the commitment is raised for. For a whole-package award that
+         * is the bidder's AS-BID contract sum. For a PARTIAL award it is the
+         * sum of their LEVELLED amounts over the rows this award covers —
+         * the as-bid total priced work this award is not buying, so calling
+         * it the as-bid sum would misname the number.
+         */
         asBidContractSum: award.awardAmount,
+        partialAward: ((award.scopeLevellingItemIds as string[] | null) ?? []).length > 0,
+        scopeLevellingItemIds: (award.scopeLevellingItemIds as string[] | null) ?? [],
+        awardAmountBasis:
+          ((award.scopeLevellingItemIds as string[] | null) ?? []).length > 0
+            ? `Levelled sum over the ${((award.scopeLevellingItemIds as string[] | null) ?? []).length} ` +
+              "scope row(s) this partial award covers — not the bidder's package total."
+            : "The bidder's as-bid contract sum for the whole package.",
         /** the figure the comparison was actually made on */
         recommendedComparableAmount:
           award.recommendedComparableAmount ??

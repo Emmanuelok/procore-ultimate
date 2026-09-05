@@ -19,6 +19,9 @@ import { newId } from "../../lib/ids.js";
 import { intelligenceModule } from "./index.js";
 import type { AttentionItem, PulseResponse } from "./types.js";
 
+/** Same reasoning as intelligence.test.ts: PGlite + migrations per file, on a shared box. */
+vi.setConfig({ testTimeout: 180_000, hookTimeout: 900_000 });
+
 const { createMock } = vi.hoisted(() => ({ createMock: vi.fn() }));
 
 vi.mock("@anthropic-ai/sdk", () => ({

@@ -1055,10 +1055,6 @@ export const estimatingApi = {
       `${p(projectId)}/estimates/${id}/proposal-preview?${params.toString()}`,
     );
   },
-  changeEvents: (projectId: string) =>
-    api.get<Paginated<{ id: string; reference: string; title: string; status: string; estimatedCost: number | null; currency: string }>>(
-      `${p(projectId)}/change-events?page=1&pageSize=200`,
-    ),
   pushToChangeEvent: (projectId: string, id: string, body: unknown) =>
     api.post<{
       changeEventId: string;

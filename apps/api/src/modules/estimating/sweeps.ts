@@ -614,7 +614,24 @@ export async function sweepQuoteOutliers(
             currency: quote.currency,
           },
         });
-        if (raised.raised) signalsRaised += 1;
+        if (raised.raised) {
+          signalsRaised += 1;
+          // The person who entered the quote is the person who can confirm
+          // the scope with the bidder, so the finding goes to them rather
+          // than only into the register.
+          await pushNotifications(db, [
+            {
+              companyId,
+              userId: quote.createdBy,
+              projectId: quote.projectId,
+              kind: "estimate",
+              title: `${outlier.vendorName} is ${outlier.direction} on "${outlier.description}"`,
+              body: `${outlier.amount} ${quote.currency} against a pack median of ${outlier.median} for ${quote.tradePackage}.`,
+              recordType: "estimate_sub_quote",
+              recordId: quote.id,
+            },
+          ]);
+        }
       }
     }
   }

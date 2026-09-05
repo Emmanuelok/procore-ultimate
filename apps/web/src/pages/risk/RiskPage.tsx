@@ -33,6 +33,9 @@ import Heatmap, { cellScores, type HeatCell } from "./Heatmap";
 import RiskModal from "./RiskModal";
 import RiskDrawer from "./RiskDrawer";
 import { DrawdownCurve, SCurve, Tornado, type TornadoRow } from "./SimulationCharts";
+import AppetiteTab from "./AppetiteTab";
+import ReferenceClassTab from "./ReferenceClassTab";
+import ContingencyGovernance from "./ContingencyGovernance";
 import {
   bandChipClass,
   bandTone,
@@ -768,6 +771,7 @@ function ContingencyTab({ base }: { base: string }) {
   const [error, setError] = useState<string | null>(null);
   const [curves, setCurves] = useState<Record<string, DrawdownCurveData | "loading">>({});
   const [openCurves, setOpenCurves] = useState<Record<string, boolean>>({});
+  const [openGovernance, setOpenGovernance] = useState<Record<string, boolean>>({});
 
   const load = useCallback(async () => {
     setError(null);
@@ -979,14 +983,33 @@ function ContingencyTab({ base }: { base: string }) {
                     {/* 20% threshold tick */}
                     <div className="absolute inset-y-0 left-[20%] w-px bg-ink-400/60" />
                   </div>
-                  <div className="flex gap-2">
+                  <div className="flex flex-wrap gap-2">
                     <Button variant="secondary" size="sm" onClick={() => void openDraw(c)}>
                       Draw down
                     </Button>
                     <Button variant="ghost" size="sm" onClick={() => toggleCurve(c.id)}>
                       {openCurves[c.id] ? "Hide drawdown curve" : "Drawdown curve"}
                     </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setOpenGovernance((m) => ({ ...m, [c.id]: !m[c.id] }))}
+                    >
+                      {openGovernance[c.id] ? "Hide releases & plan" : "Releases & plan"}
+                    </Button>
                   </div>
+                  {openGovernance[c.id] ? (
+                    <div className="mt-3 border-t border-ink-100 pt-3">
+                      <ContingencyGovernance
+                        base={base}
+                        contingency={c}
+                        onChanged={() => {
+                          void load();
+                          if (openCurves[c.id]) void loadCurve(c.id);
+                        }}
+                      />
+                    </div>
+                  ) : null}
                   {openCurves[c.id] ? (
                     <div className="mt-3 border-t border-ink-100 pt-3">
                       {curve === "loading" || !curve ? (
@@ -1168,6 +1191,8 @@ const TABS = [
   { id: "register", label: "Register" },
   { id: "simulation", label: "Simulation" },
   { id: "contingency", label: "Contingency" },
+  { id: "appetite", label: "Appetite" },
+  { id: "reference", label: "Reference class" },
 ] as const;
 
 type TabId = (typeof TABS)[number]["id"];
@@ -1258,6 +1283,10 @@ export default function RiskPage() {
         <RegisterTab base={base} projectId={projectId} users={users} tasks={tasks} />
       ) : tab === "simulation" ? (
         <SimulationTab base={base} schedules={schedules} taskNames={taskNames} />
+      ) : tab === "appetite" ? (
+        <AppetiteTab base={base} />
+      ) : tab === "reference" ? (
+        <ReferenceClassTab />
       ) : (
         <ContingencyTab base={base} />
       )}

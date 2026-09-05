@@ -586,8 +586,11 @@ export interface BidAward extends BidAwardRow {
     approvedAt: string | null;
     segregated: boolean;
     isLowestBid: boolean;
-    /** the AS-BID contract sum — what the commitment is raised for */
+    /** what the commitment is raised for: as-bid whole-package, or the levelled scope sum */
     asBidContractSum: number | null;
+    partialAward?: boolean;
+    scopeLevellingItemIds?: string[];
+    awardAmountBasis?: string;
     /** the figure the comparison was actually made on (levelled where levelled) */
     recommendedComparableAmount: number | null;
     lowestBidAmount: number | null;

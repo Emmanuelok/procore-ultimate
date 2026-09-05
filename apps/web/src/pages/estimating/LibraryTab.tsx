@@ -316,7 +316,7 @@ function CatalogueImporter({
     <Modal
       open={open}
       title="Import a rate list"
-      description="One rate per line: code | description | unit | cost type | rate. Nothing is written until every line parses, so a half-imported library cannot happen."
+      description="One rate per line: code | description | unit | cost type | rate. Nothing is written until every line parses, so a half-imported library cannot happen. Importing over the company library is an owner or administrator action."
       onClose={onClose}
       size="lg"
       footer={

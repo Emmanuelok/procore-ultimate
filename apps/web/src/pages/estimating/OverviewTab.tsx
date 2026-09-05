@@ -224,7 +224,13 @@ export default function OverviewTab({
           title="What the sweeps found"
           subtitle="Stale catalogue rates, estimates resting on them, approved estimates nobody converted, measurements nobody priced, quotes out of validity, and bidders a long way from the pack on the same scope row. Each is raised once and closed automatically when it clears."
           actions={
-            <Button size="sm" icon={IconRefresh} onClick={() => void runSweep()} loading={action.busy === "sweep"}>
+            <Button
+              size="sm"
+              icon={IconRefresh}
+              onClick={() => void runSweep()}
+              loading={action.busy === "sweep"}
+              title="Runs against this project only, and needs admin on the estimating tool"
+            >
               Run them on this project
             </Button>
           }

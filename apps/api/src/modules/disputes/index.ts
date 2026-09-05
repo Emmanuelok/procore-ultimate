@@ -397,6 +397,9 @@ function nextDeadlineOf(steps: TimetableStep[]): string | null {
   return open.length === 0 ? null : open.sort()[0]!;
 }
 
+const round2 = (n: number): number => Math.round(n * 100) / 100;
+const round4 = (n: number): number => Math.round(n * 10000) / 10000;
+
 const csvCell = (v: string | null | undefined): string => {
   const s = v ?? "";
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
@@ -2143,6 +2146,823 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
       return { disputeId, currency: dispute.currency, ...analysis };
     },
   );
+
+  /* ---------------------------------------------------------------- */
+  /* Statutory timetables (#322-333)                                   */
+  /* ---------------------------------------------------------------- */
+
+  /** The regime library, read-only: the statutes, with their authorities. */
+  app.get("/disputes/regimes", { preHandler: companyReadGate }, async () => ({
+    regimes: REGIMES,
+    note:
+      "These are the published statutory and contractual timetables, encoded as offsets from a " +
+      "trigger date. They are not legal advice and they do not know your contract: a contract that " +
+      "varies the statute is handled by editing the generated steps.",
+  }));
+
+  /**
+   * Generate (or regenerate) a dispute's procedural timetable from its
+   * regime. Existing steps that are already DONE are always kept — a
+   * regeneration must not erase what has actually happened.
+   */
+  app.post(
+    "/projects/:projectId/disputes/:disputeId/timetable/generate",
+    { preHandler: standardGate },
+    async (req) => {
+      const { disputeId } = req.params as { disputeId: string };
+      const body = timetableGenerateSchema.parse(req.body);
+      const dispute = await fetchDispute(disputeId, req.companyId!, req.projectId!);
+      if (TERMINAL.includes(dispute.status as DisputeStatus)) {
+        throw badRequest(`A ${dispute.status} dispute's timetable can no longer be regenerated`);
+      }
+      const generated = generateTimetable(body.jurisdiction, body.triggerDate, body.holidays ?? []);
+      if (!generated) throw badRequest(`Unknown dispute jurisdiction ${body.jurisdiction}`);
+      const regime = regimeFor(body.jurisdiction)!;
+      if (regime.kinds.length > 0 && !regime.kinds.includes(dispute.kind)) {
+        throw badRequest(
+          `${regime.label} applies to ${regime.kinds.join(" / ")} disputes; this one is a ${dispute.kind}. ` +
+            `Record the timetable by hand if the contract adopts the regime anyway.`,
+        );
+      }
+
+      const existing = dispute.timetable as TimetableStep[];
+      const keptDone = existing.filter((s) => s.done);
+      const keptOther = body.replace ? [] : existing.filter((s) => !s.done);
+      const keptKeys = new Set(
+        [...keptDone, ...keptOther].map((s) => s.key).filter((k): k is string => Boolean(k)),
+      );
+
+      const now = new Date().toISOString();
+      const next: TimetableStep[] = [...keptDone, ...keptOther];
+      await app.db.transaction(async (tx) => {
+        // Steps being replaced release their open obligations.
+        if (body.replace) {
+          for (const s of existing) {
+            if (s.done || !s.obligationId) continue;
+            await tx
+              .update(obligations)
+              .set({ status: "waived" })
+              .where(and(eq(obligations.id, s.obligationId), eq(obligations.status, "open")));
+          }
+        }
+        for (const step of generated.steps) {
+          if (keptKeys.has(step.key)) continue;
+          const obligationId = newId("obl");
+          await tx.insert(obligations).values({
+            id: obligationId,
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            sourceClause: step.authority,
+            trigger: `Dispute #${dispute.number} procedural timetable: ${step.name}`,
+            deadline: `${step.dueDate}T23:59:59Z`,
+            warnDaysBefore: 3,
+            evidenceRequirement: "Served submission / completed procedural step",
+            status: "open",
+            createdBy: req.user!.id,
+          });
+          next.push({
+            id: newId("stp"),
+            name: step.name,
+            dueDate: step.dueDate,
+            obligationId,
+            done: false,
+            doneAt: null,
+            breachedAt: null,
+            key: step.key,
+            owner: step.owner,
+            authority: step.authority,
+            extendedDueDate: step.extendedDueDate,
+          });
+        }
+        next.sort((a, b) => {
+          const ad = a.dueDate ?? "9999-12-31";
+          const bd = b.dueDate ?? "9999-12-31";
+          return ad < bd ? -1 : ad > bd ? 1 : 0;
+        });
+        await tx
+          .update(disputes)
+          .set({
+            timetable: next,
+            jurisdiction: body.jurisdiction,
+            triggerDate: body.triggerDate,
+            updatedAt: now,
+          })
+          .where(eq(disputes.id, disputeId));
+        await appendLedger(tx as never, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "update",
+          objectType: "dispute",
+          objectId: disputeId,
+          payload: {
+            event: "timetable_generated",
+            jurisdiction: body.jurisdiction,
+            triggerDate: body.triggerDate,
+            statute: generated.statute,
+            steps: next.length,
+            replaced: body.replace,
+          },
+          storePayload: true,
+          projectId: req.projectId!,
+        });
+      });
+      return {
+        ...(await fetchDispute(disputeId, req.companyId!, req.projectId!)),
+        regime: {
+          label: generated.label,
+          statute: generated.statute,
+          triggerName: generated.triggerName,
+          weekendsOnly: generated.weekendsOnly,
+          notes: generated.notes,
+        },
+      };
+    },
+  );
+
+  /**
+   * Assemble the adjudicator nomination request (#328). Document ASSEMBLY,
+   * not drafting: every sentence is built from a recorded field, and what
+   * is missing is named rather than invented.
+   */
+  app.get(
+    "/projects/:projectId/disputes/:disputeId/nomination-request",
+    { preHandler: readGate },
+    async (req) => {
+      const { disputeId } = req.params as { disputeId: string };
+      const dispute = await fetchDispute(disputeId, req.companyId!, req.projectId!);
+      const projectRow = (
+        await app.db
+          .select({ name: projects.name })
+          .from(projects)
+          .where(eq(projects.id, req.projectId!))
+          .limit(1)
+      )[0];
+      const counterparty = dispute.counterpartyEntityId
+        ? (
+            await app.db
+              .select({ name: entities.name })
+              .from(entities)
+              .where(eq(entities.id, dispute.counterpartyEntityId))
+              .limit(1)
+          )[0]
+        : null;
+      const contract = dispute.contractId
+        ? (
+            await app.db
+              .select({ reference: contracts.reference, title: contracts.title })
+              .from(contracts)
+              .where(eq(contracts.id, dispute.contractId))
+              .limit(1)
+          )[0]
+        : null;
+      return buildNominationRequest({
+        disputeNumber: dispute.number,
+        disputeTitle: dispute.title,
+        jurisdiction: dispute.jurisdiction ?? "custom",
+        forum: dispute.forum,
+        rules: dispute.rules,
+        contractReference: contract?.reference ?? null,
+        contractFamily: dispute.contractFamily,
+        projectName: projectRow?.name ?? "(project name not recorded)",
+        referringParty: "The referring party (record it on the dispute before sending)",
+        respondingParty: counterparty?.name ?? "(counterparty not recorded)",
+        amountInDispute: dispute.amountInDispute,
+        currency: dispute.currency,
+        triggerDate: dispute.triggerDate,
+        natureOfDispute: dispute.title,
+        requestedAt: new Date().toISOString(),
+      });
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Outcome and enforcement (#333, #356-357)                          */
+  /* ---------------------------------------------------------------- */
+
+  app.patch(
+    "/projects/:projectId/disputes/:disputeId/outcome",
+    { preHandler: standardGate },
+    async (req) => {
+      const { disputeId } = req.params as { disputeId: string };
+      const body = outcomeSchema.parse(req.body);
+      const dispute = await fetchDispute(disputeId, req.companyId!, req.projectId!);
+      const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
+      for (const [k, v] of Object.entries(body)) if (v !== undefined) set[k] = v;
+      if (Object.keys(set).length === 1) throw badRequest("Nothing to update");
+      await app.db.update(disputes).set(set).where(eq(disputes.id, disputeId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "dispute",
+        objectId: disputeId,
+        payload: { outcomeFields: body, previousStatus: dispute.status },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      return fetchDispute(disputeId, req.companyId!, req.projectId!);
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Standing dispute board (#331-332)                                 */
+  /* ---------------------------------------------------------------- */
+
+  app.post(
+    "/projects/:projectId/disputes/:disputeId/board-members",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { disputeId } = req.params as { disputeId: string };
+      const body = boardMemberSchema.parse(req.body);
+      await fetchDispute(disputeId, req.companyId!, req.projectId!);
+      const id = newId("dbm");
+      await app.db.insert(disputeBoardMembers).values({
+        id,
+        disputeId,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        name: body.name,
+        boardRole: body.boardRole,
+        nominatedBy: body.nominatedBy ?? null,
+        appointedAt: body.appointedAt ?? null,
+        independenceDisclosure: body.independenceDisclosure ?? null,
+        conflictDeclared: body.conflictDeclared ? 1 : 0,
+        feeBasis: body.feeBasis ?? null,
+        recordedBy: req.user!.id,
+      });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "dispute_board_member",
+        objectId: id,
+        payload: {
+          disputeId,
+          name: body.name,
+          boardRole: body.boardRole,
+          conflictDeclared: Boolean(body.conflictDeclared),
+        },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      const [row] = await app.db
+        .select()
+        .from(disputeBoardMembers)
+        .where(eq(disputeBoardMembers.id, id))
+        .limit(1);
+      return reply.status(201).send(row);
+    },
+  );
+
+  app.get(
+    "/projects/:projectId/disputes/:disputeId/board",
+    { preHandler: readGate },
+    async (req) => {
+      const { disputeId } = req.params as { disputeId: string };
+      await fetchDispute(disputeId, req.companyId!, req.projectId!);
+      const members = await app.db
+        .select()
+        .from(disputeBoardMembers)
+        .where(
+          and(
+            eq(disputeBoardMembers.disputeId, disputeId),
+            eq(disputeBoardMembers.companyId, req.companyId!),
+          ),
+        )
+        .orderBy(asc(disputeBoardMembers.boardRole), asc(disputeBoardMembers.name));
+      const visits = await app.db
+        .select()
+        .from(disputeBoardVisits)
+        .where(
+          and(
+            eq(disputeBoardVisits.disputeId, disputeId),
+            eq(disputeBoardVisits.companyId, req.companyId!),
+          ),
+        )
+        .orderBy(desc(disputeBoardVisits.visitDate));
+      const warnings: string[] = [];
+      const undisclosed = members.filter((m) => !m.independenceDisclosure);
+      if (undisclosed.length > 0) {
+        warnings.push(
+          `${undisclosed.length} board member(s) have no independence disclosure on record. A board ` +
+            `member with an undeclared connection to a party is a challengeable appointment.`,
+        );
+      }
+      if (members.length > 0 && !members.some((m) => m.boardRole === "chair")) {
+        warnings.push("No chair is recorded for this board.");
+      }
+      return { members, visits, warnings };
+    },
+  );
+
+  app.post(
+    "/projects/:projectId/disputes/:disputeId/board-visits",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { disputeId } = req.params as { disputeId: string };
+      const body = boardVisitSchema.parse(req.body);
+      await fetchDispute(disputeId, req.companyId!, req.projectId!);
+      if (body.reportFileId) {
+        await validateFileId(req.companyId!, req.projectId!, body.reportFileId);
+      }
+      const id = newId("dbv");
+      await app.db.insert(disputeBoardVisits).values({
+        id,
+        disputeId,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        visitDate: body.visitDate,
+        attendees: body.attendees ?? [],
+        summary: body.summary ?? null,
+        recommendations: body.recommendations ?? null,
+        reportFileId: body.reportFileId ?? null,
+        recordedBy: req.user!.id,
+      });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "dispute_board_visit",
+        objectId: id,
+        payload: { disputeId, visitDate: body.visitDate },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      const [row] = await app.db
+        .select()
+        .from(disputeBoardVisits)
+        .where(eq(disputeBoardVisits.id, id))
+        .limit(1);
+      return reply.status(201).send(row);
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Cost of recovery (#354)                                           */
+  /* ---------------------------------------------------------------- */
+
+  app.post(
+    "/projects/:projectId/disputes/:disputeId/costs",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { disputeId } = req.params as { disputeId: string };
+      const body = costCreateSchema.parse(req.body);
+      const dispute = await fetchDispute(disputeId, req.companyId!, req.projectId!);
+      const id = newId("dcs");
+      await app.db.insert(disputeCosts).values({
+        id,
+        disputeId,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        category: body.category,
+        supplier: body.supplier ?? null,
+        description: body.description,
+        incurredAt: body.incurredAt,
+        budgetAmount: body.budgetAmount ?? null,
+        actualAmount: body.actualAmount,
+        currency: body.currency ?? dispute.currency,
+        recoverable: body.recoverable ? 1 : 0,
+        recordedBy: req.user!.id,
+      });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "dispute_cost",
+        objectId: id,
+        payload: {
+          disputeId,
+          category: body.category,
+          actualAmount: body.actualAmount,
+          currency: body.currency ?? dispute.currency,
+        },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      const [row] = await app.db
+        .select()
+        .from(disputeCosts)
+        .where(eq(disputeCosts.id, id))
+        .limit(1);
+      return reply.status(201).send(row);
+    },
+  );
+
+  /**
+   * The cost of recovery, next to the recovery (#354). Money is bucketed by
+   * currency and never summed across them; a claim worth 200k pursued for
+   * 260k of fees is a loss, and nothing else on the platform can say so.
+   */
+  app.get(
+    "/projects/:projectId/disputes/:disputeId/costs",
+    { preHandler: readGate },
+    async (req) => {
+      const { disputeId } = req.params as { disputeId: string };
+      const dispute = await fetchDispute(disputeId, req.companyId!, req.projectId!);
+      const items = await app.db
+        .select()
+        .from(disputeCosts)
+        .where(
+          and(eq(disputeCosts.disputeId, disputeId), eq(disputeCosts.companyId, req.companyId!)),
+        )
+        .orderBy(asc(disputeCosts.incurredAt), asc(disputeCosts.createdAt));
+      const currencies = [...new Set(items.map((c) => c.currency))].sort();
+      const byCurrency = currencies.map((currency) => {
+        const rows = items.filter((c) => c.currency === currency);
+        const actual = round2(rows.reduce((sum, c) => sum + c.actualAmount, 0));
+        const budgeted = rows.some((c) => c.budgetAmount !== null)
+          ? round2(rows.reduce((sum, c) => sum + (c.budgetAmount ?? 0), 0))
+          : null;
+        return {
+          currency,
+          actual,
+          budgeted,
+          variance: budgeted === null ? null : round2(actual - budgeted),
+          recoverable: round2(
+            rows.filter((c) => c.recoverable === 1).reduce((sum, c) => sum + c.actualAmount, 0),
+          ),
+        };
+      });
+      const byCategory = [...new Set(items.map((c) => c.category))].sort().map((category) => ({
+        category,
+        byCurrency: [...new Set(items.filter((c) => c.category === category).map((c) => c.currency))]
+          .sort()
+          .map((currency) => ({
+            currency,
+            actual: round2(
+              items
+                .filter((c) => c.category === category && c.currency === currency)
+                .reduce((sum, c) => sum + c.actualAmount, 0),
+            ),
+          })),
+      }));
+      const inDisputeCurrency = byCurrency.find((b) => b.currency === dispute.currency) ?? null;
+      const costOfRecovery =
+        inDisputeCurrency === null || dispute.amountAwarded === null || dispute.amountAwarded <= 0
+          ? {
+              ratio: null,
+              reason:
+                dispute.amountAwarded === null
+                  ? "No award has been recorded on this dispute, so the cost of recovery cannot be expressed as a ratio."
+                  : dispute.amountAwarded <= 0
+                    ? "Nothing was recovered, so every unit of cost is unrecovered."
+                    : `No costs are recorded in the dispute's own currency (${dispute.currency}); costs in other currencies are not converted.`,
+            }
+          : {
+              ratio: round4(inDisputeCurrency.actual / dispute.amountAwarded),
+              reason: null,
+            };
+      return {
+        items,
+        total: items.length,
+        byCurrency,
+        byCategory,
+        awarded: dispute.amountAwarded,
+        currency: dispute.currency,
+        costOfRecovery,
+      };
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Decision-tree settlement modelling (#351-355)                     */
+  /* ---------------------------------------------------------------- */
+
+  async function loadOffersForAnalysis(
+    disputeId: string,
+    companyId: string,
+  ): Promise<OfferForAnalysis[]> {
+    const rows = await app.db
+      .select()
+      .from(settlementOffers)
+      .where(
+        and(eq(settlementOffers.disputeId, disputeId), eq(settlementOffers.companyId, companyId)),
+      );
+    return rows.map((o) => ({
+      id: o.id,
+      direction: o.direction,
+      status: o.status,
+      amount: o.amount,
+      currency: o.currency,
+      basis: o.basis,
+      offeredAt: o.offeredAt,
+      expiresAt: o.expiresAt,
+    }));
+  }
+
+  app.put(
+    "/projects/:projectId/disputes/:disputeId/settlement-model",
+    { preHandler: standardGate },
+    async (req) => {
+      const { disputeId } = req.params as { disputeId: string };
+      const body = settlementModelSchema.parse(req.body);
+      const dispute = await fetchDispute(disputeId, req.companyId!, req.projectId!);
+      const currency = body.currency ?? dispute.currency;
+      const branches: TreeBranch[] = body.branches.map((b) => ({
+        id: b.id ?? newId("brh"),
+        kind: b.kind,
+        label: b.label,
+        probability: b.probability,
+        award: b.award,
+      }));
+      const stages: TreeStage[] = body.stages.map((st) => ({
+        id: st.id ?? newId("stg"),
+        name: st.name,
+        ownCosts: st.ownCosts,
+        opponentCosts: st.opponentCosts,
+      }));
+      const costsRules: CostsRules | null = body.costsRules
+        ? {
+            enabled: body.costsRules.enabled,
+            indemnityCostsPercent: body.costsRules.indemnityCostsPercent,
+            enhancedInterestPercent: body.costsRules.enhancedInterestPercent,
+            ownOfferAmount: body.costsRules.ownOfferAmount,
+          }
+        : null;
+      const offers = await loadOffersForAnalysis(disputeId, req.companyId!);
+      const computed = evaluateDecisionTree(
+        {
+          branches,
+          stages,
+          discountRatePercent: body.discountRatePercent,
+          yearsToResolution: body.yearsToResolution,
+          costsRules,
+          currency,
+        },
+        offers,
+        { today: todayISO(), disputeCurrency: dispute.currency },
+      );
+      const provision = litigationProvision(computed);
+
+      const existing = await app.db
+        .select({ id: settlementModels.id })
+        .from(settlementModels)
+        .where(
+          and(
+            eq(settlementModels.disputeId, disputeId),
+            eq(settlementModels.companyId, req.companyId!),
+          ),
+        )
+        .limit(1);
+      const id = existing[0]?.id ?? newId("smd");
+      const values = {
+        name: body.name,
+        currency,
+        branches: branches as unknown as unknown[],
+        stages: stages as unknown as unknown[],
+        discountRatePercent: body.discountRatePercent,
+        yearsToResolution: body.yearsToResolution,
+        costsRules: costsRules as unknown as Record<string, unknown> | null,
+        computed: { ...computed, provision } as unknown as Record<string, unknown>,
+        updatedAt: new Date().toISOString(),
+      };
+      if (existing[0]) {
+        await app.db.update(settlementModels).set(values).where(eq(settlementModels.id, id));
+      } else {
+        await app.db.insert(settlementModels).values({
+          id,
+          disputeId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          createdBy: req.user!.id,
+          ...values,
+        });
+      }
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: existing[0] ? "update" : "create",
+        objectType: "settlement_model",
+        objectId: id,
+        payload: {
+          disputeId,
+          branches: branches.length,
+          expectedValue: computed.expectedValue,
+          valid: computed.valid,
+          provision: provision.provision,
+        },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      const [row] = await app.db
+        .select()
+        .from(settlementModels)
+        .where(eq(settlementModels.id, id))
+        .limit(1);
+      return row;
+    },
+  );
+
+  app.get(
+    "/projects/:projectId/disputes/:disputeId/settlement-model",
+    { preHandler: readGate },
+    async (req) => {
+      const { disputeId } = req.params as { disputeId: string };
+      const dispute = await fetchDispute(disputeId, req.companyId!, req.projectId!);
+      await sweepExpiredOffers(app.db, req.companyId!, todayISO(), [disputeId]);
+      const rows = await app.db
+        .select()
+        .from(settlementModels)
+        .where(
+          and(
+            eq(settlementModels.disputeId, disputeId),
+            eq(settlementModels.companyId, req.companyId!),
+          ),
+        )
+        .limit(1);
+      const model = rows[0];
+      if (!model) {
+        return {
+          model: null,
+          reason:
+            "No decision tree has been built for this dispute. The single-probability view is " +
+            "available on the settlement-analysis endpoint in the meantime.",
+        };
+      }
+      // Recompute against today's offers: the stored `computed` block is a
+      // snapshot of the last write, and offers move.
+      const offers = await loadOffersForAnalysis(disputeId, req.companyId!);
+      const computed = evaluateDecisionTree(
+        {
+          branches: model.branches as TreeBranch[],
+          stages: model.stages as TreeStage[],
+          discountRatePercent: model.discountRatePercent,
+          yearsToResolution: model.yearsToResolution,
+          costsRules: (model.costsRules ?? null) as CostsRules | null,
+          currency: model.currency,
+        },
+        offers,
+        { today: todayISO(), disputeCurrency: dispute.currency },
+      );
+      return { model, computed, provision: litigationProvision(computed) };
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Outcome analytics (#356-357) — company-level                       */
+  /* ---------------------------------------------------------------- */
+
+  async function outcomeRows(
+    companyId: string,
+    scope: string[] | null,
+    projectId?: string,
+  ): Promise<DisputeOutcomeRow[]> {
+    const clauses = [eq(disputes.companyId, companyId)];
+    if (projectId) clauses.push(eq(disputes.projectId, projectId));
+    else if (scope !== null) clauses.push(inArray(disputes.projectId, scope));
+    const rows = await app.db
+      .select()
+      .from(disputes)
+      .where(and(...clauses));
+    if (rows.length === 0) return [];
+    const costs = await app.db
+      .select()
+      .from(disputeCosts)
+      .where(
+        inArray(
+          disputeCosts.disputeId,
+          rows.map((d) => d.id),
+        ),
+      );
+    return rows.map((d) => {
+      // Only costs in the dispute's own currency roll into its own-cost
+      // figure — mixing currencies would fabricate a number.
+      const own = costs.filter((c) => c.disputeId === d.id && c.currency === d.currency);
+      return {
+        id: d.id,
+        projectId: d.projectId,
+        number: d.number,
+        title: d.title,
+        kind: d.kind,
+        forum: d.forum,
+        status: d.status,
+        jurisdiction: d.jurisdiction,
+        contractFamily: d.contractFamily,
+        governingClause: d.governingClause,
+        rootCause: d.rootCause,
+        currency: d.currency,
+        amountClaimed: d.amountClaimed ?? d.amountInDispute,
+        amountAwarded: d.amountAwarded,
+        costsAwarded: d.costsAwarded,
+        notifiedAt: d.createdAt.slice(0, 10),
+        resolvedAt: d.resolvedAt,
+        ownCosts:
+          own.length === 0 ? null : round2(own.reduce((sum, c) => sum + c.actualAmount, 0)),
+      };
+    });
+  }
+
+  app.get("/disputes/analytics", { preHandler: companyReadGate }, async (req) => {
+    const q = analyticsQuery.parse(req.query);
+    const scope = await visibleProjectIds(app, req, "disputes");
+    if (scope !== null && scope.length === 0) {
+      return {
+        overall: null,
+        groups: [],
+        reason: "You do not hold disputes access on any project in this company.",
+      };
+    }
+    const rows = await outcomeRows(req.companyId!, scope, q.projectId);
+    return { ...outcomeAnalytics(rows, q.groupBy as GroupBy), scoped: scope !== null };
+  });
+
+  /**
+   * What the outcome database says the contract should have said (#357).
+   * Every recommendation cites the disputes behind it, so nothing here is
+   * asserted that cannot be clicked through to.
+   */
+  app.get("/disputes/drafting-recommendations", { preHandler: companyReadGate }, async (req) => {
+    const scope = await visibleProjectIds(app, req, "disputes");
+    if (scope !== null && scope.length === 0) {
+      return { recommendations: [], reason: "You do not hold disputes access on any project." };
+    }
+    const rows = await outcomeRows(req.companyId!, scope);
+    const recommendations = draftingRecommendations(rows);
+    return {
+      recommendations,
+      disputesConsidered: rows.length,
+      reason:
+        recommendations.length === 0
+          ? "Not enough terminal disputes carry a governing clause or a root cause to draw a pattern from yet."
+          : null,
+      scoped: scope !== null,
+    };
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Health inputs (contract 3.5)                                      */
+  /* ---------------------------------------------------------------- */
+
+  app.get("/projects/:projectId/disputes/health-inputs", { preHandler: readGate }, async (req) => {
+    const companyId = req.companyId!;
+    const projectId = req.projectId!;
+    const today = todayISO();
+    await sweepMissedDeadlines(companyId, projectId);
+    await sweepExpiredOffers(app.db, companyId, today);
+    const rows = await app.db
+      .select()
+      .from(disputes)
+      .where(and(eq(disputes.companyId, companyId), eq(disputes.projectId, projectId)));
+    const reasons: string[] = [];
+    if (rows.length === 0) reasons.push("No disputes are recorded on this project.");
+    const live = rows.filter((d) => ACTIVE.includes(d.status as DisputeStatus));
+    let missedDeadlines = 0;
+    let nextDeadline: string | null = null;
+    for (const d of live) {
+      for (const s of d.timetable as TimetableStep[]) {
+        if (s.breachedAt) missedDeadlines += 1;
+        if (!s.done && s.dueDate && (nextDeadline === null || s.dueDate < nextDeadline)) {
+          nextDeadline = s.dueDate;
+        }
+      }
+    }
+    const costs = rows.length
+      ? await app.db
+          .select()
+          .from(disputeCosts)
+          .where(
+            inArray(
+              disputeCosts.disputeId,
+              rows.map((d) => d.id),
+            ),
+          )
+      : [];
+    const currencies = new Set(rows.map((d) => d.currency));
+    let amountInDisputeTotal: number | null = null;
+    if (currencies.size > 1) {
+      reasons.push(
+        `Live disputes span ${[...currencies].join(", ")}; a single amount-in-dispute total would require an exchange rate this platform does not hold.`,
+      );
+    } else if (live.length > 0) {
+      const quantified = live.filter((d) => d.amountInDispute !== null);
+      amountInDisputeTotal =
+        quantified.length > 0
+          ? round2(quantified.reduce((sum, d) => sum + (d.amountInDispute ?? 0), 0))
+          : null;
+      if (amountInDisputeTotal === null) {
+        reasons.push("No live dispute carries a quantified amount in dispute.");
+      }
+    }
+    return {
+      metrics: {
+        totalDisputes: rows.length,
+        liveDisputes: live.length,
+        adjudications: live.filter((d) => d.kind === "adjudication").length,
+        missedDeadlines,
+        daysToNextDeadline:
+          nextDeadline === null
+            ? null
+            : Math.round(
+                (Date.parse(`${nextDeadline}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) /
+                  86_400_000,
+              ),
+        amountInDisputeTotal,
+        awaitingCompliance: rows.filter((d) => d.enforcementStatus === "awaiting_compliance").length,
+        costsRecorded: costs.length,
+      },
+      reasons,
+    };
+  });
 };
 
 // re-export for colocated tests and the web layer

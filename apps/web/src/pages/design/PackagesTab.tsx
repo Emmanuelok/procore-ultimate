@@ -13,6 +13,7 @@ import { IconCheck, IconLock, IconPlus } from "../../ui/icons";
 import { api } from "../../lib/api";
 import {
   EM_DASH,
+  EditPanel,
   GATE_STATUS_TONE,
   KeyValue,
   LoadError,
@@ -634,6 +635,36 @@ function PackageDrawer({
               ]}
             />
             {row.description ? <p className="text-meta text-content-muted">{row.description}</p> : null}
+
+            <EditPanel
+              title="Correct this package"
+              hint="Only while it is still being drawn: an approved or frozen package is changed through a design change notice."
+              path={`${base}/packages/${row.id}`}
+              initial={row as unknown as Record<string, unknown>}
+              disabled={row.status === "approved" || row.status === "frozen"}
+              disabledReason={`${row.reference} is ${labelize(row.status).toLowerCase()}. Raise a design change notice rather than editing what has been fixed.`}
+              onSaved={onChanged}
+              fields={[
+                { key: "name", label: "Name", kind: "text", maxLength: 200, nullable: false },
+                { key: "description", label: "Description", kind: "textarea" },
+                {
+                  key: "discipline",
+                  label: "Discipline",
+                  kind: "select",
+                  options: DESIGN_DISCIPLINES.map((d) => ({ value: d, label: labelize(d) })),
+                },
+                {
+                  key: "stageKey",
+                  label: "Stage",
+                  kind: "select",
+                  options: [{ value: "", label: "— not assigned —" }, ...DESIGN_STAGE_KEYS.map((s) => ({ value: s, label: labelize(s) }))],
+                },
+                { key: "plannedIssueDate", label: "Planned issue", kind: "date" },
+                { key: "plannedApprovalDate", label: "Planned approval", kind: "date" },
+                { key: "revision", label: "Revision", kind: "text", maxLength: 20, placeholder: "P01" },
+                { key: "notes", label: "Notes", kind: "textarea" },
+              ]}
+            />
 
             <div className="flex flex-wrap gap-2">
               {(TRANSITIONS[row.status] ?? []).map((to) => (

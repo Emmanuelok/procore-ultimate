@@ -13,7 +13,9 @@
  *     authorisation, readiness) is shown next to the basis the engine used.
  */
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { Alert, Badge, Card, CardBody, Tooltip } from "../../ui";
+import { toast } from "sonner";
+import { Alert, Badge, Button, Card, CardBody, Field, Input, Select, Textarea, Tooltip } from "../../ui";
+import { IconEdit } from "../../ui/icons";
 import { cx } from "../../ui/cx";
 import type { Tone } from "../../ui/tokens";
 import { api } from "../../lib/api";
@@ -498,6 +500,10 @@ export interface ChangeNoticeDetail extends ChangeNoticeRow {
   authorisation: AuthorisationVerdict;
   entitlement: Entitlement;
   thresholds: { projectManagerAbove: number; clientAbove: number; boardAbove: number; clientTimeDaysAbove: number };
+  /** the currency the project's change register is kept in (change_events has none of its own) */
+  projectCurrency: string | null;
+  /** the level the READER may sign at, checked server-side against what they hold */
+  heldAuthorisation: { level: string; basis: string };
 }
 
 export interface ReadinessDimension {
@@ -540,6 +546,8 @@ export interface SignalRow {
 
 export interface Summary {
   asOf: string;
+  /** caveats about the roll-up itself, e.g. a row cap that bit on a huge register */
+  notes?: string[];
   packages: { total: number; byStatus: Record<string, number>; byDiscipline: Record<string, number>; frozen: number; approved: number };
   stages: { planned: number; open: number; signedOff: number; current: { stageKey: string; label: string | null } | null };
   reviews: { open: number; overdue: number; total: number; averageTurnaroundDays: Figure; byCode: Record<string, number> };
@@ -655,6 +663,17 @@ export interface SheetOption {
 
 export const EM_DASH = "—";
 export const NOT_AVAILABLE = "Not available";
+
+/**
+ * The DCN authorisation ladder, mirrored from the engine so the workspace can
+ * offer only the levels the reader actually holds. Unknown values sort to the
+ * bottom rather than the top: never assume authority the server did not name.
+ */
+const AUTHORISATION_ORDER = ["design_lead", "project_manager", "client", "board"] as const;
+export function authorisationRank(level: string | null | undefined): number {
+  const index = AUTHORISATION_ORDER.indexOf((level ?? "") as (typeof AUTHORISATION_ORDER)[number]);
+  return index === -1 ? -1 : index;
+}
 
 export function labelize(value: string | null | undefined): string {
   if (!value) return EM_DASH;
@@ -1120,6 +1139,182 @@ export function KeyValue({ items }: { items: Array<{ label: string; value: React
 
 export function optionList<T extends { id: string }>(items: T[], label: (item: T) => string, emptyLabel = "— none —") {
   return [{ value: "", label: emptyLabel }, ...items.map((i) => ({ value: i.id, label: label(i) }))];
+}
+
+/* ========================================================================== */
+/* Correcting a record in place                                                */
+/* ========================================================================== */
+
+export type EditFieldKind = "text" | "textarea" | "date" | "number" | "select";
+
+export interface EditFieldSpec {
+  /** the JSON key the API PATCH expects */
+  key: string;
+  label: string;
+  kind: EditFieldKind;
+  options?: Array<{ value: string; label: string }>;
+  maxLength?: number;
+  rows?: number;
+  placeholder?: string;
+  hint?: string;
+  /** an empty box sends null rather than "" (default true for nullable columns) */
+  nullable?: boolean;
+  /** full width inside the two-column grid */
+  wide?: boolean;
+}
+
+/**
+ * The correction path every register needs and none of them had: a drawer
+ * section that PATCHes the record while it is still editable. The API refuses
+ * once a record is approved, closed, verified or accepted, so this surfaces
+ * that refusal rather than trying to predict it — except where `disabled`
+ * says up front that the record is past editing, which saves a round trip.
+ *
+ * Only fields the user actually changed are sent: a PATCH is what the caller
+ * touched, never a whole-record overwrite.
+ */
+export function EditPanel({
+  title = "Correct this record",
+  hint,
+  path,
+  fields,
+  initial,
+  disabled = false,
+  disabledReason,
+  onSaved,
+}: {
+  title?: string;
+  hint?: string;
+  path: string;
+  fields: readonly EditFieldSpec[];
+  initial: Record<string, unknown>;
+  disabled?: boolean;
+  disabledReason?: string;
+  onSaved: () => void;
+}) {
+  const action = useAction();
+  const [open, setOpen] = useState(false);
+  const toText = useCallback(
+    (value: unknown): string => {
+      if (value === null || value === undefined) return "";
+      if (typeof value === "number") return String(value);
+      if (typeof value === "string") return value.length > 10 && /^\d{4}-\d{2}-\d{2}T/.test(value) ? value.slice(0, 10) : value;
+      return "";
+    },
+    [],
+  );
+  const seed = useCallback(() => {
+    const out: Record<string, string> = {};
+    for (const field of fields) out[field.key] = toText(initial[field.key]);
+    return out;
+  }, [fields, initial, toText]);
+  const [draft, setDraft] = useState<Record<string, string>>(seed);
+
+  useEffect(() => {
+    if (!open) setDraft(seed());
+  }, [open, seed]);
+
+  if (disabled) {
+    return disabledReason ? (
+      <p className="text-2xs italic text-content-subtle">{disabledReason}</p>
+    ) : null;
+  }
+
+  const changed = fields.filter((f) => draft[f.key] !== toText(initial[f.key]));
+
+  async function save() {
+    const payload: Record<string, unknown> = {};
+    for (const field of changed) {
+      const raw = (draft[field.key] ?? "").trim();
+      if (raw === "") payload[field.key] = field.nullable === false ? "" : null;
+      else if (field.kind === "number") {
+        const n = Number(raw);
+        if (!Number.isFinite(n)) continue;
+        payload[field.key] = n;
+      } else payload[field.key] = raw;
+    }
+    if (Object.keys(payload).length === 0) return;
+    const count = Object.keys(payload).length;
+    const r = await action.run("save", () => api.patch(path, payload));
+    if (r) {
+      toast.success(`${count} field${count === 1 ? "" : "s"} corrected`);
+      setOpen(false);
+      onSaved();
+    }
+  }
+
+  return (
+    <div className="rounded-md border border-border-subtle p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="text-meta font-semibold text-content">{title}</h3>
+          {hint ? <p className="text-2xs text-content-muted">{hint}</p> : null}
+        </div>
+        <Button size="xs" variant="secondary" leadingIcon={IconEdit} onClick={() => setOpen((v) => !v)}>
+          {open ? "Close" : "Edit"}
+        </Button>
+      </div>
+      {open ? (
+        <form
+          className="mt-3 space-y-3"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void save();
+          }}
+        >
+          {action.refusal ? <RefusalNotice refusal={action.refusal} onDismiss={action.clear} /> : null}
+          <div className="grid gap-3 sm:grid-cols-2">
+            {fields.map((field) => (
+              <div key={field.key} className={field.wide || field.kind === "textarea" ? "sm:col-span-2" : undefined}>
+                <Field label={field.label} hint={field.hint}>
+                  {field.kind === "textarea" ? (
+                    <Textarea
+                      rows={field.rows ?? 3}
+                      maxLength={field.maxLength}
+                      value={draft[field.key] ?? ""}
+                      onChange={(e) => setDraft((d) => ({ ...d, [field.key]: e.target.value }))}
+                    />
+                  ) : field.kind === "select" ? (
+                    <Select
+                      value={draft[field.key] ?? ""}
+                      onChange={(e) => setDraft((d) => ({ ...d, [field.key]: e.target.value }))}
+                    >
+                      {(field.options ?? []).map((o) => (
+                        <option key={o.value} value={o.value}>
+                          {o.label}
+                        </option>
+                      ))}
+                    </Select>
+                  ) : (
+                    <Input
+                      type={field.kind === "date" ? "date" : field.kind === "number" ? "number" : "text"}
+                      maxLength={field.maxLength}
+                      placeholder={field.placeholder}
+                      value={draft[field.key] ?? ""}
+                      onChange={(e) => setDraft((d) => ({ ...d, [field.key]: e.target.value }))}
+                    />
+                  )}
+                </Field>
+              </div>
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            <Button
+              type="submit"
+              size="sm"
+              loading={action.busy === "save"}
+              disabled={changed.length === 0}
+            >
+              {changed.length === 0 ? "Nothing changed" : `Save ${changed.length} change${changed.length === 1 ? "" : "s"}`}
+            </Button>
+            <Button type="button" size="sm" variant="ghost" onClick={() => setOpen(false)}>
+              Cancel
+            </Button>
+          </div>
+        </form>
+      ) : null}
+    </div>
+  );
 }
 
 /** The engine's verdict with its basis underneath — never a bare colour. */

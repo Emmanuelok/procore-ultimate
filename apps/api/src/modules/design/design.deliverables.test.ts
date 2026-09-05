@@ -262,6 +262,52 @@ describe("deliverable schedule", () => {
     expect(res.statusCode).toBe(409);
   });
 
+  it("refuses acceptance by the ISSUER even when somebody else registered it", async () => {
+    // The check used to look at createdBy, so where A registered and B issued,
+    // B could accept their own issue: the assertion and the evidence that
+    // tests it would carry one name.
+    const created = await post(`${base()}/deliverables`, {
+      title: "Registered by one, issued by another",
+      consultantId,
+      plannedIssueDate: addDaysISO(today, 15),
+    });
+    const id = (created.json() as { id: string }).id;
+    const issued = await post(`${base()}/deliverables/${id}/issue`, {}, checker.headers);
+    expect(issued.statusCode).toBe(200);
+    expect((issued.json() as { issuedBy: string }).issuedBy).toBe(checker.userId);
+
+    const selfAccept = await post(`${base()}/deliverables/${id}/accept`, {}, checker.headers);
+    expect(selfAccept.statusCode).toBe(403);
+    expect(selfAccept.json().message).toContain("other than the person who issued it");
+
+    // The registrar did not issue it, so they may accept it.
+    const proper = await post(`${base()}/deliverables/${id}/accept`, {});
+    expect(proper.statusCode).toBe(200);
+    const body = proper.json() as { status: string; acceptedBy: string; issuedBy: string };
+    expect(body.status).toBe("accepted");
+    expect(body.acceptedBy).toBe(owner.userId);
+    expect(body.issuedBy).toBe(checker.userId);
+  });
+
+  it("clears the issuer on rejection so the next issue is attributed afresh", async () => {
+    const created = await post(`${base()}/deliverables`, {
+      title: "Rejected then reissued",
+      consultantId,
+      plannedIssueDate: addDaysISO(today, 25),
+    });
+    const id = (created.json() as { id: string }).id;
+    await post(`${base()}/deliverables/${id}/issue`, {}, checker.headers);
+    const rejected = await post(`${base()}/deliverables/${id}/reject`, { reason: "Wrong revision" });
+    expect(rejected.statusCode).toBe(200);
+    expect((rejected.json() as { issuedBy: string | null }).issuedBy).toBeNull();
+
+    const reissued = await post(`${base()}/deliverables/${id}/issue`, {});
+    expect((reissued.json() as { issuedBy: string }).issuedBy).toBe(owner.userId);
+    // The new issuer may not accept their own issue either.
+    expect((await post(`${base()}/deliverables/${id}/accept`, {})).statusCode).toBe(403);
+    expect((await post(`${base()}/deliverables/${id}/accept`, {}, checker.headers)).statusCode).toBe(200);
+  });
+
   it("returns a rejected deliverable to outstanding with a fresh obligation", async () => {
     const created = await post(`${base()}/deliverables`, {
       title: "Rejected deliverable",
@@ -343,6 +389,16 @@ describe("information requirements", () => {
     const again = await post(`${base()}/information-requirements/sweep`, {});
     expect((again.json() as { signalsRaised: number }).signalsRaised).toBe(0);
     expect(await signalsFor("design_info_requirement_overdue")).toHaveLength(1);
+  });
+
+  it("refuses to make somebody from another company responsible", async () => {
+    const res = await post(`${base()}/information-requirements`, {
+      kind: "bep",
+      title: "BEP owned by a stranger",
+      responsibleUserId: stranger.userId,
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("not a member of this company");
   });
 
   it("marks the requirement overdue and lets a re-plan clear it", async () => {

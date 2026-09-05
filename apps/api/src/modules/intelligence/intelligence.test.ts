@@ -5,7 +5,7 @@
  * orchestrator's step; buildApp() never calls ready(), so a late register
  * is legal until the first inject.
  */
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import {
@@ -35,6 +35,14 @@ import { appendLedger } from "../../lib/ledger.js";
 import { intelligenceModule } from "./index.js";
 import { dirtyProjects, listCompanyProjects, refreshAttention, refreshPulse } from "./service.js";
 import type { AttentionItem, ProjectHealth, PulseResponse } from "./types.js";
+
+/**
+ * Every test here boots PGlite, applies the whole migration set and runs
+ * company-wide sweeps, so each one is disk- and CPU-bound. The repo default
+ * (30s) is comfortable on an idle machine and not on a shared one, where a
+ * green package would otherwise be reported as failing for want of seconds.
+ */
+vi.setConfig({ testTimeout: 180_000, hookTimeout: 900_000 });
 
 const DAY_MS = 86_400_000;
 const isoDate = (daysFromNow: number) => new Date(Date.now() + daysFromNow * DAY_MS).toISOString().slice(0, 10);

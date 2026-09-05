@@ -1842,6 +1842,7 @@ function MarkupPanel({
   const [basis, setBasis] = useState("direct_cost");
   const [rate, setRate] = useState("");
   const [costTypes, setCostTypes] = useState<string[]>([]);
+  const [sectionIds, setSectionIds] = useState<string[]>([]);
   const [rationale, setRationale] = useState("");
   const action = useAction();
 
@@ -1856,6 +1857,7 @@ function MarkupPanel({
         basis,
         rate: Number(rate) || 0,
         costTypes: basis === "cost_type" ? costTypes : [],
+        sectionIds,
         rationale: rationale.trim().length > 0 ? rationale : null,
         sequence: estimate.markups.length + 1,
       }),
@@ -1866,6 +1868,7 @@ function MarkupPanel({
       setName("");
       setRate("");
       setRationale("");
+      setSectionIds([]);
       onReload();
     }
   }
@@ -2038,6 +2041,29 @@ function MarkupPanel({
                       setCostTypes((prev) => (ev.target.checked ? [...prev, c] : prev.filter((x) => x !== c)))
                     }
                     label={titleCase(c)}
+                    size="sm"
+                  />
+                ))}
+              </div>
+            </Field>
+          ) : null}
+          {estimate.sections.length > 0 ? (
+            <Field
+              label="Limit to sections"
+              optional
+              hint="Leave every box clear to apply the tier to the whole estimate."
+            >
+              <div className="flex flex-wrap gap-3">
+                {estimate.sections.map((s) => (
+                  <Checkbox
+                    key={s.id}
+                    checked={sectionIds.includes(s.id)}
+                    onChange={(ev) =>
+                      setSectionIds((prev) =>
+                        ev.target.checked ? [...prev, s.id] : prev.filter((x) => x !== s.id),
+                      )
+                    }
+                    label={s.code ? `${s.code} ${s.name}` : s.name}
                     size="sm"
                   />
                 ))}
