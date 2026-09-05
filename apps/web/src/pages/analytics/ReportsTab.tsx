@@ -20,6 +20,7 @@ import {
   Field,
   Input,
   Modal,
+  SegmentedControl,
   Select,
   Spinner,
   Table,
@@ -157,12 +158,25 @@ export default function ReportsTab({
     }
   }
 
-  async function onExport(report: ReportRow) {
+  /**
+   * Export a report at an EXPLICIT scope.
+   *
+   * The old version appended the current project to every export, so a report
+   * saved company-wide silently exported one project's rows and the header
+   * still read "scoped to this project". A company-wide definition now exports
+   * company-wide unless the caller asks otherwise; a project-pinned definition
+   * always exports its own project, because the server would refuse anything
+   * else anyway.
+   */
+  async function onExport(report: ReportRow, scope?: "project" | "company") {
     setActionError(null);
     setRowBusy(report.id);
     try {
+      const effective = report.projectId !== null ? "project" : (scope ?? "company");
+      const query =
+        effective === "project" ? `?projectId=${encodeURIComponent(projectId)}` : "";
       const url = await fetchBlobUrl(
-        `/api/v1/analytics/reports/${report.id}/export.csv?projectId=${encodeURIComponent(projectId)}`,
+        `/api/v1/analytics/reports/${report.id}/export.csv${query}`,
       );
       const a = document.createElement("a");
       a.href = url;
@@ -200,7 +214,7 @@ export default function ReportsTab({
         projectId={projectId}
         report={view.report}
         onBack={() => setView({ kind: "list" })}
-        onExport={() => void onExport(view.report)}
+        onExport={(scope) => void onExport(view.report, scope)}
         exporting={rowBusy === view.report.id}
       />
     );
@@ -1058,7 +1072,7 @@ function RunView({
   projectId: string;
   report: ReportRow;
   onBack: () => void;
-  onExport: () => void;
+  onExport: (scope: "project" | "company") => void;
   exporting: boolean;
 }) {
   const PAGE_SIZE = 50;
@@ -1066,14 +1080,24 @@ function RunView({
   const [result, setResult] = useState<RunResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
+  /*
+   * A report pinned to a project can only run there; a company-wide definition
+   * defaults to company-wide, which is what it was saved as. Previously every
+   * run forced the current project on, so #739's company scope could not be
+   * reached from the web at all.
+   */
+  const pinned = report.projectId !== null;
+  const [scope, setScope] = useState<"project" | "company">(pinned ? "project" : "company");
 
   const run = useCallback(
     async (p: number) => {
       setRunning(true);
       setError(null);
       try {
+        const scopeQuery =
+          pinned || scope === "project" ? `&projectId=${encodeURIComponent(projectId)}` : "";
         const res = await api.post<RunResponse>(
-          `/api/v1/analytics/reports/${report.id}/run?page=${p}&pageSize=${PAGE_SIZE}&projectId=${encodeURIComponent(projectId)}`,
+          `/api/v1/analytics/reports/${report.id}/run?page=${p}&pageSize=${PAGE_SIZE}${scopeQuery}`,
         );
         setResult(res);
       } catch (err) {
@@ -1083,12 +1107,16 @@ function RunView({
         setRunning(false);
       }
     },
-    [report.id, projectId],
+    [report.id, projectId, pinned, scope],
   );
 
   useEffect(() => {
     void run(page);
   }, [run, page]);
+
+  useEffect(() => {
+    setPage(1);
+  }, [scope]);
 
   const offsetEnd = result ? result.offset + result.rowCount : 0;
   const hasNext = result !== null && result.truncated && offsetEnd < result.limitRows;
@@ -1112,9 +1140,22 @@ function RunView({
             </p>
           </div>
         </div>
-        <Button variant="secondary" onClick={onExport} disabled={exporting}>
-          {exporting ? "Exporting…" : "Export CSV"}
-        </Button>
+        <div className="flex items-center gap-2">
+          {pinned ? null : (
+            <SegmentedControl<"project" | "company">
+              value={scope}
+              onChange={setScope}
+              aria-label="Run scope"
+              options={[
+                { value: "company", label: "All projects I can open" },
+                { value: "project", label: "This project" },
+              ]}
+            />
+          )}
+          <Button variant="secondary" onClick={() => onExport(scope)} disabled={exporting}>
+            {exporting ? "Exporting…" : "Export CSV"}
+          </Button>
+        </div>
       </div>
 
       <ErrorAlert message={error} />

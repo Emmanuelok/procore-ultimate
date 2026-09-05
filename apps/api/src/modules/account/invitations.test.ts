@@ -19,6 +19,20 @@ import { mintToken } from "./tokens.js";
 import { newId } from "../../lib/ids.js";
 
 /**
+ * How long a suite may take to boot its own embedded Postgres.
+ *
+ * `buildTestApp()` starts PGlite (WASM) and replays every migration from 0000,
+ * which is seconds of CPU on an idle machine and a great deal more on a shared
+ * one. Vitest's 30-second default hook timeout therefore fails these suites for
+ * a reason that has nothing to do with the code under test — and a suite that
+ * fails when the machine is busy teaches people to ignore red, which is the
+ * expensive failure. The assertions are unaffected: a hook that is going to
+ * succeed still succeeds, it is simply allowed to take longer.
+ */
+const HOOK_TIMEOUT_MS = 180_000;
+
+
+/**
  * Invitations, from "an administrator typed an address" to "somebody signed in
  * holding a role".
  *
@@ -93,7 +107,7 @@ describe("invitations", () => {
     built = await buildTestApp();
     app = built.app;
     owner = await signUp(app, "Brightwell Construction");
-  });
+  }, HOOK_TIMEOUT_MS);
 
   afterAll(async () => {
     await built.close();

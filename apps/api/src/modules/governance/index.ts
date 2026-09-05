@@ -2,21 +2,32 @@ import type { FastifyPluginAsync } from "fastify";
 import { and, asc, count, desc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import {
+  assuranceActions,
+  benefitDependencies,
   benefitReadings,
   benefits,
   businessCases,
   events,
+  evidence,
+  files,
   gateReviews,
   obligations,
+  projects,
   stageGates,
+  upliftChallenges,
 } from "@constructos/db";
 import {
+  ASSURANCE_ACTION_PRIORITIES,
+  ASSURANCE_ACTION_STATUSES,
+  BENEFIT_DEPENDENCY_TYPES,
   BUSINESS_CASE_STAGES,
   BUSINESS_CASE_STATUSES,
   BENEFIT_STATUSES,
   GATE_DECISIONS,
+  LOGIC_MODEL_LEVELS,
+  OPTIMISM_BIAS_CATEGORIES,
   RAG_RATINGS,
-  type BenefitStatus,
+  type BenefitDependencyType,
 } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
@@ -28,10 +39,36 @@ import { pushNotifications } from "../notifications/service.js";
 import {
   appraiseOption,
   benefitProgressPercent,
-  benefitStatusFor,
+  economicIrr,
+  netCashflows,
+  sensitivityAnalysis,
   type AppraisalConfig,
   type OptionAppraisal,
+  type SensitivityAnalysis,
 } from "./appraisal.js";
+import {
+  propagateBenefitStatus,
+  realisationSeries,
+  wouldCycle,
+  type BenefitEdge,
+  type BenefitNode,
+} from "./benefits.js";
+import {
+  buildGateEvidencePack,
+  gateStatusForDecision,
+  missingEvidenceLinks,
+  type EvidenceLink,
+  type PackItemInput,
+} from "./pack.js";
+import {
+  registerGovernanceJobs,
+  sweepAssuranceActions,
+  sweepBenefitStatuses,
+  sweepGateConditions,
+} from "./jobs.js";
+import { companyToolGate, isIndependentReviewer, visibleProjectIds } from "./gates.js";
+import { OPTIMISM_BIAS_TABLE, referenceClassForecast, upliftFor } from "../risk/optimism.js";
+import { referenceProjects } from "@constructos/db";
 
 /* ------------------------------------------------------------------ */
 /* JSONB shapes                                                        */
@@ -45,7 +82,12 @@ interface BcOption {
   capex: number;
   annualBenefits: number[];
   annualCosts: number[];
-  computed: OptionAppraisal;
+  computed: OptionAppraisal & {
+    /** economic IRR; null when the cashflow series has no sign change (#400) */
+    eirr: number | null;
+    /** ±10/20/30% grid, switching values and tornado ordering (#406) */
+    sensitivity: SensitivityAnalysis;
+  };
 }
 
 interface GateCriterion {
@@ -172,6 +214,9 @@ const reviewCreateSchema = z.object({
         criterionId: z.string().min(1),
         met: z.boolean(),
         note: z.string().max(5000).optional(),
+        /** artefacts the reviewer looked at — required where evidenceRequired (#410) */
+        evidenceIds: z.array(z.string().min(1)).max(50).optional(),
+        fileIds: z.array(z.string().min(1)).max(50).optional(),
       }),
     )
     .max(200),
@@ -188,6 +233,81 @@ const reviewCreateSchema = z.object({
 
 const conditionCloseSchema = z.object({
   note: z.string().max(5000).nullable().optional(),
+});
+
+/* ---- platform upgrade wave ---- */
+
+const referenceClassSchema = z.object({
+  category: z.enum(OPTIMISM_BIAS_CATEGORIES),
+  /** 0 = nothing mitigated (upper bound), 1 = all drivers addressed (lower bound) */
+  position: z.number().min(0).max(1).default(0),
+  mitigations: z.array(z.string().max(1000)).max(50).optional(),
+  /** apply the outside view instead of the table, when the class supports it */
+  useOutsideView: z.boolean().default(false),
+  outsideConfidence: z.enum(["p50", "p80", "p90"]).default("p80"),
+});
+
+const upliftChallengeSchema = z.object({
+  category: z.enum(OPTIMISM_BIAS_CATEGORIES),
+  proposedPercent: z.number().min(0).max(1000),
+  justification: z.string().min(20).max(20000),
+});
+
+const challengeDecisionSchema = z.object({
+  note: z.string().max(5000).nullable().optional(),
+});
+
+const logicModelSchema = z.object({
+  nodes: z
+    .array(
+      z.object({
+        id: z.string().min(1).max(60).optional(),
+        level: z.enum(LOGIC_MODEL_LEVELS),
+        label: z.string().min(1).max(500),
+        note: z.string().max(5000).nullable().optional(),
+        benefitId: z.string().min(1).nullable().optional(),
+      }),
+    )
+    .max(200),
+  edges: z
+    .array(z.object({ from: z.string().min(1), to: z.string().min(1) }))
+    .max(400),
+});
+
+const dependencySchema = z.object({
+  fromBenefitId: z.string().min(1),
+  toBenefitId: z.string().min(1),
+  depType: z.enum(BENEFIT_DEPENDENCY_TYPES).default("contributes"),
+  note: z.string().max(2000).nullable().optional(),
+});
+
+const assuranceActionCreateSchema = z.object({
+  title: z.string().min(1).max(300),
+  description: z.string().max(20000).nullable().optional(),
+  source: z.enum(["gate_review", "assurance_review", "audit", "other"]).default("other"),
+  gateReviewId: z.string().min(1).nullable().optional(),
+  priority: z.enum(ASSURANCE_ACTION_PRIORITIES).default("recommended"),
+  ownerId: z.string().min(1).nullable().optional(),
+  dueDate: isoDateSchema.nullable().optional(),
+});
+
+const assuranceActionPatchSchema = z.object({
+  title: z.string().min(1).max(300).optional(),
+  description: z.string().max(20000).nullable().optional(),
+  priority: z.enum(ASSURANCE_ACTION_PRIORITIES).optional(),
+  ownerId: z.string().min(1).nullable().optional(),
+  dueDate: isoDateSchema.nullable().optional(),
+  status: z.enum(["open", "in_progress", "cancelled"]).optional(),
+});
+
+const assuranceActionCloseSchema = z.object({
+  note: z.string().max(5000).nullable().optional(),
+  evidenceIds: z.array(z.string().min(1)).max(50).optional(),
+});
+
+const assuranceActionListQuery = pageQuerySchema.extend({
+  status: z.enum(ASSURANCE_ACTION_STATUSES).optional(),
+  ownerId: z.string().min(1).optional(),
 });
 
 const benefitCreateSchema = z.object({
@@ -225,6 +345,23 @@ function daysUntil(isoDate: string): number {
   );
 }
 
+/**
+ * The full computed block for one option: NPV/BCR/payback (#398-399), the
+ * economic IRR (#400) and the sensitivity/switching-value analysis (#406).
+ * One definition, used by both the options PUT and the appraisal-config
+ * PATCH, so a persisted block can never drift from its config.
+ */
+function computeOption(
+  cashflows: { capex: number; annualBenefits: number[]; annualCosts: number[] },
+  config: AppraisalConfig,
+): BcOption["computed"] {
+  return {
+    ...appraiseOption(cashflows, config),
+    eirr: economicIrr(netCashflows(cashflows, config)),
+    sensitivity: sensitivityAnalysis(cashflows, config),
+  };
+}
+
 function asAppraisalConfig(raw: Record<string, unknown>): AppraisalConfig {
   return {
     discountRatePercent: Number(raw.discountRatePercent ?? 3.5),
@@ -251,6 +388,25 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
     app.requireCompany,
     app.requireTool("governance", "standard"),
   ];
+  /**
+   * The decision gates. Approving a business case and recording a Gateway
+   * review are determinations, not edits: both were on "standard", which
+   * meant any project member with governance:standard — the estimator, a
+   * contractor-side user — could approve the money case or stop the
+   * project. They now need governance:admin, and a gate review
+   * additionally needs an independence finding (see the review route).
+   */
+  const adminGate = [
+    app.authenticate,
+    app.requireCompany,
+    app.requireTool("governance", "admin"),
+  ];
+  const companyReadGate = [
+    app.authenticate,
+    app.requireCompany,
+    companyToolGate(app, "governance", "read"),
+  ];
+  registerGovernanceJobs(app);
 
   /* ---------------------------------------------------------------- */
   /* Business cases (#394-405)                                         */
@@ -355,7 +511,7 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
       const merged = { ...asAppraisalConfig(bc.appraisal), ...body.appraisal };
       set.appraisal = merged;
       const options = bc.options as BcOption[];
-      set.options = options.map((o) => ({ ...o, computed: appraiseOption(o, merged) }));
+      set.options = options.map((o) => ({ ...o, computed: computeOption(o, merged) }));
     }
     await app.db.update(businessCases).set(set).where(eq(businessCases.id, bcId));
     await appendLedger(app.db, {
@@ -403,7 +559,7 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
         name: o.name,
         isCounterfactual: o.isCounterfactual ?? false,
         ...cashflows,
-        computed: appraiseOption(cashflows, config),
+        computed: computeOption(cashflows, config),
       };
     });
     const set: Record<string, unknown> = { options, updatedAt: new Date().toISOString() };
@@ -487,7 +643,7 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
   for (const verb of ["approve", "reject"] as const) {
     app.post(
       `/projects/:projectId/business-cases/:bcId/${verb}`,
-      { preHandler: standardGate },
+      { preHandler: adminGate },
       async (req) => {
         const { bcId } = req.params as { bcId: string };
         const bc = await fetchBc(bcId, req.companyId!, req.projectId!);
@@ -551,6 +707,11 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
 
   app.post("/projects/:projectId/stage-gates", { preHandler: standardGate }, async (req, reply) => {
     const body = gateCreateSchema.parse(req.body);
+    // The check-then-insert below is a race against stage_gates_uq: two
+    // concurrent "Gate 2" creates both pass the lookup and the second used to
+    // surface the unique violation as a 500. The lookup stays for the good
+    // error message; the insert is guarded so the loser gets the 409 the
+    // check would have given it.
     const existing = await app.db
       .select({ id: stageGates.id })
       .from(stageGates)
@@ -567,17 +728,24 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
       text: c.text,
       evidenceRequired: c.evidenceRequired ?? false,
     }));
-    await app.db.insert(stageGates).values({
-      id,
-      companyId: req.companyId!,
-      projectId: req.projectId!,
-      gateNumber: body.gateNumber,
-      name: body.name,
-      description: body.description ?? null,
-      criteria,
-      plannedDate: body.plannedDate ?? null,
-      status: "pending",
-    });
+    const inserted = await app.db
+      .insert(stageGates)
+      .values({
+        id,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        gateNumber: body.gateNumber,
+        name: body.name,
+        description: body.description ?? null,
+        criteria,
+        plannedDate: body.plannedDate ?? null,
+        status: "pending",
+      })
+      .onConflictDoNothing({ target: [stageGates.projectId, stageGates.gateNumber] })
+      .returning({ id: stageGates.id });
+    if (inserted.length === 0) {
+      throw conflict(`Gate ${body.gateNumber} is already defined for this project`);
+    }
     await appendLedger(app.db, {
       companyId: req.companyId!,
       actorId: req.user!.id,
@@ -669,21 +837,51 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
   });
 
   /**
-   * Record a gate review (#409-414): findings must cover EVERY criterion
-   * (400 listing what is missing), each condition of approval materializes
-   * as an assurance obligation tracked to closure (#413), the gate becomes
-   * `decided`, and a stop decision lands in the project event graph. A gate
-   * held or stopped may be re-reviewed later; every review is retained in
-   * the decision register (#412) and the latest one governs.
+   * Record a gate review (#409-415).
+   *
+   * Three things changed here, and each of them was a real hole:
+   *
+   *  1. INDEPENDENCE. This route used to be `standard`. Any project member
+   *     holding governance:standard — the estimator, a contractor-side user —
+   *     could record a Gateway review, set a `stop` decision that lands in
+   *     the project event graph, and close their own conditions. #411/#412
+   *     expect an independent assurance reviewer, so the route now requires
+   *     governance:admin AND an independence test: an assurance grant
+   *     (integrity_reviewer / auditor) or company owner/admin. The basis of
+   *     that finding is stored on the review, because "who was allowed to
+   *     decide this, and why" is part of the decision.
+   *
+   *  2. EVIDENCE. Criteria marked `evidenceRequired` must be linked to real
+   *     evidence or files; those content hashes are frozen into a
+   *     Merkle-rooted pack whose root is stored on the review, so the
+   *     decision is reproducible six months later.
+   *
+   *  3. ATOMICITY. Conditions materialise as obligations. That used to be N
+   *     inserts followed by the review insert with no transaction, so a
+   *     failure part-way left obligations with no owning record on the
+   *     assurance register. The whole handler now runs in one transaction.
+   *
+   * A `hold` decision no longer marks the gate `decided` — a hold is a
+   * review still running, so the gate moves to `in_review` (the status the
+   * schema and the UI already modelled and no route ever set).
    */
   app.post(
     "/projects/:projectId/stage-gates/:gateId/reviews",
-    { preHandler: standardGate },
+    { preHandler: adminGate },
     async (req, reply) => {
       const { gateId } = req.params as { gateId: string };
       const body = reviewCreateSchema.parse(req.body);
       const gate = await fetchGate(gateId, req.companyId!, req.projectId!);
       const criteria = gate.criteria as GateCriterion[];
+
+      const independence = await isIndependentReviewer(app, req);
+      if (!independence.independent) {
+        throw forbidden(
+          `A gate review must be recorded by an independent reviewer. ${independence.basis} ` +
+            `Grant an assurance role (integrity_reviewer or auditor) to the reviewer, or have a ` +
+            `company owner or admin record the decision.`,
+        );
+      }
 
       const knownIds = new Set(criteria.map((c) => c.id));
       const coveredIds = new Set(body.findings.map((f) => f.criterionId));
@@ -701,88 +899,186 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
         });
       }
 
+      // Evidence-required criteria must carry at least one artefact (#410).
+      const links: EvidenceLink[] = body.findings.map((f) => ({
+        criterionId: f.criterionId,
+        evidenceIds: f.evidenceIds,
+        fileIds: f.fileIds,
+      }));
+      const unevidenced = missingEvidenceLinks(criteria, links);
+      if (unevidenced.length > 0) {
+        throw badRequest(
+          "Every criterion marked as requiring evidence must be linked to evidence or a file before the gate can be decided",
+          { unevidencedCriteria: unevidenced },
+        );
+      }
+
+      // Resolve the artefacts and freeze the pack.
+      const wantedEvidence = [...new Set(links.flatMap((l) => l.evidenceIds ?? []))];
+      const wantedFiles = [...new Set(links.flatMap((l) => l.fileIds ?? []))];
+      const evidenceRows = wantedEvidence.length
+        ? await app.db
+            .select({ id: evidence.id, contentHash: evidence.contentHash, source: evidence.source, kind: evidence.kind })
+            .from(evidence)
+            .where(
+              and(
+                inArray(evidence.id, wantedEvidence),
+                eq(evidence.companyId, req.companyId!),
+                eq(evidence.projectId, req.projectId!),
+              ),
+            )
+        : [];
+      if (evidenceRows.length !== wantedEvidence.length) {
+        throw badRequest("One or more evidenceIds do not belong to this project");
+      }
+      const fileRows = wantedFiles.length
+        ? await app.db
+            .select({ id: files.id, sha256: files.sha256, name: files.name, projectId: files.projectId })
+            .from(files)
+            .where(and(inArray(files.id, wantedFiles), eq(files.companyId, req.companyId!)))
+        : [];
+      if (fileRows.length !== wantedFiles.length) {
+        throw badRequest("One or more fileIds do not belong to this company");
+      }
+      const foreignFiles = fileRows.filter((f) => f.projectId && f.projectId !== req.projectId);
+      if (foreignFiles.length > 0) {
+        throw badRequest(
+          "A gate evidence pack may only cite files belonging to this project",
+          { foreignFileIds: foreignFiles.map((f) => f.id) },
+        );
+      }
+      const evidenceById = new Map(evidenceRows.map((e) => [e.id, e]));
+      const fileById = new Map(fileRows.map((f) => [f.id, f]));
+      const criterionText = new Map(criteria.map((c) => [c.id, c.text]));
+      const packItems: PackItemInput[] = [];
+      for (const l of links) {
+        for (const id of l.evidenceIds ?? []) {
+          const e = evidenceById.get(id)!;
+          packItems.push({
+            criterionId: l.criterionId,
+            criterionText: criterionText.get(l.criterionId) ?? "",
+            kind: "evidence",
+            id,
+            sha256: e.contentHash,
+            title: `${e.kind} — ${e.source}`,
+          });
+        }
+        for (const id of l.fileIds ?? []) {
+          const f = fileById.get(id)!;
+          packItems.push({
+            criterionId: l.criterionId,
+            criterionText: criterionText.get(l.criterionId) ?? "",
+            kind: "file",
+            id,
+            sha256: f.sha256,
+            title: f.name,
+          });
+        }
+      }
+      const evidenceRequiredWithoutLink = criteria
+        .filter((c) => c.evidenceRequired)
+        .filter((c) => !packItems.some((i) => i.criterionId === c.id))
+        .map((c) => ({ criterionId: c.id, text: c.text }));
+      const pack = buildGateEvidencePack(
+        packItems,
+        evidenceRequiredWithoutLink,
+        new Date().toISOString(),
+      );
+
       const reviewId = newId("grv");
-      const conditions: GateCondition[] = [];
-      for (const c of body.conditions ?? []) {
-        // conditions-of-approval tracked to closure as assurance obligations (#413)
-        const obligationId = newId("obl");
-        await app.db.insert(obligations).values({
-          id: obligationId,
-          companyId: req.companyId!,
-          projectId: req.projectId!,
-          sourceClause: `Gate ${gate.gateNumber} — ${gate.name}`,
-          trigger: c.text,
-          deadline: c.dueDate ? `${c.dueDate}T23:59:59Z` : null,
-          warnDaysBefore: 7,
-          evidenceRequirement: "Evidence that the gate condition has been discharged",
-          status: "open",
-          createdBy: req.user!.id,
-        });
-        conditions.push({
-          id: newId("gcn"),
-          text: c.text,
-          dueDate: c.dueDate ?? null,
-          obligationId,
-          closed: false,
-          closedAt: null,
-          closedBy: null,
-          closeNote: null,
-        });
-      }
+      const nextStatus = gateStatusForDecision(body.decision);
 
-      await app.db.insert(gateReviews).values({
-        id: reviewId,
-        gateId,
-        companyId: req.companyId!,
-        projectId: req.projectId!,
-        reviewDate: body.reviewDate,
-        rag: body.rag,
-        decision: body.decision,
-        narrative: body.narrative ?? null,
-        findings: body.findings,
-        conditions,
-        reviewedBy: req.user!.id,
-      });
-      await app.db
-        .update(stageGates)
-        .set({ status: "decided", updatedAt: new Date().toISOString() })
-        .where(eq(stageGates.id, gateId));
+      await app.db.transaction(async (tx) => {
+        const conditions: GateCondition[] = [];
+        for (const c of body.conditions ?? []) {
+          // conditions-of-approval tracked to closure as assurance obligations (#413)
+          const obligationId = newId("obl");
+          await tx.insert(obligations).values({
+            id: obligationId,
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            sourceClause: `Gate ${gate.gateNumber} — ${gate.name}`,
+            trigger: c.text,
+            deadline: c.dueDate ? `${c.dueDate}T23:59:59Z` : null,
+            warnDaysBefore: 7,
+            evidenceRequirement: "Evidence that the gate condition has been discharged",
+            status: "open",
+            createdBy: req.user!.id,
+          });
+          conditions.push({
+            id: newId("gcn"),
+            text: c.text,
+            dueDate: c.dueDate ?? null,
+            obligationId,
+            closed: false,
+            closedAt: null,
+            closedBy: null,
+            closeNote: null,
+          });
+        }
 
-      if (body.decision === "stop") {
-        // a stop decision is a project-level event, not just a register row
-        await app.db.insert(events).values({
-          id: newId("evt"),
-          companyId: req.companyId!,
-          projectId: req.projectId!,
-          type: "gate_stop",
-          occurredAt: new Date().toISOString(),
-          detectedOrReported: "reported",
-          payload: { gateId, reviewId, gateNumber: gate.gateNumber, rag: body.rag },
-          createdBy: req.user!.id,
-        });
-      }
-
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: req.user!.id,
-        action: "create",
-        objectType: "gate_review",
-        objectId: reviewId,
-        payload: {
+        await tx.insert(gateReviews).values({
+          id: reviewId,
           gateId,
-          decision: body.decision,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          reviewDate: body.reviewDate,
           rag: body.rag,
-          conditions: conditions.map((c) => ({ id: c.id, obligationId: c.obligationId })),
-        },
-        storePayload: true,
-      });
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: req.user!.id,
-        action: "state_change",
-        objectType: "stage_gate",
-        objectId: gateId,
-        payload: { from: gate.status, to: "decided", reviewId, decision: body.decision },
+          decision: body.decision,
+          narrative: body.narrative ?? null,
+          findings: body.findings,
+          conditions,
+          evidencePack: pack as unknown as Record<string, unknown>,
+          evidencePackRoot: pack.root,
+          independence: { independent: true, basis: independence.basis },
+          reviewedBy: req.user!.id,
+        });
+        await tx
+          .update(stageGates)
+          .set({ status: nextStatus, updatedAt: new Date().toISOString() })
+          .where(eq(stageGates.id, gateId));
+
+        if (body.decision === "stop") {
+          // a stop decision is a project-level event, not just a register row
+          await tx.insert(events).values({
+            id: newId("evt"),
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            type: "gate_stop",
+            occurredAt: new Date().toISOString(),
+            detectedOrReported: "reported",
+            payload: { gateId, reviewId, gateNumber: gate.gateNumber, rag: body.rag },
+            createdBy: req.user!.id,
+          });
+        }
+
+        await appendLedger(tx as never, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "create",
+          objectType: "gate_review",
+          objectId: reviewId,
+          payload: {
+            gateId,
+            decision: body.decision,
+            rag: body.rag,
+            evidencePackRoot: pack.root,
+            evidenceItems: pack.itemCount,
+            independence: independence.basis,
+            conditions: conditions.map((c) => ({ id: c.id, obligationId: c.obligationId })),
+          },
+          storePayload: true,
+          projectId: req.projectId!,
+        });
+        await appendLedger(tx as never, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "state_change",
+          objectType: "stage_gate",
+          objectId: gateId,
+          payload: { from: gate.status, to: nextStatus, reviewId, decision: body.decision },
+          projectId: req.projectId!,
+        });
       });
 
       const review = (
@@ -816,24 +1112,43 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
       const condition = conditions.find((c) => c.id === conditionId);
       if (!condition) throw notFound("Condition not found on this gate review");
       if (condition.closed) throw badRequest("Condition is already closed");
+      // Segregation of duties (#413): the reviewer who imposed a condition
+      // cannot also declare it discharged. Somebody else has to look.
+      if (review.reviewedBy === req.user!.id) {
+        throw forbidden(
+          "The reviewer who imposed this condition of approval cannot close it — a condition " +
+            "closed by the person who set it is not an independent check.",
+        );
+      }
       const now = new Date().toISOString();
       const updated = conditions.map((c) =>
         c.id === conditionId
           ? { ...c, closed: true, closedAt: now, closedBy: req.user!.id, closeNote: body.note ?? null }
           : c,
       );
-      await app.db.update(gateReviews).set({ conditions: updated }).where(eq(gateReviews.id, reviewId));
-      await app.db
-        .update(obligations)
-        .set({ status: "satisfied" })
-        .where(and(eq(obligations.id, condition.obligationId), eq(obligations.status, "open")));
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: req.user!.id,
-        action: "state_change",
-        objectType: "gate_condition",
-        objectId: conditionId,
-        payload: { reviewId, obligationId: condition.obligationId, closed: true, note: body.note ?? null },
+      await app.db.transaction(async (tx) => {
+        await tx.update(gateReviews).set({ conditions: updated }).where(eq(gateReviews.id, reviewId));
+        // A late closure does not rewrite the register: a breached
+        // obligation stays breached, it just stops being open.
+        await tx
+          .update(obligations)
+          .set({ status: "satisfied" })
+          .where(and(eq(obligations.id, condition.obligationId), eq(obligations.status, "open")));
+        await appendLedger(tx as never, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "state_change",
+          objectType: "gate_condition",
+          objectId: conditionId,
+          payload: {
+            reviewId,
+            obligationId: condition.obligationId,
+            closed: true,
+            note: body.note ?? null,
+          },
+          storePayload: true,
+          projectId: req.projectId!,
+        });
       });
       const after = (
         await app.db.select().from(gateReviews).where(eq(gateReviews.id, reviewId)).limit(1)
@@ -1008,8 +1323,23 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
     return reply.status(201).send(await fetchBenefit(id, req.companyId!, req.projectId!));
   });
 
+  /**
+   * The status shown here is recomputed before it is read (#418).
+   *
+   * Before this, applyBenefitStatus ran only on a PATCH or a new reading,
+   * so a benefit at 30% progress with a target date a hundred days in the
+   * past stayed "tracking" indefinitely and its owner was never told. The
+   * scheduler recomputes on a cycle; this read-path sweep means a page
+   * opened between cycles still shows the truth. Both call the same
+   * sweepBenefitStatuses, so they cannot disagree.
+   */
   app.get("/projects/:projectId/benefits", { preHandler: readGate }, async (req) => {
     const q = benefitListQuery.parse(req.query);
+    await sweepBenefitStatuses(app.db, req.companyId!, {
+      projectId: req.projectId!,
+      actorId: null,
+      today: todayISO(),
+    });
     const clauses = [eq(benefits.companyId, req.companyId!), eq(benefits.projectId, req.projectId!)];
     if (q.status) clauses.push(eq(benefits.status, q.status));
     const where = and(...clauses);
@@ -1045,6 +1375,13 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/benefits/:benefitId", { preHandler: readGate }, async (req) => {
     const { benefitId } = req.params as { benefitId: string };
+    await fetchBenefit(benefitId, req.companyId!, req.projectId!); // 404 before sweeping
+    await sweepBenefitStatuses(app.db, req.companyId!, {
+      projectId: req.projectId!,
+      benefitIds: [benefitId],
+      actorId: null,
+      today: todayISO(),
+    });
     const benefit = await fetchBenefit(benefitId, req.companyId!, req.projectId!);
     const readings = await app.db
       .select()

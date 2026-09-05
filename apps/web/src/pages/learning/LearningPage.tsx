@@ -13,6 +13,13 @@
  *                rule registry that says what fires capture and why.
  *   · Capture  — the lesson lifecycle, retrieval bound to the moment, and
  *                post-project reviews with metrics read from real records.
+ *   · Pushed   — the lessons the ranker sent AT this project (#985-986), and
+ *                the answer each one got: read, applied with the record that
+ *                proves it, or dismissed with the reason it does not apply.
+ *   · Suppliers — the same idea pointed at vendors (#987-989): a supplier's
+ *                record on one job is an anecdote, across eleven it is
+ *                knowledge. Assembled from certificates, owned actions and
+ *                NCRs, worst first, with the arithmetic on every score.
  *   · Search   — natural language over the published register, honest about
  *                whether it is running in AI or deterministic mode.
  *
@@ -27,6 +34,8 @@ import CaptureTab from "./CaptureTab";
 import HealthTab from "./HealthTab";
 import RegisterTab from "./RegisterTab";
 import SearchTab from "./SearchTab";
+import SuppliersTab from "./SuppliersTab";
+import PushesPanel from "./PushesPanel";
 import TriggersTab from "./TriggersTab";
 import { TabBar, projectLabel, useProjects } from "./learningShared";
 
@@ -35,10 +44,12 @@ const TABS = [
   { key: "register", label: "Register" },
   { key: "triggers", label: "Triggers" },
   { key: "capture", label: "Capture & review" },
+  { key: "pushes", label: "Pushed here" },
+  { key: "suppliers", label: "Suppliers" },
   { key: "search", label: "Search" },
 ];
 
-const PROJECT_TABS = new Set(["triggers", "capture"]);
+const PROJECT_TABS = new Set(["triggers", "capture", "pushes"]);
 
 export default function LearningPage() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -161,6 +172,19 @@ export default function LearningPage() {
           />
         ) : null
       ) : null}
+
+      {tab === "pushes" ? (
+        projectId ? (
+          <PushesPanel projectId={projectId} onInspectLesson={inspectLesson} />
+        ) : projects && projects.length > 0 ? (
+          <EmptyState
+            title="Pick a project"
+            hint="A push is a lesson the ranker says applies to one project, sent to it rather than waiting to be searched for. Answering a push — read, applied, or does not apply and here is why — is what closes the loop."
+          />
+        ) : null
+      ) : null}
+
+      {tab === "suppliers" ? <SuppliersTab /> : null}
 
       {tab === "search" ? <SearchTab projects={projects} canSupersede={canAdmin} /> : null}
     </div>

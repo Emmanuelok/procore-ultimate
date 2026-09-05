@@ -89,9 +89,59 @@ export async function canActOnProject(
     .from(permissionTemplates)
     .where(and(eq(permissionTemplates.companyId, companyId), eq(permissionTemplates.key, membership.templateKey)))
     .limit(1);
+  return actsOnIntelligence(membership, stored ? (stored.tools as ToolPermissionMap) : undefined);
+}
+
+interface MembershipRow {
+  templateKey: string;
+  overrides: unknown;
+}
+
+/** The same resolution `requireTool` performs, for one membership. */
+function actsOnIntelligence(membership: MembershipRow, storedTools: ToolPermissionMap | undefined): boolean {
   const builtin = BUILTIN_PERMISSION_TEMPLATES.find((t) => t.key === membership.templateKey)?.tools;
-  const template: ToolPermissionMap | undefined = stored
-    ? { ...(builtin ?? {}), ...(stored.tools as ToolPermissionMap) }
+  const template: ToolPermissionMap | undefined = storedTools
+    ? { ...(builtin ?? {}), ...storedTools }
     : builtin;
   return meetsLevel(resolveLevel("intelligence", template, membership.overrides as ToolPermissionMap), "standard");
+}
+
+/**
+ * Every project the caller may ACT on (dismiss/reopen an attention item),
+ * resolved in two queries so a list route can label its rows without one
+ * permission lookup per item. `null` = every project (owner/admin).
+ */
+export async function actableProjectIds(
+  app: FastifyInstance,
+  req: FastifyRequest,
+): Promise<Set<string> | null> {
+  if (req.companyRole === "owner" || req.companyRole === "admin") return null;
+  const companyId = req.companyId!;
+  const memberships = await app.db
+    .select({
+      projectId: projectMemberships.projectId,
+      templateKey: projectMemberships.templateKey,
+      overrides: projectMemberships.overrides,
+    })
+    .from(projectMemberships)
+    .innerJoin(projects, eq(projects.id, projectMemberships.projectId))
+    .where(and(eq(projectMemberships.userId, req.user!.id), eq(projects.companyId, companyId)));
+  if (memberships.length === 0) return new Set<string>();
+  const stored = await app.db
+    .select({ key: permissionTemplates.key, tools: permissionTemplates.tools })
+    .from(permissionTemplates)
+    .where(eq(permissionTemplates.companyId, companyId));
+  const byKey = new Map(stored.map((t) => [t.key, t.tools as ToolPermissionMap] as const));
+  const out = new Set<string>();
+  for (const m of memberships) {
+    if (actsOnIntelligence(m, byKey.get(m.templateKey))) out.add(m.projectId);
+  }
+  return out;
+}
+
+/** True when the caller may act on `projectId` given a resolved actable set. */
+export function canActWith(actable: Set<string> | null, projectId: string | null): boolean {
+  if (projectId === null) return true;
+  if (actable === null) return true;
+  return actable.has(projectId);
 }

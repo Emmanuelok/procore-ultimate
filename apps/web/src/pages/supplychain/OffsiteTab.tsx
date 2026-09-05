@@ -114,7 +114,7 @@ export default function OffsiteTab({ projectId, lookups, onChanged }: { projectI
         </CardBody>
       </Card>
       <UnitForm projectId={projectId} open={createOpen} lookups={lookups} nodes={nodes.data?.items ?? []} onClose={() => setCreateOpen(false)} onCreated={() => { setCreateOpen(false); changed(); }} />
-      <UnitDrawer projectId={projectId} unitId={openId} detail={detail} lookups={lookups} onClose={() => setOpenId(null)} onChanged={changed} />
+      <UnitDrawer projectId={projectId} unitId={openId} detail={detail} lookups={lookups} nodes={nodes.data?.items ?? []} onClose={() => setOpenId(null)} onChanged={changed} />
     </div>
   );
 }
@@ -233,7 +233,26 @@ function UnitForm({ projectId, open, lookups, nodes, onClose, onCreated }: { pro
   );
 }
 
-function UnitDrawer({ projectId, unitId, detail, lookups, onClose, onChanged }: { projectId: string; unitId: string | null; detail: Loadable<UnitDetail>; lookups: Lookups; onClose: () => void; onChanged: () => void }) {
+interface UnitEdit {
+  name: string;
+  unitType: string;
+  serialNumber: string;
+  designReference: string;
+  factoryNodeId: string;
+  scheduleTaskId: string;
+  locationId: string;
+  plannedProductionStart: string;
+  plannedProductionEnd: string;
+  plannedDeliveryDate: string;
+  value: string;
+  currency: string;
+  transportKm: string;
+  weightTonnes: string;
+}
+
+const EMPTY_UNIT_EDIT: UnitEdit = { name: "", unitType: "volumetric_module", serialNumber: "", designReference: "", factoryNodeId: "", scheduleTaskId: "", locationId: "", plannedProductionStart: "", plannedProductionEnd: "", plannedDeliveryDate: "", value: "", currency: "USD", transportKm: "", weightTonnes: "" };
+
+function UnitDrawer({ projectId, unitId, detail, lookups, nodes, onClose, onChanged }: { projectId: string; unitId: string | null; detail: Loadable<UnitDetail>; lookups: Lookups; nodes: NodeRow[]; onClose: () => void; onChanged: () => void }) {
   const base = `/api/v1/projects/${projectId}/supply-chain/offsite`;
   const action = useAction();
   const d = detail.data;
@@ -249,6 +268,121 @@ function UnitDrawer({ projectId, unitId, detail, lookups, onClose, onChanged }: 
   const [vestingAt, setVestingAt] = useState("");
   const [insuredUntil, setInsuredUntil] = useState("");
   const [storageText, setStorageText] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [edit, setEdit] = useState<UnitEdit>(EMPTY_UNIT_EDIT);
+  const [newStage, setNewStage] = useState("");
+  const [newStageIsGate, setNewStageIsGate] = useState(false);
+  const [voidReason, setVoidReason] = useState("");
+
+  function startEditing() {
+    if (!d) return;
+    setEdit({
+      name: d.name,
+      unitType: d.unitType,
+      serialNumber: d.serialNumber ?? "",
+      designReference: d.designReference ?? "",
+      factoryNodeId: d.factoryNodeId ?? "",
+      scheduleTaskId: d.scheduleTaskId ?? "",
+      locationId: d.locationId ?? "",
+      plannedProductionStart: d.plannedProductionStart ?? "",
+      plannedProductionEnd: d.plannedProductionEnd ?? "",
+      plannedDeliveryDate: d.plannedDeliveryDate ?? "",
+      value: d.value === null ? "" : String(d.value),
+      currency: d.currency,
+      transportKm: d.transportKm === null ? "" : String(d.transportKm),
+      weightTonnes: d.weightTonnes === null ? "" : String(d.weightTonnes),
+    });
+    setEditing(true);
+  }
+
+  /** Everything the register form collects stays correctable while the unit is open. */
+  async function saveEdit(e: FormEvent) {
+    e.preventDefault();
+    if (!d) return;
+    const payload: Record<string, unknown> = {
+      name: edit.name.trim(),
+      unitType: edit.unitType,
+      serialNumber: edit.serialNumber.trim() ? edit.serialNumber.trim() : null,
+      designReference: edit.designReference.trim() ? edit.designReference.trim() : null,
+      factoryNodeId: edit.factoryNodeId ? edit.factoryNodeId : null,
+      scheduleTaskId: edit.scheduleTaskId ? edit.scheduleTaskId : null,
+      locationId: edit.locationId ? edit.locationId : null,
+      plannedProductionStart: edit.plannedProductionStart ? edit.plannedProductionStart : null,
+      plannedProductionEnd: edit.plannedProductionEnd ? edit.plannedProductionEnd : null,
+      plannedDeliveryDate: edit.plannedDeliveryDate ? edit.plannedDeliveryDate : null,
+      value: edit.value.trim() ? Number(edit.value) : null,
+      currency: edit.currency.trim().toUpperCase(),
+      transportKm: edit.transportKm.trim() ? Number(edit.transportKm) : null,
+      weightTonnes: edit.weightTonnes.trim() ? Number(edit.weightTonnes) : null,
+    };
+    const r = await action.run("edit", () => api.patch<UnitRow>(`${base}/units/${d.id}`, payload));
+    if (r) {
+      toast.success(`${r.reference} updated`);
+      setEditing(false);
+      onChanged();
+    }
+  }
+
+  async function addStage(e: FormEvent) {
+    e.preventDefault();
+    if (!d || !newStage.trim()) return;
+    const r = await action.run("addStage", () => api.post(`${base}/units/${d.id}/stages`, { name: newStage.trim(), isQaGate: newStageIsGate }));
+    if (r) {
+      toast.success(`Stage "${newStage.trim()}" added`);
+      setNewStage("");
+      setNewStageIsGate(false);
+      onChanged();
+    }
+  }
+
+  async function renameStage(stage: StageRow) {
+    if (!d) return;
+    const next = window.prompt("Rename this production stage", stage.name);
+    if (next === null || !next.trim() || next.trim() === stage.name) return;
+    const r = await action.run(`rename:${stage.id}`, () => api.patch(`${base}/units/${d.id}/stages/${stage.id}`, { name: next.trim() }));
+    if (r) {
+      toast.success("Stage renamed");
+      onChanged();
+    }
+  }
+
+  async function moveStage(stage: StageRow, delta: number) {
+    if (!d) return;
+    const position = Math.max(0, stage.position + delta);
+    const r = await action.run(`move:${stage.id}`, () => api.patch(`${base}/units/${d.id}/stages/${stage.id}`, { position }));
+    if (r) {
+      toast.success("Stage moved");
+      onChanged();
+    }
+  }
+
+  async function removeStage(stage: StageRow) {
+    if (!d) return;
+    const r = await action.run(`rm:${stage.id}`, () => api.del(`${base}/units/${d.id}/stages/${stage.id}`));
+    if (r !== null) {
+      toast.success("Stage removed");
+      onChanged();
+    }
+  }
+
+  /**
+   * Withdraw a mis-recorded inspection. The verified-for-payment percent is
+   * the most recent inspection that still stands, so voiding one falls back
+   * to the last that does — and the platform refuses a self-void.
+   */
+  async function voidInspection(inspectionId: string) {
+    const reason = voidReason.trim();
+    if (reason.length < 10) {
+      toast.error("Say why in at least ten characters — the reason is the audit answer.");
+      return;
+    }
+    const r = await action.run(`void:${inspectionId}`, () => api.post(`${base}/inspections/${inspectionId}/void`, { reason }));
+    if (r) {
+      toast.success("Inspection voided; the verified percent falls back to the last that stands");
+      setVoidReason("");
+      onChanged();
+    }
+  }
 
   async function stageAction(stage: StageRow, verb: "start" | "complete") {
     if (!d) return;
@@ -353,6 +487,7 @@ function UnitDrawer({ projectId, unitId, detail, lookups, onClose, onChanged }: 
                 <FigureCell value={d.verifiedForPayment.percent} reasons={d.verifiedForPayment.reasons} render={(v) => pct(v, 0)} />
               </div>
               <div className="mt-1 text-2xs text-content-muted">{d.verifiedForPaymentAt ? `by ${d.verifiedForPaymentBy} · ${dateTime(d.verifiedForPaymentAt)}` : `${d.verifiedForPayment.inspectionCount} inspection(s) on record`}</div>
+              {d.verifiedForPayment.percent !== null ? <ReasonList reasons={d.verifiedForPayment.reasons} className="mt-1" /> : null}
             </div>
             <ReasonList reasons={d.rollup.reasons} className="col-span-2" />
           </section>
@@ -385,6 +520,22 @@ function UnitDrawer({ projectId, unitId, detail, lookups, onClose, onChanged }: 
                           Complete
                         </Button>
                       ) : null}
+                      {s.status === "not_started" ? (
+                        <>
+                          <Button size="xs" variant="ghost" title="Move earlier" disabled={s.position === 0} loading={action.busy === `move:${s.id}`} onClick={() => void moveStage(s, -1)}>
+                            ↑
+                          </Button>
+                          <Button size="xs" variant="ghost" title="Move later" loading={action.busy === `move:${s.id}`} onClick={() => void moveStage(s, 1)}>
+                            ↓
+                          </Button>
+                          <Button size="xs" variant="ghost" loading={action.busy === `rename:${s.id}`} onClick={() => void renameStage(s)}>
+                            Rename
+                          </Button>
+                          <Button size="xs" variant="ghost" loading={action.busy === `rm:${s.id}`} onClick={() => void removeStage(s)}>
+                            Remove
+                          </Button>
+                        </>
+                      ) : null}
                       {s.isQaGate === 1 && s.status === "complete" && s.qaResult === "pending" ? (
                         <>
                           <Button size="xs" variant="secondary" loading={action.busy === `qa:${s.id}:passed`} onClick={() => void qa(s, "passed")}>
@@ -414,10 +565,35 @@ function UnitDrawer({ projectId, unitId, detail, lookups, onClose, onChanged }: 
                 <Input value={qaNotes} onChange={(e) => setQaNotes(e.target.value)} />
               </Field>
             ) : null}
+            {d.status === "installed" ? null : (
+              <form onSubmit={(e) => void addStage(e)} className="mt-3 flex flex-wrap items-end gap-2 rounded-md border border-border p-3">
+                <Field label="Add a stage" className="min-w-48 flex-1" hint="A stage that has started is history: only one that has not can be renamed, moved or removed.">
+                  <Input size="sm" value={newStage} onChange={(e) => setNewStage(e.target.value)} placeholder="Second fix" />
+                </Field>
+                <Checkbox label="QA gate (a second person must verify it)" checked={newStageIsGate} onChange={(e) => setNewStageIsGate(e.target.checked)} />
+                <Button type="submit" size="sm" variant="secondary" loading={action.busy === "addStage"} disabled={!newStage.trim()}>
+                  Add stage
+                </Button>
+              </form>
+            )}
           </section>
 
           <section>
-            <SectionHeading title="Lifecycle" hint={`Allowed next: ${d.allowedTransitions.length > 0 ? d.allowedTransitions.map(labelize).join(", ") : "none"}. Passed QA and ready to ship are refused until every stage is complete and every gate passed or waived.`} />
+            <SectionHeading
+              title="Lifecycle"
+              hint={`Allowed next: ${d.allowedTransitions.length > 0 ? d.allowedTransitions.map(labelize).join(", ") : "none"}. Passed QA and ready to ship are refused until every stage is complete and every gate passed or waived; a QA hold comes only from a failed gate.`}
+              actions={
+                d.status === "installed" ? null : editing ? (
+                  <Button size="sm" variant="ghost" onClick={() => setEditing(false)}>
+                    Cancel edit
+                  </Button>
+                ) : (
+                  <Button size="sm" variant="secondary" onClick={startEditing}>
+                    Edit unit
+                  </Button>
+                )
+              }
+            />
             <div className="flex flex-wrap items-end gap-2">
               <Field label="Note" className="min-w-48 flex-1">
                 <Input value={transitionNote} onChange={(e) => setTransitionNote(e.target.value)} placeholder="required for a rejection" />
@@ -439,16 +615,95 @@ function UnitDrawer({ projectId, unitId, detail, lookups, onClose, onChanged }: 
                 </Button>
               ))}
             </div>
-            <KeyValue
-              items={[
-                { label: "Production", value: `${isoDate(d.actualProductionStart ?? d.plannedProductionStart)} → ${isoDate(d.actualProductionEnd ?? d.plannedProductionEnd)}` },
-                { label: "Delivery", value: d.actualDeliveryDate ? `${isoDate(d.actualDeliveryDate)} (actual)` : d.plannedDeliveryDate ? `${isoDate(d.plannedDeliveryDate)} (planned)` : EM_DASH },
-                { label: "Installed", value: d.installedAt ? `${isoDate(d.installedAt)} at ${d.locationId ?? "?"}` : EM_DASH },
-                { label: "Delivery slot", value: d.deliverySlotId ?? <span className="italic text-content-subtle">not booked</span> },
-                { label: "Value", value: money(d.value, d.currency) },
-                { label: "Transport", value: d.transportKm === null ? EM_DASH : `${d.transportKm} km` },
-              ]}
-            />
+            {editing ? (
+              <form onSubmit={(e) => void saveEdit(e)} className="mt-3 space-y-3 rounded-md border border-border p-3">
+                <Field label="Unit" required>
+                  <Input value={edit.name} onChange={(e) => setEdit({ ...edit, name: e.target.value })} required maxLength={200} />
+                </Field>
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label="Type">
+                    <Select value={edit.unitType} onChange={(e) => setEdit({ ...edit, unitType: e.target.value })}>
+                      {OFFSITE_UNIT_TYPES.map((t) => (
+                        <option key={t} value={t}>
+                          {labelize(t)}
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                  <Field label="Serial / DfMA id">
+                    <Input value={edit.serialNumber} onChange={(e) => setEdit({ ...edit, serialNumber: e.target.value })} />
+                  </Field>
+                  <Field label="Design reference">
+                    <Input value={edit.designReference} onChange={(e) => setEdit({ ...edit, designReference: e.target.value })} />
+                  </Field>
+                  <Field label="Factory (node)">
+                    <Select value={edit.factoryNodeId} onChange={(e) => setEdit({ ...edit, factoryNodeId: e.target.value })}>
+                      {optionList(nodes, (n) => `T${n.tier} ${n.name}`).map((o) => (
+                        <option key={o.value} value={o.value}>
+                          {o.label}
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                  <Field label="Install task">
+                    <Select value={edit.scheduleTaskId} onChange={(e) => setEdit({ ...edit, scheduleTaskId: e.target.value })}>
+                      {optionList(lookups.tasks, (t) => `${t.name}${t.startDate ? ` (${t.startDate})` : ""}`).map((o) => (
+                        <option key={o.value} value={o.value}>
+                          {o.label}
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                  <Field label="Install location">
+                    <Select value={edit.locationId} onChange={(e) => setEdit({ ...edit, locationId: e.target.value })}>
+                      {optionList(lookups.locations, (l) => l.name).map((o) => (
+                        <option key={o.value} value={o.value}>
+                          {o.label}
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                  <Field label="Planned production start">
+                    <Input type="date" value={edit.plannedProductionStart} onChange={(e) => setEdit({ ...edit, plannedProductionStart: e.target.value })} />
+                  </Field>
+                  <Field label="Planned production end">
+                    <Input type="date" value={edit.plannedProductionEnd} onChange={(e) => setEdit({ ...edit, plannedProductionEnd: e.target.value })} />
+                  </Field>
+                  <Field label="Planned delivery">
+                    <Input type="date" value={edit.plannedDeliveryDate} onChange={(e) => setEdit({ ...edit, plannedDeliveryDate: e.target.value })} />
+                  </Field>
+                  <Field label="Value">
+                    <Input type="number" min={0} step="0.01" value={edit.value} onChange={(e) => setEdit({ ...edit, value: e.target.value })} />
+                  </Field>
+                  <Field label="Currency" hint="ISO 4217">
+                    <Input value={edit.currency} onChange={(e) => setEdit({ ...edit, currency: e.target.value })} maxLength={3} />
+                  </Field>
+                  <Field label="Transport to site (km)" hint="feeds the A4 transport carbon estimate">
+                    <Input type="number" min={0} value={edit.transportKm} onChange={(e) => setEdit({ ...edit, transportKm: e.target.value })} />
+                  </Field>
+                  <Field label="Weight (t)">
+                    <Input type="number" min={0} step="0.01" value={edit.weightTonnes} onChange={(e) => setEdit({ ...edit, weightTonnes: e.target.value })} />
+                  </Field>
+                </div>
+                <ReasonList reasons={lookups.notes} />
+                <div className="flex justify-end">
+                  <Button type="submit" size="sm" loading={action.busy === "edit"}>
+                    Save changes
+                  </Button>
+                </div>
+              </form>
+            ) : (
+              <KeyValue
+                items={[
+                  { label: "Production", value: `${isoDate(d.actualProductionStart ?? d.plannedProductionStart)} → ${isoDate(d.actualProductionEnd ?? d.plannedProductionEnd)}` },
+                  { label: "Delivery", value: d.actualDeliveryDate ? `${isoDate(d.actualDeliveryDate)} (actual)` : d.plannedDeliveryDate ? `${isoDate(d.plannedDeliveryDate)} (planned)` : EM_DASH },
+                  { label: "Installed", value: d.installedAt ? `${isoDate(d.installedAt)} at ${d.locationId ?? "?"}` : EM_DASH },
+                  { label: "Delivery slot", value: d.deliverySlotId ?? <span className="italic text-content-subtle">not booked</span> },
+                  { label: "Value", value: money(d.value, d.currency) },
+                  { label: "Transport", value: d.transportKm === null ? EM_DASH : `${d.transportKm} km` },
+                ]}
+              />
+            )}
           </section>
 
           <section>
@@ -468,6 +723,13 @@ function UnitDrawer({ projectId, unitId, detail, lookups, onClose, onChanged }: 
                     <span className="text-2xs text-content-muted">{i.performedAt ? `performed ${isoDate(i.performedAt)}` : `scheduled ${isoDate(i.scheduledFor)}`}{i.percentVerified !== null ? ` · ${pct(i.percentVerified, 0)} verified` : ""}</span>
                   </div>
                   {i.findings ? <div className="text-2xs text-content-muted">{i.findings}</div> : null}
+                  {i.result === "passed" || i.result === "conditional" || i.result === "failed" ? (
+                    <div className="mt-1 flex justify-end">
+                      <Button size="xs" variant="ghost" loading={action.busy === `void:${i.id}`} onClick={() => void voidInspection(i.id)}>
+                        Void this inspection
+                      </Button>
+                    </div>
+                  ) : null}
                 </li>
               ))}
             </ul>
@@ -494,6 +756,11 @@ function UnitDrawer({ projectId, unitId, detail, lookups, onClose, onChanged }: 
                   ))}
                 </div>
               </div>
+            ) : null}
+            {d.inspections.some((i) => i.result === "passed" || i.result === "conditional" || i.result === "failed") ? (
+              <Field label="Reason to void" hint="At least ten characters. A recorded inspection can only be withdrawn by someone other than the inspector of record; the row survives with the reason." className="mt-2">
+                <Input size="sm" value={voidReason} onChange={(e) => setVoidReason(e.target.value)} placeholder="Recorded against the wrong unit reference." />
+              </Field>
             ) : null}
             <form onSubmit={(e) => void scheduleInspection(e)} className="mt-2 flex flex-wrap items-end gap-2">
               <Field label="Kind">

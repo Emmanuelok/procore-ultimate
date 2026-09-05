@@ -3,6 +3,7 @@
  * (project workspace, company register) and the AI workspace.
  */
 import { useState, type ReactNode } from "react";
+import { fetchBlobUrl } from "../../lib/api";
 
 export interface ListResponse<T> {
   items: T[];
@@ -176,6 +177,28 @@ export function daysUntil(iso: string | null): number | null {
   const d = new Date(iso).getTime();
   if (Number.isNaN(d)) return null;
   return Math.ceil((d - Date.now()) / 86_400_000);
+}
+
+/**
+ * Download a file from an API route that requires the bearer token.
+ *
+ * A plain `<a href="/api/v1/…">` cannot work here: the client puts the access
+ * token and the tenant header on every request itself, and a browser
+ * navigation carries neither, so the link returned 401 and the pack never
+ * arrived (nor was its download logged in the chain-of-custody register).
+ */
+export async function downloadAuthenticated(path: string, filename: string): Promise<void> {
+  const url = await fetchBlobUrl(path);
+  try {
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 }
 
 /* -------------------------------- Components ------------------------------- */

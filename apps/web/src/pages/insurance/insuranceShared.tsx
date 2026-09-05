@@ -71,6 +71,17 @@ export interface PolicyRow {
   createdBy: string;
   createdAt: string;
   updatedAt: string;
+  /*
+   * RENEWAL PIPELINE (#775). Deliberately separate from `status`: a policy is
+   * comfortably `active` right up to the day it is not, and the only useful
+   * question ninety days out is whether anyone has started.
+   */
+  renewalStatus: string;
+  renewalOwnerId: string | null;
+  renewalTargetDate: string | null;
+  renewalNotes: string | null;
+  previousPolicyId: string | null;
+  renewedByPolicyId: string | null;
   /** derived — expiry is computed from periodEnd, never typed */
   derivedStatus: string;
   daysToExpiry: number;
@@ -253,6 +264,10 @@ export interface ClaimRow {
   createdBy: string;
   createdAt: string;
   updatedAt: string;
+  packFileId: string | null;
+  packSha256: string | null;
+  packGeneratedAt: string | null;
+  packItemCount: number;
   /** derived */
   daysToNotificationDue: number | null;
   notificationOutstanding: boolean;
@@ -463,6 +478,29 @@ export interface InsuranceSummary {
     called: number;
     released: number;
     note: string;
+    /**
+     * Bonding lines (#796). Utilisation is DERIVED from the bonds drawn
+     * against each facility, never stored, and headroom is refused across
+     * currencies — a bond in another currency is excluded and named rather
+     * than converted at a rate nobody recorded.
+     */
+    facilities: {
+      facilityId: string;
+      number: string;
+      name: string;
+      provider: string;
+      currency: string;
+      limitAmount: number;
+      drawnAmount: number;
+      headroom: number | null;
+      utilisationPct: number | null;
+      bondCount: number;
+      excludedForeignCurrency: { bondId: string; currency: string; amount: number }[];
+      outsidePermittedTypes: string[];
+      inForce: boolean | null;
+      daysToReview: number | null;
+      reasons: string[];
+    }[];
     headroomNote: string;
   };
   claims: {
@@ -1227,3 +1265,52 @@ export function Pager({
     </div>
   );
 }
+
+/* --------------------- Claim pack and the loss adjuster -------------------- */
+
+/** One entry on the adjuster's task list (#785). `overdue` is derived server-side. */
+export interface ClaimRequest {
+  id: string;
+  claimId: string;
+  kind: string;
+  title: string;
+  description: string | null;
+  requestedBy: string | null;
+  requestedAt: string | null;
+  dueDate: string | null;
+  obligationId: string | null;
+  ownerId: string | null;
+  status: string;
+  respondedAt: string | null;
+  respondedBy: string | null;
+  responseNote: string | null;
+  overdue: boolean;
+  daysToDue: number | null;
+}
+
+export interface ClaimRequestList {
+  items: ClaimRequest[];
+  total: number;
+  open: number;
+  overdue: number;
+}
+
+/** POST /claims/:id/pack — the assembled, content-addressed documentation. */
+export interface ClaimPackResult {
+  claimId: string;
+  fileId: string;
+  sha256: string;
+  sizeBytes: number;
+  contentType: string;
+  generatedAt: string;
+  itemCount: number;
+  gaps: string[];
+  note: string;
+}
+
+export const CLAIM_REQUEST_KIND_LABELS: Record<string, string> = {
+  information_request: "Information request",
+  site_visit: "Site visit",
+  interim_report: "Interim report",
+  expert_appointment: "Expert appointment",
+};

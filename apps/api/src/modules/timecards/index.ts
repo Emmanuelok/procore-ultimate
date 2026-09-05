@@ -4,6 +4,7 @@ import { timecardRoutes } from "./cards.js";
 import { batchRoutes } from "./batches.js";
 import { reconcileRoutes } from "./reconcile.js";
 import { tmTicketRoutes } from "./tickets.js";
+import { timecardReportRoutes } from "./reports.js";
 
 /**
  * TIMECARDS, CREWS & T&M TICKETS (M24) — tool key `timecards`.
@@ -29,7 +30,16 @@ import { tmTicketRoutes } from "./tickets.js";
  *      the cost report; a card with no allocation is hours nobody can code,
  *      which is how a labour overrun stays invisible until month end.
  *
- *   3. OUR HOURS vs THEIR SIGNATURE.  A `tm_ticket` is the hours the CLIENT's
+ *   3. HOURS vs WHAT WAS ACTUALLY BUILT.  `labour_progress_entries` records
+ *      installed quantity per cost code per day, measured by whoever walked
+ *      the work. It exists because `timecard_allocations.quantity` lets the
+ *      person claiming the hours also state what those hours produced — one
+ *      author on both sides of the productivity ratio, which is the
+ *      arrangement ADR 0004 forbids everywhere else. Where a budget line has
+ *      field entries they are the AUTHORITY on installed quantity and the
+ *      allocation quantities on it are not added to them.
+ *
+ *   4. OUR HOURS vs THEIR SIGNATURE.  A `tm_ticket` is the hours the CLIENT's
  *      representative signed for, on site, on the day — or signed UNDER
  *      PROTEST, or REFUSED to sign. All three are recorded distinctly and an
  *      unsigned ticket never presents as signed. A ticket with a client-side
@@ -49,7 +59,7 @@ import { tmTicketRoutes } from "./tickets.js";
  *
  * Schema: packages/db/src/schema/timecards.ts —
  *   crews, crew_members, timecard_batches, timecards, timecard_allocations,
- *   timecard_approvals, tm_tickets, tm_ticket_lines.
+ *   timecard_approvals, labour_progress_entries, tm_tickets, tm_ticket_lines.
  *
  * Route surface, all under `/api/v1`:
  *   /projects/:projectId/crews                (+ /:id/members, /:id/members/:memberId/end)
@@ -62,6 +72,24 @@ import { tmTicketRoutes } from "./tickets.js";
  *   /projects/:projectId/timecard-batches     (+ /collect, /submit, /approve, /lock, /export)
  *   /projects/:projectId/tm-tickets           (+ /lines, /lines/source, /sign,
  *                                                /submit, /promote)
+ *   /projects/:projectId/labour-progress      installed quantity per cost code
+ *                                             per day (+ /:id/verify — never
+ *                                             by whoever measured it)
+ *   /projects/:projectId/labour-productivity  earned hours against actual, by
+ *                                             budget line, crew and week
+ *   /projects/:projectId/timecard-batches/:id/payroll-export   generic CSV,
+ *                                             per-day CSV, WH-347 certified
+ *                                             payroll, or JSON with provenance
+ *   /projects/:projectId/certified-payroll    the WH-347 report, never signed
+ *   /projects/:projectId/labour-cost-report/post-to-budget     hours onto the
+ *                                             cost report (#715)
+ *   /projects/:projectId/timecards/health-inputs
+ *
+ * SCHEDULED JOBS. `timecards.access-links` attaches site-access records that
+ * land after a card did (this used to run as a WRITE on every list read, under
+ * a read-only permission); `timecards.orphan-cards` finds approved hours in no
+ * batch, which is hours somebody worked that no payroll export will ever
+ * reach.
  *
  * `read` sees everything; `standard` raises, codes, submits and approves; and
  * exactly three routes are `admin` — locking a card, locking a batch, and
@@ -74,4 +102,5 @@ export const timecardsModule: FastifyPluginAsync = async (app) => {
   await app.register(batchRoutes);
   await app.register(reconcileRoutes);
   await app.register(tmTicketRoutes);
+  await app.register(timecardReportRoutes);
 };

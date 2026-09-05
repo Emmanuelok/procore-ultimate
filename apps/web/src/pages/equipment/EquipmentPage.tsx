@@ -23,9 +23,27 @@
  */
 import { useCallback, useMemo, useState } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
-import { Alert, Badge, PageHeader, SegmentedControl, Tabs } from "../../ui";
+import { Alert, Badge, Button, PageHeader, SegmentedControl, Tabs } from "../../ui";
 import { IconEquipment } from "../../ui/icons";
 import CertificatesTab from "./CertificatesTab";
+import {
+  AssignPlantModal,
+  AssignmentActionModal,
+  CertificateModal,
+  DeliveryModal,
+  DeviceMapModal,
+  MaintenanceRecordModal,
+  MaintenanceScheduleModal,
+  MaterialItemModal,
+  OffHireModal,
+  ReadingModal,
+  ReceiveDeliveryModal,
+  RegisterPlantModal,
+  StockMovementModal,
+  UtilisationModal,
+  VerifyModal,
+  type VerifyTarget,
+} from "./EquipmentForms";
 import EquipmentDrawer from "./EquipmentDrawer";
 import IdleTab from "./IdleTab";
 import MaintenanceTab from "./MaintenanceTab";
@@ -47,8 +65,14 @@ import {
   useIdleReport,
   useInvoiceMatch,
   useMaintenance,
+  useMaterialSupply,
   useMaterials,
   useProjectPlant,
+  useCompanyProjects,
+  useResource,
+  useSupplierScorecard,
+  useTelematicsDevices,
+  useTelematicsIntelligence,
   useStockLedger,
   useStockMovements,
   useTelematics,
@@ -101,6 +125,37 @@ export default function EquipmentPage() {
   const [criticalOnly, setCriticalOnly] = useState(false);
   const [materialItemId, setMaterialItemId] = useState<string | null>(null);
   const [deliveryId, setDeliveryId] = useState<string | null>(null);
+  /** which write form is open — the module's whole write side lives here */
+  const [form, setForm] = useState<
+    | "register"
+    | "assign"
+    | "utilisation"
+    | "certificate"
+    | "stock"
+    | "schedule"
+    | "maintenance"
+    | "reading"
+    | "device"
+    | "delivery"
+    | "receive"
+    | "offhire"
+    | "assignment"
+    | "material"
+    | "verify"
+    | "editMachine"
+    | null
+  >(null);
+  /** what the VerifyModal is about to countersign, and which record */
+  const [verify, setVerify] = useState<{
+    target: VerifyTarget;
+    id: string;
+    label: string | null;
+  } | null>(null);
+  /** which assignment transition the AssignmentActionModal is running */
+  const [assignmentAction, setAssignmentAction] = useState<
+    "approve" | "mobilise" | "demobilise" | "cancel" | "transfer" | null
+  >(null);
+  const [assignmentId, setAssignmentId] = useState<string | null>(null);
 
   const utilisationTo = useMemo(() => today(), []);
   const utilisationFrom = useMemo(
@@ -115,7 +170,9 @@ export default function EquipmentPage() {
   const projectPlant = useProjectPlant(
     tab === "register" || tab === "idle" ? projectId : undefined,
   );
-  const fleet = useCompanyFleet(tab === "register" && scope === "company");
+  const fleet = useCompanyFleet(
+    (tab === "register" && scope === "company") || form === "assign" || form === "utilisation",
+  );
   const certificates = useCertificates(inServiceOnly, tab === "certificates");
   const maintenance = useMaintenance(tab === "maintenance", criticalOnly);
   const utilisationSummary = useUtilisationSummary(
@@ -133,11 +190,46 @@ export default function EquipmentPage() {
   const telematics = useTelematics(projectId, telematicsDays, tab === "telematics");
   const deliveries = useDeliveries(projectId, tab === "materials");
   const invoiceMatch = useInvoiceMatch(projectId, tab === "materials");
-  const materials = useMaterials(projectId, tab === "materials");
+  const materials = useMaterials(projectId, tab === "materials" || form === "stock");
+  const supply = useMaterialSupply(projectId, tab === "materials");
+  const scorecard = useSupplierScorecard(tab === "materials");
+  const devices = useTelematicsDevices(tab === "telematics" || form === "device");
+  const companyProjects = useCompanyProjects(form === "assignment");
+  const machineSchedules = useMachineSchedules(openMachine, form === "maintenance");
+  const intelligence = useTelematicsIntelligence(projectId, telematicsDays, tab === "telematics");
   const stockLedger = useStockLedger(projectId, materialItemId);
   const stockMovements = useStockMovements(projectId, materialItemId);
   const deliveryDetail = useDeliveryDetail(projectId, deliveryId);
   const machineDetail = useEquipmentDetail(openMachine);
+
+  /** After any write, re-read the views that could have changed. */
+  const refresh = useCallback(() => {
+    summary.reload();
+    idle.reload();
+    projectPlant.reload();
+    fleet.reload();
+    certificates.reload();
+    maintenance.reload();
+    utilisationSummary.reload();
+    utilisationRows.reload();
+    materials.reload();
+    stockLedger.reload();
+    stockMovements.reload();
+    machineDetail.reload();
+  }, [
+    summary,
+    idle,
+    projectPlant,
+    fleet,
+    certificates,
+    maintenance,
+    utilisationSummary,
+    utilisationRows,
+    materials,
+    stockLedger,
+    stockMovements,
+    machineDetail,
+  ]);
 
   const selectTab = useCallback(
     (next: TabKey) => {
@@ -216,18 +308,100 @@ export default function EquipmentPage() {
           </span>
         }
         actions={
-          scopeSwitchable ? (
-            <SegmentedControl<Scope>
-              value={scope}
-              onChange={selectScope}
-              size="sm"
-              aria-label="Register scope"
-              options={[
-                { value: "project", label: "This project" },
-                { value: "company", label: "Company fleet" },
-              ]}
-            />
-          ) : null
+          <div className="flex flex-wrap items-center gap-2">
+            {scopeSwitchable ? (
+              <SegmentedControl<Scope>
+                value={scope}
+                onChange={selectScope}
+                size="sm"
+                aria-label="Register scope"
+                options={[
+                  { value: "project", label: "This project" },
+                  { value: "company", label: "Company fleet" },
+                ]}
+              />
+            ) : null}
+            {tab === "materials" ? (
+              <>
+                <Button size="sm" variant="secondary" onClick={() => setForm("material")}>
+                  Add a material
+                </Button>
+                <Button size="sm" variant="secondary" onClick={() => setForm("delivery")}>
+                  Book a delivery
+                </Button>
+                {deliveryId ? (
+                  <Button size="sm" variant="secondary" onClick={() => setForm("receive")}>
+                    Receive
+                  </Button>
+                ) : null}
+                <Button size="sm" variant="secondary" onClick={() => setForm("stock")}>
+                  Move stock
+                </Button>
+              </>
+            ) : null}
+            {tab === "telematics" ? (
+              <Button size="sm" variant="secondary" onClick={() => setForm("device")}>
+                Map a device
+              </Button>
+            ) : null}
+            {tab === "maintenance" && openMachine ? (
+              <>
+                <Button size="sm" variant="secondary" onClick={() => setForm("schedule")}>
+                  Add schedule
+                </Button>
+                <Button size="sm" variant="secondary" onClick={() => setForm("maintenance")}>
+                  Record a service
+                </Button>
+              </>
+            ) : null}
+            {openMachine ? (
+              <>
+                <Button size="sm" variant="secondary" onClick={() => setForm("editMachine")}>
+                  Edit machine
+                </Button>
+                <Button size="sm" variant="secondary" onClick={() => setForm("reading")}>
+                  Add a reading
+                </Button>
+                <Button size="sm" variant="secondary" onClick={() => setForm("offhire")}>
+                  Off-hire
+                </Button>
+                {machineDetail.data && !machineDetail.data.verifiedAt ? (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => {
+                      setVerify({
+                        target: "equipment",
+                        id: openMachine,
+                        label: `${machineDetail.data?.reference ?? openMachine} · ${
+                          machineDetail.data?.name ?? ""
+                        }`.trim(),
+                      });
+                      setForm("verify");
+                    }}
+                  >
+                    Accept machine
+                  </Button>
+                ) : null}
+              </>
+            ) : null}
+            {tab === "utilisation" || tab === "idle" ? (
+              <Button size="sm" variant="secondary" onClick={() => setForm("utilisation")}>
+                Record a day
+              </Button>
+            ) : null}
+            {tab === "certificates" && openMachine ? (
+              <Button size="sm" variant="secondary" onClick={() => setForm("certificate")}>
+                Add certificate
+              </Button>
+            ) : null}
+            <Button size="sm" variant="secondary" onClick={() => setForm("assign")}>
+              Assign plant
+            </Button>
+            <Button size="sm" variant="primary" onClick={() => setForm("register")}>
+              Register plant
+            </Button>
+          </div>
         }
         tabs={
           <Tabs
@@ -272,6 +446,12 @@ export default function EquipmentPage() {
           fleet={fleet}
           onOpenMachine={openMachineDrawer}
           onOpenCertificates={() => selectTab("certificates")}
+          onAssignmentAction={(assignment, equipmentId, action) => {
+            setAssignmentId(assignment);
+            setAssignmentAction(action);
+            openMachineDrawer(equipmentId);
+            setForm("assignment");
+          }}
         />
       ) : tab === "certificates" ? (
         <CertificatesTab
@@ -279,6 +459,10 @@ export default function EquipmentPage() {
           inServiceOnly={inServiceOnly}
           onInServiceOnly={setInServiceOnly}
           onOpenMachine={openMachineDrawer}
+          onVerify={(certificateId, label) => {
+            setVerify({ target: "certificate", id: certificateId, label });
+            setForm("verify");
+          }}
         />
       ) : tab === "maintenance" ? (
         <MaintenanceTab
@@ -289,15 +473,21 @@ export default function EquipmentPage() {
         />
       ) : tab === "utilisation" ? (
         <UtilisationTab
+          projectId={projectId}
           summary={utilisationSummary}
           rows={utilisationRows}
           windowDays={utilisationDays}
           onWindowDays={setUtilisationDays}
           onOpenMachine={openMachineDrawer}
+          onVerify={(utilisationId, label) => {
+            setVerify({ target: "utilisation", id: utilisationId, label });
+            setForm("verify");
+          }}
         />
       ) : tab === "telematics" ? (
         <TelematicsTab
           report={telematics}
+          intelligence={intelligence}
           days={telematicsDays}
           onDays={setTelematicsDays}
           onOpenMachine={openMachineDrawer}
@@ -314,6 +504,16 @@ export default function EquipmentPage() {
           selectedDeliveryId={deliveryId}
           onSelectDelivery={setDeliveryId}
           deliveryDetail={deliveryDetail}
+          supply={supply}
+          scorecard={scorecard}
+          onVerifyDelivery={(id, label) => {
+            setVerify({ target: "delivery", id, label });
+            setForm("verify");
+          }}
+          onVerifyMovement={(id, label) => {
+            setVerify({ target: "movement", id, label });
+            setForm("verify");
+          }}
         />
       )}
 
@@ -322,8 +522,155 @@ export default function EquipmentPage() {
         detail={machineDetail}
         onClose={() => openMachineDrawer(null)}
       />
+
+      {/* keyed so the edit form re-seeds when a different machine is opened */}
+      <RegisterPlantModal
+        key={form === "editMachine" ? (openMachine ?? "edit") : "new"}
+        open={form === "register" || form === "editMachine"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        machine={form === "editMachine" ? machineDetail.data : null}
+      />
+      <AssignPlantModal
+        open={form === "assign"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        projectId={projectId}
+        fleet={fleet.data?.items ?? []}
+      />
+      <UtilisationModal
+        open={form === "utilisation"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        projectId={projectId}
+        fleet={projectPlant.data?.items ?? fleet.data?.items ?? []}
+        defaultEquipmentId={openMachine}
+      />
+      {openMachine ? (
+        <CertificateModal
+          open={form === "certificate"}
+          onClose={() => setForm(null)}
+          onDone={refresh}
+          equipmentId={openMachine}
+          equipmentLabel={machineDetail.data?.reference ?? "this machine"}
+        />
+      ) : null}
+      <StockMovementModal
+        open={form === "stock"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        projectId={projectId}
+        materials={materials.data?.items ?? []}
+        defaultItemId={materialItemId}
+      />
+      <MaintenanceScheduleModal
+        open={form === "schedule"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        equipmentId={openMachine}
+        machineLabel={machineDetail.data?.reference ?? "this machine"}
+      />
+      <MaintenanceRecordModal
+        open={form === "maintenance"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        equipmentId={openMachine}
+        machineLabel={machineDetail.data?.reference ?? "this machine"}
+        schedules={machineSchedules.data?.items ?? []}
+      />
+      <ReadingModal
+        open={form === "reading"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        equipmentId={openMachine}
+        machineLabel={machineDetail.data?.reference ?? "this machine"}
+        projectId={projectId}
+      />
+      <OffHireModal
+        open={form === "offhire"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        equipmentId={openMachine}
+        machineLabel={machineDetail.data?.reference ?? "this machine"}
+      />
+      <DeviceMapModal
+        open={form === "device"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        fleet={fleet.data?.items ?? []}
+        devices={devices.data?.items ?? []}
+      />
+      <DeliveryModal
+        open={form === "delivery"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        projectId={projectId}
+        materials={materials.data?.items ?? []}
+      />
+      {deliveryDetail.data ? (
+        <ReceiveDeliveryModal
+          open={form === "receive"}
+          onClose={() => setForm(null)}
+          onDone={refresh}
+          projectId={projectId}
+          delivery={deliveryDetail.data}
+        />
+      ) : null}
+      <MaterialItemModal
+        open={form === "material"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        projectId={projectId}
+      />
+      <VerifyModal
+        open={form === "verify"}
+        onClose={() => {
+          setForm(null);
+          setVerify(null);
+        }}
+        onDone={refresh}
+        projectId={projectId}
+        target={verify?.target ?? null}
+        recordId={verify?.id ?? null}
+        recordLabel={verify?.label ?? null}
+      />
+      <AssignmentActionModal
+        open={form === "assignment"}
+        action={assignmentAction}
+        onClose={() => {
+          setForm(null);
+          setAssignmentAction(null);
+        }}
+        onDone={refresh}
+        projectId={projectId}
+        assignmentId={assignmentId}
+        machineLabel={machineDetail.data?.reference ?? "this machine"}
+        projects={(companyProjects.data?.items ?? []).filter((entry) => entry.id !== projectId)}
+      />
     </div>
   );
+}
+
+/**
+ * The schedules on ONE machine, for the "which service is this closing"
+ * picker. A maintenance record with no schedule is a repair; a record against
+ * a schedule is the thing that moves the next due date, which is why the
+ * picker has to be populated from the machine and not typed.
+ */
+function useMachineSchedules(
+  equipmentId: string | null,
+  enabled: boolean,
+): { data: { items: Array<{ scheduleId: string; name: string }> } | null } {
+  const res = useResource<{ items: Array<{ id: string; name: string }> }>(
+    enabled && equipmentId
+      ? `/api/v1/companies/current/equipment/${equipmentId}/maintenance-schedules`
+      : null,
+  );
+  return {
+    data: res.data
+      ? { items: res.data.items.map((s) => ({ scheduleId: s.id, name: s.name })) }
+      : null,
+  };
 }
 
 /** The single biggest currency bucket, for the page header. Never a sum. */

@@ -7,6 +7,14 @@
  * the percent a valuation may rely on (#924) comes only from inspections by
  * someone who completed none of the stages — the assertion and the evidence
  * that tests it never share an author.
+ *
+ * That figure is the MOST RECENT inspection that still stands, never the
+ * highest ever recorded, and a mis-recorded inspection can be withdrawn
+ * (POST .../inspections/:id/void) by a second person: an inspector's typo
+ * must never become a permanent over-certification a payment draws on.
+ *
+ * Reads do not write. GET /units/:unitId computes the rollup for the
+ * response only; the write paths persist it.
  */
 import type { FastifyPluginAsync } from "fastify";
 import { and, asc, count, desc, eq, ilike, or } from "drizzle-orm";
@@ -23,13 +31,14 @@ import { badRequest, forbidden, notFound } from "../../../lib/errors.js";
 import { newId } from "../../../lib/ids.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.js";
 import { transitionAllowed } from "../engines/offsite.js";
-import { loadLongLeadContext, recomputeUnit } from "../service.js";
+import { computeUnit, loadLongLeadContext, recomputeUnit } from "../service.js";
 import {
   allocateReference,
   assertLocation,
   assertNode,
   assertVendor,
   buildGates,
+  currencyCodeSchema,
   fileIdsSchema,
   idSchema,
   isoDateSchema,
@@ -64,7 +73,7 @@ const unitBodySchema = z.object({
   plannedProductionEnd: isoDateSchema.nullable().optional(),
   plannedDeliveryDate: isoDateSchema.nullable().optional(),
   value: z.number().min(0).nullable().optional(),
-  currency: z.string().length(3).toUpperCase().optional(),
+  currency: currencyCodeSchema.optional(),
   transportKm: z.number().min(0).nullable().optional(),
   weightTonnes: z.number().min(0).nullable().optional(),
   storageLocationText: z.string().max(300).nullable().optional(),
@@ -251,7 +260,10 @@ export const offsiteRoutes: FastifyPluginAsync = async (app) => {
   app.get(`${base}/units/:unitId`, { preHandler: readGate }, async (req) => {
     const { projectId, unitId } = req.params as { projectId: string; unitId: string };
     const row = await loadUnit(req.companyId!, projectId, unitId);
-    const { unit, stages, inspections, rollup, verified } = await recomputeUnit(app.db, row);
+    // A read never writes: the rollup is computed for the response only. The
+    // write paths (stage start/complete/QA, inspection record, transition,
+    // delivery completion) are what persist it.
+    const { unit, stages, inspections, rollup, verified } = await computeUnit(app.db, row);
     const [ctx, traces] = await Promise.all([
       loadLongLeadContext(app.db, projectId, [{ scheduleTaskId: unit.scheduleTaskId, supplierNodeId: unit.factoryNodeId }]),
       app.db
@@ -615,6 +627,57 @@ export const offsiteRoutes: FastifyPluginAsync = async (app) => {
       unitAfter = { ...rc.unit, rollup: rc.rollup, verifiedForPayment: rc.verified };
     }
     await ledger(app.db, { companyId, projectId, actorId: req.user!.id, action: "state_change", objectType: "factory_inspection", objectId: inspectionId, payload: { result: body.result, performedAt, percentVerified: body.percentVerified ?? null, unitId: inspection.unitId } });
+    return { ...row, unit: unitAfter };
+  });
+
+  /**
+   * Withdraw a recorded inspection (#924). An inspector's typo must never be
+   * permanent: a second person voids the record with a written reason, the
+   * row survives for the audit trail, and the unit's verified-for-payment
+   * percent falls back to the most recent inspection that still stands.
+   * The voider may not be the inspector of record — the same segregation the
+   * recording itself is held to.
+   */
+  app.post(`${base}/inspections/:inspectionId/void`, { preHandler: standardGate }, async (req) => {
+    const { projectId, inspectionId } = req.params as { projectId: string; inspectionId: string };
+    const body = z.object({ reason: z.string().trim().min(10).max(2000) }).parse(req.body);
+    const companyId = req.companyId!;
+    const [inspection] = await app.db
+      .select()
+      .from(factoryInspections)
+      .where(and(eq(factoryInspections.id, inspectionId), eq(factoryInspections.companyId, companyId), eq(factoryInspections.projectId, projectId)))
+      .limit(1);
+    if (!inspection) throw notFound("Inspection not found");
+    if (inspection.result === "scheduled") throw badRequest("Nothing is recorded yet; cancel the inspection instead of voiding it.");
+    if (inspection.result === "voided") throw badRequest("This inspection is already voided.");
+    if (inspection.inspectorId && inspection.inspectorId === req.user!.id) {
+      throw forbidden("The inspector of record cannot void their own inspection: a second person must withdraw it.");
+    }
+    const at = nowISO();
+    const [row] = await app.db
+      .update(factoryInspections)
+      .set({
+        result: "voided",
+        findings: `${inspection.findings ? `${inspection.findings}\n\n` : ""}VOIDED by a second person: ${body.reason}`,
+        updatedAt: at,
+      })
+      .where(eq(factoryInspections.id, inspectionId))
+      .returning();
+    let unitAfter: unknown = null;
+    if (inspection.unitId) {
+      const unit = await loadUnit(companyId, projectId, inspection.unitId);
+      const rc = await recomputeUnit(app.db, unit);
+      unitAfter = { ...rc.unit, rollup: rc.rollup, verifiedForPayment: rc.verified };
+    }
+    await ledger(app.db, {
+      companyId,
+      projectId,
+      actorId: req.user!.id,
+      action: "state_change",
+      objectType: "factory_inspection",
+      objectId: inspectionId,
+      payload: { from: inspection.result, to: "voided", reason: body.reason, inspectorOfRecord: inspection.inspectorId, percentVerified: inspection.percentVerified, unitId: inspection.unitId },
+    });
     return { ...row, unit: unitAfter };
   });
 

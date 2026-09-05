@@ -275,7 +275,13 @@ export function notificationState(input: NotificationStateInput): NotificationSt
     outstanding,
     missed: [...new Set(missed)],
     notified,
-    allDischarged: states.length > 0 && outstanding.length === 0,
+    /* Discharged means EVERY duty has a recorded notification. A duty whose
+     * deadline has passed with nothing filed is `missed`, not `outstanding`,
+     * and treating the absence of an outstanding clock as discharge is how the
+     * missed duty would have vanished from the close gate a second time. */
+    allDischarged:
+      states.length > 0 &&
+      states.every((d) => d.state === "notified" || d.state === "notified_late"),
     anyMissed: states.some((d) => d.state === "missed" || d.state === "notified_late"),
     earliestDueAt: live[0]?.dueAt ?? null,
     required: states.length > 0,

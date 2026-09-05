@@ -47,26 +47,39 @@ Use S3. The local driver exists for development and as an escape hatch.
 
 ---
 
-## 1.9 Production image — verified, not assumed
+## 1.9 Production image — verified by CI, not by a memory of a walkthrough
 
-The image in this repo was built and booted before this release shipped, because a
-deployment that fails at boot costs more than the check does. What was verified, on
-2026-08-26, against the exact `Dockerfile` and `railway.json` here:
+This section used to be a table of results from one hand-run walkthrough, dated, quoting
+a migration range (0000–0008) and a table count (177) that stopped being true within a
+fortnight. A verification that decays is worse than none: it invites confidence in a fact
+nobody has re-checked.
 
-| Check | Result |
-|---|---|
-| Image builds with the full dependency set (React 19, Tailwind v4, recharts, framer-motion, TanStack Table, pdf.js, three/web-ifc) | builds clean |
-| Container boots with only `AUTH_SECRET` set | `/api/v1/health` → 200, `db: pglite` |
-| Container boots against real PostgreSQL 16 via `DATABASE_URL` | `/api/v1/health` → 200, `db: postgres` |
-| Migrations 0000–0008 apply at boot on a virgin Postgres | **177 tables created**, including all 17 financial tables |
-| SPA served same-origin from the API container | `GET /` → 200 |
-| Financial API end to end inside the image | project → cost code → budget → budget line; `revisedBudget` = `originalBudget` + `approvedChanges` reconciled |
-| Hash-chained ledger inside the image | `/ledger/verify` → `{"valid": true}` |
+The check now runs on every push. `.github/workflows/ci.yml` has an `image` job that:
 
-Two refusals fired correctly during that walkthrough and are worth knowing about, because
-both look like errors and are not: creating a project with an invalid `stage` returns a
-zod validation error naming the five permitted values, and creating a budget line without
-a cost code is refused outright — budget lines bind to the project's cost-code structure
+1. builds this exact `Dockerfile`;
+2. runs the resulting container against a real PostgreSQL 16 service, in production mode,
+   with only the variables a real deployment sets (`DATABASE_URL`, `AUTH_SECRET`,
+   `APP_BASE_URL`);
+3. waits for `GET /api/v1/health/ready` to return 200 — which means migrations applied and
+   a query executed, not merely that a process is listening;
+4. asserts `GET /api/v1/health` reports `db: postgres`, so an image that silently fell
+   back to the embedded database fails rather than passing every other check;
+5. asserts the SPA is served same-origin with a CSP header and that a client route falls
+   back to `index.html`;
+6. asserts an unauthenticated SCIM call is refused **in SCIM's own error envelope** (an
+   identity provider parses that; it logs this platform's envelope as an unexplained
+   failure);
+7. registers an account end to end against the real database.
+
+The deploy workflow is gated on that run: `deploy-railway.yml` triggers on CI's
+completion and refuses to run unless the conclusion was `success`, checking out
+`workflow_run.head_sha` — the commit CI actually tested, not whatever the branch tip has
+become since.
+
+Two refusals fire during a manual walkthrough and are worth knowing about, because both
+look like errors and are not: creating a project with an invalid `stage` returns a zod
+validation error naming the five permitted values, and creating a budget line without a
+cost code is refused outright — budget lines bind to the project's cost-code structure
 rather than inventing a parallel hierarchy.
 
 ## 2. Runbook
@@ -319,8 +332,17 @@ Workspace → Usage/Billing settings:
   - Each replica opens up to **10 Postgres connections** (`postgres(url, { max: 10 })`,
     `apps/api/src/lib/db.ts`). Budget accordingly.
 - **The database is the bottleneck**, not the app. Scale Postgres vertically first. When
-  connection counts grow (many replicas, or sidecar jobs), put Railway's **PgBouncer
-  template** between app and DB and point `DATABASE_URL` at it (transaction pooling mode).
+  connection counts grow (many replicas, or sidecar jobs), lower `DATABASE_POOL_MAX`
+  before reaching for a pooler.
+- **A connection pooler needs one code change first, and this runbook used to omit it.**
+  `apps/api/src/lib/db.ts` opens `postgres(url, { max })` with postgres-js defaults, which
+  means **named prepared statements**. Those are per-session, so under PgBouncer in
+  *transaction* pooling mode a statement prepared on one backend is executed on another
+  and the query fails with `prepared statement "…" does not exist` — intermittently, under
+  load, which is the worst way to find out. Either point `DATABASE_URL` at PgBouncer in
+  **session** pooling mode (safe, and pools far less), or set `prepare: false` on the
+  client before switching to transaction mode. Do not switch on the strength of this
+  runbook's earlier advice.
 
 ---
 
@@ -352,18 +374,53 @@ boot). "Image" = value baked into `Dockerfile`; set in Railway only what §2.5 l
 | `WEB_DIST_DIR` | unset (SPA serving off) | `/app/public` | — |
 | `MIGRATIONS_DIR` | unset (repo-relative search) | `/app/migrations` | — |
 | `TRUST_PROXY` | `false` | `true` | Must be `true` behind Railway's proxy |
+| `TRUST_PROXY_HOPS` | `1` | — | Raise only when a CDN sits in front of the Railway edge. Each increment is one more hop whose word is taken for the client's address. |
+| `CORS_ORIGINS` | `""` | — | Only when a browser on another origin calls the API. `APP_BASE_URL`'s origin is always allowed. |
+| `ALLOW_EMBEDDED_DB` | `false` | — | Set only for a deliberate throwaway environment — production otherwise refuses to boot without `DATABASE_URL`. |
+| `ALLOW_LOCAL_STORAGE` | `false` | — | Set only for the volume topology (§1.1). |
+| `UPLOAD_MAX_BYTES` | `268435456` (256 MiB) | — | Bounds memory per in-flight upload (multipart is buffered per request). |
+| `UPLOAD_MAX_FILES` | `25` | — | Optional tuning |
+| `DATABASE_POOL_MAX` | `10` | — | Multiply by replica count and compare with Postgres `max_connections` before raising. |
+| `SCHEDULER_ENABLED` | `true` | — | Leave on. Off means the sweeps (session/invitation expiry, security-webhook delivery, MFA-challenge and trail retention, deadline detection, heartbeat seals) do not run at all — not "later". |
+| `SCHEDULER_TICK_MS` | `60000` | — | Tick granularity; a job's `everyMs` rounds up to it. |
 | `RATE_LIMIT_ENABLED` | `true` | — | — |
 | `RATE_LIMIT_MAX_PER_MINUTE` | `300` | — | Optional tuning (per IP, per replica) |
-| `AUTH_RATE_LIMIT_MAX_PER_MINUTE` | `10` | — | Optional tuning (credential endpoints) |
+| `AUTH_RATE_LIMIT_MAX_PER_MINUTE` | `10` | — | Optional tuning (credential endpoints). NOT a lockout — see §4.6. |
+| `WEBHOOK_SIGNING_KEY` | unset → derived from `AUTH_SECRET` | — | Set it: under the fallback anyone who can read the JWT secret can forge a webhook signature a receiver would accept. |
+| `WEBHOOK_ALLOW_HOSTS` | unset | — | Comma-separated hosts exempt from the SSRF refusal. Use only for a receiver inside your own network. |
+| `SSO_ENCRYPTION_KEY` | unset → derived from `AUTH_SECRET` | — | Set it before configuring SSO or MFA. **Rotating it makes every stored client secret and TOTP seed unreadable** — re-encrypt first. |
+| `ANCHOR_SIGNING_KEY` | unset → derived from `AUTH_SECRET` | — | Set it, or seals prove integrity against a database-only attacker and not against the operator. |
+| `ANCHOR_TRUSTED_FINGERPRINTS` | unset | — | Pin out of band; see `.env.example`. |
+| `ANCHOR_TSA_URL`, `ANCHOR_OTS_CALENDAR_URL` | unset | — | Optional external timestamping. |
+| `ANCHOR_HEARTBEAT_HOURS` | `24` | — | Bounds how long a tail truncation can hide. |
 | `ANTHROPIC_API_KEY` | unset | — | Optional — AI routes 503 without it |
 | `AI_MODEL` | `claude-opus-5` | — | Optional |
 | `LOG_LEVEL` | `info` | — | Optional (`debug`, `warn`, …) |
 
+There are deliberately **no environment variables** for the session timeout, password
+policy, lockout thresholds or IP allowlist. Those are **per tenant**, set by an owner or
+admin at `PUT /api/v1/company/security-policy` (web app → Security). The `LOGIN_*`,
+`SESSION_*` and `BCRYPT_COST` values are the platform DEFAULTS a tenant that has chosen
+nothing inherits; a tenant may tighten them and can never loosen them below the platform
+floor. See §4.6. The same is true of **retention and legal hold** (§4.9): there is no
+environment variable, the platform default is "keep", and only an owner can change it.
+
 ### 4.2 Upgrade and rollback
 
 - **Upgrade**: push to the deployed branch → Railway builds the Dockerfile and deploys.
-  The healthcheck (`/api/v1/health`) gates cutover — a build that cannot boot (bad
-  variable, failed migration) never replaces the running deployment.
+  The healthcheck gates cutover — a build that cannot boot (bad variable, failed
+  migration) never replaces the running deployment.
+- **The healthcheck is READINESS, not liveness.** `railway.json` points at
+  `/api/v1/health/ready`, which executes `select 1` against the database before
+  answering. `/api/v1/health` only proves the process is listening, and a container that
+  is listening while unable to reach Postgres would have passed it. Readiness answers
+  200 **with** configuration warnings present — a warning describes a smaller
+  deployment, not a broken one — and 503 only when a check genuinely failed.
+- **CI gates the deploy.** `.github/workflows/deploy-railway.yml` triggers on the
+  *completion* of the CI workflow and refuses to run unless that run concluded
+  `success`, then checks out `workflow_run.head_sha` — the exact commit CI tested, not
+  whatever the branch tip has become since. A manual `workflow_dispatch` is an operator's
+  deliberate act and is not gated.
 - **Migrations are forward-only and run at boot** (`lib/db.ts`). Write additive
   migrations: rolling back the *app image* does not roll back the *schema*, so an old
   image must tolerate the new schema. This repo's drizzle migrations are committed under
@@ -395,6 +452,118 @@ boot). "Image" = value baked into `Dockerfile`; set in Railway only what §2.5 l
 | Everyone hits 429 at once | `TRUST_PROXY` not `true` → all traffic keyed on the proxy's IP for rate limiting | Keep the image default `TRUST_PROXY=true`; don't override it |
 | Upload fails `EACCES` (volume mode only) | Railway mounts volumes as root; image runs as `USER node` | Set `RAILWAY_RUN_UID=0` on the service (§1.1) |
 | AI routes return `503 AiDisabled` | No `ANTHROPIC_API_KEY` | Intentional degradation; set the key to enable |
+| SSO sign-in fails ~half the time with "this sign-in link is not valid any more" | More than one replica **and** `DATABASE_URL` unset, so the authorization-code state lives in one process's memory and the callback lands on another | Set `DATABASE_URL`. With a shared Postgres the SSO flow/ticket store is a table (`sso_flows`, `sso_tickets`) and any replica can complete any sign-in. |
+| Everyone in a company is refused with "your organisation only permits sign-in from approved networks" | An IP allowlist was set to `enforce` with the wrong ranges, or `TRUST_PROXY` is off so every request appears to come from the proxy | An owner on the break-glass list can still sign in and fix it (`ipAllowlistBreakGlassUserIds`). Otherwise set `ipAllowlistMode` back to `off` in `company_security_policies`. Introduce allowlists in `monitor` mode first. |
+| A SIEM stops receiving security webhooks and nothing is logged | 20 consecutive delivery failures disabled the endpoint | The row carries `disabledReason`. Fix the destination, then re-enable it — re-enabling clears the failure count. |
+| SCIM calls answer 401 with a SCIM error document | The bearer token was revoked, expired, or is a user access token rather than a `scim_…` token | Mint a new one at `POST /api/v1/company/scim/tokens`; it is shown once. |
+
+### 4.5 Replica safety — what is and is not shared
+
+| Concern | Shared across replicas? | Where it lives |
+|---|---|---|
+| Application data | Yes | Postgres |
+| Uploaded evidence | Yes **with `STORAGE_DRIVER=s3`**; no with `local` | Bucket / container disk |
+| SSO authorization-code state and tickets | Yes **when `DATABASE_URL` is set** | `sso_flows` / `sso_tickets` |
+| Scheduler jobs | Yes — one runner per job via a Postgres advisory lock | `lib/scheduler.ts` |
+| Ledger appends | Yes — serialised per company by an advisory lock | `lib/ledger.ts` |
+| Account and IP lockout counters | Yes — derived from `auth_security_events`, not from process memory | `modules/account/lockout.ts` |
+| `@fastify/rate-limit` counters | **No** — per process | In-memory. `RATE_LIMIT_MAX_PER_MINUTE` is therefore per replica; the lockout engine, which is not, is the control that actually stops credential guessing. |
+| MFA challenges | Yes — the token is a stateless MAC, the challenge is a row consumed by upsert, so a challenge minted on one replica cannot be exchanged twice on another | `modules/mfa/challenge.ts` + `mfa_challenges` |
+
+### 4.6 Tenant security policy (spec #23, #24, #25)
+
+Each company sets its own policy; a person who belongs to several companies is governed
+by the **strictest** of them, because a session is an account-level object that can read
+every tenant the holder belongs to.
+
+| Setting | Effect | Platform default |
+|---|---|---|
+| `sessionIdleTimeoutMinutes` | Sign out a session idle this long | none |
+| `sessionAbsoluteTimeoutHours` | Hard ceiling on a session's age | 720 (30 days) |
+| `passwordMinLength` | Minimum length (floor 12, may only be raised) | 12 |
+| `passwordRequireComplexity` | Require upper, lower, digit and symbol | off |
+| `passwordHistoryDepth` | Refuse the last N passwords (ceiling 24) | 0 |
+| `passwordMaxAgeDays` | Maximum password age | none |
+| `lockoutMaxAttempts` / `WindowMinutes` / `DurationMinutes` | Account lockout | 5 / 15 / 15 |
+| `ipAllowlistMode` + `ipAllowlist` | `off`, `monitor` (records) or `enforce` (refuses) | off |
+| `ipAllowlistBreakGlassUserIds` | Members exempt from the allowlist | empty |
+| `mfaRequired` | Require a second factor, including for SSO | off |
+| `securityEventRetentionDays` | Age past which the sign-in audit is pseudonymised (floor 30) | none — kept |
+| `emailDispatchRetentionDays` | Age past which the message log is deleted (floor 30) | none — kept |
+| `legalHold` + `legalHoldReason` | Suspend every retention sweep for this tenant | off |
+
+**Introduce an allowlist in `monitor` first.** It records every sign-in it would have
+refused (`login_blocked_ip`, outcome `pending`) without refusing anything, so you can
+read a week of real traffic before enforcing. The API refuses to enable `enforce` from an
+address the new list would itself refuse.
+
+### 4.7 SCIM 2.0 provisioning (spec #21)
+
+Base URL `https://<your-host>/api/v1/scim/v2`. Authentication is a per-tenant bearer
+token minted at `POST /api/v1/company/scim/tokens` and shown exactly once.
+
+- `Users` supports GET (filter `userName eq "…"`, `active eq true|false`), POST, GET/:id,
+  PUT, PATCH and DELETE.
+- `Groups` are this platform's four **company roles** (`owner`, `admin`, `member`,
+  `guest`). Per-project permission templates are not exposed: SCIM has no concept of a
+  project, so a directory cannot know which projects exist. `ServiceProviderConfig` says
+  so in the discovery document rather than only here.
+- `active: false` (via PUT, PATCH or DELETE) removes the company membership, revokes the
+  sessions opened in that company, and deactivates the account platform-wide when it
+  belongs to no other company.
+- The `owner` role is never removed by a directory: an IdP mapping mistake that removed
+  every owner would leave the tenant with nobody able to fix it.
+
+### 4.8 Security event webhooks
+
+`POST /api/v1/company/security-webhooks` registers a destination for a tenant's
+`auth_security_events`. Deliveries are signed exactly like the integrations webhooks
+(`x-constructos-signature: v1=HMAC-SHA256` over `v1:<timestamp>:<deliveryId>:<body>`), so
+one verifier serves both. Delivery is at-least-once — dedupe on
+`x-constructos-delivery`. Retries back off quadratically to a 30-minute ceiling over five
+attempts; twenty consecutive failures disable the endpoint with a stated reason, because
+a webhook that has been silently failing for a month is worse than one that is visibly
+off. Destinations are re-checked against the SSRF policy on **every** delivery, not only
+at registration, because DNS moves.
+
+### 4.9 Retention and the data-subject export (spec §0.2 #45, #46, #47)
+
+Two logs accumulate personal data as a side effect of working correctly:
+`auth_security_events` (an address, an IP and a user agent per sign-in, failure, lockout
+and provisioning call) and `email_dispatches` (a recipient, a subject and a preview per
+message composed). Both are evidence, so neither is swept by default.
+
+- **The default is KEEP.** `securityEventRetentionDays` and
+  `emailDispatchRetentionDays` are null until an owner sets them. A retention default
+  that deleted records would opt every existing customer into destroying evidence they
+  never agreed to lose.
+- **The trail is pseudonymised, not deleted.** Past the retention age the email, IP and
+  user agent are cleared and the kind, outcome and timestamp are kept, so "how many
+  failed sign-ins last quarter" stays answerable. The message log is deleted outright: a
+  redacted preview of a message nobody can identify is not evidence of anything.
+- **A legal hold always beats a retention period.** With `legalHold` on, the sweep skips
+  the tenant and *says so* — it does not report zero rows and let an operator conclude
+  there was nothing to do.
+- The sweep is the scheduler job `account.trail-retention` (daily). An owner can run it
+  on demand at `POST /api/v1/company/security/retention/run`; every run is written to the
+  company ledger as `auth_retention_run`, including a run that removed nothing.
+- `GET /api/v1/account/export` returns everything the authentication layer holds about
+  the caller — account, memberships, sessions, linked providers, second-factor state,
+  trail, messages, invitations — and **no credential of any kind**: no password hash, no
+  TOTP seed, no recovery-code hash, no session or refresh token. Each export is ledgered
+  as an `access` on every company the caller belongs to.
+
+### 4.10 MFA challenges are single-use
+
+A challenge token (`mfachal_v1.…`) is a MAC, so any module can mint one without a shared
+write; the CHALLENGE is a row in `mfa_challenges`, and consumption is an upsert on the
+token's `jti`. The first exchange wins and every later exchange is refused as a replay —
+including a challenge minted by a module that never registered it. An administrator's
+`POST /company/security/users/:id/mfa/reset` revokes every challenge in flight, because a
+challenge minted a minute earlier is authority issued on the strength of the factor being
+removed. Spent and expired rows are deleted by the `mfa.challenge-sweep` job an hour after
+expiry; the grace exists so a replay of a just-expired token is still answered with
+"already used" rather than silently treated as a first use.
 
 ---
 

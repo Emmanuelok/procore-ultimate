@@ -178,3 +178,274 @@ export function benefitStatusFor(
   }
   return "tracking";
 }
+
+/* ================================================================== */
+/* Platform upgrade wave — EIRR, sensitivity and switching values      */
+/* (#400, #406)                                                        */
+/* ================================================================== */
+
+/**
+ * The undiscounted net cashflow series an option produces:
+ * year 0 = −capexAdjusted, years 1..n = benefits − costs.
+ * Exported because the EIRR and switching-value routines both need exactly
+ * this series and a second construction of it would be a second definition.
+ */
+export function netCashflows(option: OptionCashflows, config: AppraisalConfig): number[] {
+  const years = Math.max(1, Math.floor(config.appraisalYears));
+  const benefits = padToYears(option.annualBenefits, years);
+  const costs = padToYears(option.annualCosts, years);
+  const capexAdjusted = option.capex * (1 + config.optimismBiasPercent / 100);
+  const out = [-capexAdjusted];
+  for (let t = 0; t < years; t += 1) out.push(benefits[t]! - costs[t]!);
+  return out;
+}
+
+/** NPV of a cashflow series at rate r (fraction), year 0 undiscounted. */
+export function npvOf(cashflows: number[], r: number): number {
+  let npv = 0;
+  for (let t = 0; t < cashflows.length; t += 1) npv += cashflows[t]! / (1 + r) ** t;
+  return npv;
+}
+
+/**
+ * Economic internal rate of return (#400): the discount rate at which NPV
+ * is zero, found by bisection on [-0.99, 10].
+ *
+ * Returns null — never 0 — when the series has no sign change (an option
+ * that never pays back has no IRR, and reporting one would be a lie) or
+ * when the bracket does not contain a root. Bisection rather than
+ * Newton–Raphson because it cannot diverge and the precision needed here is
+ * four decimal places, not fifteen.
+ */
+export function economicIrr(
+  cashflows: number[],
+  options: { lower?: number; upper?: number; tolerance?: number; maxIterations?: number } = {},
+): number | null {
+  const hasPositive = cashflows.some((c) => c > EPS);
+  const hasNegative = cashflows.some((c) => c < -EPS);
+  if (!hasPositive || !hasNegative) return null;
+
+  let lo = options.lower ?? -0.9999;
+  let hi = options.upper ?? 10;
+  const tol = options.tolerance ?? 1e-7;
+  const maxIter = options.maxIterations ?? 200;
+  let fLo = npvOf(cashflows, lo);
+  let fHi = npvOf(cashflows, hi);
+  if (!Number.isFinite(fLo) || !Number.isFinite(fHi)) return null;
+  if (fLo * fHi > 0) return null; // no root inside the bracket
+
+  for (let i = 0; i < maxIter; i += 1) {
+    const mid = (lo + hi) / 2;
+    const fMid = npvOf(cashflows, mid);
+    if (!Number.isFinite(fMid)) return null;
+    if (Math.abs(fMid) < tol || hi - lo < tol) {
+      return round4(mid * 100);
+    }
+    if (fLo * fMid <= 0) {
+      hi = mid;
+      fHi = fMid;
+    } else {
+      lo = mid;
+      fLo = fMid;
+    }
+  }
+  return round4(((lo + hi) / 2) * 100);
+}
+
+export interface SensitivityCell {
+  /** which input was flexed */
+  variable: "capex" | "benefits" | "costs" | "discountRate";
+  /** the % change applied (e.g. −20, +10) */
+  changePercent: number;
+  npv: number;
+  bcr: number | null;
+}
+
+export interface SwitchingValue {
+  variable: "capex" | "benefits" | "costs" | "discountRate";
+  /**
+   * The % change in that variable that drives NPV to zero. null when no
+   * change within ±1000% does so (an option that is viable at any plausible
+   * capex has no switching value, and inventing one would mislead).
+   */
+  changePercent: number | null;
+  /** the resulting absolute level of the variable at the switching point */
+  switchesAt: number | null;
+  note: string;
+}
+
+export interface SensitivityAnalysis {
+  /**
+   * NPV/BCR with one variable flexed at a time by ±10/20/30% (a RELATIVE
+   * change, including for the discount rate: −20% of a 3.5% rate is 2.8%).
+   */
+  grid: SensitivityCell[];
+  switching: SwitchingValue[];
+  /** ranked |ΔNPV| per variable at ±20% — the tornado ordering */
+  tornado: { variable: string; low: number; high: number; swing: number }[];
+  basis: string;
+}
+
+const SENSITIVITY_STEPS = [-30, -20, -10, 10, 20, 30] as const;
+
+function flex(
+  option: OptionCashflows,
+  config: AppraisalConfig,
+  variable: SensitivityCell["variable"],
+  changePercent: number,
+): { option: OptionCashflows; config: AppraisalConfig } {
+  const factor = 1 + changePercent / 100;
+  switch (variable) {
+    case "capex":
+      return { option: { ...option, capex: option.capex * factor }, config };
+    case "benefits":
+      return {
+        option: { ...option, annualBenefits: option.annualBenefits.map((v) => v * factor) },
+        config,
+      };
+    case "costs":
+      return {
+        option: { ...option, annualCosts: option.annualCosts.map((v) => v * factor) },
+        config,
+      };
+    case "discountRate":
+      return {
+        option,
+        config: { ...config, discountRatePercent: config.discountRatePercent * factor },
+      };
+  }
+}
+
+/**
+ * Bisect the % change in one variable that drives NPV to zero (#406). The
+ * search runs over [-99%, +1000%]; outside that range the answer is "no
+ * plausible change switches this decision", which is reported as null.
+ */
+export function switchingValue(
+  option: OptionCashflows,
+  config: AppraisalConfig,
+  variable: SensitivityCell["variable"],
+): SwitchingValue {
+  const npvAt = (change: number): number => {
+    const flexed = flex(option, config, variable, change);
+    return appraiseOption(flexed.option, flexed.config).npv;
+  };
+
+  const base = npvAt(0);
+  const lowBound = -99;
+  const highBound = 1000;
+  // NPV moves monotonically in each of these variables, so the sign of the
+  // base value tells us which direction to search.
+  const fLow = npvAt(lowBound);
+  const fHigh = npvAt(highBound);
+  let lo: number;
+  let hi: number;
+  if (base === 0) {
+    return {
+      variable,
+      changePercent: 0,
+      switchesAt: absoluteLevel(option, config, variable, 0),
+      note: "NPV is already zero at the base case.",
+    };
+  }
+  if (fLow * base < 0) {
+    lo = lowBound;
+    hi = 0;
+  } else if (fHigh * base < 0) {
+    lo = 0;
+    hi = highBound;
+  } else {
+    return {
+      variable,
+      changePercent: null,
+      switchesAt: null,
+      note:
+        `No change to ${variable} between ${lowBound}% and +${highBound}% drives NPV to zero — ` +
+        `the decision does not switch on this variable within any plausible range.`,
+    };
+  }
+
+  let fLoCurrent = npvAt(lo);
+  for (let i = 0; i < 200; i += 1) {
+    const mid = (lo + hi) / 2;
+    const fMid = npvAt(mid);
+    if (Math.abs(fMid) < 0.005 || hi - lo < 1e-6) {
+      return {
+        variable,
+        changePercent: round2(mid),
+        switchesAt: absoluteLevel(option, config, variable, mid),
+        note:
+          `NPV reaches zero when ${variable} changes by ${round2(mid)}% from the base case ` +
+          `(base NPV ${round2(base)}).`,
+      };
+    }
+    if (fLoCurrent * fMid <= 0) {
+      hi = mid;
+    } else {
+      lo = mid;
+      fLoCurrent = fMid;
+    }
+  }
+  const mid = (lo + hi) / 2;
+  return {
+    variable,
+    changePercent: round2(mid),
+    switchesAt: absoluteLevel(option, config, variable, mid),
+    note: `NPV reaches zero at approximately a ${round2(mid)}% change in ${variable}.`,
+  };
+}
+
+function absoluteLevel(
+  option: OptionCashflows,
+  config: AppraisalConfig,
+  variable: SensitivityCell["variable"],
+  changePercent: number,
+): number {
+  const factor = 1 + changePercent / 100;
+  switch (variable) {
+    case "capex":
+      return round2(option.capex * factor);
+    case "benefits":
+      return round2(option.annualBenefits.reduce((s, v) => s + v, 0) * factor);
+    case "costs":
+      return round2(option.annualCosts.reduce((s, v) => s + v, 0) * factor);
+    case "discountRate":
+      return round4(config.discountRatePercent * factor);
+  }
+}
+
+/**
+ * The full sensitivity block persisted on each option (#406): a ±10/20/30%
+ * grid on the three money inputs and the discount rate, switching values for
+ * each, and a tornado ordering by NPV swing at ±20%.
+ */
+export function sensitivityAnalysis(
+  option: OptionCashflows,
+  config: AppraisalConfig,
+): SensitivityAnalysis {
+  const variables: SensitivityCell["variable"][] = ["capex", "benefits", "costs", "discountRate"];
+  const grid: SensitivityCell[] = [];
+  for (const variable of variables) {
+    for (const changePercent of SENSITIVITY_STEPS) {
+      const flexed = flex(option, config, variable, changePercent);
+      const computed = appraiseOption(flexed.option, flexed.config);
+      grid.push({ variable, changePercent, npv: computed.npv, bcr: computed.bcr });
+    }
+  }
+  const tornado = variables
+    .map((variable) => {
+      const low = grid.find((c) => c.variable === variable && c.changePercent === -20)!.npv;
+      const high = grid.find((c) => c.variable === variable && c.changePercent === 20)!.npv;
+      return { variable, low, high, swing: round2(Math.abs(high - low)) };
+    })
+    .sort((a, b) => b.swing - a.swing);
+  return {
+    grid,
+    switching: variables.map((v) => switchingValue(option, config, v)),
+    tornado,
+    basis:
+      "NPV and BCR recomputed with one input flexed at a time (±10/20/30%), holding the rest at " +
+      "the base case. Switching values are the change in each input that drives NPV to zero, " +
+      "found by bisection over −99%…+1000%. Correlated movement between inputs is not modelled.",
+  };
+}

@@ -372,8 +372,14 @@ export interface DayVariance {
   telematicsReasons?: string[];
   varianceHours: number | null;
   ratio: number | null;
+  /**
+   * `ok` is the API's word for "the two streams agree" (telematics.ts
+   * VarianceClassification). The web used to call it "comparable", so every
+   * agreeing day rendered a blank badge and the classification filter offered
+   * a value that matched nothing.
+   */
   classification:
-    | "comparable"
+    | "ok"
     | "unsupported_hours"
     | "under_reported"
     | "no_manual_record"
@@ -513,6 +519,8 @@ export interface InvoiceMatchReport {
 
 export interface MaterialRow {
   id: string;
+  /** null = a COMPANY CATALOGUE item: the product as specified, with no stock */
+  projectId: string | null;
   number: number;
   reference: string;
   code: string | null;
@@ -711,7 +719,7 @@ export const DISCREPANCY_LABEL: Record<string, string> = {
 };
 
 export const VARIANCE_CLASS_LABEL: Record<DayVariance["classification"], string> = {
-  comparable: "Comparable",
+  ok: "Comparable",
   unsupported_hours: "Unsupported hours",
   under_reported: "Under-reported",
   no_manual_record: "No plant sheet",
@@ -1523,5 +1531,325 @@ export function useDeliveryDetail(
 export function useEquipmentSummary(projectId: string | undefined): Loadable<EquipmentSummary> {
   return useResource<EquipmentSummary>(
     projectId ? `/api/v1/projects/${projectId}/equipment-summary` : null,
+  );
+}
+
+/* ========================================================================== */
+/* Write-side reads: unmapped devices, and the projects a machine can go to    */
+/* ========================================================================== */
+
+export interface TelematicsDeviceRow {
+  providerKey: string;
+  deviceId: string;
+  readings: number;
+  firstSeen: string | null;
+  lastSeen: string | null;
+}
+
+/** Devices reporting into the company that nobody has said belong to a
+ *  machine. Their readings are kept, not dropped, which is why this list is
+ *  actionable rather than a log. */
+export function useTelematicsDevices(enabled: boolean): Loadable<
+  ListResponse<TelematicsDeviceRow> & { note?: string | null }
+> {
+  return useResource<ListResponse<TelematicsDeviceRow> & { note?: string | null }>(
+    enabled ? "/api/v1/companies/current/telematics/devices" : null,
+  );
+}
+
+export interface ProjectRef {
+  id: string;
+  name: string;
+}
+
+/** The company's projects, for a plant transfer. */
+export function useCompanyProjects(enabled: boolean): Loadable<ListResponse<ProjectRef>> {
+  return useResource<ListResponse<ProjectRef>>(
+    enabled ? "/api/v1/projects?page=1&pageSize=200" : null,
+  );
+}
+
+/* ========================================================================== */
+/* Materials supply, telematics intelligence and fleet availability            */
+/* ========================================================================== */
+
+export type SupplyRisk =
+  | "ok"
+  | "order_now"
+  | "order_by_date_missed"
+  | "shortage"
+  | "unknown";
+
+export const SUPPLY_RISK_LABEL: Record<SupplyRisk, string> = {
+  ok: "On track",
+  order_now: "Order now",
+  order_by_date_missed: "Order-by date missed",
+  shortage: "Shortage forecast",
+  unknown: "No order-by date",
+};
+
+export const SUPPLY_RISK_TONE: Record<SupplyRisk, Tone> = {
+  ok: "success",
+  order_now: "warning",
+  order_by_date_missed: "danger",
+  shortage: "danger",
+  unknown: "neutral",
+};
+
+export interface SupplyItemAssessment {
+  id: string;
+  reference: string;
+  name: string;
+  unit: string;
+  orderByDate: string | null;
+  daysUntilOrderBy: number | null;
+  shortfall: number | null;
+  earliestArrivalIfOrderedToday: string | null;
+  risk: SupplyRisk;
+  exposure: number | null;
+  currency: string;
+  activityAtRisk: { id: string; name: string | null; start: string | null } | null;
+  reasons: string[];
+}
+
+export interface DeliveryDelay {
+  id: string;
+  reference: string;
+  scheduledFor: string | null;
+  daysLate: number;
+  status: string;
+  supplierVendorId: string | null;
+  itemIds: string[];
+  reasons: string[];
+}
+
+export interface InventoryValuation {
+  byCurrency: Array<{
+    currency: string;
+    onHandValue: number;
+    wasteValue: number;
+    items: number;
+  }>;
+  unpricedItems: Array<{ id: string; reference: string; quantityOnHand: number }>;
+  wasteRatePercent: number | null;
+  totals: {
+    itemsWithStock: number;
+    quantityWasted: number;
+    quantityDelivered: number;
+  };
+  reasons: string[];
+}
+
+export interface SupplyReport {
+  asOf: string;
+  items: SupplyItemAssessment[];
+  atRisk: SupplyItemAssessment[];
+  delayedDeliveries: DeliveryDelay[];
+  valuation: InventoryValuation;
+  summary: {
+    items: number;
+    orderByDateMissed: number;
+    orderNow: number;
+    shortages: number;
+    unknown: number;
+    delayedDeliveries: number;
+  };
+  method: string;
+}
+
+export function useMaterialSupply(
+  projectId: string | undefined,
+  enabled: boolean,
+): Loadable<SupplyReport> {
+  return useResource<SupplyReport>(
+    enabled && projectId ? `/api/v1/projects/${projectId}/materials/supply` : null,
+  );
+}
+
+export interface SupplierScore {
+  vendorId: string;
+  vendorName: string | null;
+  deliveries: number;
+  onTimePercent: number | null;
+  onTimeBasis: number;
+  discrepancyPercent: number | null;
+  rejectionPercent: number | null;
+  averageWaitingMinutes: number | null;
+  invoiceMatchPercent: number | null;
+  invoiceVarianceByCurrency: Array<{ currency: string; amount: number }>;
+  score: number | null;
+  reasons: string[];
+}
+
+export function useSupplierScorecard(enabled: boolean): Loadable<{
+  items: SupplierScore[];
+  total: number;
+  method: string;
+}> {
+  return useResource(enabled ? "/api/v1/companies/current/materials/supplier-scorecard" : null);
+}
+
+export interface GeofenceVerdict {
+  breaches: Array<{ recordedAt: string; distanceMetres: number }>;
+  maxDistanceMetres: number | null;
+  spanHours: number | null;
+  reasons: string[];
+}
+
+export interface FuelReconciliation {
+  burnLitres: number | null;
+  filledLitres: number;
+  differenceLitres: number | null;
+  ratio: number | null;
+  unexplained: boolean;
+  reasons: string[];
+}
+
+export interface TelematicsFault {
+  code: string;
+  description?: string | null;
+  severity?: string | null;
+  activeSince?: string | null;
+}
+
+export interface FaultVerdict {
+  actionable: TelematicsFault[];
+  worst: string | null;
+  stopWork: boolean;
+  reason: string | null;
+}
+
+export interface TelematicsIntelligence {
+  from: string;
+  to: string;
+  site: { latitude: number; longitude: number } | null;
+  machines: Array<{
+    equipmentId: string;
+    reference: string;
+    name: string;
+    readings: number;
+    geofence: GeofenceVerdict;
+    fuel: FuelReconciliation;
+    faults: FaultVerdict;
+  }>;
+  reasons: string[];
+}
+
+export function useTelematicsIntelligence(
+  projectId: string | undefined,
+  days: number,
+  enabled: boolean,
+): Loadable<TelematicsIntelligence> {
+  return useResource<TelematicsIntelligence>(
+    enabled && projectId
+      ? `/api/v1/projects/${projectId}/equipment-telematics/intelligence?days=${days}`
+      : null,
+  );
+}
+
+export interface AvailabilityRow {
+  id: string;
+  reference: string;
+  name: string;
+  category: string;
+  ownership: string;
+  status: string;
+  currency: string;
+  hireRateAmount: number | null;
+  hireRateUnit: string | null;
+  internalRateAmount: number | null;
+  outOfCertificate: boolean;
+  nextCertificateExpiry: string | null;
+  clashes: Array<{
+    assignmentId: string;
+    projectId: string;
+    status: string;
+    assignedFrom: string;
+    assignedTo: string | null;
+  }>;
+  serviceDue: Array<{ scheduleId: string; name: string; nextDueAt: string | null }>;
+  caveats: string[];
+}
+
+export function useAvailability(
+  from: string,
+  to: string,
+  enabled: boolean,
+): Loadable<{ from: string; to: string; available: AvailabilityRow[]; busy: AvailabilityRow[]; note?: string }> {
+  return useResource(
+    enabled
+      ? `/api/v1/companies/current/equipment-availability?from=${from}&to=${to}`
+      : null,
+  );
+}
+
+/* ========================================================================== */
+/* Rental against owned                                                        */
+/* ========================================================================== */
+
+export interface OwnershipSide {
+  machines: number;
+  days: number;
+  workingHours: number;
+  paidHours: number;
+  cost: number | null;
+  costPerWorkingHour: number | null;
+  utilisationPercent: number | null;
+  uncostedDays: number;
+  partiallyCostedDays: number;
+}
+
+export interface OwnershipBucket {
+  category: string;
+  currency: string;
+  hired: OwnershipSide;
+  owned: OwnershipSide;
+  ratio: number | null;
+  verdict: "hired_dearer" | "owned_dearer" | "comparable" | "not_comparable";
+  differenceOnHiredHours: number | null;
+  reasons: string[];
+}
+
+export interface OwnershipComparison {
+  from: string;
+  to: string;
+  projectId?: string | null;
+  buckets: OwnershipBucket[];
+  totals: {
+    machineDays: number;
+    hiredDays: number;
+    ownedDays: number;
+    uncostedDays: number;
+    bucketsCompared: number;
+  };
+  reasons: string[];
+  method?: string;
+}
+
+export const OWNERSHIP_VERDICT_LABEL: Record<OwnershipBucket["verdict"], string> = {
+  hired_dearer: "Hiring costs more",
+  owned_dearer: "Our own costs more",
+  comparable: "The same, within 10%",
+  not_comparable: "Not comparable",
+};
+
+export const OWNERSHIP_VERDICT_TONE: Record<OwnershipBucket["verdict"], Tone> = {
+  hired_dearer: "warning",
+  owned_dearer: "warning",
+  comparable: "neutral",
+  not_comparable: "neutral",
+};
+
+export function useOwnershipComparison(
+  from: string,
+  to: string,
+  projectId: string | undefined,
+  enabled: boolean,
+): Loadable<OwnershipComparison> {
+  return useResource<OwnershipComparison>(
+    enabled
+      ? `/api/v1/companies/current/equipment-ownership-comparison?from=${from}&to=${to}` +
+          (projectId ? `&projectId=${projectId}` : "")
+      : null,
   );
 }

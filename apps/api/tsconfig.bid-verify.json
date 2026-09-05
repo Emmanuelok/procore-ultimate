@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist-bid-verify",
+    "rootDir": "src",
+    "types": ["node"],
+    "declaration": false,
+    "declarationMap": false,
+    "noEmit": true
+  },
+  "include": ["src/modules/bidding/**/*.ts", "src/types.ts"]
+}

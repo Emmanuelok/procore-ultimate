@@ -42,7 +42,9 @@ import {
   ReasonList,
   SOURCE_LABEL,
   SectionHeading,
+  RegisterPager,
   count,
+  pageParams,
   decimal,
   isoDate,
   labelize,
@@ -53,6 +55,8 @@ import {
 } from "./safetyShared";
 
 export interface ActionFilters {
+  /** 1-based; the register is paged rather than silently truncated */
+  page: string;
   status: string;
   sourceType: string;
   hierarchyOfControl: string;
@@ -60,7 +64,7 @@ export interface ActionFilters {
   overdue: string;
 }
 
-export const EMPTY_ACTION_FILTERS: ActionFilters = {
+export const EMPTY_ACTION_FILTERS: ActionFilters = { page: "1",
   status: "",
   sourceType: "",
   hierarchyOfControl: "",
@@ -462,6 +466,15 @@ export default function ActionsTab({
         }}
         aria-label="Corrective action register"
       />
+
+      <RegisterPager
+        page={filters.page}
+        loaded={rows.length}
+        total={actions.data?.total ?? null}
+        noun="corrective action"
+        loading={actions.loading}
+        onPage={(page) => onFilters({ ...filters, page })}
+      />
     </div>
   );
 }
@@ -554,7 +567,7 @@ function HierarchyStrip({ profile }: { profile: ActionListResponse["hierarchyPro
 }
 
 export function actionQueryString(filters: ActionFilters): string {
-  const params = new URLSearchParams({ page: "1", pageSize: "200" });
+  const params = pageParams(filters.page);
   if (filters.status) params.set("status", filters.status);
   if (filters.sourceType) params.set("sourceType", filters.sourceType);
   if (filters.hierarchyOfControl) params.set("hierarchyOfControl", filters.hierarchyOfControl);

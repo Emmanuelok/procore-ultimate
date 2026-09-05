@@ -1056,6 +1056,80 @@ export const workflowModule: FastifyPluginAsync = async (app) => {
   });
 
   /**
+   * Health inputs (cross-package contract §3.5).
+   *
+   * The substrate's honest contribution to a project's health score is
+   * approval throughput: how much is waiting, how much is late, how much has
+   * been escalated, and how much is stuck in a blocked state nobody can
+   * clear. Every figure is a count this query actually produced — a metric it
+   * cannot compute is `null`, with the reason stated, never 0.
+   */
+  app.get("/projects/:projectId/workflow/health-inputs", { preHandler: readGate }, async (req) => {
+    const today = todayISO();
+    const base = and(
+      eq(workflowInstances.companyId, req.companyId!),
+      eq(workflowInstances.projectId, req.projectId!),
+    );
+    const [runningRow] = await app.db
+      .select({ n: count() })
+      .from(workflowInstances)
+      .where(and(base, eq(workflowInstances.status, "running")));
+    const [blockedRow] = await app.db
+      .select({ n: count() })
+      .from(workflowInstances)
+      .where(and(base, eq(workflowInstances.status, "blocked")));
+    const [pendingRow] = await app.db
+      .select({ n: count() })
+      .from(workflowStepInstances)
+      .innerJoin(workflowInstances, eq(workflowInstances.id, workflowStepInstances.instanceId))
+      .where(and(base, eq(workflowStepInstances.decision, "pending")));
+    const [overdueRow] = await app.db
+      .select({ n: count() })
+      .from(workflowStepInstances)
+      .innerJoin(workflowInstances, eq(workflowInstances.id, workflowStepInstances.instanceId))
+      .where(
+        and(
+          base,
+          eq(workflowInstances.status, "running"),
+          eq(workflowStepInstances.decision, "pending"),
+          isNotNull(workflowStepInstances.dueDate),
+          lt(workflowStepInstances.dueDate, today),
+        ),
+      );
+    const [escalatedRow] = await app.db
+      .select({ n: count() })
+      .from(workflowStepInstances)
+      .innerJoin(workflowInstances, eq(workflowInstances.id, workflowStepInstances.instanceId))
+      .where(and(base, isNotNull(workflowStepInstances.escalatedAt)));
+
+    const running = Number(runningRow?.n ?? 0);
+    const overdue = Number(overdueRow?.n ?? 0);
+    const pending = Number(pendingRow?.n ?? 0);
+    const blocked = Number(blockedRow?.n ?? 0);
+    const reasons: string[] = [];
+    if (running === 0) reasons.push("No approval chain is running on this project.");
+    if (blocked > 0) {
+      reasons.push(
+        `${blocked} instance(s) are blocked and cannot advance without an administrator.`,
+      );
+    }
+    if (overdue > 0) reasons.push(`${overdue} approval step(s) are past their due date.`);
+    return {
+      metrics: {
+        runningInstances: running,
+        blockedInstances: blocked,
+        pendingSteps: pending,
+        overdueSteps: overdue,
+        escalatedSteps: Number(escalatedRow?.n ?? 0),
+        // A ratio needs a denominator; with nothing pending it is not 0, it
+        // is not a number at all.
+        overdueRatio: pending > 0 ? Number((overdue / pending).toFixed(4)) : null,
+      },
+      reasons,
+    };
+  });
+
+  /**
    * #788 — is a workflow mandatory for this record type on this project, and
    * has one been started? The owning module calls this before letting a
    * record leave draft.
@@ -1300,6 +1374,26 @@ export const workflowModule: FastifyPluginAsync = async (app) => {
         throw conflict("Step has already been decided or is not in the active group");
       }
 
+      /*
+       * The decision and its ledger entry are one transaction.
+       *
+       * A decision that committed without a ledger row is exactly the
+       * unledgered mutation lib/ledger.ts calls unacceptable — and for an
+       * approval, "who approved this and when" is the whole point of the
+       * record. `appendLedger` nests as a savepoint when handed a
+       * transaction handle, and its per-company advisory lock is held to the
+       * outer commit.
+       */
+      await appendLedger(tx as Db, {
+        companyId: instance.companyId,
+        actorId: uid,
+        action: "state_change",
+        objectType: "workflow_step",
+        objectId: step.id,
+        payload: { decision: body.decision, instanceId: instance.id, position: step.position },
+        projectId: instance.projectId,
+      });
+
       if (body.decision === "rejected") {
         // A rejection withdraws the rest of the active group: there is
         // nothing left for them to decide.
@@ -1317,6 +1411,15 @@ export const workflowModule: FastifyPluginAsync = async (app) => {
           .update(workflowInstances)
           .set({ status: "rejected", completedAt: now, updatedAt: now })
           .where(eq(workflowInstances.id, locked.id));
+        await appendLedger(tx as Db, {
+          companyId: instance.companyId,
+          actorId: uid,
+          action: "state_change",
+          objectType: "workflow_instance",
+          objectId: instance.id,
+          payload: { from: "running", to: "rejected" },
+          projectId: instance.projectId,
+        });
         return { kind: "rejected" as const, locked };
       }
 
@@ -1359,26 +1462,7 @@ export const workflowModule: FastifyPluginAsync = async (app) => {
       return { kind: "advanced" as const, locked, activation };
     });
 
-    await appendLedger(app.db, {
-      companyId: instance.companyId,
-      actorId: uid,
-      action: "state_change",
-      objectType: "workflow_step",
-      objectId: step.id,
-      payload: { decision: body.decision, instanceId: instance.id, position: step.position },
-      projectId: instance.projectId,
-    });
-
     if (result.kind === "rejected") {
-      await appendLedger(app.db, {
-        companyId: instance.companyId,
-        actorId: uid,
-        action: "state_change",
-        objectType: "workflow_instance",
-        objectId: instance.id,
-        payload: { from: "running", to: "rejected" },
-        projectId: instance.projectId,
-      });
       await pushNotifications(app.db, [
         {
           companyId: instance.companyId,

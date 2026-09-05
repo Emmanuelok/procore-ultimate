@@ -119,6 +119,8 @@ describe("decideVote (#1058)", () => {
     expect(out.sharePresentPercent).toBe(60);
     expect(out.quorumMet).toBe(false);
     expect(out.outcome).toBe("not_quorate");
+    // the outcome carries its own arithmetic, so a minute can be read on its own
+    expect(out.reasons.join(" ")).toMatch(/Not quorate: 60% of the shares were present/);
   });
 
   it("counts an abstention as present but not in favour", () => {
@@ -129,6 +131,7 @@ describe("decideVote (#1058)", () => {
     expect(out.shareAbstainPercent).toBe(60);
     expect(out.shareForPercent).toBe(40);
     expect(out.outcome).toBe("rejected");
+    expect(out.reasons.join(" ")).toMatch(/Not carried: 40% of the shares voted in favour/);
   });
 
   it("ignores votes from parties that are not active partners and names them", () => {

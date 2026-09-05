@@ -24,6 +24,14 @@ export interface StorageService {
   readStream(storageKey: string): Readable;
   filePath(storageKey: string): string;
   remove(storageKey: string): Promise<void>;
+  /**
+   * Cheapest round trip that proves the backing store is reachable and the
+   * credentials work. A missing key answers `false`; anything that stops the
+   * question being answered at all — a bad bucket, a wrong secret, a
+   * disconnected volume — throws, which is what readiness needs to see.
+   * Never use it as a "does this object exist" test in a hot path.
+   */
+  probe(storageKey: string): Promise<boolean>;
 }
 
 export function createLocalStorage(rootDir: string): StorageService {
@@ -67,6 +75,18 @@ export function createLocalStorage(rootDir: string): StorageService {
     },
     async remove(storageKey) {
       await rm(keyToPath(storageKey), { force: true });
+    },
+    async probe(storageKey) {
+      // ENOENT is the healthy answer for a key nobody wrote. Anything else —
+      // the mount gone, the directory unreadable — is a real fault and is
+      // rethrown so readiness reports it.
+      try {
+        await stat(keyToPath(storageKey));
+        return true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw err;
+      }
     },
   };
 }

@@ -603,6 +603,17 @@ export const letterRoutes: FastifyPluginAsync = async (app) => {
           "This recipient has acknowledged receipt; removing them would erase that acknowledgement from the record.",
         );
       }
+      // A LETTER's distribution list is frozen in both directions once it is
+      // issued. Adding is already refused after issue; deleting somebody the
+      // record says was SENT the letter would erase who was told what, which
+      // is exactly the fact a dispute turns on. Correct it by voiding and
+      // reissuing. (A transmittal is deliberately different: its recipient
+      // list stays editable after issue and the counters resync.)
+      if (recipient.recordType === "letter" && recipient.sentAt !== null) {
+        throw conflict(
+          `${recipient.name} was already sent ${recipient.recordId}; an issued letter's distribution list is frozen. Void and reissue if it was wrong.`,
+        );
+      }
       await app.db.delete(correspondenceRecipients).where(eq(correspondenceRecipients.id, recipientId));
       await ledger(app.db, {
         companyId,
@@ -774,12 +785,24 @@ export const letterRoutes: FastifyPluginAsync = async (app) => {
           `The type "${type.name}" has no approval workflow configured, so there is nothing to submit to. Issue the letter directly.`,
         );
       }
+      // A rejected letter comes back to draft with its decided steps still on
+      // the record (the ledger and the drawer both read them). Numbering the
+      // new round from 1 would collide with those rows on
+      // correspondence_approvals_seq_uq, so a resubmission continues the
+      // sequence instead of repeating it: the history stays, and the "is an
+      // earlier step still pending?" check is unaffected because every older
+      // row is already decided.
+      const [{ maxSeq = 0 } = { maxSeq: 0 }] = await app.db
+        .select({ maxSeq: sql<number>`coalesce(max(${correspondenceApprovals.seq}), 0)::int` })
+        .from(correspondenceApprovals)
+        .where(eq(correspondenceApprovals.letterId, letterId));
+      const base = Number(maxSeq);
       const rows = steps.map((step, index) => ({
         id: newId("cap"),
         companyId,
         projectId,
         letterId,
-        seq: index + 1,
+        seq: base + index + 1,
         name: step.name,
         role: step.role ?? null,
         userId: step.userId ?? null,

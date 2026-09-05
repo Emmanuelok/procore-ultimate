@@ -25,6 +25,20 @@ import { Alert, Badge, PageHeader, Tabs } from "../../ui";
 import { IconSafety } from "../../ui/icons";
 import { api } from "../../lib/api";
 import ActionDrawer from "./ActionDrawer";
+import {
+  NewInspectionModal,
+  NewProgrammeRecordModal,
+  NewTalkModal,
+  NewTemplateModal,
+} from "./CreateModals";
+import DevicesTab, {
+  EMPTY_DEVICE_FILTERS,
+  deviceQueryString,
+  type DeviceFilters,
+} from "./DevicesTab";
+import ProgrammeDrawer from "./ProgrammeDrawer";
+import RiskTab from "./RiskTab";
+import StatutoryTab from "./StatutoryTab";
 import ActionsTab, {
   EMPTY_ACTION_FILTERS,
   actionQueryString,
@@ -73,6 +87,7 @@ import {
   type SafetyObservation,
   type SafetyStatistics,
   type SafetySummary,
+  type SensorEvent,
   type ToolboxTalk,
 } from "./safetyShared";
 
@@ -83,7 +98,10 @@ type TabKey =
   | "actions"
   | "inspections"
   | "talks"
-  | "programme";
+  | "programme"
+  | "devices"
+  | "statutory"
+  | "risk";
 
 const TABS: Array<{ value: TabKey; label: string }> = [
   { value: "dashboard", label: "Dashboard" },
@@ -93,6 +111,9 @@ const TABS: Array<{ value: TabKey; label: string }> = [
   { value: "inspections", label: "Inspections" },
   { value: "talks", label: "Toolbox talks" },
   { value: "programme", label: "Programme" },
+  { value: "devices", label: "Device alarms" },
+  { value: "statutory", label: "Statutory forms" },
+  { value: "risk", label: "Leading indicators" },
 ];
 
 const isTabKey = (value: string | null): value is TabKey =>
@@ -127,6 +148,7 @@ export default function SafetyPage() {
   const [talkFilters, setTalkFilters] = useState<TalkFilters>(EMPTY_TALK_FILTERS);
   const [programmeFilters, setProgrammeFilters] =
     useState<ProgrammeFilters>(EMPTY_PROGRAMME_FILTERS);
+  const [deviceFilters, setDeviceFilters] = useState<DeviceFilters>(EMPTY_DEVICE_FILTERS);
 
   const [openIncident, setOpenIncident] = useState<string | null>(() =>
     searchParams.get("incident"),
@@ -140,6 +162,12 @@ export default function SafetyPage() {
   );
   const [openTalk, setOpenTalk] = useState<string | null>(() => searchParams.get("talk"));
   const [newRecord, setNewRecord] = useState<NewRecordKind | null>(null);
+  const [openProgrammeRecord, setOpenProgrammeRecord] = useState<string | null>(() =>
+    searchParams.get("record"),
+  );
+  const [creating, setCreating] = useState<
+    "inspection" | "template" | "talk" | "programme" | null
+  >(null);
 
   const users = useCompanyUsers();
   const vendors = useVendors();
@@ -233,6 +261,37 @@ export default function SafetyPage() {
     enabled,
   );
 
+  /**
+   * Changing any filter returns the register to its first page.
+   *
+   * Without this a reader on page 4 who narrows the filter is shown "no rows"
+   * for a register that has plenty — the emptiest possible lie a filtered view
+   * can tell.
+   */
+  function withPageReset<T extends { page: string }>(
+    current: T,
+    set: (next: T) => void,
+  ): (next: T) => void {
+    return (next) => {
+      const changedSomethingElse = Object.keys(next).some(
+        (key) =>
+          key !== "page" &&
+          (next as Record<string, string>)[key] !== (current as Record<string, string>)[key],
+      );
+      set(changedSomethingElse ? { ...next, page: "1" } : next);
+    };
+  }
+
+  const sensorEvents = useResource<Paged<SensorEvent>>(
+    (signal) =>
+      api.get<Paged<SensorEvent>>(
+        `/api/v1/projects/${projectKey}/safety/sensor-events?${deviceQueryString(deviceFilters)}`,
+        { signal },
+      ),
+    [projectKey, version, JSON.stringify(deviceFilters)],
+    enabled,
+  );
+
   const selectTab = useCallback(
     (next: TabKey) => {
       setTab(next);
@@ -253,15 +312,26 @@ export default function SafetyPage() {
     [searchParams, setSearchParams],
   );
 
-  /** The two facts that outrank everything else on this screen. */
+  /**
+   * The two facts that outrank everything else on this screen.
+   *
+   * Read from the SUMMARY, which is unfiltered and unwindowed. They used to be
+   * derived from `incidents.data.items` — the current tab's filtered first
+   * page — so applying any incident filter that excluded the offending record,
+   * or holding more than one page of incidents, silently removed the red
+   * "statutory notification deadline has passed" banner from the whole
+   * workspace while the duty was still live.
+   */
   const alarm = useMemo(() => {
-    const rows = incidents.data?.items ?? [];
+    const standing = summary.data?.statutory;
     return {
-      missed: rows.filter((i) => i.notification.missed),
-      unsettled: rows.filter((i) => i.notification.needsHumanReview === true),
-      awaiting: rows.filter((i) => i.isReportable && !i.notification.notifiedAt),
+      missed: standing?.missedRefs ?? [],
+      missedDuties: standing?.missedDuties ?? 0,
+      unsettled: standing?.reviewRefs ?? [],
+      awaiting: standing?.awaitingRefs ?? [],
+      outstandingDuties: standing?.outstandingDuties ?? 0,
     };
-  }, [incidents.data]);
+  }, [summary.data]);
 
   if (!projectId) {
     return (
@@ -321,17 +391,22 @@ export default function SafetyPage() {
         <div className="mb-3">
           <Alert
             tone="danger"
-            title={`${alarm.missed.length} statutory notification deadline${alarm.missed.length === 1 ? " has" : "s have"} passed`}
+            title={`${alarm.missedDuties} statutory notification deadline${alarm.missedDuties === 1 ? " has" : "s have"} passed`}
           >
             <p>
               {alarm.missed
                 .slice(0, 4)
-                .map((i) => i.reference)
+                .map((i) =>
+                  i.regimes && i.regimes.length > 0
+                    ? `${i.reference} (${i.regimes.join(", ")})`
+                    : i.reference,
+                )
                 .join(", ")}
               {alarm.missed.length > 4 ? ` and ${alarm.missed.length - 4} more` : ""}. Failing to
               notify is an offence in its own right, separate from whatever caused the incident. The
               deadline does not stop mattering once it has passed — record the notification and the
-              date it was actually made.
+              date it was actually made. An incident answerable to two authorities owes two
+              notifications: discharging one discharges nothing of the other.
             </p>
           </Alert>
         </div>
@@ -370,7 +445,7 @@ export default function SafetyPage() {
         <IncidentsTab
           incidents={incidents}
           filters={incidentFilters}
-          onFilters={setIncidentFilters}
+          onFilters={withPageReset(incidentFilters, setIncidentFilters)}
           users={users}
           vendors={vendors}
           onOpen={(id) => {
@@ -383,7 +458,7 @@ export default function SafetyPage() {
         <ObservationsTab
           observations={observations}
           filters={observationFilters}
-          onFilters={setObservationFilters}
+          onFilters={withPageReset(observationFilters, setObservationFilters)}
           users={users}
           onOpen={(id) => {
             setOpenObservation(id);
@@ -395,7 +470,7 @@ export default function SafetyPage() {
         <ActionsTab
           actions={actions}
           filters={actionFilters}
-          onFilters={setActionFilters}
+          onFilters={withPageReset(actionFilters, setActionFilters)}
           users={users}
           vendors={vendors}
           onOpen={(id) => {
@@ -408,32 +483,59 @@ export default function SafetyPage() {
           inspections={inspections}
           templates={templates}
           filters={inspectionFilters}
-          onFilters={setInspectionFilters}
+          onFilters={withPageReset(inspectionFilters, setInspectionFilters)}
           users={users}
           onOpen={(id) => {
             setOpenInspection(id);
             setParam("inspection", id);
           }}
+          onNew={() => setCreating("inspection")}
+          onNewTemplate={() => setCreating("template")}
         />
+      ) : tab === "devices" ? (
+        <DevicesTab
+          projectId={projectKey}
+          events={sensorEvents}
+          filters={deviceFilters}
+          onFilters={withPageReset(deviceFilters, setDeviceFilters)}
+          users={users}
+          onMutated={refresh}
+        />
+      ) : tab === "statutory" ? (
+        <StatutoryTab
+          projectId={projectKey}
+          incidents={incidents}
+          users={users}
+          version={version}
+          onMutated={refresh}
+        />
+      ) : tab === "risk" ? (
+        <RiskTab projectId={projectKey} version={version} onMutated={refresh} />
       ) : tab === "talks" ? (
         <TalksTab
           talks={talks}
           filters={talkFilters}
-          onFilters={setTalkFilters}
+          onFilters={withPageReset(talkFilters, setTalkFilters)}
           users={users}
           vendors={vendors}
           onOpen={(id) => {
             setOpenTalk(id);
             setParam("talk", id);
           }}
+          onNew={() => setCreating("talk")}
         />
       ) : (
         <ProgrammeTab
           records={programme}
           filters={programmeFilters}
-          onFilters={setProgrammeFilters}
+          onFilters={withPageReset(programmeFilters, setProgrammeFilters)}
           users={users}
           vendors={vendors}
+          onOpen={(id) => {
+            setOpenProgrammeRecord(id);
+            setParam("record", id);
+          }}
+          onNew={() => setCreating("programme")}
         />
       )}
 
@@ -495,6 +597,65 @@ export default function SafetyPage() {
           setParam("talk", null);
         }}
         onMutated={refresh}
+      />
+
+      <ProgrammeDrawer
+        recordId={openProgrammeRecord}
+        users={users}
+        vendors={vendors}
+        onClose={() => {
+          setOpenProgrammeRecord(null);
+          setParam("record", null);
+        }}
+        onMutated={refresh}
+      />
+
+      <NewInspectionModal
+        projectId={projectKey}
+        open={creating === "inspection"}
+        templates={templates}
+        onClose={() => setCreating(null)}
+        onCreated={(id) => {
+          setCreating(null);
+          refresh();
+          setOpenInspection(id);
+          setParam("inspection", id);
+        }}
+      />
+
+      <NewTemplateModal
+        open={creating === "template"}
+        onClose={() => setCreating(null)}
+        onCreated={() => {
+          setCreating(null);
+          refresh();
+        }}
+      />
+
+      <NewTalkModal
+        projectId={projectKey}
+        open={creating === "talk"}
+        vendors={vendors}
+        onClose={() => setCreating(null)}
+        onCreated={(id) => {
+          setCreating(null);
+          refresh();
+          setOpenTalk(id);
+          setParam("talk", id);
+        }}
+      />
+
+      <NewProgrammeRecordModal
+        projectId={projectKey}
+        open={creating === "programme"}
+        vendors={vendors}
+        onClose={() => setCreating(null)}
+        onCreated={(id) => {
+          setCreating(null);
+          refresh();
+          setOpenProgrammeRecord(id);
+          setParam("record", id);
+        }}
       />
 
       <NewRecordModal

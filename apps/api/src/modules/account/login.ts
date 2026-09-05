@@ -11,8 +11,18 @@ import {
   ipLockout,
   lockoutMessage,
   progressiveDelayMs,
+  type LockoutOverrides,
   type LockoutState,
 } from "./lockout.js";
+import {
+  effectivePolicyForEmail,
+  evaluateIpAccess,
+  loadCompanyPolicy,
+  loadUserPolicies,
+  PLATFORM_DEFAULT_POLICY,
+  type ResolvedSecurityPolicy,
+  type StoredSecurityPolicy,
+} from "./policy.js";
 import { hashPassword, needsRehash, passwordHashCost } from "./password.js";
 import { issueUserSession, requestContext, type IssuedSession } from "./sessions.js";
 
@@ -54,10 +64,11 @@ export async function guardLoginAttempt(
   req: FastifyRequest,
   email: string,
   nowMs = Date.now(),
+  overrides?: LockoutOverrides,
 ): Promise<LoginGate> {
   const ctx = requestContext(req);
-  const account = await accountLockout(app.db, app.appConfig, email, nowMs);
-  const ip = await ipLockout(app.db, app.appConfig, ctx.ip, nowMs);
+  const account = await accountLockout(app.db, app.appConfig, email, nowMs, overrides);
+  const ip = await ipLockout(app.db, app.appConfig, ctx.ip, nowMs, overrides);
   const blocked = account.locked ? account : ip.locked ? ip : null;
   if (blocked) {
     await recordAuthEvent(app.db, {
@@ -87,7 +98,12 @@ export async function guardLoginAttempt(
 export async function noteLoginFailure(
   app: FastifyInstance,
   req: FastifyRequest,
-  input: { email: string; userId?: string | null; reason?: string },
+  input: {
+    email: string;
+    userId?: string | null;
+    reason?: string;
+    overrides?: LockoutOverrides;
+  },
   nowMs = Date.now(),
 ): Promise<LockoutState> {
   const ctx = requestContext(req);
@@ -100,7 +116,7 @@ export async function noteLoginFailure(
     userAgent: ctx.userAgent,
     reason: input.reason ?? "invalid_credentials",
   });
-  const state = await accountLockout(app.db, app.appConfig, input.email, nowMs);
+  const state = await accountLockout(app.db, app.appConfig, input.email, nowMs, input.overrides);
   if (state.locked) {
     await recordAuthEvent(app.db, {
       kind: "account_locked",
@@ -144,6 +160,9 @@ export async function completeLogin(
     password: string;
     companyId?: string | null;
     authMethod?: "password" | "invitation";
+    /** resolved tenant policy; its absolute lifetime bounds the session */
+    policy?: ResolvedSecurityPolicy;
+    mfaSatisfied?: boolean;
   },
 ): Promise<LoginCompletion> {
   const ctx = requestContext(req);
@@ -166,6 +185,9 @@ export async function completeLogin(
     user: input.user,
     authMethod: input.authMethod ?? "password",
     companyId: input.companyId ?? null,
+    // #23 — the tenant's absolute session lifetime, not only the platform's.
+    absoluteTtlHours: input.policy?.sessionAbsoluteTimeoutHours,
+    mfaSatisfied: input.mfaSatisfied ?? false,
   });
 
   await recordAuthEvent(app.db, {
@@ -236,4 +258,200 @@ export async function notifyNewDevice(
     reason: outcome.result.reasons[0] ?? null,
     metadata: { dispatchId: outcome.dispatchId, deviceLabel: input.deviceLabel },
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* #24 — the tenant IP allowlist, applied at sign-in                   */
+/* ------------------------------------------------------------------ */
+
+export interface LoginIpVerdict {
+  allowed: boolean;
+  /** companies whose allowlist refused this address, for the trail */
+  refusedBy: string[];
+  /** companies that would have refused it but are only monitoring */
+  monitoredBy: string[];
+  reason: string | null;
+}
+
+/**
+ * Would this address be refused by EVERY company the account belongs to?
+ *
+ * The allowlist is a per-tenant control, so the authoritative enforcement
+ * point is `requireCompany` — that is where a request names the tenant whose
+ * data it wants. But a sign-in that cannot reach a single one of the holder's
+ * tenants is not a sign-in, and letting it mint a session so that every
+ * subsequent request can be refused individually is a worse experience and a
+ * worse trail: one `login_blocked_ip` row says what happened; forty 403s do
+ * not.
+ *
+ * So: refuse the LOGIN only when every membership refuses. Where one tenant
+ * allows the address and another does not, the session is issued and the
+ * strict tenant refuses at `requireCompany`. An account with no memberships is
+ * never refused here — there is no tenant to have an opinion.
+ */
+export async function evaluateLoginIpAccess(
+  app: FastifyInstance,
+  req: FastifyRequest,
+  userId: string,
+): Promise<LoginIpVerdict> {
+  const ctx = requestContext(req);
+  const policies = await loadUserPolicies(app.db, userId);
+  if (policies.length === 0) {
+    return { allowed: true, refusedBy: [], monitoredBy: [], reason: null };
+  }
+  const refusedBy: string[] = [];
+  const monitoredBy: string[] = [];
+  let allowedSomewhere = false;
+  for (const policy of policies) {
+    const verdict = evaluateIpAccess(policy, ctx.ip, userId);
+    if (verdict.outside && verdict.mode === "enforce" && !verdict.breakGlass) {
+      refusedBy.push(policy.companyId);
+      continue;
+    }
+    if (verdict.outside && verdict.mode === "monitor") monitoredBy.push(policy.companyId);
+    allowedSomewhere = true;
+  }
+  return {
+    allowed: allowedSomewhere,
+    refusedBy,
+    monitoredBy,
+    reason:
+      allowedSomewhere || refusedBy.length === 0
+        ? null
+        : `Address ${ctx.ip ?? "(unknown)"} is outside the allowed ranges of every organisation this account belongs to.`,
+  };
+}
+
+/**
+ * Refuse a sign-in from an address no tenant of this account permits, and
+ * record it. Returns silently when the address is acceptable somewhere.
+ *
+ * The refusal is a 403 with an explicit message rather than the uniform 401
+ * every other refusal answers with, and that is deliberate: this one is not an
+ * enumeration risk (it is only reachable AFTER a correct password) and a user
+ * told "invalid credentials" when their password was right will reset it,
+ * fail again, and call support. Naming the real reason is the kinder and the
+ * cheaper answer.
+ */
+export async function guardLoginIpAllowlist(
+  app: FastifyInstance,
+  req: FastifyRequest,
+  user: { id: string; email: string },
+): Promise<void> {
+  const verdict = await evaluateLoginIpAccess(app, req, user.id);
+  const ctx = requestContext(req);
+  if (verdict.monitoredBy.length > 0) {
+    await recordAuthEvent(app.db, {
+      kind: "login_blocked_ip",
+      outcome: "pending",
+      userId: user.id,
+      email: user.email,
+      ip: ctx.ip,
+      userAgent: ctx.userAgent,
+      reason: "Address outside the allowlist; the policy is in monitor mode so the sign-in was allowed.",
+      metadata: { mode: "monitor", companies: verdict.monitoredBy },
+    });
+  }
+  if (verdict.allowed) return;
+  await recordAuthEvent(app.db, {
+    kind: "login_blocked_ip",
+    outcome: "blocked",
+    userId: user.id,
+    email: user.email,
+    ip: ctx.ip,
+    userAgent: ctx.userAgent,
+    reason: verdict.reason,
+    metadata: { mode: "enforce", companies: verdict.refusedBy },
+  });
+  throw new AppError(
+    403,
+    "Your organisation only permits sign-in from approved networks, and this address is not one " +
+      "of them. Connect through the corporate network or VPN, or ask an administrator to add " +
+      "this address to the allowlist.",
+    { code: "ip_not_allowed", ip: ctx.ip },
+  );
+}
+
+/** The resolved policy for an address, used by the login routes before the
+ *  password is compared so that lockout thresholds are the tenant's own. */
+export async function loginPolicyFor(
+  app: FastifyInstance,
+  email: string,
+): Promise<ResolvedSecurityPolicy> {
+  try {
+    return await effectivePolicyForEmail(app.db, email);
+  } catch {
+    return { ...PLATFORM_DEFAULT_POLICY };
+  }
+}
+
+/**
+ * #24 — THE TENANT IP ALLOWLIST, AT THE POINT THE TENANT IS CHOSEN.
+ *
+ * `guardLoginIpAllowlist` above refuses a SIGN-IN only when EVERY company the
+ * account belongs to refuses the address, which is the right answer there: a
+ * contractor who works for a strict client and a relaxed one must still be
+ * able to sign in and do the relaxed one's work. The consequence is that the
+ * strict tenant's own rule has to be applied somewhere else — on the request
+ * that names it — and this is that function.
+ *
+ * Call it from `requireCompany` (plugins/auth.ts) after membership is proved
+ * and before `req.companyId` is set, so that a session held from an
+ * unapproved network can read nothing belonging to the tenant that excluded
+ * it. Until that one-line change lands the allowlist is enforced at sign-in
+ * only, which is honest but weaker: a session opened from the office and
+ * carried home keeps working.
+ *
+ * `monitor` mode records what it WOULD have refused and allows the request —
+ * that is the whole point of the mode, and it is why an administrator can
+ * introduce an allowlist without locking their own company out on a Friday.
+ * Break-glass users are exempt in every mode.
+ *
+ * FAIL-OPEN ON A POLICY READ FAILURE is deliberate and stated: if the policy
+ * table cannot be read, refusing every request in the tenant turns a database
+ * blip into a total outage for exactly the customers who configured the most
+ * security. The failure is logged; the request proceeds.
+ */
+export async function guardCompanyIpAccess(
+  app: FastifyInstance,
+  req: FastifyRequest,
+  companyId: string,
+  userId: string,
+): Promise<void> {
+  let policy: StoredSecurityPolicy;
+  try {
+    policy = await loadCompanyPolicy(app.db, companyId);
+  } catch (err) {
+    app.log.error({ err, companyId }, "could not read the tenant security policy; allowing");
+    return;
+  }
+  if (policy.ipAllowlistMode === "off" || policy.ipAllowlist.length === 0) return;
+  const ctx = requestContext(req);
+  const verdict = evaluateIpAccess(policy, ctx.ip, userId);
+  if (!verdict.outside) return;
+  await recordAuthEvent(app.db, {
+    kind: "login_blocked_ip",
+    outcome: verdict.allowed ? "pending" : "blocked",
+    companyId,
+    userId,
+    ip: ctx.ip,
+    userAgent: ctx.userAgent,
+    reason: verdict.breakGlass
+      ? "Address outside the allowlist; admitted under the break-glass exemption."
+      : verdict.reason,
+    metadata: {
+      mode: verdict.mode,
+      breakGlass: verdict.breakGlass,
+      scope: "company_request",
+      path: req.url,
+    },
+  });
+  if (verdict.allowed) return;
+  throw new AppError(
+    403,
+    "This organisation only permits access from approved networks, and this address is not one " +
+      "of them. Connect through the corporate network or VPN, or ask an administrator to add " +
+      "this address to the allowlist.",
+    { code: "ip_not_allowed", companyId, ip: ctx.ip },
+  );
 }

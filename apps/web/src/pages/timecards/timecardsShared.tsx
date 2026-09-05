@@ -381,7 +381,16 @@ export interface BatchRecord {
   doubleTimeHours: number;
   premiumHours: number;
   totalHours: number;
-  totalCost: number;
+  /**
+   * NULL when any card in the week could not be costed. The register used to
+   * render a materialised 0 here while the detail view — which recomputes —
+   * said the cost was unknown; payroll is paid from this figure.
+   */
+  totalCost: number | null;
+  /** cards in the week carrying hours the platform holds no rate for */
+  uncostedCardCount?: number;
+  totalCostIsKnown?: boolean;
+  costNote?: string | null;
   currency: string;
   varianceHours: number | null;
   exceptionCount: number;
@@ -595,6 +604,18 @@ export interface TicketRecord {
   createdBy: string;
   signature: SignatureEvidence;
   isSigned: boolean;
+}
+
+/**
+ * The register row. `total` is the priced-SO-FAR subtotal, which is why
+ * `totalsAreComplete` travels with it: a ticket with unpriced labour hours
+ * has no total, and rendering the column as though it did contradicts the
+ * drawer, which says so.
+ */
+export interface TicketListRow extends TicketRecord {
+  unpricedLineCount: number;
+  totalsAreComplete: boolean;
+  totalNote: string | null;
 }
 
 export interface TicketDetail extends TicketRecord {
@@ -1772,8 +1793,8 @@ export function useReconciliation(
 export function useTickets(
   projectId: string | undefined,
   enabled: boolean,
-): Loadable<ListResponse<TicketRecord>> {
-  return useResource<ListResponse<TicketRecord>>(
+): Loadable<ListResponse<TicketListRow>> {
+  return useResource<ListResponse<TicketListRow>>(
     enabled && projectId ? `/api/v1/projects/${projectId}/tm-tickets?page=1&pageSize=200` : null,
   );
 }
@@ -1807,4 +1828,134 @@ export function useCostCodes(
   return useResource<{ items: CostCodeOption[]; total: number }>(
     enabled && projectId ? `/api/v1/projects/${projectId}/cost-codes` : null,
   );
+}
+
+
+/* ========================================================================== */
+/* Labour productivity (#615) and the posting onto the budget (#715)           */
+/* ========================================================================== */
+
+export interface ProductivityLine {
+  budgetLineItemId: string;
+  code: string | null;
+  description: string;
+  unit: string | null;
+  actualHours: number;
+  installedQuantity: number | null;
+  /** whether the quantity was MEASURED in the field or asserted on the
+   *  timesheet that claimed the hours — the two are never added together */
+  quantitySource: "field_progress" | "timecard_allocation" | "none";
+  plannedUnitRate: number | null;
+  achievedUnitRate: number | null;
+  earnedHours: number | null;
+  productivityFactor: number | null;
+  percentComplete: number | null;
+  remainingQuantity: number | null;
+  forecastHoursAtCompletion: number | null;
+  forecastVarianceHours: number | null;
+  reasons: string[];
+}
+
+export interface ProductivityWeek {
+  weekStart: string;
+  actualHours: number;
+  earnedHours: number | null;
+  productivityFactor: number | null;
+}
+
+export interface ProductivityCrew {
+  crewId: string | null;
+  crewName: string | null;
+  actualHours: number;
+  earnedHours: number | null;
+  productivityFactor: number | null;
+}
+
+export interface ProductivityReport {
+  from: string;
+  to: string;
+  timecards: number;
+  lines: ProductivityLine[];
+  weeks: ProductivityWeek[];
+  crews: ProductivityCrew[];
+  totals: {
+    actualHours: number;
+    earnedHours: number | null;
+    productivityFactor: number | null;
+    forecastHoursAtCompletion: number | null;
+    linesMeasured: number;
+    linesUnmeasurable: number;
+  };
+  deviation: {
+    from: string;
+    to: string;
+    weeks: number;
+    worstFactor: number;
+    averageFactor: number;
+    lostHours: number;
+    explanation: string;
+  } | null;
+  reasons: string[];
+  method: string;
+  thresholds: { floor: number; minWeeks: number };
+}
+
+/** A field measurement of installed quantity — the independent side of the
+ *  productivity ratio. */
+export interface ProgressEntry {
+  id: string;
+  progressDate: string;
+  costCodeId: string | null;
+  costCode: string | null;
+  budgetLineItemId: string | null;
+  crewId: string | null;
+  quantity: number;
+  unit: string;
+  method: string;
+  notes: string | null;
+  recordedBy: string;
+  verifiedBy: string | null;
+  verifiedAt: string | null;
+}
+
+export function useProgressEntries(
+  projectId: string | undefined,
+  from: string,
+  to: string,
+  enabled: boolean,
+): Loadable<ListResponse<ProgressEntry>> {
+  return useResource<ListResponse<ProgressEntry>>(
+    enabled && projectId
+      ? `/api/v1/projects/${projectId}/labour-progress?from=${from}&to=${to}&page=1&pageSize=100`
+      : null,
+  );
+}
+
+/** The productivity report over a window, or null while it is not asked for. */
+export function useProductivity(
+  projectId: string | undefined,
+  from: string,
+  to: string,
+  enabled: boolean,
+): Loadable<ProductivityReport> {
+  return useResource<ProductivityReport>(
+    enabled && projectId
+      ? `/api/v1/projects/${projectId}/labour-productivity?from=${from}&to=${to}`
+      : null,
+  );
+}
+
+export interface LabourPostingResult {
+  runId: string;
+  from: string;
+  to: string;
+  posted: number;
+  lines: Array<{
+    budgetLineItemId: string;
+    costCode: string;
+    labourCost: number;
+    labourHours: number;
+    currency: string;
+  }>;
+  reasons: string[];
 }

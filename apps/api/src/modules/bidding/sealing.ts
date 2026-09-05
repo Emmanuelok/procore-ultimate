@@ -47,6 +47,23 @@ export const WITHHELD_SUBMISSION_FIELDS = [
   "bondsOffered",
 ] as const;
 
+/**
+ * Free text the BIDDER wrote. An exclusions or qualifications note routinely
+ * quotes the price it is qualifying ("our figure of 168,400 excludes the
+ * temporary works"), so while the seal is on these are replaced by a length
+ * rather than shown. They are not deleted: the fact that a bid carried four
+ * pages of qualifications is itself readable before the opening.
+ */
+export const WITHHELD_SUBMISSION_TEXT_FIELDS = [
+  "exclusions",
+  "qualifications",
+  "assumptions",
+  "clarificationsRequested",
+  "clarificationResponse",
+  "evaluationNote",
+  "nonComplianceNote",
+] as const;
+
 export interface SealState {
   /** the package was declared sealed at issue */
   isSealed: boolean;
@@ -142,18 +159,49 @@ export function redactSubmission(
   for (const field of WITHHELD_SUBMISSION_FIELDS) {
     out[field] = Array.isArray(out[field]) ? [] : null;
   }
+  /*
+   * DETAIL IS WITHHELD BY ALLOWLIST, NOT BY BLACKLIST.
+   *
+   * `detail` is a free-form jsonb bag that carries whatever the caller sent
+   * plus whatever this module computed. Deleting the two keys we happened to
+   * know about left the seal defeated by anything else that mentioned a
+   * number — and it was: `detail.totalsNotes` carried the sentence "Base bid
+   * taken as the sum of the 4 non-alternate line(s): 168400", which every
+   * read path returned to any bidding:read user while the package was sealed
+   * and unopened. A blacklist protects the keys somebody remembered; an
+   * allowlist protects the ones nobody has invented yet.
+   *
+   * Nothing in the bag is worth leaking a price for, so the whole thing goes,
+   * and the KEY NAMES come back so a client can say what is being withheld
+   * rather than pretending the bag was empty.
+   */
   const detail = { ...((row.detail as Record<string, unknown>) ?? {}) };
-  delete detail["criterionScores"];
-  delete detail["priceAnalysis"];
-  out["detail"] = detail;
+  out["detail"] = {
+    sealed: true,
+    withheldDetailKeys: Object.keys(detail).sort(),
+  };
   // Priced lines carry rates; a rate is a price. They come back empty.
   out["lines"] = [];
   out["lineCount"] = row.lineCount;
+  // Free-text fields the bidder wrote can quote their own price; while the
+  // seal is on, they are summarised rather than shown.
+  for (const field of WITHHELD_SUBMISSION_TEXT_FIELDS) {
+    const value = out[field];
+    out[field] =
+      typeof value === "string" && value.length > 0
+        ? `[withheld while sealed — ${value.length} characters recorded]`
+        : value;
+  }
   return {
     ...out,
     sealed: true,
     sealNote: seal.note,
-    withheldFields: [...WITHHELD_SUBMISSION_FIELDS, "lines"],
+    withheldFields: [
+      ...WITHHELD_SUBMISSION_FIELDS,
+      ...WITHHELD_SUBMISSION_TEXT_FIELDS,
+      "lines",
+      "detail",
+    ],
   } as SealedSubmissionView;
 }
 

@@ -297,6 +297,33 @@ export interface ActionItemDetail extends ActionItem {
   } | null;
 }
 
+export interface MinutesObjection {
+  id?: string;
+  note?: string;
+  raisedBy?: string;
+  raisedAt?: string;
+  resolvedAt?: string | null;
+  resolvedBy?: string | null;
+  resolutionNote?: string | null;
+  [k: string]: unknown;
+}
+
+/** One recipient's copy of one issue of the minutes (#422, #425). */
+export interface MinuteDelivery {
+  id: string;
+  minutesVersion: number;
+  userId: string | null;
+  contactId: string | null;
+  recipientName: string;
+  email: string | null;
+  channel: string;
+  status: string;
+  deliveredAt: string | null;
+  acknowledgedAt: string | null;
+  failureReason: string | null;
+  documentSha256: string | null;
+}
+
 export interface MeetingDetail extends Meeting {
   attendees: Attendee[];
   agendaItems: AgendaItem[];
@@ -304,6 +331,24 @@ export interface MeetingDetail extends Meeting {
   actionItems: ActionItem[];
   quorum: QuorumResult;
   minutesObjectionWindow: MinutesWindow;
+  /** live objections against the current issue — unresolved ones block sign-off */
+  objections: MinutesObjection[];
+  /** objections raised against versions that were withdrawn for correction */
+  objectionHistory: unknown[];
+  minutesDocument: {
+    fileId: string;
+    sha256: string | null;
+    renderedAt: string | null;
+    minutesVersion: number;
+  } | null;
+  agendaPack: { fileId: string; sha256: string | null } | null;
+  deliveries: {
+    items: MinuteDelivery[];
+    total: number;
+    delivered: number;
+    acknowledged: number;
+    failed: number;
+  };
   carryForward: { carriedIn: number; maxCarryCount: number };
 }
 
@@ -314,7 +359,15 @@ export interface SeriesDetail extends MeetingSeries {
 }
 
 export interface ActionsResponse extends Paginated<ActionItem> {
-  sweep: { raised: number; scanned: number };
+  /**
+   * The job that keeps this list true, named by the API.
+   *
+   * The overdue sweep used to run as a side effect of this very read, which
+   * meant a project nobody opened was never warned and the resulting signals
+   * were ledgered against whoever happened to look — including read-only
+   * members. The read is pure now; the scheduler does the work.
+   */
+  sweptBy: string;
 }
 
 export interface SeriesCarryForward {
@@ -919,17 +972,14 @@ export function DueDate({
   );
 }
 
-/** The banner that explains what the lazy sweep just did on this read. */
-export function SweepNote({ sweep }: { sweep: { raised: number; scanned: number } | undefined }) {
-  if (!sweep || sweep.scanned === 0) return null;
+/** Says which job keeps this list true, and that the read itself wrote nothing. */
+export function SweepNote({ sweptBy }: { sweptBy: string | undefined }) {
+  if (!sweptBy) return null;
   return (
     <p className="text-2xs text-content-subtle">
-      Overdue actions are found when this list is read, never by a scheduled job — the read is the
-      moment the answer has to be true. This read scanned {count(sweep.scanned)} candidate
-      {sweep.scanned === 1 ? "" : "s"} and raised {count(sweep.raised)} new signal
-      {sweep.raised === 1 ? "" : "s"}; a signal is keyed on the action, so re-reading raises it
-      once and only once. A promoted action is skipped, because its obligation owns the time bar
-      from then on.
+      {sweptBy} A signal is keyed on the action, so however often the job runs it raises the same
+      warning once and only once — and a promoted action is skipped, because its obligation owns
+      the time bar from then on.
     </p>
   );
 }

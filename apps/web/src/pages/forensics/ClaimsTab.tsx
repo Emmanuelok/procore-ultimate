@@ -4,10 +4,11 @@
  * (#299-301), chronology auto-assembly (#318) and independent assessment
  * (#310 — the self-assessment 403 surfaces as an info banner, not an error).
  */
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { CLAIM_KINDS } from "@constructos/shared";
 import { api, ApiClientError } from "../../lib/api";
 import {
+  Alert,
   Badge,
   Button,
   EmptyState,
@@ -35,6 +36,7 @@ import {
   TiaChip,
   type ClaimDetail,
   type ClaimRow,
+  type SufficiencyResult,
   type ContractLite,
   type DelayEventRow,
   type ListResponse,
@@ -62,13 +64,22 @@ const SOURCE_TONES: Record<string, string> = {
   variation: "amber",
 };
 
-export default function ClaimsTab({ projectId }: { projectId: string }) {
+export default function ClaimsTab({
+  projectId,
+  focusId,
+}: {
+  projectId: string;
+  /** deep link from ⌘K search: open this claim's drawer once, on arrival */
+  focusId?: string | null;
+}) {
   const base = `/api/v1/projects/${projectId}`;
 
   const [items, setItems] = useState<ClaimRow[] | null>(null);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [error, setError] = useState<string | null>(null);
+  /** bumped on every successful list load so the exposure strip refollows it */
+  const [exposureKey, setExposureKey] = useState(0);
 
   const load = useCallback(async () => {
     setError(null);
@@ -77,6 +88,7 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
       const res = await api.get<ListResponse<ClaimRow>>(`${base}/claims?${params}`);
       setItems(res.items);
       setTotal(res.total);
+      setExposureKey((k) => k + 1);
     } catch (err) {
       setItems([]);
       setError(err instanceof Error ? err.message : "Failed to load claims");
@@ -168,6 +180,16 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
 
   const [chronoBusy, setChronoBusy] = useState(false);
 
+  /* --- claim assurance: sufficiency, valuation, Scott Schedule, package --- */
+  const [sufficiency, setSufficiency] = useState<SufficiencyResult | null>(null);
+  const [sufficiencyBusy, setSufficiencyBusy] = useState(false);
+  const [valuation, setValuation] = useState({ best: "", likely: "", worst: "", probability: "" });
+  const [valuationBusy, setValuationBusy] = useState(false);
+  const [scottBusy, setScottBusy] = useState(false);
+  const [packageInfo, setPackageInfo] = useState<{ ready: boolean; missing: string[] } | null>(null);
+
+  const [reasonFor, setReasonFor] = useState<string | null>(null);
+  const [reasonText, setReasonText] = useState("");
   const [assessOpen, setAssessOpen] = useState(false);
   const [assessDays, setAssessDays] = useState("");
   const [assessAmount, setAssessAmount] = useState("");
@@ -208,6 +230,20 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
       setError(err instanceof Error ? err.message : "Failed to load the claim");
     }
   }
+
+  /*
+   * Arriving from company search (or any link that names a claim) opens that
+   * claim. Once per id: reopening after the user closes the drawer would trap
+   * them on the record they just dismissed.
+   */
+  const openedFocus = useRef<string | null>(null);
+  useEffect(() => {
+    if (!focusId || openedFocus.current === focusId) return;
+    openedFocus.current = focusId;
+    void openDrawer(focusId);
+    // openDrawer is stable for a given base; the id is what drives this.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusId, base]);
 
   async function refresh() {
     if (selected) await openDrawer(selected.id);
@@ -291,6 +327,68 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
     }
   }
 
+  async function scoreSufficiency() {
+    if (!selected) return;
+    setDrawerError(null);
+    setSufficiencyBusy(true);
+    try {
+      const res = await api.post<SufficiencyResult>(`${base}/claims/${selected.id}/sufficiency`);
+      setSufficiency(res);
+      await refresh();
+    } catch (err) {
+      setDrawerError(err instanceof ApiClientError ? err.message : "Record scoring failed.");
+    } finally {
+      setSufficiencyBusy(false);
+    }
+  }
+
+  async function saveValuation() {
+    if (!selected) return;
+    setDrawerError(null);
+    setValuationBusy(true);
+    try {
+      const num = (v: string) => (v.trim() === "" ? null : Number(v));
+      await api.put(`${base}/claims/${selected.id}/valuation`, {
+        quantumBest: num(valuation.best),
+        quantumLikely: num(valuation.likely),
+        quantumWorst: num(valuation.worst),
+        successProbability: num(valuation.probability),
+      });
+      await refresh();
+    } catch (err) {
+      setDrawerError(err instanceof ApiClientError ? err.message : "The valuation could not be saved.");
+    } finally {
+      setValuationBusy(false);
+    }
+  }
+
+  async function generateScottSchedule() {
+    if (!selected) return;
+    setDrawerError(null);
+    setScottBusy(true);
+    try {
+      await api.post(`${base}/claims/${selected.id}/scott-schedule`);
+      await refresh();
+    } catch (err) {
+      setDrawerError(err instanceof ApiClientError ? err.message : "The Scott Schedule could not be generated.");
+    } finally {
+      setScottBusy(false);
+    }
+  }
+
+  async function checkPackage() {
+    if (!selected) return;
+    setDrawerError(null);
+    try {
+      const res = await api.get<{ completeness: { ready: boolean; missing: string[] } }>(
+        `${base}/claims/${selected.id}/package`,
+      );
+      setPackageInfo(res.completeness);
+    } catch (err) {
+      setDrawerError(err instanceof ApiClientError ? err.message : "The package could not be assembled.");
+    }
+  }
+
   async function transition(status: string, extra?: Record<string, unknown>) {
     if (!selected) return;
     setDrawerError(null);
@@ -340,6 +438,8 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
       </div>
 
       <ErrorAlert message={error} />
+
+      <ExposureStrip projectId={projectId} reloadKey={exposureKey} />
 
       {items === null ? (
         <Spinner />
@@ -717,6 +817,159 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
             )}
           </div>
 
+          {/* Claim assurance: does the record actually support the claim? */}
+          <div className="rounded-lg border border-ink-100 p-4">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <div className="text-sm font-semibold text-ink-900">Record sufficiency</div>
+              <Button size="sm" variant="secondary" disabled={sufficiencyBusy} onClick={() => void scoreSufficiency()}>
+                {sufficiencyBusy ? "Scoring…" : "Score the record"}
+              </Button>
+            </div>
+            {sufficiency ? (
+              <div className="space-y-2">
+                <div className="text-sm text-ink-800">
+                  Overall {Math.round(sufficiency.overallScore * 100)}% — presence, independence,
+                  contemporaneity and coverage of the contemporaneous record.
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {sufficiency.limbs.map((l) => (
+                    <Badge key={l.key} tone={l.present ? (l.score >= 0.6 ? "green" : "amber") : "red"}>
+                      {l.key} {Math.round(l.score * 100)}%
+                    </Badge>
+                  ))}
+                </div>
+                {sufficiency.gaps.length > 0 ? (
+                  <div className="text-xs text-amber-700">
+                    Record gaps:{" "}
+                    {sufficiency.gaps
+                      .slice(0, 4)
+                      .map((g) => `${g.from} → ${g.to} (${g.days}d, no daily log)`)
+                      .join("; ")}
+                    {sufficiency.gaps.length > 4 ? ` and ${sufficiency.gaps.length - 4} more` : ""}
+                  </div>
+                ) : null}
+                {sufficiency.missingNotices.length > 0 ? (
+                  <div className="text-xs text-red-700">
+                    {sufficiency.missingNotices.map((n) => `${n.title}: ${n.reason}`).join("; ")}
+                  </div>
+                ) : null}
+                {sufficiency.reasons.length > 0 ? (
+                  <ul className="ml-4 list-disc text-xs text-ink-500">
+                    {sufficiency.reasons.map((r) => (
+                      <li key={r}>{r}</li>
+                    ))}
+                  </ul>
+                ) : null}
+              </div>
+            ) : (
+              <p className="text-xs text-ink-400">
+                Not scored yet. Scoring reports which limbs are thin, which delay days have no daily
+                log behind them, and which events were never noticed inside the contract time bar.
+              </p>
+            )}
+          </div>
+
+          {/* Valuation range and provision (#312-313) */}
+          <div className="rounded-lg border border-ink-100 p-4">
+            <div className="mb-2 text-sm font-semibold text-ink-900">
+              Valuation range & provision
+              {selected.currency ? (
+                <span className="ml-2 text-xs font-normal text-ink-400">{selected.currency}</span>
+              ) : null}
+            </div>
+            <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+              <Field label="Best">
+                <Input
+                  inputMode="decimal"
+                  value={valuation.best}
+                  onChange={(e) => setValuation({ ...valuation, best: e.target.value })}
+                  placeholder={selected.quantumBest !== null && selected.quantumBest !== undefined ? String(selected.quantumBest) : ""}
+                />
+              </Field>
+              <Field label="Likely">
+                <Input
+                  inputMode="decimal"
+                  value={valuation.likely}
+                  onChange={(e) => setValuation({ ...valuation, likely: e.target.value })}
+                  placeholder={selected.quantumLikely !== null && selected.quantumLikely !== undefined ? String(selected.quantumLikely) : ""}
+                />
+              </Field>
+              <Field label="Worst">
+                <Input
+                  inputMode="decimal"
+                  value={valuation.worst}
+                  onChange={(e) => setValuation({ ...valuation, worst: e.target.value })}
+                  placeholder={selected.quantumWorst !== null && selected.quantumWorst !== undefined ? String(selected.quantumWorst) : ""}
+                />
+              </Field>
+              <Field label="P(success) 0-1">
+                <Input
+                  inputMode="decimal"
+                  value={valuation.probability}
+                  onChange={(e) => setValuation({ ...valuation, probability: e.target.value })}
+                  placeholder={
+                    selected.successProbability !== null && selected.successProbability !== undefined
+                      ? String(selected.successProbability)
+                      : ""
+                  }
+                />
+              </Field>
+            </div>
+            <div className="mt-2 flex items-center gap-3">
+              <Button size="sm" disabled={valuationBusy} onClick={() => void saveValuation()}>
+                {valuationBusy ? "Saving…" : "Save valuation"}
+              </Button>
+              <span className="text-xs text-ink-600">
+                Provision:{" "}
+                {selected.provisionAmount === null || selected.provisionAmount === undefined ? (
+                  <span className="text-ink-400">— no likely value or probability recorded</span>
+                ) : (
+                  <strong>{selected.provisionAmount}</strong>
+                )}
+              </span>
+            </div>
+          </div>
+
+          {/* Submission package */}
+          <div className="rounded-lg border border-ink-100 p-4">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <div className="text-sm font-semibold text-ink-900">Submission package</div>
+              <div className="flex gap-2">
+                <Button size="sm" variant="secondary" disabled={scottBusy} onClick={() => void generateScottSchedule()}>
+                  {scottBusy ? "Generating…" : "Scott Schedule"}
+                </Button>
+                <Button size="sm" variant="secondary" onClick={() => void checkPackage()}>
+                  Check readiness
+                </Button>
+              </div>
+            </div>
+            <p className="text-xs text-ink-400">
+              The Scott Schedule fills the claimant columns from the register and leaves the
+              respondent and tribunal columns empty — this platform does not write the other side's
+              case.
+            </p>
+            {selected.scottSchedule ? (
+              <div className="mt-1 text-xs text-ink-600">
+                {selected.scottSchedule.length} item
+                {selected.scottSchedule.length === 1 ? "" : "s"} generated.
+              </div>
+            ) : null}
+            {packageInfo ? (
+              packageInfo.ready ? (
+                <div className="mt-2 text-xs text-emerald-700">
+                  The package is complete: chronology, sufficiency, analysis and quantum are all
+                  linked.
+                </div>
+              ) : (
+                <ul className="mt-2 ml-4 list-disc text-xs text-amber-700">
+                  {packageInfo.missing.map((m) => (
+                    <li key={m}>{m}</li>
+                  ))}
+                </ul>
+              )
+            ) : null}
+          </div>
+
           {/* Status actions */}
           <div className="rounded-lg border border-ink-100 p-4">
             <div className="mb-2 text-sm font-semibold text-ink-900">Lifecycle</div>
@@ -749,7 +1002,14 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
                           : "secondary"
                     }
                     disabled={statusBusy}
-                    onClick={() => void transition(next)}
+                    onClick={() => {
+                      if (next === "draft" || next === "withdrawn") {
+                        setReasonFor(next);
+                        setReasonText("");
+                        return;
+                      }
+                      void transition(next);
+                    }}
                   >
                     {next === "submitted"
                       ? "Submit"
@@ -757,7 +1017,9 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
                         ? "Agree"
                         : next === "rejected"
                           ? "Reject"
-                          : "Withdraw"}
+                          : next === "draft"
+                            ? "Revise (clears the assessment)…"
+                            : "Withdraw"}
                   </Button>
                 ),
               )}
@@ -772,6 +1034,51 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
       ) : null}
 
       {/* ------------------------------- assess modal ------------------------------- */}
+      {/* ------------------------------ reason modal ------------------------------ */}
+      <Modal
+        open={reasonFor !== null}
+        title={reasonFor === "draft" ? "Revise this claim" : "Withdraw this claim"}
+        onClose={() => setReasonFor(null)}
+      >
+        <p className="mb-3 text-sm text-ink-500">
+          {reasonFor === "draft"
+            ? "Taking the claim back to draft clears the recorded assessment — an assessed figure must never survive against changed numbers. The reason is written to the ledger."
+            : "Withdrawing removes this claim from the register's open position. The reason is written to the ledger."}
+        </p>
+        <form
+          className="space-y-4"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const status = reasonFor;
+            if (!status) return;
+            setReasonFor(null);
+            void transition(status, { reason: reasonText.trim() });
+          }}
+        >
+          <Field label="Reason">
+            <Textarea
+              rows={3}
+              value={reasonText}
+              onChange={(e) => setReasonText(e.target.value)}
+              required
+              placeholder={
+                reasonFor === "draft"
+                  ? "Quantum restated after the measured mile."
+                  : "Raised in error — duplicated by CLM-004."
+              }
+            />
+          </Field>
+          <div className="flex justify-end gap-2">
+            <Button type="button" variant="secondary" onClick={() => setReasonFor(null)}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={statusBusy || reasonText.trim().length === 0}>
+              {statusBusy ? "Recording…" : "Confirm"}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+
       <Modal open={assessOpen} title="Assess claim" onClose={() => setAssessOpen(false)}>
         <p className="mb-3 text-sm text-ink-500">
           Record the independent determination. The assessor must not be the user who prepared the
@@ -808,6 +1115,119 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
           </div>
         </form>
       </Modal>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Exposure strip (#313, #320)                                         */
+/* ------------------------------------------------------------------ */
+
+interface ExposureBucket {
+  currency: string;
+  claims: number;
+  claimed: number;
+  /** claims in this currency with no amount claimed — excluded from `claimed` */
+  unpriced: number;
+  provision: number;
+  unprovisioned: number;
+}
+
+interface ExposureResponse {
+  generatedAt: string;
+  openClaims: number;
+  totalClaims: number;
+  byCurrency: ExposureBucket[];
+  reasons: string[];
+}
+
+/**
+ * Open claim exposure and the provision carried against it, per currency.
+ *
+ * Reads the company-level endpoint narrowed to this project, so the figure a
+ * commercial manager sees here is the same figure that rolls into the
+ * portfolio. Currencies are never added together and a claim with no
+ * valuation range is counted as unprovisioned rather than as zero exposure.
+ */
+function ExposureStrip({ projectId, reloadKey }: { projectId: string; reloadKey: number }) {
+  const [data, setData] = useState<ExposureResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setError(null);
+    api
+      .get<ExposureResponse>(`/api/v1/claims/exposure?projectId=${encodeURIComponent(projectId)}`)
+      .then((res) => {
+        if (!cancelled) setData(res);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        /*
+         * The endpoint is company-level and narrows to the projects the caller
+         * can see. A reader who holds the forensics tool on this project but
+         * no company-wide visibility gets a 403; that is not an error worth
+         * shouting about on a page they may legitimately read, so the strip
+         * simply does not appear.
+         */
+        if (err instanceof ApiClientError && (err.status === 403 || err.status === 404)) return;
+        setError(
+          err instanceof ApiClientError ? err.message : "Claim exposure could not be loaded.",
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, reloadKey]);
+
+  if (error) {
+    return (
+      <Alert tone="warning" title="Exposure unavailable" className="mb-4">
+        {error}
+      </Alert>
+    );
+  }
+  if (!data || data.openClaims === 0) return null;
+
+  return (
+    <div className="mb-4 rounded border border-ink-200 bg-ink-50/40 p-3">
+      <SectionTitle>
+        Open exposure — {data.openClaims} of {data.totalClaims} claim
+        {data.totalClaims === 1 ? "" : "s"}
+      </SectionTitle>
+      <div className="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+        {data.byCurrency.map((b) => (
+          <div key={b.currency} className="rounded border border-ink-200 bg-white p-3">
+            <div className="flex items-baseline justify-between">
+              <span className="font-mono text-xs uppercase text-ink-500">{b.currency}</span>
+              <span className="text-xs text-ink-500">
+                {b.claims} claim{b.claims === 1 ? "" : "s"}
+              </span>
+            </div>
+            <div className="mt-1 text-lg font-semibold tabular-nums text-ink-900">
+              {formatMoney(b.claimed, b.currency)}
+            </div>
+            <div className="mt-1 text-xs text-ink-500">
+              Provision {formatMoney(b.provision, b.currency)}
+              {b.unprovisioned > 0 ? (
+                <span className="text-amber-700"> · {b.unprovisioned} unvalued</span>
+              ) : null}
+            </div>
+            {b.unpriced > 0 ? (
+              <div className="mt-1 text-xs text-amber-700">
+                {b.unpriced} claim{b.unpriced === 1 ? "" : "s"} carry no amount — not counted above
+              </div>
+            ) : null}
+          </div>
+        ))}
+      </div>
+      {data.reasons.length > 0 ? (
+        <ul className="mt-2 list-disc pl-5 text-xs text-ink-500">
+          {data.reasons.map((r) => (
+            <li key={r}>{r}</li>
+          ))}
+        </ul>
+      ) : null}
     </div>
   );
 }

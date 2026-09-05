@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import Fastify, { type FastifyInstance } from "fastify";
@@ -79,6 +79,18 @@ import { biddingModule } from "./modules/bidding/index.js";
 import { ssoModule } from "./modules/sso/index.js";
 import { mfaModule } from "./modules/mfa/index.js";
 import { accountModule } from "./modules/account/index.js";
+import { intelligenceModule } from "./modules/intelligence/index.js";
+import { automationModule } from "./modules/automation/index.js";
+import { searchModule } from "./modules/search/index.js";
+import { correspondenceModule } from "./modules/correspondence/index.js";
+import { designModule } from "./modules/design/index.js";
+import { estimatingModule } from "./modules/estimating/index.js";
+import { portfolioModule } from "./modules/portfolio/index.js";
+import { resourcesModule } from "./modules/resources/index.js";
+import { siteModule } from "./modules/site/index.js";
+import { supplychainModule } from "./modules/supplychain/index.js";
+import { taxModule } from "./modules/tax/index.js";
+import { mcpModule } from "./modules/mcp/index.js";
 
 /**
  * sha256 CSP hashes for every inline <script> in the index.html this process
@@ -123,6 +135,18 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
         ? false
         : { level: config.LOG_LEVEL },
     bodyLimit: 32 * 1024 * 1024,
+    // Adopt the edge's request id when it sends one, so a line in these logs
+    // can be joined to the proxy's record of the same request. Fastify's
+    // default is a per-process counter, which collides across replicas and
+    // means nothing upstream. Length-bounded because the value is echoed
+    // back in a response header.
+    genReqId: (req) => {
+      const header = req.headers["x-request-id"];
+      const value = Array.isArray(header) ? header[0] : header;
+      return typeof value === "string" && value.length > 0 && value.length <= 200
+        ? value
+        : randomUUID();
+    },
     // A hop COUNT rather than `true`: with `true`, Fastify takes the LEFTMOST
     // X-Forwarded-For entry as the client address, and a client can prepend
     // any value it likes — which is exactly how the per-IP auth rate limit
@@ -185,6 +209,17 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
     await app.register(rateLimit, {
       max: config.RATE_LIMIT_MAX_PER_MINUTE,
       timeWindow: "1 minute",
+      // The SPA is served from this same process, and this plugin is
+      // registered before fastify-static, so without an allowList a single
+      // page load — index.html, every JS chunk, the CSS, the fonts, the
+      // landing posters — spends a large share of one address's budget. An
+      // office behind a single NAT then gets 429s on JavaScript chunks, which
+      // is not a throttled API but a blank screen. Only /api/ traffic is
+      // metered; static assets are the SPA's own shell, not a caller.
+      allowList: (req) => {
+        const url = req.url.split("?", 1)[0] ?? "";
+        return !url.startsWith("/api/");
+      },
     });
   }
 
@@ -237,6 +272,12 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
 
   await app.register(authPlugin);
 
+  // Hand the id back on every response, error or not, so a caller reporting a
+  // problem can quote the same string that appears in the logs.
+  app.addHook("onSend", async (req, reply) => {
+    void reply.header("x-request-id", req.id);
+  });
+
   app.setErrorHandler((error, req, reply) => {
     if (error instanceof AppError) {
       return reply.status(error.statusCode).send({
@@ -264,6 +305,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
         status >= 500 && config.NODE_ENV === "production"
           ? "Internal server error"
           : err.message,
+      // A 500 is deliberately opaque in production. The id is what makes it
+      // supportable: the caller can quote it and an operator can find the
+      // logged stack behind it.
+      requestId: req.id,
     });
   });
 
@@ -284,7 +329,20 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
     } catch (err) {
       checks["database"] = { ok: false, detail: err instanceof Error ? err.message : String(err) };
     }
-    checks["storage"] = { ok: true, detail: config.STORAGE_DRIVER };
+    // Asserting `ok: true` here reported a healthy bucket for credentials
+    // that could not sign a request, and a healthy volume for a mount that
+    // was gone - the one failure readiness exists to catch. A probe for a key
+    // that is never written answers `false` cheaply when the store is
+    // reachable, and throws when it is not.
+    try {
+      await app.storage.probe(`__readiness__/${config.NODE_ENV}`);
+      checks["storage"] = { ok: true, detail: config.STORAGE_DRIVER };
+    } catch (err) {
+      checks["storage"] = {
+        ok: false,
+        detail: `${config.STORAGE_DRIVER}: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
     checks["scheduler"] = {
       ok: true,
       detail: scheduler.enabled ? `enabled, ${scheduler.list().length} jobs` : "disabled",
@@ -355,6 +413,22 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
   await app.register(equipmentModule, { prefix });
   await app.register(timecardsModule, { prefix });
   await app.register(biddingModule, { prefix });
+  // Cross-cutting reach: search reads projects/access.ts for the same
+  // permission scoping the project routes use, so it registers alongside them.
+  await app.register(searchModule, { prefix });
+  // The intelligence layer and the rules engine both observe every other
+  // module's ledger writes, so they mount after the modules they read.
+  await app.register(intelligenceModule, { prefix });
+  await app.register(automationModule, { prefix });
+  await app.register(correspondenceModule, { prefix });
+  await app.register(designModule, { prefix });
+  await app.register(estimatingModule, { prefix });
+  await app.register(portfolioModule, { prefix });
+  await app.register(resourcesModule, { prefix });
+  await app.register(siteModule, { prefix });
+  await app.register(supplychainModule, { prefix });
+  await app.register(taxModule, { prefix });
+  await app.register(mcpModule, { prefix });
 
   // Every module has registered its jobs; start the ticker.
   scheduler.start();
@@ -371,8 +445,17 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<BuiltApp>
       wildcard: true,
       index: "index.html",
       setHeaders: (reply, filePath) => {
-        if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+        // `immutable` is a promise that the bytes at this URL will never
+        // change, and it is only true for a name Vite fingerprinted. Files
+        // under apps/web/public/assets/ are copied through verbatim — the
+        // landing posters and the OG image among them — so marking them
+        // immutable for a year means replacing one never reaches anyone who
+        // has already visited. Fingerprint test first, then the promise.
+        const hashed = /-[A-Za-z0-9_-]{8,}\.[a-z0-9]+$/.test(path.basename(filePath));
+        if (hashed && filePath.includes(`${path.sep}assets${path.sep}`)) {
           void reply.header("cache-control", "public, max-age=31536000, immutable");
+        } else if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+          void reply.header("cache-control", "public, max-age=86400, must-revalidate");
         } else {
           void reply.header("cache-control", "no-cache");
         }

@@ -16,7 +16,7 @@ import {
   type FormEvent,
   type KeyboardEvent,
 } from "react";
-import { useParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 import { DEPENDENCY_TYPES, TASK_CONSTRAINT_TYPES } from "@constructos/shared";
 import { api, ApiClientError } from "../../lib/api";
 import {
@@ -38,6 +38,17 @@ import { formatDate, formatDateTime, humanize } from "../format";
 import GanttSvg from "./GanttSvg";
 import QualityPanel from "./QualityPanel";
 import {
+  CalendarViewPanel,
+  CalendarsPanel,
+  ConstraintsPanel,
+  EarnedValuePanel,
+  ImportPanel,
+  MilestonesPanel,
+  NarrativesPanel,
+  ResourcesPanel,
+  RevisionsPanel,
+} from "./ProgrammePanels";
+import {
   shortDate,
   type BaselineDetail,
   type BaselineRow,
@@ -56,7 +67,19 @@ import {
 /** Constraint types that require a date (mirrors the server rule). */
 const DATED_CONSTRAINTS = ["start_no_earlier_than", "finish_no_later_than", "must_start_on"];
 
-type Panel = "compare" | "lookahead" | "health";
+type Panel =
+  | "compare"
+  | "revisions"
+  | "lookahead"
+  | "calendar"
+  | "health"
+  | "earned-value"
+  | "resources"
+  | "milestones"
+  | "constraints"
+  | "calendars"
+  | "narratives"
+  | "import";
 
 function errMessage(err: unknown, fallback: string): string {
   return err instanceof ApiClientError || err instanceof Error ? err.message : fallback;
@@ -393,7 +416,13 @@ function varianceBadge(days: number | null) {
 
 export default function SchedulePage() {
   const { projectId } = useParams<{ projectId: string }>();
+  const [searchParams] = useSearchParams();
   const base = `/api/v1/projects/${projectId}`;
+
+  /** activity named by a deep link, consumed once it has been shown */
+  const [pendingTaskId, setPendingTaskId] = useState<string | null>(() =>
+    searchParams.get("taskId"),
+  );
 
   const [schedules, setSchedules] = useState<ScheduleRow[] | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -455,6 +484,13 @@ export default function SchedulePage() {
   const [lookaheadLoading, setLookaheadLoading] = useState(false);
   const [quality, setQuality] = useState<QualityReport | null>(null);
   const [qualityLoading, setQualityLoading] = useState(false);
+  /**
+   * Which baseline BEI, missed tasks and the critical-path test are measured
+   * against. Empty = the earliest baseline, which is what the API picks when
+   * no id is given; naming it here lets a planner test the programme against
+   * a re-baselined position instead of the original contract programme.
+   */
+  const [qualityBaselineId, setQualityBaselineId] = useState("");
 
   const bump = useCallback(() => setVersion((v) => v + 1), []);
 
@@ -523,6 +559,9 @@ export default function SchedulePage() {
   }, [base, selectedId, version]);
 
   useEffect(() => {
+    // A baseline belongs to one programme; carrying the selection across would
+    // ask the server for a baseline of a schedule it does not belong to.
+    setQualityBaselineId("");
     if (!selectedId) {
       setBaselines(null);
       return;
@@ -599,8 +638,9 @@ export default function SchedulePage() {
     if (!selectedId || panel !== "health") return;
     let cancelled = false;
     setQualityLoading(true);
+    const qs = qualityBaselineId ? `?baselineId=${encodeURIComponent(qualityBaselineId)}` : "";
     api
-      .get<QualityReport>(`${base}/schedules/${selectedId}/quality`)
+      .get<QualityReport>(`${base}/schedules/${selectedId}/quality${qs}`)
       .then((res) => {
         if (!cancelled) setQuality(res);
       })
@@ -613,7 +653,7 @@ export default function SchedulePage() {
     return () => {
       cancelled = true;
     };
-  }, [base, selectedId, panel, version]);
+  }, [base, selectedId, panel, version, qualityBaselineId]);
 
   /* ------------------------------ derived ------------------------------ */
 
@@ -626,6 +666,38 @@ export default function SchedulePage() {
     () => tasks.find((t) => t.id === selectedTaskId) ?? null,
     [tasks, selectedTaskId],
   );
+
+  /*
+   * Deep link from company search (?taskId=…): resolve the activity to the
+   * programme it lives in, switch to that programme, then select and expand
+   * the row once it is on screen. Resolving happens server-side because a
+   * link only carries the activity id, not which of the project's schedules
+   * holds it. A dead link says so instead of silently doing nothing.
+   */
+  useEffect(() => {
+    if (!pendingTaskId || !projectId) return;
+    let cancelled = false;
+    api
+      .get<{ id: string; scheduleId: string }>(`${base}/schedule-tasks/${pendingTaskId}`)
+      .then((t) => {
+        if (!cancelled) setSelectedId(t.scheduleId);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setPendingTaskId(null);
+        setError(errMessage(err, "That activity is no longer in this project."));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [base, projectId, pendingTaskId]);
+
+  useEffect(() => {
+    if (!pendingTaskId || !tasks.some((t) => t.id === pendingTaskId)) return;
+    setSelectedTaskId(pendingTaskId);
+    setExpandedTaskId(pendingTaskId);
+    setPendingTaskId(null);
+  }, [pendingTaskId, tasks]);
   const predecessorDeps = useMemo(
     () => deps.filter((d) => d.successorId === selectedTaskId),
     [deps, selectedTaskId],
@@ -805,7 +877,17 @@ export default function SchedulePage() {
     }
   }
 
-  /** Edit an existing link: delete → recreate; restore the original if the new link is rejected. */
+  /**
+   * Edit an existing link.
+   *
+   * Changing the type or the lag is a PATCH on the link itself — this used to
+   * be delete-then-recreate, which dropped the link outright whenever the
+   * recreate failed and wrote a delete + create pair into the ledger for what
+   * is one edit. Repointing the predecessor still needs a new row (the
+   * endpoints are the link's identity), so the new link is CREATED FIRST and
+   * the old one removed only once the new one exists: a failure leaves the
+   * original in place rather than nothing at all.
+   */
   async function onUpdateDependency(
     dep: DepRow,
     next: { predecessorId: string; depType: string; lagDays: number },
@@ -814,24 +896,19 @@ export default function SchedulePage() {
     setDepError(null);
     setBusy(true);
     try {
-      await api.del(`${base}/schedule-dependencies/${dep.id}`);
-      try {
+      if (next.predecessorId === dep.predecessorId) {
+        await api.patch(`${base}/schedule-dependencies/${dep.id}`, {
+          depType: next.depType,
+          lagDays: next.lagDays,
+        });
+      } else {
         await api.post(`${base}/schedules/${selectedId}/dependencies`, {
           predecessorId: next.predecessorId,
           successorId: dep.successorId,
           depType: next.depType,
           lagDays: next.lagDays,
         });
-      } catch (err) {
-        await api
-          .post(`${base}/schedules/${selectedId}/dependencies`, {
-            predecessorId: dep.predecessorId,
-            successorId: dep.successorId,
-            depType: dep.depType,
-            lagDays: dep.lagDays,
-          })
-          .catch(() => undefined);
-        throw err;
+        await api.del(`${base}/schedule-dependencies/${dep.id}`);
       }
       flashRecomputed();
     } catch (err) {
@@ -856,8 +933,17 @@ export default function SchedulePage() {
 
   const panels: { key: Panel; label: string }[] = [
     { key: "compare", label: "Baseline compare" },
+    { key: "revisions", label: "Revisions" },
     { key: "lookahead", label: "Lookahead" },
+    { key: "calendar", label: "Calendar" },
     { key: "health", label: "Schedule health" },
+    { key: "earned-value", label: "Earned value" },
+    { key: "resources", label: "Resources" },
+    { key: "milestones", label: "Milestones" },
+    { key: "constraints", label: "Constraints" },
+    { key: "calendars", label: "Calendars" },
+    { key: "narratives", label: "Narrative" },
+    { key: "import", label: "Import / export" },
   ];
 
   return (
@@ -1499,14 +1585,87 @@ export default function SchedulePage() {
 
               {/* ------------------------------ health ------------------------------ */}
               {panel === "health" ? (
-                <QualityPanel
-                  report={quality}
-                  loading={qualityLoading}
-                  tasks={tasks}
-                  deps={deps}
+                <>
+                  {baselines && baselines.length > 1 ? (
+                    <div className="mb-3 flex items-center gap-2">
+                      <label
+                        htmlFor="quality-baseline"
+                        className="text-xs font-medium text-ink-600"
+                      >
+                        Measure BEI and missed tasks against
+                      </label>
+                      <Select
+                        id="quality-baseline"
+                        value={qualityBaselineId}
+                        onChange={(e) => setQualityBaselineId(e.target.value)}
+                        className="w-64 py-1 text-xs"
+                      >
+                        <option value="">Earliest baseline</option>
+                        {baselines.map((b) => (
+                          <option key={b.id} value={b.id}>
+                            {b.name}
+                          </option>
+                        ))}
+                      </Select>
+                    </div>
+                  ) : null}
+                  <QualityPanel
+                    report={quality}
+                    loading={qualityLoading}
+                    tasks={tasks}
+                    deps={deps}
+                    onSelectTask={(id) => {
+                      setSelectedTaskId(id);
+                      setExpandedTaskId(id);
+                    }}
+                  />
+                </>
+              ) : null}
+
+              {panel === "revisions" ? (
+                <RevisionsPanel base={base} schedules={schedules ?? []} scheduleId={selectedId} />
+              ) : null}
+              {panel === "calendar" ? (
+                <CalendarViewPanel base={base} scheduleId={selectedId} />
+              ) : null}
+              {panel === "earned-value" ? (
+                <EarnedValuePanel base={base} scheduleId={selectedId} />
+              ) : null}
+              {panel === "resources" ? (
+                <ResourcesPanel
+                  base={base}
+                  scheduleId={selectedId}
+                  tasks={tasks.map((t) => ({ id: t.id, name: t.name }))}
+                />
+              ) : null}
+              {panel === "milestones" ? (
+                <MilestonesPanel
+                  base={base}
+                  scheduleId={selectedId}
                   onSelectTask={(id) => {
                     setSelectedTaskId(id);
                     setExpandedTaskId(id);
+                  }}
+                />
+              ) : null}
+              {panel === "constraints" ? (
+                <ConstraintsPanel
+                  base={base}
+                  scheduleId={selectedId}
+                  tasks={tasks.map((t) => ({ id: t.id, name: t.name }))}
+                />
+              ) : null}
+              {panel === "calendars" ? <CalendarsPanel base={base} /> : null}
+              {panel === "narratives" ? (
+                <NarrativesPanel base={base} scheduleId={selectedId} />
+              ) : null}
+              {panel === "import" ? (
+                <ImportPanel
+                  base={base}
+                  schedules={schedules ?? []}
+                  onImported={(id) => {
+                    setSelectedId(id);
+                    bump();
                   }}
                 />
               ) : null}

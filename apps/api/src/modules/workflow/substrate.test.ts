@@ -761,3 +761,55 @@ describe("scheduler job workflow.escalations", () => {
     expect((second.lastResult as { escalated: number }).escalated).toBe(0);
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* Health inputs (cross-package contract §3.5)                         */
+/* ------------------------------------------------------------------ */
+
+describe("GET /projects/:projectId/workflow/health-inputs", () => {
+  it("counts what is running, pending, overdue and blocked — and refuses to invent a ratio", async () => {
+    const fresh = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: owner.headers,
+      payload: { name: "Health Inputs Project" },
+    });
+    const freshId = fresh.json().id;
+
+    const empty = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${freshId}/workflow/health-inputs`,
+      headers: owner.headers,
+    });
+    expect(empty.statusCode).toBe(200);
+    const emptyBody = empty.json();
+    expect(emptyBody.metrics.runningInstances).toBe(0);
+    expect(emptyBody.metrics.pendingSteps).toBe(0);
+    // No denominator: the ratio is unknowable, not zero.
+    expect(emptyBody.metrics.overdueRatio).toBeNull();
+    expect(emptyBody.reasons.join(" ")).toContain("No approval chain");
+
+    // A live chain on the main project produces real counts.
+    const live = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/workflow/health-inputs`,
+      headers: owner.headers,
+    });
+    expect(live.statusCode).toBe(200);
+    const body = live.json();
+    expect(body.metrics.pendingSteps).toBeGreaterThanOrEqual(0);
+    expect(typeof body.metrics.blockedInstances).toBe("number");
+    if (body.metrics.pendingSteps > 0) {
+      expect(typeof body.metrics.overdueRatio).toBe("number");
+    }
+  });
+
+  it("refuses a caller with no read access to the project", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/workflow/health-inputs`,
+      headers: strangerHeaders,
+    });
+    expect(res.statusCode).toBe(403);
+  });
+});

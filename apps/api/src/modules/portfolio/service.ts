@@ -9,18 +9,16 @@
  * tables — fetching bounded row sets, recomputing materialised totals, and
  * raising signals and obligations exactly once.
  */
-import { and, eq, inArray, isNull, ne, or } from "drizzle-orm";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import {
   callOffOrders,
   definedCostItems,
-  disallowedCosts,
   jvPartners,
   jvTransactions,
   obligations,
   openBookVerifications,
   portfolioAllocations,
   projectMemberships,
-  projects,
   signals,
 } from "@constructos/db";
 import type { PortfolioSignalDetector } from "@constructos/shared";
@@ -55,35 +53,6 @@ export async function visibleProjectIds(
     .from(projectMemberships)
     .where(and(eq(projectMemberships.companyId, companyId), eq(projectMemberships.userId, userId)));
   return rows.map((r) => r.projectId);
-}
-
-/** Live (not soft-deleted) projects in a company, optionally one portfolio. */
-export async function liveProjects(
-  db: Db,
-  companyId: string,
-  options: { portfolioId?: string | null; projectIds?: string[] | null } = {},
-) {
-  const clauses = [eq(projects.companyId, companyId), isNull(projects.deletedAt)];
-  if (options.portfolioId) clauses.push(eq(projects.portfolioId, options.portfolioId));
-  if (options.projectIds) {
-    if (options.projectIds.length === 0) return [];
-    clauses.push(inArray(projects.id, options.projectIds));
-  }
-  return db
-    .select({
-      id: projects.id,
-      name: projects.name,
-      stage: projects.stage,
-      currency: projects.currency,
-      value: projects.value,
-      portfolioId: projects.portfolioId,
-      isSandbox: projects.isSandbox,
-      isTemplate: projects.isTemplate,
-      startDate: projects.startDate,
-      finishDate: projects.finishDate,
-    })
-    .from(projects)
-    .where(and(...clauses));
 }
 
 /* ------------------------------------------------------------------ */
@@ -390,41 +359,9 @@ export async function loadJvTransactions(
   }));
 }
 
-/** Disallowed costs for a project, or for one verification. */
-export async function loadDisallowed(
-  db: Db,
-  companyId: string,
-  options: { projectId?: string; verificationId?: string; projectIds?: string[] | null } = {},
-) {
-  const clauses = [eq(disallowedCosts.companyId, companyId)];
-  if (options.projectId) clauses.push(eq(disallowedCosts.projectId, options.projectId));
-  if (options.verificationId) clauses.push(eq(disallowedCosts.verificationId, options.verificationId));
-  if (options.projectIds) {
-    if (options.projectIds.length === 0) return [];
-    clauses.push(inArray(disallowedCosts.projectId, options.projectIds));
-  }
-  return db
-    .select()
-    .from(disallowedCosts)
-    .where(and(...clauses));
-}
-
-/** Statuses a disallowance is still live in. */
+/**
+ * Statuses a disallowance is still live in. Shared by the sweep and the
+ * register summary so the two can never disagree about what "unresolved"
+ * means.
+ */
 export const UNRESOLVED_DISALLOWED_STATUSES = ["raised", "under_review", "disputed"];
-
-/** Rows that are still open, used by the sweep and the register summary. */
-export function unresolvedFilter() {
-  return or(
-    ...UNRESOLVED_DISALLOWED_STATUSES.map((s) => eq(disallowedCosts.status, s)),
-  );
-}
-
-/** A guard used by the routes: an approved record's numbers may not be edited in place. */
-export function refuseIfLocked(status: string, locked: string[], what: string): string | null {
-  return locked.includes(status)
-    ? `This ${what} is ${status.replace(/_/g, " ")}; its numbers cannot be edited in place. Withdraw or supersede it instead.`
-    : null;
-}
-
-/** Small helper so routes never build a `ne` import of their own. */
-export const notEq = ne;

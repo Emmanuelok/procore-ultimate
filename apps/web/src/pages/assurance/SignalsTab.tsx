@@ -31,6 +31,15 @@ import {
   type SignalRow,
 } from "./assuranceShared";
 
+/**
+ * Every ACTIVE project-scope detector in the registry.
+ *
+ * The run route executes exactly what is asked for, so a detector missing from
+ * this list is a detector that never runs in production: nothing else triggers
+ * a project-scope run (the scheduled sweep is company-scope).
+ * `backdated_record` was implemented and then unreachable for exactly that
+ * reason. Company-scope detectors are run from the company Detectors tab.
+ */
 const DETECTORS = [
   "benford_first_digit",
   "duplicate_assertions",
@@ -38,6 +47,7 @@ const DETECTORS = [
   "approval_velocity",
   "segregation_of_duties",
   "contradicted_claimant",
+  "backdated_record",
 ] as const;
 
 interface RunResult {

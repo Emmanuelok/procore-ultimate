@@ -33,6 +33,7 @@ import { loadSession } from "../modules/account/sessions.js";
 // plugin-encapsulated, and the integrations module is registered last, so
 // nothing it adds can reach routes registered before it.
 import { machineAuth } from "../modules/integrations/machine-auth.js";
+import { guardCompanyIpAccess } from "../modules/account/login.js";
 
 const authPlugin: FastifyPluginAsync = async (app) => {
   const secret = new TextEncoder().encode(app.appConfig.AUTH_SECRET);
@@ -131,6 +132,13 @@ const authPlugin: FastifyPluginAsync = async (app) => {
       )
       .limit(1);
     if (!membership[0]) throw forbidden("Not a member of this company");
+    // The sign-in guard refuses an address only when EVERY company of the
+    // account refuses it, so a strict tenant's own rule has to be applied on
+    // the request that names that tenant - otherwise a session opened from
+    // the office and carried home keeps reading the tenant that excluded the
+    // home address. `monitor` mode records and allows, break-glass users are
+    // exempt, and a policy read failure allows and is logged.
+    await guardCompanyIpAccess(app, req, companyId, req.user.id);
     req.companyId = companyId;
     req.companyRole = membership[0].role as CompanyRole;
   });

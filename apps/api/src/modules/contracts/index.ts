@@ -39,6 +39,8 @@ import {
   resolveClause,
 } from "./timebar.js";
 import { computeLdExposure } from "../commercial/valuation-engine.js";
+import { buildNoticePack } from "./notice.js";
+import { aiDisabledError, aiEnabled, runAgent, type InputRef } from "../ai/service.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -1297,6 +1299,183 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
         today: todayISO(),
       });
       return { ...exposure, currency: contract.currency };
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Notice composition (#228) and the AI drafting hook (#1006-1007)   */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * The deterministic notice pack: who serves it on whom, by which route the
+   * form's notices clause allows, what the notice must state, which of those
+   * facts the record already holds — and a draft built ONLY from facts on the
+   * record, with a bracketed placeholder wherever one is missing.
+   *
+   * This never touches the AI layer. A notice has a deadline; the pack must
+   * exist whether or not ANTHROPIC_API_KEY is set.
+   */
+  app.get(
+    "/projects/:projectId/contracts/:contractId/events/:eventId/notice-pack",
+    { preHandler: readGate },
+    async (req) => {
+      const { contractId, eventId } = req.params as { contractId: string; eventId: string };
+      const contract = await fetchContract(contractId, req.companyId!, req.projectId!);
+      const ev = await fetchEvent(eventId, contractId, req.companyId!, req.projectId!);
+      const clause = ev.clauseRef
+        ? resolveClause(contract.form as ContractForm, ev.clauseRef, contract.particularConditions, {
+            calendarBasis: contract.calendarBasis as "calendar" | "working",
+          })
+        : null;
+      const pack = buildNoticePack({
+        contract: {
+          name: contract.name,
+          form: contract.form as ContractForm,
+          currency: contract.currency,
+          parties: contract.parties ?? {},
+        },
+        event: {
+          number: ev.number,
+          kind: ev.kind,
+          title: ev.title,
+          description: ev.description,
+          eventDate: ev.eventDate,
+          awarenessDate: ev.awarenessDate,
+          noticeDeadline: ev.noticeDeadline,
+          deadlineSource: ev.deadlineSource,
+          effectiveTimeBarDays: ev.effectiveTimeBarDays,
+          calendarBasis: ev.calendarBasis,
+          costImpactEstimate: ev.costImpactEstimate,
+          timeImpactDaysEstimate: ev.timeImpactDaysEstimate,
+          status: ev.status,
+          noticeServedAt: ev.noticeServedAt,
+        },
+        clause,
+        today: todayISO(),
+      });
+      return {
+        ...pack,
+        eventId: ev.id,
+        contractId: contract.id,
+        aiAvailable: aiEnabled(app),
+        note: aiEnabled(app)
+          ? "POST .../draft-notice to have the notice drafter expand this pack into prose, cited to the records it used."
+          : "The AI drafter is unavailable (ANTHROPIC_API_KEY is not configured). This pack and its draft are produced deterministically from the contract and the event record.",
+      };
+    },
+  );
+
+  /**
+   * The AI drafting hook (#1006-1007): hand the deterministic pack to the
+   * notice drafter so it becomes prose, cited to the records it used, with
+   * the facts it could not find listed rather than invented.
+   *
+   * 503 AiDisabled without a key — and the pack above still works, so the
+   * capability degrades to a template rather than disappearing.
+   */
+  app.post(
+    "/projects/:projectId/contracts/:contractId/events/:eventId/draft-notice",
+    { preHandler: standardGate },
+    async (req) => {
+      const { contractId, eventId } = req.params as { contractId: string; eventId: string };
+      const contract = await fetchContract(contractId, req.companyId!, req.projectId!);
+      const ev = await fetchEvent(eventId, contractId, req.companyId!, req.projectId!);
+      if (!aiEnabled(app)) throw aiDisabledError();
+
+      const clause = ev.clauseRef
+        ? resolveClause(contract.form as ContractForm, ev.clauseRef, contract.particularConditions, {
+            calendarBasis: contract.calendarBasis as "calendar" | "working",
+          })
+        : null;
+      const pack = buildNoticePack({
+        contract: {
+          name: contract.name,
+          form: contract.form as ContractForm,
+          currency: contract.currency,
+          parties: contract.parties ?? {},
+        },
+        event: {
+          number: ev.number,
+          kind: ev.kind,
+          title: ev.title,
+          description: ev.description,
+          eventDate: ev.eventDate,
+          awarenessDate: ev.awarenessDate,
+          noticeDeadline: ev.noticeDeadline,
+          deadlineSource: ev.deadlineSource,
+          effectiveTimeBarDays: ev.effectiveTimeBarDays,
+          calendarBasis: ev.calendarBasis,
+          costImpactEstimate: ev.costImpactEstimate,
+          timeImpactDaysEstimate: ev.timeImpactDaysEstimate,
+          status: ev.status,
+          noticeServedAt: ev.noticeServedAt,
+        },
+        clause,
+        today: todayISO(),
+      });
+
+      const inputRefs: InputRef[] = [
+        { type: "contract_event", id: ev.id },
+        { type: "contract", id: contract.id },
+      ];
+      const system = [
+        "You are the ConstructOS contractual notice drafter.",
+        "Expand the supplied notice pack into a compliant notice under the stated contract form.",
+        "Use ONLY the facts in the pack. Do not invent clause numbers, dates, quantities or entitlements.",
+        "Every requirement the pack marks NOT SATISFIED must appear in missingFacts and stay a bracketed placeholder in the draft.",
+        'Return ONLY JSON: {"subject":string,"noticeText":string,"missingFacts":[string],"citations":[{"type":string,"id":string}],"confidence":number}.',
+        "citations must reference the supplied record ids; confidence is 0-1.",
+      ].join("\n");
+      const user = [
+        `Contract: ${contract.name} (${contract.form}${contract.necOption ? ` Option ${contract.necOption}` : ""}), currency ${contract.currency}.`,
+        `Parties: ${JSON.stringify(contract.parties ?? {})}.`,
+        `Record: contract_event ${ev.id}, contract ${contract.id}.`,
+        `Clause in force: ${pack.clauseRef ?? "(none attached)"} — ${pack.clauseTitle ?? ""}.`,
+        `Deadline basis: ${pack.basis}`,
+        `Deadline: ${pack.deadline ?? "none"} (${pack.urgency}).`,
+        `Service rules: ${pack.serviceRules.join(" ")}`,
+        "Requirements:",
+        ...pack.requirements.map(
+          (r) => `- [${r.satisfied ? "SATISFIED" : "NOT SATISFIED"}] ${r.label}: ${r.detail}`,
+        ),
+        "",
+        "Deterministic draft to expand:",
+        pack.draft,
+      ].join("\n");
+
+      const schema = z.object({
+        subject: z.string().min(1).max(300),
+        noticeText: z.string().min(1).max(20_000),
+        missingFacts: z.array(z.string().max(400)).max(30).default([]),
+        confidence: z.number().min(0).max(1).default(0.5),
+      });
+
+      const result = await runAgent({
+        app,
+        req,
+        agentKind: "time_bar_notice_drafter",
+        projectId: req.projectId!,
+        system,
+        user,
+        inputRefs,
+        schema,
+        dataCategories: ["contract_terms"],
+        contextChars: user.length,
+      });
+
+      return {
+        pack,
+        runId: result.runId,
+        subject: result.json?.subject ?? null,
+        noticeText: result.json?.noticeText ?? result.text,
+        // The engine's own gap list is authoritative; the model may only add.
+        missingFacts: [...new Set([...pack.missing, ...(result.json?.missingFacts ?? [])])],
+        confidence: result.json?.confidence ?? null,
+        citations: result.grounding.citations,
+        droppedCitations: result.grounding.dropped,
+        note:
+          "This is a draft for a contract administrator to review and serve. Serving it is a separate, recorded act: POST .../serve-notice.",
+      };
     },
   );
 

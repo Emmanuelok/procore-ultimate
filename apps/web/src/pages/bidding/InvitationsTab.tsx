@@ -402,6 +402,7 @@ export default function InvitationsTab({
         projectId={projectId}
         packageId={packageId}
         onClose={() => setInviteOpen(false)}
+        onCreated={refresh}
         onDone={() => {
           setInviteOpen(false);
           refresh();
@@ -574,12 +575,15 @@ function InviteModal({
   projectId,
   packageId,
   onClose,
+  onCreated,
   onDone,
 }: {
   open: boolean;
   projectId: string;
   packageId: string;
   onClose: () => void;
+  /** Fired on every successful write, notes or no notes. */
+  onCreated: () => void;
   onDone: () => void;
 }) {
   const vendors = useVendors();
@@ -600,8 +604,18 @@ function InviteModal({
       ),
     );
     if (res) {
+      /*
+       * THE LIST REFRESHES WHETHER OR NOT THERE WERE NOTES.
+       *
+       * Refreshing only on the clean path meant that an invitation issued to a
+       * vendor whose prequalification was expiring — the case a buyer most
+       * needs to see — was created on the server and then not shown, because
+       * the warning kept the modal open and the footer's Close never
+       * refreshed. The write happened; the register must show it.
+       */
       setWarnings(res.warnings ?? []);
       setSelected([]);
+      onCreated();
       if ((res.warnings ?? []).length === 0) onDone();
     }
   }

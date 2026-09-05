@@ -345,7 +345,7 @@ describe("connector mappings", () => {
 /* ------------------------------------------------------------------ */
 
 describe("sources & dataset registry", () => {
-  it("GET /ingestion/datasets describes all 9 datasets with typed fields", async () => {
+  it("GET /ingestion/datasets describes every dataset with typed fields", async () => {
     const res = await app.inject({
       method: "GET",
       url: url("/ingestion/datasets"),
@@ -356,7 +356,11 @@ describe("sources & dataset registry", () => {
       datasets: { dataset: string; fields: { key: string; required: boolean }[] }[];
     };
     expect(body.datasets.map((d) => d.dataset).sort()).toEqual([
+      // The upgrade wave added the two datasets a new company's first day needs
+      // beyond the directory: the cost breakdown and the budget it hangs on.
+      "budget_lines",
       "cost_assertions",
+      "cost_codes",
       "evidence",
       "fx_rates",
       "payroll",
@@ -457,11 +461,22 @@ describe("CSV migration wizard", () => {
     const records = await app.inject({
       method: "GET",
       url: url(`/ingestion/runs/${run.id}/records?status=committed`),
-      headers: memberHeaders,
+      headers: owner.headers,
     });
     const items = (records.json() as { items: { committedRecordId: string | null }[] }).items;
     expect(items).toHaveLength(2);
     expect(items.every((r) => r.committedRecordId)).toBe(true);
+
+    // REGRESSION (audit: staged payloads readable by any member). `vendors` is
+    // a company-level dataset with no project to resolve a tool level against,
+    // so a plain member — the built-in template a subcontractor gets — is
+    // refused the staged rows, not merely the committed ones.
+    const memberRecords = await app.inject({
+      method: "GET",
+      url: url(`/ingestion/runs/${run.id}/records?status=committed`),
+      headers: memberHeaders,
+    });
+    expect(memberRecords.statusCode).toBe(403);
 
     // the commit is ledgered once, with the file hash and the counts
     const entries = await app.db
@@ -699,11 +714,21 @@ describe("CSV migration wizard", () => {
     const list = await app.inject({
       method: "GET",
       url: url("/ingestion/runs?dataset=vendors&status=discarded"),
-      headers: memberHeaders,
+      headers: owner.headers,
     });
     const body = list.json() as { items: RunView[] };
     expect(body.items.length).toBeGreaterThanOrEqual(1);
     expect(body.items.every((r) => r.status === "discarded")).toBe(true);
+
+    // REGRESSION: the same list for a plain member excludes company-level runs
+    // entirely — a directory import is not readable by every membership.
+    const memberList = await app.inject({
+      method: "GET",
+      url: url("/ingestion/runs?dataset=vendors&status=discarded"),
+      headers: memberHeaders,
+    });
+    expect(memberList.statusCode).toBe(200);
+    expect((memberList.json() as { items: RunView[] }).items).toHaveLength(0);
   });
 });
 

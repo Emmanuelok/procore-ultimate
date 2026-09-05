@@ -1,11 +1,18 @@
 /**
  * Delay event register (spec Domain D #265-268) with entitlement
- * classification, evidence links and per-event Time Impact Analysis (#272).
+ * classification, culpable party, notice time bars, evidence links and
+ * per-event Time Impact Analysis (#272).
+ *
+ * Notice time bars matter more than anything else on this screen: on most
+ * standard forms a late notice extinguishes the entitlement the event would
+ * otherwise carry, so the register shows the bar's state on every row and the
+ * sweep that opens the obligation can be run from here.
  */
-import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { DELAY_CAUSES, DELAY_EVENT_STATUSES } from "@constructos/shared";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { CULPABLE_PARTIES, DELAY_CAUSES } from "@constructos/shared";
 import { api, ApiClientError } from "../../lib/api";
 import {
+  Alert,
   Badge,
   Button,
   Card,
@@ -45,6 +52,83 @@ import {
 
 const PAGE_SIZE = 25;
 
+/**
+ * Mirror of the server's DELAY_EVENT_TRANSITIONS. Offering a button the API
+ * will refuse is worse than offering none, so the drawer shows only the moves
+ * that exist — and asks for the reason the server requires before it sends.
+ */
+const TRANSITIONS: Record<string, string[]> = {
+  open: ["assessed", "withdrawn", "closed"],
+  assessed: ["closed", "withdrawn"],
+  closed: ["open"],
+  withdrawn: ["open"],
+};
+/** Leaving these states needs a recorded reason, as does withdrawing. */
+const REOPEN_FROM = new Set(["closed", "withdrawn"]);
+
+/** Days before the bar at which the platform starts warning (server: NOTICE_WARN_DAYS). */
+const NOTICE_WARN_DAYS = 5;
+
+interface WeatherAnalysis {
+  id: string;
+  reference: string;
+  status: string;
+  periodStart: string;
+  periodEnd: string;
+  observedAdverseDays: number | null;
+  baselineAdverseDays: number | null;
+  exceptionalDays: number | null;
+  hoursLost: number | null;
+  coveragePercent: number | null;
+}
+
+interface WeatherEvidence {
+  analyses: WeatherAnalysis[];
+  summary: {
+    analyses: number;
+    exceptionalDays: number | null;
+    hoursLost: number | null;
+    meanCoveragePercent: number | null;
+  };
+  reasons: string[];
+}
+
+interface NoticeState {
+  label: string;
+  tone: "red" | "amber" | "green" | "gray";
+  title: string;
+}
+
+/** Notice time-bar state for a row — the single most consequential column. */
+function noticeState(ev: {
+  noticeDueDate?: string | null;
+  contractEventId: string | null;
+  status: string;
+}): NoticeState | null {
+  if (!ev.noticeDueDate) return null;
+  if (ev.contractEventId) {
+    return { label: "served", tone: "green", title: `Notice recorded; bar was ${ev.noticeDueDate}` };
+  }
+  if (ev.status === "withdrawn" || ev.status === "closed") {
+    return { label: "n/a", tone: "gray", title: `Event is ${ev.status}` };
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  const days = Math.round(
+    (Date.parse(`${ev.noticeDueDate}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000,
+  );
+  if (days < 0) {
+    return {
+      label: `barred ${Math.abs(days)}d`,
+      tone: "red",
+      title: `The notice was due ${ev.noticeDueDate} and none is recorded — entitlement may be barred`,
+    };
+  }
+  if (days <= NOTICE_WARN_DAYS) {
+    return { label: `${days}d left`, tone: "amber", title: `Notice due ${ev.noticeDueDate}` };
+  }
+  return { label: `${days}d`, tone: "gray", title: `Notice due ${ev.noticeDueDate}` };
+}
+
 interface CreateForm {
   title: string;
   description: string;
@@ -57,6 +141,8 @@ interface CreateForm {
   durationDays: string;
   contractId: string;
   contractEventId: string;
+  noticeDueDate: string;
+  party: string;
   evidenceIds: string[];
 }
 
@@ -72,10 +158,19 @@ const emptyForm: CreateForm = {
   durationDays: "1",
   contractId: "",
   contractEventId: "",
+  noticeDueDate: "",
+  party: "neither",
   evidenceIds: [],
 };
 
-export default function DelayEventsTab({ projectId }: { projectId: string }) {
+export default function DelayEventsTab({
+  projectId,
+  focusId,
+}: {
+  projectId: string;
+  /** deep link from ⌘K search: open this event's drawer once, on arrival */
+  focusId?: string | null;
+}) {
   const base = `/api/v1/projects/${projectId}`;
 
   const [items, setItems] = useState<DelayEventRow[] | null>(null);
@@ -101,6 +196,38 @@ export default function DelayEventsTab({ projectId }: { projectId: string }) {
   useEffect(() => {
     void load();
   }, [load]);
+
+  /* --------------------------- notice time bars --------------------------- */
+
+  const [sweepBusy, setSweepBusy] = useState(false);
+  const [sweepNote, setSweepNote] = useState<string | null>(null);
+
+  async function runNoticeSweep() {
+    setSweepBusy(true);
+    setSweepNote(null);
+    setError(null);
+    try {
+      const res = await api.post<{
+        scanned: number;
+        obligationsOpened: number;
+        obligationsClosed: number;
+        dueSoon: number;
+        missed: number;
+        alerted: number;
+        warnDays: number;
+      }>(`${base}/forensics/notice-sweep`, {});
+      setSweepNote(
+        `${res.scanned} event(s) with a notice date checked — ${res.obligationsOpened} obligation(s) opened, ` +
+          `${res.obligationsClosed} closed, ${res.missed} past the bar, ${res.dueSoon} due within ${res.warnDays} days, ` +
+          `${res.alerted} new alert(s).`,
+      );
+      await load();
+    } catch (err) {
+      setError(err instanceof ApiClientError ? err.message : "The notice sweep could not be run.");
+    } finally {
+      setSweepBusy(false);
+    }
+  }
 
   /* ----------------------------- create modal ----------------------------- */
 
@@ -196,6 +323,8 @@ export default function DelayEventsTab({ projectId }: { projectId: string }) {
       if (form.scheduleId) payload["scheduleId"] = form.scheduleId;
       if (form.taskId) payload["taskId"] = form.taskId;
       if (form.contractEventId) payload["contractEventId"] = form.contractEventId;
+      if (form.noticeDueDate) payload["noticeDueDate"] = form.noticeDueDate;
+      if (form.party) payload["party"] = form.party;
       if (form.evidenceIds.length > 0) payload["evidenceIds"] = form.evidenceIds;
       await api.post<DelayEventRow>(`${base}/delay-events`, payload);
       setCreateOpen(false);
@@ -218,16 +347,40 @@ export default function DelayEventsTab({ projectId }: { projectId: string }) {
   const [tiaBanner, setTiaBanner] = useState<TiaResult | null>(null);
   const [statusBusy, setStatusBusy] = useState(false);
 
+  const [weather, setWeather] = useState<WeatherEvidence | null>(null);
+
   async function openDrawer(id: string) {
     setDrawerError(null);
     setTiaBanner(null);
+    setWeather(null);
     try {
       const detail = await api.get<DelayEventDetail>(`${base}/delay-events/${id}`);
       setSelected(detail);
+      // The weather comparison lives in the site module; forensics reads it so
+      // the claim and the met record can never disagree. Its own failure must
+      // not blank the drawer.
+      api
+        .get<WeatherEvidence>(`${base}/delay-events/${id}/weather`)
+        .then((res) => setWeather(res))
+        .catch(() => setWeather(null));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load the delay event");
     }
   }
+
+  /*
+   * Arriving from company search (or any link that names an event) opens that
+   * event rather than dropping the reader on an unfiltered register. It fires
+   * once per id: reopening after the user closes the drawer would trap them.
+   */
+  const openedFocus = useRef<string | null>(null);
+  useEffect(() => {
+    if (!focusId || openedFocus.current === focusId) return;
+    openedFocus.current = focusId;
+    void openDrawer(focusId);
+    // openDrawer is stable for a given base; the id is what drives this.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusId, base]);
 
   async function runTia() {
     if (!selected) return;
@@ -245,12 +398,30 @@ export default function DelayEventsTab({ projectId }: { projectId: string }) {
     }
   }
 
+  const [statusReason, setStatusReason] = useState("");
+
+  function reasonRequired(from: string, to: string): boolean {
+    return to === "withdrawn" || REOPEN_FROM.has(from);
+  }
+
   async function setStatus(status: string) {
     if (!selected) return;
     setDrawerError(null);
+    if (reasonRequired(selected.status, status) && statusReason.trim().length === 0) {
+      setDrawerError(
+        status === "withdrawn"
+          ? "A reason is required to withdraw a delay event — it disappears from every downstream aggregation."
+          : `A reason is required to reopen a ${selected.status} delay event.`,
+      );
+      return;
+    }
     setStatusBusy(true);
     try {
-      await api.post(`${base}/delay-events/${selected.id}/status`, { status });
+      await api.post(`${base}/delay-events/${selected.id}/status`, {
+        status,
+        ...(statusReason.trim() ? { reason: statusReason.trim() } : {}),
+      });
+      setStatusReason("");
       await openDrawer(selected.id);
       await load();
     } catch (err) {
@@ -271,10 +442,20 @@ export default function DelayEventsTab({ projectId }: { projectId: string }) {
           Delay events are the atoms of the forensic model — classify entitlement, anchor a
           fragnet, attach evidence.
         </p>
-        <Button onClick={() => void openCreate()}>Register delay event</Button>
+        <div className="flex gap-2">
+          <Button variant="secondary" disabled={sweepBusy} onClick={() => void runNoticeSweep()}>
+            {sweepBusy ? "Checking…" : "Check notice time bars"}
+          </Button>
+          <Button onClick={() => void openCreate()}>Register delay event</Button>
+        </div>
       </div>
 
       <ErrorAlert message={error} />
+      {sweepNote ? (
+        <Alert tone="info" title="Notice time bars" className="mb-4">
+          {sweepNote}
+        </Alert>
+      ) : null}
 
       {items === null ? (
         <Spinner />
@@ -295,6 +476,7 @@ export default function DelayEventsTab({ projectId }: { projectId: string }) {
                 <Th>E / C</Th>
                 <Th className="text-right">Duration</Th>
                 <Th>Start</Th>
+                <Th>Notice</Th>
                 <Th>TIA Δ</Th>
                 <Th>Status</Th>
               </tr>
@@ -322,6 +504,20 @@ export default function DelayEventsTab({ projectId }: { projectId: string }) {
                     {ev.durationDays}d
                   </Td>
                   <Td className="whitespace-nowrap">{formatDate(ev.startDate)}</Td>
+                  <Td>
+                    {(() => {
+                      const n = noticeState(ev);
+                      return n ? (
+                        <Badge tone={n.tone} title={n.title}>
+                          {n.label}
+                        </Badge>
+                      ) : (
+                        <span className="text-xs text-ink-300" title="No notice time bar recorded">
+                          —
+                        </span>
+                      );
+                    })()}
+                  </Td>
                   <Td>
                     <TiaChip deltaDays={ev.tiaResult?.completionDeltaDays ?? null} />
                   </Td>
@@ -482,6 +678,31 @@ export default function DelayEventsTab({ projectId }: { projectId: string }) {
           </div>
 
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <Field
+              label="Culpable party"
+              hint="Whose delay this is — the concurrency engine cannot classify without it."
+            >
+              <Select value={form.party} onChange={(e) => set("party", e.target.value)}>
+                {CULPABLE_PARTIES.map((party) => (
+                  <option key={party} value={party}>
+                    {humanize(party)}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field
+              label="Notice due by"
+              hint="The contract time bar. A missed bar can extinguish the entitlement."
+            >
+              <Input
+                type="date"
+                value={form.noticeDueDate}
+                onChange={(e) => set("noticeDueDate", e.target.value)}
+              />
+            </Field>
+          </div>
+
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <Field label="Contract" hint="To link a contract event (notice).">
               <Select
                 value={form.contractId}
@@ -585,13 +806,45 @@ export default function DelayEventsTab({ projectId }: { projectId: string }) {
               <DetailRow label="Struck task">
                 {selected.task ? selected.task.name : "— none —"}
               </DetailRow>
+              <DetailRow label="Culpable party">
+                {selected.party ? humanize(selected.party) : "— not classified —"}
+              </DetailRow>
               <DetailRow label="Contract event">
                 {selected.contractEvent
                   ? `CE-${selected.contractEvent.number} — ${selected.contractEvent.title}`
                   : "— none —"}
               </DetailRow>
+              <DetailRow label="Notice due by">
+                {selected.noticeDueDate ? (
+                  <span className="flex items-center gap-2">
+                    {formatDate(selected.noticeDueDate)}
+                    {(() => {
+                      const n = noticeState(selected);
+                      return n ? <Badge tone={n.tone}>{n.label}</Badge> : null;
+                    })()}
+                  </span>
+                ) : (
+                  "— no time bar recorded —"
+                )}
+              </DetailRow>
             </CardBody>
           </Card>
+
+          {selected.noticeDueDate && !selected.contractEventId ? (
+            <Alert
+              tone={noticeState(selected)?.tone === "red" ? "danger" : "warning"}
+              title={
+                noticeState(selected)?.tone === "red"
+                  ? "The notice time bar has passed"
+                  : "A notice is outstanding"
+              }
+              className="mb-4"
+            >
+              No contract event is linked to this delay event. Serve the notice and record it above —
+              the platform holds this deadline as an obligation and escalates it, but it cannot serve
+              a notice for you.
+            </Alert>
+          ) : null}
 
           {/* TIA */}
           <div className="mb-4 rounded-lg border border-ink-100 p-4">
@@ -648,6 +901,63 @@ export default function DelayEventsTab({ projectId }: { projectId: string }) {
             )}
           </div>
 
+          {/* Weather baseline (site module) */}
+          {weather && (weather.analyses.length > 0 || selected.cause === "exceptional_weather") ? (
+            <div className="mb-4">
+              <SectionTitle>Weather against the contract baseline</SectionTitle>
+              {weather.analyses.length === 0 ? (
+                <p className="text-xs text-ink-400">
+                  {weather.reasons[0] ??
+                    "No weather analysis has been issued against this event."}{" "}
+                  Issue one from Site operations → Weather to evidence the excusable period.
+                </p>
+              ) : (
+                <>
+                  <div className="mb-2 flex flex-wrap gap-4 text-sm">
+                    <span>
+                      <span className="text-ink-500">Exceptional days </span>
+                      <strong className="tabular-nums">
+                        {weather.summary.exceptionalDays ?? "—"}
+                      </strong>
+                    </span>
+                    <span>
+                      <span className="text-ink-500">Hours lost </span>
+                      <strong className="tabular-nums">{weather.summary.hoursLost ?? "—"}</strong>
+                    </span>
+                    <span>
+                      <span className="text-ink-500">Record coverage </span>
+                      <strong className="tabular-nums">
+                        {weather.summary.meanCoveragePercent === null
+                          ? "—"
+                          : `${weather.summary.meanCoveragePercent}%`}
+                      </strong>
+                    </span>
+                  </div>
+                  <ul className="divide-y divide-ink-100 rounded-md border border-ink-100">
+                    {weather.analyses.map((a) => (
+                      <li key={a.id} className="px-3 py-2 text-sm">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono text-xs text-ink-500">{a.reference}</span>
+                          <Badge tone={a.status === "issued" ? "green" : "gray"}>
+                            {humanize(a.status)}
+                          </Badge>
+                          <span className="text-xs text-ink-400">
+                            {formatDate(a.periodStart)} – {formatDate(a.periodEnd)}
+                          </span>
+                        </div>
+                        <div className="mt-0.5 text-xs text-ink-600">
+                          {a.observedAdverseDays ?? "—"} adverse days observed against{" "}
+                          {a.baselineAdverseDays ?? "—"} in the baseline —{" "}
+                          <strong>{a.exceptionalDays ?? "—"}</strong> exceptional.
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </div>
+          ) : null}
+
           {/* Evidence */}
           <div className="mb-4">
             <SectionTitle>Evidence ({selected.evidence.length})</SectionTitle>
@@ -666,22 +976,49 @@ export default function DelayEventsTab({ projectId }: { projectId: string }) {
             )}
           </div>
 
-          {/* Status actions */}
+          {/* Status actions — only the transitions the server allows */}
           <div className="rounded-lg border border-ink-100 p-4">
             <div className="mb-2 text-sm font-semibold text-ink-900">Status</div>
-            <div className="flex flex-wrap gap-2">
-              {DELAY_EVENT_STATUSES.filter((s) => s !== selected.status).map((s) => (
-                <Button
-                  key={s}
-                  size="sm"
-                  variant={s === "withdrawn" ? "danger" : "secondary"}
-                  disabled={statusBusy}
-                  onClick={() => void setStatus(s)}
+            {selected.statusReason ? (
+              <p className="mb-2 text-xs text-ink-500">
+                Last change: {selected.statusReason}
+              </p>
+            ) : null}
+            {(TRANSITIONS[selected.status] ?? []).length === 0 ? (
+              <p className="text-xs text-ink-400">
+                {humanize(selected.status)} is a terminal state for this event.
+              </p>
+            ) : (
+              <>
+                <Field
+                  label="Reason"
+                  hint={
+                    REOPEN_FROM.has(selected.status)
+                      ? "Required to reopen — the event returns to every downstream aggregation."
+                      : "Required to withdraw."
+                  }
                 >
-                  {s === "open" ? "Reopen" : `Mark ${humanize(s).toLowerCase()}`}
-                </Button>
-              ))}
-            </div>
+                  <Input
+                    value={statusReason}
+                    onChange={(e) => setStatusReason(e.target.value)}
+                    placeholder="Raised in error; superseded by DE-014…"
+                  />
+                </Field>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {(TRANSITIONS[selected.status] ?? []).map((next) => (
+                    <Button
+                      key={next}
+                      size="sm"
+                      variant={next === "withdrawn" ? "danger" : "secondary"}
+                      disabled={statusBusy}
+                      onClick={() => void setStatus(next)}
+                    >
+                      {next === "open" ? "Reopen" : `Mark ${humanize(next).toLowerCase()}`}
+                    </Button>
+                  ))}
+                </div>
+              </>
+            )}
           </div>
         </Drawer>
       ) : null}

@@ -269,10 +269,12 @@ function PeriodDrawer({ projectId, periodId, onClose, onChanged }: { projectId: 
   const p = detail.data;
   const [filingReference, setFilingReference] = useState("");
   const [filedAt, setFiledAt] = useState("");
+  const [reopenReason, setReopenReason] = useState("");
 
   useEffect(() => {
     setFilingReference("");
     setFiledAt("");
+    setReopenReason("");
     action.clear();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [periodId]);
@@ -295,6 +297,17 @@ function PeriodDrawer({ projectId, periodId, onClose, onChanged }: { projectId: 
     const res = await action.run("file", () => taxApi.filePeriod(projectId, p.id, body));
     if (res) {
       toast.success("Return filed; obligation satisfied");
+      detail.reload();
+      onChanged();
+    }
+  }
+
+  async function reopen(e: FormEvent) {
+    e.preventDefault();
+    if (!p) return;
+    const res = await action.run("reopen", () => taxApi.reopenPeriod(projectId, p.id, reopenReason.trim()));
+    if (res) {
+      toast.success("Return re-opened; the filing reference was cleared");
       detail.reload();
       onChanged();
     }
@@ -407,7 +420,13 @@ function PeriodDrawer({ projectId, periodId, onClose, onChanged }: { projectId: 
               <Button size="sm" variant="secondary" onClick={() => void compute()} loading={action.busy === "compute"}>
                 {computed ? "Recompute" : "Compute"}
               </Button>
-            ) : null}
+            ) : (
+              <div className="text-2xs text-content-subtle">
+                These are the figures that were {p.status}
+                {p.filingReference ? ` under reference ${p.filingReference}` : ""}, so they are frozen. Live now moves as
+                determinations and certificates change; re-open the return to correct what was submitted.
+              </div>
+            )}
           </section>
 
           {p.status !== "filed" && p.status !== "paid" ? (
@@ -418,7 +437,7 @@ function PeriodDrawer({ projectId, periodId, onClose, onChanged }: { projectId: 
                 <Field label="Filing reference" required hint="Authority receipt / submission id">
                   <Input value={filingReference} onChange={(e) => setFilingReference(e.target.value)} required />
                 </Field>
-                <Field label="Filed at" hint="Defaults to now">
+                <Field label="Filed at" hint="Back-entry only, never in the future; lateness is measured from when the filing is recorded here">
                   <Input type="datetime-local" value={filedAt} onChange={(e) => setFiledAt(e.target.value)} />
                 </Field>
               </div>
@@ -435,6 +454,28 @@ function PeriodDrawer({ projectId, periodId, onClose, onChanged }: { projectId: 
                 Mark paid
               </Button>
             </section>
+          ) : null}
+
+          {p.status === "filed" || p.status === "paid" ? (
+            <form onSubmit={reopen} className="space-y-2 rounded-md border border-border p-3">
+              <h3 className="text-sm font-semibold text-content">Re-open</h3>
+              <Alert tone="warning" size="sm">
+                Re-opening clears the filing reference and the filed/paid stamps and puts the obligation back on the
+                clock. Nothing keeps a submission on top of numbers that changed: correct, recompute and file again.
+              </Alert>
+              <Field label="Reason" required>
+                <Textarea value={reopenReason} onChange={(e) => setReopenReason(e.target.value)} rows={2} required />
+              </Field>
+              <Button
+                type="submit"
+                size="sm"
+                variant="danger"
+                disabled={reopenReason.trim().length === 0}
+                loading={action.busy === "reopen"}
+              >
+                Re-open the return
+              </Button>
+            </form>
           ) : null}
         </div>
       ) : null}

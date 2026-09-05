@@ -7,7 +7,7 @@
  */
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
-import { Badge, Button, Card, CardBody, Drawer, EmptyState } from "../../ui";
+import { Alert, Badge, Button, Card, CardBody, Drawer, EmptyState } from "../../ui";
 import { DataTable, type DataColumns } from "../../ui/data";
 import { IconZap } from "../../ui/icons";
 import { api } from "../../lib/api";
@@ -72,12 +72,34 @@ export default function RiskTab({ projectId, onChanged }: { projectId: string; o
     <div className="space-y-4">
       {action.refusal ? <RefusalNotice refusal={action.refusal} onDismiss={action.clear} /> : null}
       {risk.error ? <LoadError message={risk.error} onRetry={risk.reload} /> : null}
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
-        {(["critical", "high", "medium", "low", "not_assessable"] as const).map((level) => (
+      {(r?.truncated ?? []).length > 0 ? (
+        <Alert tone="warning" title="These counts are a lower bound">
+          <ReasonList reasons={r?.truncated ?? []} />
+        </Alert>
+      ) : null}
+      {/*
+        Six tiles, not five: `not_assessed` is the bucket for a node the
+        engine has never scored. Dropping it rendered ten unexamined
+        suppliers as five reassuring zeros.
+      */}
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-6">
+        {(["critical", "high", "medium", "low", "not_assessable", "not_assessed"] as const).map((level) => (
           <Card key={level}>
             <CardBody>
-              <div className="text-label uppercase text-content-subtle">{labelize(level)}</div>
-              <div className={`text-display-xs font-semibold tabular-nums ${level === "critical" && (r?.summary[level] ?? 0) > 0 ? "text-danger-fg" : "text-content"}`}>{r ? num(r.summary[level] ?? 0) : EM_DASH}</div>
+              <div className="text-label uppercase text-content-subtle">{level === "not_assessed" ? "Never scored" : labelize(level)}</div>
+              <div
+                className={`text-display-xs font-semibold tabular-nums ${
+                  level === "critical" && (r?.summary[level] ?? 0) > 0
+                    ? "text-danger-fg"
+                    : level === "not_assessed" && (r?.summary[level] ?? 0) > 0
+                      ? "text-warning-fg"
+                      : "text-content"
+                }`}
+              >
+                {r ? num(r.summary[level] ?? 0) : EM_DASH}
+              </div>
+              {level === "not_assessed" ? <div className="mt-0.5 text-2xs text-content-muted">Not scored is not low risk.</div> : null}
+              {level === "not_assessable" ? <div className="mt-0.5 text-2xs text-content-muted">Nothing to read on this node.</div> : null}
             </CardBody>
           </Card>
         ))}

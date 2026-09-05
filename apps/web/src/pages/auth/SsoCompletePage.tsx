@@ -26,6 +26,12 @@ interface TicketPayload {
   linked?: boolean;
   provisioned?: boolean;
   emailVerifiedByProvider?: boolean;
+  identity?: { id: string; displayName: string; providerKind: string; emailAtLink: string | null };
+  /** the tenant demands a second factor and the IdP did not provide one */
+  mfaRequired?: boolean;
+  challengeToken?: string;
+  scope?: "verify" | "enrol";
+  reasons?: string[];
 }
 
 export default function SsoCompletePage() {
@@ -40,6 +46,9 @@ export default function SsoCompletePage() {
   const error = searchParams.get("error");
   const message = searchParams.get("message");
   const returnTo = searchParams.get("returnTo");
+  // Set only for an unexpected server-side failure: the message in the URL is
+  // then generic and this names the log line that has the detail.
+  const reference = searchParams.get("reference");
 
   useEffect(() => {
     if (!ticket || attempted) return;
@@ -54,6 +63,18 @@ export default function SsoCompletePage() {
           await reload();
           const target = res.returnTo ?? returnTo;
           navigate(target && target.startsWith("/") ? target : "/", { replace: true });
+          return;
+        }
+        // A LINK, not a sign-in. `completeLink` returns { linked, identity,
+        // returnTo } and no tokens — which this page used to report as "the
+        // exchange succeeded but carried no tokens", i.e. it told the user
+        // their successful link had failed.
+        if (res.linked) {
+          const target = res.returnTo ?? returnTo ?? "/account/security";
+          navigate(target.startsWith("/") ? target : "/account/security", {
+            replace: true,
+            state: { linkedProvider: res.identity?.displayName ?? "the identity provider" },
+          });
         }
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -70,6 +91,12 @@ export default function SsoCompletePage() {
           <p className="whitespace-pre-wrap">
             {message ?? "The identity provider did not return a usable assertion."}
           </p>
+          {reference ? (
+            <p className="mt-2 text-2xs">
+              Reference <code className="select-all font-mono">{reference}</code> — quote it to your
+              administrator; the detail is in the server log, deliberately not in this URL.
+            </p>
+          ) : null}
         </Alert>
         <p className="mt-4 text-2xs leading-snug text-content-subtle">
           A sign-in this server did not start, a state parameter that has already been spent, or an
@@ -105,6 +132,30 @@ export default function SsoCompletePage() {
         <Button className="mt-2" fullWidth onClick={() => navigate("/login", { replace: true })}>
           Start again
         </Button>
+      ) : payload?.mfaRequired ? (
+        // The tenant requires a second factor and this connection did not
+        // provide one. The challenge is redeemed on the sign-in page, which
+        // already implements the whole enrol/verify flow.
+        <div className="space-y-3">
+          <Alert tone="info" title="One more step">
+            <p>Your organisation requires a second factor before this sign-in can finish.</p>
+          </Alert>
+          {payload.reasons?.length ? (
+            <ul className="list-disc space-y-1 pl-4 text-2xs text-content-subtle">
+              {payload.reasons.map((reason) => (
+                <li key={reason}>{reason}</li>
+              ))}
+            </ul>
+          ) : null}
+          <Button fullWidth onClick={() => navigate("/login", { replace: true })}>
+            Continue on the sign-in page
+          </Button>
+        </div>
+      ) : payload?.linked ? (
+        <Alert tone="success" title="Provider linked">
+          {payload.identity?.displayName ?? "That identity provider"} is now a way into this
+          account. Taking you back to your security settings.
+        </Alert>
       ) : payload && !payload.accessToken ? (
         <Alert tone="warning" title="No session came back">
           The exchange succeeded but carried no tokens. Start the sign-in again.

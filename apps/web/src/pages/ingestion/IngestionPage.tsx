@@ -5,6 +5,8 @@
  * Everything that enters the platform from outside comes through here:
  *   · Runs       — staged batches: inspect, validate report, commit/discard
  *   · New import — the 4-step CSV migration wizard (upload → map → validate → commit)
+ *   · Programme  — P6 XER and MS Project XML importers (#349-350), staged and
+ *     committed through the same pipeline, then recomputed by the CPM engine
  *   · Sources    — where data comes from (CSV, connectors, machine tokens)
  *   · API tokens — machine credentials for evidence-stream pushes
  *
@@ -18,6 +20,7 @@ import { useSearchParams } from "react-router-dom";
 import { api } from "../../lib/api";
 import { ErrorAlert, PageHeader } from "../../ui";
 import ImportWizard from "./ImportWizard";
+import ProgrammeTab from "./ProgrammeTab";
 import RunsTab from "./RunsTab";
 import SourcesTab from "./SourcesTab";
 import TokensTab from "./TokensTab";
@@ -32,6 +35,7 @@ import {
 const TABS = [
   { key: "runs", label: "Runs" },
   { key: "import", label: "New import" },
+  { key: "programme", label: "Programme (P6 / MSP)" },
   { key: "sources", label: "Sources" },
   { key: "tokens", label: "API tokens" },
 ];
@@ -137,6 +141,14 @@ export default function IngestionPage() {
             setFocusRunId(runId);
             selectTab("runs");
           }}
+        />
+      ) : null}
+      {tab === "programme" ? (
+        <ProgrammeTab
+          datasets={datasets}
+          sources={sources}
+          projects={projects}
+          onDone={(runId) => setFocusRunId(runId)}
         />
       ) : null}
       {tab === "sources" ? (

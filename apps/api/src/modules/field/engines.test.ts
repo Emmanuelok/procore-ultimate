@@ -205,6 +205,17 @@ describe("daily log engine", () => {
     expect(out["manpower"]).toEqual([{ company: "Acme", workers: 3, hours: 24, notes: "Pour" }]);
   });
 
+  it("keeps the diarist's own manpower fields when normalising (trade is not an AI key)", () => {
+    // dailyLogs.ts runs this over the request body on the first save of a day,
+    // so anything it drops is data the site typed and never gets back.
+    const out = normaliseAiSections({
+      manpower: [{ company: "Acme", trade: "Formwork", workers: 5, hours: 40, notes: "L3 east" }],
+    });
+    expect(out["manpower"]).toEqual([
+      { company: "Acme", trade: "Formwork", workers: 5, hours: 40, notes: "L3 east" },
+    ]);
+  });
+
   it("consolidates a site day across creators", () => {
     const day = consolidateLogs([
       { id: "1", createdBy: "u1", status: "approved", logKind: "internal", vendorId: null, weather: { tempC: 20 },

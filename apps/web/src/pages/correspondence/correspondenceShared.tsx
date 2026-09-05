@@ -13,7 +13,7 @@
  *  · every panel loads, fails and empties on its own.
  */
 import { useCallback, useState, type ReactNode } from "react";
-import { api, ApiClientError } from "../../lib/api";
+import { api, ApiClientError, fetchBlobUrl } from "../../lib/api";
 import { Alert, Badge, Skeleton, cx } from "../../ui";
 import type { Tone } from "../../ui/tokens";
 import { useResource, type Loadable, type Paginated } from "../../layouts/project/lib";
@@ -935,6 +935,23 @@ export function useAction(): {
   }, []);
   const clear = useCallback(() => setError(null), []);
   return { busy, error, clear, run };
+}
+
+/**
+ * Download a CSV the API guards behind the bearer token. `window.open` on an
+ * /api path sends neither the Authorization nor the tenant header, so the new
+ * tab renders a 401 rather than the export — fetch it with the client's own
+ * credentials and hand the browser a blob instead.
+ */
+export async function downloadCsv(path: string, filename: string): Promise<void> {
+  const url = await fetchBlobUrl(path);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
 export function useSummary(projectId: string): Loadable<CorrespondenceSummary> {

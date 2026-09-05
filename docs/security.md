@@ -15,10 +15,16 @@ Implemented in `apps/api/src/plugins/auth.ts` (verification) and
 
 ### 1.1 Passwords
 
-- Hashed with **bcrypt, cost factor 10** (`bcryptjs`, `modules/identity/index.ts`
-  `POST /auth/register`). Plaintext is never persisted.
-- Policy: 8–128 chars enforced by zod (`registerSchema`). No complexity rules, no breach-list
-  check yet (see §8).
+- Hashed with **bcrypt**, cost from `BCRYPT_COST` — floored at 12 everywhere except
+  `NODE_ENV=test`, where it is capped at 10 so a suite is not a CPU burn
+  (`passwordHashCost`, `modules/account/password.ts`) — and rehashed transparently on the next successful
+  sign-in when the stored cost is below the current one (`completeLogin`,
+  `modules/account/login.ts`). Plaintext is never persisted.
+- Policy is no longer a zod length check: `modules/account/policy.ts` resolves the tenant
+  policy (minimum length ≥ 12, optional complexity, maximum age, history depth) and
+  `assessPasswordWithPolicy` applies it at registration, change, reset and invitation
+  acceptance. Reuse is refused against `password_history` (hashes only). See §1.9.
+  Still absent: a breach-list check (see §8).
 - Login compares with `bcrypt.compare` and returns a uniform `401 Invalid credentials` for
   unknown email, wrong password and deactivated account alike — no account enumeration via
   the login route. (The register route does reveal whether an email exists via `409`; see §8.)
@@ -82,6 +88,177 @@ The platform's second credential type, added in Phase 6 for machine evidence str
   that no human session authored these rows (real committed records carry the token
   creator's user id, because the columns demand a user; the run and the ledger carry the
   pathway).
+
+### 1.6 Multi-factor authentication (spec Vol I #22)
+
+TOTP only, and that is a deliberate limit stated rather than hidden:
+`MFA_METHODS` lists what the platform can actually verify today, and a factor it cannot
+check would be the security equivalent of a fabricated figure. Recovery codes are the
+second member, single-use, hashed at rest.
+
+- **A password alone never produces a session** for an account with a confirmed factor.
+  It produces a CHALLENGE — a short-lived, MAC-authenticated, purpose-scoped token that
+  is not an access token and cannot reach a single authenticated route. Both
+  `POST /auth/login` and `POST /auth/mfa/login` speak that one protocol and both redeem
+  at `POST /auth/mfa/challenge`.
+- **A `pending` enrolment is not a factor.** A seed that has been shown and never proved
+  does not satisfy anything; treating it as one would lock out every user who scanned a
+  QR code into an app they then deleted.
+- **`mfa_satisfied_at` sits on the SESSION**, not the user: clearing a factor authorises
+  one device, and a new device must clear it again.
+- **Tenant policy** (`mfaRequired`) forces enrolment at the next sign-in for members with
+  no factor, and — since this wave — applies to SSO sign-ins too (§1.7).
+- **Admin reset** (`POST /company/security/users/:id/mfa/reset`) disables every factor,
+  revokes every recovery code and kills every session, because the sessions were
+  authorised against the factor being removed.
+
+### 1.7 Single sign-on (OIDC)
+
+`modules/sso`. Per-tenant connections (`identity_providers`), authorization-code flow with
+PKCE, id_tokens verified against the provider's published JWKS before any claim is read,
+`state` as an opaque server-side lookup key bound to a browser cookie, and a single-use
+ticket exchange so a refresh token never travels in a redirect URL.
+
+What this wave changed:
+
+- **The tenant MFA policy now applies to SSO.** Previously `issueSession` wrote
+  `mfa_satisfied_at: null` and never consulted the policy or the assertion's `amr`/`acr`,
+  so a company that required a second factor still admitted every SSO user without one —
+  the policy and the coverage figure next to it were cosmetic for exactly the tenants
+  most likely to have SSO. The callback now returns the same challenge envelope a
+  password sign-in returns, unless the connection is explicitly configured to perform MFA
+  itself (`idpPerformsMfa`) **and** the assertion carries one of the administrator's
+  accepted `mfaAmrValues`. Trusting an IdP's word about MFA is a decision an
+  administrator takes, never a default.
+- **`defaultTemplateKey` is applied.** It used to be resolved, written into the ledger
+  payload and applied to nothing, so a JIT-provisioned member held a company membership
+  and could not open a single project. The connection now names the projects
+  (`provisionProjectIds`, each validated to belong to the same company) and provisioning
+  creates the project memberships.
+- **Redirect-mode errors no longer leak internals.** The callback used to put
+  `err.message` into the redirect URL for any thrown error — browser history, the Referer
+  header of the next request, every proxy log in between — bypassing the production 5xx
+  masking. Only an `AppError` below 500 travels; anything else is logged server-side with
+  a reference the user is asked to quote.
+- **In-flight state is durable.** The flow/ticket store was a process-memory map whose
+  own header said a multi-replica deployment needed sticky routing or a shared store.
+  With `DATABASE_URL` set it is now `sso_flows` / `sso_tickets`, keyed on
+  `sha256(state)`, single-use by `DELETE … RETURNING`, swept lazily.
+- **SAML is refused, not half-built.** `POST /identity-providers` accepts `kind: "saml"`
+  as configuration and every flow route answers 501 with the reason. Implementing it
+  needs a reviewed XML-DSIG dependency with exclusive canonicalisation; a hand-rolled
+  signature check over XML is a well-known way to build an authentication bypass.
+
+### 1.8 SCIM 2.0 provisioning (spec Vol I #21)
+
+`/api/v1/scim/v2`. Per-tenant bearer tokens, hashed at rest exactly like every other
+credential here and shown once. The token authenticates a DIRECTORY, not a person: it
+carries no user id, and its authority is exactly "manage members of this one company", so
+every handler filters on the token's company rather than on anything in the request.
+
+Deprovisioning is real: `active: false` removes the company membership, revokes the
+sessions opened in that company, and deactivates the account platform-wide when it belongs
+to no other company. Groups are the four company roles; per-project permission templates
+are not exposed because SCIM has no concept of a project, and the discovery document says
+so rather than leaving an integrator to find out. The `owner` role is never removed by a
+directory.
+
+### 1.9 The tenant security policy (spec Vol I #23, #24, #25)
+
+`company_security_policies`, one row per tenant, set at `PUT /company/security-policy` by
+an owner or admin, ledgered and written to the security trail.
+
+**The rule that is not obvious: the strictest policy across a user's companies wins.** A
+session is an ACCOUNT-level object — one token reads data from every tenant the holder
+belongs to — so the policy governing it must be the strictest of the tenants it can reach.
+Anything else means a member of a lax tenant holds a long-lived, short-password session
+and then reads a strict tenant's records through it. Half the folds in
+`resolvePolicies` are minima (timeouts, attempt counts) and half are maxima (length,
+history depth, lockout duration); each direction is unit-tested, because getting one
+backwards silently weakens every multi-company user.
+
+The **IP allowlist is the exception** and has to be: intersecting several tenants'
+allowlists would produce an empty set and lock the user out of all of them. It is
+evaluated per tenant, and a sign-in is refused only when *every* company of that account
+refuses the address — one `login_blocked_ip` row rather than forty subsequent 403s.
+Three modes (`off`, `monitor`, `enforce`), a break-glass exemption list, and a refusal to
+enable `enforce` from an address the new list would itself refuse. An empty list in
+`enforce` mode is treated as `off`, because interpreting it literally is a tenant nobody
+can reach including the administrator who could fix it.
+
+Password history (`password_history`) retains hashes only, at the cost they were written
+at; a reuse check is N bcrypt comparisons, which is why N is a tenant setting with a hard
+ceiling of 24 rather than "all of them".
+
+### 1.10 Security event webhooks
+
+A tenant's `auth_security_events` can be pushed to a SIEM. Deliberately separate from the
+integrations webhooks: that subscription carries ledger events about the works and its
+subscribers are line-of-business systems, which have no business receiving a failed-login
+stream. The two share the wire format, the HMAC signing scheme and the SSRF policy, so one
+integrator implementation verifies both.
+
+Nothing that could be replayed ever leaves: the payload is built from the trail row, and
+`auth_security_events.metadata` is forbidden from holding a password, a raw token, a TOTP
+code or a recovery code in the first place.
+
+An event with **no company** — a failed login against an address that belongs to nobody —
+reaches no endpoint, because there is no tenant whose webhook it is. Those are exactly the
+rows an intrusion investigation needs most; they are retained platform-wide for the
+operator, and the tenant-facing audit says so rather than letting an auditor conclude
+there were none.
+
+### 1.11 MFA challenges are single-use and revocable (`mfa_challenges`)
+
+The challenge token is a MAC (`mfachal_v1.<claims>.<mac>`), purpose-separated from the JWT
+key so it cannot be presented as a bearer token; the CHALLENGE it names is a row.
+
+Consumption is an **upsert on the token's own `jti`**, not a lookup. That shape is the
+whole design: three modules mint challenges — `mfa` (`/auth/mfa/login`), `sso` (an IdP
+sign-in into a tenant that requires a second factor) and `identity` (`/auth/login`) — and
+requiring every minter to register first would have made a cross-module edit a
+precondition of every sign-in. So the first exchange either flips a live row or inserts an
+already-consumed one, and any later exchange finds a consumed row and is refused. A
+challenge minted by a module that never registered is single-use exactly like one that
+did.
+
+Registration at mint time adds what the upsert cannot: a challenge an administrator can
+revoke in flight. `POST /company/security/users/:id/mfa/reset` cuts them, because a
+challenge minted a minute before the reset is authority issued on the strength of the
+factor being removed.
+
+The store **fails open on an infrastructure error and closed on a replay**: a database
+that cannot be read is already an outage, and turning it into "nobody with a second factor
+can sign in" adds nothing to anyone's safety. The exposure under that failure is exactly
+the one the stateless design always had.
+
+Confirming a factor now also **tells the account holder** (`renderMfaEnrolled`, which
+existed and was never dispatched): the one change that most needs to reach a human is
+"a second factor now guards your account, and if it was not you, someone else holds your
+password".
+
+### 1.12 Data lifecycle for the authentication record (§0.2 #45, #46, #47)
+
+| Log | Holds | Past retention |
+|---|---|---|
+| `auth_security_events` | address, IP, user agent, kind, outcome, time | **pseudonymised** — address/IP/agent cleared, countable facts kept |
+| `email_dispatches` | recipient, subject, body preview | **deleted** — a preview of a message nobody can identify is not evidence |
+
+Three rules, in the order they override each other:
+
+1. **A legal hold beats a retention period**, always, and the sweep says it skipped the
+   tenant rather than reporting zero rows.
+2. **A tenant that has chosen nothing is not swept.** null means keep, which is what the
+   platform did before the policy existed.
+3. Otherwise the retention age applies, with a floor of 30 days — shorter than that and a
+   tenant would delete the record of the incident the audit exists to investigate.
+
+`GET /account/export` (spec #45) returns everything the authentication layer holds about
+the caller and **no credential**: no password hash, no TOTP seed, no recovery-code hash,
+no session or refresh token. An export is a file that ends up in a downloads folder, so
+putting a credential in it would turn a transparency feature into a second copy of the
+thing this platform hashes everything to avoid holding. Every export is ledgered as an
+`access` in each company the caller belongs to.
 
 ---
 
@@ -376,30 +553,30 @@ Ordered roughly by risk. "Spec" references are `docs/master-specification.md`.
 
 | # | Gap | Notes / spec ref |
 |---|---|---|
-| 1 | **No MFA** | Vol I #22 |
+| 1 | ~~**No MFA**~~ — **CLOSED.** TOTP enrolment, challenge, recovery codes, per-action step-up and a tenant policy that makes it mandatory. See §1.6 | Vol I #22 |
 | 2 | **Ledger anchoring & escrow: built, and its guarantee is only as strong as the key custody** — Phase 7 closed what was the second structural hole. Chain seals commit to `entryCount` and a Merkle root over every entry hash, signed Ed25519 with a private half that never enters the database, chained to one another by `prevSealHash`; heartbeat seals bound how long a truncation can hide; `classifyChain` names the failing seal or entry sequence; escrow receipts are verifiable offline by a third party. Tail truncation and wholesale rewrite are **detected**, tested against real corrupted database state. What remains: outside production with `ANCHOR_SIGNING_KEY` unset the key is derived from `AUTH_SECRET` and is therefore held by the same operator who runs the application — proving integrity against a database-only attacker, **not** against the operator. That weakening is carried in every key, seal, verdict and receipt (`derivedFromAuthSecret`, key ids prefixed `ankd_`), and production refuses to seal without a real key Adversarial testing also found, and closed, a second custody hole: signature checking read public keys from `signing_keys` — inside the database under attack — so a database-only attacker could register their own key and re-sign a rewritten chain to a clean `intact`. `ANCHOR_TRUSTED_FINGERPRINTS` now pins accepted fingerprints out of band; unpinned, every verdict carries a `trustAnchor` block naming the attack and the remedy. Bounded claim: **sealing defeats a database-only attacker who does not also register a key; pinning removes that qualifier** | ADR 0017; Domain S #860–861, #874; `modules/anchoring/keys.ts` |
 | 3 | **No trusted timestamping — narrowed, not closed** — ledger `at` and seal `sealedAt` are still the app-server clock, so seals prove **order**, not wall-clock time. The mechanism to close this is built and fixture-tested: the RFC 3161 and OpenTimestamps providers carry real wire implementations behind an injected client, and with no `ANCHOR_TSA_URL` / `ANCHOR_OTS_CALENDAR_URL` configured they record `unavailable` naming the missing variable rather than fabricating a proof (a successful OpenTimestamps submission records `pending` — a calendar receipt is not yet a Bitcoin attestation). What remains is configuration and a network route, not code | ADR 0017; Domain S #864; `modules/anchoring/providers.ts` |
-| 4 | **No SSO (SAML) / SCIM** — blocks enterprise tenants | Vol I #20–21 |
-| 5 | Access-token revocation only via 1h expiry (no jti denylist); refresh-token **reuse detection** absent; no progressive lockout on top of the auth rate limit | §1.2–1.3 |
+| 4 | **SAML is still absent; OIDC SSO and SCIM 2.0 are implemented.** OIDC sign-in (PKCE, JWKS-verified id_tokens, per-tenant connections, domain allow-lists, JIT provisioning with permission templates) and SCIM 2.0 Users/Groups with real deprovisioning both ship — see §1.7 and §1.8. What remains is SAML 2.0, which needs a reviewed XML-DSIG dependency and is refused with a 501 that names the reason rather than half-implemented | Vol I #20–21 |
+| 5 | **Narrowed.** Access tokens now carry a `sid` naming an `auth_sessions` row that `plugins/auth.ts` re-reads on every request, so revocation is enforced on the access path rather than at the next refresh; a progressive delay and a two-scope lockout (per account and per IP, derived from the trail rather than a counter column) sit on top of the per-IP rate limit. What remains: no jti denylist for a token minted without a `sid`, and refresh-token reuse detection is still absent | §1.2–1.3 |
 | 6 | **No DB-level row security** — tenant isolation is a code convention; one missed `companyId` filter is a cross-tenant leak | add Postgres RLS keyed on a per-request setting as defense-in-depth |
-| 7 | CORS `origin: true` and open registration — fine for dev, must be tightened per deployment | `app.ts`; noted in `docs/deployment.md` §2.8 |
+| 7 | **Narrowed.** CORS no longer reflects every origin: in production the allowed set is `APP_BASE_URL`'s origin plus whatever `CORS_ORIGINS` names, and a request from anywhere else is answered without the credentialed CORS headers. Development still reflects, deliberately. What remains is **open registration** — anyone may create a company at `POST /auth/register`, which is right for a self-serve product and wrong for a single-tenant deployment, and there is no switch to close it | `app.ts` (cors registration), `config.ts` (`CORS_ORIGINS`); `docs/deployment.md` §4.1 |
 | 8 | Storage: no hash re-verification on read, no malware scanning of uploads; local driver (dev/volume mode) unencrypted at rest | §4; Domain S #862 (retrieval half) |
 | 9 | Ledger coverage relies on module convention (no DB trigger writes entries for out-of-band changes); no automated drift job comparing row state to last `payloadHash` | §5 |
 | 10 | Overlapping operational + assurance roles for the same user are not forbidden | §2.4 |
 | 11 | Register route reveals email existence (409); no email verification flow | §1.1 |
-| 12 | **No IP allowlisting**, session timeout policy, or password policy configuration | Vol I #23–25 |
+| 12 | ~~**No IP allowlisting, session timeout policy, or password policy configuration**~~ — **CLOSED.** A per-tenant security policy covers all three plus lockout thresholds and password history; the strictest policy across a user's companies wins. See §1.9 | Vol I #23–25 |
 | 13 | **No log forwarding pipeline** — app logs are stdout JSON only; platform retention is finite (~30 days on Railway Pro) and `auth_events`/ledger cover mutations, not infrastructure events | operational option (Vector sidecar) documented in `docs/deployment.md` §3.3 |
 | 14 | Read access is mostly unlogged (exceptions: `file_access_log`, ledger `access` entries); regulator access is read-all rather than record-scoped | Domain A #92 wants scoped regulator portals |
 | 15 | No field-level visibility control on financial data (tools are all-or-nothing per level) | Vol I #18 |
 | 16 | Refresh tokens and JWTs are bearer credentials — TLS termination is the platform's job (the app sends HSTS via helmet but cannot terminate TLS itself) | per-deployment TLS documented in `docs/deployment.md` §2.6 |
 | 17 | **Evidence-pathway independence is available but not provable** — Phase 6 narrowed what was the highest-consequence gap on this list: evidence streams now have a separate machine inlet (`POST /ingestion/push/:dataset`, dataset-scoped SHA-256-stored tokens, §1.5), so payroll and site access no longer *must* share a pathway, and the record distinguishes the pathways forever. What remains: nothing attests **who operates the pushing system** — a token handed to the employer's own administrator reproduces the shared-pathway condition exactly; the workforce module's user-facing bulk route (`POST …/site-access`) stays open; and no deployment yet receives a real third-party feed. Independence became a product capability; it is still a deployment property | ADR 0004, ADR 0014, ADR 0015; `site_access_records.source` + per-run token provenance is where feed attestation attaches next (`docs/roadmap.md`, "Recommended next sequence" step 1) |
-| 18 | **Personal data of workers and affected households is now held with no lifecycle tooling** — `workers` carries date of birth, nationality, employer and pay rate; `payroll_entries` carries pay; `affected_persons` carries household composition, socio-economic baselines and **vulnerability flags** (disability, indigeneity, poverty, child-headed household). There is no data-subject export or erasure path, no retention policy, no consent record, and no field-level masking; deletion is whatever the module's routes happen to allow. Tool-level permissions are the only control, and they are all-or-nothing (see gap 15) | Vol I §0.2 data residency & compliance (#29–48) is unimplemented as a section; the schema deliberately stores verification *flags* rather than identity-document images (`workers.idVerified`/`biometricEnrolled`), which limits but does not remove the exposure |
+| 18 | **Narrowed to the domain modules.** The AUTHENTICATION record now has the full set: `GET /account/export` (a data-subject export that carries no credential), per-tenant retention that pseudonymises `auth_security_events` and deletes `email_dispatches`, a legal hold that overrides both, and a daily sweep — see §1.12. What remains is unchanged and is the larger half: personal data of workers and affected households is held with no lifecycle tooling. `workers` carries date of birth, nationality, employer and pay rate; `payroll_entries` carries pay; `affected_persons` carries household composition, socio-economic baselines and **vulnerability flags** (disability, indigeneity, poverty, child-headed household). There is no data-subject export or erasure path, no retention policy, no consent record, and no field-level masking; deletion is whatever the module's routes happen to allow. Tool-level permissions are the only control, and they are all-or-nothing (see gap 15) | Vol I §0.2 data residency & compliance (#29–48) is unimplemented as a section; the schema deliberately stores verification *flags* rather than identity-document images (`workers.idVerified`/`biometricEnrolled`), which limits but does not remove the exposure |
 | 19 | **Anonymity is structural at intake but not end-to-end** — an anonymous grievance has its complainant name and contact stripped before the row is written (not merely hidden), but the free-text `description`, the `locationId` and the linked `papId` can still identify a complainant in a small community, and nothing redacts them. Retaliation monitoring (M#691) is not built | `modules/land/grievances.ts`, intake route |
 | 20 | **No independent inspector or complainant-facing role** — welfare inspections, grievance closure verification and gate reviews are all recorded by users inside the tenant being assessed. Assurance grants give an outsider read access, never the ability to *author* the verifying record | §2.4 residual weakness; Domain M #689–692, Domain G #411 |
 | 21 | **Benchmark anonymization is aggregation + min-n, not differential privacy** — a contributed sample is protected by never returning contributor ids and by suppressing cells below n = 5, which defeats casual inference, not a determined adversary: a contributor comparing a small cell's statistics before and after another contribution can bound the newcomer's value, and `assetClass`/`region` are self-declared, so a contributor also chooses how identifying its cell is. Stated in the ADR rather than discovered later | ADR 0016; `MIN_SAMPLE_N` in `modules/benchmarks/metrics.ts` |
 
 | 22 | **Webhook and OAuth secret custody shares the application's own key material by default** — webhook signing secrets are HKDF-derived from `WEBHOOK_SIGNING_KEY`, falling back to `AUTH_SECRET`, so under the fallback anyone holding the application secret can forge a signature a receiver would accept. OAuth client secrets and issued access tokens are stored as SHA-256 hashes only and shown once, but a machine caller's bearer token is, like the human one, a bearer credential | ADR 0018; `modules/integrations/signing.ts`, `modules/integrations/oauth.ts` |
-| 23 | **Outbound webhooks are an egress path out of the tenant boundary** — a delivery carries record payloads to an operator-nominated URL. Endpoint URLs are not restricted to an allowlist and no SSRF-style guard forbids internal addresses; a mis-scoped or malicious endpoint is an exfiltration channel authorised by a company admin. Deliveries are logged, signed and per-company, and auto-disable after consecutive failures, which limits blast radius without closing the class | `modules/integrations/dispatcher.ts`; tenant isolation of deliveries is tested |
+| 23 | **Outbound webhooks are an egress path out of the tenant boundary** — a delivery carries record payloads to an operator-nominated URL, authorised by a company admin. An SSRF guard now refuses destinations that name or resolve to the platform's own network, and it runs on EVERY delivery rather than only at registration (DNS moves). Deliveries are logged, signed and per-company, and auto-disable after consecutive failures. What remains is the class itself: a *public* destination the admin chose is still an exfiltration channel | `modules/integrations/ssrf.ts`, `modules/integrations/dispatcher.ts`, `modules/account/webhooks.ts` |
 
 None of these are silent: this register, `docs/roadmap.md` and the ADRs are the paper trail
 that they are known, scoped and sequenced.

@@ -1,12 +1,16 @@
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, isNull } from "drizzle-orm";
 import { z } from "zod";
 import {
   bidAwards,
   bidInvitations,
+  bidLevellingEntries,
   bidLevellingItems,
   bidPackages,
+  bidSubmissionLines,
   bidSubmissions,
+  budgetLineItems,
+  signals,
   vendors,
 } from "@constructos/db";
 import {
@@ -50,7 +54,12 @@ import {
   sealState,
   type SealState,
 } from "./sealing.js";
-import { effectiveLimit, sweepPrequalification, vendorPrequalStatus } from "./prequal-status.js";
+import {
+  batchVendorPrequalStatus,
+  effectiveLimit,
+  sweepPrequalification,
+} from "./prequal-status.js";
+import { findScopeGaps } from "./analytics-math.js";
 import { checkContractAgainstLimit } from "./financial-limits.js";
 
 /* ------------------------------------------------------------------ */
@@ -177,6 +186,51 @@ export interface Addendum {
 export const addendaOf = (pkg: BidPackageRow): Addendum[] =>
   ((pkg.detail as Record<string, unknown>)["addenda"] as Addendum[] | undefined) ?? [];
 
+export interface AddendumStatus extends Addendum {
+  acknowledgedBy: string[];
+  outstandingFrom: string[];
+}
+
+/**
+ * Addenda with their acknowledgement state.
+ *
+ * This used to live only in `GET .../addenda`, so the package detail returned
+ * bare addenda and the drawer's "N invited bidders have not acknowledged"
+ * warning — which reads `outstandingFrom` — never rendered. One function,
+ * used by both, so the two screens cannot disagree about who has answered.
+ */
+export function addendaWithAcknowledgement(
+  pkg: BidPackageRow,
+  invitations: readonly {
+    vendorId: string;
+    status: string;
+    addendaAcknowledged: unknown;
+  }[],
+): AddendumStatus[] {
+  return addendaOf(pkg).map((a) => {
+    const acknowledgedBy = invitations
+      .filter((inv) =>
+        ((inv.addendaAcknowledged as { addendumRef?: string }[]) ?? []).some(
+          (ack) => ack.addendumRef === a.reference,
+        ),
+      )
+      .map((inv) => inv.vendorId);
+    return {
+      ...a,
+      acknowledgedBy,
+      outstandingFrom: invitations
+        .filter(
+          (inv) =>
+            !acknowledgedBy.includes(inv.vendorId) &&
+            inv.status !== "declined" &&
+            inv.status !== "withdrawn" &&
+            inv.status !== "disqualified",
+        )
+        .map((inv) => inv.vendorId),
+    };
+  });
+}
+
 /* ------------------------------------------------------------------ */
 /* Views                                                               */
 /* ------------------------------------------------------------------ */
@@ -227,7 +281,13 @@ export function requirementsOf(pkg: BidPackageRow) {
 export function estimateComparison(
   pkg: BidPackageRow,
   seal: SealState,
-  submissions: readonly { totalAmount: number | null; currency: string; status: string }[],
+  submissions: readonly {
+    totalAmount: number | null;
+    currency: string;
+    status: string;
+    isLate?: number;
+    lateAcceptedBy?: string | null;
+  }[],
 ): { lowest: Unknowable; median: Unknowable; againstEstimatePercent: Unknowable } {
   const withheld = seal.amountsWithheld;
   const blocked = (extra: string) =>
@@ -243,7 +303,21 @@ export function estimateComparison(
       againstEstimatePercent: blocked(""),
     };
   }
-  const live = submissions.filter((s) => isInContention(s.status) && s.totalAmount !== null);
+  /*
+   * A LATE BID NOBODY HAS ACCEPTED IS NOT IN THE MARKET.
+   *
+   * Levelling, scoring and the award comparison all exclude it; these tiles
+   * did not, so the package detail, the tabulation and the Bids tab could
+   * report a "lowest bid" and an "against estimate" figure driven by a bid
+   * that cannot be awarded. The buyer then negotiates against a number that
+   * does not exist.
+   */
+  const live = submissions.filter(
+    (s) =>
+      isInContention(s.status) &&
+      s.totalAmount !== null &&
+      !(s.isLate === 1 && !s.lateAcceptedBy),
+  );
   const currencies = distinctCurrencies(live.map((s) => s.currency));
   if (live.length === 0) {
     const why = "No bid on this package carries a total amount yet.";
@@ -308,6 +382,43 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
     }
   }
 
+  /**
+   * The budget lines an award will be charged against must EXIST on this
+   * project. The column accepted arbitrary strings, and the first thing that
+   * noticed was `insertSovLine` — throwing after the award approval had
+   * already created a commitment, which left an orphan. Validation belongs
+   * where the value is entered.
+   */
+  async function assertBudgetLines(
+    companyId: string,
+    projectId: string,
+    ids: readonly string[] | undefined,
+  ): Promise<void> {
+    if (!ids || ids.length === 0) return;
+    const unique = [...new Set(ids)];
+    const rows = await app.db
+      .select({ id: budgetLineItems.id })
+      .from(budgetLineItems)
+      .where(
+        and(
+          eq(budgetLineItems.companyId, companyId),
+          eq(budgetLineItems.projectId, projectId),
+          inArray(budgetLineItems.id, unique),
+        ),
+      );
+    const found = new Set(rows.map((r) => r.id));
+    const missing = unique.filter((id) => !found.has(id));
+    if (missing.length > 0) {
+      throw badRequest(
+        `${missing.length} budgetLineItemId(s) are not budget lines on this project: ` +
+          `${missing.join(", ")}. The award created from this package charges its committed cost ` +
+          "to the first of these, so an id that does not resolve produces a commitment with " +
+          "nowhere to land — and it fails half way through the approval, after the commitment " +
+          "has been created.",
+      );
+    }
+  }
+
   function assertCriteria(criteria: z.infer<typeof criterionSchema>[] | undefined): void {
     if (!criteria) return;
     const keys = new Set<string>();
@@ -357,8 +468,12 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
       .where(eq(bidSubmissions.packageId, pkg.id))
       .orderBy(asc(bidSubmissions.createdAt));
     const seal = sealState(pkg);
-    const [invitationCount] = await db
-      .select({ n: count() })
+    const invitationRows = await db
+      .select({
+        vendorId: bidInvitations.vendorId,
+        status: bidInvitations.status,
+        addendaAcknowledged: bidInvitations.addendaAcknowledged,
+      })
       .from(bidInvitations)
       .where(eq(bidInvitations.packageId, pkg.id));
     const [levellingItemCount] = await db
@@ -370,23 +485,34 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
       .from(bidAwards)
       .where(eq(bidAwards.packageId, pkg.id))
       .orderBy(desc(bidAwards.createdAt));
+    const addenda = addendaWithAcknowledgement(pkg, invitationRows);
 
     return {
       ...pkg,
       seal,
       timetable: timetableOf(pkg),
       requirements: requirementsOf(pkg),
-      addenda: addendaOf(pkg),
+      addenda,
+      publication: {
+        isPublished: pkg.isPublished === 1,
+        publishedAt: pkg.publishedAt,
+        publishedBy: pkg.publishedBy,
+        publicSummary: pkg.publicSummary,
+      },
       counts: {
-        invitations: Number(invitationCount?.n ?? 0),
+        invitations: invitationRows.length,
         submissions: subs.length,
         declines: pkg.declineCount,
         addenda: pkg.addendaCount,
         levellingItems: Number(levellingItemCount?.n ?? 0),
+        addendaOutstanding: addenda.reduce(
+          (n, a) => n + (a.requiresAcknowledgement ? a.outstandingFrom.length : 0),
+          0,
+        ),
       },
       submissions: subs.map((s) => redactSubmission(s, seal)),
       market: estimateComparison(pkg, seal, subs),
-      awards: awardRows,
+      awards: awardRows.map((a) => ({ ...a, isLowestBid: a.isLowestBid === 1 })),
     };
   }
 
@@ -400,6 +526,7 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
     const projectId = req.projectId!;
     assertWeights(body.priceWeight ?? null, body.qualityWeight ?? null);
     assertCriteria(body.evaluationCriteria);
+    await assertBudgetLines(companyId, projectId, body.budgetLineItemIds);
 
     if (body.isSealed && !body.bidDueAt && !body.sealedUntil) {
       throw badRequest(
@@ -547,15 +674,84 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
       if (pkg.status === "awarded" || pkg.status === "cancelled") {
         throw conflict(`A ${pkg.status} package can no longer be edited.`);
       }
-      const issued = ISSUED_STATUSES.includes(pkg.status);
+      const [submissionCountRow] = await app.db
+        .select({ n: count() })
+        .from(bidSubmissions)
+        .where(eq(bidSubmissions.packageId, packageId));
+      const bidsRecorded = Number(submissionCountRow?.n ?? 0);
+      /*
+       * The basis is frozen once bidders can see the package OR once any bid
+       * has been recorded against it — whichever happens first. Freezing on
+       * status alone left a hole: bids could be recorded on a draft package,
+       * and `isSealed` could then be PATCHed away, exposing every recorded
+       * amount with no opening, no witness and no ledger entry. Submissions
+       * on unissued packages are now refused outright, and this is the second
+       * lock on the same door.
+       */
+      const issued = ISSUED_STATUSES.includes(pkg.status) || bidsRecorded > 0;
       if (issued) {
         const touched = BASIS_FIELDS.filter((f) => body[f] !== undefined);
         if (touched.length > 0) {
           throw conflict(
-            `The evaluation basis cannot be changed after the package has been issued — ` +
-              `${touched.join(", ")} ${touched.length === 1 ? "is" : "are"} frozen at issue. ` +
+            `The evaluation basis cannot be changed once the package has been issued or any bid ` +
+              `has been recorded — ${touched.join(", ")} ` +
+              `${touched.length === 1 ? "is" : "are"} frozen. ` +
+              (bidsRecorded > 0
+                ? `${bidsRecorded} bid(s) are already on this package. `
+                : "") +
               "How the winner will be chosen is declared before bids open, never after the " +
-              "prices are visible. Cancel and re-tender if the basis was wrong.",
+              "prices are in the room. Cancel and re-tender if the basis was wrong.",
+          );
+        }
+      }
+
+      /*
+       * --- Bug: the deadline could be shortened or erased after issue ---
+       *
+       * `bidDueAt` decides which bids are late, and `sealedUntil` decides
+       * when the seal may lift. Both were plain copy fields, so a standard
+       * user could move the deadline backwards (making on-time bids late) or
+       * set it to null on a sealed package (leaving a seal with no moment to
+       * lift and no lawful opening), while the addendum route correctly
+       * refused exactly the same change.
+       */
+      if (issued && body.bidDueAt !== undefined) {
+        if (body.bidDueAt === null) {
+          throw badRequest(
+            "bidDueAt cannot be cleared once the package has been issued or bids exist. A " +
+              "tender with no deadline has no late bids and no fair ones either, and a sealed " +
+              "package with no deadline has no moment at which the seal may lawfully lift.",
+          );
+        }
+        const current = epochMs(pkg.bidDueAt);
+        const next = epochMs(body.bidDueAt);
+        if (current !== null && next !== null && next < current) {
+          throw badRequest(
+            `The bid deadline may be extended but never shortened: bidders have planned around ` +
+              `${pkg.bidDueAt}. Moving it to ${body.bidDueAt} would make bids retroactively ` +
+              "late. Issue an addendum with the new date instead — that is the route that " +
+              "tells every bidder the date has moved.",
+          );
+        }
+      }
+      {
+        const nextSealedUntil =
+          body.sealedUntil !== undefined ? body.sealedUntil : pkg.sealedUntil;
+        const nextBidDueAt = body.bidDueAt !== undefined ? body.bidDueAt : pkg.bidDueAt;
+        if (
+          nextSealedUntil &&
+          nextBidDueAt &&
+          (epochMs(nextSealedUntil) ?? 0) < (epochMs(nextBidDueAt) ?? 0)
+        ) {
+          throw badRequest(
+            "sealedUntil is before bidDueAt: the seal would lift while bids were still being " +
+              "taken, which is the one thing a seal exists to prevent.",
+          );
+        }
+        if (pkg.isSealed === 1 && body.sealedUntil === null && !nextBidDueAt) {
+          throw badRequest(
+            "Clearing sealedUntil on a sealed package with no bid deadline would leave no " +
+              "moment at which the seal could lift.",
           );
         }
       }
@@ -564,6 +760,7 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
         body.qualityWeight !== undefined ? (body.qualityWeight ?? null) : pkg.qualityWeight,
       );
       assertCriteria(body.evaluationCriteria);
+      await assertBudgetLines(req.companyId!, req.projectId!, body.budgetLineItemIds);
 
       const detail: Record<string, unknown> = {
         ...(pkg.detail as Record<string, unknown>),
@@ -650,8 +847,32 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
         .select({ n: count() })
         .from(bidInvitations)
         .where(eq(bidInvitations.packageId, packageId));
-      if (Number(invited?.n ?? 0) > 0) {
-        throw conflict("This package has invitations against it and cannot be deleted. Cancel it.");
+      const [bids] = await app.db
+        .select({ n: count() })
+        .from(bidSubmissions)
+        .where(eq(bidSubmissions.packageId, packageId));
+      const [scopeRows] = await app.db
+        .select({ n: count() })
+        .from(bidLevellingItems)
+        .where(eq(bidLevellingItems.packageId, packageId));
+      const attached = [
+        Number(invited?.n ?? 0) > 0 ? `${invited?.n} invitation(s)` : null,
+        Number(bids?.n ?? 0) > 0 ? `${bids?.n} bid(s)` : null,
+        Number(scopeRows?.n ?? 0) > 0 ? `${scopeRows?.n} levelling scope row(s)` : null,
+      ].filter((x): x is string => x !== null);
+      if (attached.length > 0) {
+        /*
+         * Deleting the package used to check invitations only, so a draft
+         * package carrying levelling rows, submissions and priced lines could
+         * be deleted and leave every one of those rows behind pointing at a
+         * package id that no longer resolved.
+         */
+        throw conflict(
+          `This package carries ${attached.join(", ")} and cannot be deleted — those records ` +
+            "would be left pointing at a package that no longer exists. Cancel it instead: the " +
+            "record of a tender that went out and was abandoned is itself worth keeping, and a " +
+            "cancelled package still answers what was asked of whom.",
+        );
       }
       await app.db.delete(bidPackages).where(eq(bidPackages.id, packageId));
       await ledger(app.db, req, "delete", "bid_package", packageId, {
@@ -746,8 +967,20 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
     async (req) => {
       const { packageId } = req.params as { packageId: string };
       const pkg = await fetchPackage(app.db, packageId, req.companyId!, req.projectId!);
-      if (!ISSUED_STATUSES.includes(pkg.status)) {
-        throw conflict(`A ${pkg.status} package cannot be closed to bids.`);
+      /*
+       * Closing means "the tender period is over". It is not a way back from
+       * levelled, under_evaluation or partially_awarded: moving those to
+       * "closed" erased the levelled marker (so the grid's levelledAt went
+       * null) and the partial-award marker, losing work that had been done
+       * rather than recording that a period had ended.
+       */
+      if (pkg.status !== "invitations_sent" && pkg.status !== "open") {
+        throw conflict(
+          `A ${pkg.status} package cannot be closed to bids. Closing marks the end of the ` +
+            "tender period, so it applies only while the period is running " +
+            "(invitations_sent or open). Going back to 'closed' from a later status would " +
+            "discard the evaluation state that status records.",
+        );
       }
       const now = new Date().toISOString();
       await app.db
@@ -830,7 +1063,17 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
           ),
         );
 
-      await app.db
+      /*
+       * THE SEAL IS BROKEN ONCE, AND THE UPDATE SAYS SO.
+       *
+       * `assertOpeningPermitted` reads `openedAt` from a row fetched a moment
+       * earlier. With an unconditional UPDATE, two openers racing both passed
+       * the check, both wrote themselves in, and the second silently
+       * overwrote the record of the first — while two "sealed_bid_opening"
+       * ledger entries claimed the very thing the conflict message says
+       * cannot happen. The condition belongs in the statement.
+       */
+      const claimed = await app.db
         .update(bidPackages)
         .set({
           openedAt: now,
@@ -844,7 +1087,16 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
           },
           updatedAt: now,
         })
-        .where(eq(bidPackages.id, packageId));
+        .where(and(eq(bidPackages.id, packageId), isNull(bidPackages.openedAt)))
+        .returning({ id: bidPackages.id });
+      if (claimed.length === 0) {
+        const current = await fetchPackage(app.db, packageId, req.companyId!, req.projectId!);
+        throw conflict(
+          `This package was opened at ${current.openedAt} by ${current.openedBy} while this ` +
+            "request was in flight. A seal is broken once; the first opening stands and this " +
+            "one changed nothing.",
+        );
+      }
 
       for (const sub of subs) {
         await app.db
@@ -974,31 +1226,348 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
         .select()
         .from(bidInvitations)
         .where(eq(bidInvitations.packageId, packageId));
-      const addenda = addendaOf(pkg);
+      const items = addendaWithAcknowledgement(pkg, invites);
+      return { items, total: items.length };
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Bid board publication (#180)                                      */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * PUBLISHING A PACKAGE TO THE BID BOARD.
+   *
+   * The board is how a supply chain finds out work exists without being on a
+   * list somebody drew up years ago — which is the single most effective
+   * thing a buyer can do about a closed, rotating bidder set. What the board
+   * shows is deliberately narrow: the scope, the trade, the timetable and how
+   * to express interest. NEVER the pre-tender estimate, never the budget,
+   * never who else has been invited. A board that publishes the estimate has
+   * priced the job for the market.
+   */
+  app.post(
+    "/projects/:projectId/bid-packages/:packageId/publish",
+    { preHandler: standardGate },
+    async (req) => {
+      const { packageId } = req.params as { packageId: string };
+      const body = z
+        .object({
+          publish: z.boolean().default(true),
+          publicSummary: z.string().trim().min(20).max(8000).nullable().optional(),
+        })
+        .parse(req.body ?? {});
+      const pkg = await fetchPackage(app.db, packageId, req.companyId!, req.projectId!);
+      if (body.publish) {
+        if (!pkg.approvedBy) {
+          throw conflict(
+            "This package has not been approved for issue, so it cannot be published to the " +
+              "bid board. Publishing an unapproved scope invites the market to price the wrong " +
+              "job.",
+          );
+        }
+        if (!pkg.bidDueAt) {
+          throw badRequest(
+            "Set bidDueAt before publishing. A board entry with no closing date tells nobody " +
+              "when to respond by.",
+          );
+        }
+      }
+      const now = new Date().toISOString();
+      await app.db
+        .update(bidPackages)
+        .set({
+          isPublished: body.publish ? 1 : 0,
+          publishedAt: body.publish ? (pkg.publishedAt ?? now) : null,
+          publishedBy: body.publish ? (pkg.publishedBy ?? req.user!.id) : null,
+          publicSummary:
+            body.publicSummary !== undefined ? body.publicSummary : pkg.publicSummary,
+          updatedAt: now,
+        })
+        .where(eq(bidPackages.id, packageId));
+      await ledger(app.db, req, "state_change", "bid_package", packageId, {
+        projectId: req.projectId!,
+        event: body.publish ? "published_to_bid_board" : "withdrawn_from_bid_board",
+        reference: pkg.reference,
+        tradeCode: pkg.tradeCode,
+        bidDueAt: pkg.bidDueAt,
+      }, req.projectId!, true);
+      return packageDetail(
+        app.db,
+        await fetchPackage(app.db, packageId, req.companyId!, req.projectId!),
+      );
+    },
+  );
+
+  /**
+   * The board itself, company-wide. Available to any company member: finding
+   * out what this company is buying is not a privileged act, and the numbers
+   * that ARE privileged are not on it.
+   */
+  app.get(
+    "/companies/current/bid-board",
+    { preHandler: [app.authenticate, app.requireCompany] },
+    async (req) => {
+      const q = z
+        .object({
+          tradeCode: z.string().max(60).optional(),
+          openOnly: z
+            .union([z.boolean(), z.string()])
+            .optional()
+            .transform((v) => v === true || v === "true"),
+        })
+        .parse(req.query ?? {});
+      const rows = await app.db
+        .select()
+        .from(bidPackages)
+        .where(
+          and(
+            eq(bidPackages.companyId, req.companyId!),
+            eq(bidPackages.isPublished, 1),
+            ...(q.tradeCode ? [eq(bidPackages.tradeCode, q.tradeCode)] : []),
+          ),
+        )
+        .orderBy(asc(bidPackages.bidDueAt))
+        .limit(200);
+      const nowMs = Date.now();
+      const items = rows
+        .filter((p) => {
+          if (p.status === "cancelled" || p.status === "awarded") return false;
+          if (!q.openOnly) return true;
+          return p.bidDueAt !== null && (epochMs(p.bidDueAt) ?? 0) > nowMs;
+        })
+        .map((p) => ({
+          id: p.id,
+          projectId: p.projectId,
+          reference: p.reference,
+          title: p.title,
+          summary: p.publicSummary ?? p.scopeDescription,
+          packageKind: p.packageKind,
+          procurementRoute: p.procurementRoute,
+          tradeCode: p.tradeCode,
+          csiDivision: p.csiDivision,
+          currency: p.currency,
+          status: p.status,
+          publishedAt: p.publishedAt,
+          questionsDueAt: p.questionsDueAt,
+          bidDueAt: p.bidDueAt,
+          siteVisitAt: p.siteVisitAt,
+          isSiteVisitMandatory: p.isSiteVisitMandatory === 1,
+          prequalificationRequired: p.prequalificationRequired === 1,
+          closed: p.bidDueAt === null ? null : (epochMs(p.bidDueAt) ?? 0) <= nowMs,
+          hoursToClose:
+            p.bidDueAt === null
+              ? null
+              : round2(((epochMs(p.bidDueAt) ?? nowMs) - nowMs) / 3_600_000),
+        }));
       return {
-        items: addenda.map((a) => {
-          const acknowledgedBy = invites
-            .filter((inv) =>
-              ((inv.addendaAcknowledged as { addendumRef?: string }[]) ?? []).some(
-                (ack) => ack.addendumRef === a.reference,
-              ),
-            )
-            .map((inv) => inv.vendorId);
-          return {
-            ...a,
-            acknowledgedBy,
-            outstandingFrom: invites
-              .filter(
-                (inv) =>
-                  !acknowledgedBy.includes(inv.vendorId) &&
-                  inv.status !== "declined" &&
-                  inv.status !== "withdrawn" &&
-                  inv.status !== "disqualified",
-              )
-              .map((inv) => inv.vendorId),
-          };
-        }),
-        total: addenda.length,
+        items,
+        total: items.length,
+        note:
+          "The board carries the scope, the trade and the timetable. It never carries the " +
+          "pre-tender estimate, the budget or the list of who else has been invited — a board " +
+          "that publishes the estimate has priced the job for the market.",
+      };
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Scope gaps across bids (#172)                                     */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * WHERE THE BIDS DISAGREE ABOUT WHAT THEY ARE BUYING.
+   *
+   * The failure this catches makes the cheapest bid the most expensive: a
+   * scope row nobody priced, or that only the expensive bidders priced. The
+   * low bid is then low because it is missing work, which will be bought
+   * after the award from the winner, with no competition.
+   */
+  app.get(
+    "/projects/:projectId/bid-packages/:packageId/scope-gaps",
+    { preHandler: readGate },
+    async (req) => {
+      const { packageId } = req.params as { packageId: string };
+      const pkg = await fetchPackage(app.db, packageId, req.companyId!, req.projectId!);
+      const seal = sealState(pkg);
+      if (seal.amountsWithheld) {
+        return {
+          seal,
+          sealed: true,
+          gaps: [],
+          summary: { rows: 0, gapRows: 0, universalGaps: 0, exposure: null },
+          note: `Scope coverage is part of the comparison and the comparison is sealed. ${seal.note}`,
+        };
+      }
+      const items = await app.db
+        .select()
+        .from(bidLevellingItems)
+        .where(eq(bidLevellingItems.packageId, packageId))
+        .orderBy(asc(bidLevellingItems.position));
+      const entries = await app.db
+        .select()
+        .from(bidLevellingEntries)
+        .where(eq(bidLevellingEntries.packageId, packageId));
+      const subs = await app.db
+        .select()
+        .from(bidSubmissions)
+        .where(eq(bidSubmissions.packageId, packageId));
+      const contenders = subs.filter(
+        (sub) => isInContention(sub.status) && !(sub.isLate === 1 && !sub.lateAcceptedBy),
+      );
+      const contenderIds = new Set(contenders.map((c) => c.id));
+      const vendorIds = [...new Set(contenders.map((c) => c.vendorId))];
+      const vendorRows = vendorIds.length
+        ? await app.db
+            .select({ id: vendors.id, name: vendors.name })
+            .from(vendors)
+            .where(inArray(vendors.id, vendorIds))
+        : [];
+      const names = new Map(vendorRows.map((v) => [v.id, v.name] as const));
+
+      const result = findScopeGaps(
+        items.map((item) => ({
+          itemId: item.id,
+          itemCode: item.itemCode,
+          description: item.description,
+          isMandatory: item.isMandatory === 1,
+          engineersEstimate: item.engineersEstimate,
+          answers: entries
+            .filter((e) => e.levellingItemId === item.id && contenderIds.has(e.submissionId))
+            .map((e) => ({
+              submissionId: e.submissionId,
+              vendorId: e.vendorId,
+              vendorName: names.get(e.vendorId) ?? null,
+              includedStatus: e.includedStatus,
+              levelledAmount: e.levelledAmount,
+              adjustmentAmount: e.adjustmentAmount,
+            })),
+        })),
+        contenders.length,
+      );
+      return {
+        seal,
+        sealed: false,
+        contenders: contenders.length,
+        ...result,
+        vendors: contenders.map((c) => ({
+          submissionId: c.id,
+          vendorId: c.vendorId,
+          vendorName: names.get(c.vendorId) ?? null,
+        })),
+        note:
+          items.length === 0
+            ? "This package has no levelling scope rows, so there is nothing to test coverage " +
+              "against. Scope gaps are found by asking every bidder the same question about " +
+              "the same row — without the rows, the question cannot be asked."
+            : result.summary.universalGaps > 0
+              ? `${result.summary.universalGaps} scope row(s) are in NOBODY's price. That work ` +
+                "will be bought after the award, from the winner, without competition."
+              : `${result.summary.gapRows} of ${items.length} scope row(s) are not carried by ` +
+                "every bidder. Until the levelling adjusts for them, the totals are not " +
+                "like-for-like.",
+      };
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Health inputs — what this module contributes to project health     */
+  /* ---------------------------------------------------------------- */
+
+  app.get(
+    "/projects/:projectId/bidding/health-inputs",
+    { preHandler: readGate },
+    async (req) => {
+      const projectId = req.projectId!;
+      const companyId = req.companyId!;
+      const packages = await app.db
+        .select()
+        .from(bidPackages)
+        .where(
+          and(eq(bidPackages.companyId, companyId), eq(bidPackages.projectId, projectId)),
+        );
+      const nowMs = Date.now();
+      const reasons: string[] = [];
+      if (packages.length === 0) {
+        reasons.push("No bid packages exist on this project, so procurement contributes nothing.");
+        return {
+          metrics: {
+            packages: 0,
+            liveTenders: null,
+            overdueTenders: null,
+            packagesWithoutEstimate: null,
+            thinFields: null,
+            awardsAwaitingApproval: null,
+            openIntegrityFindings: null,
+            averageBiddersPerPackage: null,
+          },
+          reasons,
+        };
+      }
+      const live = packages.filter((p) =>
+        ["invitations_sent", "open", "closed", "under_evaluation", "levelled"].includes(p.status),
+      );
+      const overdue = live.filter(
+        (p) => p.bidDueAt !== null && (epochMs(p.bidDueAt) ?? 0) < nowMs && p.status !== "levelled",
+      );
+      const noEstimate = packages.filter((p) => p.engineersEstimate === null);
+      const thin = live.filter((p) => p.submissionCount < 3);
+      const awards = await app.db
+        .select({ status: bidAwards.status })
+        .from(bidAwards)
+        .where(and(eq(bidAwards.companyId, companyId), eq(bidAwards.projectId, projectId)));
+      const awaiting = awards.filter(
+        (a) => a.status === "recommended" || a.status === "pending_approval",
+      ).length;
+      const findings = await app.db
+        .select({ id: signals.id, detector: signals.detector, disposition: signals.disposition })
+        .from(signals)
+        .where(and(eq(signals.companyId, companyId), eq(signals.projectId, projectId)))
+        .limit(500);
+      const openIntegrity = findings.filter(
+        (f) =>
+          f.detector.startsWith("bid_integrity_") &&
+          f.disposition !== "dismissed" &&
+          f.disposition !== "closed",
+      ).length;
+      const bidders =
+        live.length === 0
+          ? null
+          : round2(live.reduce((sum, p) => sum + p.submissionCount, 0) / live.length);
+
+      if (overdue.length > 0) {
+        reasons.push(
+          `${overdue.length} tender(s) are past their bid deadline without a completed ` +
+            "levelling — the procurement is holding the programme.",
+        );
+      }
+      if (thin.length > 0) {
+        reasons.push(
+          `${thin.length} live tender(s) have fewer than three bids. A field of two is a ` +
+            "quotation, not a market, and the price it produces is not a market price.",
+        );
+      }
+      if (noEstimate.length > 0) {
+        reasons.push(
+          `${noEstimate.length} package(s) carry no pre-tender estimate, so nothing measures ` +
+            "whether the market came back over or under.",
+        );
+      }
+      if (openIntegrity > 0) {
+        reasons.push(`${openIntegrity} open bid-integrity finding(s) on this project.`);
+      }
+      return {
+        metrics: {
+          packages: packages.length,
+          liveTenders: live.length,
+          overdueTenders: overdue.length,
+          packagesWithoutEstimate: noEstimate.length,
+          thinFields: thin.length,
+          awardsAwaitingApproval: awaiting,
+          openIntegrityFindings: openIntegrity,
+          averageBiddersPerPackage: bidders,
+        },
+        reasons,
       };
     },
   );
@@ -1027,9 +1596,16 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
         : [];
       const vendorName = new Map(vendorRows.map((v) => [v.id, v.name] as const));
 
+      // One batched standing lookup for the whole tabulation rather than
+      // three queries per row: a 12-bidder tabulation was 36 statements.
+      const standing = await batchVendorPrequalStatus(
+        app.db,
+        req.companyId!,
+        subs.map((s) => s.vendorId),
+      );
       const rows = await Promise.all(
         subs.map(async (s) => {
-          const status = await vendorPrequalStatus(app.db, req.companyId!, s.vendorId);
+          const status = standing.get(s.vendorId)!;
           const cap = effectiveLimit(status);
           const limitCheck = seal.amountsWithheld
             ? null

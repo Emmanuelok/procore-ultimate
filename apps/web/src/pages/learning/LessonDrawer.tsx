@@ -27,15 +27,18 @@ import {
 } from "../../ui";
 import { formatDate, formatDateTime } from "../format";
 import ApplyModal from "./ApplyModal";
+import OutcomeForm from "./OutcomeForm";
 import type { ApplyOutcome } from "./ApplyModal";
 import {
   Drawer,
   KV,
+  LESSON_OUTCOME_LABELS,
   LoadError,
   NoteCard,
   Prose,
   RefLine,
   SectionTitle,
+  Stat,
   TagList,
   errorMessage,
   fmtInt,
@@ -46,7 +49,9 @@ import {
   triggerStatusTone,
 } from "./learningShared";
 import type {
+  LessonApplication,
   LessonDetail,
+  LessonOutcomes,
   LessonImpact,
   LessonListRow,
   ListResponse,
@@ -75,6 +80,8 @@ export default function LessonDrawer({
   const [notice, setNotice] = useState<string | null>(null);
 
   const [applyOpen, setApplyOpen] = useState(false);
+  const [measuring, setMeasuring] = useState<LessonApplication | null>(null);
+  const [outcomes, setOutcomes] = useState<LessonOutcomes | null>(null);
   const [supersedeOpen, setSupersedeOpen] = useState(false);
   const [candidates, setCandidates] = useState<LessonListRow[] | null>(null);
   const [replacementId, setReplacementId] = useState("");
@@ -87,6 +94,17 @@ export default function LessonDrawer({
     } catch (err) {
       setLesson(null);
       setError(errorMessage(err, "Failed to load the lesson"));
+    }
+  }, [lessonId]);
+
+  const loadOutcomes = useCallback(async () => {
+    try {
+      setOutcomes(
+        await api.get<LessonOutcomes>(`/api/v1/learning/lessons/${lessonId}/outcomes`),
+      );
+    } catch {
+      /* The outcome panel fails alone: the lesson itself still renders. */
+      setOutcomes(null);
     }
   }, [lessonId]);
 
@@ -107,6 +125,7 @@ export default function LessonDrawer({
     setActionError(null);
     void load();
     void loadImpact();
+    void loadOutcomes();
   }, [load, loadImpact]);
 
   async function openSupersede() {
@@ -154,6 +173,7 @@ export default function LessonDrawer({
     );
     void load();
     void loadImpact();
+    void loadOutcomes();
     onChanged();
   }
 
@@ -396,6 +416,66 @@ export default function LessonDrawer({
           </CardBody>
         </Card>
 
+        {/* ------------------------------- outcomes ------------------------------ */}
+        {outcomes && outcomes.applications > 0 ? (
+          <Card>
+            <CardBody>
+              <SectionTitle hint="Computed over MEASURED applications only, with the denominator stated. An unmeasured application is not a successful one.">
+                Did it work?
+              </SectionTitle>
+              <div className="grid gap-3 sm:grid-cols-4">
+                <Stat
+                  label="Applications"
+                  value={fmtInt(outcomes.applications)}
+                  hint={`${fmtInt(outcomes.measured)} measured, ${fmtInt(outcomes.unmeasured)} not`}
+                />
+                <Stat
+                  label="Effectiveness"
+                  value={
+                    outcomes.effectiveness.value === null
+                      ? "—"
+                      : `${Math.round(outcomes.effectiveness.value * 100)}%`
+                  }
+                  hint={
+                    outcomes.effectiveness.value === null
+                      ? outcomes.effectiveness.reasons[0]
+                      : `over ${fmtInt(outcomes.effectiveness.denominator)} measured`
+                  }
+                />
+                <Stat
+                  label="Days avoided"
+                  value={outcomes.daysAvoided === null ? "—" : fmtInt(outcomes.daysAvoided)}
+                  hint={
+                    outcomes.daysAvoided === null
+                      ? "no application recorded a day figure"
+                      : `measured on ${fmtInt(outcomes.daysMeasuredOn)}`
+                  }
+                />
+                <Stat
+                  label="Value avoided"
+                  value={
+                    outcomes.valueByCurrency.length === 0
+                      ? "—"
+                      : outcomes.valueByCurrency
+                          .map((v) => `${v.currency} ${fmtInt(v.value)}`)
+                          .join(" · ")
+                  }
+                  hint={
+                    outcomes.valueByCurrency.length === 0
+                      ? "no application recorded a money figure"
+                      : "per currency, never summed across"
+                  }
+                />
+              </div>
+              {outcomes.reasons.map((r) => (
+                <p key={r} className="mt-2 text-xs leading-relaxed text-amber-800">
+                  {r}
+                </p>
+              ))}
+            </CardBody>
+          </Card>
+        ) : null}
+
         {/* ----------------------------- applications ---------------------------- */}
         <Card>
           <CardBody>
@@ -428,11 +508,54 @@ export default function LessonDrawer({
                       </div>
                     ) : null}
                     <p className="mt-1 whitespace-pre-wrap text-sm text-ink-800">{a.action}</p>
+                    <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                      <Badge
+                        tone={
+                          a.outcome === "avoided"
+                            ? "green"
+                            : a.outcome === "partially_avoided"
+                              ? "amber"
+                              : a.outcome === "counterproductive"
+                                ? "red"
+                                : "gray"
+                        }
+                      >
+                        {LESSON_OUTCOME_LABELS[a.outcome ?? "unknown"] ?? "Not yet measured"}
+                      </Badge>
+                      {a.outcomeValue !== null ? (
+                        <span className="text-xs tabular-nums text-ink-600">
+                          {a.outcomeCurrency ?? ""} {a.outcomeValue}
+                        </span>
+                      ) : null}
+                      {a.outcomeDays !== null ? (
+                        <span className="text-xs tabular-nums text-ink-600">
+                          {a.outcomeDays} day(s)
+                        </span>
+                      ) : null}
+                      {a.measuredAt ? (
+                        <span className="text-xs text-ink-400">
+                          measured {formatDateTime(a.measuredAt)}
+                        </span>
+                      ) : null}
+                      <button
+                        type="button"
+                        onClick={() => setMeasuring(a)}
+                        className="rounded bg-white px-2 py-0.5 text-xs font-medium text-ink-700 ring-1 ring-ink-200 hover:bg-ink-50"
+                      >
+                        {a.outcome && a.outcome !== "unknown" ? "Revise" : "Record"} the outcome
+                      </button>
+                    </div>
                     {a.outcomeNote ? (
                       <p className="mt-1 whitespace-pre-wrap text-xs text-ink-600">
-                        <span className="font-medium">Outcome:</span> {a.outcomeNote}
+                        <span className="font-medium">Observed:</span> {a.outcomeNote}
                       </p>
-                    ) : null}
+                    ) : (
+                      <p className="mt-1 text-xs italic text-ink-400">
+                        No outcome has been measured, so this application counts towards the
+                        register's reach and towards nothing else. An application nobody measured
+                        is not evidence that the lesson worked.
+                      </p>
+                    )}
                   </li>
                 ))}
               </ul>
@@ -462,6 +585,20 @@ export default function LessonDrawer({
       >
         {body}
       </Drawer>
+
+      {measuring ? (
+        <OutcomeForm
+          application={measuring}
+          onClose={() => setMeasuring(null)}
+          onSaved={() => {
+            setMeasuring(null);
+            void load();
+            void loadImpact();
+            void loadOutcomes();
+            onChanged();
+          }}
+        />
+      ) : null}
 
       {lesson ? (
         <ApplyModal

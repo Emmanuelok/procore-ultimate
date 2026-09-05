@@ -29,6 +29,7 @@ import {
   Button,
   Card,
   CardBody,
+  CardHeader,
   DescriptionList,
   EmptyState,
   Field,
@@ -37,6 +38,7 @@ import {
   PageHeader,
   Skeleton,
   Tabs,
+  formatNumber,
 } from "../../ui";
 import type { TimelineItem } from "../../ui";
 import type { Tone } from "../../ui/tokens";
@@ -57,10 +59,12 @@ import {
   QrCode,
   Reasons,
   ShowOnce,
+  discoverProviders,
   failureFrom,
   useAuthAction,
   usePasswordPolicy,
   type AuthFailure,
+  type ProviderDiscovery,
 } from "./authShared";
 
 /* ================================================================== */
@@ -101,6 +105,8 @@ interface MfaStatus {
   /** null — never 0 — where no factor exists to count codes for */
   recoveryCodesRemaining: number | null;
   stepUp: { satisfied: boolean; at?: string | null };
+  /** half-finished sign-ins: password accepted, second factor never produced */
+  challengesInFlight: number;
   policy: { required: boolean; requiredBy: Array<{ companyId: string; name: string }> };
   reasons: string[];
 }
@@ -589,6 +595,15 @@ function MfaPanel({
         </Alert>
       ) : null}
 
+      {status.challengesInFlight > 1 ? (
+        <Alert tone="warning" size="sm" title="More than one sign-in is waiting for a code">
+          {status.challengesInFlight} sign-ins have passed the password step and not yet produced
+          a second factor. One is usually the tab you are reading this in. More than one means the
+          password was accepted somewhere else too — change it, and sign out every device below.
+          Each challenge can be exchanged once and expires on its own.
+        </Alert>
+      ) : null}
+
       {status.enrolled ? (
         <Card>
           <CardBody className="space-y-3">
@@ -903,6 +918,10 @@ function MethodsPanel({ nonce, onChanged }: { nonce: number; onChanged: () => vo
         </Card>
       ) : null}
 
+      {verification.data ? (
+        <EmailChangeCard currentEmail={verification.data.email} onChanged={onChanged} />
+      ) : null}
+
       {/* ------------------------- identities ------------------------- */}
       <Card>
         <CardBody className="space-y-3">
@@ -974,12 +993,19 @@ function MethodsPanel({ nonce, onChanged }: { nonce: number; onChanged: () => vo
               {identities.data.items.length === 0 ? (
                 <div className="rounded-lg border border-dashed border-border p-3">
                   <p className="text-meta text-content-muted">
-                    No identity provider is linked to this account. Signing in with Google,
-                    Microsoft or your company&rsquo;s own provider from the sign-in page links one
-                    the first time it is used.
+                    No identity provider is linked to this account yet.
                   </p>
                 </div>
               ) : null}
+
+              {/*
+                LINK A PROVIDER — the action the API kept telling people to
+                take here and that no page offered. `sso/index.ts` refuses an
+                unverified-email SSO sign-in with "link this provider from your
+                account settings instead", and this is those settings; without
+                the control the advice was a dead end.
+              */}
+              <LinkProviderRow linked={identities.data.items.map((i) => i.providerId)} />
 
               <p className="text-2xs text-content-subtle">
                 Unlinking also kills any session that provider authenticated: &ldquo;I removed that
@@ -1114,6 +1140,7 @@ function ActivityPanel({ nonce }: { nonce: number }) {
         done to PROJECT records and is anchored for dispute use; this records what happened to this
         ACCOUNT, and is what a security auditor asks to see.
       </Alert>
+      <AccountExportCard />
       {items.length === 0 ? (
         <EmptyState
           title="Nothing has been recorded against this account yet"
@@ -1123,5 +1150,276 @@ function ActivityPanel({ nonce }: { nonce: number }) {
         <ActivityFeed items={items} timeFormat="absolute" aria-label="Account security events" />
       )}
     </div>
+  );
+}
+
+/**
+ * §0.2 #45 — the data-subject export.
+ *
+ * It is HERE, next to the trail, because this is the tab where somebody is
+ * already asking "what does this platform know about me". The download is
+ * assembled in the browser from the JSON the API returns rather than being a
+ * link to a URL with a token in it: an export URL that works when pasted is an
+ * export URL that works when forwarded.
+ *
+ * The copy names what the file does NOT contain, because that is the part a
+ * reader cannot verify for themselves and the part that matters most.
+ */
+function AccountExportCard() {
+  const action = useAuthAction();
+  const [exported, setExported] = useState<{ at: string; bytes: number } | null>(null);
+
+  async function download() {
+    const data = await action.run("export", () =>
+      api.get<Record<string, unknown>>("/api/v1/account/export"),
+    );
+    if (!data) return;
+    const text = JSON.stringify(data, null, 2);
+    const blob = new Blob([text], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `constructos-account-export-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    setExported({ at: new Date().toISOString(), bytes: text.length });
+  }
+
+  return (
+    <Card>
+      <CardHeader
+        title="Export everything held about this account"
+        subtitle="Sessions, linked providers, second-factor state, the full trail, messages sent to you and any invitation to your address."
+      />
+      <CardBody className="space-y-3">
+        <FailureAlert failure={action.failure} onDismiss={action.clear} />
+        <p className="text-meta text-content-subtle">
+          The file contains no credential of any kind: no password hash, no authenticator seed, no
+          recovery-code hash and no session or refresh token. Records outside authentication —
+          projects, documents, financials — belong to the company export, not this one. The export
+          is written to the company ledger, because this is the moment an account&apos;s whole
+          history leaves the platform.
+        </p>
+        <div className="flex items-center gap-3">
+          <Button variant="secondary" loading={action.busy === "export"} onClick={() => void download()}>
+            Download JSON
+          </Button>
+          {exported ? (
+            <span className="text-2xs text-content-subtle">
+              {formatNumber(exported.bytes)} characters, exported {when(exported.at)}.
+            </span>
+          ) : null}
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+
+/* ================================================================== */
+/* Linking an identity provider from account settings                  */
+/* ================================================================== */
+
+/**
+ * Start a LINK flow for the signed-in account.
+ *
+ * The account being linked to is fixed on the server at start time, from a
+ * verified bearer token, and nothing the identity provider later asserts can
+ * change it — that is the whole security property, and it is why this control
+ * belongs here rather than on the sign-in page.
+ *
+ * `mode: "redirect"` sends the browser through the IdP and back to
+ * /auth/sso/complete, which recognises `linked: true` and returns here.
+ */
+function LinkProviderRow({ linked }: { linked: string[] }) {
+  const [discovery, setDiscovery] = useState<ProviderDiscovery | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [failure, setFailure] = useState<AuthFailure | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const { user } = useAuth();
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!user?.email) {
+      setLoading(false);
+      return;
+    }
+    discoverProviders(user.email)
+      .then((res) => {
+        if (!cancelled) setDiscovery(res);
+      })
+      .catch(() => {
+        // Discovery is an optimisation, never a gate: a deployment without SSO
+        // configured simply shows nothing here.
+        if (!cancelled) setDiscovery({ domain: null, providers: [], passwordLoginAllowed: true, reasons: [] });
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.email]);
+
+  async function link(providerId: string) {
+    setBusy(providerId);
+    setFailure(null);
+    try {
+      const res = await api.post<{ authorizationUrl: string }>("/api/v1/auth/sso/link", {
+        providerId,
+        mode: "redirect",
+        returnTo: "/account/security",
+      });
+      window.location.assign(res.authorizationUrl);
+    } catch (err) {
+      setFailure(failureFrom(err));
+      setBusy(null);
+    }
+  }
+
+  if (loading) return <Skeleton height={44} radius="md" />;
+  const available = (discovery?.providers ?? []).filter(
+    (p) => p.status === "ready" && !linked.includes(p.id),
+  );
+  if (available.length === 0) {
+    return (
+      <p className="text-2xs text-content-subtle">
+        {discovery && discovery.providers.length > 0
+          ? "Every identity provider available to your address is already linked."
+          : "No identity provider is configured for your email domain, so there is nothing to link."}
+      </p>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      <FailureAlert failure={failure} onDismiss={() => setFailure(null)} />
+      <p className="text-2xs text-content-subtle">
+        Link another way in. You stay signed in throughout; the provider is attached to this
+        account and cannot be redirected to another one.
+      </p>
+      <div className="flex flex-wrap gap-2">
+        {available.map((provider) => (
+          <Button
+            key={provider.id}
+            size="sm"
+            variant="secondary"
+            loading={busy === provider.id}
+            onClick={() => void link(provider.id)}
+          >
+            Link {provider.displayName}
+          </Button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ================================================================== */
+/* Changing the address on the account                                 */
+/* ================================================================== */
+
+interface PendingEmail {
+  pending: { email: string; expiresAt: string; requestedAt: string } | null;
+  history: Array<{ email: string; requestedAt: string; consumedAt: string | null }>;
+}
+
+/**
+ * The address is the recovery channel, so moving it costs the current
+ * password and is not applied until the NEW address is proved. A typo
+ * therefore cannot lock anybody out of their own account.
+ */
+export function EmailChangeCard({ currentEmail, onChanged }: { currentEmail: string; onChanged: () => void }) {
+  const action = useAuthAction();
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [pending, setPending] = useState<PendingEmail | null>(null);
+  const [started, setStarted] = useState<{ verifyUrl: string | null; reasons: string[] } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .get<PendingEmail>("/api/v1/account/email/pending")
+      .then((res) => {
+        if (!cancelled) setPending(res);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [started]);
+
+  async function submit() {
+    const res = await action.run("email", () =>
+      api.post<{ verifyUrl: string | null; reasons: string[] }>("/api/v1/account/email", {
+        email: email.trim().toLowerCase(),
+        password,
+      }),
+    );
+    if (res) {
+      setStarted(res);
+      setEmail("");
+      setPassword("");
+      onChanged();
+    }
+  }
+
+  return (
+    <Card>
+      <CardBody className="space-y-3">
+        <div>
+          <p className="text-sm font-semibold">Change your email address</p>
+          <p className="mt-0.5 text-meta text-content-muted">
+            Currently <span className="font-medium text-content">{currentEmail}</span>. The change
+            takes effect only when the link sent to the new address is opened — never before.
+          </p>
+        </div>
+        <FailureAlert failure={action.failure} onDismiss={action.clear} />
+        {pending?.pending ? (
+          <Alert tone="info" size="sm" title="A change is waiting to be proved">
+            <p>
+              {pending.pending.email} — requested {when(pending.pending.requestedAt)}, the link
+              expires {when(pending.pending.expiresAt)}.
+            </p>
+          </Alert>
+        ) : null}
+        {started ? (
+          <Alert tone="success" size="sm" title="Confirmation sent">
+            <Reasons reasons={started.reasons} />
+            {started.verifyUrl ? (
+              <p className="mt-1 break-all text-2xs">
+                No mail transport is configured, so the link is shown here once:{" "}
+                <code className="select-all font-mono">{started.verifyUrl}</code>
+              </p>
+            ) : null}
+          </Alert>
+        ) : null}
+        <Field label="New email address" required>
+          <Input
+            type="email"
+            autoComplete="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+          />
+        </Field>
+        <Field label="Your current password" required hint="Proof that this account is yours.">
+          <Input
+            type="password"
+            autoComplete="current-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+        </Field>
+        <Button
+          onClick={() => void submit()}
+          loading={action.busy === "email"}
+          disabled={email.trim().length === 0 || password.length === 0}
+        >
+          Send the confirmation link
+        </Button>
+      </CardBody>
+    </Card>
   );
 }

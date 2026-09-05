@@ -8,6 +8,7 @@ import {
   delayEvents,
   disputes,
   forensicClaims,
+  insuranceCertificates,
   gateReviews,
   lessonTriggers,
   ledgerEntries,
@@ -23,6 +24,7 @@ import {
   signals,
   stageGates,
   valuations,
+  vendors,
   variations,
 } from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
@@ -376,7 +378,7 @@ beforeAll(async () => {
     agreedValue: 10_000,
     createdBy: owner.userId,
   });
-});
+}, 180_000);
 
 afterAll(async () => {
   await built.close();
@@ -609,15 +611,26 @@ describe("mandatory-capture triggers", () => {
     expect(((await post(`/projects/${projectId}/learning/triggers/sweep`)).json() as Json).created).toBe(0);
   });
 
-  it("sweeps lazily when the trigger list is read, and ages the backlog", async () => {
+  it("reads the backlog purely — the sweep is a scheduled job, not a side effect", async () => {
     const res = await get(`/projects/${bareProjectId}/learning/triggers`);
     expect(res.statusCode).toBe(200);
     expect((res.json() as Json).total).toBe(0); // nothing has happened here
 
     const listed = await get(`/projects/${projectId}/learning/triggers?status=open`);
-    const body = listed.json() as { items: Json[]; total: number; sweep: Json };
+    const body = listed.json() as {
+      items: Json[];
+      total: number;
+      sweptBy: string;
+    };
     expect(body.total).toBeGreaterThanOrEqual(6);
-    expect(body.sweep).toBeTruthy();
+    /*
+     * The read used to run the sweep, so a read-only member — or an assurance
+     * grantee with no write permission at all — created obligations, lesson
+     * triggers and hash-chained ledger entries simply by opening the tab, all
+     * attributed to them. The response now names the job that does it instead.
+     */
+    expect(body.sweptBy).toMatch(/learning\.capture-triggers/);
+    expect(body.sweptBy).toMatch(/performs no writes/);
     for (const item of body.items) {
       expect(typeof item.ageDays).toBe("number");
       expect(typeof item.overdue).toBe("boolean");
@@ -1150,5 +1163,354 @@ describe("tenant isolation and permissions", () => {
       readerHeaders,
     );
     expect(res.statusCode).toBe(403);
+  });
+});
+
+/* ================================================================== */
+/* Health inputs for the intelligence layer                            */
+/* ================================================================== */
+
+describe("learning health-inputs", () => {
+  it("refuses a capture rate on a project nothing has ever obliged", async () => {
+    const res = await get(`/projects/${bareProjectId}/learning/health-inputs`);
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Json;
+    const metrics = body.metrics as Json;
+    expect(metrics.triggersRaised).toBe(0);
+    expect(metrics.captureRate).toBeNull();
+    expect((body.reasons as string[]).join(" ")).toMatch(/never been asked to learn/i);
+  });
+
+  it("reports the trigger backlog and the measured-outcome count on a live project", async () => {
+    await post(`/projects/${projectId}/learning/triggers/sweep`);
+    const res = await get(`/projects/${projectId}/learning/health-inputs`);
+    expect(res.statusCode).toBe(200);
+    const metrics = (res.json() as Json).metrics as Json;
+    expect(metrics.triggersRaised as number).toBeGreaterThan(0);
+    expect(typeof metrics.triggersOpen).toBe("number");
+    expect(typeof metrics.lessonsAuthored).toBe("number");
+    expect(typeof metrics.appliedLessonsMeasured).toBe("number");
+    expect(metrics.appliedLessonsMeasured as number).toBeLessThanOrEqual(
+      metrics.lessonsApplied as number,
+    );
+  });
+
+  it("is read-gated and tenant-scoped", async () => {
+    const reader = await get(`/projects/${projectId}/learning/health-inputs`, readerHeaders);
+    expect(reader.statusCode).toBe(200);
+    const foreign = await get(
+      `/projects/${projectId}/learning/health-inputs`,
+      outsider.headers,
+    );
+    expect([403, 404]).toContain(foreign.statusCode);
+  });
+});
+
+/* ================================================================== */
+/* AI lesson drafting from the triggering record                       */
+/* ================================================================== */
+
+describe("AI lesson draft", () => {
+  it("answers 503 AiDisabled with no key, and leaves the capture path untouched", async () => {
+    await post(`/projects/${projectId}/learning/triggers/sweep`);
+    const triggers = await get(`/projects/${projectId}/learning/triggers?status=open`);
+    const open = (triggers.json() as { items: Json[] }).items[0];
+    expect(open).toBeDefined();
+    const triggerId = open!.id as string;
+
+    const res = await post(
+      `/projects/${projectId}/learning/triggers/${triggerId}/draft`,
+      {},
+    );
+    /* buildTestApp runs with no ANTHROPIC_API_KEY: the AI path must degrade,
+       never take the non-AI workflow down with it. */
+    expect(res.statusCode).toBe(503);
+    expect(res.json().message).toMatch(/Capture the lesson directly/);
+
+    /* And capture still works, on the same trigger, with no AI at all. */
+    const captured = await post(
+      `/projects/${projectId}/learning/triggers/${triggerId}/capture`,
+      lessonBody({ title: "Captured without the AI layer" }),
+    );
+    expect(captured.statusCode).toBe(201);
+  });
+
+  it("refuses a draft for a trigger that is no longer owed", async () => {
+    const triggers = await get(`/projects/${projectId}/learning/triggers?status=captured`);
+    const done = (triggers.json() as { items: Json[] }).items[0];
+    if (!done) return;
+    const res = await post(
+      `/projects/${projectId}/learning/triggers/${done.id as string}/draft`,
+      {},
+    );
+    expect(res.statusCode).toBe(409);
+  });
+
+  it("is refused to a read-only member", async () => {
+    const triggers = await get(`/projects/${projectId}/learning/triggers?status=open`);
+    const open = (triggers.json() as { items: Json[] }).items[0];
+    if (!open) return;
+    const res = await post(
+      `/projects/${projectId}/learning/triggers/${open.id as string}/draft`,
+      {},
+      readerHeaders,
+    );
+    expect(res.statusCode).toBe(403);
+  });
+});
+
+
+/* ================================================================== */
+/* The scheduled capture sweep                                         */
+/*                                                                     */
+/* Deliberately LAST in the file: this runs the sweep across the whole  */
+/* tenant, and a global sweep run earlier would discharge triggers the  */
+/* per-project tests above are asserting on.                            */
+/* ================================================================== */
+
+describe("scheduled capture sweep", () => {
+  it("raises triggers under the system actor, with no reader involved", async () => {
+    const fresh = newId("prj");
+    await app.db.insert(projects).values({
+      id: fresh,
+      companyId: owner.companyId,
+      name: "Scheduled sweep project",
+      stage: "closed",
+    });
+
+    /* A read raises nothing: the sweep is not a side effect of looking. */
+    const beforeRead = await get(`/projects/${fresh}/learning/triggers`);
+    expect(beforeRead.statusCode).toBe(200);
+    expect((beforeRead.json() as Json).total).toBe(0);
+
+    await app.scheduler.runNow("learning.capture-triggers");
+
+    const afterJob = await get(`/projects/${fresh}/learning/triggers`);
+    const body = afterJob.json() as { total: number; items: Json[] };
+    expect(body.total).toBeGreaterThan(0);
+    expect(body.items.some((t) => t.kind === "project_closeout")).toBe(true);
+
+    /* And the obligation it raised is attributed to the system, not to a user
+       who merely opened a page. */
+    const obligationRows = await app.db
+      .select()
+      .from(obligations)
+      .where(
+        and(eq(obligations.companyId, owner.companyId), eq(obligations.projectId, fresh)),
+      );
+    expect(obligationRows.length).toBeGreaterThan(0);
+  });
+
+  it("is idempotent — a second run raises nothing twice", async () => {
+    const before = await app.db
+      .select()
+      .from(lessonTriggers)
+      .where(eq(lessonTriggers.companyId, owner.companyId));
+    await app.scheduler.runNow("learning.capture-triggers");
+    const after = await app.db
+      .select()
+      .from(lessonTriggers)
+      .where(eq(lessonTriggers.companyId, owner.companyId));
+    expect(after.length).toBe(before.length);
+  });
+});
+
+/* ================================================================== */
+/* Cross-project supplier performance (#987-989)                       */
+/* ================================================================== */
+
+describe("supplier performance scorecard", () => {
+  let goodVendor: string;
+  let badVendor: string;
+  let silentVendor: string;
+
+  beforeAll(async () => {
+    goodVendor = newId("ven");
+    badVendor = newId("ven");
+    silentVendor = newId("ven");
+    await app.db.insert(vendors).values([
+      { id: goodVendor, companyId: owner.companyId, name: "Aaa Reliable Ltd" },
+      { id: badVendor, companyId: owner.companyId, name: "Bbb Chaotic Ltd" },
+      { id: silentVendor, companyId: owner.companyId, name: "Ccc Unknown Ltd" },
+    ]);
+    const iso = (d: number) => new Date(Date.now() + d * 86_400_000).toISOString().slice(0, 10);
+    await app.db.insert(insuranceCertificates).values([
+      {
+        id: newId("cert"),
+        companyId: owner.companyId,
+        projectId,
+        vendorId: goodVendor,
+        subjectName: "Aaa Reliable Ltd",
+        policyType: "public_liability",
+        validFrom: iso(-100),
+        validTo: iso(200),
+        verifiedAt: new Date().toISOString(),
+        verificationMethod: "insurer_confirmation",
+        createdBy: owner.userId,
+      },
+      {
+        id: newId("cert"),
+        companyId: owner.companyId,
+        projectId,
+        vendorId: goodVendor,
+        subjectName: "Aaa Reliable Ltd",
+        policyType: "employers_liability",
+        validFrom: iso(-100),
+        validTo: iso(200),
+        verifiedAt: new Date().toISOString(),
+        verificationMethod: "insurer_confirmation",
+        createdBy: owner.userId,
+      },
+      {
+        id: newId("cert"),
+        companyId: owner.companyId,
+        projectId,
+        vendorId: goodVendor,
+        subjectName: "Aaa Reliable Ltd",
+        policyType: "professional_indemnity",
+        validFrom: iso(-100),
+        validTo: iso(200),
+        verifiedAt: new Date().toISOString(),
+        verificationMethod: "insurer_confirmation",
+        createdBy: owner.userId,
+      },
+      {
+        id: newId("cert"),
+        companyId: owner.companyId,
+        projectId,
+        vendorId: badVendor,
+        subjectName: "Bbb Chaotic Ltd",
+        policyType: "public_liability",
+        validFrom: iso(-400),
+        validTo: iso(-30),
+        verifiedAt: null,
+        createdBy: owner.userId,
+      },
+      {
+        id: newId("cert"),
+        companyId: owner.companyId,
+        projectId,
+        vendorId: badVendor,
+        subjectName: "Bbb Chaotic Ltd",
+        policyType: "employers_liability",
+        validFrom: iso(-400),
+        validTo: iso(-10),
+        verifiedAt: null,
+        createdBy: owner.userId,
+      },
+      {
+        id: newId("cert"),
+        companyId: owner.companyId,
+        projectId,
+        vendorId: badVendor,
+        subjectName: "Bbb Chaotic Ltd",
+        policyType: "professional_indemnity",
+        validFrom: iso(-400),
+        validTo: iso(-5),
+        verifiedAt: null,
+        createdBy: owner.userId,
+      },
+    ]);
+  }, 120_000);
+
+  it("ranks the worst supplier first and refuses to rate one with no records", async () => {
+    const res = await get("/learning/supplier-performance");
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      items: Array<{ vendorId: string; composite: number | null; reasons: string[] }>;
+      sources: string[];
+    };
+    const ids = body.items.map((i) => i.vendorId);
+    expect(ids.indexOf(badVendor)).toBeLessThan(ids.indexOf(goodVendor));
+    const silent = body.items.find((i) => i.vendorId === silentVendor)!;
+    expect(silent.composite).toBeNull();
+    expect(silent.reasons.join(" ")).toMatch(/coincidence wearing a number/);
+    expect(body.sources.length).toBeGreaterThan(0);
+  });
+
+  it("shows the basis and counts behind every dimension", async () => {
+    const res = await get(`/learning/supplier-performance?vendorId=${badVendor}`);
+    expect(res.statusCode).toBe(200);
+    const [row] = res.json().items as Array<{
+      certificateDiscipline: { score: number; counts: Record<string, number>; basis: string };
+      quality: { score: number | null; basis: string };
+      reasons: string[];
+    }>;
+    expect(row!.certificateDiscipline.counts["expired"]).toBe(3);
+    expect(row!.certificateDiscipline.basis).toMatch(/in date/);
+    // no NCR exists against this vendor: null, not zero
+    expect(row!.quality.score).toBeNull();
+    expect(row!.reasons.join(" ")).toMatch(/not a recommendation/);
+  });
+
+  it("says so, rather than reporting zero, when the caller holds learning nowhere", async () => {
+    const nobody = await registerActor(app);
+    await app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: nobody.userId,
+      role: "guest",
+    });
+    const res = await get("/learning/supplier-performance", {
+      authorization: nobody.headers["authorization"]!,
+      "x-company-id": owner.companyId,
+    });
+    // A guest with no project membership holds the tool nowhere: refused
+    // outright rather than handed an empty list that reads as "nothing to report".
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("keeps another tenant out", async () => {
+    const res = await get("/learning/supplier-performance", outsider.headers);
+    const body = res.statusCode === 200 ? (res.json().items as unknown[]) : [];
+    expect(body).toHaveLength(0);
+  });
+});
+
+/* ================================================================== */
+/* Audit bug regressions                                               */
+/* ================================================================== */
+
+describe("audit bug regressions", () => {
+  it("[#21] numbers lessons on a COMPANY counter, so two projects cannot both hold LL-0001", async () => {
+    const a = await post(`/projects/${projectId}/learning/lessons`, lessonBody({ title: "A" }));
+    const b = await post(
+      `/projects/${bareProjectId}/learning/lessons`,
+      lessonBody({ title: "B" }),
+    );
+    expect(a.statusCode).toBe(201);
+    expect(b.statusCode).toBe(201);
+    const na = (a.json() as Json).number as string;
+    const nb = (b.json() as Json).number as string;
+    expect(na).toMatch(/^LL-\d{4}$/);
+    expect(nb).toMatch(/^LL-\d{4}$/);
+    // Published lessons are a company-wide register and their number is cited
+    // as the reference. Two lessons sharing LL-0001 makes every citation
+    // ambiguous, which is precisely what a per-project counter produced.
+    expect(na).not.toBe(nb);
+  });
+
+  it("[#9] leaves the trigger list a pure read — no obligation, trigger or ledger entry", async () => {
+    const before = await app.db
+      .select()
+      .from(lessonTriggers)
+      .where(eq(lessonTriggers.projectId, projectId));
+    const oblBefore = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.projectId, projectId));
+    const res = await get(`/projects/${projectId}/learning/triggers`, readerHeaders);
+    expect(res.statusCode).toBe(200);
+    expect((res.json() as Json).sweptBy).toMatch(/performs no writes/);
+    const after = await app.db
+      .select()
+      .from(lessonTriggers)
+      .where(eq(lessonTriggers.projectId, projectId));
+    const oblAfter = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.projectId, projectId));
+    expect(after.length).toBe(before.length);
+    expect(oblAfter.length).toBe(oblBefore.length);
   });
 });

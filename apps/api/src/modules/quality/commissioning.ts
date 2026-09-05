@@ -23,7 +23,7 @@
  */
 
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, ilike, inArray } from "drizzle-orm";
+import { and, asc, count, desc, eq, ilike, inArray, isNull } from "drizzle-orm";
 import { z } from "zod";
 import {
   commissioningSystems,
@@ -907,6 +907,23 @@ export const commissioningRoutes: FastifyPluginAsync = async (app) => {
           `${record.reference} is ${record.status}; an accepted test record is evidence and is not edited.`,
         );
       }
+      /*
+       * STATUS IS NOT A FIELD ON THIS FORM.
+       *
+       * `complete`, `failed`, `retest_required` and `accepted` are the outcomes
+       * of acts with their own routes — the result (which checks calibration,
+       * judges the readings and raises the deficiencies) and the acceptance
+       * (which is somebody other than the tester). Letting a generic PATCH set
+       * them would let a scheduled test be marked complete and accepted with no
+       * reading taken, no deficiency raised and nobody named, and turnover
+       * would then read that as a system that had passed. Only the two moves
+       * with no route of their own are allowed here.
+       */
+      if (body.status !== undefined && !["in_progress", "void"].includes(body.status)) {
+        throw badRequest(
+          `${record.reference} cannot be moved to ${body.status} by editing it. A result is recorded at POST .../result (which checks the instruments' calibration, judges the readings and raises the deficiencies) and acceptance at POST .../accept, by somebody other than the person who performed the test.`,
+        );
+      }
       if (body.vendorId) await assertVendor(app.db, req.companyId!, body.vendorId);
       if (body.locationId) await assertLocation(app.db, req.projectId!, body.locationId);
       if (body.assetId) await assertAsset(app.db, req.projectId!, body.assetId);
@@ -967,6 +984,11 @@ export const commissioningRoutes: FastifyPluginAsync = async (app) => {
             `Raise a retest instead: POST /projects/:projectId/commissioning/test-records/${record.id}/retest.`,
         );
       }
+      if (record.status === "void") {
+        throw badRequest(
+          `${record.reference} is void. A void record is a record somebody withdrew; recording a result on it would put a reading against a test the register says did not happen. Raise a new test record.`,
+        );
+      }
       const performedAt = body.performedAt ?? nowISO();
       const onDate = performedAt.slice(0, 10);
       const instruments = (body.instruments ??
@@ -999,10 +1021,41 @@ export const commissioningRoutes: FastifyPluginAsync = async (app) => {
         );
       }
 
+      /*
+       * CLAIM THE RESULT BEFORE RAISING ANYTHING.
+       *
+       * The status refusal above is a read, and the deficiency loop below is a
+       * write that creates a punch item or an NCR per deficiency. Two
+       * concurrent submissions of the same result — a double-clicked button, a
+       * retried request — both passed the read and both ran the loop, so the
+       * same defect arrived in the field register twice and blocked turnover
+       * twice. `performedAt` is null until a result is recorded and set by it,
+       * so a single conditional UPDATE claims the act; the loser gets a 409
+       * rather than a duplicate register entry. The claim is released below if
+       * anything after it fails, so a genuine retry is never locked out.
+       */
+      const claimed = await app.db
+        .update(commissioningTestRecords)
+        .set({ performedAt, performedBy: req.user!.id, updatedAt: nowISO() })
+        .where(
+          and(
+            eq(commissioningTestRecords.id, recordId),
+            isNull(commissioningTestRecords.performedAt),
+            inArray(commissioningTestRecords.status, ["scheduled", "in_progress", "failed"]),
+          ),
+        )
+        .returning({ id: commissioningTestRecords.id });
+      if (!claimed[0]) {
+        throw conflict(
+          `${record.reference} is already being resulted by another request. Reload it: recording the result twice would raise the same deficiencies twice.`,
+        );
+      }
+
       const deficiencyRecordIds: string[] = [...record.deficiencyRecordIds];
       const raisedPunchItems: { punchItemId: string; number: number }[] = [];
       const raisedNcrs: { ncrId: string; reference: string }[] = [];
       let ncrId = record.ncrId;
+      try {
       for (const deficiency of deficiencies) {
         if (deficiency.raiseAs === "ncr") {
           const ncr = await createNcr(app.db, {
@@ -1088,6 +1141,20 @@ export const commissioningRoutes: FastifyPluginAsync = async (app) => {
         judgedReadings: judged,
         raised: { punchItems: raisedPunchItems, ncrs: raisedNcrs },
       };
+      } catch (err) {
+        // Release the claim: the result was never recorded, and a test stuck
+        // half-resulted is worse than the error the caller is about to see.
+        await app.db
+          .update(commissioningTestRecords)
+          .set({ performedAt: null, performedBy: null, updatedAt: nowISO() })
+          .where(
+            and(
+              eq(commissioningTestRecords.id, recordId),
+              eq(commissioningTestRecords.status, record.status),
+            ),
+          );
+        throw err;
+      }
     },
   );
 

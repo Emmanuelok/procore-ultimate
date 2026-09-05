@@ -445,7 +445,10 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/invoice-payments", { preHandler: readGate }, async (req) => {
     const q = paymentListQuery.parse(req.query);
-    const clauses = [eq(commitmentPayments.projectId, req.projectId!)];
+    const clauses = [
+      eq(commitmentPayments.companyId, req.companyId!),
+      eq(commitmentPayments.projectId, req.projectId!),
+    ];
     if (q.status) clauses.push(eq(commitmentPayments.status, q.status));
     if (q.vendorId) clauses.push(eq(commitmentPayments.vendorId, q.vendorId));
     if (q.commitmentId) clauses.push(eq(commitmentPayments.commitmentId, q.commitmentId));

@@ -1960,36 +1960,51 @@ export function libraryCoversAllRegimes(): boolean {
   return TAX_REGIMES.every((r) => byRegime.has(r));
 }
 
-/** ISO-3166 alpha-2 → default regime (null when the library has no regime for it). */
-export function regimeForCountry(country: string | null | undefined): TaxRegime | null {
+const COUNTRY_ALIASES: Record<string, string> = {
+  UK: "GB",
+  "UNITED KINGDOM": "GB",
+  "GREAT BRITAIN": "GB",
+  ENGLAND: "GB",
+  SCOTLAND: "GB",
+  WALES: "GB",
+  IRELAND: "IE",
+  SINGAPORE: "SG",
+  AUSTRALIA: "AU",
+  "NEW ZEALAND": "NZ",
+  MALAYSIA: "MY",
+  "SOUTH AFRICA": "ZA",
+  NIGERIA: "NG",
+  KENYA: "KE",
+  GHANA: "GH",
+  INDIA: "IN",
+  UAE: "AE",
+  "UNITED ARAB EMIRATES": "AE",
+  "SAUDI ARABIA": "SA",
+  KSA: "SA",
+  USA: "US",
+  "UNITED STATES": "US",
+  "UNITED STATES OF AMERICA": "US",
+};
+
+/**
+ * Free text country → ISO-3166 alpha-2, or null when it is not a code and not
+ * a name the library knows. `projects.country` is free text, so callers that
+ * need a code (the PE register writes one and prints it) must normalise
+ * rather than truncate: "United Kingdom".slice(0, 2) is "UN", a country that
+ * does not exist.
+ */
+export function countryCodeFor(country: string | null | undefined): string | null {
   if (!country) return null;
   const c = country.trim().toUpperCase();
-  const aliases: Record<string, string> = {
-    UK: "GB",
-    "UNITED KINGDOM": "GB",
-    "GREAT BRITAIN": "GB",
-    ENGLAND: "GB",
-    SCOTLAND: "GB",
-    WALES: "GB",
-    IRELAND: "IE",
-    SINGAPORE: "SG",
-    AUSTRALIA: "AU",
-    "NEW ZEALAND": "NZ",
-    MALAYSIA: "MY",
-    "SOUTH AFRICA": "ZA",
-    NIGERIA: "NG",
-    KENYA: "KE",
-    GHANA: "GH",
-    INDIA: "IN",
-    UAE: "AE",
-    "UNITED ARAB EMIRATES": "AE",
-    "SAUDI ARABIA": "SA",
-    KSA: "SA",
-    USA: "US",
-    "UNITED STATES": "US",
-    "UNITED STATES OF AMERICA": "US",
-  };
-  const code = aliases[c] ?? c;
+  const alias = COUNTRY_ALIASES[c];
+  if (alias) return alias;
+  return /^[A-Z]{2}$/.test(c) ? c : null;
+}
+
+/** ISO-3166 alpha-2 (or a country name) → default regime; null when unknown. */
+export function regimeForCountry(country: string | null | undefined): TaxRegime | null {
+  const code = countryCodeFor(country);
+  if (!code) return null;
   for (const def of TAX_REGIME_LIBRARY) {
     if (def.countryCode && def.countryCode === code) return def.regime;
   }

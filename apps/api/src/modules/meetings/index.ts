@@ -1,15 +1,42 @@
-import type { FastifyPluginAsync, FastifyRequest } from "fastify";
-import { and, asc, count, desc, eq, inArray, isNotNull, isNull, lt, ne, or } from "drizzle-orm";
+import type { FastifyInstance, FastifyPluginAsync, FastifyRequest } from "fastify";
+import {
+  and,
+  asc,
+  count,
+  desc,
+  eq,
+  gte,
+  inArray,
+  isNotNull,
+  isNull,
+  lt,
+  lte,
+  ne,
+  or,
+  sql,
+} from "drizzle-orm";
 import { z } from "zod";
 import {
+  changeEvents,
+  companies,
+  companyMemberships,
+  contacts,
+  files,
   meetingActionItems,
   meetingAgendaItems,
+  meetingAgendaTemplates,
   meetingAttendees,
   meetingDecisions,
+  meetingMinuteDeliveries,
   meetingSeries,
   meetings,
   obligations,
+  projects,
+  recordLinks,
+  rfis,
+  risks,
   signals,
+  users,
 } from "@constructos/db";
 import {
   ACTION_ITEM_PRIORITIES,
@@ -18,17 +45,24 @@ import {
   MEETING_ATTENDANCE_STATES,
   MEETING_ATTENDEE_ROLES,
   MEETING_ITEM_CATEGORIES,
+  MEETING_RAISE_TARGETS,
+  MEETING_DOCUMENT_KINDS,
   MEETING_RECURRENCES,
   MEETING_SERIES_STATUSES,
   MEETING_STATUSES,
   MEETING_TYPES,
+  MINUTE_DELIVERY_CHANNELS,
+  MINUTE_DELIVERY_STATUSES,
 } from "@constructos/shared";
+import type { Db } from "../../lib/db.js";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
-import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
+import { AppError, badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
+import { forEachCompany } from "../../lib/scheduler.js";
 import { pushNotifications } from "../notifications/service.js";
+import { resolveEmailTransport, type EmailTransport } from "../../lib/email.js";
 import { isoDateSchema, todayISO } from "../field/dates.js";
 import {
   checkQuorum,
@@ -36,6 +70,34 @@ import {
   ruleForRecurrence,
   UnsupportedRecurrenceRule,
 } from "./recurrence.js";
+import {
+  computeObjectionWindow,
+  renderMeetingDocument,
+  type MinutesAction,
+  type MinutesAgendaItem,
+  type MinutesAttendee,
+  type MinutesDecision,
+  type MinutesModel,
+} from "./minutes.js";
+import {
+  companyScopeOf,
+  companyToolGate,
+  scopeAllows,
+  scopeProjects,
+  scopeProjectsOrCompanyWide,
+} from "./scope.js";
+import {
+  TRANSCRIPT_LIMIT,
+  buildDraftSystemPrompt,
+  buildDraftUserPrompt,
+  buildProposal,
+  minutesDraftSchema,
+  proposalToMinutesBody,
+  type DraftAgendaItem,
+  type DraftAttendee,
+  type DraftInput,
+} from "./aiminutes.js";
+import { aiEnabled, runAgent } from "../ai/service.js";
 
 /**
  * MEETINGS (M20, spec Vol I §2.9) — tool key `meetings`.
@@ -150,8 +212,19 @@ const meetingCreateSchema = z.object({
   objectionPeriodDays: z.number().int().min(0).max(90).nullable().optional(),
 });
 
+/*
+ * NO `status` HERE, AND THAT IS THE POINT.
+ *
+ * Every meeting transition has a dedicated route that enforces something:
+ * /hold settles quorum from the attendance, /minutes/issue stamps who issued
+ * them, /minutes/approve refuses the minute taker and the issuer, /cancel
+ * refuses an issued meeting. A generic PATCH that accepted `status` let a
+ * standard user write `minutes_accepted` with no approver, no objection check
+ * and no segregation — the audit control the module is built around,
+ * circumvented by choosing a different URL. `minuteTakerId` and `chairId` are
+ * accepted only while the minutes are still unwritten (see the route).
+ */
 const meetingPatchSchema = meetingCreateSchema.partial().extend({
-  status: z.enum(MEETING_STATUSES).optional(),
   actualStart: isoTimestamp.nullable().optional(),
   actualEnd: isoTimestamp.nullable().optional(),
   agendaFileId: z.string().max(64).nullable().optional(),
@@ -245,9 +318,29 @@ const actionCreateSchema = z.object({
   linkedRecordId: z.string().max(64).nullable().optional(),
 });
 
-const actionPatchSchema = actionCreateSchema.partial().extend({
-  status: z.enum(ACTION_ITEM_STATUSES).optional(),
-});
+/*
+ * Again no `status`: /complete records who completed it, /verify refuses that
+ * same person, /cancel refuses a promoted action and /block refuses a
+ * completed one. `PATCH { status: "verified" }` skipped all four and wrote no
+ * state_change to the ledger, so an action could be certified as verified by
+ * the person who did it, with nothing in the chain to show it.
+ */
+const actionPatchSchema = actionCreateSchema.partial();
+
+/**
+ * Once an action has been promoted, these columns are the obligation's terms,
+ * copied here so the two rows tell one story. Editing them on the action
+ * afterwards makes the action and the obligation disagree about what is owed,
+ * to whom and by when — and the obligation is the one with the time bar.
+ */
+const PROMOTED_LOCKED_FIELDS = [
+  "sourceClause",
+  "obligorId",
+  "obligeeId",
+  "deadline",
+  "warnDaysBefore",
+  "evidenceRequirement",
+] as const;
 
 const actionsListQuery = pageQuerySchema.extend({
   status: z.enum(ACTION_ITEM_STATUSES).optional(),
@@ -270,6 +363,29 @@ const CARRY_SIGNAL_THRESHOLD = 3;
 /** Agenda item states that do NOT carry forward. */
 const CLOSED_ITEM_STATES = ["closed", "noted"] as const;
 const OPEN_ACTION_STATES = ["open", "in_progress", "blocked"] as const;
+/** A meeting can only be *held* from these — see the /hold route. */
+const HOLDABLE_STATES = ["scheduled", "in_progress"] as const;
+/** Action states from which cancel / block / escalate are meaningful. */
+const CANCELLABLE_ACTION_STATES = ["open", "in_progress", "blocked"] as const;
+const BLOCKABLE_ACTION_STATES = ["open", "in_progress"] as const;
+/** How many days before the objection period closes the platform warns. */
+const OBJECTION_WARN_DAYS = 2;
+const OBJECTION_DETECTOR = "meeting_minutes_objection_closing";
+
+/** Printed on read routes that used to sweep, so the change is visible. */
+const SWEEP_NOTE =
+  "scheduler job meetings.overdue-actions (system actor) — this read performs no writes";
+
+/**
+ * A list boundary the caller gave us. `from=2026-06-01` is a date, not an
+ * instant; parsing it here (rather than in a post-filter) is what lets the
+ * predicate go into the WHERE clause where pagination can see it.
+ */
+function parseBoundary(raw: string, which: "from" | "to"): string {
+  const ms = Date.parse(raw.length === 10 ? `${raw}T${which === "from" ? "00:00:00" : "23:59:59"}.000Z` : raw);
+  if (Number.isNaN(ms)) throw badRequest(`"${which}" is not a date or instant this platform can read`);
+  return new Date(ms).toISOString();
+}
 
 export const meetingsModule: FastifyPluginAsync = async (app) => {
   const readGate = [app.authenticate, app.requireCompany, app.requireTool("meetings", "read")];
@@ -279,7 +395,36 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
     app.requireTool("meetings", "standard"),
   ];
   const adminGate = [app.authenticate, app.requireCompany, app.requireTool("meetings", "admin")];
+  /*
+   * One transport per app instance. `resolveEmailTransport` builds a NEW one
+   * per call and the default records into memory, so calling it per request
+   * would throw away the log the no-op transport exists to keep — and, under
+   * test, make "was it sent?" unanswerable.
+   */
+  let transport: EmailTransport | null = null;
+  const emailTransport = (): EmailTransport => {
+    transport ??= resolveEmailTransport(app.appConfig);
+    return transport;
+  };
+
   const companyRead = [app.authenticate, app.requireCompany];
+  /*
+   * A route with no `:projectId` cannot be gated by `requireTool`, so the
+   * company-level routes ran on [authenticate, requireCompany] alone — and
+   * COMPANY_ROLES includes `guest`. Any company member could read every
+   * project's overdue actions. `companyToolGate` resolves the caller's
+   * visibility once and every handler filters by it (see scope.ts).
+   */
+  const companyScopedRead = [
+    app.authenticate,
+    app.requireCompany,
+    companyToolGate(app, "meetings", "read"),
+  ];
+  const companyTemplateAdmin = [
+    app.authenticate,
+    app.requireCompany,
+    companyToolGate(app, "meetings", "admin"),
+  ];
 
   /* ---------------------------------------------------------------- */
   /* Fetchers + shared helpers                                         */
@@ -447,44 +592,24 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
     return { ...row, ...decisionImpacts(row) };
   }
 
-  /** The objection period, and whether silence has run its course. */
+  /**
+   * The objection period, and whether silence has run its course.
+   *
+   * Delegated to a pure function (minutes.ts) so the arithmetic — including
+   * the rule that the clock runs from DELIVERY when one is recorded and only
+   * falls back to issue when it is not — is unit-tested without a database.
+   */
   function minutesWindow(row: typeof meetings.$inferSelect) {
-    const objections = (detailOf(row)["objections"] as unknown[] | undefined) ?? [];
-    const openObjections = objections.filter(
-      (o) => (o as { resolvedAt?: unknown } | null)?.resolvedAt == null,
-    ).length;
-    if (!row.minutesIssuedAt || row.objectionPeriodDays == null) {
-      return {
-        closesAt: null,
-        expired: null,
-        objections: objections.length,
-        openObjections,
-        deemedAccepted: null,
-        reasons: [
-          row.minutesIssuedAt
-            ? "No objection period is recorded on this meeting, so nothing is deemed accepted."
-            : "Minutes have not been issued, so no objection period is running.",
-        ],
-      };
-    }
-    const closesAt = new Date(
-      Date.parse(row.minutesIssuedAt) + row.objectionPeriodDays * 86_400_000,
-    ).toISOString();
-    const expired = Date.now() > Date.parse(closesAt);
-    return {
-      closesAt,
-      expired,
-      objections: objections.length,
-      openObjections,
-      /*
-       * "Deemed accepted" is REPORTED, never written: the status stays
-       * minutes_issued until a human signs the minutes off. Silence has legal
-       * weight, but it is not a signature and the record must not pretend it
-       * is one.
-       */
-      deemedAccepted: expired && openObjections === 0 && row.approvedAt == null,
-      reasons: [],
-    };
+    const objections =
+      (detailOf(row)["objections"] as Array<{ resolvedAt?: unknown }> | undefined) ?? [];
+    return computeObjectionWindow({
+      minutesIssuedAt: row.minutesIssuedAt,
+      minutesDeliveredAt: row.minutesDeliveredAt,
+      objectionPeriodDays: row.objectionPeriodDays,
+      approvedAt: row.approvedAt,
+      objections,
+      nowMs: Date.now(),
+    });
   }
 
   async function loadAttendees(meetingId: string) {
@@ -532,12 +657,33 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       .where(eq(meetings.id, meetingId));
   }
 
-  /** Signal keys already raised for a detector in this company (idempotence). */
-  async function alreadySignalled(companyId: string, detector: string): Promise<Set<string>> {
+  /**
+   * Signal keys already raised for a detector in this company (idempotence).
+   *
+   * `candidateKeys` narrows the query to the keys actually being considered:
+   * the previous version loaded every signal row for the detector into a Set
+   * on every list read, which grows without bound. `signals` has no index on
+   * (company_id, detector) and belongs to another package, so the honest fix
+   * available here is to ask a bounded question.
+   */
+  async function alreadySignalled(
+    companyId: string,
+    detector: string,
+    candidateKeys?: readonly string[],
+  ): Promise<Set<string>> {
+    if (candidateKeys && candidateKeys.length === 0) return new Set();
     const rows = await app.db
       .select({ refs: signals.evidenceRefs })
       .from(signals)
-      .where(and(eq(signals.companyId, companyId), eq(signals.detector, detector)));
+      .where(
+        and(
+          eq(signals.companyId, companyId),
+          eq(signals.detector, detector),
+          candidateKeys
+            ? sql`${signals.evidenceRefs} ->> 'key' in ${candidateKeys}`
+            : undefined,
+        ),
+      );
     const keys = new Set<string>();
     for (const row of rows) {
       const refs = row.refs as { key?: unknown } | null;
@@ -547,18 +693,24 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
   }
 
   /* ---------------------------------------------------------------- */
-  /* THE LAZY OVERDUE SWEEP                                            */
+  /* THE OVERDUE SWEEP — now a scheduled job, not a read side effect   */
   /*                                                                   */
-  /* Runs on action-item and report reads. Never a cron: an action     */
-  /* nobody looks at harms nobody, and the read is the moment the      */
-  /* answer has to be true. Idempotent twice over — the signal is      */
-  /* keyed on the action id AND the action row records `signalId`.     */
+  /* It used to run on every action-item and report read. That was     */
+  /* wrong twice over: a project nobody opened was never warned about  */
+  /* (the deadline does not wait for a browser tab), and the ledger    */
+  /* attributed the resulting signals to whoever happened to open the  */
+  /* list — including read-only users and assurance grantees who hold  */
+  /* no write permission at all. It now runs under the platform        */
+  /* scheduler with a null (system) actor; reads are pure.             */
+  /*                                                                   */
+  /* Idempotent twice over — the signal is keyed on the action id AND  */
+  /* the action row records `signalId`.                                */
   /* ---------------------------------------------------------------- */
 
   async function sweepOverdueActions(
     companyId: string,
     projectId: string | null,
-    actorId: string,
+    actorId: string | null,
   ): Promise<{ raised: number; scanned: number }> {
     const today = todayISO();
     const nowIso = new Date().toISOString();
@@ -578,7 +730,11 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       );
     if (candidates.length === 0) return { raised: 0, scanned: 0 };
 
-    const seen = await alreadySignalled(companyId, OVERDUE_DETECTOR);
+    const seen = await alreadySignalled(
+      companyId,
+      OVERDUE_DETECTOR,
+      candidates.map((c) => c.id),
+    );
     let raised = 0;
     for (const item of candidates) {
       if (seen.has(item.id)) continue;
@@ -609,6 +765,9 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
           `re-dated or closed is how a project loses the thread of what it agreed: either close ` +
           `it, re-date it (which is recorded as slippage), or promote it to an obligation so the ` +
           `time bar is enforced.`,
+        fingerprint: `${OVERDUE_DETECTOR}:${item.id}`,
+        subjectType: "meeting_action_item",
+        subjectId: item.id,
         evidenceRefs: {
           key: item.id,
           actionItemId: item.id,
@@ -642,8 +801,8 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
   /** Carried-too-often agenda items, keyed on the ROOT item so a chain signals once. */
   async function sweepCarriedItems(
     companyId: string,
-    projectId: string,
-    actorId: string,
+    projectId: string | null,
+    actorId: string | null,
   ): Promise<{ raised: number }> {
     const rows = await app.db
       .select()
@@ -651,14 +810,19 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       .where(
         and(
           eq(meetingAgendaItems.companyId, companyId),
-          eq(meetingAgendaItems.projectId, projectId),
+          projectId ? eq(meetingAgendaItems.projectId, projectId) : undefined,
           isNull(meetingAgendaItems.carriedForwardToItemId),
           ne(meetingAgendaItems.status, "closed"),
+          gte(meetingAgendaItems.carryCount, CARRY_SIGNAL_THRESHOLD),
         ),
       );
     const overCarried = rows.filter((r) => r.carryCount >= CARRY_SIGNAL_THRESHOLD);
     if (overCarried.length === 0) return { raised: 0 };
-    const seen = await alreadySignalled(companyId, CARRY_DETECTOR);
+    const seen = await alreadySignalled(
+      companyId,
+      CARRY_DETECTOR,
+      overCarried.map((i) => (detailOf(i)["rootItemId"] as string | undefined) ?? i.id),
+    );
     let raised = 0;
     for (const item of overCarried) {
       const rootId = (detailOf(item)["rootItemId"] as string | undefined) ?? item.id;
@@ -668,7 +832,7 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       await app.db.insert(signals).values({
         id: signalId,
         companyId,
-        projectId,
+        projectId: item.projectId,
         detector: CARRY_DETECTOR,
         severity: item.carryCount >= 6 ? "high" : "medium",
         confidence: 1,
@@ -678,6 +842,9 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
           `without being closed. An item that survives this many meetings is not an agenda ` +
           `item, it is an undecided question: give it an owner and a date, escalate it, or ` +
           `record the decision not to decide it.`,
+        fingerprint: `${CARRY_DETECTOR}:${rootId}`,
+        subjectType: "meeting_agenda_item",
+        subjectId: rootId,
         evidenceRefs: {
           key: rootId,
           rootItemId: rootId,
@@ -694,7 +861,7 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
         objectType: "signal",
         objectId: signalId,
         payload: { detector: CARRY_DETECTOR, agendaItemId: item.id, carryCount: item.carryCount },
-        projectId,
+        projectId: item.projectId,
       });
       raised += 1;
     }
@@ -827,6 +994,89 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       }
     }
     return { carried, skipped, actionsCarried };
+  }
+
+  /**
+   * APPLY THE SERIES STANDARDS TO ONE OCCURRENCE.
+   *
+   * Standing agenda first (so carried items land beneath it), then the
+   * standing invitees as `absent` — nobody has attended a meeting that has
+   * not happened yet — then the previous occurrence's unclosed items.
+   *
+   * Factored out of `generate-occurrences` because `POST /meetings` with a
+   * seriesId did none of it: it copied the location and the quorum and left
+   * the occurrence with no agenda, no roll and nothing carried, while the UI
+   * told the user the opposite in as many words. A series whose standards
+   * apply only when you press one particular button is not a series.
+   */
+  async function applySeriesStandards(
+    req: FastifyRequest,
+    meetingId: string,
+    series: typeof meetingSeries.$inferSelect,
+    previousMeetingId: string | null,
+  ): Promise<{
+    agendaItemsCreated: number;
+    inviteesCreated: number;
+    carriedForward: { carried: number; skipped: number; actionsCarried: number };
+  }> {
+    let agendaItemsCreated = 0;
+    let position = 0;
+    for (const raw of (series.agendaTemplate as unknown[]) ?? []) {
+      const parsed = agendaTemplateSchema.safeParse(raw);
+      if (!parsed.success) continue;
+      await app.db.insert(meetingAgendaItems).values({
+        id: newId("magi"),
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        meetingId,
+        seriesId: series.id,
+        itemNumber: parsed.data.itemNumber ?? null,
+        position: parsed.data.position ?? position,
+        title: parsed.data.title,
+        category: parsed.data.category ?? "other",
+        status: "open",
+        allocatedMinutes: parsed.data.allocatedMinutes ?? null,
+        firstRaisedMeetingId: meetingId,
+        detail: { fromTemplate: true },
+        createdBy: req.user!.id,
+      });
+      position += 1;
+      agendaItemsCreated += 1;
+    }
+
+    let inviteesCreated = 0;
+    for (const raw of (series.defaultAttendees as unknown[]) ?? []) {
+      const parsed = attendeeTemplateSchema.safeParse(raw);
+      if (!parsed.success) continue;
+      await app.db.insert(meetingAttendees).values({
+        id: newId("matt"),
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        meetingId,
+        userId: parsed.data.userId ?? null,
+        contactId: parsed.data.contactId ?? null,
+        vendorId: parsed.data.vendorId ?? null,
+        name: parsed.data.name,
+        organisation: parsed.data.organisation ?? null,
+        email: parsed.data.email ?? null,
+        jobTitle: parsed.data.jobTitle ?? null,
+        role: parsed.data.role ?? "required",
+        attendance: "absent",
+      });
+      inviteesCreated += 1;
+    }
+
+    const [meetingRow] = await app.db
+      .select()
+      .from(meetings)
+      .where(eq(meetings.id, meetingId))
+      .limit(1);
+    let carriedForward = { carried: 0, skipped: 0, actionsCarried: 0 };
+    if (previousMeetingId && meetingRow) {
+      carriedForward = await carryForwardInto(req, meetingRow, previousMeetingId);
+    }
+    await refreshMeetingCounts(meetingId);
+    return { agendaItemsCreated, inviteesCreated, carriedForward };
   }
 
   /* ================================================================ */
@@ -1102,71 +1352,13 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
           generated: true,
         });
 
-        // Standing agenda first, so carried items land beneath it.
-        const template = (series.agendaTemplate as unknown[]) ?? [];
-        let position = 0;
-        for (const raw of template) {
-          const parsed = agendaTemplateSchema.safeParse(raw);
-          if (!parsed.success) continue;
-          const itemId = newId("magi");
-          await app.db.insert(meetingAgendaItems).values({
-            id: itemId,
-            companyId: req.companyId!,
-            projectId: req.projectId!,
-            meetingId,
-            seriesId,
-            itemNumber: parsed.data.itemNumber ?? null,
-            position: parsed.data.position ?? position,
-            title: parsed.data.title,
-            category: parsed.data.category ?? "other",
-            status: "open",
-            allocatedMinutes: parsed.data.allocatedMinutes ?? null,
-            firstRaisedMeetingId: meetingId,
-            detail: { fromTemplate: true },
-            createdBy: req.user!.id,
-          });
-          position += 1;
-        }
-
-        // Standing invitees.
-        for (const raw of (series.defaultAttendees as unknown[]) ?? []) {
-          const parsed = attendeeTemplateSchema.safeParse(raw);
-          if (!parsed.success) continue;
-          await app.db.insert(meetingAttendees).values({
-            id: newId("matt"),
-            companyId: req.companyId!,
-            projectId: req.projectId!,
-            meetingId,
-            userId: parsed.data.userId ?? null,
-            contactId: parsed.data.contactId ?? null,
-            vendorId: parsed.data.vendorId ?? null,
-            name: parsed.data.name,
-            organisation: parsed.data.organisation ?? null,
-            email: parsed.data.email ?? null,
-            jobTitle: parsed.data.jobTitle ?? null,
-            role: parsed.data.role ?? "required",
-            // Nobody has attended a meeting that has not happened. Invitees
-            // start as `absent` and are marked present when they turn up.
-            attendance: "absent",
-          });
-        }
-
-        const [meetingRow] = await app.db
-          .select()
-          .from(meetings)
-          .where(eq(meetings.id, meetingId))
-          .limit(1);
-        let carry = { carried: 0, skipped: 0, actionsCarried: 0 };
-        if (previousMeetingId && meetingRow) {
-          carry = await carryForwardInto(req, meetingRow, previousMeetingId);
-        }
-        await refreshMeetingCounts(meetingId);
+        const applied = await applySeriesStandards(req, meetingId, series, previousMeetingId);
         const [finalRow] = await app.db
           .select()
           .from(meetings)
           .where(eq(meetings.id, meetingId))
           .limit(1);
-        created.push({ ...finalRow, carriedForward: carry });
+        created.push({ ...finalRow, ...applied });
 
         previousMeetingId = meetingId;
         occurrenceNumber += 1;
@@ -1245,18 +1437,33 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       seriesId: series?.id ?? null,
       occurrenceNumber,
     });
+    // A meeting created into a series inherits the series' standards, exactly
+    // as a generated occurrence does.
+    const applied = series
+      ? await applySeriesStandards(req, id, series, previousMeetingId)
+      : null;
     const [row] = await app.db.select().from(meetings).where(eq(meetings.id, id)).limit(1);
-    return reply.status(201).send(row);
+    return reply.status(201).send(applied ? { ...row, ...applied } : row);
   });
 
   app.get("/projects/:projectId/meetings", { preHandler: readGate }, async (req) => {
     const q = meetingsListQuery.parse(req.query);
+    /*
+     * The date filter belongs in the WHERE, not in a post-LIMIT array filter.
+     * Filtering after pagination made `total` count rows the page had already
+     * dropped: with 300 meetings and from=2026-06-01 the first page could come
+     * back empty while total said 300, and the matching rows sat on page 4.
+     */
+    const from = q.from ? parseBoundary(q.from, "from") : null;
+    const to = q.to ? parseBoundary(q.to, "to") : null;
     const where = and(
       eq(meetings.companyId, req.companyId!),
       eq(meetings.projectId, req.projectId!),
       q.seriesId ? eq(meetings.seriesId, q.seriesId) : undefined,
       q.status ? eq(meetings.status, q.status) : undefined,
       q.meetingType ? eq(meetings.meetingType, q.meetingType) : undefined,
+      from ? gte(meetings.scheduledStart, from) : undefined,
+      to ? lte(meetings.scheduledStart, to) : undefined,
     );
     const [totalRow] = await app.db.select({ n: count() }).from(meetings).where(where);
     const items = await app.db
@@ -1266,14 +1473,7 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       .orderBy(desc(meetings.number))
       .limit(q.pageSize)
       .offset(pageOffset(q));
-    const filtered = items.filter((m) => {
-      if (q.from && m.scheduledStart && Date.parse(m.scheduledStart) < Date.parse(q.from)) {
-        return false;
-      }
-      if (q.to && m.scheduledStart && Date.parse(m.scheduledStart) > Date.parse(q.to)) return false;
-      return true;
-    });
-    return paginate(filtered, Number(totalRow?.n ?? 0), q);
+    return paginate(items, Number(totalRow?.n ?? 0), q);
   });
 
   app.get("/projects/:projectId/meetings/:meetingId", { preHandler: readGate }, async (req) => {
@@ -1306,6 +1506,46 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
         meeting.quorumRequired,
       ),
       minutesObjectionWindow: minutesWindow(meeting),
+      /*
+       * Objections were reachable only inside the opaque `detail` blob, so the
+       * web app could raise one and then had nothing to resolve it with — and
+       * an unresolved objection blocks /minutes/approve forever. They are a
+       * first-class part of the minutes state; the detail route returns them.
+       */
+      objections: ((detailOf(meeting)["objections"] as unknown[] | undefined) ?? []).map((o) =>
+        typeof o === "object" && o !== null ? (o as Record<string, unknown>) : { note: o },
+      ),
+      objectionHistory:
+        (detailOf(meeting)["objectionHistory"] as unknown[] | undefined) ?? [],
+      minutesDocument: meeting.minutesFileId
+        ? {
+            fileId: meeting.minutesFileId,
+            sha256: meeting.minutesSha256,
+            renderedAt: meeting.minutesRenderedAt,
+            minutesVersion: Math.max(1, meeting.minutesVersion),
+          }
+        : null,
+      agendaPack: meeting.agendaPackFileId
+        ? { fileId: meeting.agendaPackFileId, sha256: meeting.agendaPackSha256 }
+        : null,
+      deliveries: await (async () => {
+        const rows = await app.db
+          .select()
+          .from(meetingMinuteDeliveries)
+          .where(eq(meetingMinuteDeliveries.meetingId, meetingId))
+          .orderBy(
+            desc(meetingMinuteDeliveries.minutesVersion),
+            asc(meetingMinuteDeliveries.recipientName),
+          );
+        return {
+          items: rows,
+          total: rows.length,
+          delivered: rows.filter((r) => r.status === "delivered" || r.status === "acknowledged")
+            .length,
+          acknowledged: rows.filter((r) => r.status === "acknowledged").length,
+          failed: rows.filter((r) => r.status === "failed").length,
+        };
+      })(),
       carryForward: {
         carriedIn: agendaItems.filter((i) => i.carriedFromItemId != null).length,
         maxCarryCount: agendaItems.reduce((m, i) => Math.max(m, i.carryCount), 0),
@@ -1318,14 +1558,44 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
     const body = meetingPatchSchema.parse(req.body);
     const meeting = await fetchMeeting(req, meetingId);
     if (meeting.status === "cancelled") throw badRequest("A cancelled meeting cannot be edited");
+
+    /*
+     * The two identities the minutes approval rests on. `approve` refuses the
+     * minute taker and the issuer; swapping the minute taker afterwards let
+     * the author of the minutes sign off their own. Once the minutes exist,
+     * these are historical facts, not settings.
+     */
+    const minutesExist = Boolean(meeting.minutesBody || meeting.minutesFileId || meeting.minutesIssuedAt);
+    for (const key of ["minuteTakerId", "chairId"] as const) {
+      const next = body[key];
+      if (next === undefined || next === meeting[key]) continue;
+      if (minutesExist) {
+        throw conflict(
+          `The ${key === "chairId" ? "chair" : "minute taker"} cannot be changed once minutes ` +
+            "exist for this meeting: approval is refused to whoever wrote or issued them, so " +
+            "reassigning the role after the fact would defeat that check. Correct the minutes " +
+            "instead, or record the change as an agenda item at the next occurrence.",
+        );
+      }
+    }
+
+    const identityChanges: Record<string, unknown> = {};
     const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
     for (const [k, v] of Object.entries(body)) {
       if (v === undefined) continue;
       if (k === "seriesId") continue; // a meeting never changes series
       set[k] = k === "isVirtual" ? (v ? 1 : 0) : v;
+      if (k === "minuteTakerId" || k === "chairId") {
+        identityChanges[k] = { from: meeting[k as "minuteTakerId" | "chairId"], to: v };
+      }
     }
     await app.db.update(meetings).set(set).where(eq(meetings.id, meetingId));
     await ledger("update", "meeting", meetingId, req, { changed: Object.keys(body) });
+    if (Object.keys(identityChanges).length > 0) {
+      // Who chairs and who holds the pen decides who may sign the minutes off,
+      // so a change of either is a state change, not a field edit.
+      await ledger("state_change", "meeting", meetingId, req, { identity: identityChanges });
+    }
     return fetchMeeting(req, meetingId);
   });
 
@@ -1342,7 +1612,18 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
         })
         .parse(req.body ?? {});
       const meeting = await fetchMeeting(req, meetingId);
-      if (meeting.status === "cancelled") throw badRequest("A cancelled meeting cannot be held");
+      /*
+       * Hold moves a meeting FORWARD. Allowing it from minutes_draft upward
+       * rewrote an issued or accepted meeting back to "held", hiding the
+       * objection window and the acceptance from every list view and putting a
+       * backwards state_change in the ledger.
+       */
+      if (!HOLDABLE_STATES.includes(meeting.status as (typeof HOLDABLE_STATES)[number])) {
+        throw conflict(
+          `A meeting can only be held from scheduled or in_progress (this one is ` +
+            `"${meeting.status}"). Holding it again would rewind its minutes.`,
+        );
+      }
       const quorum = await quorumFor(meeting);
       const now = new Date().toISOString();
       await app.db
@@ -1670,6 +1951,26 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       const meeting = await fetchMeeting(req, meetingId);
       if (meeting.status === "cancelled") throw badRequest("A cancelled meeting has no minutes");
       if (meeting.approvedAt) throw conflict("Approved minutes cannot be redrafted");
+      /*
+       * THE DEADLOCK THIS PREVENTS.
+       *
+       * Saving a draft over ISSUED minutes used to set the status back to
+       * minutes_draft while minutesIssuedAt stayed set. /minutes/approve then
+       * refused (status is not minutes_issued) and /minutes/issue refused
+       * (already issued), so the meeting could never reach minutes_accepted —
+       * the core workflow, wedged, with no route out of it. Correction after
+       * issue is a deliberate, ledgered act with its own route: it withdraws
+       * the issued version, bumps the version number and lets the redraft
+       * proceed, so recipients can see that what they received was replaced.
+       */
+      if (meeting.minutesIssuedAt) {
+        throw conflict(
+          "These minutes have been issued and cannot be silently redrafted: recipients are " +
+            "relying on the version they received, and the objection period is running against " +
+            "it. Withdraw them first with POST /minutes/correct (which records why and bumps " +
+            "the version), then redraft and re-issue.",
+        );
+      }
       const now = new Date().toISOString();
       await app.db
         .update(meetings)
@@ -1695,27 +1996,60 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
     },
   );
 
+  /**
+   * ISSUE THE MINUTES: render the document, hash it, deliver it, and start
+   * the clock from DELIVERY.
+   *
+   * Everything before the notification loop is what makes the deeming
+   * defensible. The bytes are rendered and content-addressed, one delivery row
+   * is written per recipient (platform users through the notification centre,
+   * external attendees by email), the email transport's own verdict is
+   * recorded per recipient rather than assumed, and `minutesDeliveredAt` — the
+   * timestamp the objection window actually runs from — is set from the
+   * earliest delivery that really happened. Where nothing could be delivered,
+   * the window falls back to issue and SAYS SO.
+   */
   app.post(
     "/projects/:projectId/meetings/:meetingId/minutes/issue",
     { preHandler: standardGate },
     async (req) => {
       const { meetingId } = req.params as { meetingId: string };
       const body = z
-        .object({ objectionPeriodDays: z.number().int().min(0).max(90).optional() })
+        .object({
+          objectionPeriodDays: z.number().int().min(0).max(90).optional(),
+          /** false when minutes are handed over on paper and logged manually */
+          sendEmail: z.boolean().default(true),
+        })
         .parse(req.body ?? {});
       const meeting = await fetchMeeting(req, meetingId);
       if (!meeting.minutesBody && !meeting.minutesFileId) {
         throw badRequest("There are no minutes to issue — draft them first");
       }
       if (meeting.minutesIssuedAt) throw conflict("These minutes have already been issued");
+      if (meeting.status === "cancelled") throw badRequest("A cancelled meeting has no minutes");
+
+      const version = Math.max(1, meeting.minutesVersion);
       const now = new Date().toISOString();
+      const objectionPeriodDays = body.objectionPeriodDays ?? meeting.objectionPeriodDays;
+
+      /* Version the meeting FIRST so the rendered document carries the number
+         it will be filed under, then render: the hash covers the version. */
+      if (meeting.minutesVersion < 1) {
+        await app.db
+          .update(meetings)
+          .set({ minutesVersion: 1, updatedAt: now })
+          .where(eq(meetings.id, meetingId));
+      }
+      const forRender = await fetchMeeting(req, meetingId);
+      const document = await renderAndStore(req, forRender, "minutes");
+
       await app.db
         .update(meetings)
         .set({
           status: "minutes_issued",
           minutesIssuedAt: now,
           minutesIssuedBy: req.user!.id,
-          objectionPeriodDays: body.objectionPeriodDays ?? meeting.objectionPeriodDays,
+          objectionPeriodDays,
           updatedAt: now,
         })
         .where(eq(meetings.id, meetingId));
@@ -1723,27 +2057,198 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
         from: meeting.status,
         to: "minutes_issued",
         issuedBy: req.user!.id,
-        objectionPeriodDays: body.objectionPeriodDays ?? meeting.objectionPeriodDays,
+        objectionPeriodDays,
+        minutesVersion: version,
+        minutesSha256: document.sha256,
+        minutesFileId: document.fileId,
       });
-      const distribution = (meeting.distribution as string[]) ?? [];
+
+      /* ---- who receives it -------------------------------------- */
+      const distribution = [...new Set(((meeting.distribution as string[]) ?? []).filter(Boolean))];
+      const distUsers = distribution.length
+        ? await app.db
+            .select({ id: users.id, name: users.name, email: users.email })
+            .from(users)
+            .innerJoin(companyMemberships, eq(companyMemberships.userId, users.id))
+            .where(
+              and(
+                eq(companyMemberships.companyId, req.companyId!),
+                inArray(users.id, distribution),
+              ),
+            )
+        : [];
+      const attendeeRows = await loadAttendees(meetingId);
+
+      type Recipient = {
+        userId: string | null;
+        contactId: string | null;
+        attendeeId: string | null;
+        name: string;
+        email: string | null;
+        channel: (typeof MINUTE_DELIVERY_CHANNELS)[number];
+      };
+      const recipients: Recipient[] = [];
+      const seenUsers = new Set<string>();
+      for (const u of distUsers) {
+        seenUsers.add(u.id);
+        recipients.push({
+          userId: u.id,
+          contactId: null,
+          attendeeId: null,
+          name: u.name ?? u.email,
+          email: u.email,
+          channel: "platform",
+        });
+      }
+      for (const a of attendeeRows) {
+        if (a.userId && seenUsers.has(a.userId)) continue;
+        if (a.userId) {
+          seenUsers.add(a.userId);
+          recipients.push({
+            userId: a.userId,
+            contactId: a.contactId,
+            attendeeId: a.id,
+            name: a.name,
+            email: a.email,
+            channel: "platform",
+          });
+          continue;
+        }
+        if (!a.email) continue; // an external attendee with no address cannot be served
+        recipients.push({
+          userId: null,
+          contactId: a.contactId,
+          attendeeId: a.id,
+          name: a.name,
+          email: a.email,
+          channel: "email",
+        });
+      }
+
+      /* ---- deliver ---------------------------------------------- */
+      const transport = emailTransport();
+      const emailReasons = new Set<string>();
+      let earliestDelivery: string | null = null;
+      const delivered: string[] = [];
+      const pending: string[] = [];
+      for (const r of recipients) {
+        let status: (typeof MINUTE_DELIVERY_STATUSES)[number] = "pending";
+        let deliveredAt: string | null = null;
+        let failureReason: string | null = null;
+
+        if (r.channel === "platform") {
+          /* The notification centre IS the delivery: the recipient holds an
+             account on this platform and the document is in front of them. */
+          status = "delivered";
+          deliveredAt = now;
+        } else if (!body.sendEmail) {
+          failureReason = "Email was not requested for this issue; record delivery manually.";
+        } else if (!r.email) {
+          failureReason = "No email address is recorded for this recipient.";
+        } else {
+          const result = await transport.send({
+            to: { email: r.email, name: r.name },
+            subject: `Minutes issued — ${meeting.reference}: ${meeting.title}`,
+            text:
+              `The minutes of ${meeting.reference} ("${meeting.title}") have been issued.\n\n` +
+              (objectionPeriodDays != null
+                ? `Objections must be raised within ${objectionPeriodDays} day(s) of delivery. ` +
+                  `After that, items not objected to are taken as an accurate record.\n\n`
+                : "No objection period is recorded for these minutes.\n\n") +
+              `Document sha256: ${document.sha256}\n`,
+            html: document.html,
+          });
+          if (result.dispatched) {
+            status = "delivered";
+            deliveredAt = result.at ?? now;
+          } else {
+            status = "failed";
+            failureReason = result.reasons.join(" ") || "The email transport did not dispatch.";
+            for (const reason of result.reasons) emailReasons.add(reason);
+          }
+        }
+
+        if (deliveredAt && (!earliestDelivery || deliveredAt < earliestDelivery)) {
+          earliestDelivery = deliveredAt;
+        }
+        if (status === "delivered") delivered.push(r.name);
+        else pending.push(r.name);
+
+        await app.db
+          .insert(meetingMinuteDeliveries)
+          .values({
+            id: newId("mmd"),
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            meetingId,
+            minutesVersion: version,
+            userId: r.userId,
+            contactId: r.contactId,
+            attendeeId: r.attendeeId,
+            recipientName: r.name,
+            email: r.email,
+            channel: r.channel,
+            status,
+            deliveredAt,
+            failureReason,
+            documentSha256: document.sha256,
+          })
+          .onConflictDoNothing();
+      }
+
+      if (earliestDelivery) {
+        await app.db
+          .update(meetings)
+          .set({ minutesDeliveredAt: earliestDelivery, updatedAt: now })
+          .where(eq(meetings.id, meetingId));
+      }
+
       await pushNotifications(
         app.db,
-        distribution.map((userId) => ({
-          companyId: req.companyId!,
-          userId,
-          projectId: req.projectId!,
-          kind: "status_change" as const,
-          title: `Minutes issued for ${meeting.reference}: ${meeting.title}`,
-          body:
-            meeting.objectionPeriodDays != null
-              ? `Objections must be raised within ${meeting.objectionPeriodDays} days.`
-              : null,
-          recordType: "meeting",
-          recordId: meetingId,
-        })),
+        recipients
+          .filter((r) => r.userId)
+          .map((r) => ({
+            companyId: req.companyId!,
+            userId: r.userId!,
+            projectId: req.projectId!,
+            kind: "status_change" as const,
+            title: `Minutes issued for ${meeting.reference}: ${meeting.title}`,
+            body:
+              objectionPeriodDays != null
+                ? `Objections must be raised within ${objectionPeriodDays} days of delivery.`
+                : null,
+            recordType: "meeting",
+            recordId: meetingId,
+          })),
       );
+
       const issued = await fetchMeeting(req, meetingId);
-      return { ...issued, minutesObjectionWindow: minutesWindow(issued) };
+      return {
+        ...issued,
+        minutesObjectionWindow: minutesWindow(issued),
+        document: {
+          fileId: document.fileId,
+          sha256: document.sha256,
+          sizeBytes: document.sizeBytes,
+          minutesVersion: version,
+        },
+        distributionReport: {
+          recipients: recipients.length,
+          delivered: delivered.length,
+          undelivered: pending.length,
+          transport: transport.describe(),
+          reasons: [
+            ...emailReasons,
+            ...(recipients.length === 0
+              ? [
+                  "Nobody is on the distribution and no attendee has an email address, so these " +
+                    "minutes have been issued to no one. The objection period will run from " +
+                    "issue, which a recipient can displace.",
+                ]
+              : []),
+          ],
+        },
+      };
     },
   );
 
@@ -1872,7 +2377,16 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       }
 
       // Approval happens AT a meeting: the next occurrence of the series.
+      // Whatever the caller passes must be a real meeting in this project —
+      // an unvalidated string was previously persisted and ledgered as the
+      // place the minutes were tabled, including another tenant's id.
       let approvedAtMeetingId: string | null = body.atMeetingId ?? null;
+      if (approvedAtMeetingId) {
+        if (approvedAtMeetingId === meetingId) {
+          throw badRequest("Minutes are not approved at the meeting whose minutes they are");
+        }
+        await fetchMeeting(req, approvedAtMeetingId);
+      }
       if (meeting.seriesId) {
         const later = await app.db
           .select()
@@ -2032,13 +2546,45 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
         throw badRequest(`A ${row.status} decision cannot be edited`);
       }
       const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
+      const changed: string[] = [];
       for (const [k, v] of Object.entries(body)) {
         if (v === undefined) continue;
         set[k] = k === "impactsCost" || k === "impactsSchedule" ? (v ? 1 : 0) : v;
+        changed.push(k);
+      }
+      /*
+       * A RATIFIED DECISION IS CERTIFIED CONTENT.
+       *
+       * Ratification is an independent check by someone who is not the person
+       * who made the call. Editing the decision text, its cost impact or who
+       * made it while the row still says "ratified" makes that check certify
+       * words it never saw. Editing is allowed — minutes get corrected — but
+       * it costs the ratification, which must then be given again against the
+       * new text.
+       */
+      let unratified = false;
+      if (row.status === "ratified" && changed.length > 0) {
+        set["status"] = "recorded";
+        set["ratifiedBy"] = null;
+        set["ratifiedAt"] = null;
+        unratified = true;
       }
       await app.db.update(meetingDecisions).set(set).where(eq(meetingDecisions.id, decisionId));
-      await ledger("update", "meeting_decision", decisionId, req, { changed: Object.keys(body) });
-      return withImpacts(await fetchDecision(req, decisionId));
+      await ledger("update", "meeting_decision", decisionId, req, { changed });
+      if (unratified) {
+        await ledger("state_change", "meeting_decision", decisionId, req, {
+          from: "ratified",
+          to: "recorded",
+          reason: "The decision was edited after ratification; the ratification does not carry.",
+          previouslyRatifiedBy: row.ratifiedBy,
+          previouslyRatifiedAt: row.ratifiedAt,
+          changed,
+        });
+      }
+      return {
+        ...withImpacts(await fetchDecision(req, decisionId)),
+        unratifiedByEdit: unratified,
+      };
     },
   );
 
@@ -2249,8 +2795,8 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/meeting-action-items", { preHandler: readGate }, async (req) => {
     const q = actionsListQuery.parse(req.query);
-    // Lazy sweep on the read path (see the module header).
-    const swept = await sweepOverdueActions(req.companyId!, req.projectId!, req.user!.id);
+    // No sweep here: reads are pure (see the sweep's own comment). The
+    // overdue signals are raised by the scheduler under a system actor.
     const today = todayISO();
     const where = and(
       eq(meetingActionItems.companyId, req.companyId!),
@@ -2289,7 +2835,7 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
         Number(totalRow?.n ?? 0),
         q,
       ),
-      sweep: swept,
+      sweptBy: SWEEP_NOTE,
     };
   });
 
@@ -2319,6 +2865,28 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       const { actionId } = req.params as { actionId: string };
       const body = actionPatchSchema.parse(req.body);
       const row = await fetchAction(req, actionId);
+      if (row.status === "cancelled") {
+        throw conflict("A cancelled action cannot be edited — raise a new one.");
+      }
+      /*
+       * After promotion these columns are the OBLIGATION's terms, copied here
+       * so the two rows tell one story. Editing them on the action afterwards
+       * made the action and the obligation disagree about what is owed, to
+       * whom, and by when — while /promote's own comment claimed they could
+       * not drift.
+       */
+      if (row.obligationId) {
+        const locked = PROMOTED_LOCKED_FIELDS.filter(
+          (f) => body[f] !== undefined && body[f] !== row[f],
+        );
+        if (locked.length > 0) {
+          throw conflict(
+            `This action was promoted to obligation ${row.obligationId}; ${locked.join(", ")} ` +
+              "now belong to the obligation and cannot be changed here. Amend the obligation, " +
+              "which is what carries the time bar.",
+          );
+        }
+      }
       const now = new Date().toISOString();
       const set: Record<string, unknown> = { updatedAt: now };
       for (const [k, v] of Object.entries(body)) {
@@ -2431,8 +2999,12 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       const { actionId } = req.params as { actionId: string };
       const body = z.object({ reason: z.string().min(1).max(2000) }).parse(req.body);
       const row = await fetchAction(req, actionId);
-      if (row.status === "completed" || row.status === "verified") {
-        throw badRequest("A completed action cannot be blocked");
+      // Blocking is something that happens to LIVE work. Blocking a cancelled
+      // action resurrected it; blocking a completed one erased the completion.
+      if (!BLOCKABLE_ACTION_STATES.includes(row.status as (typeof BLOCKABLE_ACTION_STATES)[number])) {
+        throw conflict(
+          `Only an open or in-progress action can be blocked (this one is "${row.status}").`,
+        );
       }
       const now = new Date().toISOString();
       await app.db
@@ -2457,6 +3029,28 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
         .object({ escalatedToId: z.string().min(1).max(64), note: z.string().max(2000).optional() })
         .parse(req.body);
       const row = await fetchAction(req, actionId);
+      // Escalating a finished action tells someone senior to chase work that
+      // is done, cancelled or already verified. Nothing good follows.
+      if (!CANCELLABLE_ACTION_STATES.includes(row.status as (typeof CANCELLABLE_ACTION_STATES)[number])) {
+        throw conflict(
+          `Only an open, in-progress or blocked action can be escalated (this one is ` +
+            `"${row.status}").`,
+        );
+      }
+      const escalatee = await app.db
+        .select({ id: users.id, name: users.name })
+        .from(users)
+        .innerJoin(companyMemberships, eq(companyMemberships.userId, users.id))
+        .where(
+          and(
+            eq(users.id, body.escalatedToId),
+            eq(companyMemberships.companyId, req.companyId!),
+          ),
+        )
+        .limit(1);
+      if (!escalatee[0]) {
+        throw badRequest("escalatedToId is not a user in this company");
+      }
       const now = new Date().toISOString();
       await app.db
         .update(meetingActionItems)
@@ -2494,6 +3088,15 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
         throw badRequest(
           "This action has been promoted to an obligation — cancel or waive the obligation " +
             "instead; the time bar no longer lives here.",
+        );
+      }
+      // Cancelling a verified action overwrote its closure note with the
+      // cancellation reason and erased the verification. Whatever the reason
+      // for wanting that, it is not a cancellation.
+      if (!CANCELLABLE_ACTION_STATES.includes(row.status as (typeof CANCELLABLE_ACTION_STATES)[number])) {
+        throw conflict(
+          `Only an open, in-progress or blocked action can be cancelled (this one is ` +
+            `"${row.status}"). A completed or verified action is history.`,
         );
       }
       const now = new Date().toISOString();
@@ -2644,7 +3247,6 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
     async (req) => {
       const { seriesId } = req.params as { seriesId: string };
       const series = await fetchSeries(req, seriesId);
-      await sweepCarriedItems(req.companyId!, req.projectId!, req.user!.id);
       const items = await app.db
         .select()
         .from(meetingAgendaItems)
@@ -2695,7 +3297,6 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
     "/projects/:projectId/meeting-reports/carry-forward",
     { preHandler: readGate },
     async (req) => {
-      await sweepCarriedItems(req.companyId!, req.projectId!, req.user!.id);
       const items = await app.db
         .select()
         .from(meetingAgendaItems)
@@ -2742,7 +3343,6 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
     "/projects/:projectId/meeting-reports/overdue-actions",
     { preHandler: readGate },
     async (req) => {
-      const swept = await sweepOverdueActions(req.companyId!, req.projectId!, req.user!.id);
       const today = todayISO();
       const rows = await app.db
         .select()
@@ -2769,7 +3369,7 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       }
       return {
         asOf: today,
-        sweep: swept,
+        sweptBy: SWEEP_NOTE,
         summary: {
           openActions: rows.length,
           overdue: overdue.length,
@@ -2810,8 +3410,6 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
     const q = pageQuerySchema
       .extend({ includeClosed: z.enum(["0", "1"]).default("0") })
       .parse(req.query);
-    // Company-wide sweep: the same idempotent pass, unscoped by project.
-    const swept = await sweepOverdueActions(req.companyId!, null, req.user!.id);
     const today = todayISO();
     const where = and(
       eq(meetingActionItems.companyId, req.companyId!),
@@ -2841,13 +3439,13 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
         q,
       ),
       asOf: today,
-      sweep: swept,
+      sweptBy: SWEEP_NOTE,
     };
   });
 
   /** Company-level view: every overdue action across the tenant. */
-  app.get("/meeting-action-items/overdue", { preHandler: companyRead }, async (req) => {
-    const swept = await sweepOverdueActions(req.companyId!, null, req.user!.id);
+  app.get("/meeting-action-items/overdue", { preHandler: companyScopedRead }, async (req) => {
+    const scope = companyScopeOf(req, "meetings");
     const today = todayISO();
     const rows = await app.db
       .select()
@@ -2855,6 +3453,7 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       .where(
         and(
           eq(meetingActionItems.companyId, req.companyId!),
+          scopeProjects(scope, meetingActionItems.projectId),
           inArray(meetingActionItems.status, [...OPEN_ACTION_STATES]),
           lt(meetingActionItems.dueDate, today),
         ),
@@ -2864,10 +3463,1602 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
     for (const r of rows) byProject.set(r.projectId, (byProject.get(r.projectId) ?? 0) + 1);
     return {
       asOf: today,
-      sweep: swept,
+      sweptBy: SWEEP_NOTE,
+      scope: scope.all ? "all_projects" : `${scope.projectIds.length} project(s) you hold meetings on`,
       total: rows.length,
       byProject: [...byProject.entries()].map(([projectId, overdue]) => ({ projectId, overdue })),
       items: rows,
     };
   });
+
+  /* ================================================================ */
+  /* 10. The agenda template library (#416)                            */
+  /*                                                                   */
+  /* A progress meeting's agenda is an ORGANISATIONAL standard, not a   */
+  /* per-series invention. Before this, `agendaTemplate` could only be  */
+  /* typed into one series through the API — the web app never sent it  */
+  /* — so every generated occurrence started empty and the standing     */
+  /* eighth item ("safety moment") quietly stopped appearing.           */
+  /*                                                                   */
+  /* Applying a template COPIES it. Referencing it would let a later    */
+  /* edit of the library change minutes that were issued last March.    */
+  /* ================================================================ */
+
+  const templateItemsSchema = z.array(agendaTemplateSchema).max(200);
+
+  const templateCreateSchema = z.object({
+    name: z.string().min(1).max(200),
+    description: z.string().max(2000).nullable().optional(),
+    meetingType: z.enum(MEETING_TYPES).optional(),
+    projectId: z.string().max(64).nullable().optional(),
+    items: templateItemsSchema.optional(),
+    defaultAttendees: z.array(attendeeTemplateSchema).max(200).optional(),
+    contractRequirement: z.string().max(300).nullable().optional(),
+    isDefault: z.boolean().optional(),
+  });
+
+  const templatePatchSchema = templateCreateSchema.partial().extend({
+    status: z.enum(["active", "archived"]).optional(),
+  });
+
+  async function fetchTemplate(req: FastifyRequest, templateId: string) {
+    const rows = await app.db
+      .select()
+      .from(meetingAgendaTemplates)
+      .where(
+        and(
+          eq(meetingAgendaTemplates.id, templateId),
+          eq(meetingAgendaTemplates.companyId, req.companyId!),
+        ),
+      )
+      .limit(1);
+    if (!rows[0]) throw notFound("Agenda template not found");
+    return rows[0];
+  }
+
+  app.get("/meeting-agenda-templates", { preHandler: companyScopedRead }, async (req) => {
+    const q = pageQuerySchema
+      .extend({
+        meetingType: z.enum(MEETING_TYPES).optional(),
+        status: z.enum(["active", "archived"]).optional(),
+        projectId: z.string().max(64).optional(),
+      })
+      .parse(req.query);
+    const scope = companyScopeOf(req, "meetings");
+    const where = and(
+      eq(meetingAgendaTemplates.companyId, req.companyId!),
+      q.meetingType ? eq(meetingAgendaTemplates.meetingType, q.meetingType) : undefined,
+      eq(meetingAgendaTemplates.status, q.status ?? "active"),
+      q.projectId ? eq(meetingAgendaTemplates.projectId, q.projectId) : undefined,
+      /* Company-wide templates (projectId null) are tenant assets and stay
+         visible to anyone who holds the tool anywhere; a project-scoped one
+         is project data and obeys the caller's project scope. */
+      scopeProjectsOrCompanyWide(scope, meetingAgendaTemplates.projectId),
+    );
+    const [totalRow] = await app.db
+      .select({ n: count() })
+      .from(meetingAgendaTemplates)
+      .where(where);
+    const items = await app.db
+      .select()
+      .from(meetingAgendaTemplates)
+      .where(where)
+      .orderBy(desc(meetingAgendaTemplates.isDefault), asc(meetingAgendaTemplates.name))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    return paginate(
+      items.map((t) => ({
+        ...t,
+        itemCount: ((t.items as unknown[]) ?? []).length,
+        inviteeCount: ((t.defaultAttendees as unknown[]) ?? []).length,
+      })),
+      Number(totalRow?.n ?? 0),
+      q,
+    );
+  });
+
+  app.post("/meeting-agenda-templates", { preHandler: companyTemplateAdmin }, async (req, reply) => {
+    const body = templateCreateSchema.parse(req.body);
+    if (body.projectId) {
+      const scope = companyScopeOf(req, "meetings");
+      if (!scopeAllows(scope, body.projectId)) {
+        throw forbidden("You do not hold meetings admin on that project");
+      }
+      const [p] = await app.db
+        .select({ id: projects.id })
+        .from(projects)
+        .where(and(eq(projects.id, body.projectId), eq(projects.companyId, req.companyId!)))
+        .limit(1);
+      if (!p) throw badRequest("projectId is not a project in this company");
+    }
+    const id = newId("magt");
+    await app.db.insert(meetingAgendaTemplates).values({
+      id,
+      companyId: req.companyId!,
+      projectId: body.projectId ?? null,
+      name: body.name,
+      description: body.description ?? null,
+      meetingType: body.meetingType ?? "progress",
+      items: body.items ?? [],
+      defaultAttendees: body.defaultAttendees ?? [],
+      contractRequirement: body.contractRequirement ?? null,
+      isDefault: body.isDefault ? 1 : 0,
+      status: "active",
+      createdBy: req.user!.id,
+    });
+    await appendLedger(app.db, {
+      companyId: req.companyId!,
+      actorId: req.user!.id,
+      action: "create",
+      objectType: "meeting_agenda_template",
+      objectId: id,
+      payload: { name: body.name, meetingType: body.meetingType ?? "progress", items: (body.items ?? []).length },
+      projectId: body.projectId ?? null,
+    });
+    return reply.status(201).send(await fetchTemplate(req, id));
+  });
+
+  app.patch(
+    "/meeting-agenda-templates/:templateId",
+    { preHandler: companyTemplateAdmin },
+    async (req) => {
+      const { templateId } = req.params as { templateId: string };
+      const body = templatePatchSchema.parse(req.body);
+      const row = await fetchTemplate(req, templateId);
+      const scope = companyScopeOf(req, "meetings");
+      if (!scopeAllows(scope, row.projectId)) {
+        throw forbidden("You do not hold meetings admin on that project");
+      }
+      const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
+      for (const [k, v] of Object.entries(body)) {
+        if (v === undefined) continue;
+        set[k] = k === "isDefault" ? (v ? 1 : 0) : v;
+      }
+      await app.db
+        .update(meetingAgendaTemplates)
+        .set(set)
+        .where(eq(meetingAgendaTemplates.id, templateId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "meeting_agenda_template",
+        objectId: templateId,
+        payload: { changed: Object.keys(body) },
+        projectId: row.projectId,
+      });
+      return fetchTemplate(req, templateId);
+    },
+  );
+
+  /**
+   * Copy a library template onto a SERIES: its standing agenda and its
+   * standing invitees become the series' own, so every occurrence generated
+   * from then on carries them. `mode: "replace" | "append"` because a series
+   * that already has a bespoke tail should not silently lose it.
+   */
+  app.post(
+    "/projects/:projectId/meeting-series/:seriesId/apply-template",
+    { preHandler: standardGate },
+    async (req) => {
+      const { seriesId } = req.params as { seriesId: string };
+      const body = z
+        .object({
+          templateId: z.string().min(1).max(64),
+          mode: z.enum(["replace", "append"]).default("replace"),
+          includeAttendees: z.boolean().default(true),
+        })
+        .parse(req.body);
+      const series = await fetchSeries(req, seriesId);
+      const template = await fetchTemplate(req, body.templateId);
+      if (template.projectId && template.projectId !== req.projectId) {
+        throw badRequest("That template belongs to a different project");
+      }
+      if (template.status !== "active") throw conflict("That template is archived");
+
+      const parsedItems = templateItemsSchema.safeParse(template.items);
+      if (!parsedItems.success) {
+        throw badRequest(
+          "This template's items are not a readable agenda — it was written by an older " +
+            "version and must be re-saved before it can be applied.",
+        );
+      }
+      const existing = body.mode === "append" ? ((series.agendaTemplate as unknown[]) ?? []) : [];
+      const merged = [...existing, ...parsedItems.data].map((raw, i) => {
+        const item = raw as Record<string, unknown>;
+        return { ...item, position: i };
+      });
+      const attendees =
+        body.includeAttendees && ((template.defaultAttendees as unknown[]) ?? []).length > 0
+          ? body.mode === "append"
+            ? [...((series.defaultAttendees as unknown[]) ?? []), ...((template.defaultAttendees as unknown[]) ?? [])]
+            : ((template.defaultAttendees as unknown[]) ?? [])
+          : ((series.defaultAttendees as unknown[]) ?? []);
+
+      await app.db
+        .update(meetingSeries)
+        .set({
+          agendaTemplate: merged,
+          defaultAttendees: attendees,
+          contractRequirement: series.contractRequirement ?? template.contractRequirement,
+          updatedAt: new Date().toISOString(),
+        })
+        .where(eq(meetingSeries.id, seriesId));
+      await app.db
+        .update(meetingAgendaTemplates)
+        .set({ usageCount: template.usageCount + 1 })
+        .where(eq(meetingAgendaTemplates.id, template.id));
+      await ledger("update", "meeting_series", seriesId, req, {
+        appliedTemplateId: template.id,
+        templateName: template.name,
+        mode: body.mode,
+        agendaItems: merged.length,
+        invitees: attendees.length,
+      });
+      return {
+        ...(await fetchSeries(req, seriesId)),
+        appliedTemplate: { id: template.id, name: template.name, items: merged.length },
+      };
+    },
+  );
+
+  /** Copy a template's items straight onto ONE occurrence. */
+  app.post(
+    "/projects/:projectId/meetings/:meetingId/apply-template",
+    { preHandler: standardGate },
+    async (req) => {
+      const { meetingId } = req.params as { meetingId: string };
+      const body = z.object({ templateId: z.string().min(1).max(64) }).parse(req.body);
+      const meeting = await fetchMeeting(req, meetingId);
+      if (meeting.minutesIssuedAt) {
+        throw conflict("The agenda of a meeting whose minutes are issued is history, not a plan");
+      }
+      const template = await fetchTemplate(req, body.templateId);
+      if (template.projectId && template.projectId !== req.projectId) {
+        throw badRequest("That template belongs to a different project");
+      }
+      const parsedItems = templateItemsSchema.safeParse(template.items);
+      if (!parsedItems.success) throw badRequest("This template's items are not a readable agenda");
+      const [countRow] = await app.db
+        .select({ n: count() })
+        .from(meetingAgendaItems)
+        .where(eq(meetingAgendaItems.meetingId, meetingId));
+      let position = Number(countRow?.n ?? 0);
+      const created: string[] = [];
+      for (const item of parsedItems.data) {
+        const id = newId("magi");
+        await app.db.insert(meetingAgendaItems).values({
+          id,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          meetingId,
+          seriesId: meeting.seriesId,
+          itemNumber: item.itemNumber ?? null,
+          position: position++,
+          title: item.title,
+          category: item.category ?? "other",
+          status: "open",
+          allocatedMinutes: item.allocatedMinutes ?? null,
+          firstRaisedMeetingId: meetingId,
+          detail: { fromTemplate: true, templateId: template.id },
+          createdBy: req.user!.id,
+        });
+        created.push(id);
+      }
+      await app.db
+        .update(meetingAgendaTemplates)
+        .set({ usageCount: template.usageCount + 1 })
+        .where(eq(meetingAgendaTemplates.id, template.id));
+      await ledger("update", "meeting", meetingId, req, {
+        appliedTemplateId: template.id,
+        agendaItemsCreated: created.length,
+      });
+      return { meetingId, templateId: template.id, created: created.length, itemIds: created };
+    },
+  );
+
+  /* ================================================================ */
+  /* 11. THE MINUTES AS A DOCUMENT (#422, #425)                        */
+  /*                                                                   */
+  /* Deemed acceptance is the sharpest rule in this module: after the   */
+  /* objection period, silence becomes agreement. A clock that starts   */
+  /* when the sender clicks a button, against a body of text that can   */
+  /* be edited afterwards, is indefensible. So the minutes are RENDERED */
+  /* into a self-contained document, CONTENT-ADDRESSED (sha256 on the   */
+  /* meeting and in the ledger), DELIVERED to a recorded list of        */
+  /* recipients, and the objection window runs from the earliest        */
+  /* delivery — falling back to issue only where no delivery is known,  */
+  /* and saying so.                                                    */
+  /* ================================================================ */
+
+  /**
+   * Assemble the structural model the renderer needs. Kept out of the route
+   * so both documents (the agenda pack before, the minutes after) come from
+   * one place and cannot drift apart.
+   */
+  async function buildDocumentModel(
+    req: FastifyRequest,
+    meeting: typeof meetings.$inferSelect,
+    kind: "agenda_pack" | "minutes",
+    renderedAt: string,
+  ): Promise<MinutesModel> {
+    const [project] = await app.db
+      .select({ name: projects.name })
+      .from(projects)
+      .where(eq(projects.id, meeting.projectId))
+      .limit(1);
+    const [company] = await app.db
+      .select({ name: companies.name })
+      .from(companies)
+      .where(eq(companies.id, meeting.companyId))
+      .limit(1);
+    const series = meeting.seriesId
+      ? (
+          await app.db
+            .select({ title: meetingSeries.title })
+            .from(meetingSeries)
+            .where(eq(meetingSeries.id, meeting.seriesId))
+            .limit(1)
+        )[0]
+      : undefined;
+
+    const attendeeRows = await loadAttendees(meeting.id);
+    const agendaRows = await app.db
+      .select()
+      .from(meetingAgendaItems)
+      .where(eq(meetingAgendaItems.meetingId, meeting.id))
+      .orderBy(asc(meetingAgendaItems.position));
+    const decisionRows =
+      kind === "minutes"
+        ? await app.db
+            .select()
+            .from(meetingDecisions)
+            .where(eq(meetingDecisions.meetingId, meeting.id))
+            .orderBy(asc(meetingDecisions.number))
+        : [];
+    const actionRows = await app.db
+      .select()
+      .from(meetingActionItems)
+      .where(eq(meetingActionItems.meetingId, meeting.id))
+      .orderBy(asc(meetingActionItems.number));
+
+    const idsNeeded = [
+      meeting.chairId,
+      meeting.minuteTakerId,
+      req.user!.id,
+      ...agendaRows.map((a) => a.presenterId),
+      ...decisionRows.map((d) => d.decidedById),
+      ...decisionRows.map((d) => d.ratifiedBy),
+      ...actionRows.map((a) => a.ownerId),
+      ...((meeting.distribution as string[]) ?? []),
+    ];
+    const wanted = [...new Set(idsNeeded.filter((v): v is string => Boolean(v)))];
+    const nameRows = wanted.length
+      ? await app.db
+          .select({ id: users.id, name: users.name, email: users.email })
+          .from(users)
+          .innerJoin(companyMemberships, eq(companyMemberships.userId, users.id))
+          .where(
+            and(
+              eq(companyMemberships.companyId, meeting.companyId),
+              inArray(users.id, wanted),
+            ),
+          )
+      : [];
+    const names = new Map(nameRows.map((r) => [r.id, r.name ?? r.email]));
+    const nameOf = (id: string | null): string | null => (id ? (names.get(id) ?? id) : null);
+
+    const attendees: MinutesAttendee[] = attendeeRows.map((a) => ({
+      name: a.name,
+      organisation: a.organisation,
+      role: a.role,
+      attendance: a.attendance,
+      delegateName: a.delegateName,
+    }));
+    const agendaItems: MinutesAgendaItem[] = agendaRows.map((a) => ({
+      itemNumber: a.itemNumber,
+      position: a.position,
+      title: a.title,
+      category: a.category,
+      status: a.status,
+      description: a.description,
+      discussion: kind === "minutes" ? a.discussion : null,
+      carryCount: a.carryCount,
+      allocatedMinutes: a.allocatedMinutes,
+      presenterName: nameOf(a.presenterId),
+      linkLabel: a.originType && a.originId ? `${a.originType} ${a.originId}` : null,
+    }));
+    const decisions: MinutesDecision[] = decisionRows.map((d) => ({
+      reference: d.reference,
+      title: d.title,
+      decision: d.decision,
+      rationale: d.rationale,
+      decidedByName: d.decidedByName ?? nameOf(d.decidedById),
+      status: d.status,
+      ratifiedByName: nameOf(d.ratifiedBy),
+      impactsCost: d.impactsCost,
+      estimatedCostImpact: d.estimatedCostImpact,
+      currency: d.currency,
+      impactsSchedule: d.impactsSchedule,
+      estimatedScheduleImpactDays: d.estimatedScheduleImpactDays,
+    }));
+    const actions: MinutesAction[] = actionRows.map((a) => ({
+      reference: a.reference,
+      title: a.title,
+      ownerLabel: a.ownerName ?? nameOf(a.ownerId) ?? "not assigned",
+      dueDate: a.dueDate,
+      originalDueDate: a.originalDueDate,
+      status: a.status,
+      priority: a.priority,
+      carryCount: a.carryCount,
+      revisedCount: a.revisedCount,
+      obligationId: a.obligationId,
+      sourceClause: a.sourceClause,
+    }));
+
+    const quorum = checkQuorum(
+      attendeeRows.map((a) => ({ role: a.role, attendance: a.attendance })),
+      meeting.quorumRequired,
+    );
+
+    return {
+      kind,
+      projectName: project?.name ?? null,
+      companyName: company?.name ?? null,
+      seriesTitle: series?.title ?? null,
+      meeting: {
+        reference: meeting.reference,
+        title: meeting.title,
+        meetingType: meeting.meetingType,
+        status: meeting.status,
+        occurrenceNumber: meeting.occurrenceNumber,
+        scheduledStart: meeting.scheduledStart,
+        actualStart: meeting.actualStart,
+        actualEnd: meeting.actualEnd,
+        location: meeting.location,
+        isVirtual: meeting.isVirtual,
+        chairName: nameOf(meeting.chairId),
+        minuteTakerName: nameOf(meeting.minuteTakerId),
+        quorumRequired: meeting.quorumRequired,
+        minutesBody: kind === "minutes" ? meeting.minutesBody : null,
+        objectionPeriodDays: meeting.objectionPeriodDays,
+        minutesVersion: Math.max(1, meeting.minutesVersion),
+      },
+      attendees,
+      agendaItems,
+      decisions,
+      actions,
+      quorum: {
+        met: quorum.met,
+        required: quorum.required,
+        counted: quorum.counted,
+        reasons: quorum.reasons,
+      },
+      renderedAt,
+      renderedByName: nameOf(req.user!.id),
+      recipients: ((meeting.distribution as string[]) ?? []).map((id) => nameOf(id) ?? id),
+    };
+  }
+
+  /**
+   * Render, hash and store one document. Returns the file row id and the
+   * sha256 — the address that makes "these are the minutes that were issued"
+   * checkable a year later.
+   */
+  async function renderAndStore(
+    req: FastifyRequest,
+    meeting: typeof meetings.$inferSelect,
+    kind: "agenda_pack" | "minutes",
+  ) {
+    const renderedAt = new Date().toISOString();
+    const model = await buildDocumentModel(req, meeting, kind, renderedAt);
+    const { html, contentType } = renderMeetingDocument(model);
+    const buf = Buffer.from(html, "utf8");
+    const saved = await app.storage.saveBuffer(req.companyId!, buf);
+    const version = kind === "minutes" ? Math.max(1, meeting.minutesVersion) : meeting.minutesVersion;
+    const fileId = newId("fil");
+    await app.db.insert(files).values({
+      id: fileId,
+      companyId: req.companyId!,
+      projectId: req.projectId!,
+      folderId: null,
+      name:
+        kind === "minutes"
+          ? `${meeting.reference}-minutes-v${version}.html`
+          : `${meeting.reference}-agenda.html`,
+      contentType,
+      sizeBytes: saved.sizeBytes,
+      sha256: saved.sha256,
+      storageKey: saved.storageKey,
+      documentType: "meeting",
+      metadata: { meetingId: meeting.id, kind, minutesVersion: version, renderedAt },
+      uploadedBy: req.user!.id,
+    });
+    const set: Record<string, unknown> =
+      kind === "minutes"
+        ? {
+            minutesFileId: fileId,
+            minutesSha256: saved.sha256,
+            minutesRenderedAt: renderedAt,
+            updatedAt: renderedAt,
+          }
+        : { agendaPackFileId: fileId, agendaPackSha256: saved.sha256, updatedAt: renderedAt };
+    await app.db.update(meetings).set(set).where(eq(meetings.id, meeting.id));
+    await ledger("create", "meeting_document", fileId, req, {
+      meetingId: meeting.id,
+      kind,
+      sha256: saved.sha256,
+      sizeBytes: saved.sizeBytes,
+      minutesVersion: version,
+      /* The hash is ledgered because the ledger is hash-chained: a later copy
+         that differs in a single byte will not match this entry. */
+    });
+    return { fileId, sha256: saved.sha256, sizeBytes: saved.sizeBytes, contentType, renderedAt, html };
+  }
+
+  app.post(
+    "/projects/:projectId/meetings/:meetingId/minutes/render",
+    { preHandler: standardGate },
+    async (req) => {
+      const { meetingId } = req.params as { meetingId: string };
+      const body = z
+        .object({ kind: z.enum(MEETING_DOCUMENT_KINDS).default("minutes") })
+        .parse(req.body ?? {});
+      const meeting = await fetchMeeting(req, meetingId);
+      if (meeting.status === "cancelled") throw badRequest("A cancelled meeting has no document");
+      if (body.kind === "minutes" && !meeting.minutesBody && !meeting.minutesFileId) {
+        throw badRequest(
+          "There are no minutes to render yet — draft them first. An empty document with a " +
+            "hash on it is still an empty document.",
+        );
+      }
+      const out = await renderAndStore(req, meeting, body.kind);
+      return {
+        meetingId,
+        kind: body.kind,
+        fileId: out.fileId,
+        sha256: out.sha256,
+        sizeBytes: out.sizeBytes,
+        contentType: out.contentType,
+        renderedAt: out.renderedAt,
+        minutesVersion: Math.max(1, meeting.minutesVersion),
+      };
+    },
+  );
+
+  /** The rendered document itself, for preview and printing. */
+  app.get(
+    "/projects/:projectId/meetings/:meetingId/minutes/document",
+    { preHandler: readGate },
+    async (req, reply) => {
+      const { meetingId } = req.params as { meetingId: string };
+      const q = z
+        .object({ kind: z.enum(MEETING_DOCUMENT_KINDS).default("minutes") })
+        .parse(req.query ?? {});
+      const meeting = await fetchMeeting(req, meetingId);
+      const fileId = q.kind === "minutes" ? meeting.minutesFileId : meeting.agendaPackFileId;
+      if (!fileId) {
+        throw notFound(
+          `No ${q.kind === "minutes" ? "minutes" : "agenda pack"} has been rendered for this ` +
+            "meeting. Render it first — this route returns the stored bytes, never a fresh " +
+            "render, so what it serves is what was hashed.",
+        );
+      }
+      const [file] = await app.db
+        .select()
+        .from(files)
+        .where(and(eq(files.id, fileId), eq(files.companyId, req.companyId!)))
+        .limit(1);
+      if (!file) throw notFound("The stored document is missing from the file register");
+      const chunks: Buffer[] = [];
+      for await (const chunk of app.storage.readStream(file.storageKey)) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
+      }
+      return reply
+        .header("content-type", file.contentType)
+        .header("x-document-sha256", file.sha256)
+        .send(Buffer.concat(chunks).toString("utf8"));
+    },
+  );
+
+  /** Who the issued minutes went to, and what happened to each copy. */
+  app.get(
+    "/projects/:projectId/meetings/:meetingId/minutes/deliveries",
+    { preHandler: readGate },
+    async (req) => {
+      const { meetingId } = req.params as { meetingId: string };
+      const meeting = await fetchMeeting(req, meetingId);
+      const rows = await app.db
+        .select()
+        .from(meetingMinuteDeliveries)
+        .where(eq(meetingMinuteDeliveries.meetingId, meetingId))
+        .orderBy(desc(meetingMinuteDeliveries.minutesVersion), asc(meetingMinuteDeliveries.recipientName));
+      const delivered = rows.filter((r) => r.status === "delivered" || r.status === "acknowledged");
+      return {
+        items: rows,
+        total: rows.length,
+        minutesVersion: meeting.minutesVersion,
+        minutesSha256: meeting.minutesSha256,
+        deliveredCount: delivered.length,
+        acknowledgedCount: rows.filter((r) => r.status === "acknowledged").length,
+        failedCount: rows.filter((r) => r.status === "failed").length,
+        pendingCount: rows.filter((r) => r.status === "pending").length,
+        objectionWindow: minutesWindow(meeting),
+      };
+    },
+  );
+
+  /** A recipient confirms receipt — the strongest form of delivery evidence. */
+  app.post(
+    "/projects/:projectId/meetings/:meetingId/minutes/deliveries/:deliveryId/acknowledge",
+    { preHandler: readGate },
+    async (req) => {
+      const { meetingId, deliveryId } = req.params as { meetingId: string; deliveryId: string };
+      const meeting = await fetchMeeting(req, meetingId);
+      const [row] = await app.db
+        .select()
+        .from(meetingMinuteDeliveries)
+        .where(
+          and(
+            eq(meetingMinuteDeliveries.id, deliveryId),
+            eq(meetingMinuteDeliveries.meetingId, meetingId),
+            eq(meetingMinuteDeliveries.companyId, req.companyId!),
+          ),
+        )
+        .limit(1);
+      if (!row) throw notFound("Delivery record not found");
+      if (row.userId && row.userId !== req.user!.id) {
+        throw forbidden(
+          "Only the recipient can acknowledge their own copy — an acknowledgement someone " +
+            "else pressed is not evidence of anything.",
+        );
+      }
+      if (row.status === "acknowledged") return row;
+      const now = new Date().toISOString();
+      await app.db
+        .update(meetingMinuteDeliveries)
+        .set({ status: "acknowledged", acknowledgedAt: now, deliveredAt: row.deliveredAt ?? now })
+        .where(eq(meetingMinuteDeliveries.id, deliveryId));
+      if (!meeting.minutesDeliveredAt) {
+        await app.db
+          .update(meetings)
+          .set({ minutesDeliveredAt: row.deliveredAt ?? now, updatedAt: now })
+          .where(eq(meetings.id, meetingId));
+      }
+      await ledger("update", "meeting", meetingId, req, {
+        minutesAcknowledgedBy: req.user!.id,
+        deliveryId,
+        minutesVersion: row.minutesVersion,
+      });
+      const [after] = await app.db
+        .select()
+        .from(meetingMinuteDeliveries)
+        .where(eq(meetingMinuteDeliveries.id, deliveryId))
+        .limit(1);
+      return after ?? row;
+    },
+  );
+
+  /**
+   * WITHDRAW ISSUED MINUTES SO THEY CAN BE CORRECTED.
+   *
+   * The deadlock this route resolves: saving a draft over issued minutes used
+   * to regress the status while `minutesIssuedAt` stayed set, after which
+   * neither /issue nor /approve would accept the meeting and it could never
+   * reach `minutes_accepted`. Correction is now an explicit, ledgered act: it
+   * bumps the version, clears the issue stamps, moves the live objections into
+   * the history, and tells the previous recipients that what they received has
+   * been withdrawn. A correction nobody is told about is a rewrite.
+   */
+  app.post(
+    "/projects/:projectId/meetings/:meetingId/minutes/correct",
+    { preHandler: standardGate },
+    async (req) => {
+      const { meetingId } = req.params as { meetingId: string };
+      const body = z.object({ reason: z.string().min(1).max(5000) }).parse(req.body);
+      const meeting = await fetchMeeting(req, meetingId);
+      if (!meeting.minutesIssuedAt) {
+        throw badRequest("These minutes have not been issued, so there is nothing to withdraw");
+      }
+      if (meeting.approvedAt) {
+        throw conflict(
+          "These minutes have been signed off. A signed record is corrected by a decision at " +
+            "the next occurrence, not by rewriting it.",
+        );
+      }
+      const now = new Date().toISOString();
+      const detail = detailOf(meeting);
+      const live = (detail["objections"] as unknown[] | undefined) ?? [];
+      const history = (detail["objectionHistory"] as unknown[] | undefined) ?? [];
+      const version = Math.max(1, meeting.minutesVersion);
+      await app.db
+        .update(meetings)
+        .set({
+          status: "minutes_draft",
+          minutesIssuedAt: null,
+          minutesIssuedBy: null,
+          minutesDeliveredAt: null,
+          minutesVersion: version + 1,
+          detail: {
+            ...detail,
+            objections: [],
+            objectionHistory: [
+              ...history,
+              { version, withdrawnAt: now, withdrawnBy: req.user!.id, reason: body.reason, objections: live },
+            ],
+          },
+          updatedAt: now,
+        })
+        .where(eq(meetings.id, meetingId));
+      await ledger("state_change", "meeting", meetingId, req, {
+        from: meeting.status,
+        to: "minutes_draft",
+        withdrawnVersion: version,
+        newVersion: version + 1,
+        reason: body.reason,
+        previouslyIssuedBy: meeting.minutesIssuedBy,
+        previouslyIssuedAt: meeting.minutesIssuedAt,
+        objectionsCarriedToHistory: live.length,
+      });
+      const previous = await app.db
+        .select({ userId: meetingMinuteDeliveries.userId })
+        .from(meetingMinuteDeliveries)
+        .where(
+          and(
+            eq(meetingMinuteDeliveries.meetingId, meetingId),
+            eq(meetingMinuteDeliveries.minutesVersion, version),
+            isNotNull(meetingMinuteDeliveries.userId),
+          ),
+        );
+      await pushNotifications(
+        app.db,
+        [...new Set(previous.map((p) => p.userId).filter((v): v is string => Boolean(v)))].map(
+          (userId) => ({
+            companyId: req.companyId!,
+            userId,
+            projectId: req.projectId!,
+            kind: "status_change" as const,
+            title: `Minutes withdrawn for correction: ${meeting.reference}`,
+            body: body.reason,
+            recordType: "meeting",
+            recordId: meetingId,
+          }),
+        ),
+      );
+      const after = await fetchMeeting(req, meetingId);
+      return { ...after, minutesObjectionWindow: minutesWindow(after) };
+    },
+  );
+
+  /* ================================================================ */
+  /* 11b. AI MINUTES DRAFTING (#418-421)                               */
+  /*                                                                   */
+  /* A PROPOSAL, never an issue. The model reads a transcript and the   */
+  /* meeting's own structure and proposes discussion per agenda item,   */
+  /* decisions and actions with a suggested owner from the roll; a      */
+  /* person accepts them item by item through the routes that already   */
+  /* exist. Nothing here writes minutes, and nothing here can start a   */
+  /* deemed-acceptance clock — that is an act against real people and   */
+  /* it stays a human one.                                             */
+  /* ================================================================ */
+
+  /** 503 with the name the platform uses everywhere for "AI is off". */
+  function aiUnavailable(message: string): AppError {
+    const err = new AppError(503, message);
+    err.name = "AiDisabled";
+    return err;
+  }
+
+  /**
+   * Assemble everything the draft is grounded in: the agenda (with each
+   * carried item's previous discussion, so "what changed" is answerable) and
+   * the attendance roll (the only names an action may be owed by).
+   */
+  async function buildDraftInput(
+    req: FastifyRequest,
+    meeting: typeof meetings.$inferSelect,
+    transcript: string,
+  ): Promise<DraftInput> {
+    const items = await app.db
+      .select()
+      .from(meetingAgendaItems)
+      .where(eq(meetingAgendaItems.meetingId, meeting.id))
+      .orderBy(asc(meetingAgendaItems.position));
+    const carriedFrom = items
+      .map((i) => i.carriedFromItemId)
+      .filter((v): v is string => Boolean(v));
+    const previous = carriedFrom.length
+      ? await app.db
+          .select({
+            id: meetingAgendaItems.id,
+            discussion: meetingAgendaItems.discussion,
+            status: meetingAgendaItems.status,
+          })
+          .from(meetingAgendaItems)
+          .where(
+            and(
+              eq(meetingAgendaItems.companyId, req.companyId!),
+              inArray(meetingAgendaItems.id, carriedFrom),
+            ),
+          )
+      : [];
+    const priorById = new Map(previous.map((p) => [p.id, p]));
+    const agendaItems: DraftAgendaItem[] = items.map((i) => {
+      const prior = i.carriedFromItemId ? priorById.get(i.carriedFromItemId) : undefined;
+      return {
+        id: i.id,
+        itemNumber: i.itemNumber,
+        position: i.position,
+        title: i.title,
+        category: i.category,
+        description: i.description,
+        discussion: i.discussion,
+        carryCount: i.carryCount,
+        previousDiscussion: prior?.discussion ?? null,
+        previousStatus: prior?.status ?? null,
+      };
+    });
+    const rows = await app.db
+      .select()
+      .from(meetingAttendees)
+      .where(eq(meetingAttendees.meetingId, meeting.id))
+      .orderBy(asc(meetingAttendees.name));
+    const attendees: DraftAttendee[] = rows.map((a) => ({
+      userId: a.userId,
+      contactId: a.contactId,
+      name: a.name,
+      organisation: a.organisation,
+      attendance: a.attendance,
+    }));
+    return {
+      meeting: {
+        reference: meeting.reference,
+        title: meeting.title,
+        meetingType: meeting.meetingType,
+        scheduledStart: meeting.scheduledStart,
+        occurrenceNumber: meeting.occurrenceNumber,
+      },
+      agendaItems,
+      attendees,
+      transcript,
+    };
+  }
+
+  app.post(
+    "/projects/:projectId/meetings/:meetingId/minutes/draft-ai",
+    { preHandler: standardGate },
+    async (req) => {
+      const { meetingId } = req.params as { meetingId: string };
+      const body = z
+        .object({
+          transcript: z.string().min(50).max(400_000),
+        })
+        .parse(req.body);
+      const meeting = await fetchMeeting(req, meetingId);
+      if (meeting.status === "cancelled") {
+        throw badRequest("A cancelled meeting has no minutes to draft");
+      }
+      if (meeting.minutesIssuedAt) {
+        throw conflict(
+          "These minutes have been issued. A draft over an issued record would rewrite what " +
+            "recipients are relying on: withdraw them with POST /minutes/correct first.",
+        );
+      }
+      if (!aiEnabled(app)) {
+        throw aiUnavailable(
+          "ANTHROPIC_API_KEY is not configured, so no draft can be generated. Write the minutes " +
+            "directly — the agenda, the roll and the carried items are all on this page, and " +
+            "nothing about issuing, objecting to or approving minutes depends on the AI layer.",
+        );
+      }
+      const input = await buildDraftInput(req, meeting, body.transcript);
+      try {
+        const result = await runAgent({
+          app,
+          req,
+          agentKind: "minutes_drafter",
+          projectId: req.projectId!,
+          system: buildDraftSystemPrompt(),
+          user: buildDraftUserPrompt(input),
+          inputRefs: [
+            { type: "meeting", id: meeting.id },
+            ...input.agendaItems.map((i) => ({ type: "meeting_agenda_item", id: i.id })),
+          ],
+          schema: minutesDraftSchema,
+          contextChars: Math.min(body.transcript.length, TRANSCRIPT_LIMIT),
+          maxTokens: 4096,
+        });
+        const draft = result.json;
+        if (!draft) {
+          return {
+            meetingId,
+            runId: result.runId,
+            aiAvailable: true,
+            applied: false,
+            proposal: null,
+            note:
+              "The model answered, but not in the shape the minutes proposal requires, so nothing " +
+              "is offered. The raw run is in the AI console under this run id.",
+          };
+        }
+        const proposal = buildProposal(draft, input);
+        return {
+          meetingId,
+          runId: result.runId,
+          aiAvailable: true,
+          /* NOTHING IS WRITTEN. The meeting is untouched; the minute taker
+             accepts items through the routes that already enforce the rules. */
+          applied: false,
+          proposal,
+          suggestedMinutesBody: proposaltoBodySafe(proposal, input),
+          grounding: result.grounding,
+          note:
+            `A proposal, not minutes. ${proposal.ungroundedCitations} citation(s) could not be ` +
+            `found in the transcript, ${proposal.unmatchedOwners} proposed owner(s) are not on ` +
+            "the attendance roll, and nothing has been written. Accept it item by item: " +
+            "PATCH the agenda item to keep its discussion, POST a decision, POST an action. " +
+            "Issuing minutes remains a human act because it starts a clock against real people.",
+        };
+      } catch (err) {
+        if (err instanceof AppError) throw err;
+        const message = err instanceof Error ? err.message : String(err);
+        throw aiUnavailable(
+          `The AI layer was configured but the drafting call did not succeed: ${message.slice(0, 300)}. ` +
+            "Write the minutes directly.",
+        );
+      }
+    },
+  );
+
+  /** Never let a rendering slip fail the whole draft — the proposal is the value. */
+  function proposaltoBodySafe(
+    proposal: ReturnType<typeof buildProposal>,
+    input: DraftInput,
+  ): string | null {
+    try {
+      return proposalToMinutesBody(proposal, input);
+    } catch {
+      return null;
+    }
+  }
+
+  /* ================================================================ */
+  /* 12. RAISING A REAL RECORD FROM AN AGENDA ITEM (#424)               */
+  /*                                                                   */
+  /* `originType`/`originId` were free text: a note that looks like a   */
+  /* link and that nothing downstream can verify or follow. Raising an  */
+  /* RFI, a change event or a risk from an item now creates the record, */
+  /* writes a `record_links` edge both ways, and shows the target's     */
+  /* LIVE status on the agenda row — so an item whose RFI has been      */
+  /* answered stops being carried forward out of habit.                */
+  /* ================================================================ */
+
+  const RAISE_TARGET_TABLES = {
+    rfi: { type: "rfi", label: "RFI" },
+    change_event: { type: "change_event", label: "change event" },
+    risk: { type: "risk", label: "risk" },
+  } as const;
+
+  /** The live state of a linked record, whatever kind it is. */
+  async function resolveLinkedRecord(
+    companyId: string,
+    projectId: string,
+    type: string,
+    id: string,
+  ): Promise<{ type: string; id: string; reference: string; title: string; status: string } | null> {
+    if (type === "rfi") {
+      const [r] = await app.db
+        .select({ id: rfis.id, number: rfis.number, subject: rfis.subject, status: rfis.status })
+        .from(rfis)
+        .where(and(eq(rfis.id, id), eq(rfis.companyId, companyId), eq(rfis.projectId, projectId)))
+        .limit(1);
+      return r
+        ? { type, id: r.id, reference: `RFI-${String(r.number).padStart(3, "0")}`, title: r.subject, status: r.status }
+        : null;
+    }
+    if (type === "change_event") {
+      const [r] = await app.db
+        .select({
+          id: changeEvents.id,
+          reference: changeEvents.reference,
+          title: changeEvents.title,
+          status: changeEvents.status,
+        })
+        .from(changeEvents)
+        .where(
+          and(
+            eq(changeEvents.id, id),
+            eq(changeEvents.companyId, companyId),
+            eq(changeEvents.projectId, projectId),
+          ),
+        )
+        .limit(1);
+      return r ? { type, id: r.id, reference: r.reference, title: r.title, status: r.status } : null;
+    }
+    if (type === "risk") {
+      const [r] = await app.db
+        .select({ id: risks.id, number: risks.number, title: risks.title, status: risks.status })
+        .from(risks)
+        .where(and(eq(risks.id, id), eq(risks.companyId, companyId), eq(risks.projectId, projectId)))
+        .limit(1);
+      return r
+        ? { type, id: r.id, reference: `RSK-${String(r.number).padStart(3, "0")}`, title: r.title, status: r.status }
+        : null;
+    }
+    return null;
+  }
+
+  async function linkRecords(
+    req: FastifyRequest,
+    fromType: string,
+    fromId: string,
+    toType: string,
+    toId: string,
+    linkKind: string,
+  ) {
+    const existing = await app.db
+      .select({ id: recordLinks.id })
+      .from(recordLinks)
+      .where(
+        and(
+          eq(recordLinks.companyId, req.companyId!),
+          eq(recordLinks.fromType, fromType),
+          eq(recordLinks.fromId, fromId),
+          eq(recordLinks.toType, toType),
+          eq(recordLinks.toId, toId),
+        ),
+      )
+      .limit(1);
+    if (existing[0]) return existing[0].id;
+    const id = newId("rlk");
+    await app.db.insert(recordLinks).values({
+      id,
+      companyId: req.companyId!,
+      projectId: req.projectId!,
+      fromType,
+      fromId,
+      toType,
+      toId,
+      linkKind,
+      createdBy: req.user!.id,
+    });
+    return id;
+  }
+
+  app.post(
+    "/projects/:projectId/meeting-agenda-items/:itemId/raise",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { itemId } = req.params as { itemId: string };
+      const body = z
+        .object({
+          target: z.enum(MEETING_RAISE_TARGETS),
+          title: z.string().min(1).max(300).optional(),
+          detail: z.string().max(20_000).optional(),
+          dueDate: isoDateSchema.nullable().optional(),
+          assigneeId: z.string().max(64).nullable().optional(),
+          category: z.string().max(60).optional(),
+          closeItem: z.boolean().default(false),
+        })
+        .parse(req.body);
+      const item = await fetchAgendaItem(req, itemId);
+      if (item.carriedForwardToItemId) {
+        throw badRequest("Raise from the live occurrence of this item, not the carried copy");
+      }
+      const title = body.title ?? item.title;
+      const description = body.detail ?? item.discussion ?? item.description ?? null;
+      const meta = RAISE_TARGET_TABLES[body.target];
+      let createdId: string;
+      let reference: string;
+
+      if (body.target === "rfi") {
+        if (body.assigneeId) {
+          const [u] = await app.db
+            .select({ id: users.id })
+            .from(users)
+            .innerJoin(companyMemberships, eq(companyMemberships.userId, users.id))
+            .where(
+              and(
+                eq(users.id, body.assigneeId),
+                eq(companyMemberships.companyId, req.companyId!),
+              ),
+            )
+            .limit(1);
+          if (!u) throw badRequest("assigneeId is not a user in this company");
+        }
+        const number = await nextRecordNumber(app.db, req.projectId!, "rfi");
+        createdId = newId("rfi");
+        reference = `RFI-${String(number).padStart(3, "0")}`;
+        await app.db.insert(rfis).values({
+          id: createdId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          number,
+          subject: title,
+          question:
+            description ??
+            `Raised from meeting agenda item "${item.title}". The question was not written down ` +
+              `at the meeting and must be completed before this RFI is issued.`,
+          status: "draft",
+          assigneeId: body.assigneeId ?? null,
+          ballInCourtId: body.assigneeId ?? null,
+          dueDate: body.dueDate ?? null,
+          source: "manual",
+          sourceMeta: { raisedFrom: "meeting_agenda_item", agendaItemId: item.id, meetingId: item.meetingId },
+          createdBy: req.user!.id,
+        });
+      } else if (body.target === "change_event") {
+        const number = await nextRecordNumber(app.db, req.projectId!, "change_event");
+        createdId = newId("ce");
+        reference = `CE-${String(number).padStart(3, "0")}`;
+        await app.db.insert(changeEvents).values({
+          id: createdId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          number,
+          reference,
+          title,
+          description,
+          status: "open",
+          eventType: "other",
+          scope: "tbd",
+          originType: "meeting",
+          originId: item.meetingId,
+          dueDate: body.dueDate ?? null,
+          detail: { agendaItemId: item.id },
+          createdBy: req.user!.id,
+        });
+      } else {
+        const number = await nextRecordNumber(app.db, req.projectId!, "risk");
+        createdId = newId("risk");
+        reference = `RSK-${String(number).padStart(3, "0")}`;
+        await app.db.insert(risks).values({
+          id: createdId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          number,
+          title,
+          description,
+          category: "other",
+          status: "open",
+          ownerId: body.assigneeId ?? null,
+          createdBy: req.user!.id,
+        });
+      }
+
+      await linkRecords(req, "meeting_agenda_item", item.id, meta.type, createdId, "raised_from");
+      await linkRecords(req, meta.type, createdId, "meeting_agenda_item", item.id, "tabled_at");
+      if (item.meetingId) {
+        await linkRecords(req, meta.type, createdId, "meeting", item.meetingId, "tabled_at");
+      }
+
+      const now = new Date().toISOString();
+      const raised = ((detailOf(item)["raised"] as unknown[] | undefined) ?? []).concat([
+        { type: meta.type, id: createdId, reference, at: now, by: req.user!.id },
+      ]);
+      await app.db
+        .update(meetingAgendaItems)
+        .set({
+          detail: { ...detailOf(item), raised },
+          originType: item.originType ?? meta.type,
+          originId: item.originId ?? createdId,
+          status: body.closeItem ? "closed" : item.status,
+          closedAt: body.closeItem ? now : item.closedAt,
+          closedBy: body.closeItem ? req.user!.id : item.closedBy,
+          updatedAt: now,
+        })
+        .where(eq(meetingAgendaItems.id, item.id));
+
+      await ledger("create", meta.type, createdId, req, {
+        raisedFromAgendaItemId: item.id,
+        meetingId: item.meetingId,
+        reference,
+        title,
+      });
+      await ledger("update", "meeting_agenda_item", item.id, req, {
+        raised: { type: meta.type, id: createdId, reference },
+        closed: body.closeItem === true,
+      });
+      return reply.status(201).send({
+        agendaItemId: item.id,
+        raised: { type: meta.type, id: createdId, reference, label: meta.label },
+        itemStatus: body.closeItem ? "closed" : item.status,
+      });
+    },
+  );
+
+  /** Every record this agenda item is linked to, with its LIVE status. */
+  app.get(
+    "/projects/:projectId/meeting-agenda-items/:itemId/links",
+    { preHandler: readGate },
+    async (req) => {
+      const { itemId } = req.params as { itemId: string };
+      const item = await fetchAgendaItem(req, itemId);
+      const edges = await app.db
+        .select()
+        .from(recordLinks)
+        .where(
+          and(
+            eq(recordLinks.companyId, req.companyId!),
+            eq(recordLinks.projectId, req.projectId!),
+            eq(recordLinks.fromType, "meeting_agenda_item"),
+            eq(recordLinks.fromId, itemId),
+          ),
+        );
+      const items: Array<Record<string, unknown>> = [];
+      const unresolved: Array<Record<string, unknown>> = [];
+      for (const edge of edges) {
+        const live = await resolveLinkedRecord(req.companyId!, req.projectId!, edge.toType, edge.toId);
+        if (live) items.push({ ...live, linkKind: edge.linkKind, linkedAt: edge.createdAt });
+        else {
+          unresolved.push({
+            type: edge.toType,
+            id: edge.toId,
+            linkKind: edge.linkKind,
+            reason:
+              "The linked record could not be read — either this platform does not resolve that " +
+              "type yet, or the record has been deleted. It is shown rather than hidden.",
+          });
+        }
+      }
+      return { agendaItemId: item.id, items, unresolved, total: items.length + unresolved.length };
+    },
+  );
+
+  /**
+   * THE REVERSE VIEW: which meetings tabled this record. An RFI's own page
+   * can ask "where was this discussed?" and get an answer, which is the half
+   * of #424 a one-way link never provides.
+   */
+  app.get("/projects/:projectId/meeting-links", { preHandler: readGate }, async (req) => {
+    const q = z
+      .object({ recordType: z.string().min(1).max(60), recordId: z.string().min(1).max(64) })
+      .parse(req.query);
+    const edges = await app.db
+      .select()
+      .from(recordLinks)
+      .where(
+        and(
+          eq(recordLinks.companyId, req.companyId!),
+          eq(recordLinks.projectId, req.projectId!),
+          eq(recordLinks.fromType, q.recordType),
+          eq(recordLinks.fromId, q.recordId),
+          inArray(recordLinks.toType, ["meeting", "meeting_agenda_item"]),
+        ),
+      );
+    const meetingIds = new Set<string>();
+    for (const e of edges) {
+      if (e.toType === "meeting") meetingIds.add(e.toId);
+    }
+    const itemIds = edges.filter((e) => e.toType === "meeting_agenda_item").map((e) => e.toId);
+    const itemRows = itemIds.length
+      ? await app.db
+          .select()
+          .from(meetingAgendaItems)
+          .where(
+            and(
+              eq(meetingAgendaItems.companyId, req.companyId!),
+              inArray(meetingAgendaItems.id, itemIds),
+            ),
+          )
+      : [];
+    for (const i of itemRows) meetingIds.add(i.meetingId);
+    const meetingRows = meetingIds.size
+      ? await app.db
+          .select({
+            id: meetings.id,
+            reference: meetings.reference,
+            title: meetings.title,
+            status: meetings.status,
+            scheduledStart: meetings.scheduledStart,
+            occurrenceNumber: meetings.occurrenceNumber,
+          })
+          .from(meetings)
+          .where(
+            and(eq(meetings.companyId, req.companyId!), inArray(meetings.id, [...meetingIds])),
+          )
+          .orderBy(desc(meetings.scheduledStart))
+      : [];
+    return {
+      recordType: q.recordType,
+      recordId: q.recordId,
+      meetings: meetingRows,
+      agendaItems: itemRows.map((i) => ({
+        id: i.id,
+        meetingId: i.meetingId,
+        title: i.title,
+        status: i.status,
+        carryCount: i.carryCount,
+      })),
+      total: meetingRows.length,
+    };
+  });
+
+  /* ================================================================ */
+  /* 13. Health inputs (contract 3.5)                                  */
+  /* ================================================================ */
+
+  app.get(
+    "/projects/:projectId/meetings/health-inputs",
+    { preHandler: readGate },
+    async (req) => {
+      const today = todayISO();
+      const reasons: string[] = [];
+      const [openRow] = await app.db
+        .select({ n: count() })
+        .from(meetingActionItems)
+        .where(
+          and(
+            eq(meetingActionItems.companyId, req.companyId!),
+            eq(meetingActionItems.projectId, req.projectId!),
+            inArray(meetingActionItems.status, [...OPEN_ACTION_STATES]),
+          ),
+        );
+      const [overdueRow] = await app.db
+        .select({ n: count() })
+        .from(meetingActionItems)
+        .where(
+          and(
+            eq(meetingActionItems.companyId, req.companyId!),
+            eq(meetingActionItems.projectId, req.projectId!),
+            inArray(meetingActionItems.status, [...OPEN_ACTION_STATES]),
+            lt(meetingActionItems.dueDate, today),
+          ),
+        );
+      const [meetingCountRow] = await app.db
+        .select({ n: count() })
+        .from(meetings)
+        .where(
+          and(eq(meetings.companyId, req.companyId!), eq(meetings.projectId, req.projectId!)),
+        );
+      const [heldRow] = await app.db
+        .select({ n: count() })
+        .from(meetings)
+        .where(
+          and(
+            eq(meetings.companyId, req.companyId!),
+            eq(meetings.projectId, req.projectId!),
+            inArray(meetings.status, [
+              "held",
+              "minutes_draft",
+              "minutes_issued",
+              "minutes_accepted",
+            ]),
+          ),
+        );
+      const [acceptedRow] = await app.db
+        .select({ n: count() })
+        .from(meetings)
+        .where(
+          and(
+            eq(meetings.companyId, req.companyId!),
+            eq(meetings.projectId, req.projectId!),
+            eq(meetings.status, "minutes_accepted"),
+          ),
+        );
+      const meetingCount = Number(meetingCountRow?.n ?? 0);
+      const heldCount = Number(heldRow?.n ?? 0);
+      const acceptedCount = Number(acceptedRow?.n ?? 0);
+      if (heldCount === 0) {
+        reasons.push(
+          "No meeting on this project has been held, so minutesAcceptedRatio is null rather " +
+            "than 0 — a project that has held no meeting has not failed to minute one.",
+        );
+      }
+      const [carriedRow] = await app.db
+        .select({ n: count() })
+        .from(meetingAgendaItems)
+        .where(
+          and(
+            eq(meetingAgendaItems.companyId, req.companyId!),
+            eq(meetingAgendaItems.projectId, req.projectId!),
+            isNull(meetingAgendaItems.carriedForwardToItemId),
+            ne(meetingAgendaItems.status, "closed"),
+            gte(meetingAgendaItems.carryCount, CARRY_SIGNAL_THRESHOLD),
+          ),
+        );
+      const [unissuedRow] = await app.db
+        .select({ n: count() })
+        .from(meetings)
+        .where(
+          and(
+            eq(meetings.companyId, req.companyId!),
+            eq(meetings.projectId, req.projectId!),
+            eq(meetings.status, "held"),
+            isNull(meetings.minutesIssuedAt),
+          ),
+        );
+      const open = Number(openRow?.n ?? 0);
+      const overdue = Number(overdueRow?.n ?? 0);
+      if (open === 0) {
+        reasons.push(
+          "No open action items on this project — the overdue ratio is not a meaningful number " +
+            "and is returned as null rather than 0%.",
+        );
+      }
+      return {
+        metrics: {
+          meetings: meetingCount,
+          meetingsHeld: heldCount,
+          openActionItems: open,
+          overdueActionItems: overdue,
+          overdueActionRatio: open === 0 ? null : Math.round((overdue / open) * 1000) / 1000,
+          itemsCarriedOverThreshold: Number(carriedRow?.n ?? 0),
+          heldMeetingsWithNoMinutesIssued: Number(unissuedRow?.n ?? 0),
+          minutesAcceptedRatio:
+            heldCount === 0 ? null : Math.round((acceptedCount / heldCount) * 1000) / 1000,
+        },
+        reasons,
+        asOf: today,
+      };
+    },
+  );
+
+  /* ================================================================ */
+  /* 14. SCHEDULED SWEEPS                                              */
+  /*                                                                   */
+  /* These used to run as a side effect of somebody opening a list. A  */
+  /* project nobody looked at was never warned, and the ledger         */
+  /* attributed the resulting signals to whichever reader happened to  */
+  /* trigger them — including read-only users. They run here, under    */
+  /* the platform scheduler, with a null (system) actor.               */
+  /* ================================================================ */
+
+  /**
+   * Warn BEFORE the objection window closes, not after it has.
+   *
+   * `warnDaysBefore` exists all over this platform and almost nothing emits
+   * anything before a deadline. Deemed acceptance is the one clock where the
+   * warning has to arrive early: once it runs out, silence has already done
+   * its work and the record is settled.
+   */
+  async function sweepObjectionWindows(
+    companyId: string,
+    nowMs: number,
+  ): Promise<{ warned: number; scanned: number }> {
+    const candidates = await app.db
+      .select()
+      .from(meetings)
+      .where(
+        and(
+          eq(meetings.companyId, companyId),
+          eq(meetings.status, "minutes_issued"),
+          isNotNull(meetings.minutesIssuedAt),
+          isNotNull(meetings.objectionPeriodDays),
+          isNull(meetings.approvedAt),
+        ),
+      );
+    if (candidates.length === 0) return { warned: 0, scanned: 0 };
+    const keyOf = (m: typeof meetings.$inferSelect) => `${m.id}:v${Math.max(1, m.minutesVersion)}`;
+    const seen = await alreadySignalled(companyId, OBJECTION_DETECTOR, candidates.map(keyOf));
+    let warned = 0;
+    for (const meeting of candidates) {
+      const key = keyOf(meeting);
+      if (seen.has(key)) continue;
+      const window = computeObjectionWindow({
+        minutesIssuedAt: meeting.minutesIssuedAt,
+        minutesDeliveredAt: meeting.minutesDeliveredAt,
+        objectionPeriodDays: meeting.objectionPeriodDays,
+        approvedAt: meeting.approvedAt,
+        objections:
+          ((meeting.detail as Record<string, unknown> | null)?.["objections"] as
+            | Array<{ resolvedAt?: unknown }>
+            | undefined) ?? [],
+        nowMs,
+      });
+      if (!window.closesAt || window.expired === true) continue;
+      const msLeft = Date.parse(window.closesAt) - nowMs;
+      if (msLeft > OBJECTION_WARN_DAYS * 86_400_000) continue;
+      seen.add(key);
+      const daysLeft = Math.max(0, Math.ceil(msLeft / 86_400_000));
+      const signalId = newId("sig");
+      await app.db.insert(signals).values({
+        id: signalId,
+        companyId,
+        projectId: meeting.projectId,
+        detector: OBJECTION_DETECTOR,
+        severity: "medium",
+        confidence: 1,
+        title: `Objection period for ${meeting.reference} closes in ${daysLeft} day(s)`,
+        explanation:
+          `The minutes of "${meeting.title}" were issued on ${meeting.minutesIssuedAt} with a ` +
+          `${meeting.objectionPeriodDays}-day objection period, measured from ` +
+          `${window.runsFrom === "delivery" ? "delivery" : "issue"}. It closes on ` +
+          `${window.closesAt}. After that, items not objected to are taken as an accurate ` +
+          `record — so a disagreement raised afterwards is a new agenda item, not a correction. ` +
+          `This warning exists because a deeming clock that only reports itself once it has run ` +
+          `out has told you nothing you could act on.`,
+        fingerprint: `${OBJECTION_DETECTOR}:${key}`,
+        subjectType: "meeting",
+        subjectId: meeting.id,
+        evidenceRefs: {
+          key,
+          meetingId: meeting.id,
+          reference: meeting.reference,
+          minutesVersion: Math.max(1, meeting.minutesVersion),
+          closesAt: window.closesAt,
+          runsFrom: window.runsFrom,
+          openObjections: window.openObjections,
+        },
+      });
+      await appendLedger(app.db, {
+        companyId,
+        actorId: null,
+        action: "create",
+        objectType: "signal",
+        objectId: signalId,
+        payload: { detector: OBJECTION_DETECTOR, meetingId: meeting.id, daysLeft },
+        projectId: meeting.projectId,
+      });
+      await pushNotifications(
+        app.db,
+        [...new Set(((meeting.distribution as string[]) ?? []).concat(
+          meeting.minuteTakerId ? [meeting.minuteTakerId] : [],
+        ))].map((userId) => ({
+          companyId,
+          userId,
+          projectId: meeting.projectId,
+          kind: "due_soon" as const,
+          title: `Objection period closes in ${daysLeft} day(s): ${meeting.reference}`,
+          body: `After ${window.closesAt} the minutes are taken as an accurate record.`,
+          recordType: "meeting",
+          recordId: meeting.id,
+        })),
+      );
+      warned += 1;
+    }
+    return { warned, scanned: candidates.length };
+  }
+
+  app.scheduler.register({
+    name: "meetings.overdue-actions",
+    description:
+      "Raise a signal for every meeting action past its date that has not been promoted to an obligation — the sweep that used to run only when somebody opened the action list",
+    everyMs: 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db }) =>
+      forEachCompany(db, (companyId) => sweepOverdueActions(companyId, null, null)),
+  });
+
+  app.scheduler.register({
+    name: "meetings.carried-items",
+    description:
+      "Signal agenda items that have survived three or more consecutive occurrences without being closed: an item carried that often is an undecided question, not an agenda item",
+    everyMs: 12 * 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db }) => forEachCompany(db, (companyId) => sweepCarriedItems(companyId, null, null)),
+  });
+
+  app.scheduler.register({
+    name: "meetings.objection-window",
+    description:
+      "Warn the distribution before an issued set of minutes is deemed accepted by silence, rather than reporting the deeming after it has happened",
+    everyMs: 6 * 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db, now }) =>
+      forEachCompany(db, (companyId) => sweepObjectionWindows(companyId, now.getTime())),
+  });
+
+  /**
+   * Run the sweeps for one project on demand. Admin-gated because it WRITES:
+   * the whole point of moving them off the read path was that a reader must
+   * not create obligations and signals by opening a page.
+   */
+  app.post(
+    "/projects/:projectId/meeting-reports/sweep",
+    { preHandler: adminGate },
+    async (req) => {
+      const overdue = await sweepOverdueActions(req.companyId!, req.projectId!, req.user!.id);
+      const carried = await sweepCarriedItems(req.companyId!, req.projectId!, req.user!.id);
+      return {
+        overdue,
+        carried,
+        note:
+          "This is the manual trigger for the scheduled jobs meetings.overdue-actions and " +
+          "meetings.carried-items. Signals are keyed on the record, so running it repeatedly " +
+          "raises nothing twice.",
+      };
+    },
+  );
+
 };

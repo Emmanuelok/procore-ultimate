@@ -10,10 +10,14 @@ import { TabBar } from "./forensicsShared";
 import DelayEventsTab from "./DelayEventsTab";
 import AnalysisTab from "./AnalysisTab";
 import ClaimsTab from "./ClaimsTab";
+import MethodsTab from "./MethodsTab";
+import QuantumTab from "./QuantumTab";
 
 const TABS = [
   { key: "events", label: "Delay Events" },
   { key: "analysis", label: "Analysis" },
+  { key: "methods", label: "Method Suite" },
+  { key: "quantum", label: "Quantum & Disruption" },
   { key: "claims", label: "Claims" },
 ];
 
@@ -24,6 +28,13 @@ export default function ForensicsPage() {
     const t = searchParams.get("tab");
     return TABS.some((x) => x.key === t) ? (t as string) : "events";
   });
+
+  /*
+   * A deep link may name a record as well as a tab (company search emits
+   * ?tab=events&id=… ). Switching tab by hand drops the id so the drawer does
+   * not follow the reader around.
+   */
+  const focusId = searchParams.get("id");
 
   function selectTab(key: string) {
     setTab(key);
@@ -36,12 +47,14 @@ export default function ForensicsPage() {
     <div>
       <PageHeader
         title="Delay & Disruption Forensics"
-        subtitle="Delay events, time impact analysis, windows attribution and the claims workspace"
+        subtitle="Delay events, the AACE method suite, concurrency and float doctrine, quantum and disruption, and the claims workspace"
       />
       <TabBar tabs={TABS} active={tab} onSelect={selectTab} />
-      {tab === "events" ? <DelayEventsTab projectId={projectId} /> : null}
+      {tab === "events" ? <DelayEventsTab projectId={projectId} focusId={focusId} /> : null}
       {tab === "analysis" ? <AnalysisTab projectId={projectId} /> : null}
-      {tab === "claims" ? <ClaimsTab projectId={projectId} /> : null}
+      {tab === "methods" ? <MethodsTab projectId={projectId} /> : null}
+      {tab === "quantum" ? <QuantumTab projectId={projectId} /> : null}
+      {tab === "claims" ? <ClaimsTab projectId={projectId} focusId={focusId} /> : null}
     </div>
   );
 }

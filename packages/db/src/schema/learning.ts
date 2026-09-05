@@ -6,6 +6,7 @@ import {
   pgTable,
   text,
   timestamp,
+  uniqueIndex,
 } from "drizzle-orm/pg-core";
 
 const createdAt = () =>
@@ -66,6 +67,7 @@ export const lessons = pgTable(
     index("lessons_company_idx").on(t.companyId),
     index("lessons_category_idx").on(t.companyId, t.category),
     index("lessons_status_idx").on(t.companyId, t.status),
+    index("lessons_origin_idx").on(t.companyId, t.originProjectId),
   ],
 );
 
@@ -85,12 +87,61 @@ export const lessonApplications = pgTable(
     appliedTo: jsonb("applied_to").$type<Record<string, unknown>>().default({}).notNull(),
     action: text("action").notNull(),
     outcomeNote: text("outcome_note"),
+    /*
+     * OUTCOME MEASUREMENT (#984). An application with no measured outcome is
+     * `unknown` and stays `unknown` — counting it as a success is exactly how
+     * a lessons register comes to report impact it never had. The measurement
+     * is a separate act by a separate person and carries its own date.
+     */
+    outcome: text("outcome").default("unknown").notNull(), // LessonOutcome
+    outcomeValue: doublePrecision("outcome_value"),
+    outcomeCurrency: text("outcome_currency"),
+    outcomeDays: integer("outcome_days"),
+    measuredAt: timestamp("measured_at", { withTimezone: true, mode: "string" }),
+    measuredBy: text("measured_by"),
     appliedBy: text("applied_by").notNull(),
     appliedAt: createdAt(),
   },
   (t) => [
     index("lesson_applications_lesson_idx").on(t.lessonId),
     index("lesson_applications_project_idx").on(t.projectId),
+    index("lesson_applications_outcome_idx").on(t.companyId, t.outcome),
+  ],
+);
+
+/**
+ * CROSS-PROJECT RELEVANCE PUSH (#985–986).
+ *
+ * Retrieval that waits to be searched for is retrieval that does not happen.
+ * When a lesson is published, the projects it plausibly applies to are
+ * computed from the deterministic ranker and the lesson is PUSHED to their
+ * teams — and the push itself is a record, so "we told them" is checkable and
+ * the rate at which pushes become applications is measurable.
+ */
+export const lessonPushes = pgTable(
+  "lesson_pushes",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    lessonId: text("lesson_id").notNull(),
+    /** the project the lesson was pushed TO (never its origin) */
+    projectId: text("project_id").notNull(),
+    /** the ranker's score and the reasons it gave, kept for honesty */
+    score: doublePrecision("score"),
+    reasons: jsonb("reasons").$type<unknown[]>().default([]).notNull(),
+    status: text("status").default("pushed").notNull(), // LessonPushStatus
+    notifiedUserIds: jsonb("notified_user_ids").$type<string[]>().default([]).notNull(),
+    acknowledgedBy: text("acknowledged_by"),
+    acknowledgedAt: timestamp("acknowledged_at", { withTimezone: true, mode: "string" }),
+    /** set when the push turned into a real application */
+    applicationId: text("application_id"),
+    dismissedReason: text("dismissed_reason"),
+    pushedAt: createdAt(),
+  },
+  (t) => [
+    uniqueIndex("lesson_pushes_uq").on(t.lessonId, t.projectId),
+    index("lesson_pushes_project_idx").on(t.projectId, t.status),
+    index("lesson_pushes_company_idx").on(t.companyId, t.status),
   ],
 );
 
@@ -107,6 +158,14 @@ export const lessonTriggers = pgTable(
     kind: text("kind").notNull(), // LessonTriggerKind
     /** the record that fired the trigger: { tool, recordId, label } */
     sourceRef: jsonb("source_ref").$type<Record<string, unknown>>().default({}).notNull(),
+    /**
+     * `sourceRef.recordId`, denormalised so the database — not a Set held in
+     * one request's memory — enforces one trigger per (project, kind, record).
+     * The in-memory check let two people opening the Triggers tab at the same
+     * moment create two obligations for the same dispute, doubling the
+     * capture-rate denominator with no way to tell which was real.
+     */
+    sourceKey: text("source_key"),
     /** why this crossed the mandatory threshold, in words */
     rationale: text("rationale").notNull(),
     dueAt: text("due_at"),
@@ -122,6 +181,9 @@ export const lessonTriggers = pgTable(
   (t) => [
     index("lesson_triggers_company_idx").on(t.companyId),
     index("lesson_triggers_project_idx").on(t.projectId, t.status),
+    /* DB-level sweep idempotency. NULLs do not collide, so legacy rows with no
+       sourceKey are tolerated while every new row is unique by construction. */
+    uniqueIndex("lesson_triggers_source_uq").on(t.projectId, t.kind, t.sourceKey),
   ],
 );
 

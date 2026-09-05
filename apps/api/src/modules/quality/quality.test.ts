@@ -108,7 +108,12 @@ beforeAll(async () => {
     name: "Air handling unit 01",
     createdBy: owner.userId,
   });
-});
+  // Booting an embedded PGlite and applying the full migration set takes well
+  // over the file-level 30s default when other workers are doing the same on a
+  // shared machine — the suite then fails at the FILE level with a hook
+  // timeout rather than on an assertion, which reads like a broken module and
+  // is not one. The sibling files in this module carry the same allowance.
+}, 180_000);
 
 afterAll(async () => {
   await built.close();
@@ -1449,6 +1454,29 @@ describe("sweeps and signals", () => {
     expect(holdSignal).toBeTruthy();
     expect(holdSignal!.explanation).toContain("Adhesion test witness");
     expect(holdSignal!.explanation).toContain("2020-01-01");
+  });
+
+  /*
+   * The read-path sweep keeps an open page honest; the scheduler job is what
+   * makes a hold point nobody looks at still get raised. They share one
+   * implementation so they cannot drift, and the job must therefore add
+   * nothing on top of what the manual sweep already raised.
+   */
+  it("runs the same detectors on the platform scheduler without double-raising", async () => {
+    const before = await app.db
+      .select()
+      .from(signals)
+      .where(eq(signals.companyId, owner.companyId));
+
+    const status = await app.scheduler.runNow("quality.sweeps");
+    expect(status.lastError).toBeNull();
+    await app.scheduler.runNow("quality.sweeps");
+
+    const after = await app.db
+      .select()
+      .from(signals)
+      .where(eq(signals.companyId, owner.companyId));
+    expect(after.length).toBe(before.length);
   });
 
   it("does not re-raise on the lazy sweep that runs on a list read", async () => {

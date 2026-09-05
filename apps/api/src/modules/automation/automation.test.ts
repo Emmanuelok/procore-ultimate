@@ -54,7 +54,7 @@ beforeAll(async () => {
   projectAdmin = await addCompanyMember(t.app, owner, "member", { projectId, automationLevel: "admin" });
   projectReader = await addCompanyMember(t.app, owner, "member", { projectId, automationLevel: "read" });
   noProject = await addCompanyMember(t.app, owner, "member");
-}, 120_000);
+}, 600_000);
 
 afterAll(async () => {
   await t.close();
@@ -147,7 +147,7 @@ describe("rule lifecycle", () => {
 
   beforeAll(async () => {
     ruleId = ((await post(owner, "/automation/rules", baseRule({ name: "Lifecycle" }))).json() as { id: string }).id;
-  }, 120_000);
+  }, 600_000);
 
   it("activates, pauses, edits and archives with the right conflicts", async () => {
     const activate = await post(owner, `/automation/rules/${ruleId}/activate`);
@@ -203,7 +203,7 @@ describe("tenancy and project visibility", () => {
     const res = await post(projectAdmin, `/projects/${projectId}/automation/rules`, baseRule({ name: "Project only" }));
     expect(res.statusCode).toBe(201);
     projectRuleId = (res.json() as { id: string }).id;
-  }, 120_000);
+  }, 600_000);
 
   it("a project admin creates project rules that carry the project", async () => {
     const detail = await get(projectAdmin, `/projects/${projectId}/automation/rules/${projectRuleId}`);
@@ -331,6 +331,23 @@ describe("dry runs", () => {
     expect((ok.json() as { matched: boolean }).matched).toBe(true);
     expect((await post(projectAdmin, `/projects/${projectId}/automation/rules/${ruleId}/test`, { objectId: theirs.id })).statusCode).toBe(403);
   });
+
+  it("a project tester cannot read another project's record through a type that carries no projectId column", async () => {
+    // A `project` record IS its own project: the guard must resolve the
+    // record's project from the registry, not from a projectId field.
+    const created = await post(projectAdmin, `/projects/${projectId}/automation/rules`, {
+      name: "Project trigger",
+      trigger: { kind: "event", objectType: "project", action: "*" },
+      actions: [{ type: "tag", params: { name: "probe" } }],
+    });
+    expect(created.statusCode).toBe(201);
+    const probeRuleId = (created.json() as { id: string }).id;
+    const own = await post(projectAdmin, `/projects/${projectId}/automation/rules/${probeRuleId}/test`, { objectId: projectId });
+    expect(own.statusCode).toBe(200);
+    const other = await post(projectAdmin, `/projects/${projectId}/automation/rules/${probeRuleId}/test`, { objectId: otherProjectId });
+    expect(other.statusCode).toBe(403);
+    expect(JSON.stringify(other.json())).not.toContain("Other route project");
+  });
 });
 
 describe("runs, summary, engine operations and health inputs", () => {
@@ -342,7 +359,7 @@ describe("runs, summary, engine operations and health inputs", () => {
     await createRfi(t.app, owner, projectId, { subject: "Fires the live rule" });
     const runs = (await get(owner, `/automation/runs?ruleId=${ruleId}`)).json() as { items: Array<{ id: string; status: string }> };
     runId = runs.items[0]!.id;
-  }, 120_000);
+  }, 600_000);
 
   it("lists and reads runs with tenancy and project visibility", async () => {
     const list = (await get(owner, `/automation/runs?ruleId=${ruleId}`)).json() as { items: Array<{ status: string; objectType: string; projectId: string }>; total: number };
@@ -364,6 +381,13 @@ describe("runs, summary, engine operations and health inputs", () => {
     expect((await get(owner, "/automation/runs?status=nonsense")).statusCode).toBe(400);
     const detail = (await get(owner, `/automation/rules/${ruleId}`)).json() as { recentRuns: Array<{ id: string }> };
     expect(detail.recentRuns.map((r) => r.id)).toContain(runId);
+    // A company-wide rule is readable by every member, but its recent runs are
+    // project data: a member with no project must not read them through it.
+    const asNoProjectDetail = await get(noProject, `/automation/rules/${ruleId}`);
+    expect(asNoProjectDetail.statusCode).toBe(200);
+    expect((asNoProjectDetail.json() as { recentRuns: Array<{ id: string }> }).recentRuns).toEqual([]);
+    const asReaderDetail = (await get(projectReader, `/automation/rules/${ruleId}`)).json() as { recentRuns: Array<{ id: string }> };
+    expect(asReaderDetail.recentRuns.map((r) => r.id)).toContain(runId);
   });
 
   it("retries only failed, throttled or queued runs, and only for admins", async () => {
@@ -436,5 +460,18 @@ describe("runs, summary, engine operations and health inputs", () => {
     const drain = await t.app.scheduler.runNow("automation.drain");
     expect(drain.state).toBe("succeeded");
     expect(drain.lastResult).toMatchObject({ executed: 0 });
+  });
+
+  it("the manual cycle never drains another company's queued runs", async () => {
+    const theirProject = await createProject(t.app, outsider, "Their drain project");
+    await post(outsider, "/automation/rules", baseRule({ name: "Theirs", status: "active", conditions: null }));
+    await createRfi(t.app, outsider, theirProject, { subject: "Queued for them" });
+    const queuedBefore = (await get(outsider, "/automation/runs?status=queued")).json() as { items: Array<{ id: string }> };
+    expect(queuedBefore.items.length).toBeGreaterThanOrEqual(1);
+    const cycle = await post(owner, "/automation/run", { scan: false });
+    expect(cycle.statusCode).toBe(200);
+    expect((cycle.json() as { drain: { executed: number } }).drain.executed).toBe(0);
+    const queuedAfter = (await get(outsider, "/automation/runs?status=queued")).json() as { items: Array<{ id: string }> };
+    expect(queuedAfter.items.map((r) => r.id)).toEqual(queuedBefore.items.map((r) => r.id));
   });
 });

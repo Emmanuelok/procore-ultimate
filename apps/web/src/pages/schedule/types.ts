@@ -12,6 +12,12 @@ export interface ScheduleRow {
   computedFinish: string | null;
   computedDurationDays: number | null;
   lastComputedAt: string | null;
+  /** progress data date — work before it is actual, after it is forecast */
+  dataDate?: string | null;
+  source?: string;
+  revision?: number;
+  parentScheduleId?: string | null;
+  defaultCalendarId?: string | null;
 }
 
 export interface TaskRow {
@@ -30,6 +36,15 @@ export interface TaskRow {
   finishDate: string | null; // inclusive last day
   totalFloat: number | null;
   isCritical: number;
+  remainingDurationDays?: number | null;
+  taskType?: string;
+  calendarId?: string | null;
+  isKeyMilestone?: number;
+  contractualDate?: string | null;
+  budgetedCost?: number | null;
+  budgetedHours?: number | null;
+  responsibleId?: string | null;
+  locationId?: string | null;
 }
 
 export interface DepRow {
@@ -115,7 +130,7 @@ export interface LookaheadResponse {
   weeks: number;
   from: string;
   to: string;
-  items: TaskRow[];
+  items: (TaskRow & { inProgress?: boolean; constraints?: ConstraintRow[] })[];
   total: number;
 }
 
@@ -125,7 +140,11 @@ export interface QualityCheck {
   ratio?: number | null;
   threshold?: string;
   pass: boolean;
-  value?: number;
+  /** false when the inputs the check needs (baseline, data date, resources) are absent */
+  applicable?: boolean;
+  /** why the check could not run, or the basis of the computed figure */
+  basis?: string;
+  value?: number | null;
 }
 
 export interface QualityReport {
@@ -136,6 +155,149 @@ export interface QualityReport {
   passed?: number;
   total?: number;
   score: number;
+  notApplicable?: string[];
+  dataDate?: string | null;
+  baselineName?: string | null;
+}
+
+/* ------------------------------------------------------------------ */
+/* Upgrade-wave shapes (calendars, resources, constraints, EV, …)      */
+/* ------------------------------------------------------------------ */
+
+export interface CalendarRow {
+  id: string;
+  name: string;
+  scheduleId: string | null;
+  workdays: number[];
+  holidays: string[];
+  exceptions: string[];
+  hoursPerDay: number;
+  isDefault: number;
+}
+
+export interface ResourceRow {
+  id: string;
+  taskId: string;
+  name: string;
+  resourceType: string;
+  unit: string | null;
+  budgetedUnits: number;
+  actualUnits: number;
+  unitRate: number | null;
+  budgetedCost: number;
+  actualCost: number;
+}
+
+export interface ConstraintRow {
+  id: string;
+  number: number;
+  scheduleId: string;
+  taskId: string | null;
+  description: string;
+  category: string;
+  status: string;
+  ownerId: string | null;
+  needByDate: string | null;
+  clearedAt: string | null;
+  escalatedAt: string | null;
+  resolution: string | null;
+}
+
+export interface MilestoneRow {
+  id: string;
+  name: string;
+  wbsCode: string | null;
+  isKeyMilestone: boolean;
+  contractualDate: string | null;
+  forecastDate: string | null;
+  actualFinish: string | null;
+  slipDays: number | null;
+  status: string;
+  totalFloat: number | null;
+  isCritical: boolean;
+}
+
+export interface EarnedValueResponse {
+  scheduleId: string;
+  baselineName: string | null;
+  basis: string;
+  currency: string;
+  dataDate: string;
+  bac: number;
+  pv: number;
+  ev: number;
+  ac: number;
+  sv: number;
+  cv: number;
+  spi: number | null;
+  cpi: number | null;
+  eac: number | null;
+  etc: number | null;
+  vac: number | null;
+  scheduleEacDays: number | null;
+  plannedDurationDays: number | null;
+  pricedActivities: number;
+  unpriced: number;
+  reasons: string[];
+  activities: {
+    id: string;
+    name: string;
+    bac: number;
+    pv: number;
+    ev: number;
+    ac: number;
+    sv: number;
+    cv: number;
+  }[];
+}
+
+export interface NarrativeRow {
+  id: string;
+  title: string;
+  body: string;
+  periodStart: string | null;
+  periodEnd: string | null;
+  dataDate: string | null;
+  metrics: Record<string, unknown> | null;
+  createdAt: string;
+}
+
+export interface ImportRunRow {
+  id: string;
+  format: string;
+  fileName: string;
+  byteSize: number;
+  scheduleId: string | null;
+  targetScheduleId: string | null;
+  stats: Record<string, unknown>;
+  warnings: string[];
+  createdAt: string;
+}
+
+export interface RevisionDiffSummary {
+  totals: {
+    from: number;
+    to: number;
+    added: number;
+    removed: number;
+    durationChanged: number;
+    dateChanged: number;
+    logicChanged: number;
+  };
+  addedTasks: { name: string }[];
+  removedTasks: { name: string }[];
+  durationChanges: { name: string; fromDays: number; toDays: number; deltaDays: number }[];
+  dateChanges?: {
+    name: string;
+    fromFinish: string | null;
+    toFinish: string | null;
+    finishDeltaDays: number | null;
+  }[];
+  progressChanges?: { name: string; fromPercent: number; toPercent: number }[];
+  duplicateKeys?: string[];
+  logicAdded: { predecessor: string; successor: string; toType?: string }[];
+  logicRemoved: { predecessor: string; successor: string; fromType?: string }[];
+  logicChanged: { predecessor: string; successor: string; fromType?: string; toType?: string }[];
 }
 
 /* ------------------------------------------------------------------ */
@@ -163,4 +325,57 @@ export function shortDate(iso: string | null | undefined): string {
   const d = new Date(`${iso}T00:00:00Z`);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
+}
+
+/* ------------------------------------------------------------------ */
+/* Resource loading (#370), revision comparison (#357), calendar view   */
+/* ------------------------------------------------------------------ */
+
+export interface ResourceTypeSummary {
+  resourceType: string;
+  budgetedUnits: number;
+  actualUnits: number;
+  budgetedCost: number;
+  actualCost: number;
+}
+
+export interface ResourcesResponse {
+  items: ResourceRow[];
+  total: number;
+  /** the project's active budget currency, or USD with a reason */
+  currency: string;
+  reasons: string[];
+  byType: ResourceTypeSummary[];
+}
+
+export interface RevisionSide {
+  id: string;
+  name: string;
+  revision?: number;
+  computedFinish: string | null;
+  dataDate: string | null;
+}
+
+export interface RevisionCompareResponse {
+  from: RevisionSide;
+  to: RevisionSide;
+  completionMovementDays: number | null;
+  diff: RevisionDiffSummary;
+}
+
+export interface CalendarViewDay {
+  date: string;
+  working: boolean;
+  starting: { id: string; name: string; isCritical: boolean }[];
+  finishing: { id: string; name: string; isCritical: boolean; isMilestone: boolean }[];
+  inProgress: number;
+}
+
+export interface CalendarViewResponse {
+  scheduleId: string;
+  from: string;
+  to: string;
+  calendarId: string | null;
+  calendarName: string | null;
+  days: CalendarViewDay[];
 }

@@ -78,6 +78,10 @@ beforeAll(async () => {
     title: "Scope blow-out",
     status: "agreed",
     agreedValue: 400_000,
+    // Same currency as the contract: a money metric refuses a project whose
+    // basis spans currencies (see mixedCurrencyReason), which is asserted in
+    // its own test below rather than accidentally here.
+    currency: "GBP",
     createdBy: rival.userId,
   });
 });
@@ -136,6 +140,7 @@ async function seedCommercialData(actor: TestActor, projectId: string) {
     title: "Agreed change",
     status: "agreed",
     agreedValue: 50_000,
+    currency: "GBP",
     createdBy: actor.userId,
   });
   // Proposed variations are not approved budget.
@@ -147,6 +152,7 @@ async function seedCommercialData(actor: TestActor, projectId: string) {
     title: "Proposed change",
     status: "proposed",
     costEstimate: 100_000,
+    currency: "GBP",
     createdBy: actor.userId,
   });
 }
@@ -589,10 +595,15 @@ describe("distributions", () => {
     };
     expect(body.accessLevel).toBe("contributed");
     expect(body.distribution.suppressed).toBe(true);
-    expect(body.distribution.n).toBe(1);
+    // The caller's OWN sample is excluded from the figures it is compared
+    // against, so the only sample in the cell leaves nothing to describe. That
+    // is the anonymity repair: a company must never be shown a distribution it
+    // is itself most of.
+    expect(body.distribution.n).toBe(0);
     expect(body.distribution.median).toBeUndefined();
     expect(body.seedIncluded).toBe(false);
-    expect(body.disclosures.join(" ")).toContain("n=1");
+    expect(body.disclosures.join(" ")).toContain("n=0");
+    expect(body.disclosures.join(" ")).toContain("you contributed are excluded");
   });
 
   it("computes contributed stats over contributed rows only, with no contributor ids anywhere", async () => {
@@ -634,10 +645,12 @@ describe("distributions", () => {
       distribution: { n: number; min: number; max: number };
     };
     expect(body.accessLevel).toBe("contributed");
-    // 6 contributed samples — seed rows for the same cell exist but are excluded
-    expect(body.distribution.n).toBe(6);
+    // Six contributed samples exist in the cell; the caller sees FIVE, because
+    // its own is excluded from the population it is compared with. Seed rows
+    // for the same cell exist and are excluded too.
+    expect(body.distribution.n).toBe(5);
     expect(body.distribution.min).toBe(10);
-    expect(body.distribution.max).toBe(100);
+    expect(body.distribution.max).toBe(30);
     expect(body.seedIncluded).toBe(false);
     expect(body.healthWarning).toBeUndefined();
     expect(res.body).not.toContain("co_fake");
@@ -698,9 +711,27 @@ describe("compare", () => {
     expect(body.assetClass).toBe("commercial");
     expect(body.region).toBe("GB");
     expect(body.value).toBe(100);
-    expect(body.distribution.n).toBe(6);
+    expect(body.distribution.n).toBe(5);
     expect(body.value).toBeGreaterThan(body.distribution.p90);
-    expect(body.outlier).toEqual({ adverse: true, side: "above_p90", signalRaised: true });
+    // A GET NEVER WRITES. Compare reports that a signal WOULD be raised; the
+    // raising happens on the explicit evaluate route, where a conditional
+    // update on the snapshot makes it exactly-once.
+    expect(body.outlier).toMatchObject({
+      adverse: true,
+      side: "above_p90",
+      signalRaised: false,
+      wouldRaise: true,
+    });
+    expect(await outlierSignals(owner.companyId)).toHaveLength(0);
+
+    const evaluated = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projOutlier}/benchmarks/snapshots/${outlierSnapshotId}/evaluate`,
+      headers: owner.headers,
+      payload: {},
+    });
+    expect(evaluated.statusCode).toBe(200);
+    expect((evaluated.json() as { signalRaised: boolean }).signalRaised).toBe(true);
 
     const raised = await outlierSignals(owner.companyId);
     expect(raised.length).toBe(1);
@@ -711,33 +742,69 @@ describe("compare", () => {
     expect(await ledgerCount(owner.companyId, "benchmark_outlier_signal")).toBe(1);
   });
 
-  it("is idempotent per snapshot — a second compare raises nothing new", async () => {
+  it("is idempotent per snapshot — a second evaluation raises nothing new", async () => {
+    const again = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projOutlier}/benchmarks/snapshots/${outlierSnapshotId}/evaluate`,
+      headers: owner.headers,
+      payload: {},
+    });
+    expect(again.statusCode).toBe(200);
+    // the signal id is claimed with a conditional update, so the second caller
+    // reports the first one rather than writing a duplicate
+    expect((await outlierSignals(owner.companyId)).length).toBe(1);
+
     const res = await app.inject({
       method: "GET",
       url: `/api/v1/projects/${projOutlier}/benchmarks/compare?metric=punch_open_rate`,
       headers: owner.headers,
     });
     expect(res.statusCode).toBe(200);
-    expect((res.json() as { outlier: { signalRaised: boolean } }).outlier.signalRaised).toBe(false);
+    const outlier = (res.json() as { outlier: { signalRaised: boolean; wouldRaise: boolean } })
+      .outlier;
+    expect(outlier.signalRaised).toBe(true);
+    expect(outlier.wouldRaise).toBe(false);
     expect((await outlierSignals(owner.companyId)).length).toBe(1);
   });
 
   it("stays quiet for a value inside the distribution", async () => {
-    const created = await createSnapshot(owner, projMid, "punch_open_rate");
-    expect((created.json() as { value: number }).value).toBe(50);
+    // The other contributors sit at 10, 15, 20, 25 and 30. A project at 20%
+    // is squarely inside that spread, so nothing adverse is reported and the
+    // evaluate route has nothing to raise.
+    const projInside = await makeProject(owner, "Inside the pack");
+    await insertPunch(owner, projInside, [
+      { number: 1, status: "open" },
+      { number: 2, status: "closed" },
+      { number: 3, status: "closed" },
+      { number: 4, status: "closed" },
+      { number: 5, status: "closed" },
+    ]);
+    const created = await createSnapshot(owner, projInside, "punch_open_rate");
+    expect((created.json() as { value: number }).value).toBe(20);
+    const snapshotId = (created.json() as { id: string }).id;
 
     const res = await app.inject({
       method: "GET",
-      url: `/api/v1/projects/${projMid}/benchmarks/compare?metric=punch_open_rate&assetClass=commercial&region=GB`,
+      url: `/api/v1/projects/${projInside}/benchmarks/compare?metric=punch_open_rate&assetClass=commercial&region=GB`,
       headers: owner.headers,
     });
     const body = res.json() as {
       percentile: number;
-      outlier: { adverse: boolean; signalRaised: boolean };
+      outlier: { adverse: boolean; signalRaised: boolean; wouldRaise: boolean };
     };
     expect(body.outlier.adverse).toBe(false);
     expect(body.outlier.signalRaised).toBe(false);
-    expect(body.percentile).toBeCloseTo(83.33, 2); // 5 of 6 samples below 50
+    expect(body.outlier.wouldRaise).toBe(false);
+    expect(body.percentile).toBeLessThan(100);
+
+    const evaluated = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projInside}/benchmarks/snapshots/${snapshotId}/evaluate`,
+      headers: owner.headers,
+      payload: { assetClass: "commercial", region: "GB" },
+    });
+    expect(evaluated.statusCode).toBe(200);
+    expect((evaluated.json() as { signalRaised: boolean }).signalRaised).toBe(false);
     expect((await outlierSignals(owner.companyId)).length).toBe(1); // unchanged
   });
 
@@ -751,6 +818,11 @@ describe("compare", () => {
   });
 
   it("400s when no cell is given and the snapshot was never contributed", async () => {
+    // A snapshot that exists but was never contributed carries no cell, so a
+    // compare with no assetClass/region has nothing to compare against and must
+    // say so rather than guessing one.
+    const created = await createSnapshot(owner, projMid, "punch_open_rate");
+    expect(created.statusCode).toBe(201);
     const res = await app.inject({
       method: "GET",
       url: `/api/v1/projects/${projMid}/benchmarks/compare?metric=punch_open_rate`,

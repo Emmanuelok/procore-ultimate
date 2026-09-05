@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import { and, desc, eq, gte, inArray, isNotNull, lt, ne } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull, lt, ne, or } from "drizzle-orm";
 import {
   commitmentPayments,
   commitments,
@@ -34,7 +34,11 @@ import {
  * clears closes its own signal.
  *
  * Registered with the platform scheduler as `tax.risk-sweep` and
- * `tax.pe-exposure`; also runnable on demand from the risks tab.
+ * `tax.pe-exposure` (company-wide, system actor); every sweep also takes an
+ * optional projectId so the on-demand scan behind a project's Risks tab
+ * touches and reports on that project alone — a caller gated on one project
+ * must not mutate another project's periods or push notifications about them
+ * (plan §6.3).
  */
 
 export interface SweepCounts {
@@ -51,8 +55,45 @@ function today(now: Date): string {
   return now.toISOString().slice(0, 10);
 }
 
+/** The profiled projects a sweep covers: one when scoped, all of them otherwise. */
+async function profiledProjects(
+  db: Db,
+  companyId: string,
+  projectId?: string | null,
+): Promise<Array<{ projectId: string; regime: string }>> {
+  return db
+    .select({ projectId: taxProjectProfiles.projectId, regime: taxProjectProfiles.regime })
+    .from(taxProjectProfiles)
+    .where(
+      and(
+        eq(taxProjectProfiles.companyId, companyId),
+        projectId ? eq(taxProjectProfiles.projectId, projectId) : undefined,
+      ),
+    );
+}
+
+/** Vendors with a live commitment on a project — who that project actually pays. */
+async function payingVendorIds(db: Db, companyId: string, projectId: string): Promise<string[]> {
+  const rows = await db
+    .select({ vendorId: commitments.vendorId })
+    .from(commitments)
+    .where(
+      and(
+        eq(commitments.companyId, companyId),
+        eq(commitments.projectId, projectId),
+        isNotNull(commitments.vendorId),
+      ),
+    );
+  return [...new Set(rows.map((r) => r.vendorId).filter((v): v is string => Boolean(v)))];
+}
+
 /** Overdue returns: flip the period, breach the obligation, raise HIGH (#803). */
-export async function sweepTaxPeriods(db: Db, companyId: string, now: Date): Promise<{ overdue: number; raised: number }> {
+export async function sweepTaxPeriods(
+  db: Db,
+  companyId: string,
+  now: Date,
+  projectId?: string | null,
+): Promise<{ overdue: number; raised: number }> {
   const todayIso = today(now);
   const rows = await db
     .select()
@@ -60,6 +101,7 @@ export async function sweepTaxPeriods(db: Db, companyId: string, now: Date): Pro
     .where(
       and(
         eq(taxPeriods.companyId, companyId),
+        projectId ? eq(taxPeriods.projectId, projectId) : undefined,
         inArray(taxPeriods.status, ["open", "closed"]),
         lt(taxPeriods.dueDate, todayIso),
       ),
@@ -114,7 +156,19 @@ export async function sweepTaxPeriods(db: Db, companyId: string, now: Date): Pro
 }
 
 /** Verifications that have aged past the regime's validity (UK CIS: two tax years). */
-export async function sweepVerificationExpiry(db: Db, companyId: string, now: Date): Promise<{ expired: number }> {
+export async function sweepVerificationExpiry(
+  db: Db,
+  companyId: string,
+  now: Date,
+  projectId?: string | null,
+): Promise<{ expired: number }> {
+  // Registrations are company-level facts. A project-scoped scan may only
+  // touch the ones that project actually pays against (its vendors) plus the
+  // tenant's own, so scanning from one project cannot expire another's.
+  let holderScope: string[] | null = null;
+  if (projectId) {
+    holderScope = await payingVendorIds(db, companyId, projectId);
+  }
   const rows = await db
     .select()
     .from(taxRegistrations)
@@ -123,6 +177,11 @@ export async function sweepVerificationExpiry(db: Db, companyId: string, now: Da
         eq(taxRegistrations.companyId, companyId),
         eq(taxRegistrations.verificationStatus, "verified"),
         isNotNull(taxRegistrations.verifiedAt),
+        holderScope
+          ? holderScope.length > 0
+            ? or(eq(taxRegistrations.holderType, "company"), inArray(taxRegistrations.holderId, holderScope))
+            : eq(taxRegistrations.holderType, "company")
+          : undefined,
       ),
     );
   let expired = 0;
@@ -170,11 +229,9 @@ export async function sweepMissingRegistrations(
   db: Db,
   companyId: string,
   now: Date,
+  projectId?: string | null,
 ): Promise<{ raised: number; cleared: number }> {
-  const profiles = await db
-    .select({ projectId: taxProjectProfiles.projectId, regime: taxProjectProfiles.regime })
-    .from(taxProjectProfiles)
-    .where(eq(taxProjectProfiles.companyId, companyId));
+  const profiles = await profiledProjects(db, companyId, projectId);
   let raised = 0;
   let cleared = 0;
   const todayIso = today(now);
@@ -248,11 +305,13 @@ export async function sweepMissingRegistrations(
  * requires a deduction, with no withholding certificate against the payment.
  * Bounded to the last 180 days of payments.
  */
-export async function sweepWhtNotDeducted(db: Db, companyId: string, now: Date): Promise<{ raised: number }> {
-  const profiles = await db
-    .select({ projectId: taxProjectProfiles.projectId, regime: taxProjectProfiles.regime })
-    .from(taxProjectProfiles)
-    .where(eq(taxProjectProfiles.companyId, companyId));
+export async function sweepWhtNotDeducted(
+  db: Db,
+  companyId: string,
+  now: Date,
+  projectId?: string | null,
+): Promise<{ raised: number }> {
+  const profiles = await profiledProjects(db, companyId, projectId);
   let raised = 0;
   const since = addDaysISO(today(now), -180);
   for (const p of profiles) {
@@ -306,6 +365,7 @@ export async function sweepWhtNotDeducted(db: Db, companyId: string, now: Date):
         .from(withholdingCertificates)
         .where(
           and(
+            eq(withholdingCertificates.companyId, companyId),
             eq(withholdingCertificates.paymentId, pay.id),
             ne(withholdingCertificates.status, "cancelled"),
           ),
@@ -342,11 +402,9 @@ export async function sweepReverseChargeMisapplied(
   db: Db,
   companyId: string,
   now: Date,
+  projectId?: string | null,
 ): Promise<{ raised: number }> {
-  const profiles = await db
-    .select({ projectId: taxProjectProfiles.projectId, regime: taxProjectProfiles.regime })
-    .from(taxProjectProfiles)
-    .where(eq(taxProjectProfiles.companyId, companyId));
+  const profiles = await profiledProjects(db, companyId, projectId);
   let raised = 0;
   const since = addDaysISO(today(now), -180);
   for (const p of profiles) {
@@ -427,11 +485,22 @@ export async function sweepReverseChargeMisapplied(
   return { raised };
 }
 
-export async function sweepPeExposures(db: Db, companyId: string, now: Date): Promise<{ recomputed: number; raised: number }> {
+export async function sweepPeExposures(
+  db: Db,
+  companyId: string,
+  now: Date,
+  projectId?: string | null,
+): Promise<{ recomputed: number; raised: number }> {
   const rows = await db
     .select()
     .from(peExposures)
-    .where(and(eq(peExposures.companyId, companyId), ne(peExposures.status, "closed")));
+    .where(
+      and(
+        eq(peExposures.companyId, companyId),
+        projectId ? eq(peExposures.projectId, projectId) : undefined,
+        ne(peExposures.status, "closed"),
+      ),
+    );
   let raised = 0;
   for (const row of rows) {
     const res = await recomputeExposure(db, row, today(now));
@@ -451,12 +520,17 @@ export async function sweepPeExposures(db: Db, companyId: string, now: Date): Pr
   return { recomputed: rows.length, raised };
 }
 
-export async function runTaxRiskSweep(db: Db, companyId: string, now: Date): Promise<SweepCounts> {
-  const periods = await sweepTaxPeriods(db, companyId, now);
-  const ver = await sweepVerificationExpiry(db, companyId, now);
-  const missing = await sweepMissingRegistrations(db, companyId, now);
-  const wht = await sweepWhtNotDeducted(db, companyId, now);
-  const rc = await sweepReverseChargeMisapplied(db, companyId, now);
+export async function runTaxRiskSweep(
+  db: Db,
+  companyId: string,
+  now: Date,
+  projectId?: string | null,
+): Promise<SweepCounts> {
+  const periods = await sweepTaxPeriods(db, companyId, now, projectId);
+  const ver = await sweepVerificationExpiry(db, companyId, now, projectId);
+  const missing = await sweepMissingRegistrations(db, companyId, now, projectId);
+  const wht = await sweepWhtNotDeducted(db, companyId, now, projectId);
+  const rc = await sweepReverseChargeMisapplied(db, companyId, now, projectId);
   return {
     overduePeriods: periods.overdue,
     verificationsExpired: ver.expired,

@@ -361,7 +361,7 @@ export default function DashboardTab({
           hint="What the regulator would ask on arrival: what was reportable, what was reported, and what is still undecided."
         />
         {stats ? (
-          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
             <Card>
               <CardBody>
                 <Stat
@@ -382,14 +382,25 @@ export default function DashboardTab({
                 />
               </CardBody>
             </Card>
-            <Card accent={stats.reportable.awaitingNotification > 0 ? "danger" : undefined}>
+            <Card accent={stats.reportable.awaitingNotification > 0 ? "warning" : undefined}>
               <CardBody>
                 <Stat
                   label="Awaiting notification"
                   value={count(stats.reportable.awaitingNotification)}
                   icon={IconAlert}
-                  tone={stats.reportable.awaitingNotification > 0 ? "danger" : "neutral"}
-                  hint="Reportable, and no notification on the record. Each one is a live statutory duty."
+                  tone={stats.reportable.awaitingNotification > 0 ? "warning" : "neutral"}
+                  hint={`Reportable with the clock still running. Counted per DUTY: ${count(stats.reportable.outstandingDuties)} outstanding across the window.`}
+                />
+              </CardBody>
+            </Card>
+            <Card accent={stats.reportable.missedNotification > 0 ? "danger" : undefined}>
+              <CardBody>
+                <Stat
+                  label="Deadline already passed"
+                  value={count(stats.reportable.missedNotification)}
+                  icon={IconAlert}
+                  tone={stats.reportable.missedNotification > 0 ? "danger" : "neutral"}
+                  hint={`${count(stats.reportable.missedDuties)} duty/duties whose statutory deadline has gone by with nothing filed. Failing to notify is an offence in its own right, separate from the accident.`}
                 />
               </CardBody>
             </Card>

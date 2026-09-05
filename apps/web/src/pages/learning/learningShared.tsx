@@ -90,6 +90,29 @@ export interface LessonListRow extends Lesson {
   applicationCount: number;
 }
 
+/**
+ * What actually happened after a lesson was applied (#979, #981-984).
+ *
+ * `unknown` is a real answer and the default: an application whose outcome
+ * nobody measured must not be counted as a success, which is precisely how
+ * lessons registers come to report impact they never had.
+ */
+export const LESSON_OUTCOMES = [
+  "unknown",
+  "avoided",
+  "partially_avoided",
+  "no_effect",
+  "counterproductive",
+] as const;
+
+export const LESSON_OUTCOME_LABELS: Record<string, string> = {
+  unknown: "Not yet measured",
+  avoided: "The problem was avoided",
+  partially_avoided: "Partly avoided",
+  no_effect: "No effect",
+  counterproductive: "Made it worse",
+};
+
 export interface LessonApplication {
   id: string;
   companyId: string;
@@ -97,12 +120,66 @@ export interface LessonApplication {
   projectId: string;
   appliedTo: { tool?: string; recordId?: string; label?: string | null } | null;
   action: string;
+  outcome: string | null;
   outcomeNote: string | null;
+  outcomeValue: number | null;
+  outcomeCurrency: string | null;
+  outcomeDays: number | null;
+  measuredAt: string | null;
+  measuredBy: string | null;
   appliedBy: string;
   appliedAt: string;
   /** present on the impact report only */
   projectName?: string | null;
   crossedProjectBoundary?: boolean;
+}
+
+/**
+ * An AI PROPOSAL for a lesson, from the record that obliged its capture.
+ *
+ * `created` is always false and the trigger stays open: a lesson nobody chose
+ * to write is a lesson nobody stands behind, and the validation step that
+ * follows would then be checking a machine's work against nothing.
+ */
+export interface LessonDraft {
+  triggerId: string;
+  runId: string | null;
+  aiAvailable: boolean;
+  created: false;
+  proposal: {
+    title: string | null;
+    whatHappened: string | null;
+    rootCause: string | null;
+    recommendation: string | null;
+    category: string | null;
+    tags: string[];
+  } | null;
+  confidence: number | null;
+  citations: { recordId: string; excerpt: string | null }[];
+  evidenceRefs: { tool: string; recordId: string; label: string }[];
+  note: string;
+}
+
+/**
+ * Applied-lesson outcome measurement (#979, #981-984).
+ *
+ * `effectiveness` is computed over MEASURED applications only, with the
+ * denominator stated: an unmeasured application is not a successful one, and a
+ * register that reads it as one reports impact it never had.
+ */
+export interface LessonOutcomes {
+  lessonId: string;
+  number: string;
+  applications: number;
+  measured: number;
+  unmeasured: number;
+  byOutcome: Record<string, number>;
+  effectiveness: { value: number | null; denominator: number; reasons: string[] };
+  valueByCurrency: { currency: string; value: number; applications: number }[];
+  daysAvoided: number | null;
+  daysMeasuredOn: number;
+  reasons: string[];
+  items: LessonApplication[];
 }
 
 export interface LessonDetail extends Lesson {
@@ -761,4 +838,48 @@ export function KV({ k, v }: { k: string; v: ReactNode }) {
 export function Prose({ text }: { text: string | null | undefined }) {
   if (!text || !text.trim()) return <p className="text-xs text-ink-300">—</p>;
   return <p className="whitespace-pre-wrap text-sm leading-relaxed text-ink-700">{text}</p>;
+}
+
+/* ------------------ Cross-project supplier performance -------------------- */
+
+export interface SupplierDimension {
+  /** null when there is nothing to score — never 0 */
+  score: number | null;
+  observations: number;
+  basis: string;
+  counts: Record<string, number>;
+}
+
+export interface SupplierScore {
+  vendorId: string;
+  vendorName: string;
+  certificateDiscipline: SupplierDimension;
+  commitmentSlippage: SupplierDimension;
+  quality: SupplierDimension;
+  composite: number | null;
+  observations: number;
+  reasons: string[];
+}
+
+export interface SupplierPerformanceResponse {
+  asOf: string;
+  items: SupplierScore[];
+  total: number;
+  scope: "company" | "restricted";
+  sources?: string[];
+  note?: string;
+}
+
+export const SUPPLIER_DIMENSIONS = [
+  { key: "certificateDiscipline", label: "Certificate discipline" },
+  { key: "commitmentSlippage", label: "Commitment slippage" },
+  { key: "quality", label: "Quality" },
+] as const;
+
+/** A colour for a 0-100 score. Null is grey — an unknown is not a good score. */
+export function scoreTone(score: number | null): string {
+  if (score === null) return "text-ink-400";
+  if (score >= 80) return "text-emerald-700";
+  if (score >= 55) return "text-amber-700";
+  return "text-red-700";
 }

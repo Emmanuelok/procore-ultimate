@@ -32,6 +32,7 @@ import {
   type TimelineItem,
 } from "../../ui";
 import { DataTable, type DataColumns } from "../../ui/data";
+import { BatchActions } from "./TimecardForms";
 import type { Tone } from "../../ui/tokens";
 import { IconCalendarCheck, IconWarning } from "../../ui/icons";
 import {
@@ -62,6 +63,8 @@ export default function BatchesTab({
   detail,
   users,
   onOpenCard,
+  projectId,
+  onChanged,
 }: {
   batches: Loadable<ListResponse<BatchRecord>>;
   selectedBatchId: string | null;
@@ -69,6 +72,8 @@ export default function BatchesTab({
   detail: Loadable<BatchDetail>;
   users: Map<string, string>;
   onOpenCard: (timecardId: string) => void;
+  projectId: string;
+  onChanged: () => void;
 }) {
   const rows = useMemo(() => batches.data?.items ?? [], [batches.data]);
 
@@ -162,10 +167,19 @@ export default function BatchesTab({
         align: "right",
         width: 155,
         aggregate: "none",
-        cell: ({ row }) => (
-          <span className="tabular-nums">{money(row.totalCost, row.currency)}</span>
-        ),
-        toCsv: ({ row }) => `${row.totalCost} ${row.currency}`,
+        cell: ({ row }) =>
+          row.totalCost === null ? (
+            <NotComparable
+              reason={
+                row.costNote ??
+                "A card in this week carries hours the platform holds no rate for, so the week's " +
+                  "cost is unknown rather than the sum of the rest."
+              }
+            />
+          ) : (
+            <span className="tabular-nums">{money(row.totalCost, row.currency)}</span>
+          ),
+        toCsv: ({ row }) => (row.totalCost === null ? "" : `${row.totalCost} ${row.currency}`),
       },
       {
         id: "payrollBatchRef",
@@ -233,6 +247,12 @@ export default function BatchesTab({
           users={users}
           onClose={() => onSelectBatch(null)}
           onOpenCard={onOpenCard}
+          projectId={projectId}
+          onChanged={() => {
+            detail.reload();
+            batches.reload();
+            onChanged();
+          }}
         />
       ) : rows.length > 0 ? (
         <p className="text-2xs text-content-subtle">
@@ -249,11 +269,15 @@ function BatchPanel({
   users,
   onClose,
   onOpenCard,
+  projectId,
+  onChanged,
 }: {
   detail: Loadable<BatchDetail>;
   users: Map<string, string>;
   onClose: () => void;
   onOpenCard: (timecardId: string) => void;
+  projectId: string;
+  onChanged: () => void;
 }) {
   if (detail.error) return <LoadError message={detail.error} onRetry={detail.reload} />;
   if (detail.loading && !detail.data) return <SkeletonTable rows={6} columns={5} />;
@@ -307,6 +331,8 @@ function BatchPanel({
             </Button>
           }
         />
+
+        <BatchActions projectId={projectId} batch={batch} onDone={onChanged} />
 
         {rollup.reasons.length > 0 ? (
           <Alert tone="warning" title="Why this batch's totals read as they do" icon={IconWarning}>

@@ -4,15 +4,18 @@
 import type { FastifyPluginAsync } from "fastify";
 import { and, asc, count, desc, eq, ilike, or } from "drizzle-orm";
 import { z } from "zod";
-import { longLeadItems, supplierRiskAssessments, supplyChainLinks, supplyChainNodes } from "@constructos/db";
+import { deliverySlots, factoryInspections, longLeadItems, materialTraceRecords, offsiteUnits, supplierRiskAssessments, supplyChainLinks, supplyChainNodes } from "@constructos/db";
 import { SUPPLY_CRITICALITIES, SUPPLY_LINK_KINDS, SUPPLY_NODE_KINDS, SUPPLY_NODE_STATUSES } from "@constructos/shared";
 import { badRequest, conflict, notFound } from "../../../lib/errors.js";
 import { newId } from "../../../lib/ids.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.js";
 import {
+  ROLLUP_CAP,
   assertVendor,
   buildGates,
+  capped,
   countryCodeSchema,
+  currencyCodeSchema,
   idSchema,
   ledger,
   nowISO,
@@ -32,7 +35,7 @@ const nodeBodySchema = z.object({
   entityId: idSchema.nullable().optional(),
   commitmentId: idSchema.nullable().optional(),
   annualValue: z.number().min(0).nullable().optional(),
-  currency: z.string().length(3).toUpperCase().optional(),
+  currency: currencyCodeSchema.optional(),
   leadTimeDays: z.number().int().min(0).max(2000).nullable().optional(),
   notes: z.string().max(4000).nullable().optional(),
 });
@@ -58,7 +61,7 @@ const linkBodySchema = z.object({
   isSoleSource: z.boolean().default(false),
   leadTimeDays: z.number().int().min(0).max(2000).nullable().optional(),
   value: z.number().min(0).nullable().optional(),
-  currency: z.string().length(3).toUpperCase().nullable().optional(),
+  currency: currencyCodeSchema.nullable().optional(),
 });
 
 export const mapRoutes: FastifyPluginAsync = async (app) => {
@@ -71,17 +74,26 @@ export const mapRoutes: FastifyPluginAsync = async (app) => {
   app.get("/projects/:projectId/supply-chain/map", { preHandler: readGate }, async (req) => {
     const { projectId } = req.params as { projectId: string };
     const companyId = req.companyId!;
-    const [nodes, links] = await Promise.all([
+    // The map is a whole-register read, so it obeys the same ceiling as the
+    // roll-up next door: one row over the cap and the view says so.
+    const [allNodes, allLinks] = await Promise.all([
       app.db
         .select()
         .from(supplyChainNodes)
         .where(and(eq(supplyChainNodes.companyId, companyId), eq(supplyChainNodes.projectId, projectId)))
-        .orderBy(asc(supplyChainNodes.tier), asc(supplyChainNodes.name)),
+        .orderBy(asc(supplyChainNodes.tier), asc(supplyChainNodes.name))
+        .limit(ROLLUP_CAP + 1),
       app.db
         .select()
         .from(supplyChainLinks)
-        .where(and(eq(supplyChainLinks.companyId, companyId), eq(supplyChainLinks.projectId, projectId))),
+        .where(and(eq(supplyChainLinks.companyId, companyId), eq(supplyChainLinks.projectId, projectId)))
+        .limit(ROLLUP_CAP + 1),
     ]);
+    const capNodes = capped(allNodes, "supply chain nodes");
+    const capLinks = capped(allLinks, "supply chain links");
+    const nodes = capNodes.rows;
+    const links = capLinks.rows;
+    const truncated = [capNodes.notice, capLinks.notice].filter((n): n is string => n !== null);
     const byTier: Record<string, number> = {};
     const byCountry: Record<string, number> = {};
     const byCriticality: Record<string, number> = {};
@@ -99,6 +111,7 @@ export const mapRoutes: FastifyPluginAsync = async (app) => {
     return {
       nodes,
       links,
+      truncated,
       stats: {
         nodes: nodes.length,
         links: links.length,
@@ -179,12 +192,13 @@ export const mapRoutes: FastifyPluginAsync = async (app) => {
       .limit(1);
     if (!node) throw notFound("Supply chain node not found");
     const [upstream, downstream, items, assessments] = await Promise.all([
-      app.db.select().from(supplyChainLinks).where(and(eq(supplyChainLinks.projectId, projectId), eq(supplyChainLinks.toNodeId, nodeId))),
-      app.db.select().from(supplyChainLinks).where(and(eq(supplyChainLinks.projectId, projectId), eq(supplyChainLinks.fromNodeId, nodeId))),
+      app.db.select().from(supplyChainLinks).where(and(eq(supplyChainLinks.projectId, projectId), eq(supplyChainLinks.toNodeId, nodeId))).limit(500),
+      app.db.select().from(supplyChainLinks).where(and(eq(supplyChainLinks.projectId, projectId), eq(supplyChainLinks.fromNodeId, nodeId))).limit(500),
       app.db
         .select({ id: longLeadItems.id, reference: longLeadItems.reference, name: longLeadItems.name, status: longLeadItems.status, riskLevel: longLeadItems.riskLevel, requiredOnSite: longLeadItems.requiredOnSite })
         .from(longLeadItems)
-        .where(and(eq(longLeadItems.projectId, projectId), eq(longLeadItems.supplierNodeId, nodeId))),
+        .where(and(eq(longLeadItems.projectId, projectId), eq(longLeadItems.supplierNodeId, nodeId)))
+        .limit(500),
       app.db
         .select()
         .from(supplierRiskAssessments)
@@ -216,17 +230,53 @@ export const mapRoutes: FastifyPluginAsync = async (app) => {
   app.delete("/projects/:projectId/supply-chain/nodes/:nodeId", { preHandler: adminGate }, async (req, reply) => {
     const { projectId, nodeId } = req.params as { projectId: string; nodeId: string };
     const companyId = req.companyId!;
-    const [items] = await app.db.select({ n: count() }).from(longLeadItems).where(and(eq(longLeadItems.projectId, projectId), eq(longLeadItems.supplierNodeId, nodeId)));
-    if ((items?.n ?? 0) > 0) {
-      throw badRequest(`${items?.n} long-lead item(s) name this node as supplier. Re-point or cancel them first; the map must not lose the supplier of an open order.`);
+    // Every register that points at a node is checked, not just the long-lead
+    // one: deleting a factory out from under a unit in production, a booked
+    // delivery, a traceability record or a scheduled inspection would leave
+    // the provenance chain naming an id that no longer exists.
+    const [items, units, slots, traces, inspections] = await Promise.all([
+      app.db.select({ n: count() }).from(longLeadItems).where(and(eq(longLeadItems.projectId, projectId), eq(longLeadItems.supplierNodeId, nodeId))),
+      app.db.select({ n: count() }).from(offsiteUnits).where(and(eq(offsiteUnits.projectId, projectId), eq(offsiteUnits.factoryNodeId, nodeId))),
+      app.db.select({ n: count() }).from(deliverySlots).where(and(eq(deliverySlots.projectId, projectId), eq(deliverySlots.supplierNodeId, nodeId))),
+      app.db.select({ n: count() }).from(materialTraceRecords).where(and(eq(materialTraceRecords.projectId, projectId), eq(materialTraceRecords.supplierNodeId, nodeId))),
+      app.db.select({ n: count() }).from(factoryInspections).where(and(eq(factoryInspections.projectId, projectId), eq(factoryInspections.nodeId, nodeId))),
+    ]);
+    const referencing: Array<[number, string]> = [
+      [items[0]?.n ?? 0, "long-lead item(s) name this node as supplier"],
+      [units[0]?.n ?? 0, "offsite unit(s) are built at this node"],
+      [slots[0]?.n ?? 0, "delivery booking(s) name this node as supplier"],
+      [traces[0]?.n ?? 0, "traceability record(s) name this node as the source"],
+      [inspections[0]?.n ?? 0, "factory inspection(s) are held against this node"],
+    ];
+    const blocking = referencing.filter(([n]) => n > 0);
+    if (blocking.length > 0) {
+      throw badRequest(
+        `${blocking.map(([n, what]) => `${n} ${what}`).join("; ")}. Re-point or close them first; the map must not lose the supplier of an open record.`,
+      );
     }
     const [row] = await app.db
       .delete(supplyChainNodes)
       .where(and(eq(supplyChainNodes.id, nodeId), eq(supplyChainNodes.companyId, companyId), eq(supplyChainNodes.projectId, projectId)))
       .returning({ id: supplyChainNodes.id });
     if (!row) throw notFound("Supply chain node not found");
-    await app.db.delete(supplyChainLinks).where(and(eq(supplyChainLinks.projectId, projectId), or(eq(supplyChainLinks.fromNodeId, nodeId), eq(supplyChainLinks.toNodeId, nodeId))));
-    await ledger(app.db, { companyId, projectId, actorId: req.user!.id, action: "delete", objectType: "supply_chain_node", objectId: nodeId });
+    // The edges that touched it go with it — each one appended to the chain,
+    // so the map's history explains why an edge vanished.
+    const removedLinks = await app.db
+      .delete(supplyChainLinks)
+      .where(and(eq(supplyChainLinks.projectId, projectId), or(eq(supplyChainLinks.fromNodeId, nodeId), eq(supplyChainLinks.toNodeId, nodeId))))
+      .returning({ id: supplyChainLinks.id, fromNodeId: supplyChainLinks.fromNodeId, toNodeId: supplyChainLinks.toNodeId, kind: supplyChainLinks.kind });
+    for (const link of removedLinks) {
+      await ledger(app.db, {
+        companyId,
+        projectId,
+        actorId: req.user!.id,
+        action: "delete",
+        objectType: "supply_chain_link",
+        objectId: link.id,
+        payload: { fromNodeId: link.fromNodeId, toNodeId: link.toNodeId, kind: link.kind, cascadedFromNodeId: nodeId },
+      });
+    }
+    await ledger(app.db, { companyId, projectId, actorId: req.user!.id, action: "delete", objectType: "supply_chain_node", objectId: nodeId, payload: { linksRemoved: removedLinks.length } });
     return reply.code(204).send();
   });
 

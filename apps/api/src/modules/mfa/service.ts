@@ -5,17 +5,14 @@ import {
   authSecurityEvents,
   authSessions,
   companies,
+  companySecurityPolicies,
   companyMemberships,
   mfaRecoveryCodes,
   refreshTokens,
   userMfa,
 } from "@constructos/db";
-import type {
-  AuthEventKind,
-  AuthEventOutcome,
-  AuthMethod,
-  LedgerAction,
-} from "@constructos/shared";
+import type { AuthEventOutcome, AuthMethod, LedgerAction } from "@constructos/shared";
+import type { AnyAuthEventKind } from "../account/events.js";
 import { sha256Hex } from "@constructos/ledger";
 import { AppError, unauthorized } from "../../lib/errors.js";
 import { newId } from "../../lib/ids.js";
@@ -62,7 +59,13 @@ export const TOTP_WINDOW = 1;
 /* ------------------------------------------------------------------ */
 
 export interface SecurityEventInput {
-  kind: AuthEventKind;
+  /**
+   * `AnyAuthEventKind`, not `AuthEventKind`: `enums.ts` is frozen for this
+   * wave, and `enums-auth.ts` carries the kinds it has no member for. Widening
+   * the writer is what let `mfa_policy_changed` be recorded under its own name
+   * instead of borrowed from a neighbouring kind — see the policy route.
+   */
+  kind: AnyAuthEventKind;
   outcome?: AuthEventOutcome;
   userId?: string | null;
   companyId?: string | null;
@@ -569,22 +572,49 @@ export interface CompanyPolicyRow {
   policy: MfaPolicy;
 }
 
-/** Every tenant this user belongs to, with each one's MFA policy. */
+/**
+ * Every tenant this user belongs to, with each one's MFA policy.
+ *
+ * TWO WRITERS, ONE READER. The requirement can be set from the MFA policy
+ * route (which has always kept it in `companies.settings.mfa`) and from the
+ * tenant security policy route added by WP-AUTH (which keeps it in a column on
+ * `company_security_policies` alongside the session, password and IP rules an
+ * administrator sets in the same sitting). Both writers keep both in step; this
+ * reader ORs them anyway, because the failure mode of disagreeing is a tenant
+ * that believes it requires a second factor and does not.
+ */
 export async function userCompanyPolicies(db: Db, userId: string): Promise<CompanyPolicyRow[]> {
   const rows = await db
     .select({
       companyId: companies.id,
       name: companies.name,
       settings: companies.settings,
+      policyMfaRequired: companySecurityPolicies.mfaRequired,
+      policyUpdatedAt: companySecurityPolicies.updatedAt,
+      policyUpdatedBy: companySecurityPolicies.updatedBy,
     })
     .from(companyMemberships)
     .innerJoin(companies, eq(companies.id, companyMemberships.companyId))
+    .leftJoin(
+      companySecurityPolicies,
+      eq(companySecurityPolicies.companyId, companyMemberships.companyId),
+    )
     .where(eq(companyMemberships.userId, userId));
-  return rows.map((r) => ({
-    companyId: r.companyId,
-    name: r.name,
-    policy: readMfaPolicy(r.settings),
-  }));
+  return rows.map((r) => {
+    const fromSettings = readMfaPolicy(r.settings);
+    if (!r.policyMfaRequired) {
+      return { companyId: r.companyId, name: r.name, policy: fromSettings };
+    }
+    return {
+      companyId: r.companyId,
+      name: r.name,
+      policy: {
+        required: true,
+        updatedAt: fromSettings.updatedAt ?? r.policyUpdatedAt ?? null,
+        updatedBy: fromSettings.updatedBy ?? r.policyUpdatedBy ?? null,
+      },
+    };
+  });
 }
 
 export async function companiesRequiringMfa(db: Db, userId: string): Promise<CompanyPolicyRow[]> {

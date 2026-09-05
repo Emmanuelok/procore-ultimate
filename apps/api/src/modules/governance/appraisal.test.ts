@@ -3,7 +3,12 @@ import {
   appraiseOption,
   benefitProgressPercent,
   benefitStatusFor,
+  economicIrr,
+  netCashflows,
+  npvOf,
   padToYears,
+  sensitivityAnalysis,
+  switchingValue,
 } from "./appraisal.js";
 import { addDaysISO, todayISO } from "../field/dates.js";
 
@@ -146,5 +151,159 @@ describe("benefitStatusFor thresholds (#418)", () => {
     expect(benefitStatusFor(99, addDaysISO(today, -91), today)).toBe("missed");
     expect(benefitStatusFor(30, addDaysISO(today, -91), today)).toBe("missed");
     expect(benefitStatusFor(30, addDaysISO(today, -90), today)).toBe("at_risk");
+  });
+});
+
+/* ================================================================== */
+/* Platform upgrade wave — EIRR, sensitivity, switching values (#400,  */
+/* #406)                                                               */
+/* ================================================================== */
+
+describe("net cashflows", () => {
+  it("puts the optimism-bias-adjusted capex in year 0 and nets each year after", () => {
+    const cf = netCashflows(
+      { capex: 1000, annualBenefits: [500, 500], annualCosts: [100, 100] },
+      { discountRatePercent: 3.5, appraisalYears: 2, optimismBiasPercent: 20 },
+    );
+    expect(cf).toEqual([-1200, 400, 400]);
+  });
+
+  it("pads and truncates the series to the horizon", () => {
+    const cf = netCashflows(
+      { capex: 0, annualBenefits: [10], annualCosts: [1, 2, 3, 4] },
+      { discountRatePercent: 0, appraisalYears: 3, optimismBiasPercent: 0 },
+    );
+    expect(cf).toEqual([-0, 9, -2, -3]);
+  });
+});
+
+describe("economic IRR (#400)", () => {
+  it("finds the rate where NPV is zero", () => {
+    // -1000 now, +600 for three years → IRR ≈ 36.3%
+    const irr = economicIrr([-1000, 600, 600, 600]);
+    expect(irr).not.toBeNull();
+    expect(irr!).toBeGreaterThan(36);
+    expect(irr!).toBeLessThan(37);
+    expect(Math.abs(npvOf([-1000, 600, 600, 600], irr! / 100))).toBeLessThan(1);
+  });
+
+  it("is exactly the discount rate that zeroes a simple two-period series", () => {
+    // -100 now, +110 next year → IRR = 10%
+    expect(economicIrr([-100, 110])).toBeCloseTo(10, 4);
+  });
+
+  it("returns null — not 0 — when the series never turns positive", () => {
+    expect(economicIrr([-100, -50, -25])).toBeNull();
+  });
+
+  it("returns null when the series is all inflow (no investment to return on)", () => {
+    expect(economicIrr([100, 50])).toBeNull();
+  });
+
+  it("returns null when no root sits inside the search bracket", () => {
+    // Payback so small the IRR is below −99%
+    expect(economicIrr([-1_000_000, 1])).toBeNull();
+  });
+
+  it("works end to end from an option", () => {
+    const option = { capex: 1000, annualBenefits: [500, 500, 500], annualCosts: [0, 0, 0] };
+    const config = { discountRatePercent: 3.5, appraisalYears: 3, optimismBiasPercent: 0 };
+    const irr = economicIrr(netCashflows(option, config));
+    expect(irr).not.toBeNull();
+    expect(irr!).toBeGreaterThan(20);
+  });
+});
+
+describe("sensitivity grid (#406)", () => {
+  const option = { capex: 1000, annualBenefits: [400, 400, 400], annualCosts: [50, 50, 50] };
+  const config = { discountRatePercent: 3.5, appraisalYears: 3, optimismBiasPercent: 0 };
+
+  it("flexes one variable at a time across six steps", () => {
+    const s = sensitivityAnalysis(option, config);
+    expect(s.grid).toHaveLength(4 * 6);
+    const capexCells = s.grid.filter((c) => c.variable === "capex");
+    expect(capexCells.map((c) => c.changePercent)).toEqual([-30, -20, -10, 10, 20, 30]);
+  });
+
+  it("more capex lowers NPV; more benefits raise it", () => {
+    const s = sensitivityAnalysis(option, config);
+    const capexUp = s.grid.find((c) => c.variable === "capex" && c.changePercent === 30)!;
+    const capexDown = s.grid.find((c) => c.variable === "capex" && c.changePercent === -30)!;
+    expect(capexUp.npv).toBeLessThan(capexDown.npv);
+    const benUp = s.grid.find((c) => c.variable === "benefits" && c.changePercent === 30)!;
+    const benDown = s.grid.find((c) => c.variable === "benefits" && c.changePercent === -30)!;
+    expect(benUp.npv).toBeGreaterThan(benDown.npv);
+  });
+
+  it("ranks the tornado by NPV swing at ±20%", () => {
+    const s = sensitivityAnalysis(option, config);
+    expect(s.tornado).toHaveLength(4);
+    for (let i = 1; i < s.tornado.length; i += 1) {
+      expect(s.tornado[i - 1]!.swing).toBeGreaterThanOrEqual(s.tornado[i]!.swing);
+    }
+    // benefits dominate this option's NPV
+    expect(s.tornado[0]!.variable).toBe("benefits");
+  });
+
+  it("states what it did and did not model", () => {
+    expect(sensitivityAnalysis(option, config).basis).toContain("Correlated movement");
+  });
+});
+
+describe("switching values (#406)", () => {
+  // Base NPV is comfortably positive, so the switching direction is
+  // unambiguous: capex has to rise, or benefits fall, to break even.
+  const option = { capex: 1000, annualBenefits: [500, 500, 500], annualCosts: [50, 50, 50] };
+  const config = { discountRatePercent: 3.5, appraisalYears: 3, optimismBiasPercent: 0 };
+
+  it("the base case is viable, so the option has something to switch away from", () => {
+    expect(appraiseOption(option, config).npv).toBeGreaterThan(0);
+  });
+
+  it("finds the capex increase that drives NPV to zero", () => {
+    const sv = switchingValue(option, config, "capex");
+    expect(sv.changePercent).not.toBeNull();
+    expect(sv.changePercent!).toBeGreaterThan(0);
+    const flexed = {
+      ...option,
+      capex: option.capex * (1 + sv.changePercent! / 100),
+    };
+    expect(Math.abs(appraiseOption(flexed, config).npv)).toBeLessThan(1);
+    expect(sv.switchesAt).toBeCloseTo(flexed.capex, 0);
+  });
+
+  it("finds the benefits reduction that drives NPV to zero", () => {
+    const sv = switchingValue(option, config, "benefits");
+    expect(sv.changePercent!).toBeLessThan(0);
+    const flexed = {
+      ...option,
+      annualBenefits: option.annualBenefits.map((v) => v * (1 + sv.changePercent! / 100)),
+    };
+    expect(Math.abs(appraiseOption(flexed, config).npv)).toBeLessThan(1);
+  });
+
+  it("reports null with an explanation when the decision never switches", () => {
+    // Benefits so large that even +1000% costs cannot make NPV negative.
+    const robust = { capex: 1, annualBenefits: [1_000_000], annualCosts: [0] };
+    const sv = switchingValue(robust, { ...config, appraisalYears: 1 }, "costs");
+    expect(sv.changePercent).toBeNull();
+    expect(sv.note).toContain("does not switch");
+  });
+
+  it("recognises an option already sitting exactly on zero", () => {
+    const breakeven = { capex: 0, annualBenefits: [0], annualCosts: [0] };
+    const sv = switchingValue(breakeven, { ...config, appraisalYears: 1 }, "capex");
+    expect(sv.changePercent).toBe(0);
+    expect(sv.note).toContain("already zero");
+  });
+
+  it("produces one switching value per variable in the analysis block", () => {
+    const s = sensitivityAnalysis(option, config);
+    expect(s.switching.map((v) => v.variable)).toEqual([
+      "capex",
+      "benefits",
+      "costs",
+      "discountRate",
+    ]);
   });
 });

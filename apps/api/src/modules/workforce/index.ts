@@ -2,26 +2,48 @@ import type { FastifyPluginAsync } from "fastify";
 import { and, asc, count, desc, eq, gte, inArray, isNull, lte, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
+  crewMembers,
+  crews,
   labourAudits,
   labourRiskFlags,
   obligations,
   payrollEntries,
+  projects,
   siteAccessRecords,
   signals,
+  timecards,
   vendors,
   welfareInspections,
+  workerGrievances,
+  workerVoiceChannels,
   workers,
 } from "@constructos/db";
 import {
+  LABOUR_COMPLIANCE_DETECTORS,
   LABOUR_RISK_INDICATORS,
   WELFARE_INSPECTION_AREAS,
+  WORKER_GRIEVANCE_CATEGORIES,
+  WORKER_GRIEVANCE_STATUSES,
+  WORKER_GRIEVANCE_UPDATE_KINDS,
   WORKER_STATUSES,
 } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
+import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, conflict, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { addDaysISO, isoDateSchema, todayISO } from "../field/dates.js";
+import { attachAccessLinks } from "../timecards/cards.js";
+import { computeLabourPosition, type LabourPositionWorker } from "./labourposition.js";
+import {
+  assessWagePayment,
+  assessWorkingTime,
+  getJurisdiction,
+  WAGE_JURISDICTIONS,
+  type ComplianceFinding,
+} from "../timecards/jurisdictions.js";
+import { forEachCompany } from "../../lib/scheduler.js";
+import { sha256Hex } from "@constructos/ledger";
 import {
   MINIMUM_WORKING_AGE,
   ageOnDate,
@@ -119,10 +141,30 @@ const payrollIngestSchema = z.object({
         currency: z.string().length(3).optional(),
         paidAt: isoDateSchema.nullable().optional(),
         wpsReference: z.string().max(200).nullable().optional(),
+        /** the payroll system's own row id, carried for the audit trail */
+        externalRef: z.string().max(200).nullable().optional(),
+        /** coded deductions, when the file carries them (#682) */
+        deductionLines: z
+          .array(
+            z.object({
+              code: z.string().min(1).max(80),
+              label: z.string().max(200).default(""),
+              amount: z.number().min(0),
+            }),
+          )
+          .max(50)
+          .optional(),
       }),
     )
     .min(1)
     .max(5000),
+  /**
+   * Which payroll RUN this file is. Two postings of the same run replace each
+   * other; an adjustment run posted alongside the main one keeps its own row.
+   * Omitted means "the employer's single run for this period", which is the
+   * common case and the one the duplicate-upload bug lived in.
+   */
+  payrollRunRef: z.string().max(200).optional(),
 });
 
 const reconcileSchema = z.object({ periodStart: isoDateSchema, periodEnd: isoDateSchema });
@@ -272,6 +314,37 @@ const RECONCILIATION_DETECTORS = ["ghost_worker", "payroll_overclaim", "wage_und
  * Labour is modelled as PEOPLE WITH RIGHTS, not as cost and hours: every
  * finding lands in the same signals/obligations spine the rest of the platform
  * uses, so a lender or auditor reads worker harm on the same page as money.
+ */
+/**
+ * WORKFORCE RIGHTS & WELFARE (M17) — tool key `workforce`.
+ *
+ * Added in the platform upgrade wave, on top of the register, the
+ * ghost-worker reconciliation and the welfare/audit programme:
+ *
+ *  • WORKER VOICE (#689-691). `POST /worker-voice/reports` is UNAUTHENTICATED
+ *    on purpose: a grievance channel that needs the employer's account or the
+ *    employer's device is a channel the employer controls. The credential is a
+ *    token printed on a worker card, stored only as a sha256, and the reporter
+ *    keeps a tracking code whose hash is all we hold. An unanswered report is
+ *    escalated and signalled — an unanswered grievance register is worse than
+ *    no channel, because it evidences that workers raised something and
+ *    nobody answered.
+ *
+ *  • WAGE AND WORKING-TIME COMPLIANCE (#678-682). A code-resident jurisdiction
+ *    library (timecards/jurisdictions.ts) with a citation on every limit, run
+ *    over timecards where they exist and site access where they do not.
+ *    Findings raise a signal keyed (detector, worker, period) and a labour
+ *    risk flag against the EMPLOYER, which is what the vendor score reads.
+ *
+ *  • THE THREE-WAY LABOUR POSITION. Timecards (what the site approved),
+ *    payroll (what the employer says was paid) and site access (what the
+ *    turnstile recorded) set against each other, with a missing leg reported
+ *    as missing rather than as zero.
+ *
+ * PAYROLL INGEST IS IDEMPOTENT. `(workerId, periodStart, periodEnd,
+ * sourceRef)` is unique and the same run replaces itself: a file posted twice
+ * used to double every worker's claimed days and turn honest people into
+ * named "overclaims" with high-severity signals against them.
  */
 export const workforceModule: FastifyPluginAsync = async (app) => {
   const readGate = [app.authenticate, app.requireCompany, app.requireTool("workforce", "read")];
@@ -781,19 +854,37 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
           },
         });
     }
+    /*
+     * ATTACH THE CARDS HERE, WHERE THE EVIDENCE LANDS. The timecards module
+     * used to run this sweep on every list read — writes under a read-only
+     * permission, on every page load. The gate export arriving is the moment
+     * the link becomes possible, so it is the moment to make it.
+     */
+    const linked = await attachAccessLinks(
+      app.db,
+      companyId,
+      projectId,
+      [...new Set(rows.map((r) => r.workerId))],
+    );
     await appendLedger(app.db, {
       companyId,
       actorId: req.user!.id,
       action: "create",
       objectType: "site_access_batch",
       objectId: projectId,
-      payload: { received: body.records.length, upserted: rows.length, unknown: unknown.length },
+      payload: {
+        received: body.records.length,
+        upserted: rows.length,
+        unknown: unknown.length,
+        timecardsLinked: linked.linked,
+      },
       storePayload: true,
     });
     return reply.status(201).send({
       received: body.records.length,
       upserted: rows.length,
       duplicatesCollapsed: body.records.length - unknown.length - rows.length,
+      timecardsLinked: linked,
       unknown,
     });
   });
@@ -820,7 +911,14 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
 
     const { byId, byReference } = await resolveBatchWorkers(companyId, projectId, body.entries);
     const unknown: { index: number; workerId?: string; workerReference?: string }[] = [];
-    const rows: (typeof payrollEntries.$inferInsert)[] = [];
+    const sourceRef = body.payrollRunRef ?? "";
+    // Last write wins within one payload: a file that repeats a worker for the
+    // same period would otherwise make ON CONFLICT touch the row twice.
+    const staged = new Map<string, typeof payrollEntries.$inferInsert>();
+    const deductionLinesByKey = new Map<
+      string,
+      Array<{ code: string; label: string; amount: number }>
+    >();
     body.entries.forEach((e, index) => {
       const workerId = e.workerId
         ? byId.get(e.workerId)
@@ -835,7 +933,7 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
         });
         return;
       }
-      rows.push({
+      staged.set(`${workerId}|${e.periodStart}|${e.periodEnd}|${sourceRef}`, {
         id: newId("pay"),
         companyId,
         projectId,
@@ -850,12 +948,125 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
         currency: e.currency ?? "USD",
         paidAt: e.paidAt ?? null,
         wpsReference: e.wpsReference ?? null,
+        sourceRef,
+        externalRef: e.externalRef ?? null,
         submittedBy: req.user!.id,
       });
+      if (e.deductionLines && e.deductionLines.length > 0) {
+        deductionLinesByKey.set(
+          `${workerId}|${e.periodStart}|${e.periodEnd}|${sourceRef}`,
+          e.deductionLines.map((d) => ({ code: d.code, label: d.label, amount: d.amount })),
+        );
+      }
     });
+
+    /*
+     * IDEMPOTENT. A payroll file re-posted after a timeout used to be inserted
+     * a second time: `computeReconciliation` then summed daysClaimed and
+     * grossPay across both copies, every honest worker's claim ratio doubled,
+     * and the run persisted high-severity `payroll_overclaim` signals against
+     * named people and inflated their employer's modern-slavery score. On a
+     * lender-reported labour-rights control that is a false accusation the
+     * platform manufactured. `(workerId, periodStart, periodEnd, sourceRef)`
+     * is unique and the same run REPLACES itself.
+     */
+    const rows = [...staged.values()];
+    const keys = rows.map((r) => `${r.workerId}|${r.periodStart}|${r.periodEnd}|${r.sourceRef}`);
+    const before = rows.length
+      ? await app.db
+          .select({
+            workerId: payrollEntries.workerId,
+            periodStart: payrollEntries.periodStart,
+            periodEnd: payrollEntries.periodEnd,
+            sourceRef: payrollEntries.sourceRef,
+          })
+          .from(payrollEntries)
+          .where(
+            and(
+              eq(payrollEntries.companyId, companyId),
+              eq(payrollEntries.projectId, projectId),
+              inArray(
+                payrollEntries.workerId,
+                rows.map((r) => r.workerId),
+              ),
+            ),
+          )
+      : [];
+    const existingKeys = new Set(
+      before.map((b) => `${b.workerId}|${b.periodStart}|${b.periodEnd}|${b.sourceRef}`),
+    );
+    const replaced = keys.filter((k) => existingKeys.has(k)).length;
+
     for (let i = 0; i < rows.length; i += 500) {
-      await app.db.insert(payrollEntries).values(rows.slice(i, i + 500));
+      await app.db
+        .insert(payrollEntries)
+        .values(rows.slice(i, i + 500))
+        .onConflictDoUpdate({
+          target: [
+            payrollEntries.workerId,
+            payrollEntries.periodStart,
+            payrollEntries.periodEnd,
+            payrollEntries.sourceRef,
+          ],
+          set: {
+            daysClaimed: sql`excluded.days_claimed`,
+            hoursClaimed: sql`excluded.hours_claimed`,
+            grossPay: sql`excluded.gross_pay`,
+            deductions: sql`excluded.deductions`,
+            netPay: sql`excluded.net_pay`,
+            currency: sql`excluded.currency`,
+            paidAt: sql`excluded.paid_at`,
+            wpsReference: sql`excluded.wps_reference`,
+            externalRef: sql`excluded.external_ref`,
+            submittedBy: sql`excluded.submitted_by`,
+            updatedAt: sql`now()`,
+          },
+        });
     }
+
+    /*
+     * LINK THE HOURS TO THE MONEY. `timecards.payrollEntryId` has existed
+     * since the schema was written and no route ever wrote it, so the
+     * three-way reconciliation the module header promises had no join to
+     * stand on. Cards whose work date falls inside a payroll period, for the
+     * same worker, are stamped with the entry that paid them.
+     */
+    let linkedCards = 0;
+    const stored = rows.length
+      ? await app.db
+          .select()
+          .from(payrollEntries)
+          .where(
+            and(
+              eq(payrollEntries.companyId, companyId),
+              eq(payrollEntries.projectId, projectId),
+              inArray(
+                payrollEntries.workerId,
+                rows.map((r) => r.workerId),
+              ),
+            ),
+          )
+      : [];
+    for (const entry of stored) {
+      const key = `${entry.workerId}|${entry.periodStart}|${entry.periodEnd}|${entry.sourceRef}`;
+      if (!keys.includes(key)) continue;
+      const updated = await app.db
+        .update(timecards)
+        .set({ payrollEntryId: entry.id, updatedAt: new Date().toISOString() })
+        .where(
+          and(
+            eq(timecards.companyId, companyId),
+            eq(timecards.projectId, projectId),
+            eq(timecards.workerId, entry.workerId),
+            gte(timecards.workDate, entry.periodStart),
+            lte(timecards.workDate, entry.periodEnd),
+            inArray(timecards.status, ["approved", "locked", "exported"]),
+          ),
+        )
+        .returning({ id: timecards.id });
+      linkedCards += updated.length;
+    }
+
     await appendLedger(app.db, {
       companyId,
       actorId: req.user!.id,
@@ -864,15 +1075,30 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
       objectId: projectId,
       payload: {
         received: body.entries.length,
-        inserted: rows.length,
+        upserted: rows.length,
+        replaced,
+        payrollRunRef: body.payrollRunRef ?? null,
         unknown: unknown.length,
+        linkedTimecards: linkedCards,
         gross: round2(rows.reduce((s, r) => s + r.grossPay, 0)),
       },
       storePayload: true,
     });
-    return reply
-      .status(201)
-      .send({ received: body.entries.length, inserted: rows.length, unknown });
+    return reply.status(201).send({
+      received: body.entries.length,
+      upserted: rows.length,
+      /** rows that replaced an earlier posting of the same run */
+      replaced,
+      duplicatesCollapsed: body.entries.length - unknown.length - rows.length,
+      linkedTimecards: linkedCards,
+      unknown,
+      note:
+        replaced > 0
+          ? `${replaced} entr(ies) replaced an earlier posting of the same payroll run. Re-posting ` +
+            "a file never adds a second copy: two copies would double the claimed days and turn " +
+            "honest workers into overclaims."
+          : null,
+    });
   });
 
   /* ---------------------------------------------------------------- */
@@ -1283,6 +1509,14 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
           isNull(labourRiskFlags.resolvedAt),
         ),
       );
+    /*
+     * ONLY LIVE SIGNALS COUNT. This loaded every ghost/overclaim signal ever
+     * raised, whatever its disposition: a signal DISMISSED as a false positive
+     * (a gate outage, or a duplicate payroll upload) kept adding 6 or 3 points
+     * to that employer's modern-slavery score for ever, while open risk flags
+     * were correctly filtered to unresolved. A control that cannot be cleared
+     * is a control people learn to ignore.
+     */
     const reconSignals = await app.db
       .select({ detector: signals.detector, evidenceRefs: signals.evidenceRefs })
       .from(signals)
@@ -1291,6 +1525,7 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
           eq(signals.companyId, companyId),
           eq(signals.projectId, projectId),
           inArray(signals.detector, ["ghost_worker", "payroll_overclaim"]),
+          inArray(signals.disposition, ["new", "under_review", "confirmed"]),
         ),
       );
 
@@ -1348,7 +1583,10 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
       weighting:
         "45 pts open risk flags (12 per critical indicator, 6 per other), 25 pts reconciliation " +
         "signals (6 per ghost worker, 3 per overclaim), 18 pts contract-issuance gap, 12 pts " +
-        "identity-verification gap. Bands: <20 low, <45 medium, <70 high, else critical.",
+        "identity-verification gap. Bands: <20 low, <45 medium, <70 high, else critical. Only " +
+        "signals still open (new, under review or confirmed) and risk flags still unresolved " +
+        "are counted: a dismissed false positive stops scoring against the employer the moment " +
+        "somebody dismisses it.",
     };
   });
 
@@ -1590,9 +1828,11 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
   async function sweepOverdueCaps(
     companyId: string,
     projectId: string,
-    actorId: string,
-  ): Promise<void> {
+    /** null when the scheduler runs it — the system is not a person */
+    actorId: string | null,
+  ): Promise<{ breached: number }> {
     const today = todayISO();
+    let breachedCount = 0;
     const rows = await app.db
       .select()
       .from(labourAudits)
@@ -1603,7 +1843,7 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
           inArray(labourAudits.status, ["reported", "in_progress"]),
         ),
       );
-    if (rows.length === 0) return;
+    if (rows.length === 0) return { breached: 0 };
     const names = await vendorNames(
       companyId,
       rows.map((a) => a.vendorId),
@@ -1662,7 +1902,9 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
         .update(labourAudits)
         .set({ findings: next, updatedAt: now })
         .where(eq(labourAudits.id, audit.id));
+      breachedCount += overdue.length;
     }
+    return { breached: breachedCount };
   }
 
   app.post("/projects/:projectId/labour-audits", { preHandler: standardGate }, async (req, reply) => {
@@ -1906,5 +2148,1243 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
         obligation: f.obligationId ? (obById.get(f.obligationId) ?? null) : null,
       })),
     };
+  });
+  /* ================================================================ */
+  /* WORKER VOICE (#689-691) — a channel the employer does not own     */
+  /* ================================================================ */
+
+  /**
+   * The intake token is handed to workers on a card in their own language.
+   * We store only its sha256: a token that can be read back out of the
+   * database is a token an employer with database access can use to find out
+   * who reported them.
+   */
+  const channelCreateSchema = z.object({
+    name: z.string().min(1).max(200),
+    languages: z.array(z.string().min(2).max(20)).max(20).optional(),
+    handlerUserId: z.string().min(1).max(64).nullable().optional(),
+    responseSlaHours: z.number().int().min(1).max(720).optional(),
+  });
+
+  function newToken(): { token: string; hash: string; prefix: string } {
+    const token = `wv_${newId("tok").replace(/[^a-zA-Z0-9]/g, "")}${newId("tok").slice(-8)}`;
+    return { token, hash: sha256Hex(token), prefix: token.slice(0, 10) };
+  }
+
+  app.post(
+    "/projects/:projectId/worker-voice/channels",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const body = channelCreateSchema.parse(req.body);
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      const { token, hash, prefix } = newToken();
+      const id = newId("wvc");
+      await app.db.insert(workerVoiceChannels).values({
+        id,
+        companyId,
+        projectId,
+        name: body.name,
+        tokenHash: hash,
+        tokenPrefix: prefix,
+        languages: body.languages ?? [],
+        handlerUserId: body.handlerUserId ?? null,
+        responseSlaHours: body.responseSlaHours ?? 72,
+        createdBy: req.user!.id,
+      });
+      await appendLedger(app.db, {
+        companyId,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "worker_voice_channel",
+        objectId: id,
+        projectId,
+        payload: {
+          name: body.name,
+          tokenPrefix: prefix,
+          responseSlaHours: body.responseSlaHours ?? 72,
+        },
+        storePayload: true,
+      });
+      return reply.status(201).send({
+        id,
+        name: body.name,
+        tokenPrefix: prefix,
+        /** shown ONCE — the platform keeps only the hash */
+        token,
+        note:
+          "Print this token on the card workers are given, in their own language. It is shown " +
+          "once and stored only as a hash: a token that could be read back out of the database " +
+          "is a token an employer with database access could use to identify a reporter.",
+      });
+    },
+  );
+
+  app.get("/projects/:projectId/worker-voice/channels", { preHandler: readGate }, async (req) => {
+    const rows = await app.db
+      .select({
+        id: workerVoiceChannels.id,
+        name: workerVoiceChannels.name,
+        tokenPrefix: workerVoiceChannels.tokenPrefix,
+        languages: workerVoiceChannels.languages,
+        handlerUserId: workerVoiceChannels.handlerUserId,
+        responseSlaHours: workerVoiceChannels.responseSlaHours,
+        isActive: workerVoiceChannels.isActive,
+        reportCount: workerVoiceChannels.reportCount,
+        revokedAt: workerVoiceChannels.revokedAt,
+        createdAt: workerVoiceChannels.createdAt,
+      })
+      .from(workerVoiceChannels)
+      .where(
+        and(
+          eq(workerVoiceChannels.companyId, req.companyId!),
+          eq(workerVoiceChannels.projectId, req.projectId!),
+        ),
+      )
+      .orderBy(desc(workerVoiceChannels.createdAt));
+    return { items: rows, total: rows.length };
+  });
+
+  app.post(
+    "/projects/:projectId/worker-voice/channels/:channelId/revoke",
+    { preHandler: standardGate },
+    async (req) => {
+      const { channelId } = req.params as { channelId: string };
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      const rows = await app.db
+        .select()
+        .from(workerVoiceChannels)
+        .where(
+          and(
+            eq(workerVoiceChannels.id, channelId),
+            eq(workerVoiceChannels.companyId, companyId),
+            eq(workerVoiceChannels.projectId, projectId),
+          ),
+        )
+        .limit(1);
+      if (!rows[0]) throw notFound("Worker voice channel not found");
+      const now = new Date().toISOString();
+      await app.db
+        .update(workerVoiceChannels)
+        .set({ isActive: 0, revokedAt: now, updatedAt: now })
+        .where(eq(workerVoiceChannels.id, channelId));
+      await appendLedger(app.db, {
+        companyId,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "worker_voice_channel",
+        objectId: channelId,
+        projectId,
+        payload: { revoked: true },
+      });
+      return { id: channelId, revoked: true };
+    },
+  );
+
+  const grievanceIntakeSchema = z.object({
+    category: z.enum(WORKER_GRIEVANCE_CATEGORIES),
+    summary: z.string().min(3).max(500),
+    detailText: z.string().max(20000).nullable().optional(),
+    language: z.string().max(20).nullable().optional(),
+    /** the reporter chose to identify themselves */
+    workerReference: z.string().max(100).nullable().optional(),
+  });
+
+  /** Category → the severity the platform treats the report at. */
+  const GRIEVANCE_SEVERITY: Record<string, "critical" | "high" | "medium"> = {
+    forced_labour: "critical",
+    child_labour: "critical",
+    document_retention: "critical",
+    recruitment_fee: "critical",
+    wages_unpaid: "critical",
+    wages_underpaid: "high",
+    excessive_hours: "high",
+    no_rest_day: "high",
+    harassment: "high",
+    discrimination: "high",
+    health_safety: "high",
+    freedom_of_association: "high",
+    contract_substitution: "high",
+    accommodation: "medium",
+    food_water: "medium",
+    other: "medium",
+  };
+
+  /** Category → the labour risk indicator it raises, where one maps. */
+  const GRIEVANCE_INDICATOR: Record<string, string | undefined> = {
+    forced_labour: "movement_restricted",
+    child_labour: "underage",
+    document_retention: "passport_retained",
+    recruitment_fee: "recruitment_fee_paid",
+    wages_unpaid: "wage_withheld",
+    wages_underpaid: "wage_withheld",
+    excessive_hours: "excessive_overtime",
+    no_rest_day: "no_rest_day",
+    contract_substitution: "contract_substituted",
+  };
+
+  /**
+   * ANONYMOUS INTAKE. No session, no account — the token on the card is the
+   * only credential, because a channel that requires the employer's device or
+   * the employer's account is a channel the employer controls. The reporter
+   * gets a tracking code; the platform keeps only its hash, so nobody can
+   * list reports by reporter.
+   */
+  app.post("/worker-voice/reports", async (req, reply) => {
+    const header = req.headers["x-intake-token"];
+    const token = typeof header === "string" ? header.trim() : "";
+    if (!token) {
+      throw badRequest(
+        "This channel needs the intake token printed on your worker card. Send it as the " +
+          "x-intake-token header.",
+      );
+    }
+    const body = grievanceIntakeSchema.parse(req.body);
+    const rows = await app.db
+      .select()
+      .from(workerVoiceChannels)
+      .where(eq(workerVoiceChannels.tokenHash, sha256Hex(token)))
+      .limit(1);
+    const channel = rows[0];
+    if (!channel || channel.isActive !== 1) {
+      // Deliberately the same message for "wrong token" and "revoked token":
+      // a channel that distinguishes them lets somebody enumerate tokens.
+      throw badRequest("That intake token is not valid on any open channel.");
+    }
+
+    const worker = body.workerReference
+      ? (
+          await app.db
+            .select()
+            .from(workers)
+            .where(
+              and(
+                eq(workers.companyId, channel.companyId),
+                eq(workers.projectId, channel.projectId),
+                eq(workers.reference, body.workerReference),
+              ),
+            )
+            .limit(1)
+        )[0]
+      : undefined;
+    const vendorId = worker?.vendorId ?? null;
+
+    const trackingCode = `WV-${newId("trk").replace(/[^a-zA-Z0-9]/g, "").slice(-10).toUpperCase()}`;
+    const number = await nextRecordNumber(app.db, channel.projectId, "worker_grievance");
+    const id = newId("wgr");
+    const severity = GRIEVANCE_SEVERITY[body.category] ?? "medium";
+    const now = new Date();
+    const responseDueAt = new Date(
+      now.getTime() + channel.responseSlaHours * 3_600_000,
+    ).toISOString();
+    const reference = `WG-${String(number).padStart(4, "0")}`;
+
+    await app.db.insert(workerGrievances).values({
+      id,
+      companyId: channel.companyId,
+      projectId: channel.projectId,
+      channelId: channel.id,
+      number,
+      reference,
+      trackingHash: sha256Hex(trackingCode),
+      category: body.category,
+      severity,
+      summary: body.summary,
+      detailText: body.detailText ?? null,
+      language: body.language ?? null,
+      isAnonymous: worker ? 0 : 1,
+      workerId: worker?.id ?? null,
+      vendorId,
+      status: "received",
+      receivedAt: now.toISOString(),
+      responseDueAt,
+      updates: [],
+    });
+    await app.db
+      .update(workerVoiceChannels)
+      .set({ reportCount: channel.reportCount + 1, updatedAt: now.toISOString() })
+      .where(eq(workerVoiceChannels.id, channel.id));
+
+    // A signal, because a grievance is a finding the assurance layer must see
+    // — and a risk flag against the EMPLOYER for the categories that map to
+    // one. Neither carries the reporter's identity when the report is
+    // anonymous.
+    const signalId = newId("sig");
+    await app.db.insert(signals).values({
+      id: signalId,
+      companyId: channel.companyId,
+      projectId: channel.projectId,
+      detector: "worker_voice_report",
+      severity,
+      confidence: 1,
+      title: `Worker voice report — ${body.category.replace(/_/g, " ")}`,
+      explanation:
+        `A worker reported "${body.summary}" through the ${channel.name} channel on ` +
+        `${now.toISOString().slice(0, 10)}. The report is ` +
+        `${worker ? `attributed to ${worker.reference}` : "ANONYMOUS: no worker identity was given, and none may be inferred"}` +
+        `. A first response is due by ${responseDueAt.slice(0, 10)}. The value of an ` +
+        "employer-independent channel is entirely in whether reports get answered: an unanswered " +
+        "grievance register is worse than none, because it evidences that workers raised " +
+        "something and that nobody answered it.",
+      evidenceRefs: {
+        key: id,
+        grievanceId: id,
+        reference,
+        category: body.category,
+        channelId: channel.id,
+        isAnonymous: !worker,
+        vendorId,
+        responseDueAt,
+      },
+    });
+    let riskFlagId: string | null = null;
+    const indicator = GRIEVANCE_INDICATOR[body.category];
+    if (indicator) {
+      riskFlagId = newId("lrf");
+      await app.db.insert(labourRiskFlags).values({
+        id: riskFlagId,
+        companyId: channel.companyId,
+        projectId: channel.projectId,
+        workerId: worker?.id ?? null,
+        vendorId,
+        indicator,
+        severity,
+        detail: `Reported through the worker voice channel: ${body.summary}`,
+        source: "worker_report",
+        signalId,
+        raisedBy: null,
+      });
+    }
+    await app.db
+      .update(workerGrievances)
+      .set({ signalId, riskFlagId })
+      .where(eq(workerGrievances.id, id));
+
+    await appendLedger(app.db, {
+      companyId: channel.companyId,
+      // No actor: nobody on the platform authored this, and stamping the
+      // channel's creator would be a false attribution.
+      actorId: null,
+      action: "create",
+      objectType: "worker_grievance",
+      objectId: id,
+      projectId: channel.projectId,
+      payload: {
+        category: body.category,
+        severity,
+        channelId: channel.id,
+        isAnonymous: !worker,
+        responseDueAt,
+      },
+      storePayload: true,
+    });
+
+    return reply.status(201).send({
+      trackingCode,
+      reference,
+      responseDueAt,
+      note:
+        "Keep this tracking code. It is the only way to check what happened to this report, and " +
+        "the platform stores only a hash of it: nobody here can look up who reported what.",
+    });
+  });
+
+  /** Anonymous status check by tracking code — no account, no identity. */
+  app.get("/worker-voice/reports/:trackingCode", async (req) => {
+    const { trackingCode } = req.params as { trackingCode: string };
+    const rows = await app.db
+      .select()
+      .from(workerGrievances)
+      .where(eq(workerGrievances.trackingHash, sha256Hex(trackingCode)))
+      .limit(1);
+    const grievance = rows[0];
+    if (!grievance) throw notFound("No report matches that tracking code.");
+    const updates = (grievance.updates as Array<Record<string, unknown>>).filter(
+      (u) => u["visibleToReporter"] === true,
+    );
+    return {
+      reference: grievance.reference,
+      status: grievance.status,
+      receivedAt: grievance.receivedAt,
+      responseDueAt: grievance.responseDueAt,
+      firstRespondedAt: grievance.firstRespondedAt,
+      closedAt: grievance.closedAt,
+      outcome: grievance.outcome,
+      updates,
+    };
+  });
+
+  app.get("/projects/:projectId/worker-grievances", { preHandler: readGate }, async (req) => {
+    const q = pageQuerySchema
+      .extend({
+        status: z.enum(WORKER_GRIEVANCE_STATUSES).optional(),
+        category: z.enum(WORKER_GRIEVANCE_CATEGORIES).optional(),
+        overdueOnly: z.coerce.boolean().optional(),
+      })
+      .parse(req.query);
+    const clauses = [
+      eq(workerGrievances.companyId, req.companyId!),
+      eq(workerGrievances.projectId, req.projectId!),
+    ];
+    if (q.status) clauses.push(eq(workerGrievances.status, q.status));
+    if (q.category) clauses.push(eq(workerGrievances.category, q.category));
+    if (q.overdueOnly) clauses.push(eq(workerGrievances.slaBreached, 1));
+    const where = and(...clauses);
+    const [totalRow] = await app.db.select({ n: count() }).from(workerGrievances).where(where);
+    const rows = await app.db
+      .select()
+      .from(workerGrievances)
+      .where(where)
+      .orderBy(desc(workerGrievances.receivedAt))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    const names = await vendorNames(
+      req.companyId!,
+      rows.map((r) => r.vendorId).filter((v): v is string => Boolean(v)),
+    );
+    return paginate(
+      rows.map((r) => ({
+        ...r,
+        vendorName: r.vendorId ? (names.get(r.vendorId) ?? r.vendorId) : null,
+        isAnonymous: r.isAnonymous === 1,
+        slaBreached: r.slaBreached === 1,
+      })),
+      Number(totalRow?.n ?? 0),
+      q,
+    );
+  });
+
+  const grievanceUpdateSchema = z.object({
+    kind: z.enum(WORKER_GRIEVANCE_UPDATE_KINDS).default("response"),
+    text: z.string().min(1).max(10000),
+    /** the reporter can read this through their tracking code */
+    visibleToReporter: z.boolean().default(true),
+    status: z.enum(WORKER_GRIEVANCE_STATUSES).optional(),
+    outcome: z.string().max(2000).nullable().optional(),
+  });
+
+  app.post(
+    "/projects/:projectId/worker-grievances/:grievanceId/updates",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { grievanceId } = req.params as { grievanceId: string };
+      const body = grievanceUpdateSchema.parse(req.body);
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      const rows = await app.db
+        .select()
+        .from(workerGrievances)
+        .where(
+          and(
+            eq(workerGrievances.id, grievanceId),
+            eq(workerGrievances.companyId, companyId),
+            eq(workerGrievances.projectId, projectId),
+          ),
+        )
+        .limit(1);
+      const grievance = rows[0];
+      if (!grievance) throw notFound("Grievance not found on this project");
+      if (grievance.closedAt && body.kind !== "note") {
+        throw conflict(
+          `${grievance.reference} was closed on ${grievance.closedAt}. Add a note, or record a ` +
+            "new report — a closed outcome is not edited after the fact.",
+        );
+      }
+      const now = new Date().toISOString();
+      const updates = [
+        ...(grievance.updates as unknown[]),
+        {
+          at: now,
+          by: req.user!.id,
+          kind: body.kind,
+          text: body.text,
+          visibleToReporter: body.visibleToReporter,
+        },
+      ];
+      const closing = body.status === "resolved" || body.status === "closed_no_action";
+      await app.db
+        .update(workerGrievances)
+        .set({
+          updates,
+          status:
+            body.status ?? (grievance.status === "received" ? "acknowledged" : grievance.status),
+          firstRespondedAt: grievance.firstRespondedAt ?? now,
+          closedAt: closing ? now : grievance.closedAt,
+          outcome: body.outcome ?? grievance.outcome,
+          updatedAt: now,
+        })
+        .where(eq(workerGrievances.id, grievanceId));
+      await appendLedger(app.db, {
+        companyId,
+        actorId: req.user!.id,
+        action: body.status ? "state_change" : "update",
+        objectType: "worker_grievance",
+        objectId: grievanceId,
+        projectId,
+        payload: {
+          reference: grievance.reference,
+          kind: body.kind,
+          status: body.status ?? grievance.status,
+          firstResponse: grievance.firstRespondedAt === null,
+        },
+        storePayload: true,
+      });
+      const after = await app.db
+        .select()
+        .from(workerGrievances)
+        .where(eq(workerGrievances.id, grievanceId))
+        .limit(1);
+      return reply.status(201).send(after[0]);
+    },
+  );
+
+  /**
+   * Grievances whose first response is overdue. Idempotent: the breach is
+   * stamped on the row and signalled once.
+   */
+  async function sweepGrievanceSla(companyId: string): Promise<{ breached: number }> {
+    const now = new Date().toISOString();
+    const overdue = await app.db
+      .select()
+      .from(workerGrievances)
+      .where(
+        and(
+          eq(workerGrievances.companyId, companyId),
+          isNull(workerGrievances.firstRespondedAt),
+          eq(workerGrievances.slaBreached, 0),
+          lte(workerGrievances.responseDueAt, now),
+        ),
+      );
+    for (const grievance of overdue) {
+      await app.db
+        .update(workerGrievances)
+        .set({ slaBreached: 1, status: "escalated", updatedAt: now })
+        .where(eq(workerGrievances.id, grievance.id));
+      await app.db.insert(signals).values({
+        id: newId("sig"),
+        companyId,
+        projectId: grievance.projectId,
+        detector: "worker_voice_unanswered",
+        severity: grievance.severity === "critical" ? "critical" : "high",
+        confidence: 1,
+        title: `Worker grievance unanswered past its SLA — ${grievance.reference}`,
+        explanation:
+          `${grievance.reference} (${grievance.category.replace(/_/g, " ")}) was received on ` +
+          `${grievance.receivedAt.slice(0, 10)} and a first response was due by ` +
+          `${(grievance.responseDueAt ?? "").slice(0, 10)}. Nobody has responded. An unanswered ` +
+          "grievance register is worse than no channel at all: it evidences to a lender's " +
+          "reviewer that workers raised something and the project did not answer.",
+        evidenceRefs: {
+          key: grievance.id,
+          grievanceId: grievance.id,
+          reference: grievance.reference,
+          category: grievance.category,
+          receivedAt: grievance.receivedAt,
+          responseDueAt: grievance.responseDueAt,
+        },
+      });
+      await appendLedger(app.db, {
+        companyId,
+        actorId: null,
+        action: "state_change",
+        objectType: "worker_grievance",
+        objectId: grievance.id,
+        projectId: grievance.projectId,
+        payload: { slaBreached: true, responseDueAt: grievance.responseDueAt },
+      });
+    }
+    return { breached: overdue.length };
+  }
+
+  app.post(
+    "/projects/:projectId/worker-grievances/sweep",
+    { preHandler: standardGate },
+    async (req) => sweepGrievanceSla(req.companyId!),
+  );
+
+  /* ================================================================ */
+  /* WAGE AND WORKING-TIME COMPLIANCE (Domain M #678-682)              */
+  /* ================================================================ */
+
+  const complianceSchema = z.object({
+    jurisdiction: z.string().min(2).max(10),
+    periodStart: isoDateSchema,
+    periodEnd: isoDateSchema,
+    /** 0 = Sunday … 6 = Saturday */
+    weekStartsOn: z.coerce.number().int().min(0).max(6).optional(),
+    minimumWageOverride: z
+      .object({
+        amount: z.number().min(0),
+        currency: z.string().length(3),
+        unit: z.enum(["hour", "day", "month"]),
+        rateAsOf: isoDateSchema,
+      })
+      .optional(),
+  });
+
+  type ComplianceInput = z.infer<typeof complianceSchema>;
+  type WorkerFinding = ComplianceFinding & {
+    workerId: string;
+    reference: string;
+    vendorId: string | null;
+  };
+
+  /**
+   * Run the working-time and wage detectors over a window.
+   *
+   * Hours come from timecards where they exist and from SITE ACCESS where they
+   * do not, because on many projects the subcontractor keeps the timesheets
+   * and the turnstile is the only record we own. Which stream a day came from
+   * is carried on the finding.
+   */
+  async function runCompliance(companyId: string, projectId: string, input: ComplianceInput) {
+    const jurisdiction = getJurisdiction(input.jurisdiction);
+    if (!jurisdiction) {
+      throw badRequest(
+        `"${input.jurisdiction}" is not a jurisdiction this platform holds working-time and wage ` +
+          `limits for. Available: ${WAGE_JURISDICTIONS.map((j) => j.key).join(", ")}. A limit ` +
+          "borrowed from another country would produce findings against an employer that are " +
+          "simply wrong.",
+      );
+    }
+    const asOf = todayISO();
+    const workerRows = await app.db
+      .select()
+      .from(workers)
+      .where(and(eq(workers.companyId, companyId), eq(workers.projectId, projectId)));
+    if (workerRows.length === 0) {
+      return {
+        jurisdiction,
+        periodStart: input.periodStart,
+        periodEnd: input.periodEnd,
+        workers: 0,
+        findings: [] as WorkerFinding[],
+        reasons: ["no workers are enrolled on this project, so there is nothing to assess"],
+      };
+    }
+    const workerIds = workerRows.map((w) => w.id);
+    const cards = await app.db
+      .select({
+        workerId: timecards.workerId,
+        workDate: timecards.workDate,
+        totalHours: timecards.totalHours,
+        status: timecards.status,
+      })
+      .from(timecards)
+      .where(
+        and(
+          eq(timecards.companyId, companyId),
+          eq(timecards.projectId, projectId),
+          inArray(timecards.workerId, workerIds),
+          gte(timecards.workDate, input.periodStart),
+          lte(timecards.workDate, input.periodEnd),
+        ),
+      );
+    const access = await app.db
+      .select()
+      .from(siteAccessRecords)
+      .where(
+        and(
+          eq(siteAccessRecords.companyId, companyId),
+          eq(siteAccessRecords.projectId, projectId),
+          inArray(siteAccessRecords.workerId, workerIds),
+          gte(siteAccessRecords.accessDate, input.periodStart),
+          lte(siteAccessRecords.accessDate, input.periodEnd),
+        ),
+      );
+    const pay = await app.db
+      .select()
+      .from(payrollEntries)
+      .where(
+        and(
+          eq(payrollEntries.companyId, companyId),
+          eq(payrollEntries.projectId, projectId),
+          inArray(payrollEntries.workerId, workerIds),
+          lte(payrollEntries.periodStart, input.periodEnd),
+          gte(payrollEntries.periodEnd, input.periodStart),
+        ),
+      );
+
+    const findings: WorkerFinding[] = [];
+    const reasons: string[] = [];
+    let assessed = 0;
+
+    for (const worker of workerRows) {
+      const cardDays = cards
+        .filter((c) => c.workerId === worker.id && c.status !== "void" && c.status !== "revised")
+        .map((c) => ({ date: c.workDate, hours: c.totalHours, source: "timecard" as const }));
+      const accessDays = access
+        .filter((a) => a.workerId === worker.id)
+        .map((a) => ({
+          date: a.accessDate,
+          hours: a.hoursOnSite ?? 0,
+          source: "site_access" as const,
+        }));
+      // Timecards where we have them; the turnstile fills the days they do not
+      // cover, because on many projects the sub keeps the timesheets.
+      const byDate = new Map<
+        string,
+        { date: string; hours: number; source: "timecard" | "site_access" }
+      >();
+      for (const d of accessDays) if (d.hours > 0) byDate.set(d.date, d);
+      for (const d of cardDays) byDate.set(d.date, d);
+      const days = [...byDate.values()];
+      const entries = pay.filter((p) => p.workerId === worker.id);
+      if (days.length === 0 && entries.length === 0) continue;
+      assessed += 1;
+
+      if (days.length > 0) {
+        const wt = assessWorkingTime({
+          jurisdiction,
+          workerReference: worker.reference,
+          workerName: worker.fullName,
+          periodStart: input.periodStart,
+          periodEnd: input.periodEnd,
+          days,
+          weekStartsOn: input.weekStartsOn ?? 1,
+        });
+        for (const f of wt.findings) {
+          findings.push({
+            ...f,
+            workerId: worker.id,
+            reference: worker.reference,
+            vendorId: worker.vendorId,
+          });
+        }
+      }
+
+      for (const entry of entries) {
+        const wage = assessWagePayment({
+          jurisdiction,
+          workerReference: worker.reference,
+          workerName: worker.fullName,
+          periodStart: entry.periodStart,
+          periodEnd: entry.periodEnd,
+          grossPay: entry.grossPay,
+          deductions: entry.deductions,
+          netPay: entry.netPay,
+          currency: entry.currency,
+          hoursClaimed: entry.hoursClaimed,
+          daysClaimed: entry.daysClaimed,
+          paidAt: entry.paidAt,
+          asOf,
+          ...(input.minimumWageOverride ? { minimumWageOverride: input.minimumWageOverride } : {}),
+        });
+        for (const f of wage.findings) {
+          findings.push({
+            ...f,
+            workerId: worker.id,
+            reference: worker.reference,
+            vendorId: worker.vendorId,
+          });
+        }
+        for (const r of wage.reasons) if (!reasons.includes(r)) reasons.push(r);
+      }
+    }
+
+    if (assessed < workerRows.length) {
+      reasons.push(
+        `${workerRows.length - assessed} worker(s) have neither hours nor payroll in this window ` +
+          "and were not assessed. Absence of evidence is not evidence of compliance.",
+      );
+    }
+    return {
+      jurisdiction,
+      periodStart: input.periodStart,
+      periodEnd: input.periodEnd,
+      workers: assessed,
+      findings,
+      reasons,
+    };
+  }
+
+  function jurisdictionView(j: ReturnType<typeof getJurisdiction>) {
+    if (!j) return null;
+    return {
+      key: j.key,
+      name: j.name,
+      citation: j.citation,
+      maxWeeklyHours: j.maxWeeklyHours,
+      maxDailyHours: j.maxDailyHours,
+      maxConsecutiveWorkDays: j.maxConsecutiveWorkDays,
+      wagePaymentDueDays: j.wagePaymentDueDays,
+      maxDeductionPercent: j.maxDeductionPercent,
+      minimumWage: j.minimumWage,
+      recruitmentFeesProhibited: j.recruitmentFeesProhibited,
+    };
+  }
+
+  /** The library itself, so a UI can offer the jurisdictions that exist. */
+  app.get("/workforce/jurisdictions", { preHandler: [app.authenticate] }, async () => ({
+    items: WAGE_JURISDICTIONS.map((j) => jurisdictionView(j)),
+    total: WAGE_JURISDICTIONS.length,
+    note:
+      "Every limit carries the instrument it is read from. Minimum wages move: each carries the " +
+      "date the platform's figure was correct, and a comparison against a stale rate is reported " +
+      "as stale rather than as law.",
+  }));
+
+  app.get("/projects/:projectId/workforce/compliance", { preHandler: readGate }, async (req) => {
+    const q = complianceSchema.parse(req.query);
+    const result = await runCompliance(req.companyId!, req.projectId!, q);
+    return {
+      ...result,
+      jurisdiction: jurisdictionView(result.jurisdiction),
+      persisted: false,
+    };
+  });
+
+  /**
+   * Persist the findings: one signal per (detector, worker, period), and the
+   * matching labour risk flag against the EMPLOYER, which is what feeds the
+   * vendor score. Re-running the same window changes nothing.
+   */
+  /**
+   * Run the detectors and PERSIST what they found, idempotently.
+   *
+   * Shared by the manual route and the weekly scheduled sweep so both write
+   * exactly the same rows. The idempotence key is
+   * `(detector, workerId, periodStart, periodEnd)` on the signal's
+   * `evidenceRefs.key`: re-running a window never accuses the same person of
+   * the same thing twice, which for a labour-rights control is the difference
+   * between evidence and harassment.
+   */
+  async function persistCompliance(
+    companyId: string,
+    projectId: string,
+    body: ComplianceInput,
+    actorId: string | null,
+  ) {
+      const result = await runCompliance(companyId, projectId, body);
+
+      /*
+       * IDEMPOTENCE THROUGH `signals.fingerprint`, which is the platform's own
+       * indexed mechanism for exactly this — `(companyId, detector,
+       * fingerprint)` carries an index, so the lookup is bounded by the keys
+       * this run would raise rather than by every labour signal the project
+       * has ever produced. The key is
+       * `(detector, workerId, periodStart, periodEnd)`: re-running a window
+       * never accuses the same person of the same thing twice, and in a
+       * labour-rights module that is the difference between evidence and
+       * harassment.
+       */
+      const keyOf = (detector: string, workerId: string) =>
+        `${detector}|${workerId}|${body.periodStart}|${body.periodEnd}`;
+      const candidateKeys = [
+        ...new Set(result.findings.map((f) => keyOf(f.detector, f.workerId))),
+      ];
+      const existing = candidateKeys.length
+        ? await app.db
+            .select({ fingerprint: signals.fingerprint })
+            .from(signals)
+            .where(
+              and(
+                eq(signals.companyId, companyId),
+                eq(signals.projectId, projectId),
+                inArray(signals.detector, [...LABOUR_COMPLIANCE_DETECTORS]),
+                inArray(signals.fingerprint, candidateKeys),
+              ),
+            )
+        : [];
+      const seen = new Set<string>();
+      for (const row of existing) {
+        if (row.fingerprint) seen.add(row.fingerprint);
+      }
+
+      const toInsert: (typeof signals.$inferInsert)[] = [];
+      const flags: (typeof labourRiskFlags.$inferInsert)[] = [];
+      for (const finding of result.findings) {
+        const key = keyOf(finding.detector, finding.workerId);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const signalId = newId("sig");
+        toInsert.push({
+          id: signalId,
+          companyId,
+          projectId,
+          detector: finding.detector,
+          severity: finding.severity,
+          confidence: 1,
+          fingerprint: key,
+          subjectType: "worker",
+          subjectId: finding.workerId,
+          title: finding.title,
+          explanation: `${finding.explanation}\n\nBasis: ${finding.citation}`,
+          evidenceRefs: {
+            key,
+            workerId: finding.workerId,
+            reference: finding.reference,
+            vendorId: finding.vendorId,
+            periodStart: body.periodStart,
+            periodEnd: body.periodEnd,
+            jurisdiction: result.jurisdiction.key,
+            citation: finding.citation,
+            amountAtRisk: finding.amountAtRisk,
+            currency: finding.currency,
+            ...finding.inputs,
+          },
+        });
+        if (finding.indicator) {
+          flags.push({
+            id: newId("lrf"),
+            companyId,
+            projectId,
+            workerId: finding.workerId,
+            vendorId: finding.vendorId,
+            indicator: finding.indicator,
+            severity: finding.severity,
+            detail: finding.title,
+            source: "detector",
+            signalId,
+            raisedBy: null,
+          });
+        }
+      }
+      for (let i = 0; i < toInsert.length; i += 200) {
+        await app.db.insert(signals).values(toInsert.slice(i, i + 200));
+      }
+      for (let i = 0; i < flags.length; i += 200) {
+        await app.db.insert(labourRiskFlags).values(flags.slice(i, i + 200));
+      }
+      const runId = newId("wcr");
+      await appendLedger(app.db, {
+        companyId,
+        actorId,
+        action: "create",
+        objectType: "workforce_compliance_run",
+        objectId: runId,
+        projectId,
+        payload: {
+          jurisdiction: result.jurisdiction.key,
+          periodStart: body.periodStart,
+          periodEnd: body.periodEnd,
+          workers: result.workers,
+          findings: result.findings.length,
+          signalsRaised: toInsert.length,
+          flagsRaised: flags.length,
+        },
+        storePayload: true,
+      });
+      return {
+        runId,
+        jurisdiction: jurisdictionView(result.jurisdiction),
+        periodStart: body.periodStart,
+        periodEnd: body.periodEnd,
+        workers: result.workers,
+        findings: result.findings,
+        signalsRaised: toInsert.length,
+        flagsRaised: flags.length,
+        reasons: result.reasons,
+      };
+  }
+
+  app.post(
+    "/projects/:projectId/workforce/compliance/run",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const body = complianceSchema.parse(req.body);
+      return reply
+        .status(201)
+        .send(await persistCompliance(req.companyId!, req.projectId!, body, req.user!.id));
+    },
+  );
+
+  /* ================================================================ */
+  /* THREE-WAY LABOUR POSITION — timecards vs payroll vs site access   */
+  /* ================================================================ */
+
+  app.get(
+    "/projects/:projectId/workforce/labour-position",
+    { preHandler: readGate },
+    async (req) => {
+      const q = z
+        .object({ from: isoDateSchema.optional(), to: isoDateSchema.optional() })
+        .parse(req.query);
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      const to = q.to ?? todayISO();
+      const from = q.from ?? addDaysISO(to, -30);
+      if (to < from) throw badRequest("to must not precede from");
+
+      const workerRows = await app.db
+        .select()
+        .from(workers)
+        .where(and(eq(workers.companyId, companyId), eq(workers.projectId, projectId)));
+      if (workerRows.length === 0) {
+        return {
+          periodStart: from,
+          periodEnd: to,
+          workers: 0,
+          rows: [],
+          findings: [],
+          moneyAtRisk: [],
+          totals: { approvedHours: 0, paidHours: null, accessDays: 0, workersAwaitingPayroll: 0 },
+          reasons: ["no workers are enrolled on this project"],
+        };
+      }
+      const workerIds = workerRows.map((w) => w.id);
+      const cards = await app.db
+        .select()
+        .from(timecards)
+        .where(
+          and(
+            eq(timecards.companyId, companyId),
+            eq(timecards.projectId, projectId),
+            inArray(timecards.workerId, workerIds),
+            gte(timecards.workDate, from),
+            lte(timecards.workDate, to),
+          ),
+        );
+      const pay = await app.db
+        .select()
+        .from(payrollEntries)
+        .where(
+          and(
+            eq(payrollEntries.companyId, companyId),
+            eq(payrollEntries.projectId, projectId),
+            inArray(payrollEntries.workerId, workerIds),
+            lte(payrollEntries.periodStart, to),
+            gte(payrollEntries.periodEnd, from),
+          ),
+        );
+      const access = await app.db
+        .select({
+          workerId: siteAccessRecords.workerId,
+          accessDate: siteAccessRecords.accessDate,
+        })
+        .from(siteAccessRecords)
+        .where(
+          and(
+            eq(siteAccessRecords.companyId, companyId),
+            eq(siteAccessRecords.projectId, projectId),
+            inArray(siteAccessRecords.workerId, workerIds),
+            gte(siteAccessRecords.accessDate, from),
+            lte(siteAccessRecords.accessDate, to),
+          ),
+        );
+      const memberships = await app.db
+        .select({ member: crewMembers })
+        .from(crewMembers)
+        .where(
+          and(eq(crewMembers.projectId, projectId), inArray(crewMembers.workerId, workerIds)),
+        );
+      const vendorNameMap = await vendorNames(
+        companyId,
+        workerRows.map((w) => w.vendorId).filter((v): v is string => Boolean(v)),
+      );
+
+      const APPROVED = ["approved", "locked", "exported"];
+      const inputs: LabourPositionWorker[] = workerRows.map((worker) => {
+        const own = cards.filter((c) => c.workerId === worker.id);
+        const approved = own.filter((c) => APPROVED.includes(c.status));
+        const pending = own.filter((c) => c.status === "draft" || c.status === "submitted");
+        const entries = pay.filter((p) => p.workerId === worker.id);
+        const hoursKnown = entries.length > 0 && entries.every((e) => e.hoursClaimed !== null);
+        const uncosted = approved.some((c) => c.totalCost === null);
+        const rate =
+          memberships
+            .filter((m) => m.member.workerId === worker.id && m.member.hourlyRate !== null)
+            .map((m) => m.member.hourlyRate)[0] ?? null;
+        return {
+          workerId: worker.id,
+          reference: worker.reference,
+          fullName: worker.fullName,
+          vendorId: worker.vendorId,
+          vendorName: worker.vendorId
+            ? (vendorNameMap.get(worker.vendorId) ?? worker.vendorId)
+            : null,
+          approvedHours: round2(approved.reduce((s, c) => s + c.totalHours, 0)),
+          approvedDays: new Set(approved.map((c) => c.workDate)).size,
+          pendingHours: round2(pending.reduce((s, c) => s + c.totalHours, 0)),
+          approvedCost: uncosted
+            ? null
+            : round2(approved.reduce((s, c) => s + (c.totalCost ?? 0), 0)),
+          timecardCurrency: approved[0]?.currency ?? null,
+          payrollBatchRefs: [
+            ...new Set(
+              approved.map((c) => c.payrollBatchRef).filter((v): v is string => Boolean(v)),
+            ),
+          ],
+          paidHours: hoursKnown
+            ? round2(entries.reduce((s, e) => s + (e.hoursClaimed ?? 0), 0))
+            : null,
+          paidDays: round2(entries.reduce((s, e) => s + e.daysClaimed, 0)),
+          grossPay: entries.length > 0 ? round2(entries.reduce((s, e) => s + e.grossPay, 0)) : null,
+          payrollCurrency: entries[0]?.currency ?? null,
+          paidAt:
+            entries
+              .map((e) => e.paidAt)
+              .filter((v): v is string => Boolean(v))
+              .sort()
+              .at(-1) ?? null,
+          payrollEntryCount: entries.length,
+          accessDays: new Set(
+            access.filter((a) => a.workerId === worker.id).map((a) => a.accessDate),
+          ).size,
+          crewHourlyRate: rate,
+        };
+      });
+
+      const summary = computeLabourPosition(inputs, {
+        periodStart: from,
+        periodEnd: to,
+        asOf: todayISO(),
+      });
+      return {
+        ...summary,
+        persisted: false,
+        method:
+          "Three independent statements about the same days: what the site APPROVED (timecards), " +
+          "what the employer says was PAID (payroll), and what the turnstile RECORDED (site " +
+          "access). A missing leg is reported as missing, never as zero.",
+      };
+    },
+  );
+
+  /* ================================================================ */
+  /* HEALTH INPUTS (contract 3.5)                                      */
+  /* ================================================================ */
+
+  app.get("/projects/:projectId/workforce/health-inputs", { preHandler: readGate }, async (req) => {
+    const companyId = req.companyId!;
+    const projectId = req.projectId!;
+    const workerRows = await app.db
+      .select({ id: workers.id, status: workers.status, contractIssued: workers.contractIssued })
+      .from(workers)
+      .where(and(eq(workers.companyId, companyId), eq(workers.projectId, projectId)));
+    const openFlags = await app.db
+      .select({ n: count() })
+      .from(labourRiskFlags)
+      .where(
+        and(
+          eq(labourRiskFlags.companyId, companyId),
+          eq(labourRiskFlags.projectId, projectId),
+          isNull(labourRiskFlags.resolvedAt),
+        ),
+      );
+    const openGrievances = await app.db
+      .select({ n: count() })
+      .from(workerGrievances)
+      .where(
+        and(
+          eq(workerGrievances.companyId, companyId),
+          eq(workerGrievances.projectId, projectId),
+          isNull(workerGrievances.closedAt),
+        ),
+      );
+    const breachedGrievances = await app.db
+      .select({ n: count() })
+      .from(workerGrievances)
+      .where(
+        and(
+          eq(workerGrievances.companyId, companyId),
+          eq(workerGrievances.projectId, projectId),
+          eq(workerGrievances.slaBreached, 1),
+        ),
+      );
+    const active = workerRows.filter((w) => w.status === "active");
+    const reasons: string[] = [];
+    if (workerRows.length === 0) {
+      reasons.push("no workers are enrolled on this project, so the workforce metrics are null");
+    }
+    return {
+      metrics: {
+        workersActive: active.length,
+        contractIssuedPercent:
+          active.length === 0
+            ? null
+            : round2((active.filter((w) => w.contractIssued === 1).length / active.length) * 100),
+        openLabourRiskFlags: Number(openFlags[0]?.n ?? 0),
+        openGrievances: Number(openGrievances[0]?.n ?? 0),
+        grievancesPastSla: Number(breachedGrievances[0]?.n ?? 0),
+      },
+      reasons,
+    };
+  });
+
+  /* ================================================================ */
+  /* SCHEDULED JOBS (plan §6.1)                                        */
+  /* ================================================================ */
+
+  /**
+   * WEEKLY WORKING-TIME AND WAGE SWEEP.
+   *
+   * The jurisdiction is NEVER guessed. It is taken from the project's own
+   * recorded country, and a project that records no country, or one whose
+   * country this platform holds no limits for, is SKIPPED with the reason
+   * rather than assessed against somebody else's law — a rest-day limit
+   * borrowed from another country produces findings against an employer that
+   * are simply wrong, and a wrong finding in a labour-rights module is an
+   * accusation the platform manufactured.
+   */
+  app.scheduler.register({
+    name: "workforce.labour-compliance",
+    description:
+      "Working-time and wage detectors over the last full week, per project, against the " +
+      "jurisdiction the project itself records",
+    everyMs: 24 * 60 * 60_000,
+    runOnBoot: false,
+    run: async ({ db, now }) =>
+      forEachCompany(db, async (companyId) => {
+        const today = now.toISOString().slice(0, 10);
+        const periodEnd = addDaysISO(today, -1);
+        const periodStart = addDaysISO(periodEnd, -6);
+        const projectRows = await db
+          .select({ id: projects.id, country: projects.country })
+          .from(projects)
+          .where(eq(projects.companyId, companyId));
+        let assessed = 0;
+        let skipped = 0;
+        let signalsRaised = 0;
+        for (const project of projectRows) {
+          const jurisdiction = getJurisdiction(project.country);
+          if (!jurisdiction) {
+            skipped += 1;
+            continue;
+          }
+          const run = await persistCompliance(
+            companyId,
+            project.id,
+            { jurisdiction: jurisdiction.key, periodStart, periodEnd },
+            null,
+          );
+          assessed += 1;
+          signalsRaised += run.signalsRaised;
+        }
+        return { assessed, skippedNoJurisdiction: skipped, signalsRaised, periodStart, periodEnd };
+      }),
+  });
+
+  app.scheduler.register({
+    name: "workforce.grievance-sla",
+    description:
+      "Escalate worker voice reports whose first response is overdue — an unanswered grievance " +
+      "register is worse than no channel at all",
+    everyMs: 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db }) => forEachCompany(db, (companyId) => sweepGrievanceSla(companyId)),
+  });
+
+  app.scheduler.register({
+    name: "workforce.labour-audit-caps",
+    description:
+      "Breach the corrective-action deadlines on subcontractor labour audits that have run out " +
+      "of time",
+    everyMs: 12 * 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db }) =>
+      forEachCompany(db, async (companyId) => {
+        const projectRows = await app.db
+          .select({ id: projects.id })
+          .from(projects)
+          .where(eq(projects.companyId, companyId));
+        let breached = 0;
+        for (const project of projectRows) {
+          const result = await sweepOverdueCaps(companyId, project.id, null);
+          breached += result.breached;
+        }
+        return { breached };
+      }),
   });
 };

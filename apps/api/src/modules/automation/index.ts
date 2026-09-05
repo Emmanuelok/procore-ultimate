@@ -73,7 +73,7 @@ import {
   testBodySchema,
   unsavedTestBodySchema,
 } from "./schemas.js";
-import { snapshotCatalogue } from "./snapshots.js";
+import { loadSnapshot, snapshotCatalogue } from "./snapshots.js";
 import { RULE_TEMPLATES, ruleTemplate } from "./templates.js";
 
 const ACTION_HINTS: Record<(typeof AUTOMATION_ACTION_TYPES)[number], { label: string; description: string; params: string[] }> = {
@@ -220,12 +220,6 @@ export const automationModule: FastifyPluginAsync = async (app) => {
       .limit(1);
     if (!row) throw notFound("Automation rule not found");
     return row;
-  }
-
-  async function assertRuleVisible(req: FastifyRequest, rule: RuleRow): Promise<void> {
-    if (!rule.projectId) return;
-    const visible = await visibleProjectIds(req);
-    if (visible !== null && !visible.includes(rule.projectId)) throw notFound("Automation rule not found");
   }
 
   async function loadRun(req: FastifyRequest, id: string): Promise<RunRow> {
@@ -479,8 +473,13 @@ export const automationModule: FastifyPluginAsync = async (app) => {
   app.get("/automation/rules/:id", { preHandler: memberGate }, async (req) => {
     const { id } = req.params as { id: string };
     const rule = await loadRule(req, id);
-    await assertRuleVisible(req, rule);
-    const recent = await engine.recentRuns(rule.id, 10);
+    const visible = await visibleProjectIds(req);
+    if (rule.projectId && visible !== null && !visible.includes(rule.projectId)) throw notFound("Automation rule not found");
+    // Plan §6.3: a company-wide rule is readable by every member, but its runs
+    // are project data — a member only sees the runs on projects they can see.
+    const recent = (await engine.recentRuns(rule.id, 10)).filter(
+      (r) => visible === null || r.projectId === null || visible.includes(r.projectId),
+    );
     return { rule: serializeRule(rule), recentRuns: recent };
   });
 
@@ -617,7 +616,7 @@ export const automationModule: FastifyPluginAsync = async (app) => {
     const body = runCycleBodySchema.parse(req.body ?? {});
     const now = new Date();
     const scan = body.scan === false ? null : await engine.scanSchedules(req.companyId!, now, body.force === true);
-    const drain = body.drain === false ? null : await engine.drain();
+    const drain = body.drain === false ? null : await engine.drain(undefined, req.companyId!);
     return { at: now.toISOString(), scan, drain, health: engine.getHealth() };
   });
 
@@ -719,14 +718,17 @@ export const automationModule: FastifyPluginAsync = async (app) => {
     const rule = await loadProjectRule(req, id, false);
     const body = testBodySchema.parse(req.body ?? {});
     // A project-level tester may only dry-run against this project's records.
-    const result = await engine.dryRun(rule, { ...body, persist: false });
-    if (body.objectId && result.context.record) {
-      const recProject = (result.context.record as { projectId?: unknown })["projectId"];
-      if (typeof recProject === "string" && recProject !== req.projectId) {
+    // The project comes from the snapshot registry, never from a `projectId`
+    // key on the row: a project record IS its own project and carries no such
+    // column, so reading the field would let this route return another
+    // project's row. Company-level records (no project at all) stay allowed.
+    if (body.objectId) {
+      const snapshot = await loadSnapshot(app.db, req.companyId!, rule.triggerObjectType, body.objectId);
+      if (snapshot && snapshot.projectId !== null && snapshot.projectId !== req.projectId) {
         throw forbidden("That record belongs to a different project");
       }
     }
-    return result;
+    return engine.dryRun(rule, { ...body, persist: false });
   });
 
   app.get("/projects/:projectId/automation/runs", { preHandler: projectRead }, async (req) => {

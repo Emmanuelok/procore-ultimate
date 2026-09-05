@@ -244,7 +244,22 @@ export const scoringRoutes: FastifyPluginAsync = async (app) => {
       );
     }
     const declared = new Set(criteria.map((c) => c.key));
-    for (const s of body.scores) {
+    /*
+     * THE BOUND IS CHECKED AGAINST THE RESOLVED MAXIMUM, NOT THE SUPPLIED ONE.
+     *
+     * The check only ran when the caller supplied `maxScore`, while the store
+     * defaulted it to 100 — so a score of 150 with no maxScore was accepted,
+     * normalised to 1.5, and produced a technical score of 150 and a total
+     * above 100 that outranked every properly scored bid. Resolve first, then
+     * validate against what will actually be stored.
+     */
+    const resolved = body.scores.map((s) => ({
+      key: s.key,
+      score: s.score,
+      maxScore: s.maxScore ?? 100,
+      note: s.note ?? null,
+    }));
+    for (const s of resolved) {
       if (!declared.has(s.key)) {
         throw badRequest(
           `"${s.key}" is not a declared evaluation criterion on ${pkg.reference}. The declared ` +
@@ -252,21 +267,24 @@ export const scoringRoutes: FastifyPluginAsync = async (app) => {
             "they would be scored on, and on nothing else.",
         );
       }
-      if (s.score !== null && s.maxScore !== null && s.maxScore !== undefined && s.score > s.maxScore) {
-        throw badRequest(`Score ${s.score} for "${s.key}" exceeds its maximum of ${s.maxScore}.`);
+      if (s.maxScore <= 0) {
+        throw badRequest(
+          `The maximum score for "${s.key}" is ${s.maxScore}. A criterion that cannot be scored ` +
+            "above zero cannot distinguish one bidder from another.",
+        );
+      }
+      if (s.score !== null && s.score > s.maxScore) {
+        throw badRequest(
+          `Score ${s.score} for "${s.key}" exceeds its maximum of ${s.maxScore}. A score above ` +
+            "its own maximum normalises to more than 100% and outranks bids that were scored " +
+            "properly — which is the one thing a declared evaluation basis exists to prevent.",
+        );
       }
     }
 
     const existing = storedScores(submission);
     const merged = new Map(existing.map((s) => [s.key, s] as const));
-    for (const s of body.scores) {
-      merged.set(s.key, {
-        key: s.key,
-        score: s.score,
-        maxScore: s.maxScore ?? 100,
-        note: s.note ?? null,
-      });
-    }
+    for (const s of resolved) merged.set(s.key, s);
     const now = new Date().toISOString();
     await app.db
       .update(bidSubmissions)

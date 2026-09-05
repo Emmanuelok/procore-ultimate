@@ -88,6 +88,16 @@ export default function LoginPage() {
   const [useRecovery, setUseRecovery] = useState(false);
   const [enrolment, setEnrolment] = useState<EnrolResponse | null>(null);
   const [issuedCodes, setIssuedCodes] = useState<string[]>([]);
+  /**
+   * Why provisioning a seed failed, when it did.
+   *
+   * The enrol step used to have no failure state at all: a 409 (a factor was
+   * confirmed in another tab), a 401 (the challenge expired) or any transient
+   * error left `enrolment` null, the panel stuck on "Provisioning a seed…" and
+   * the submit button permanently disabled, with no way out but "Start again"
+   * — which re-enters the password step and does it all over.
+   */
+  const [enrolFailure, setEnrolFailure] = useState<string | null>(null);
 
   const returnTo = searchParams.get("returnTo") ?? undefined;
 
@@ -151,19 +161,48 @@ export default function LoginPage() {
     if ("mfaRequired" in result && result.mfaRequired) {
       setChallenge(result);
       setStep("challenge");
-      if (result.scope === "enrol") {
-        const provisioned = await action.run("enrol", () =>
-          api.post<EnrolResponse>("/api/v1/auth/mfa/challenge/enrol", {
-            challengeToken: result.challengeToken,
-          }),
-        );
-        if (provisioned) setEnrolment(provisioned);
-      }
+      if (result.scope === "enrol") await provisionSeed(result);
       return;
     }
 
     tokenStore.set(result as SessionResponse);
     await land();
+  }
+
+  /**
+   * Ask the API for a TOTP seed against an `enrol` challenge, and keep the
+   * failure when there is one so the user is offered a retry instead of a
+   * dead button.
+   *
+   * A 409 means the factor was confirmed somewhere else while this tab was
+   * waiting — the right answer then is not "retry", it is to switch this
+   * challenge to `verify` mode, which the same challenge token satisfies.
+   */
+  async function provisionSeed(challengeResponse: ChallengeResponse) {
+    setEnrolFailure(null);
+    try {
+      const provisioned = await api.post<EnrolResponse>("/api/v1/auth/mfa/challenge/enrol", {
+        challengeToken: challengeResponse.challengeToken,
+      });
+      setEnrolment(provisioned);
+    } catch (err) {
+      const status =
+        err && typeof err === "object" && "status" in err
+          ? (err as { status: number }).status
+          : null;
+      if (status === 409) {
+        // Already enrolled elsewhere: this is a verify, not an enrol.
+        setChallenge({ ...challengeResponse, scope: "verify", enrolmentRequired: false });
+        setEnrolment(null);
+        setEnrolFailure(null);
+        return;
+      }
+      setEnrolFailure(
+        err && typeof err === "object" && "message" in err
+          ? String((err as { message: unknown }).message)
+          : "The authenticator seed could not be provisioned.",
+      );
+    }
   }
 
   /* ---------------------------------------------------------------- */
@@ -228,6 +267,7 @@ export default function LoginPage() {
               setStep("password");
               setChallenge(null);
               setEnrolment(null);
+              setEnrolFailure(null);
               setCode("");
               setRecoveryCode("");
             }}
@@ -269,6 +309,19 @@ export default function LoginPage() {
                 </p>
               </div>
             </div>
+          ) : enrolFailure ? (
+            <Alert tone="danger" size="sm" className="mb-4" title="Could not provision a seed">
+              <p className="whitespace-pre-wrap">{enrolFailure}</p>
+              <Button
+                size="sm"
+                variant="secondary"
+                className="mt-2"
+                loading={action.busy === "enrol"}
+                onClick={() => void action.run("enrol", async () => provisionSeed(challenge))}
+              >
+                Try again
+              </Button>
+            </Alert>
           ) : (
             <Alert tone="info" size="sm" className="mb-4">
               Provisioning a seed…

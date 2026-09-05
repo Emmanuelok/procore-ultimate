@@ -17,6 +17,7 @@ import {
   PREQUAL_SUBMISSION_STATUSES,
 } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
+import { nextRecordNumber } from "../../lib/numbering.js";
 import { badRequest, conflict, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import type { Db } from "../../lib/db.js";
@@ -50,6 +51,7 @@ import {
   type PrequalSubmissionRow,
   type Unknowable,
 } from "./shared.js";
+import { loadVendorEvidence, tierForSubmission } from "./prequal-registers.js";
 import {
   checkContractAgainstLimit,
   contractToTurnoverRatio,
@@ -454,6 +456,26 @@ export function scoreAssessment(inputs: readonly AssessmentInput[]): AssessmentR
   };
 }
 
+/**
+ * Add whole months to an ISO date, CLAMPED to the end of the target month.
+ *
+ * `setUTCMonth` overflows: 31 January plus one month is 3 March, not 28
+ * February, so a one-month validity granted on a month end quietly ran two or
+ * three days long and disagreed with every renewal calculation done
+ * elsewhere. Validity periods are the whole point of this register; they do
+ * not get to be approximate.
+ */
+export function addMonthsClamped(isoDate: string, months: number): string {
+  const [y, m, d] = isoDate.slice(0, 10).split("-").map(Number);
+  if (!y || !m || !d) return isoDate;
+  const targetMonthIndex = m - 1 + months;
+  const targetYear = y + Math.floor(targetMonthIndex / 12);
+  const targetMonth = ((targetMonthIndex % 12) + 12) % 12;
+  const lastDay = new Date(Date.UTC(targetYear, targetMonth + 1, 0)).getUTCDate();
+  const day = Math.min(d, lastDay);
+  return `${String(targetYear).padStart(4, "0")}-${String(targetMonth + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
 /* ------------------------------------------------------------------ */
 /* Routes                                                              */
 /* ------------------------------------------------------------------ */
@@ -547,11 +569,15 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
     const body = questionnaireCreateSchema.parse(req.body);
     const companyId = req.companyId!;
     if (body.projectId) await assertProject(body.projectId, companyId);
-    const [maxRow] = await app.db
-      .select({ n: count() })
-      .from(prequalificationQuestionnaires)
-      .where(eq(prequalificationQuestionnaires.companyId, companyId));
-    const number = Number(maxRow?.n ?? 0) + 1;
+    /*
+     * ATOMIC, NOT count()+1. Two concurrent creates computed the same number
+     * and the second insert died on the (company_id, number) unique index
+     * with an unhandled 500. `nextRecordNumber` is an INSERT … ON CONFLICT DO
+     * UPDATE and cannot hand out the same number twice; the counter is keyed
+     * on the COMPANY here because prequalification is company-level, exactly
+     * as the unique index is.
+     */
+    const number = await nextRecordNumber(app.db, companyId, "prequalification_questionnaire");
     const id = newId("pqq");
     await app.db.insert(prequalificationQuestionnaires).values({
       id,
@@ -909,9 +935,12 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
       .orderBy(desc(prequalificationFinancials.financialYearEnd));
     const screening = await latestScreening(db, submission.companyId, submission.vendorId);
     const status = await vendorPrequalStatus(db, submission.companyId, submission.vendorId);
+    const evidence = await loadVendorEvidence(db, submission.companyId, submission.vendorId);
 
+    /* The token hash never leaves this module, exactly as the bidder portal's does not. */
+    const { portalTokenHash: _hash, ...safe } = submission;
     return {
-      ...submission,
+      ...safe,
       knockoutFailed: submission.knockoutFailed === 1,
       questionnaire: {
         id: questionnaire.id,
@@ -936,6 +965,36 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
         note: status.note,
         renewalWindowDays: RENEWAL_WINDOW_DAYS,
       },
+      /*
+       * WHAT A DECISION WOULD GRANT, BEFORE ANYBODY MAKES IT. The tier is a
+       * function of evidence already on file, so an assessor should be able
+       * to see it — and see what is capping it — while there is still time to
+       * chase the missing safety return rather than after the approval.
+       */
+      tier: {
+        granted: submission.tier,
+        grantedBasis: submission.tierBasis,
+        riskRating: submission.riskRating,
+        riskBasis: submission.riskBasis,
+        onCurrentEvidence: await tierForSubmission(db, submission),
+      },
+      registers: {
+        safety: evidence.safety,
+        licences: evidence.licences.map((l) => ({
+          ...l,
+          expired: l.expiresAt !== null && l.expiresAt <= todayIso(),
+        })),
+        references: evidence.references.map((r) => ({
+          ...r,
+          wouldUseAgain: r.wouldUseAgain === null ? null : r.wouldUseAgain === 1,
+          checked: r.checkedBy !== null,
+        })),
+      },
+      vendorPortal: {
+        issued: Boolean(submission.portalTokenHash),
+        expiresAt: submission.portalTokenExpiresAt,
+        lastAccessAt: submission.portalLastAccessAt,
+      },
     };
   }
 
@@ -952,11 +1011,7 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
     const vendor = await assertVendor(app.db, body.vendorId, companyId);
     if (body.projectId) await assertProject(body.projectId, companyId);
 
-    const [maxRow] = await app.db
-      .select({ n: count() })
-      .from(prequalificationSubmissions)
-      .where(eq(prequalificationSubmissions.companyId, companyId));
-    const number = Number(maxRow?.n ?? 0) + 1;
+    const number = await nextRecordNumber(app.db, companyId, "prequalification_submission");
     const id = newId("pqs");
     const now = new Date().toISOString();
     await app.db.insert(prequalificationSubmissions).values({
@@ -1020,7 +1075,11 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
       .offset(pageOffset(q));
     return {
       ...paginate(
-        items.map((s) => ({ ...s, knockoutFailed: s.knockoutFailed === 1 })),
+        items.map(({ portalTokenHash: _hash, ...s }) => ({
+          ...s,
+          knockoutFailed: s.knockoutFailed === 1,
+          vendorPortalIssued: Boolean(_hash),
+        })),
         Number(totalRow?.n ?? 0),
         q,
       ),
@@ -1039,7 +1098,11 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
 
   app.post(
     `${BASE}/submissions/:submissionId/responses`,
-    { preHandler: memberGate },
+    // Answering on a vendor's behalf decides who may work for this company;
+    // every other mutation here is owner/admin and this one was not, so any
+    // read-only project member with no bidding tool at all could populate and
+    // submit a vendor's answers.
+    { preHandler: adminGate },
     async (req) => {
       const { submissionId } = req.params as { submissionId: string };
       const body = responsesSchema.parse(req.body);
@@ -1136,7 +1199,7 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  app.post(`${BASE}/submissions/:submissionId/submit`, { preHandler: memberGate }, async (req) => {
+  app.post(`${BASE}/submissions/:submissionId/submit`, { preHandler: adminGate }, async (req) => {
     const { submissionId } = req.params as { submissionId: string };
     const submission = await fetchPrequalSubmission(app.db, submissionId, req.companyId!);
     if (submission.status !== "invited" && submission.status !== "in_progress") {
@@ -1184,6 +1247,28 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
       throw conflict(
         "This prequalification has not been submitted yet. Assessing a half-finished " +
           "questionnaire assesses the gaps, not the vendor.",
+      );
+    }
+    /*
+     * A DECIDED PREQUALIFICATION IS NOT RE-ASSESSED IN PLACE.
+     *
+     * `decide` refuses a second decision, but `assess` did not refuse a
+     * second assessment: an admin could re-score an approved vendor, flipping
+     * status back to "assessed" and overwriting scorePercent and
+     * knockoutFailed, while `outcome` stayed "approved" and could not be
+     * changed. The register then showed an approved vendor with a knockout
+     * failure against them and the gate still let them through. Reassessment
+     * is a RENEWAL: a new submission that supersedes this one, leaving what
+     * we knew in place.
+     */
+    if (submission.approvedBy) {
+      throw conflict(
+        `${submission.reference} was decided by ${submission.approvedBy} on ` +
+          `${submission.approvedAt} and cannot be re-assessed. Overwriting the scores of a ` +
+          "decided prequalification would leave an approval standing on figures nobody " +
+          "approved — and a knockout failure recorded against a vendor the gate still admits. " +
+          "Raise a renewal instead (POST .../renew): it supersedes this one and leaves what we " +
+          "knew at the time exactly as it was.",
       );
     }
     const questions = await questionsOf(app.db, submission.questionnaireId);
@@ -1382,9 +1467,7 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
     const validFrom = body.validFrom ?? todayIso();
     let expiresAt = body.expiresAt ?? null;
     if (approving && expiresAt === null && questionnaire.validityMonths !== null) {
-      const d = new Date(`${validFrom}T00:00:00Z`);
-      d.setUTCMonth(d.getUTCMonth() + questionnaire.validityMonths);
-      expiresAt = d.toISOString().slice(0, 10);
+      expiresAt = addMonthsClamped(validFrom, questionnaire.validityMonths);
     }
     if (approving && expiresAt === null) {
       throw badRequest(
@@ -1418,6 +1501,29 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
                 "No financial screening is on record for this vendor, so no single-project " +
                   "limit was derived. The approval is uncapped until one is.",
             };
+    /*
+     * THE TIER IS DERIVED, NEVER TYPED IN.
+     *
+     * A score is a number nobody uses; a buyer asks "what size of package may
+     * this firm be considered for". The letter is computed here from the
+     * score band, the derived financial limit and the SAFETY RECORD, and the
+     * safety record is a ceiling rather than one input among several — a
+     * fatality averaged into commercial answers is worth four percentage
+     * points and vanishes. `tierBasis` carries the sentence, because a letter
+     * with no reasoning is a number somebody will argue with.
+     *
+     * A REJECTION IS NOT TIERED. There is no size of package a rejected
+     * vendor may be considered for, and stamping one with a letter invites
+     * exactly the misreading the letter exists to prevent.
+     */
+    const verdict = approving
+      ? await tierForSubmission(
+          app.db,
+          submission,
+          { singleProjectLimit: cap.limit, currency: cap.currency },
+          validFrom,
+        )
+      : null;
     const now = new Date().toISOString();
     await app.db
       .update(prequalificationSubmissions)
@@ -1425,6 +1531,10 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
         outcome: body.outcome,
         conditions: body.conditions ?? null,
         rejectedReason: body.rejectedReason ?? null,
+        tier: verdict?.tier ?? null,
+        tierBasis: verdict?.tierBasis ?? null,
+        riskRating: verdict?.riskRating ?? null,
+        riskBasis: verdict?.riskBasis ?? null,
         singleProjectLimit: cap.limit,
         aggregateLimit: body.aggregateLimit ?? null,
         currency: cap.currency,
@@ -1458,6 +1568,10 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
       expiresAt: approving ? expiresAt : null,
       conditions: body.conditions ?? null,
       rejectedReason: body.rejectedReason ?? null,
+      tier: verdict?.tier ?? null,
+      tierBasis: verdict?.tierBasis ?? null,
+      riskRating: verdict?.riskRating ?? null,
+      tierCeilings: verdict?.ceilings ?? [],
     }, submission.projectId, true);
 
     // Raise the renewal obligation immediately where the approval already
@@ -1507,11 +1621,11 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
     if (questionnaire.status !== "active") {
       throw conflict(`Questionnaire ${questionnaire.reference} is ${questionnaire.status}.`);
     }
-    const [maxRow] = await app.db
-      .select({ n: count() })
-      .from(prequalificationSubmissions)
-      .where(eq(prequalificationSubmissions.companyId, req.companyId!));
-    const number = Number(maxRow?.n ?? 0) + 1;
+    const number = await nextRecordNumber(
+      app.db,
+      req.companyId!,
+      "prequalification_submission",
+    );
     const id = newId("pqs");
     const now = new Date().toISOString();
     await app.db.insert(prequalificationSubmissions).values({
@@ -1785,11 +1899,47 @@ export const prequalificationRoutes: FastifyPluginAsync = async (app) => {
         ),
       )
       .orderBy(desc(prequalificationFinancials.financialYearEnd));
+    const evidence = await loadVendorEvidence(app.db, req.companyId!, vendorId);
+    const today = todayIso();
+    /*
+     * The tier the CURRENT evidence supports, recomputed rather than read
+     * back: a licence that lapsed after the approval was granted changes the
+     * answer, and the stored letter on the submission does not know that yet.
+     * Both are returned so the difference is visible instead of hidden.
+     */
+    const latestSubmission = submissions[0] ?? null;
+    const tierNow = latestSubmission
+      ? await tierForSubmission(app.db, latestSubmission)
+      : null;
     return {
       ...status,
       history: submissions.map((s) => ({ ...s, knockoutFailed: s.knockoutFailed === 1 })),
       financials,
       rule: DEFAULT_FINANCIAL_LIMIT_RULE,
+      tier: {
+        granted: latestSubmission?.tier ?? null,
+        grantedBasis: latestSubmission?.tierBasis ?? null,
+        riskRating: latestSubmission?.riskRating ?? null,
+        riskBasis: latestSubmission?.riskBasis ?? null,
+        onCurrentEvidence: tierNow,
+        drifted:
+          tierNow !== null &&
+          latestSubmission?.tier !== null &&
+          latestSubmission?.tier !== undefined &&
+          tierNow.tier !== latestSubmission.tier,
+      },
+      registers: {
+        safety: evidence.safety,
+        licences: evidence.licences.map((l) => ({
+          ...l,
+          expired: l.expiresAt !== null && l.expiresAt <= today,
+        })),
+        references: evidence.references.map((r) => ({
+          ...r,
+          wouldUseAgain: r.wouldUseAgain === null ? null : r.wouldUseAgain === 1,
+          checked: r.checkedBy !== null,
+        })),
+      },
     };
   });
 

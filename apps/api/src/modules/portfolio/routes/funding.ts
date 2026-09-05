@@ -720,6 +720,10 @@ export const fundingRoutes: FastifyPluginAsync = async (app) => {
 
         const allocations = await loadAllocations(tx, companyId);
         const position = appropriationPosition(toAppropriationRow(locked), allocations);
+        /* `carryForwardEligible` is 0 under a lapse policy — nothing is
+           eligible to carry. The UNSPENT balance is a different number and is
+           what lapses, so both are computed and reported separately. */
+        const unspent = Math.max(0, round2(position.authorised - position.drawn));
         const eligible = position.carryForwardEligible;
         const requested = body.carryAmount ?? eligible;
         if (requested > eligible + 0.005) {
@@ -733,7 +737,7 @@ export const fundingRoutes: FastifyPluginAsync = async (app) => {
         let nextStatus = "closed";
 
         if (locked.carryForwardPolicy === "lapse") {
-          nextStatus = eligible > 0.005 ? "lapsed" : "closed";
+          nextStatus = unspent > 0.005 ? "lapsed" : "closed";
         } else if (body.successorAppropriationId) {
           const successor = (
             await tx
@@ -784,7 +788,7 @@ export const fundingRoutes: FastifyPluginAsync = async (app) => {
           })
           .where(eq(portfolioAppropriations.id, locked.id));
 
-        return { locked, position, carried, successorId, nextStatus, eligible };
+        return { locked, position, carried, successorId, nextStatus, eligible, unspent };
       });
 
       await ledger(app.db, {
@@ -798,6 +802,7 @@ export const fundingRoutes: FastifyPluginAsync = async (app) => {
           to: result.nextStatus,
           policy: result.locked.carryForwardPolicy,
           eligible: result.eligible,
+          unspent: result.unspent,
           carriedForwardOut: result.carried,
           successorAppropriationId: result.successorId,
           note: body.note ?? null,
@@ -808,7 +813,8 @@ export const fundingRoutes: FastifyPluginAsync = async (app) => {
         appropriation: await fetchAppropriation(appropriationId, companyId),
         carriedForward: result.carried,
         successorAppropriationId: result.successorId,
-        lapsed: result.nextStatus === "lapsed" ? result.eligible : 0,
+        lapsed: result.nextStatus === "lapsed" ? result.unspent : 0,
+        unspent: result.unspent,
       };
     },
   );
@@ -1244,15 +1250,24 @@ export const fundingRoutes: FastifyPluginAsync = async (app) => {
         `The allocation cannot be reduced below the ${row.drawnAmount} ${row.currency} already drawn against it.`,
       );
     }
+    /* An allocation must always name where its authority comes from. Clearing
+       both parents would leave money attached to a project with no source. */
+    const nextAppropriation =
+      body.appropriationId !== undefined ? (body.appropriationId ?? null) : row.appropriationId;
+    const nextSource =
+      body.fundingSourceId !== undefined ? (body.fundingSourceId ?? null) : row.fundingSourceId;
+    if (!nextAppropriation && !nextSource) {
+      throw badRequest(
+        "An allocation must name the appropriation or the funding source it draws on; money with no stated source is not authority.",
+      );
+    }
 
     const revertsApproval = changesMoney && ALLOCATION_LOCKED.includes(row.status);
     await app.db.transaction(async (tx) => {
       if (changesMoney) {
         await assertHeadroom(tx, companyId, {
-          fundingSourceId:
-            body.fundingSourceId !== undefined ? (body.fundingSourceId ?? null) : row.fundingSourceId,
-          appropriationId:
-            body.appropriationId !== undefined ? (body.appropriationId ?? null) : row.appropriationId,
+          fundingSourceId: nextSource,
+          appropriationId: nextAppropriation,
           currency: row.currency,
           amount: body.amount ?? row.amount,
           excludeAllocationId: row.id,

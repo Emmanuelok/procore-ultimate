@@ -15,7 +15,7 @@
  *    never by a cron — and what the sweep did is reported here rather than
  *    happening silently.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Alert,
   Badge,
@@ -34,7 +34,8 @@ import {
   Textarea,
 } from "../../ui";
 import type { DataColumns } from "../../ui";
-import { IconCompliance, IconPlus, IconWarning } from "../../ui/icons";
+import { IconCheck, IconCompliance, IconPlus, IconSave, IconTrash, IconWarning } from "../../ui/icons";
+import { CHECKLIST_ITEM_TYPES, PREQUAL_CATEGORIES } from "@constructos/shared";
 import { api } from "../../lib/api";
 import {
   Figure,
@@ -61,8 +62,16 @@ import type {
   PrequalSubmissionDetail,
   PrequalSubmissionList,
   Questionnaire,
+  QuestionnaireQuestion,
   QuestionnaireDetail,
 } from "./types";
+
+import {
+  LicenceRegisterView,
+  TierCard,
+  VendorEvidencePanel,
+  VendorPortalPanel,
+} from "./PrequalEvidence";
 
 const BASE = "/api/v1/companies/current/prequalification";
 
@@ -73,7 +82,7 @@ const PREQUAL_OUTCOMES = [
   "rejected",
 ] as const;
 
-type View = "register" | "questionnaires";
+type View = "register" | "questionnaires" | "licences";
 
 export default function PrequalificationTab() {
   const [view, setView] = useState<View>("register");
@@ -92,10 +101,17 @@ export default function PrequalificationTab() {
           options={[
             { value: "register", label: "Supply-chain register" },
             { value: "questionnaires", label: "Questionnaires" },
+            { value: "licences", label: "Licence expiry" },
           ]}
         />
       </div>
-      {view === "register" ? <RegisterView /> : <QuestionnairesView />}
+      {view === "register" ? (
+        <RegisterView />
+      ) : view === "questionnaires" ? (
+        <QuestionnairesView />
+      ) : (
+        <LicenceRegisterView />
+      )}
     </div>
   );
 }
@@ -440,6 +456,46 @@ function StatTile({
 /* One prequalification                                                */
 /* ================================================================== */
 
+/** Answers a bidder can give, keyed the way the shared validator expects. */
+interface AnswerDraft {
+  response: string;
+  numericValue: string;
+  selectedOptions: string[];
+}
+
+const BOOLEAN_ITEM_OPTIONS: Record<string, readonly string[]> = {
+  yes_no: ["yes", "no"],
+  pass_fail: ["pass", "fail"],
+  pass_fail_na: ["pass", "fail", "na"],
+};
+
+const NUMERIC_ITEM_TYPES = new Set(["numeric", "measurement", "instrument_reading", "temperature"]);
+const STRUCTURAL_ITEM_TYPES = new Set(["section_header"]);
+
+/** Statuses at which the register still accepts answers (the API refuses the rest). */
+const ANSWERABLE_STATUSES = new Set([
+  "invited",
+  "in_progress",
+  "submitted",
+  "under_review",
+  "clarification_requested",
+]);
+
+function optionsFor(q: QuestionnaireQuestion): readonly string[] {
+  const declared = BOOLEAN_ITEM_OPTIONS[q.itemType];
+  if (declared && q.options.length === 0) return declared;
+  return q.options;
+}
+
+function draftFrom(q: QuestionnaireQuestion): AnswerDraft {
+  const r = q.response ?? null;
+  return {
+    response: r?.response ?? "",
+    numericValue: r?.numericValue === null || r?.numericValue === undefined ? "" : String(r.numericValue),
+    selectedOptions: r?.selectedOptions ?? [],
+  };
+}
+
 function PrequalDrawer({
   submissionId,
   vendorName,
@@ -459,26 +515,132 @@ function PrequalDrawer({
   const [decideOpen, setDecideOpen] = useState(false);
   const sub = detail.data;
 
-  async function assess() {
-    if (!submissionId) return;
-    const scores = (sub?.questions ?? [])
-      .filter((q) => q.response && q.response.score !== null)
-      .map((q) => ({
+  /*
+   * THE ANSWERS AND THE SCORES ARE HELD SEPARATELY, AND SO ARE THE PEOPLE.
+   *
+   * The drawer previously had no way to record either: "Record the assessment"
+   * re-sent whatever scores were already on the responses, which on a fresh
+   * submission was nothing at all — so the first click produced an assessment
+   * with every required question unscored and a null overall score, and the
+   * decision that followed was refused. Answers are captured here, scores are
+   * captured here, and neither is invented from the other.
+   */
+  const [answers, setAnswers] = useState<Record<string, AnswerDraft>>({});
+  const [scores, setScores] = useState<Record<string, string>>({});
+  const [loadedFor, setLoadedFor] = useState<string | null>(null);
+
+  const questions = useMemo(() => sub?.questions ?? [], [sub]);
+
+  useEffect(() => {
+    if (!sub) return;
+    const stamp = `${sub.id}:${sub.updatedAt ?? ""}:${sub.status}`;
+    if (loadedFor === stamp) return;
+    const nextAnswers: Record<string, AnswerDraft> = {};
+    const nextScores: Record<string, string> = {};
+    for (const q of sub.questions) {
+      nextAnswers[q.id] = draftFrom(q);
+      const s = q.response?.score;
+      nextScores[q.id] = s === null || s === undefined ? "" : String(s);
+    }
+    setAnswers(nextAnswers);
+    setScores(nextScores);
+    setLoadedFor(stamp);
+  }, [sub, loadedFor]);
+
+  function setAnswer(questionId: string, patch: Partial<AnswerDraft>) {
+    setAnswers((prev) => ({
+      ...prev,
+      [questionId]: { ...(prev[questionId] ?? { response: "", numericValue: "", selectedOptions: [] }), ...patch },
+    }));
+  }
+
+  /** Only questions the user actually touched or that already carry an answer. */
+  function answerPayload(): Array<Record<string, unknown>> {
+    const out: Array<Record<string, unknown>> = [];
+    for (const q of questions) {
+      if (STRUCTURAL_ITEM_TYPES.has(q.itemType)) continue;
+      const draft = answers[q.id];
+      if (!draft) continue;
+      const hasText = draft.response.trim().length > 0;
+      const hasNumber = draft.numericValue.trim().length > 0;
+      const hasOptions = draft.selectedOptions.length > 0;
+      if (!hasText && !hasNumber && !hasOptions) continue;
+      out.push({
         questionId: q.id,
-        score: q.response!.score,
-        maxScore: q.response!.maxScore ?? q.maxScore ?? 100,
-      }));
-    const done = await action.run("assess", () =>
-      api.post(`${BASE}/submissions/${submissionId}/assess`, { scores }),
+        response: hasText ? draft.response.trim() : null,
+        numericValue: hasNumber ? Number(draft.numericValue) : null,
+        selectedOptions: draft.selectedOptions,
+        fileIds: q.response?.fileIds ?? [],
+      });
+    }
+    return out;
+  }
+
+  async function saveAnswers(): Promise<boolean> {
+    if (!submissionId) return false;
+    const responses = answerPayload();
+    if (responses.length === 0) return true;
+    const done = await action.run("answers", () =>
+      api.post(`${BASE}/submissions/${submissionId}/responses`, { responses }),
     );
     if (done) {
+      setLoadedFor(null);
+      detail.reload();
+      onMutated();
+    }
+    return done !== null;
+  }
+
+  async function submitResponses() {
+    if (!submissionId) return;
+    const saved = await saveAnswers();
+    if (!saved) return;
+    const done = await action.run("submit", () =>
+      api.post(`${BASE}/submissions/${submissionId}/submit`, {}),
+    );
+    if (done) {
+      setLoadedFor(null);
       detail.reload();
       onMutated();
     }
   }
 
-  const knockoutFailures = (sub?.questions ?? []).filter(
-    (q) => q.isKnockout && q.response?.isKnockoutFail === 1,
+  async function assess() {
+    if (!submissionId) return;
+    const payload = questions
+      .filter((q) => !STRUCTURAL_ITEM_TYPES.has(q.itemType))
+      .map((q) => {
+        const raw = scores[q.id] ?? "";
+        return {
+          questionId: q.id,
+          score: raw.trim() === "" ? null : Number(raw),
+          maxScore: q.maxScore ?? q.response?.maxScore ?? null,
+        };
+      })
+      .filter((s) => s.score !== null || s.maxScore !== null);
+    const done = await action.run("assess", () =>
+      api.post(`${BASE}/submissions/${submissionId}/assess`, { scores: payload }),
+    );
+    if (done) {
+      setLoadedFor(null);
+      detail.reload();
+      onMutated();
+    }
+  }
+
+  const knockoutFailures = questions.filter((q) => q.isKnockout && q.response?.isKnockoutFail === 1);
+  const status = sub?.status ?? "";
+  const answerable = ANSWERABLE_STATUSES.has(status);
+  const scoreable = sub !== null && !["invited", "in_progress"].includes(status) && !sub.approvedBy;
+  const unanswered = questions.filter(
+    (q) => q.required && !STRUCTURAL_ITEM_TYPES.has(q.itemType) && !q.response,
+  );
+  const unscored = questions.filter(
+    (q) =>
+      q.required &&
+      !STRUCTURAL_ITEM_TYPES.has(q.itemType) &&
+      (q.maxScore ?? 0) > 0 &&
+      (scores[q.id] ?? "").trim() === "",
   );
 
   return (
@@ -499,7 +661,26 @@ function PrequalDrawer({
               <Button variant="ghost" onClick={onClose}>
                 Close
               </Button>
-              {sub.status !== "assessed" ? (
+              {answerable ? (
+                <Button
+                  variant="secondary"
+                  icon={IconSave}
+                  loading={action.busy === "answers"}
+                  onClick={() => void saveAnswers()}
+                >
+                  Save answers
+                </Button>
+              ) : null}
+              {status === "invited" || status === "in_progress" ? (
+                <Button
+                  variant="secondary"
+                  loading={action.busy === "submit"}
+                  onClick={() => void submitResponses()}
+                >
+                  Submit the questionnaire
+                </Button>
+              ) : null}
+              {scoreable ? (
                 <Button
                   variant="secondary"
                   loading={action.busy === "assess"}
@@ -627,6 +808,24 @@ function PrequalDrawer({
               </Alert>
             ) : null}
 
+            {answerable && unanswered.length > 0 ? (
+              <Alert tone="info" variant="subtle" title={`${unanswered.length} required question(s) unanswered`}>
+                <p>
+                  The questionnaire cannot be submitted until every required question carries an
+                  answer. Answers are saved as they stand; submitting is a separate, recorded step.
+                </p>
+              </Alert>
+            ) : null}
+
+            {scoreable && unscored.length > 0 ? (
+              <Alert tone="warning" variant="subtle" title={`${unscored.length} scorable question(s) not yet scored`}>
+                <p>
+                  A required question left blank leaves the overall score null — never zero. Score
+                  them, or record the assessment and let the null stand with the questions named.
+                </p>
+              </Alert>
+            ) : null}
+
             {sub.categoryScores.length > 0 ? (
               <section>
                 <h3 className="text-label uppercase text-content-subtle">By category</h3>
@@ -653,59 +852,64 @@ function PrequalDrawer({
               <h3 className="text-label uppercase text-content-subtle">
                 Questions — knockouts marked
               </h3>
+              <p className="mt-1 text-2xs text-content-subtle">
+                {answerable
+                  ? "Answers are recorded here and validated against the question's declared type; evidence is required where the question says so."
+                  : "This submission no longer takes answers — what is shown is what was recorded."}
+                {scoreable
+                  ? " Scores are the assessor's, kept apart from the answers, and a blank stays blank."
+                  : ""}
+              </p>
               <ul className="mt-2 space-y-2">
-                {sub.questions.map((q) => (
-                  <li
+                {questions.map((q) => (
+                  <QuestionRow
                     key={q.id}
-                    className={
-                      q.isKnockout
-                        ? "rounded-md border border-danger-border bg-danger-subtle/40 p-2"
-                        : "rounded-md border border-border p-2"
-                    }
-                  >
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="min-w-0">
-                        <p className="text-meta font-medium">
-                          {q.questionCode ? (
-                            <code className="mr-1.5 font-mono text-2xs">{q.questionCode}</code>
-                          ) : null}
-                          {q.text}
-                        </p>
-                        <p className="mt-0.5 text-2xs text-content-subtle">
-                          {titleCase(q.category)} · {titleCase(q.itemType)}
-                          {q.required ? " · required" : " · optional"}
-                          {q.isKnockout && q.knockoutValue
-                            ? ` · disqualifying answer "${q.knockoutValue}"`
-                            : ""}
-                        </p>
-                      </div>
-                      {q.isKnockout ? (
-                        <Badge tone="danger" size="xs">
-                          knockout
-                        </Badge>
-                      ) : null}
-                    </div>
-                    <p className="mt-1 text-meta">
-                      <span className="text-content-subtle">Answer: </span>
-                      {q.response
-                        ? (q.response.response ??
-                          (q.response.numericValue !== null
-                            ? String(q.response.numericValue)
-                            : q.response.selectedOptions.join(", ")) ??
-                          "—")
-                        : "not answered"}
-                      {q.response && q.response.score !== null ? (
-                        <span className="ml-2 text-2xs text-content-subtle">
-                          scored {num(q.response.score, 1)} / {num(q.response.maxScore, 1)}
-                        </span>
-                      ) : q.required ? (
-                        <span className="ml-2 text-2xs italic text-warning-fg">not scored</span>
-                      ) : null}
-                    </p>
-                  </li>
+                    question={q}
+                    draft={answers[q.id] ?? { response: "", numericValue: "", selectedOptions: [] }}
+                    score={scores[q.id] ?? ""}
+                    answerable={answerable}
+                    scoreable={scoreable}
+                    onAnswer={(patch) => setAnswer(q.id, patch)}
+                    onScore={(value) => setScores((prev) => ({ ...prev, [q.id]: value }))}
+                  />
                 ))}
               </ul>
             </section>
+
+            <section>
+              <h3 className="text-label uppercase text-content-subtle">
+                Tier — what size of package this vendor may be considered for
+              </h3>
+              <div className="mt-2">
+                <TierCard tier={sub.tier} />
+              </div>
+            </section>
+
+            <section>
+              <h3 className="text-label uppercase text-content-subtle">
+                The evidence the tier is computed from
+              </h3>
+              <div className="mt-2">
+                <VendorEvidencePanel
+                  vendorId={sub.vendorId}
+                  submissionId={sub.id}
+                  onMutated={() => {
+                    setLoadedFor(null);
+                    detail.reload();
+                    onMutated();
+                  }}
+                />
+              </div>
+            </section>
+
+            <VendorPortalPanel
+              submissionId={sub.id}
+              portal={sub.vendorPortal}
+              onMutated={() => {
+                setLoadedFor(null);
+                detail.reload();
+              }}
+            />
 
             <section>
               <h3 className="text-label uppercase text-content-subtle">
@@ -762,6 +966,7 @@ function PrequalDrawer({
         onClose={() => setDecideOpen(false)}
         onDone={() => {
           setDecideOpen(false);
+          setLoadedFor(null);
           detail.reload();
           onMutated();
         }}
@@ -770,9 +975,168 @@ function PrequalDrawer({
   );
 }
 
-/* ================================================================== */
-/* Decide                                                              */
-/* ================================================================== */
+/** One question: what was asked, what was answered, and what it scored. */
+function QuestionRow({
+  question,
+  draft,
+  score,
+  answerable,
+  scoreable,
+  onAnswer,
+  onScore,
+}: {
+  question: QuestionnaireQuestion;
+  draft: AnswerDraft;
+  score: string;
+  answerable: boolean;
+  scoreable: boolean;
+  onAnswer: (patch: Partial<AnswerDraft>) => void;
+  onScore: (value: string) => void;
+}) {
+  const q = question;
+  const options = optionsFor(q);
+  const structural = STRUCTURAL_ITEM_TYPES.has(q.itemType);
+  const numeric = NUMERIC_ITEM_TYPES.has(q.itemType);
+  const recorded = q.response;
+
+  return (
+    <li
+      className={
+        q.isKnockout
+          ? "rounded-md border border-danger-border bg-danger-subtle/40 p-2"
+          : "rounded-md border border-border p-2"
+      }
+    >
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <p className="text-meta font-medium">
+            {q.questionCode ? (
+              <code className="mr-1.5 font-mono text-2xs">{q.questionCode}</code>
+            ) : null}
+            {q.text}
+          </p>
+          <p className="mt-0.5 text-2xs text-content-subtle">
+            {titleCase(q.category)} · {titleCase(q.itemType)}
+            {q.required ? " · required" : " · optional"}
+            {q.isKnockout && q.knockoutValue ? ` · disqualifying answer "${q.knockoutValue}"` : ""}
+            {q.evidenceRequired ? " · evidence required" : ""}
+          </p>
+          {q.guidance ? (
+            <p className="mt-0.5 text-2xs italic text-content-subtle">{q.guidance}</p>
+          ) : null}
+        </div>
+        {q.isKnockout ? (
+          <Badge tone="danger" size="xs">
+            knockout
+          </Badge>
+        ) : null}
+      </div>
+
+      {structural ? null : answerable ? (
+        <div className="mt-1.5 grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
+          <div className="min-w-0">
+            {options.length > 0 ? (
+              <Select
+                aria-label={`Answer to ${q.questionCode ?? q.text}`}
+                value={draft.selectedOptions[0] ?? ""}
+                onChange={(e) =>
+                  onAnswer({ selectedOptions: e.target.value ? [e.target.value] : [] })
+                }
+                placeholder="Not answered"
+              >
+                {options.map((o) => (
+                  <option key={o} value={o}>
+                    {o}
+                  </option>
+                ))}
+              </Select>
+            ) : numeric ? (
+              <Input
+                type="number"
+                inputMode="decimal"
+                aria-label={`Answer to ${q.questionCode ?? q.text}`}
+                value={draft.numericValue}
+                onChange={(e) => onAnswer({ numericValue: e.target.value })}
+                placeholder={q.unit ?? "figure"}
+              />
+            ) : q.itemType === "long_text" ? (
+              <Textarea
+                rows={2}
+                aria-label={`Answer to ${q.questionCode ?? q.text}`}
+                value={draft.response}
+                onChange={(e) => onAnswer({ response: e.target.value })}
+              />
+            ) : (
+              <Input
+                type={q.itemType === "date" ? "date" : "text"}
+                aria-label={`Answer to ${q.questionCode ?? q.text}`}
+                value={draft.response}
+                onChange={(e) => onAnswer({ response: e.target.value })}
+              />
+            )}
+            {q.evidenceRequired && (recorded?.fileIds.length ?? 0) === 0 ? (
+              <p className="mt-0.5 text-2xs text-warning-fg">
+                This question requires evidence
+                {q.evidenceKinds.length > 0 ? ` (${q.evidenceKinds.join(", ")})` : ""} and none is
+                attached, so the answer will be refused until a file is linked.
+              </p>
+            ) : null}
+          </div>
+          {scoreable && (q.maxScore ?? 0) > 0 ? (
+            <div className="w-28">
+              <label className="text-2xs uppercase text-content-subtle">
+                Score / {num(q.maxScore, 0)}
+              </label>
+              <Input
+                type="number"
+                inputMode="decimal"
+                aria-label={`Score for ${q.questionCode ?? q.text}`}
+                value={score}
+                onChange={(e) => onScore(e.target.value)}
+                placeholder="—"
+              />
+            </div>
+          ) : null}
+        </div>
+      ) : (
+        <div className="mt-1 flex flex-wrap items-end justify-between gap-2">
+          <p className="text-meta">
+            <span className="text-content-subtle">Answer: </span>
+            {recorded
+              ? (recorded.response ??
+                (recorded.numericValue !== null
+                  ? String(recorded.numericValue)
+                  : recorded.selectedOptions.join(", ")) ??
+                "—")
+              : "not answered"}
+            {recorded && recorded.score !== null ? (
+              <span className="ml-2 text-2xs text-content-subtle">
+                scored {num(recorded.score, 1)} / {num(recorded.maxScore, 1)}
+              </span>
+            ) : q.required ? (
+              <span className="ml-2 text-2xs italic text-warning-fg">not scored</span>
+            ) : null}
+          </p>
+          {scoreable && (q.maxScore ?? 0) > 0 ? (
+            <div className="w-28">
+              <label className="text-2xs uppercase text-content-subtle">
+                Score / {num(q.maxScore, 0)}
+              </label>
+              <Input
+                type="number"
+                inputMode="decimal"
+                aria-label={`Score for ${q.questionCode ?? q.text}`}
+                value={score}
+                onChange={(e) => onScore(e.target.value)}
+                placeholder="—"
+              />
+            </div>
+          ) : null}
+        </div>
+      )}
+    </li>
+  );
+}
 
 function DecideModal({
   open,
@@ -1082,7 +1446,11 @@ function QuestionnairesView() {
         />
       )}
 
-      <QuestionnaireDrawer questionnaireId={openId} onClose={() => setOpenId(null)} />
+      <QuestionnaireDrawer
+        questionnaireId={openId}
+        onClose={() => setOpenId(null)}
+        onMutated={() => setVersion((n) => n + 1)}
+      />
 
       <CreateQuestionnaireModal
         open={createOpen}
@@ -1096,120 +1464,495 @@ function QuestionnairesView() {
   );
 }
 
+/**
+ * ONE QUESTIONNAIRE, AND THE PLACE ITS QUESTIONS ARE WRITTEN.
+ *
+ * The register was previously read-only from the browser: a questionnaire
+ * could be created and then never filled in, never activated, and therefore
+ * never issued — the whole feature silently no-opped for anyone who was not
+ * driving the API by hand. A question set that decides who may work for this
+ * company is authored here, reviewed by somebody else, and frozen the moment
+ * it goes live.
+ */
 function QuestionnaireDrawer({
   questionnaireId,
   onClose,
+  onMutated,
 }: {
   questionnaireId: string | null;
   onClose: () => void;
+  onMutated: () => void;
 }) {
   const detail = useResource<QuestionnaireDetail>(
     questionnaireId ? `${BASE}/questionnaires/${questionnaireId}` : null,
   );
+  const action = useAction();
+  const nameOf = useNames();
+  const [addOpen, setAddOpen] = useState(false);
   const q = detail.data;
+  const isDraft = q?.status === "draft";
+
+  function refresh() {
+    detail.reload();
+    onMutated();
+  }
+
+  async function activate() {
+    if (!q) return;
+    const done = await action.run("activate", () =>
+      api.post(`${BASE}/questionnaires/${q.id}/activate`, {}),
+    );
+    if (done) refresh();
+  }
+
+  async function retire() {
+    if (!q) return;
+    const done = await action.run("retire", () =>
+      api.post(`${BASE}/questionnaires/${q.id}/retire`, {}),
+    );
+    if (done) refresh();
+  }
+
+  async function removeQuestion(questionId: string) {
+    const done = await action.run(`del:${questionId}`, () =>
+      api.del(`${BASE}/questions/${questionId}`),
+    );
+    if (done) refresh();
+  }
+
   return (
-    <Drawer
-      open={questionnaireId !== null}
+    <>
+      <Drawer
+        open={questionnaireId !== null}
+        onClose={onClose}
+        size="xl"
+        title={q ? `${q.reference} — ${q.name}` : "Questionnaire"}
+        description={
+          q
+            ? q.status === "draft"
+              ? "Draft — the questions can still be written, and nothing has been issued against it."
+              : q.status === "active"
+                ? "Active and frozen. Vendors have been assessed against these questions."
+                : "Retired. It stays readable because past assessments were made against it."
+            : undefined
+        }
+        footer={
+          q ? (
+            <div className="flex flex-wrap justify-end gap-2">
+              <Button variant="ghost" onClick={onClose}>
+                Close
+              </Button>
+              {q.status === "active" ? (
+                <Button
+                  variant="secondary"
+                  loading={action.busy === "retire"}
+                  onClick={() => void retire()}
+                >
+                  Retire
+                </Button>
+              ) : null}
+              {isDraft ? (
+                <>
+                  <Button variant="secondary" icon={IconPlus} onClick={() => setAddOpen(true)}>
+                    Add a question
+                  </Button>
+                  <Button
+                    icon={IconCheck}
+                    loading={action.busy === "activate"}
+                    onClick={() => void activate()}
+                    disabled={q.questions.length === 0}
+                  >
+                    Activate
+                  </Button>
+                </>
+              ) : null}
+            </div>
+          ) : null
+        }
+      >
+        {detail.loading && !q ? (
+          <LoadingBlock rows={3} />
+        ) : detail.error ? (
+          <LoadError message={detail.error} onRetry={detail.reload} />
+        ) : q ? (
+          <div className="space-y-4">
+            <RefusalPanel refusal={action.refusal} onDismiss={action.clear} />
+
+            {isDraft ? (
+              <Alert tone="info" variant="subtle" title="What activation means">
+                <p>
+                  Activation is this questionnaire&rsquo;s approval, and it is never the
+                  author&rsquo;s to give: whoever created it cannot activate it. A validity period
+                  must be set first, because an approval that never expires is a check done once
+                  and relied on forever.
+                </p>
+                {q.validityMonths === null ? (
+                  <p className="mt-1 text-meta text-warning-fg">
+                    No validity period is set on this questionnaire, so activation will be refused.
+                    Set one on the register before activating.
+                  </p>
+                ) : null}
+                {q.questions.length === 0 ? (
+                  <p className="mt-1 text-meta text-warning-fg">
+                    No questions have been written yet. A questionnaire with no questions cannot be
+                    issued to the supply chain.
+                  </p>
+                ) : null}
+              </Alert>
+            ) : null}
+
+            <DescriptionList
+              columns={2}
+              size="sm"
+              items={[
+                { label: "Status", value: titleCase(q.status) },
+                { label: "Version", value: String(q.version) },
+                {
+                  label: "Pass threshold",
+                  value: q.passThreshold === null ? "none declared" : `${num(q.passThreshold, 0)}%`,
+                  hint:
+                    q.passThreshold === null
+                      ? "Without one, no submission can be refused on score alone."
+                      : "A submission below this cannot be approved.",
+                },
+                {
+                  label: "Validity",
+                  value: q.validityMonths === null ? "not set" : `${q.validityMonths} months`,
+                  hint:
+                    q.validityMonths === null
+                      ? "Every approval will need an explicit expiry date."
+                      : "Approvals expire this long after they start.",
+                },
+                { label: "Questions", value: String(q.questionCount) },
+                { label: "Knockouts", value: String(q.knockoutQuestions.length) },
+                {
+                  label: "Activated by",
+                  value: q.approvedBy ? nameOf(q.approvedBy) : "not activated",
+                  hint: "Never the person who wrote it.",
+                  tone: q.approvedBy ? ("success" as const) : undefined,
+                },
+                {
+                  label: "Maximum score",
+                  value: q.maxScore === null ? "—" : num(q.maxScore, 1),
+                  hint: "Sum of each question's maximum times its weight.",
+                },
+              ]}
+            />
+
+            {q.knockoutQuestions.length > 0 ? (
+              <Alert tone="danger" variant="subtle" title="The knockout questions">
+                <p>
+                  A wrong answer to any of these fails the submission outright, whatever it scored
+                  elsewhere — and the reason names the question.
+                </p>
+                <ul className="mt-1.5 space-y-1 text-meta">
+                  {q.knockoutQuestions.map((k) => (
+                    <li key={k.id}>
+                      {k.questionCode ? (
+                        <code className="mr-1.5 font-mono text-2xs">{k.questionCode}</code>
+                      ) : null}
+                      {k.text}
+                      {k.knockoutValue ? (
+                        <span className="text-content-subtle">
+                          {" "}
+                          — fails on &ldquo;{k.knockoutValue}&rdquo;
+                        </span>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+              </Alert>
+            ) : null}
+
+            <section>
+              <div className="flex items-center justify-between gap-3">
+                <h3 className="text-label uppercase text-content-subtle">All questions</h3>
+                {isDraft ? (
+                  <Button size="xs" variant="secondary" icon={IconPlus} onClick={() => setAddOpen(true)}>
+                    Add a question
+                  </Button>
+                ) : null}
+              </div>
+              {q.questions.length === 0 ? (
+                <EmptyState
+                  className="mt-2"
+                  icon={IconCompliance}
+                  title="No questions yet"
+                  hint="Write the questions the supply chain is screened on: the knockouts that fail a vendor outright, and the weighted questions that score the rest."
+                  action={
+                    isDraft ? (
+                      <Button icon={IconPlus} onClick={() => setAddOpen(true)}>
+                        Add the first question
+                      </Button>
+                    ) : null
+                  }
+                />
+              ) : (
+                <ul className="mt-2 space-y-1.5">
+                  {q.questions.map((question) => (
+                    <li key={question.id} className="rounded-md border border-border p-2">
+                      <div className="flex items-start justify-between gap-2">
+                        <p className="text-meta">
+                          {question.questionCode ? (
+                            <code className="mr-1.5 font-mono text-2xs">{question.questionCode}</code>
+                          ) : null}
+                          {question.text}
+                        </p>
+                        <div className="flex shrink-0 items-center gap-1">
+                          {question.isKnockout ? (
+                            <Badge tone="danger" size="xs">
+                              knockout
+                            </Badge>
+                          ) : null}
+                          <Badge tone="neutral" size="xs">
+                            weight {num(question.weight, 0)}
+                          </Badge>
+                          {isDraft ? (
+                            <Button
+                              size="xs"
+                              variant="ghost"
+                              icon={IconTrash}
+                              iconOnly
+                              aria-label={`Delete question ${question.questionCode ?? question.text}`}
+                              loading={action.busy === `del:${question.id}`}
+                              onClick={() => void removeQuestion(question.id)}
+                            />
+                          ) : null}
+                        </div>
+                      </div>
+                      <p className="mt-0.5 text-2xs text-content-subtle">
+                        {titleCase(question.category)} · {titleCase(question.itemType)}
+                        {question.required ? " · required" : " · optional"}
+                        {question.maxScore !== null ? ` · max ${num(question.maxScore, 0)}` : " · unscored"}
+                        {question.evidenceRequired ? " · evidence required" : ""}
+                        {question.options.length > 0 ? ` · ${question.options.join(" / ")}` : ""}
+                      </p>
+                      {question.guidance ? (
+                        <p className="mt-0.5 text-2xs italic text-content-subtle">{question.guidance}</p>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+          </div>
+        ) : null}
+      </Drawer>
+
+      <AddQuestionModal
+        open={addOpen}
+        questionnaireId={q?.id ?? null}
+        onClose={() => setAddOpen(false)}
+        onDone={() => {
+          setAddOpen(false);
+          refresh();
+        }}
+      />
+    </>
+  );
+}
+
+/** Item types a vendor cannot meaningfully answer in this register. */
+const QUESTION_ITEM_TYPES = CHECKLIST_ITEM_TYPES.filter(
+  (t) => t !== "instrument_reading" && t !== "temperature" && t !== "measurement",
+);
+
+const CHOICE_ITEM_TYPES = new Set(["single_select", "multi_select", "pass_fail", "pass_fail_na", "yes_no"]);
+
+function AddQuestionModal({
+  open,
+  questionnaireId,
+  onClose,
+  onDone,
+}: {
+  open: boolean;
+  questionnaireId: string | null;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const action = useAction();
+  const [text, setText] = useState("");
+  const [questionCode, setQuestionCode] = useState("");
+  const [category, setCategory] = useState<string>("technical_capability");
+  const [itemType, setItemType] = useState<string>("yes_no");
+  const [required, setRequired] = useState(true);
+  const [options, setOptions] = useState("");
+  const [weight, setWeight] = useState("1");
+  const [maxScore, setMaxScore] = useState("10");
+  const [isKnockout, setIsKnockout] = useState(false);
+  const [knockoutValue, setKnockoutValue] = useState("");
+  const [evidenceRequired, setEvidenceRequired] = useState(false);
+  const [guidance, setGuidance] = useState("");
+
+  const declaredOptions = options
+    .split(",")
+    .map((o) => o.trim())
+    .filter((o) => o.length > 0);
+  const needsOptions = CHOICE_ITEM_TYPES.has(itemType) && itemType !== "yes_no" && itemType !== "pass_fail" && itemType !== "pass_fail_na";
+
+  async function submit() {
+    if (!questionnaireId) return;
+    const body: Record<string, unknown> = {
+      text: text.trim(),
+      category,
+      itemType,
+      required,
+      weight: Number(weight) || 1,
+      isKnockout,
+      evidenceRequired,
+    };
+    if (questionCode.trim()) body["questionCode"] = questionCode.trim();
+    if (declaredOptions.length > 0) body["options"] = declaredOptions;
+    if (maxScore.trim()) body["maxScore"] = Number(maxScore);
+    if (isKnockout && knockoutValue.trim()) body["knockoutValue"] = knockoutValue.trim();
+    if (guidance.trim()) body["guidance"] = guidance.trim();
+    const done = await action.run("add", () =>
+      api.post(`${BASE}/questionnaires/${questionnaireId}/questions`, body),
+    );
+    if (done) {
+      setText("");
+      setQuestionCode("");
+      setKnockoutValue("");
+      setGuidance("");
+      onDone();
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
       onClose={onClose}
-      size="lg"
-      title={q ? `${q.reference} — ${q.name}` : "Questionnaire"}
+      title="Add a question"
+      description="Questions can only be written while the questionnaire is a draft — once it is active, changing them would silently change what past assessments meant."
       footer={
-        <div className="flex justify-end">
+        <div className="flex justify-end gap-2">
           <Button variant="ghost" onClick={onClose}>
-            Close
+            Cancel
+          </Button>
+          <Button
+            onClick={() => void submit()}
+            loading={action.busy === "add"}
+            disabled={text.trim().length === 0 || (needsOptions && declaredOptions.length === 0)}
+          >
+            Add it
           </Button>
         </div>
       }
     >
-      {detail.loading && !q ? (
-        <LoadingBlock rows={3} />
-      ) : detail.error ? (
-        <LoadError message={detail.error} onRetry={detail.reload} />
-      ) : q ? (
-        <div className="space-y-4">
-          <DescriptionList
-            columns={2}
-            size="sm"
-            items={[
-              { label: "Status", value: titleCase(q.status) },
-              { label: "Version", value: String(q.version) },
-              {
-                label: "Pass threshold",
-                value: q.passThreshold === null ? "none declared" : `${num(q.passThreshold, 0)}%`,
-                hint:
-                  q.passThreshold === null
-                    ? "Without one, no submission can be refused on score alone."
-                    : "A submission below this cannot be approved.",
-              },
-              {
-                label: "Validity",
-                value: q.validityMonths === null ? "not set" : `${q.validityMonths} months`,
-                hint:
-                  q.validityMonths === null
-                    ? "Every approval will need an explicit expiry date."
-                    : "Approvals expire this long after they start.",
-              },
-              { label: "Questions", value: String(q.questionCount) },
-              { label: "Knockouts", value: String(q.knockoutQuestions.length) },
-            ]}
+      <div className="space-y-3">
+        <RefusalPanel refusal={action.refusal} onDismiss={action.clear} />
+        <Field label="Question" required>
+          <Textarea
+            rows={2}
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder="Has the company been prosecuted by a health and safety regulator in the last five years?"
           />
-
-          {q.knockoutQuestions.length > 0 ? (
-            <Alert tone="danger" variant="subtle" title="The knockout questions">
-              <p>
-                A wrong answer to any of these fails the submission outright, whatever it scored
-                elsewhere — and the reason names the question.
-              </p>
-              <ul className="mt-1.5 space-y-1 text-meta">
-                {q.knockoutQuestions.map((k) => (
-                  <li key={k.id}>
-                    {k.questionCode ? (
-                      <code className="mr-1.5 font-mono text-2xs">{k.questionCode}</code>
-                    ) : null}
-                    {k.text}
-                    {k.knockoutValue ? (
-                      <span className="text-content-subtle"> — fails on &ldquo;{k.knockoutValue}&rdquo;</span>
-                    ) : null}
-                  </li>
-                ))}
-              </ul>
-            </Alert>
-          ) : null}
-
-          <section>
-            <h3 className="text-label uppercase text-content-subtle">All questions</h3>
-            <ul className="mt-2 space-y-1.5">
-              {q.questions.map((question) => (
-                <li key={question.id} className="rounded-md border border-border p-2">
-                  <div className="flex items-start justify-between gap-2">
-                    <p className="text-meta">
-                      {question.questionCode ? (
-                        <code className="mr-1.5 font-mono text-2xs">{question.questionCode}</code>
-                      ) : null}
-                      {question.text}
-                    </p>
-                    <div className="flex shrink-0 gap-1">
-                      {question.isKnockout ? (
-                        <Badge tone="danger" size="xs">
-                          knockout
-                        </Badge>
-                      ) : null}
-                      <Badge tone="neutral" size="xs">
-                        weight {num(question.weight, 0)}
-                      </Badge>
-                    </div>
-                  </div>
-                  <p className="mt-0.5 text-2xs text-content-subtle">
-                    {titleCase(question.category)} · {titleCase(question.itemType)}
-                    {question.required ? " · required" : " · optional"}
-                  </p>
-                </li>
+        </Field>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Code" optional hint="Used in refusals so a failure names the question.">
+            <Input
+              value={questionCode}
+              onChange={(e) => setQuestionCode(e.target.value)}
+              placeholder="HS-01"
+            />
+          </Field>
+          <Field label="Category" required>
+            <Select value={category} onChange={(e) => setCategory(e.target.value)}>
+              {PREQUAL_CATEGORIES.map((c) => (
+                <option key={c} value={c}>
+                  {titleCase(c)}
+                </option>
               ))}
-            </ul>
-          </section>
+            </Select>
+          </Field>
+          <Field label="Answer type" required>
+            <Select value={itemType} onChange={(e) => setItemType(e.target.value)}>
+              {QUESTION_ITEM_TYPES.map((t) => (
+                <option key={t} value={t}>
+                  {titleCase(t)}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field
+            label="Options"
+            optional={!needsOptions}
+            required={needsOptions}
+            hint="Comma separated. A select with no options cannot be answered and cannot be scored."
+          >
+            <Input
+              value={options}
+              onChange={(e) => setOptions(e.target.value)}
+              placeholder="Yes, No, Not applicable"
+            />
+          </Field>
+          <Field label="Weight" hint="Multiplies this question's score in the total.">
+            <Input
+              type="number"
+              inputMode="decimal"
+              value={weight}
+              onChange={(e) => setWeight(e.target.value)}
+            />
+          </Field>
+          <Field
+            label="Maximum score"
+            optional
+            hint="Leave blank for a question that is recorded but not scored."
+          >
+            <Input
+              type="number"
+              inputMode="decimal"
+              value={maxScore}
+              onChange={(e) => setMaxScore(e.target.value)}
+            />
+          </Field>
         </div>
-      ) : null}
-    </Drawer>
+        <label className="flex items-center gap-2 text-meta">
+          <input
+            type="checkbox"
+            checked={required}
+            onChange={(e) => setRequired(e.target.checked)}
+            className="size-4 accent-[var(--accent)]"
+          />
+          Required — the submission cannot be sent in without it
+        </label>
+        <label className="flex items-center gap-2 text-meta">
+          <input
+            type="checkbox"
+            checked={evidenceRequired}
+            onChange={(e) => setEvidenceRequired(e.target.checked)}
+            className="size-4 accent-[var(--accent)]"
+          />
+          Evidence required — an answer with no attachment is refused
+        </label>
+        <label className="flex items-center gap-2 text-meta">
+          <input
+            type="checkbox"
+            checked={isKnockout}
+            onChange={(e) => setIsKnockout(e.target.checked)}
+            className="size-4 accent-[var(--accent)]"
+          />
+          Knockout — a wrong answer fails the submission outright, whatever it scored elsewhere
+        </label>
+        {isKnockout ? (
+          <Field
+            label="Disqualifying answer"
+            required
+            hint="Must be one of the declared options. A disqualifying answer nobody can give disqualifies nobody."
+          >
+            <Input
+              value={knockoutValue}
+              onChange={(e) => setKnockoutValue(e.target.value)}
+              placeholder="Yes"
+            />
+          </Field>
+        ) : null}
+        <Field label="Guidance" optional hint="Shown to whoever answers and whoever scores it.">
+          <Textarea rows={2} value={guidance} onChange={(e) => setGuidance(e.target.value)} />
+        </Field>
+      </div>
+    </Modal>
   );
 }
 

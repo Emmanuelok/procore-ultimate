@@ -32,9 +32,52 @@ import { nextRecordNumber } from "../../lib/numbering.js";
 /* Wire formats                                                        */
 /* ------------------------------------------------------------------ */
 
+/**
+ * A REAL calendar date. The shape check alone is not enough: `2026-02-30`
+ * and `2026-13-05` both match `\d{4}-\d{2}-\d{2}`, and `Date.UTC` rolls them
+ * silently into March and the following January — which would move an
+ * order-by date, a float and a late signal by weeks with nothing refused.
+ * So the parsed date must round-trip to the same string.
+ */
 export const isoDateSchema = z
   .string()
-  .regex(/^\d{4}-\d{2}-\d{2}$/, "Expected an ISO date (YYYY-MM-DD)");
+  .regex(/^\d{4}-\d{2}-\d{2}$/, "Expected an ISO date (YYYY-MM-DD)")
+  .refine((value) => {
+    const t = Date.parse(`${value}T00:00:00Z`);
+    return !Number.isNaN(t) && new Date(t).toISOString().slice(0, 10) === value;
+  }, "Not a real calendar date");
+
+/**
+ * ISO 4217 active codes. A currency is a bucket key in every per-currency
+ * total this module reports, so `ZZZ` must not become one: a typo would
+ * split a project's open order value into a bucket nobody can price.
+ */
+export const ISO_4217: ReadonlySet<string> = new Set([
+  "AED", "AFN", "ALL", "AMD", "ANG", "AOA", "ARS", "AUD", "AWG", "AZN",
+  "BAM", "BBD", "BDT", "BGN", "BHD", "BIF", "BMD", "BND", "BOB", "BOV",
+  "BRL", "BSD", "BTN", "BWP", "BYN", "BZD", "CAD", "CDF", "CHE", "CHF",
+  "CHW", "CLF", "CLP", "CNY", "COP", "COU", "CRC", "CUP", "CVE", "CZK",
+  "DJF", "DKK", "DOP", "DZD", "EGP", "ERN", "ETB", "EUR", "FJD", "FKP",
+  "GBP", "GEL", "GHS", "GIP", "GMD", "GNF", "GTQ", "GYD", "HKD", "HNL",
+  "HTG", "HUF", "IDR", "ILS", "INR", "IQD", "IRR", "ISK", "JMD", "JOD",
+  "JPY", "KES", "KGS", "KHR", "KMF", "KPW", "KRW", "KWD", "KYD", "KZT",
+  "LAK", "LBP", "LKR", "LRD", "LSL", "LYD", "MAD", "MDL", "MGA", "MKD",
+  "MMK", "MNT", "MOP", "MRU", "MUR", "MVR", "MWK", "MXN", "MXV", "MYR",
+  "MZN", "NAD", "NGN", "NIO", "NOK", "NPR", "NZD", "OMR", "PAB", "PEN",
+  "PGK", "PHP", "PKR", "PLN", "PYG", "QAR", "RON", "RSD", "RUB", "RWF",
+  "SAR", "SBD", "SCR", "SDG", "SEK", "SGD", "SHP", "SLE", "SLL", "SOS",
+  "SRD", "SSP", "STN", "SVC", "SYP", "SZL", "THB", "TJS", "TMT", "TND",
+  "TOP", "TRY", "TTD", "TWD", "TZS", "UAH", "UGX", "USD", "USN", "UYI",
+  "UYU", "UYW", "UZS", "VED", "VES", "VND", "VUV", "WST", "XAF", "XCD",
+  "XCG", "XDR", "XOF", "XPF", "XSU", "XUA", "YER", "ZAR", "ZMW", "ZWG",
+]);
+
+export const currencyCodeSchema = z
+  .string()
+  .trim()
+  .length(3)
+  .toUpperCase()
+  .refine((code) => ISO_4217.has(code), "Not an ISO 4217 currency code");
 
 export const isoTimestampSchema = z
   .string()
@@ -44,6 +87,23 @@ export const isoTimestampSchema = z
 export const idSchema = z.string().min(1).max(64);
 export const fileIdsSchema = z.array(idSchema).max(200);
 export const countryCodeSchema = z.string().trim().min(2).max(3).toUpperCase();
+
+/**
+ * No register read loads without a ceiling (plan §6.4). Query one row MORE
+ * than the cap: only then does `capped()` know the difference between "the
+ * whole truth, which happens to be exactly the cap" and "there is more".
+ */
+export const ROLLUP_CAP = 5000;
+
+export function capped<T>(rows: T[], label: string, cap: number = ROLLUP_CAP): { rows: T[]; notice: string | null } {
+  if (rows.length > cap) {
+    return {
+      rows: rows.slice(0, cap),
+      notice: `More than ${cap} ${label} on this project: this view reads the first ${cap} and the figures below are a lower bound.`,
+    };
+  }
+  return { rows, notice: null };
+}
 
 export const todayISO = (): string => new Date().toISOString().slice(0, 10);
 export const nowISO = (): string => new Date().toISOString();

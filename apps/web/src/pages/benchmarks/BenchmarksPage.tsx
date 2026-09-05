@@ -8,7 +8,10 @@
  *   · Distributions — the anonymized pool, one cell at a time, with n
  *                  always disclosed and suppression explained, not hidden;
  *   · Compare    — the project's snapshot placed on the distribution its
- *                  company has earned access to.
+ *                  company has earned access to;
+ *   · Reference classes — the outside view (#833-838, #846-849): what
+ *                  comparable projects actually did, as an empirical uplift
+ *                  and exceedance probabilities, storable against a project.
  *
  * The project selection is held here so switching between Snapshots and
  * Compare keeps the same project in hand.
@@ -20,6 +23,7 @@ import { TabBar, projectLabel, useMetrics, useProjects } from "./benchmarksShare
 import CatalogueTab from "./CatalogueTab";
 import CompareTab from "./CompareTab";
 import DistributionsTab from "./DistributionsTab";
+import ReferenceClassesTab from "./ReferenceClassesTab";
 import SnapshotsTab from "./SnapshotsTab";
 
 const TABS = [
@@ -27,6 +31,7 @@ const TABS = [
   { key: "snapshots", label: "Project snapshots" },
   { key: "distributions", label: "Distributions" },
   { key: "compare", label: "Compare" },
+  { key: "reference", label: "Reference classes" },
 ];
 
 export default function BenchmarksPage() {
@@ -112,6 +117,8 @@ export default function BenchmarksPage() {
       ) : null}
 
       {tab === "distributions" ? <DistributionsTab metrics={registry.metrics} /> : null}
+
+      {tab === "reference" ? <ReferenceClassesTab /> : null}
 
       {tab === "compare" ? (
         projectId ? (

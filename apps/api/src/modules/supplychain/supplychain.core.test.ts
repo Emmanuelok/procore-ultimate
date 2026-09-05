@@ -7,6 +7,7 @@ import { and, eq } from "drizzle-orm";
 import {
   companyMemberships,
   entities,
+  ledgerEntries,
   notifications,
   obligations,
   prequalificationFinancials,
@@ -367,6 +368,29 @@ describe("long-lead register", () => {
   });
 
   /*
+   * Regression: an unordered item that loses its order-by date has SATISFIED
+   * nothing. The obligation used to be closed as "satisfied" whenever the
+   * order-by date disappeared, which told the assurance layer an order had
+   * been placed when the item was still sitting at `identified`.
+   */
+  it("waives, never satisfies, the order-by obligation when an unordered item loses its need date", async () => {
+    const res = await post(`/projects/${projectId}/supply-chain/long-lead`, { name: "Roof plant", leadTimeDays: 30, requiredOnSite: addDaysISO(today, 150) });
+    expect(res.statusCode).toBe(201);
+    const itemId = res.json().id as string;
+    const oblId = (await get(`/projects/${projectId}/supply-chain/long-lead/${itemId}`)).json().obligationId as string;
+    expect(oblId).toBeTruthy();
+    const [open] = await app.db.select().from(obligations).where(eq(obligations.id, oblId));
+    expect(open?.status).toBe("open");
+
+    const cleared = await patch(`/projects/${projectId}/supply-chain/long-lead/${itemId}`, { requiredOnSite: null });
+    expect(cleared.statusCode).toBe(200);
+    expect(cleared.json().status).toBe("identified");
+    expect(cleared.json().orderByDate).toBeNull();
+    const [after] = await app.db.select().from(obligations).where(eq(obligations.id, oblId));
+    expect(after?.status).toBe("waived");
+  });
+
+  /*
    * Regression: a delivered item is not "at risk of arriving late". The float
    * rule used to fire on an item already on site whose arrival was only a
    * couple of days ahead of need, painting the register red and chasing the
@@ -475,5 +499,81 @@ describe("just-in-time linkage", () => {
     expect(job.state).toBe("succeeded");
     expect((await signalsFor("supply_jit_conflict")).length).toBe(count);
     expect((await get(`/projects/${projectId}/supply-chain/jit/conflicts`, stranger.headers)).statusCode).toBe(403);
+  });
+
+  it("counts JIT conflicts on health-inputs from the persisted signals, not by re-running the engine", async () => {
+    // WP-INTEL polls health-inputs for every project on every recompute, so
+    // it reads what the sweep already wrote rather than re-loading every
+    // slot, item and unit and re-running the engine per request.
+    const health = await get(`/projects/${projectId}/supply-chain/health-inputs`);
+    expect(health.statusCode).toBe(200);
+    const open = (await signalsFor("supply_jit_conflict")).length;
+    expect(health.json().metrics.jitConflicts).toBe(open);
+    expect(health.json().metrics.jitConflictsCritical).toBeGreaterThanOrEqual(0);
+  });
+});
+
+/* ================================================================== */
+/* Input validation and referential integrity                          */
+/* ================================================================== */
+
+describe("what the register refuses to store", () => {
+  it("refuses an impossible calendar date rather than rolling it over by weeks", async () => {
+    // `2026-02-30` and `2026-13-05` both match the ISO shape; Date.UTC rolls
+    // them into March and the following January, which would move the
+    // order-by date, the float and the late signal with nothing refused.
+    for (const bad of ["2026-02-30", "2026-13-05", "2026-04-31"]) {
+      const res = await post(`/projects/${projectId}/supply-chain/long-lead`, { name: "Bad date", leadTimeDays: 10, requiredOnSite: bad });
+      expect(res.statusCode).toBe(400);
+    }
+    const good = await post(`/projects/${projectId}/supply-chain/long-lead`, { name: "Good date", leadTimeDays: 10, requiredOnSite: "2026-02-28" });
+    expect(good.statusCode).toBe(201);
+    expect(good.json().requiredOnSite).toBe("2026-02-28");
+  });
+
+  it("refuses a currency that is not an ISO 4217 code, so no bucket key is invented", async () => {
+    expect((await post(`/projects/${projectId}/supply-chain/long-lead`, { name: "Fake money", leadTimeDays: 1, value: 100, currency: "ZZZ" })).statusCode).toBe(400);
+    expect((await post(`/projects/${projectId}/supply-chain/nodes`, { name: "Fake money node", currency: "QQQ" })).statusCode).toBe(400);
+    const ok = await post(`/projects/${projectId}/supply-chain/long-lead`, { name: "Real money", leadTimeDays: 1, value: 100, currency: "gbp" });
+    expect(ok.statusCode).toBe(201);
+    expect(ok.json().currency).toBe("GBP");
+  });
+
+  it("guards a node against every register that points at it, and ledgers the links it takes with it", async () => {
+    const node = await post(`/projects/${projectId}/supply-chain/nodes`, { name: "Modular factory", kind: "fabricator", tier: 1, country: "PL" });
+    const nodeId = node.json().id;
+    const other = await post(`/projects/${projectId}/supply-chain/nodes`, { name: "Frame supplier", kind: "manufacturer", tier: 2 });
+    const link = await post(`/projects/${projectId}/supply-chain/links`, { fromNodeId: other.json().id, toNodeId: nodeId, kind: "supplies" });
+    expect(link.statusCode).toBe(201);
+
+    // An offsite unit built at the node is enough to refuse the delete —
+    // the old guard only looked at long-lead items.
+    const unit = await post(`/projects/${projectId}/supply-chain/offsite/units`, { name: "Pod A", unitType: "pod", factoryNodeId: nodeId });
+    expect(unit.statusCode).toBe(201);
+    const refused = await del(`/projects/${projectId}/supply-chain/nodes/${nodeId}`);
+    expect(refused.statusCode).toBe(400);
+    expect(refused.json().message).toMatch(/offsite unit/);
+
+    expect((await del(`/projects/${projectId}/supply-chain/offsite/units/${unit.json().id}`)).statusCode).toBe(204);
+    expect((await del(`/projects/${projectId}/supply-chain/nodes/${nodeId}`)).statusCode).toBe(204);
+    // The cascaded edge is gone from the map AND recorded in the chain.
+    const map = await get(`/projects/${projectId}/supply-chain/map`);
+    expect(map.json().links.some((l: { id: string }) => l.id === link.json().id)).toBe(false);
+    expect(map.json().truncated).toEqual([]);
+    const entries = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(and(eq(ledgerEntries.companyId, owner.companyId), eq(ledgerEntries.objectType, "supply_chain_link"), eq(ledgerEntries.objectId, link.json().id), eq(ledgerEntries.action, "delete")));
+    expect(entries).toHaveLength(1);
+  });
+
+  it("counts unscored nodes as not assessed, never as low risk", async () => {
+    const fresh = await post(`/projects/${projectId}/supply-chain/nodes`, { name: "Never scored", kind: "distributor", tier: 3 });
+    expect(fresh.statusCode).toBe(201);
+    const risk = await get(`/projects/${projectId}/supply-chain/risk`);
+    expect(risk.statusCode).toBe(200);
+    expect(risk.json().summary.not_assessed).toBeGreaterThanOrEqual(1);
+    expect(risk.json().reasons.join(" ")).toMatch(/never been scored/);
+    expect(risk.json().truncated).toEqual([]);
   });
 });

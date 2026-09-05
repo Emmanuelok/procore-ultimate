@@ -3,21 +3,33 @@ import { and, desc, eq } from "drizzle-orm";
 import { z } from "zod";
 import {
   authSecurityEvents,
+  authSessions,
   companies,
   companyMemberships,
+  emailDispatches,
+  emailVerifications,
   projectMemberships,
   projects,
+  securityWebhookDeliveries,
+  userIdentities,
   userInvitations,
+  userMfa,
   users,
 } from "@constructos/db";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
-import { badRequest, conflict, forbidden, notFound, unauthorized } from "../../lib/errors.js";
+import {
+  AppError,
+  badRequest,
+  conflict,
+  forbidden,
+  notFound,
+  unauthorized,
+} from "../../lib/errors.js";
 import { isExpired } from "../../lib/time.js";
 import { emailTransportFor } from "./mailer.js";
-import { recordAuthEvent, recordLegacyAuthEvent } from "./events.js";
+import { addSecurityEventHook, recordAuthEvent, recordLegacyAuthEvent } from "./events.js";
 import {
-  assessPassword,
   hashPassword,
   PASSWORD_MAX_LENGTH,
   PASSWORD_MIN_LENGTH,
@@ -50,6 +62,20 @@ import {
   VERIFICATION_MAX_PER_HOUR,
 } from "./verification.js";
 import { mintToken } from "./tokens.js";
+import {
+  assessPasswordWithPolicy,
+  effectivePolicyForUser,
+  loadCompanyPolicy,
+  policyRules,
+  resolvePolicies,
+  PLATFORM_DEFAULT_POLICY,
+  type ResolvedSecurityPolicy,
+} from "./policy.js";
+import { isPasswordReused, recordPasswordHistory } from "./password-history.js";
+import { applyRetention } from "./retention.js";
+import { registerSecurityRoutes } from "./security-routes.js";
+import { registerScimRoutes } from "./scim.js";
+import { enqueueSecurityEvent, sweepSecurityWebhooks } from "./webhooks.js";
 
 /**
  * Account self-service: email verification, password reset and change, the
@@ -109,16 +135,46 @@ export const accountModule: FastifyPluginAsync = async (app) => {
   /* Password policy — published so a form can apply it before asking  */
   /* ================================================================ */
 
-  app.get("/account/password-policy", async () => ({
-    minLength: PASSWORD_MIN_LENGTH,
-    maxLength: PASSWORD_MAX_LENGTH,
-    rules: [
-      `At least ${PASSWORD_MIN_LENGTH} characters.`,
-      "Not one of the most commonly used passwords.",
-      "Must not contain the local part of your email address.",
-      "Must not be your own name.",
-    ],
-  }));
+  /**
+   * The rules a form must apply before it asks.
+   *
+   * UNAUTHENTICATED, deliberately — the register and accept-invitation pages
+   * need it before anybody has a token. A signed-in caller (bearer present)
+   * gets the rules their own tenants actually impose (#25); an anonymous one
+   * gets the platform floor, because resolving a tenant policy from an email
+   * address supplied by a stranger would turn this into an oracle for "does
+   * this company require twenty characters", which is a fingerprint of the
+   * tenant, not of the caller.
+   */
+  app.get("/account/password-policy", async (req) => {
+    let policy: ResolvedSecurityPolicy = PLATFORM_DEFAULT_POLICY;
+    let scope: "platform" | "tenant" = "platform";
+    const header = req.headers.authorization;
+    if (typeof header === "string" && header.startsWith("Bearer ")) {
+      try {
+        // `authenticate` takes the reply for its declared signature; it never
+        // touches it on the path this route cares about (it either sets
+        // `req.user` or throws).
+        await app.authenticate(req, undefined as never);
+        if (req.user) {
+          policy = await effectivePolicyForUser(app.db, req.user.id);
+          scope = "tenant";
+        }
+      } catch {
+        /* an unusable token simply gets the platform floor */
+      }
+    }
+    return {
+      minLength: policy.passwordMinLength,
+      maxLength: PASSWORD_MAX_LENGTH,
+      requireComplexity: policy.passwordRequireComplexity,
+      historyDepth: policy.passwordHistoryDepth,
+      maxAgeDays: policy.passwordMaxAgeDays,
+      platformMinLength: PASSWORD_MIN_LENGTH,
+      scope,
+      rules: policyRules(policy),
+    };
+  });
 
   /* ================================================================ */
   /* Email verification                                                */
@@ -200,7 +256,14 @@ export const accountModule: FastifyPluginAsync = async (app) => {
   app.post("/auth/verify-email", authLimited, async (req) => {
     const body = z.object({ token: tokenSchema }).parse(req.body);
     const consumed = await consumeVerificationToken(app, body.token, requestContext(req));
-    return { verified: true, email: consumed.email, purpose: consumed.purpose };
+    return {
+      verified: true,
+      email: consumed.email,
+      purpose: consumed.purpose,
+      // The page says "the address change is now in force" for an
+      // `email_change` token; it may only say so when this is true.
+      emailChanged: consumed.emailChanged,
+    };
   });
 
   /* ================================================================ */
@@ -280,16 +343,52 @@ export const accountModule: FastifyPluginAsync = async (app) => {
     if (body.newPassword === body.currentPassword) {
       throw badRequest("The new password must be different from the current one.");
     }
-    const assessment = assessPassword(body.newPassword, {
-      email: user.email,
-      name: user.name,
-    });
+    // #25 — the tenant's rules on top of the platform's, strictest across
+    // every company this account belongs to.
+    const policy = await effectivePolicyForUser(app.db, user.id);
+    const assessment = assessPasswordWithPolicy(
+      body.newPassword,
+      { email: user.email, name: user.name },
+      policy,
+    );
     if (!assessment.ok) {
       throw badRequest("Password does not meet the password policy.", {
         reasons: assessment.reasons,
       });
     }
+    const reuse = await isPasswordReused(
+      app.db,
+      user.id,
+      body.newPassword,
+      policy.passwordHistoryDepth,
+      user.passwordHash,
+    );
+    if (reuse.reused) {
+      await recordAuthEvent(app.db, {
+        kind: "password_reuse_refused",
+        outcome: "blocked",
+        userId: user.id,
+        email: user.email,
+        sessionId: req.accountSessionId ?? null,
+        ip: ctx.ip,
+        userAgent: ctx.userAgent,
+        reason: reuse.reason,
+        metadata: { checked: reuse.checked, depth: policy.passwordHistoryDepth },
+      });
+      throw badRequest("Password does not meet the password policy.", {
+        reasons: [reuse.reason ?? "That password has been used on this account before."],
+      });
+    }
 
+    // Retain the hash being replaced BEFORE replacing it — afterwards it is
+    // gone and the history is a hash short for ever.
+    await recordPasswordHistory(
+      app.db,
+      user.id,
+      user.passwordHash,
+      "changed",
+      policy.passwordHistoryDepth,
+    );
     await app.db
       .update(users)
       .set({
@@ -423,6 +522,213 @@ export const accountModule: FastifyPluginAsync = async (app) => {
     };
   });
 
+  /**
+   * §0.2 #45 — THE DATA-SUBJECT EXPORT.
+   *
+   * Everything this platform's authentication layer holds about the caller, in
+   * one JSON document they can keep: the account row, the tenants they belong
+   * to, every device session, every linked identity provider, the second-factor
+   * state, the full security trail, the messages sent to them and any
+   * invitation issued to their address.
+   *
+   * WHAT IS DELIBERATELY NOT IN IT, and why saying so matters more than the
+   * omission: no password hash, no TOTP seed, no recovery-code hash, no
+   * refresh token and no session token. An export is a document that will be
+   * mailed to somebody and left in a downloads folder; putting a credential in
+   * it would turn a transparency feature into a second copy of the thing the
+   * platform hashes everything to avoid holding.
+   *
+   * It is a READ, and it is ledgered as one in every company the caller
+   * belongs to: an export is the moment an account's whole history leaves the
+   * platform, and that is precisely the kind of access the chain exists to
+   * record.
+   */
+  app.get("/account/export", { preHandler: signedIn }, async (req) => {
+    const actor = req.user!;
+    const nowIso = new Date().toISOString();
+    const [account] = await app.db
+      .select({
+        id: users.id,
+        email: users.email,
+        name: users.name,
+        isActive: users.isActive,
+        title: users.title,
+        phone: users.phone,
+        createdAt: users.createdAt,
+        lastLoginAt: users.lastLoginAt,
+      })
+      .from(users)
+      .where(eq(users.id, actor.id))
+      .limit(1);
+
+    // Address verification lives in `email_verifications`, not in a column on
+    // `users` — the proof is the row, and an export that invented a
+    // `verifiedAt` field would be asserting something the schema does not
+    // hold. Only what was proved and when; never the token.
+    const verifications = await app.db
+      .select({
+        email: emailVerifications.email,
+        purpose: emailVerifications.purpose,
+        createdAt: emailVerifications.createdAt,
+        consumedAt: emailVerifications.consumedAt,
+        expiresAt: emailVerifications.expiresAt,
+      })
+      .from(emailVerifications)
+      .where(eq(emailVerifications.userId, actor.id))
+      .orderBy(desc(emailVerifications.createdAt))
+      .limit(100);
+
+    const memberships = await app.db
+      .select({
+        companyId: companyMemberships.companyId,
+        role: companyMemberships.role,
+        createdAt: companyMemberships.createdAt,
+        companyName: companies.name,
+      })
+      .from(companyMemberships)
+      .leftJoin(companies, eq(companies.id, companyMemberships.companyId))
+      .where(eq(companyMemberships.userId, actor.id));
+
+    const sessions = await app.db
+      .select({
+        id: authSessions.id,
+        createdAt: authSessions.createdAt,
+        lastSeenAt: authSessions.lastSeenAt,
+        expiresAt: authSessions.expiresAt,
+        revokedAt: authSessions.revokedAt,
+        revokedReason: authSessions.revokedReason,
+        ip: authSessions.ip,
+        userAgent: authSessions.userAgent,
+        deviceLabel: authSessions.deviceLabel,
+        authMethod: authSessions.authMethod,
+      })
+      .from(authSessions)
+      .where(eq(authSessions.userId, actor.id))
+      .orderBy(desc(authSessions.createdAt))
+      .limit(500);
+
+    const identities = await app.db
+      .select({
+        id: userIdentities.id,
+        providerId: userIdentities.providerId,
+        externalSubject: userIdentities.externalSubject,
+        emailAtLink: userIdentities.emailAtLink,
+        linkedAt: userIdentities.linkedAt,
+        lastLoginAt: userIdentities.lastLoginAt,
+      })
+      .from(userIdentities)
+      .where(eq(userIdentities.userId, actor.id));
+
+    const factors = await app.db
+      .select({
+        id: userMfa.id,
+        method: userMfa.method,
+        status: userMfa.status,
+        confirmedAt: userMfa.confirmedAt,
+        disabledAt: userMfa.disabledAt,
+        lastUsedAt: userMfa.lastUsedAt,
+      })
+      .from(userMfa)
+      .where(eq(userMfa.userId, actor.id));
+
+    const trail = await app.db
+      .select()
+      .from(authSecurityEvents)
+      .where(eq(authSecurityEvents.userId, actor.id))
+      .orderBy(desc(authSecurityEvents.at))
+      .limit(2000);
+
+    const messages = await app.db
+      .select({
+        id: emailDispatches.id,
+        template: emailDispatches.template,
+        toEmail: emailDispatches.toEmail,
+        subject: emailDispatches.subject,
+        status: emailDispatches.status,
+        transport: emailDispatches.transport,
+        dispatchedAt: emailDispatches.dispatchedAt,
+        createdAt: emailDispatches.createdAt,
+      })
+      .from(emailDispatches)
+      .where(eq(emailDispatches.userId, actor.id))
+      .orderBy(desc(emailDispatches.createdAt))
+      .limit(500);
+
+    const invitations = account
+      ? await app.db
+          .select({
+            id: userInvitations.id,
+            companyId: userInvitations.companyId,
+            role: userInvitations.role,
+            status: userInvitations.status,
+            createdAt: userInvitations.createdAt,
+            expiresAt: userInvitations.expiresAt,
+            acceptedAt: userInvitations.acceptedAt,
+          })
+          .from(userInvitations)
+          .where(eq(userInvitations.email, account.email))
+          .limit(200)
+      : [];
+
+    for (const membership of memberships) {
+      await appendLedger(app.db, {
+        companyId: membership.companyId,
+        actorId: actor.id,
+        action: "access",
+        objectType: "account_export",
+        objectId: actor.id,
+        payload: {
+          at: nowIso,
+          sessions: sessions.length,
+          trailRows: trail.length,
+          messages: messages.length,
+        },
+        storePayload: true,
+      });
+    }
+    await recordAuthEvent(app.db, {
+      kind: "account_export",
+      userId: actor.id,
+      email: account?.email ?? actor.email,
+      ...requestContext(req),
+      reason: "The account holder exported everything the authentication layer holds about them.",
+      metadata: { trailRows: trail.length, sessions: sessions.length },
+    });
+
+    return {
+      generatedAt: nowIso,
+      subject: account ?? null,
+      memberships,
+      sessions,
+      identities,
+      emailVerifications: verifications,
+      mfaFactors: factors,
+      securityTrail: trail.map((row) => ({
+        id: row.id,
+        kind: row.kind,
+        outcome: row.outcome,
+        at: row.at,
+        companyId: row.companyId,
+        ip: row.ip,
+        userAgent: row.userAgent,
+        reason: row.reason,
+        metadata: row.metadata,
+      })),
+      messages,
+      invitations,
+      excluded: [
+        "Password hashes, TOTP seeds and recovery-code hashes are never exported: they are credentials, not records about you.",
+        "Session and refresh tokens are not exported; the session list describes the devices, not the tokens.",
+        "Records outside authentication — projects, documents, financials — are exported by the company data export, not this one.",
+      ],
+      truncated: {
+        securityTrail: trail.length === 2000,
+        sessions: sessions.length === 500,
+        messages: messages.length === 500,
+      },
+    };
+  });
+
   /* ================================================================ */
   /* Invitations — the public accept flow                              */
   /* ================================================================ */
@@ -526,88 +832,96 @@ export const accountModule: FastifyPluginAsync = async (app) => {
       .from(users)
       .where(eq(users.email, invitation.email))
       .limit(1);
-    const claimable = !existing || (await invitationCreatedAccount(app, invitation));
 
     // The segregation rule: nobody accepts their own invitation into a role.
     if (existing && existing.id === invitation.invitedBy) {
       throw forbidden("The person who sent this invitation cannot accept it.");
     }
 
+    /*
+     * ORDER OF OPERATIONS — the whole point of this rewrite.
+     *
+     * The original wrote the user row, the company membership and every
+     * project membership FIRST, and spent the invitation LAST. Two clicks on
+     * one link therefore both got as far as inserting a user: the second
+     * violated `users_email_uq` and surfaced as a 500 instead of the intended
+     * 409, and for an existing account the membership was created even when
+     * the claim then failed — leaving a membership attached to an invitation
+     * the register shows as accepted by somebody else.
+     *
+     * So: everything expensive and refusable (the password policy, the reuse
+     * check, the bcrypt hash) happens BEFORE the transaction, and the
+     * transaction CLAIMS THE INVITATION FIRST. A loser of the race changes
+     * nothing at all, because its conditional UPDATE matches no row and the
+     * whole transaction rolls back.
+     */
+    const claimable = !existing || (await invitationCreatedAccount(app, invitation));
+    const nowIso = new Date(nowMs).toISOString();
+
     let userId: string;
     let userName: string;
     let userEmail = invitation.email;
     let passwordSet = false;
+    let newPasswordHash: string | null = null;
+    let previousHash: string | null = null;
+    let historyDepth = 0;
 
-    if (!existing) {
+    if (claimable) {
+      const target = existing ?? null;
       if (!body.password) {
         throw badRequest("Choose a password to accept this invitation.", {
           reasons: ["password is required"],
         });
       }
-      const assessment = assessPassword(body.password, {
-        email: invitation.email,
-        name: body.name ?? invitation.name,
-      });
+      // #25 — the inviting company's policy governs the password the invitee
+      // chooses. For an account that already exists, every company it belongs
+      // to has a say; strictest wins.
+      const policy = target
+        ? await effectivePolicyForUser(app.db, target.id)
+        : resolvePolicies([await loadCompanyPolicy(app.db, invitation.companyId)]);
+      const assessment = assessPasswordWithPolicy(
+        body.password,
+        {
+          email: target?.email ?? invitation.email,
+          name: body.name ?? target?.name ?? invitation.name,
+        },
+        policy,
+      );
       if (!assessment.ok) {
         throw badRequest("Password does not meet the password policy.", {
           reasons: assessment.reasons,
         });
       }
-      userId = newId("u");
-      userName = body.name ?? invitation.name ?? invitation.email;
-      await app.db.insert(users).values({
-        id: userId,
-        email: invitation.email,
-        name: userName,
-        passwordHash: await hashPassword(app.appConfig, body.password),
-      });
-      passwordSet = true;
-    } else if (claimable) {
-      if (!body.password) {
-        throw badRequest("Choose a password to accept this invitation.", {
-          reasons: ["password is required"],
-        });
+      if (target) {
+        const reuse = await isPasswordReused(
+          app.db,
+          target.id,
+          body.password,
+          policy.passwordHistoryDepth,
+          target.passwordHash,
+        );
+        if (reuse.reused) {
+          throw badRequest("Password does not meet the password policy.", {
+            reasons: [reuse.reason ?? "That password has been used on this account before."],
+          });
+        }
+        previousHash = target.passwordHash;
+        historyDepth = policy.passwordHistoryDepth;
       }
-      const assessment = assessPassword(body.password, {
-        email: existing.email,
-        name: body.name ?? existing.name,
-      });
-      if (!assessment.ok) {
-        throw badRequest("Password does not meet the password policy.", {
-          reasons: assessment.reasons,
-        });
-      }
-      userId = existing.id;
-      userName = body.name ?? existing.name;
-      userEmail = existing.email;
-      await app.db
-        .update(users)
-        .set({
-          passwordHash: await hashPassword(app.appConfig, body.password),
-          name: userName,
-          updatedAt: new Date(nowMs).toISOString(),
-        })
-        .where(eq(users.id, existing.id));
+      newPasswordHash = await hashPassword(app.appConfig, body.password);
       passwordSet = true;
-      // The administrator was handed a temporary password for this account.
-      // Setting a real one is the moment that credential stops working, so
-      // anything already signed in with it is cut off here.
-      await revokeAllUserSessions(app.db, existing.id, {
-        reason: "password_changed",
-        byUser: true,
-        actorId: existing.id,
-        includeOrphanTokens: true,
-        nowMs,
-      });
+      userId = target?.id ?? newId("u");
+      userName = body.name ?? target?.name ?? invitation.name ?? invitation.email;
+      userEmail = target?.email ?? invitation.email;
     } else {
       // Pre-existing account: prove it before it joins anything.
-      if (!body.password || !(await verifyPassword(body.password, existing.passwordHash))) {
+      if (!body.password || !(await verifyPassword(body.password, existing!.passwordHash))) {
         await recordAuthEvent(app.db, {
           kind: "invitation_accepted",
           outcome: "failure",
           companyId: invitation.companyId,
-          userId: existing.id,
-          email: existing.email,
+          userId: existing!.id,
+          email: existing!.email,
           ip: ctx.ip,
           userAgent: ctx.userAgent,
           reason: "existing_account_password_required",
@@ -617,90 +931,134 @@ export const accountModule: FastifyPluginAsync = async (app) => {
           "This address already has an account. Provide its current password to accept.",
         );
       }
-      userId = existing.id;
-      userName = existing.name;
-      userEmail = existing.email;
+      userId = existing!.id;
+      userName = existing!.name;
+      userEmail = existing!.email;
     }
 
-    // Bind the membership and the role the invitation carries.
-    const [membership] = await app.db
-      .select()
-      .from(companyMemberships)
-      .where(
-        and(
-          eq(companyMemberships.companyId, invitation.companyId),
-          eq(companyMemberships.userId, userId),
-        ),
-      )
-      .limit(1);
-    if (membership) {
-      if (membership.role !== invitation.role) {
-        await app.db
-          .update(companyMemberships)
-          .set({ role: invitation.role })
-          .where(eq(companyMemberships.id, membership.id));
-      }
-    } else {
-      await app.db.insert(companyMemberships).values({
-        id: newId("cm"),
-        companyId: invitation.companyId,
-        userId,
-        role: invitation.role,
-      });
-    }
-
-    // Project access, when the invitation named projects and a template.
     const boundProjects: string[] = [];
-    if (invitation.templateKey && invitation.projectIds.length > 0) {
-      for (const projectId of invitation.projectIds) {
-        const [project] = await app.db
-          .select({ id: projects.id })
-          .from(projects)
+    try {
+      await app.db.transaction(async (tx) => {
+        // 1. SPEND THE INVITATION. The conditional update on `status =
+        //    pending` is the lock: exactly one concurrent accept changes a row.
+        const claimed = await tx
+          .update(userInvitations)
+          .set({
+            status: "accepted",
+            acceptedAt: nowIso,
+            acceptedUserId: userId,
+            updatedAt: nowIso,
+          })
           .where(
-            and(eq(projects.id, projectId), eq(projects.companyId, invitation.companyId)),
+            and(eq(userInvitations.id, invitation.id), eq(userInvitations.status, "pending")),
           )
-          .limit(1);
-        if (!project) continue;
-        const [pm] = await app.db
-          .select({ id: projectMemberships.id })
-          .from(projectMemberships)
+          .returning({ id: userInvitations.id });
+        if (claimed.length === 0) {
+          throw conflict("This invitation has already been accepted.");
+        }
+
+        // 2. The account.
+        if (!existing) {
+          await tx.insert(users).values({
+            id: userId,
+            email: invitation.email,
+            name: userName,
+            passwordHash: newPasswordHash!,
+          });
+        } else if (newPasswordHash) {
+          await tx
+            .update(users)
+            .set({ passwordHash: newPasswordHash, name: userName, updatedAt: nowIso })
+            .where(eq(users.id, userId));
+        }
+
+        // 3. The company membership and the role the invitation carries.
+        const [membership] = await tx
+          .select()
+          .from(companyMemberships)
           .where(
             and(
-              eq(projectMemberships.projectId, projectId),
-              eq(projectMemberships.userId, userId),
+              eq(companyMemberships.companyId, invitation.companyId),
+              eq(companyMemberships.userId, userId),
             ),
           )
           .limit(1);
-        if (pm) continue;
-        await app.db.insert(projectMemberships).values({
-          id: newId("pm"),
-          companyId: invitation.companyId,
-          projectId,
-          userId,
-          templateKey: invitation.templateKey,
-        });
-        boundProjects.push(projectId);
+        if (membership) {
+          if (membership.role !== invitation.role) {
+            await tx
+              .update(companyMemberships)
+              .set({ role: invitation.role })
+              .where(eq(companyMemberships.id, membership.id));
+          }
+        } else {
+          await tx.insert(companyMemberships).values({
+            id: newId("cm"),
+            companyId: invitation.companyId,
+            userId,
+            role: invitation.role,
+          });
+        }
+
+        // 4. Project access, when the invitation named projects and a template.
+        const templateKey = invitation.templateKey;
+        if (templateKey && invitation.projectIds.length > 0) {
+          for (const projectId of invitation.projectIds) {
+            const [project] = await tx
+              .select({ id: projects.id })
+              .from(projects)
+              .where(and(eq(projects.id, projectId), eq(projects.companyId, invitation.companyId)))
+              .limit(1);
+            if (!project) continue;
+            const [pm] = await tx
+              .select({ id: projectMemberships.id })
+              .from(projectMemberships)
+              .where(
+                and(
+                  eq(projectMemberships.projectId, projectId),
+                  eq(projectMemberships.userId, userId),
+                ),
+              )
+              .limit(1);
+            if (pm) continue;
+            await tx.insert(projectMemberships).values({
+              id: newId("pm"),
+              companyId: invitation.companyId,
+              projectId,
+              userId,
+              templateKey,
+            });
+            boundProjects.push(projectId);
+          }
+        }
+      });
+    } catch (err) {
+      if (err instanceof AppError) throw err;
+      // A unique violation from a genuinely concurrent registration of the
+      // same address is a conflict, not an internal error.
+      const message = err instanceof Error ? err.message : String(err);
+      if (/unique|duplicate/i.test(message)) {
+        throw conflict(
+          "That address was registered while this invitation was being accepted. Sign in instead.",
+        );
       }
+      throw err;
     }
 
-    // Single use, enforced by the update itself: two simultaneous clicks
-    // cannot both win, because only one of them changes a pending row.
-    const claimed = await app.db
-      .update(userInvitations)
-      .set({
-        status: "accepted",
-        acceptedAt: new Date(nowMs).toISOString(),
-        acceptedUserId: userId,
-        updatedAt: new Date(nowMs).toISOString(),
-      })
-      .where(
-        and(eq(userInvitations.id, invitation.id), eq(userInvitations.status, "pending")),
-      )
-      .returning({ id: userInvitations.id });
-    if (claimed.length === 0) {
-      throw conflict("This invitation has already been accepted.");
+    if (previousHash && newPasswordHash) {
+      await recordPasswordHistory(app.db, userId, previousHash, "invitation", historyDepth);
     }
-
+    if (existing && newPasswordHash) {
+      // The administrator was handed a temporary password for this account.
+      // Setting a real one is the moment that credential stops working, so
+      // anything already signed in with it is cut off here.
+      await revokeAllUserSessions(app.db, userId, {
+        reason: "password_changed",
+        byUser: true,
+        actorId: userId,
+        includeOrphanTokens: true,
+        nowMs,
+      });
+    }
     await appendLedger(app.db, {
       companyId: invitation.companyId,
       actorId: userId,
@@ -887,4 +1245,239 @@ export const accountModule: FastifyPluginAsync = async (app) => {
     });
     return { invitation: invitationView(revoked ?? invitation) };
   });
+
+  /* ================================================================ */
+  /* Changing the address on the account                               */
+  /* ================================================================ */
+
+  /**
+   * Start an email change.
+   *
+   * `EMAIL_VERIFICATION_PURPOSES` has advertised `email_change` since the
+   * table was written, and `VerifyEmailPage` told the user "the address change
+   * on this account is now in force" — while nothing minted such a token and
+   * nothing changed an address. The page asserted a change that had not
+   * happened. This route is the missing half; `consumeVerificationToken` now
+   * applies it (see verification.ts).
+   *
+   * THE ORDER MATTERS: `users.email` is not touched here. The new address is
+   * proved first and applied on consumption, so a typo cannot lock anybody out
+   * of their own account — which is exactly why `email_verifications.email`
+   * holds the address BEING PROVED rather than the account's current one.
+   */
+  app.post("/account/email", { preHandler: signedIn }, async (req, reply) => {
+    const body = z.object({ email: emailSchema, password: passwordSchema }).parse(req.body);
+    const ctx = requestContext(req);
+    const [user] = await app.db.select().from(users).where(eq(users.id, req.user!.id)).limit(1);
+    if (!user) throw unauthorized("Unknown user");
+    // The current password, because an address is the recovery channel: a
+    // hijacked session that could move it owns the account for ever.
+    if (!(await verifyPassword(body.password, user.passwordHash))) {
+      await recordAuthEvent(app.db, {
+        kind: "email_change_requested",
+        outcome: "failure",
+        userId: user.id,
+        email: user.email,
+        ip: ctx.ip,
+        userAgent: ctx.userAgent,
+        reason: "current_password_incorrect",
+      });
+      throw unauthorized("Current password is incorrect");
+    }
+    if (body.email === user.email) {
+      throw badRequest("That is already the address on this account.");
+    }
+    const [taken] = await app.db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.email, body.email))
+      .limit(1);
+    if (taken) {
+      // Deliberately explicit: the caller has already proved they hold THIS
+      // account with a password, so this is not an enumeration oracle a
+      // stranger can reach, and "your change silently did nothing" is worse.
+      throw conflict("Another account already uses that address.");
+    }
+    const started = await startEmailVerification(app, ctx, {
+      userId: user.id,
+      email: body.email,
+      name: user.name,
+      purpose: "email_change",
+    });
+    return reply.status(202).send({
+      status: started.status,
+      pendingEmail: body.email,
+      currentEmail: user.email,
+      expiresAt: started.expiresAt,
+      delivery: started.delivery,
+      verifyUrl: started.verifyUrl,
+      reasons: [
+        "The address on the account does not change until the link in that message is opened.",
+        ...started.reasons,
+      ],
+    });
+  });
+
+  /** What change, if any, is waiting to be proved. */
+  app.get("/account/email/pending", { preHandler: signedIn }, async (req) => {
+    const nowMs = Date.now();
+    const rows = await app.db
+      .select()
+      .from(emailVerifications)
+      .where(
+        and(
+          eq(emailVerifications.userId, req.user!.id),
+          eq(emailVerifications.purpose, "email_change"),
+        ),
+      )
+      .orderBy(desc(emailVerifications.createdAt))
+      .limit(5);
+    const live = rows.find((r) => !r.consumedAt && !isExpired(r.expiresAt, nowMs));
+    return {
+      pending: live ? { email: live.email, expiresAt: live.expiresAt, requestedAt: live.createdAt } : null,
+      history: rows.map((r) => ({
+        email: r.email,
+        requestedAt: r.createdAt,
+        consumedAt: r.consumedAt,
+        expiresAt: r.expiresAt,
+      })),
+    };
+  });
+
+  /* ================================================================ */
+  /* Company security administration and SCIM                          */
+  /* ================================================================ */
+
+  registerSecurityRoutes(app);
+  registerScimRoutes(app);
+
+  /* ================================================================ */
+  /* Scheduled work                                                    */
+  /*                                                                   */
+  /* Everything here used to happen only when somebody opened the page  */
+  /* that called the sweep. A platform whose product is the durability  */
+  /* of its record cannot leave session expiry to a browser tab.        */
+  /* ================================================================ */
+
+  // The trail feeds the tenant's SIEM. Registered here rather than at module
+  // scope so the subscription belongs to this app instance's lifetime.
+  const removeHook = addSecurityEventHook(async (db, event) => {
+    await enqueueSecurityEvent(db, {
+      id: event.id,
+      kind: event.kind,
+      outcome: event.outcome ?? "success",
+      at: event.at,
+      companyId: event.companyId ?? null,
+      userId: event.userId ?? null,
+      email: event.email ?? null,
+      sessionId: event.sessionId ?? null,
+      providerId: event.providerId ?? null,
+      ip: event.ip ?? null,
+      userAgent: event.userAgent ?? null,
+      reason: event.reason ?? null,
+      metadata: event.metadata ?? {},
+    });
+  });
+  app.addHook("onClose", async () => {
+    removeHook();
+  });
+
+  app.scheduler.register({
+    name: "account.session-sweep",
+    description:
+      "Mark sessions past their absolute lifetime as expired, and expire invitations nobody accepted",
+    everyMs: 15 * 60_000,
+    runOnBoot: true,
+    run: async ({ db, now }) => {
+      const nowMs = now.getTime();
+      const { authSessions } = await import("@constructos/db");
+      const { isNull, lte: lteOp } = await import("drizzle-orm");
+      const stale = await db
+        .select({ id: authSessions.id })
+        .from(authSessions)
+        .where(
+          and(isNull(authSessions.revokedAt), lteOp(authSessions.expiresAt, now.toISOString())),
+        )
+        .limit(5000);
+      const sessions = await revokeSessions(db, stale.map((r) => r.id), {
+        reason: "expired",
+        byUser: false,
+        actorId: null,
+        nowMs,
+      });
+      const invitations = await forEachCompanySweep(async (companyId) =>
+        sweepExpiredInvitations(app, companyId, nowMs),
+      );
+      return { sessionsExpired: sessions, invitationsExpired: invitations };
+    },
+  });
+
+  app.scheduler.register({
+    name: "account.security-webhooks",
+    description: "Deliver queued security events to tenant SIEM endpoints, with backoff",
+    everyMs: 60_000,
+    run: async () => sweepSecurityWebhooks(app, { limit: 200 }),
+  });
+
+  app.scheduler.register({
+    name: "account.trail-retention",
+    description:
+      "Apply each tenant's authentication-record retention policy: pseudonymise the trail, delete the message log, skip anyone on legal hold",
+    everyMs: 24 * 3600_000,
+    run: async ({ db, now }) => {
+      const rows = await db.select({ id: companies.id }).from(companies);
+      let pseudonymised = 0;
+      let deleted = 0;
+      let held = 0;
+      for (const row of rows) {
+        try {
+          const outcome = await applyRetention(db, row.id, { nowMs: now.getTime() });
+          if (outcome.skipped) {
+            held += 1;
+            continue;
+          }
+          pseudonymised += outcome.securityEventsPseudonymised;
+          deleted += outcome.emailDispatchesDeleted;
+        } catch {
+          /* one tenant's retention must not stop the rest */
+        }
+      }
+      return { pseudonymised, deleted, skipped: held };
+    },
+  });
+
+  app.scheduler.register({
+    name: "account.webhook-retention",
+    description: "Drop security-webhook delivery records older than 30 days",
+    everyMs: 24 * 3600_000,
+    run: async ({ db, now }) => {
+      const cutoff = new Date(now.getTime() - 30 * 24 * 3600_000).toISOString();
+      const { lte: lteOp } = await import("drizzle-orm");
+      const doomed = await db
+        .select({ id: securityWebhookDeliveries.id })
+        .from(securityWebhookDeliveries)
+        .where(lteOp(securityWebhookDeliveries.createdAt, cutoff))
+        .limit(5000);
+      if (doomed.length === 0) return { deleted: 0 };
+      const { inArray: inArrayOp } = await import("drizzle-orm");
+      await db
+        .delete(securityWebhookDeliveries)
+        .where(inArrayOp(securityWebhookDeliveries.id, doomed.map((d) => d.id)));
+      return { deleted: doomed.length };
+    },
+  });
+
+  /** Run `fn` for every company, summing what each returns. */
+  async function forEachCompanySweep(fn: (companyId: string) => Promise<number>): Promise<number> {
+    const rows = await app.db.select({ id: companies.id }).from(companies);
+    let total = 0;
+    for (const row of rows) {
+      try {
+        total += await fn(row.id);
+      } catch {
+        /* one tenant's sweep must not stop the rest */
+      }
+    }
+    return total;
+  }
 };

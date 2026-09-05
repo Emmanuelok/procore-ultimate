@@ -271,7 +271,7 @@ export function coerceTelematicsRow(
  *  index on the table, so a replayed push collides rather than doubling —
  *  this function exists so the in-batch dedupe uses the identical key. */
 export function telematicsKey(providerKey: string, deviceId: string, recordedAt: string): string {
-  return `${providerKey} ${deviceId} ${new Date(recordedAt).toISOString()}`;
+  return `${providerKey}\u0000${deviceId}\u0000${new Date(recordedAt).toISOString()}`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -401,6 +401,8 @@ export interface EquipmentReconcileInput {
   currency: string;
   hireRateAmount: number | null;
   hireRateUnit: HireRateUnit | null;
+  /** owned plant's internal charge-out rate, per hour (#714) */
+  internalRateAmount?: number | null;
   operatorRateAmount: number | null;
   days: TelematicsDayInput[];
 }
@@ -557,10 +559,19 @@ export function reconcileEquipment(input: EquipmentReconcileInput): EquipmentRec
       .reduce((s, d) => s + (d.varianceHours ?? 0), 0),
   );
   if (unsupportedHours > 0) {
-    if (input.hireRateUnit === "hour" && input.hireRateAmount !== null) {
-      valueAtRisk = round2(
-        unsupportedHours * (input.hireRateAmount + (input.operatorRateAmount ?? 0)),
-      );
+    const hourlyRate =
+      input.hireRateUnit === "hour" && input.hireRateAmount !== null
+        ? input.hireRateAmount
+        : (input.internalRateAmount ?? null);
+    if (hourlyRate !== null) {
+      valueAtRisk = round2(unsupportedHours * (hourlyRate + (input.operatorRateAmount ?? 0)));
+      if (input.hireRateUnit !== "hour" || input.hireRateAmount === null) {
+        reasons.push(
+          "this machine carries no hourly hire rate, so the unsupported hours are priced at its " +
+            "internal charge-out rate — the right basis for an owned machine and the wrong one for " +
+            "a claim against a hire company",
+        );
+      }
       if (input.operatorRateAmount === null) {
         reasons.push(
           "no operator rate is recorded, so the value at risk covers plant hire only — the " +
@@ -637,5 +648,391 @@ export function reconcileTelematics(
       daysCompared: rows.reduce((s, r) => s + r.daysCompared, 0),
     },
     rows,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Day hours across midnight, geofence, fuel and faults                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A day's engine hours computed the way a cumulative counter actually
+ * behaves: the LAST reading on or before the end of the day, minus the last
+ * reading on or before the start of it (which is normally the previous day's
+ * final reading).
+ *
+ * `engineHoursFromCounter` — last-minus-first WITHIN a calendar day — is
+ * correct only for a device that brackets the shift. It systematically
+ * under-counts everything else: a device reporting once a day yields null
+ * every day, one reporting at 08:00 and 17:00 credits 9 hours of a 07:00-18:00
+ * day, and anything running between the last reading of day N and the first
+ * of day N+1 is lost entirely. Under the 1h + 15% tolerance that produces
+ * persistent "unsupported hours" findings against honest plant sheets, which
+ * is worse than having no reconciliation at all.
+ *
+ * `openingReading` is the last reading strictly before the day began; pass
+ * null when the feed does not go back that far, and the function falls back
+ * to within-day last-minus-first and says so.
+ */
+export function engineHoursForDay(input: {
+  /** the last reading at or before `${date}T00:00:00Z` */
+  openingReading: CounterReading | null;
+  /** every reading inside the day, in any order */
+  dayReadings: CounterReading[];
+}): CounterDelta {
+  const inside = input.dayReadings
+    .filter((r): r is CounterReading & { engineHours: number } => r.engineHours !== null)
+    .sort((a, b) => Date.parse(a.recordedAt) - Date.parse(b.recordedAt));
+  const opening =
+    input.openingReading && input.openingReading.engineHours !== null
+      ? (input.openingReading as CounterReading & { engineHours: number })
+      : null;
+
+  if (inside.length === 0) {
+    return {
+      hours: null,
+      firstAt: opening?.recordedAt ?? null,
+      lastAt: null,
+      samples: opening ? 1 : 0,
+      reasons: [
+        opening
+          ? "the counter did not report at all on this day, so the machine either did not run or " +
+            "the device was offline — the two are not distinguishable from this feed"
+          : "no telematics reading on or before this day carried an engine-hour counter",
+      ],
+    };
+  }
+  const closing = inside[inside.length - 1]!;
+  const start = opening ?? inside[0]!;
+  if (!opening) {
+    // No carry-in point: fall back to within-day, and say what was lost.
+    const fallback = engineHoursFromCounter(inside);
+    return {
+      ...fallback,
+      reasons: [
+        ...fallback.reasons,
+        "no reading exists before this day, so the hours are measured between the first and last " +
+          "reading INSIDE it — any running before the first reading is not counted",
+      ],
+    };
+  }
+  const delta = round4(closing.engineHours - start.engineHours);
+  if (delta < 0) {
+    return {
+      hours: null,
+      firstAt: start.recordedAt,
+      lastAt: closing.recordedAt,
+      samples: inside.length + 1,
+      reasons: [
+        `the engine-hour counter fell from ${start.engineHours} to ${closing.engineHours} — the ` +
+          "unit was reset or replaced, so the hours actually worked cannot be recovered",
+      ],
+    };
+  }
+  return {
+    hours: delta,
+    firstAt: start.recordedAt,
+    lastAt: closing.recordedAt,
+    samples: inside.length + 1,
+    reasons: [],
+  };
+}
+
+/**
+ * How far back the series will look for a carry-in reading before the first
+ * day of the window. Beyond this the opening is treated as unknown and the
+ * day falls back to within-day last-minus-first, saying so.
+ */
+export const CARRY_IN_LOOKBACK_DAYS = 7;
+
+/** A reading's LOCAL date, given the site's offset from UTC in minutes. */
+export function localDateOf(timestamp: string, tzOffsetMinutes = 0): IsoDate {
+  return new Date(Date.parse(timestamp) + tzOffsetMinutes * 60_000)
+    .toISOString()
+    .slice(0, 10);
+}
+
+/** The UTC instant at which a LOCAL date begins, in milliseconds. */
+export function localDayStartMs(date: IsoDate, tzOffsetMinutes = 0): number {
+  return Date.parse(`${date}T00:00:00.000Z`) - tzOffsetMinutes * 60_000;
+}
+
+export interface DayHours {
+  date: IsoDate;
+  delta: CounterDelta;
+}
+
+/**
+ * A window of days, each costed by `engineHoursForDay`, with every day's
+ * opening reading taken from the feed BEFORE that day began — which for the
+ * second day onwards is the previous day's final reading.
+ *
+ * This is the difference between a reconciliation that can be trusted and
+ * one that cannot. Grouping readings by calendar day and taking last-minus-
+ * first inside each group loses every hour the machine ran between the last
+ * reading of one day and the first of the next, yields NULL for any device
+ * that reports once a day, and credits nine hours of an eleven-hour day to a
+ * device that reports at 08:00 and 17:00. Each of those under-counts, and an
+ * under-count here is a "the plant sheet claims hours the machine did not
+ * work" finding raised against an honest foreman.
+ *
+ * `tzOffsetMinutes` is the site's offset from UTC (+480 for UTC+8). A night
+ * shift on a site east of UTC otherwise straddles two UTC days and neither
+ * of them matches the plant sheet.
+ */
+export function engineHoursSeries(input: {
+  /** the days to report on; any order, deduplicated here */
+  dates: IsoDate[];
+  /** every reading available for the machine, including before the window */
+  readings: CounterReading[];
+  tzOffsetMinutes?: number;
+}): DayHours[] {
+  const tz = input.tzOffsetMinutes ?? 0;
+  const sorted = input.readings
+    .filter((r) => r.engineHours !== null)
+    .slice()
+    .sort((a, b) => Date.parse(a.recordedAt) - Date.parse(b.recordedAt));
+  const dates = [...new Set(input.dates)].sort();
+  const out: DayHours[] = [];
+  for (const date of dates) {
+    const startMs = localDayStartMs(date, tz);
+    const endMs = startMs + 86_400_000;
+    let opening: CounterReading | null = null;
+    const dayReadings: CounterReading[] = [];
+    for (const r of sorted) {
+      const t = Date.parse(r.recordedAt);
+      if (t < startMs) opening = r;
+      else if (t < endMs) dayReadings.push(r);
+      else break;
+    }
+    out.push({ date, delta: engineHoursForDay({ openingReading: opening, dayReadings }) });
+  }
+  return out;
+}
+
+/* ----------------------------- geofence --------------------------- */
+
+export interface GeoPoint {
+  latitude: number;
+  longitude: number;
+}
+
+/** Metres between two WGS84 points (haversine, mean earth radius). */
+export function distanceMetres(a: GeoPoint, b: GeoPoint): number {
+  const R = 6_371_000;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(b.latitude - a.latitude);
+  const dLon = toRad(b.longitude - a.longitude);
+  const lat1 = toRad(a.latitude);
+  const lat2 = toRad(b.latitude);
+  const h =
+    Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+  return Math.round(2 * R * Math.asin(Math.min(1, Math.sqrt(h))));
+}
+
+/** Default site radius when a project records a point but no boundary. */
+export const DEFAULT_SITE_RADIUS_M = 2_000;
+
+export interface GeofenceReading extends GeoPoint {
+  recordedAt: string;
+  /** 1 = engine running, 0 = not, null = the feed does not say */
+  engineRunning: number | null;
+}
+
+export interface GeofenceVerdict {
+  /** readings that were outside the fence with the engine running */
+  breaches: Array<{ recordedAt: string; distanceMetres: number }>;
+  maxDistanceMetres: number | null;
+  /** hours spanned by the breaching readings — an upper bound, not a claim */
+  spanHours: number | null;
+  reasons: string[];
+}
+
+/**
+ * Plant running outside the site it is hired to. The finding is deliberately
+ * conservative: only readings with the engine RUNNING count (a machine parked
+ * in a yard overnight is not misuse), a single reading is reported without a
+ * duration, and no fence at all produces a reason rather than a verdict.
+ */
+export function checkGeofence(input: {
+  site: GeoPoint | null;
+  radiusMetres?: number | null;
+  readings: GeofenceReading[];
+}): GeofenceVerdict {
+  if (!input.site) {
+    return {
+      breaches: [],
+      maxDistanceMetres: null,
+      spanHours: null,
+      reasons: [
+        "the project records no location, so there is no fence to test the machine against",
+      ],
+    };
+  }
+  const radius = input.radiusMetres ?? DEFAULT_SITE_RADIUS_M;
+  const running = input.readings.filter((r) => r.engineRunning === 1);
+  if (running.length === 0) {
+    return {
+      breaches: [],
+      maxDistanceMetres: null,
+      spanHours: null,
+      reasons: [
+        "no reading in the window reports the engine running, so nothing can be said about where " +
+          "the machine was worked",
+      ],
+    };
+  }
+  const breaches = running
+    .map((r) => ({ recordedAt: r.recordedAt, distanceMetres: distanceMetres(input.site!, r) }))
+    .filter((r) => r.distanceMetres > radius)
+    .sort((a, b) => Date.parse(a.recordedAt) - Date.parse(b.recordedAt));
+  if (breaches.length === 0) {
+    return { breaches: [], maxDistanceMetres: null, spanHours: null, reasons: [] };
+  }
+  const first = breaches[0]!;
+  const last = breaches[breaches.length - 1]!;
+  return {
+    breaches,
+    maxDistanceMetres: Math.max(...breaches.map((b) => b.distanceMetres)),
+    spanHours:
+      breaches.length > 1
+        ? round2((Date.parse(last.recordedAt) - Date.parse(first.recordedAt)) / 3_600_000)
+        : null,
+    reasons:
+      breaches.length === 1
+        ? ["one reading only — enough to say where the machine was, not how long it was there"]
+        : [],
+  };
+}
+
+/* ------------------------------- fuel ----------------------------- */
+
+/** Litres of unexplained fill before it is worth a signal. */
+export const FUEL_TOLERANCE_LITRES = 50;
+/** Proportional head-room: fills may exceed burn by this much. */
+export const FUEL_TOLERANCE_RATIO = 1.2;
+
+export interface FuelReconciliation {
+  burnLitres: number | null;
+  filledLitres: number;
+  differenceLitres: number | null;
+  ratio: number | null;
+  unexplained: boolean;
+  reasons: string[];
+}
+
+/**
+ * Fuel put IN against fuel the machine says it burned.
+ *
+ * Tanks are not sealed systems and fills are not instantaneous, so this is a
+ * window comparison with both an absolute and a proportional tolerance, and
+ * it refuses to state anything when the feed reports no consumption at all —
+ * "the machine burned nothing and took 400 litres" is almost always a device
+ * that does not report fuel, not a theft.
+ */
+export function reconcileFuel(input: {
+  telematicsFuelUsedLitres: Array<number | null>;
+  fills: Array<{ litres: number; at: string }>;
+  toleranceLitres?: number;
+  toleranceRatio?: number;
+}): FuelReconciliation {
+  const burnSamples = input.telematicsFuelUsedLitres.filter(
+    (v): v is number => v !== null && v >= 0,
+  );
+  const filledLitres = round2(input.fills.reduce((s, f) => s + f.litres, 0));
+  if (burnSamples.length === 0) {
+    return {
+      burnLitres: null,
+      filledLitres,
+      differenceLitres: null,
+      ratio: null,
+      unexplained: false,
+      reasons: [
+        "the telematics feed reports no fuel consumption for this machine, so the fills cannot be " +
+          "compared against anything — this is a gap in the feed, not evidence of a loss",
+      ],
+    };
+  }
+  const burnLitres = round2(burnSamples.reduce((s, v) => s + v, 0));
+  const differenceLitres = round2(filledLitres - burnLitres);
+  const ratio = burnLitres > 0 ? round2(filledLitres / burnLitres) : null;
+  const tolL = input.toleranceLitres ?? FUEL_TOLERANCE_LITRES;
+  const tolR = input.toleranceRatio ?? FUEL_TOLERANCE_RATIO;
+  const unexplained =
+    differenceLitres > tolL && (ratio === null || ratio > tolR);
+  return {
+    burnLitres,
+    filledLitres,
+    differenceLitres,
+    ratio,
+    unexplained,
+    reasons: unexplained
+      ? [
+          `${filledLitres} litre(s) were booked into this machine against ${burnLitres} litre(s) ` +
+            `the machine itself reports burning — ${differenceLitres} litres unaccounted for, ` +
+            `beyond the ${tolL} litre and ${tolR}x tolerances. Fuel is the most stolen commodity ` +
+            "on a construction site and the fill docket is the only paper it leaves.",
+        ]
+      : [],
+  };
+}
+
+/* ------------------------------ faults ---------------------------- */
+
+export const FAULT_SEVERITIES = ["info", "warning", "severe", "critical"] as const;
+export type FaultSeverity = (typeof FAULT_SEVERITIES)[number];
+
+export interface TelematicsFault {
+  code: string;
+  description?: string | null;
+  severity?: string | null;
+  activeSince?: string | null;
+}
+
+export interface FaultVerdict {
+  actionable: TelematicsFault[];
+  worst: FaultSeverity | null;
+  /** true when the machine should be taken out of service until seen */
+  stopWork: boolean;
+  reason: string | null;
+}
+
+const FAULT_RANK: Record<string, number> = {
+  info: 0,
+  warning: 1,
+  severe: 2,
+  critical: 3,
+};
+
+/**
+ * Which fault codes are worth a maintenance record. Anything at `severe` or
+ * above raises a draft; `critical` takes the machine off the job, because a
+ * critical fault on a machine that lifts is a different conversation from a
+ * dashboard light.
+ */
+export function assessFaults(faults: TelematicsFault[]): FaultVerdict {
+  const graded = faults
+    .map((f) => ({ fault: f, rank: FAULT_RANK[(f.severity ?? "warning").toLowerCase()] ?? 1 }))
+    .filter((g) => g.rank >= 2)
+    .sort((a, b) => b.rank - a.rank);
+  if (graded.length === 0) {
+    return { actionable: [], worst: null, stopWork: false, reason: null };
+  }
+  const worstRank = graded[0]!.rank;
+  const worst = (FAULT_SEVERITIES[worstRank] ?? "severe") as FaultSeverity;
+  return {
+    actionable: graded.map((g) => g.fault),
+    worst,
+    stopWork: worstRank >= 3,
+    reason:
+      `${graded.length} active fault code(s) at ${worst} severity: ` +
+      graded
+        .slice(0, 5)
+        .map((g) => `${g.fault.code}${g.fault.description ? ` (${g.fault.description})` : ""}`)
+        .join(", ") +
+      (worstRank >= 3
+        ? ". A critical fault reported by the machine is the manufacturer telling you to stop it; " +
+          "running on is how a repair becomes a replacement."
+        : ". Book the service before the fault becomes the breakdown that stops the sequence."),
   };
 }

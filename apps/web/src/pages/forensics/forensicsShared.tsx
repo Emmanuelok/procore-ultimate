@@ -37,6 +37,10 @@ export interface DelayEventRow {
   startDate: string;
   durationDays: number;
   contractEventId: string | null;
+  noticeDueDate?: string | null;
+  party?: string;
+  statusReason?: string | null;
+  pacingOfEventId?: string | null;
   evidenceIds: string[];
   tiaResult: TiaResult | null;
   raisedBy: string;
@@ -52,10 +56,18 @@ export interface EvidenceLite {
   independenceScore?: number;
 }
 
+export interface TiaStatus {
+  stale: boolean;
+  deltaDays: number | null;
+  computedAt: string | null;
+  reason: string | null;
+}
+
 export interface DelayEventDetail extends DelayEventRow {
   task: { id: string; name: string } | null;
   contractEvent: { id: string; number: number; title: string } | null;
   evidence: EvidenceLite[];
+  tia?: TiaStatus;
 }
 
 export interface ClaimChain {
@@ -100,6 +112,18 @@ export interface ClaimRow {
   createdBy: string;
   createdAt: string;
   updatedAt: string;
+  currency?: string;
+  quantumBest?: number | null;
+  quantumLikely?: number | null;
+  quantumWorst?: number | null;
+  successProbability?: number | null;
+  provisionAmount?: number | null;
+  sufficiency?: { overallScore?: number } | null;
+  sufficiencyAt?: string | null;
+  scottSchedule?: unknown[] | null;
+  revisionCount?: number;
+  statusReason?: string | null;
+  decidedBy?: string | null;
 }
 
 export interface ClaimEventLite {
@@ -192,6 +216,9 @@ export interface WindowEvent {
   startDate: string;
   durationDays: number;
   tiaDeltaDays: number | null;
+  /** the cached TIA predates the schedule's last recompute */
+  tiaStale?: boolean;
+  party?: string;
 }
 
 export interface AnalysisWindow {
@@ -204,6 +231,7 @@ export interface AnalysisWindow {
     compensableDays: number;
     nonExcusableDays: number;
     tiaDeltaDays: number;
+    staleTia?: number;
   };
 }
 
@@ -213,6 +241,8 @@ export interface WindowsResponse {
   projectStart: string;
   boundaries: string[];
   method: string;
+  /** delay-event statuses included in the totals */
+  statuses?: string[];
   unattributedEvents: number;
   windows: AnalysisWindow[];
 }
@@ -304,10 +334,16 @@ export function claimKindTone(kind: string): string {
 }
 
 /** Legal state machine mirrored from the API (draft→submitted→assessed→…). */
+/**
+ * `draft` from submitted/assessed is the REVISE transition: it clears the
+ * assessment, so a changed claim can never carry an assessment that never
+ * considered the changed figures. Everything defining the claim is frozen
+ * until it is taken back to draft.
+ */
 export const CLAIM_NEXT_STATUSES: Record<string, string[]> = {
   draft: ["submitted", "withdrawn"],
-  submitted: ["assessed", "withdrawn"],
-  assessed: ["agreed", "rejected", "withdrawn"],
+  submitted: ["assessed", "draft", "withdrawn"],
+  assessed: ["agreed", "rejected", "draft", "withdrawn"],
   agreed: [],
   rejected: [],
   withdrawn: [],
@@ -455,4 +491,39 @@ export function SectionTitle({ children }: { children: ReactNode }) {
       {children}
     </div>
   );
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Record sufficiency (#307-309)                                       */
+/* ------------------------------------------------------------------ */
+
+export interface SufficiencyLimb {
+  key: string;
+  present: boolean;
+  wordCount: number;
+  evidenceCount: number;
+  independenceScore: number | null;
+  score: number;
+  reasons: string[];
+}
+
+export interface SufficiencyEvent {
+  eventId: string;
+  title: string;
+  score: number;
+  logCoveragePercent: number;
+  noticeServed: boolean;
+  noticeInTimeBar: boolean | null;
+  reasons: string[];
+}
+
+export interface SufficiencyResult {
+  overallScore: number;
+  limbs: SufficiencyLimb[];
+  events: SufficiencyEvent[];
+  gaps: { eventId: string; title: string; from: string; to: string; days: number; kind: string }[];
+  missingNotices: { eventId: string; title: string; reason: string }[];
+  reasons: string[];
+  scoredAt: string;
 }

@@ -28,7 +28,13 @@ import {
   Th,
 } from "../../ui";
 import { formatDateTime, humanize } from "../format";
-import { severityTone, StatCard, truncateMiddle, type SignalRow } from "./assuranceShared";
+import {
+  downloadAuthenticated,
+  severityTone,
+  StatCard,
+  truncateMiddle,
+  type SignalRow,
+} from "./assuranceShared";
 
 interface CaseRow {
   id: string;
@@ -378,12 +384,22 @@ export default function CasesTab() {
                           {formatDateTime(p.generatedAt)}
                           {p.sealSequence !== null ? ` · seal #${p.sealSequence}` : " · unsealed"}
                         </span>
-                        <a
+                        <button
+                          type="button"
                           className="text-brand-700 underline"
-                          href={`/api/v1/evidence-packs/${p.id}/download`}
+                          onClick={() => {
+                            void downloadAuthenticated(
+                              `/api/v1/evidence-packs/${p.id}/download`,
+                              `constructos-evidence-pack-${p.id}.json`,
+                            ).catch((err: unknown) =>
+                              setDetailError(
+                                err instanceof Error ? err.message : "Download failed",
+                              ),
+                            );
+                          }}
                         >
                           JSON
-                        </a>
+                        </button>
                       </li>
                     ))}
                   </ul>

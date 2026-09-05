@@ -15,7 +15,7 @@
  *  · MAINTENANCE OVERDUE. On critical plant that is a stoppage waiting to be
  *    discovered by the thing it breaks.
  */
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { Badge, Button, Card, CardBody, EmptyState, SkeletonTable, Tooltip } from "../../ui";
 import { DataTable, type DataColumns, type DataView } from "../../ui/data";
 import type { Tone } from "../../ui/tokens";
@@ -29,9 +29,13 @@ import {
   UnlawfulOperationBanner,
   daysAgo,
   hours,
+  shiftDays,
+  today,
+  useAvailability,
   isoDate,
   labelize,
   money,
+  type AssignmentRef,
   type EquipmentRecord,
   type ListResponse,
   type Loadable,
@@ -41,7 +45,7 @@ import {
 } from "./equipmentShared";
 
 /** The union the grid renders: project rows carry an assignment, fleet rows do not. */
-type RegisterRow = EquipmentRecord & { assignment?: { status: string; assignedFrom: string } | null };
+type RegisterRow = EquipmentRecord & { assignment?: AssignmentRef | null };
 
 const BUILT_IN_VIEWS: DataView[] = [
   {
@@ -70,13 +74,23 @@ export default function RegisterTab({
   fleet,
   onOpenMachine,
   onOpenCertificates,
+  onAssignmentAction,
 }: {
   scope: Scope;
   project: Loadable<ProjectEquipmentResponse>;
   fleet: Loadable<ListResponse<EquipmentRecord>>;
   onOpenMachine: (equipmentId: string) => void;
   onOpenCertificates: () => void;
+  /** Run a transition on the machine's live assignment (project scope only). */
+  onAssignmentAction: (
+    assignmentId: string,
+    equipmentId: string,
+    action: "approve" | "mobilise" | "demobilise" | "cancel" | "transfer",
+  ) => void;
 }) {
+  const [availabilityOpen, setAvailabilityOpen] = useState(false);
+  const [availFrom, setAvailFrom] = useState(today());
+  const [availTo, setAvailTo] = useState(shiftDays(today(), 14));
   const source = scope === "project" ? project : fleet;
   const asOf = scope === "project" ? project.data?.asOf : undefined;
 
@@ -440,6 +454,20 @@ export default function RegisterTab({
           onRowClick={({ row }) => onOpenMachine(row.id)}
           rowActions={(row) => [
             { id: "open", label: "Open the machine", onSelect: () => onOpenMachine(row.id) },
+            /*
+             * The assignment transitions, offered only where the row actually
+             * carries one and only where the transition is legal. A machine
+             * that was approved and never arrived used to have no way out at
+             * all — "cancel" is that way out, and it is why it is here rather
+             * than buried in a drawer.
+             */
+            ...(row.assignment
+              ? assignmentActionsFor(row.assignment.status).map((action) => ({
+                  id: action,
+                  label: ASSIGNMENT_ACTION_LABEL[action],
+                  onSelect: () => onAssignmentAction(row.assignment!.assignmentId, row.id, action),
+                }))
+              : []),
           ]}
           empty={{
             title: "No plant on the register",
@@ -453,6 +481,16 @@ export default function RegisterTab({
         />
       )}
 
+      <AvailabilityPanel
+        open={availabilityOpen}
+        onOpen={() => setAvailabilityOpen(true)}
+        from={availFrom}
+        to={availTo}
+        onFrom={setAvailFrom}
+        onTo={setAvailTo}
+        onOpenMachine={onOpenMachine}
+      />
+
       <p className="text-2xs text-content-subtle">
         Hire rates carry no grand total. A machine hired in one currency cannot be added to one
         hired in another without an FX rate and a date, neither of which belongs in a plant
@@ -460,6 +498,197 @@ export default function RegisterTab({
       </p>
     </div>
   );
+}
+
+/**
+ * WHAT IS FREE BETWEEN TWO DATES — the question a plant manager asks before
+ * every booking, and which the register alone could only answer by reading the
+ * assignment list by eye.
+ *
+ * "Free" here means no live assignment overlapping the window. It carries its
+ * CAVEATS rather than swallowing them: a hire agreement that ends inside the
+ * window, a service due (book the downtime, not just the machine) and a
+ * certificate that expires before the end of the window are each stated on the
+ * row, because a machine that is technically unassigned and unlawful to
+ * operate is not available. The panel also says plainly what it cannot know:
+ * a machine somebody has verbally promised elsewhere is not in any table.
+ */
+function AvailabilityPanel({
+  open,
+  onOpen,
+  from,
+  to,
+  onFrom,
+  onTo,
+  onOpenMachine,
+}: {
+  open: boolean;
+  onOpen: () => void;
+  from: string;
+  to: string;
+  onFrom: (value: string) => void;
+  onTo: (value: string) => void;
+  onOpenMachine: (equipmentId: string) => void;
+}) {
+  const availability = useAvailability(from, to, open && to >= from);
+  const data = availability.data;
+
+  return (
+    <Card>
+      <CardBody className="space-y-3">
+        <SectionHeading
+          title="What is free"
+          hint="Machines with no live assignment overlapping the window, with the caveats that decide whether they can actually be booked."
+          className="mb-0"
+          actions={
+            open ? (
+              <span className="flex flex-wrap items-center gap-2">
+                <input
+                  type="date"
+                  className="rounded-md border border-border bg-surface px-2 py-1 text-meta"
+                  value={from}
+                  max={to}
+                  onChange={(event) => onFrom(event.target.value)}
+                  aria-label="Available from"
+                />
+                <span className="text-meta text-content-muted">to</span>
+                <input
+                  type="date"
+                  className="rounded-md border border-border bg-surface px-2 py-1 text-meta"
+                  value={to}
+                  min={from}
+                  onChange={(event) => onTo(event.target.value)}
+                  aria-label="Available to"
+                />
+              </span>
+            ) : (
+              <Button size="sm" variant="secondary" onClick={onOpen}>
+                Check availability
+              </Button>
+            )
+          }
+        />
+        {!open ? (
+          <p className="text-meta text-content-muted">
+            Ask which machines are free between two dates before you hire another one.
+          </p>
+        ) : availability.error ? (
+          <LoadError message={availability.error} onRetry={availability.reload} />
+        ) : availability.loading ? (
+          <SkeletonTable rows={4} />
+        ) : !data ? null : (
+          <>
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge tone="success" size="sm">
+                {data.available.length} free
+              </Badge>
+              <Badge tone="neutral" size="sm">
+                {data.busy.length} committed
+              </Badge>
+              <span className="text-meta text-content-muted">
+                {data.from} to {data.to}
+              </span>
+            </div>
+            {data.available.length === 0 ? (
+              <EmptyState
+                icon={<IconEquipment />}
+                title="Nothing is free in this window"
+                description="Every machine on the register carries a live assignment overlapping these dates."
+              />
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-meta">
+                  <thead>
+                    <tr className="text-left text-content-subtle">
+                      <th className="py-1 pr-3">Plant</th>
+                      <th className="py-1 pr-3">Category</th>
+                      <th className="py-1 pr-3">Ownership</th>
+                      <th className="py-1 pr-3">Rate</th>
+                      <th className="py-1">Caveats</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.available.map((row) => (
+                      <tr
+                        key={row.id}
+                        className="cursor-pointer border-t border-border hover:bg-surface-sunken"
+                        onClick={() => onOpenMachine(row.id)}
+                      >
+                        <td className="py-1 pr-3">
+                          <span className="font-mono">{row.reference}</span>{" "}
+                          <span className="text-content-muted">{row.name}</span>
+                        </td>
+                        <td className="py-1 pr-3">{labelize(row.category)}</td>
+                        <td className="py-1 pr-3">
+                          {OWNERSHIP_LABEL[row.ownership] ?? labelize(row.ownership)}
+                        </td>
+                        <td className="py-1 pr-3">
+                          {row.hireRateAmount === null && row.internalRateAmount === null
+                            ? EM_DASH
+                            : `${money(row.hireRateAmount ?? row.internalRateAmount, row.currency)}${
+                                row.hireRateUnit ? ` / ${row.hireRateUnit}` : " / hour"
+                              }`}
+                        </td>
+                        <td className="py-1">
+                          {row.caveats.length === 0 ? (
+                            <span className="text-content-muted">{EM_DASH}</span>
+                          ) : (
+                            <span className="flex flex-wrap gap-1">
+                              {row.caveats.map((caveat) => (
+                                <Badge
+                                  key={caveat}
+                                  tone={row.outOfCertificate ? "danger" : "warning"}
+                                  size="xs"
+                                  variant="outline"
+                                >
+                                  {caveat}
+                                </Badge>
+                              ))}
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {data.note ? <p className="text-2xs text-content-subtle">{data.note}</p> : null}
+          </>
+        )}
+      </CardBody>
+    </Card>
+  );
+}
+
+type AssignmentAction = "approve" | "mobilise" | "demobilise" | "cancel" | "transfer";
+
+const ASSIGNMENT_ACTION_LABEL: Record<AssignmentAction, string> = {
+  approve: "Approve the hire",
+  mobilise: "Mobilise to site",
+  demobilise: "Demobilise",
+  cancel: "Cancel the assignment",
+  transfer: "Transfer to another project",
+};
+
+/**
+ * Which transitions a live assignment can take from where it is. Offering an
+ * illegal one and letting the server refuse it is a worse screen than not
+ * offering it: the refusal reads as a bug to the person who clicked.
+ */
+function assignmentActionsFor(status: string): AssignmentAction[] {
+  switch (status) {
+    case "requested":
+      return ["approve", "cancel"];
+    case "approved":
+      return ["mobilise", "cancel"];
+    case "mobilising":
+      return ["mobilise", "cancel"];
+    case "on_site":
+      return ["demobilise", "transfer"];
+    default:
+      return [];
+  }
 }
 
 function registerRail(row: RegisterRow): Tone | undefined {

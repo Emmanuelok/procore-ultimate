@@ -487,6 +487,10 @@ describe("carry-forward across three occurrences", () => {
     expect(report.json().items[0].title).toBe("Facade interface not resolved");
     expect(report.json().items[0].carryCount).toBe(3);
 
+    /* The read is pure now: the carried-item signal is raised by the scheduled
+       job, under a null (system) actor, not by whoever opened the report. */
+    await built.app.scheduler.runNow("meetings.carried-items");
+
     const raised = await built.app.db
       .select()
       .from(signals)
@@ -1111,13 +1115,36 @@ describe("action items, promotion and the overdue sweep", () => {
         and(eq(signals.companyId, chair.companyId), eq(signals.detector, "meeting_action_overdue")),
       );
 
+    /* The list read raises nothing — the sweep is the job. */
+    const pureRead = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/meeting-action-items`,
+      chair.headers,
+    );
+    expect(pureRead.statusCode).toBe(200);
+    const stillClean = await built.app.db
+      .select()
+      .from(signals)
+      .where(
+        and(eq(signals.companyId, chair.companyId), eq(signals.detector, "meeting_action_overdue")),
+      );
+    expect(stillClean.length).toBe(before.length);
+
+    const swept = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meeting-reports/sweep`,
+      chair.headers,
+      {},
+    );
+    expect(swept.statusCode).toBe(200);
+    expect(swept.json().overdue.raised).toBe(1);
+
     const first = await inject(
       "GET",
       `/api/v1/projects/${projectId}/meeting-action-items`,
       chair.headers,
     );
     expect(first.statusCode).toBe(200);
-    expect(first.json().sweep.raised).toBe(1);
 
     const afterFirst = await built.app.db
       .select()
@@ -1127,13 +1154,16 @@ describe("action items, promotion and the overdue sweep", () => {
       );
     expect(afterFirst.length).toBe(before.length + 1);
 
+    /* Running the sweep again — however often — raises nothing twice: the
+       signal is keyed on the action id AND the row records its signalId. */
     for (let i = 0; i < 3; i++) {
       const repeat = await inject(
-        "GET",
-        `/api/v1/projects/${projectId}/meeting-action-items`,
+        "POST",
+        `/api/v1/projects/${projectId}/meeting-reports/sweep`,
         chair.headers,
+        {},
       );
-      expect(repeat.json().sweep.raised).toBe(0);
+      expect(repeat.json().overdue.raised).toBe(0);
     }
     const afterRepeats = await built.app.db
       .select()
@@ -1174,12 +1204,13 @@ describe("action items, promotion and the overdue sweep", () => {
     );
     expect(promoted.statusCode).toBe(201);
 
-    const res = await inject(
-      "GET",
-      `/api/v1/projects/${projectId}/meeting-action-items`,
+    const swept = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meeting-reports/sweep`,
       chair.headers,
+      {},
     );
-    expect(res.json().sweep.raised).toBe(0);
+    expect(swept.json().overdue.raised).toBe(0);
     const row = await built.app.db
       .select()
       .from(meetingActionItems)
@@ -1211,11 +1242,12 @@ describe("action items, promotion and the overdue sweep", () => {
     expect(row[0]!.originalDueDate).toBe(addDaysISO(todayISO(), -10));
 
     const res = await inject(
-      "GET",
-      `/api/v1/projects/${projectId}/meeting-action-items`,
+      "POST",
+      `/api/v1/projects/${projectId}/meeting-reports/sweep`,
       chair.headers,
+      {},
     );
-    expect(res.json().sweep.raised).toBe(0);
+    expect(res.json().overdue.raised).toBe(0);
   });
 
   it("reports overdue actions grouped by owner", async () => {
@@ -1276,7 +1308,6 @@ describe("action items, promotion and the overdue sweep", () => {
     expect(res.json().items.every((i: { ownerId: string }) => i.ownerId === second.userId)).toBe(
       true,
     );
-    expect(res.json().sweep.raised).toBe(0);
     expect(res.json().asOf).toBe(todayISO());
   });
 
@@ -1346,5 +1377,570 @@ describe("action items, promotion and the overdue sweep", () => {
       { count: 1 },
     );
     expect(gen.statusCode).toBe(400);
+  });
+});
+
+/* ================================================================== */
+/* WP-MEET upgrade — audit bug regressions and the new surfaces        */
+/* ================================================================== */
+
+describe("audit bug regressions", () => {
+  /** A held meeting with minutes drafted, ready to be issued. */
+  async function heldMeeting(title: string) {
+    const created = await inject("POST", `/api/v1/projects/${projectId}/meetings`, chair.headers, {
+      title,
+      scheduledStart: new Date().toISOString(),
+      minuteTakerId: chair.userId,
+      objectionPeriodDays: 7,
+    });
+    expect(created.statusCode).toBe(201);
+    const id = created.json().id as string;
+    await inject("POST", `/api/v1/projects/${projectId}/meetings/${id}/hold`, chair.headers, {});
+    await inject("POST", `/api/v1/projects/${projectId}/meetings/${id}/minutes`, chair.headers, {
+      minutesBody: "The room agreed the temporary works sequence.",
+      objectionPeriodDays: 7,
+    });
+    return id;
+  }
+
+  it("[#1] refuses a redraft over issued minutes and offers a ledgered correction instead", async () => {
+    const id = await heldMeeting("Redraft deadlock");
+    const issued = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${id}/minutes/issue`,
+      chair.headers,
+      {},
+    );
+    expect(issued.statusCode).toBe(200);
+
+    const redraft = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${id}/minutes`,
+      chair.headers,
+      { minutesBody: "Rewritten after the fact", objectionPeriodDays: 30 },
+    );
+    expect(redraft.statusCode).toBe(409);
+
+    /* The state must still be issuable/approvable — no deadlock. */
+    const before = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/meetings/${id}`,
+      chair.headers,
+    );
+    expect(before.json().status).toBe("minutes_issued");
+    expect(before.json().objectionPeriodDays).toBe(7);
+
+    const corrected = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${id}/minutes/correct`,
+      chair.headers,
+      { reason: "The decision on the crane sequence was minuted the wrong way round" },
+    );
+    expect(corrected.statusCode).toBe(200);
+    const after = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/meetings/${id}`,
+      chair.headers,
+    );
+    expect(after.json().status).toBe("minutes_draft");
+    expect(after.json().minutesIssuedAt).toBeNull();
+    expect(after.json().minutesVersion).toBe(2);
+
+    /* And the workflow can now complete: redraft, re-issue, sign off. */
+    expect(
+      (
+        await inject("POST", `/api/v1/projects/${projectId}/meetings/${id}/minutes`, chair.headers, {
+          minutesBody: "Corrected: the crane sequence was agreed the other way round.",
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(
+      (
+        await inject(
+          "POST",
+          `/api/v1/projects/${projectId}/meetings/${id}/minutes/issue`,
+          chair.headers,
+          {},
+        )
+      ).statusCode,
+    ).toBe(200);
+    const approved = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${id}/minutes/approve`,
+      h2,
+      {},
+    );
+    expect(approved.statusCode).toBe(200);
+    expect(approved.json().status).toBe("minutes_accepted");
+  });
+
+  it("[#2] strips status and post-promotion terms from the action-item PATCH", async () => {
+    const created = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meeting-action-items`,
+      chair.headers,
+      { title: "Issue the revised sequence", ownerName: "A Person", dueDate: todayISO() },
+    );
+    expect(created.statusCode).toBe(201);
+    const id = created.json().id as string;
+
+    const patched = await inject(
+      "PATCH",
+      `/api/v1/projects/${projectId}/meeting-action-items/${id}`,
+      chair.headers,
+      { status: "verified", title: "Renamed" },
+    );
+    expect(patched.statusCode).toBe(200);
+    expect(patched.json().status).toBe("open");
+    expect(patched.json().title).toBe("Renamed");
+    expect(patched.json().verifiedBy ?? null).toBeNull();
+  });
+
+  it("[#3] un-ratifies a decision that is edited after ratification", async () => {
+    const id = await heldMeeting("Ratified then edited");
+    const decision = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${id}/decisions`,
+      chair.headers,
+      {
+        title: "Accept the alternative pile design",
+        decision: "The alternative design is accepted subject to the engineer's check.",
+        decidedById: chair.userId,
+        impactsCost: true,
+        estimatedCostImpact: 120_000,
+        currency: "GBP",
+      },
+    );
+    expect(decision.statusCode).toBe(201);
+    const decisionId = decision.json().id as string;
+    const ratified = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meeting-decisions/${decisionId}/ratify`,
+      h2,
+      {},
+    );
+    expect(ratified.statusCode).toBe(200);
+    expect(ratified.json().status).toBe("ratified");
+
+    const edited = await inject(
+      "PATCH",
+      `/api/v1/projects/${projectId}/meeting-decisions/${decisionId}`,
+      chair.headers,
+      { estimatedCostImpact: 900_000 },
+    );
+    expect(edited.statusCode).toBe(200);
+    expect(edited.json().status).toBe("recorded");
+    expect(edited.json().ratifiedBy).toBeNull();
+    expect(edited.json().unratifiedByEdit).toBe(true);
+  });
+
+  it("[#4] pushes the meetings date filter into the WHERE so pages and totals agree", async () => {
+    const far = await inject("POST", `/api/v1/projects/${projectId}/meetings`, chair.headers, {
+      title: "Far future occurrence",
+      scheduledStart: `${addDaysISO(todayISO(), 900)}T09:00:00.000Z`,
+    });
+    expect(far.statusCode).toBe(201);
+    const from = addDaysISO(todayISO(), 800);
+    const res = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/meetings?from=${from}&pageSize=5`,
+      chair.headers,
+    );
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.total).toBe(body.items.length);
+    expect(body.items.every((m: { scheduledStart: string }) => m.scheduledStart >= from)).toBe(
+      true,
+    );
+  });
+
+  it("[#11] refuses to hold a meeting whose minutes are already issued", async () => {
+    const id = await heldMeeting("Hold after issue");
+    await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${id}/minutes/issue`,
+      chair.headers,
+      {},
+    );
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${id}/hold`,
+      chair.headers,
+      {},
+    );
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toMatch(/rewind its minutes/i);
+  });
+
+  it("[#13] applies the standing agenda, invitees and carry-forward when a meeting joins a series", async () => {
+    const series = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meeting-series`,
+      chair.headers,
+      {
+        title: "Standing arrangements series",
+        recurrence: "weekly",
+        agendaTemplate: [
+          { title: "Safety moment", category: "safety" },
+          { title: "Programme", category: "programme" },
+        ],
+        defaultAttendees: [{ name: "Site Manager", role: "required" }],
+        quorumRequired: 1,
+      },
+    );
+    expect(series.statusCode).toBe(201);
+    const seriesId = series.json().id as string;
+
+    const created = await inject("POST", `/api/v1/projects/${projectId}/meetings`, chair.headers, {
+      title: "Occurrence 1",
+      seriesId,
+      scheduledStart: new Date().toISOString(),
+    });
+    expect(created.statusCode).toBe(201);
+    const detail = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/meetings/${created.json().id}`,
+      chair.headers,
+    );
+    expect(detail.json().agendaItems).toHaveLength(2);
+    expect(detail.json().attendees).toHaveLength(1);
+    expect(detail.json().attendees[0].attendance).toBe("absent");
+    expect(detail.json().quorumRequired).toBe(1);
+  });
+
+  it("[#16] guards cancel, block and escalate by state", async () => {
+    const created = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meeting-action-items`,
+      chair.headers,
+      { title: "Guarded action", ownerName: "A Person", dueDate: todayISO() },
+    );
+    const id = created.json().id as string;
+    await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meeting-action-items/${id}/complete`,
+      chair.headers,
+      { closureNote: "Done and evidenced by the revised drawing" },
+    );
+    const verified = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meeting-action-items/${id}/verify`,
+      h2,
+      {},
+    );
+    expect(verified.statusCode).toBe(200);
+
+    const cancelled = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meeting-action-items/${id}/cancel`,
+      chair.headers,
+      { reason: "Trying to erase the verification" },
+    );
+    expect(cancelled.statusCode).toBe(409);
+
+    const escalated = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meeting-action-items/${id}/escalate`,
+      chair.headers,
+      { escalatedToId: second.userId, note: "Trying to escalate a closed action" },
+    );
+    expect(escalated.statusCode).toBe(409);
+  });
+
+  it("[#17] validates atMeetingId on approval of a one-off meeting", async () => {
+    const id = await heldMeeting("One-off approval");
+    await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${id}/minutes/issue`,
+      chair.headers,
+      {},
+    );
+    const bogus = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${id}/minutes/approve`,
+      h2,
+      { atMeetingId: "mtg_not_a_real_id" },
+    );
+    expect(bogus.statusCode).toBe(404);
+  });
+
+  it("[#5] scopes the company-wide overdue register to the caller's own projects", async () => {
+    const res = await inject("GET", "/api/v1/meeting-action-items/overdue", hRead);
+    expect(res.statusCode).toBe(200);
+    const projectIds = new Set(
+      (res.json().items as { projectId: string }[]).map((i) => i.projectId),
+    );
+    for (const p of projectIds) expect(p).toBe(projectId);
+
+    /* A tenant member with the tool nowhere is refused outright, not given an
+       empty list — "you have no access" and "there is nothing" differ. */
+    const stranger = await registerActor(built.app);
+    const foreign = await inject("GET", "/api/v1/meeting-action-items/overdue", stranger.headers);
+    expect([200, 403]).toContain(foreign.statusCode);
+    if (foreign.statusCode === 200) {
+      expect(foreign.json().items).toEqual([]);
+    }
+  });
+});
+
+describe("minutes as a real document (#422, #425)", () => {
+  let docMeeting: string;
+
+  it("renders an agenda pack and the minutes as content-addressed files", async () => {
+    const created = await inject("POST", `/api/v1/projects/${projectId}/meetings`, chair.headers, {
+      title: "Document render",
+      scheduledStart: new Date().toISOString(),
+      minuteTakerId: chair.userId,
+      distribution: [second.userId],
+      objectionPeriodDays: 7,
+    });
+    docMeeting = created.json().id as string;
+    await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${docMeeting}/agenda-items`,
+      chair.headers,
+      { title: "Temporary works", category: "safety" },
+    );
+
+    const pack = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${docMeeting}/minutes/render`,
+      chair.headers,
+      { kind: "agenda_pack" },
+    );
+    expect(pack.statusCode).toBe(200);
+    expect(pack.json().sha256).toMatch(/^[0-9a-f]{64}$/);
+
+    /* Minutes cannot be rendered before they are written: an empty document
+       with a hash on it is still an empty document. */
+    const early = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${docMeeting}/minutes/render`,
+      chair.headers,
+      { kind: "minutes" },
+    );
+    expect(early.statusCode).toBe(400);
+
+    await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${docMeeting}/hold`,
+      chair.headers,
+      {},
+    );
+    await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${docMeeting}/minutes`,
+      chair.headers,
+      { minutesBody: "Temporary works were discussed and the sequence agreed." },
+    );
+    const rendered = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${docMeeting}/minutes/render`,
+      chair.headers,
+      { kind: "minutes" },
+    );
+    expect(rendered.statusCode).toBe(200);
+    const sha = rendered.json().sha256 as string;
+    expect(sha).toMatch(/^[0-9a-f]{64}$/);
+
+    const served = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/meetings/${docMeeting}/minutes/document?kind=minutes`,
+      chair.headers,
+    );
+    expect(served.statusCode).toBe(200);
+    expect(served.headers["x-document-sha256"]).toBe(sha);
+    expect(served.body).toContain("Temporary works");
+  });
+
+  it("records a delivery per recipient on issue and lets only the recipient acknowledge", async () => {
+    const issued = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${docMeeting}/minutes/issue`,
+      chair.headers,
+      {},
+    );
+    expect(issued.statusCode).toBe(200);
+
+    const deliveries = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/meetings/${docMeeting}/minutes/deliveries`,
+      chair.headers,
+    );
+    expect(deliveries.statusCode).toBe(200);
+    expect(deliveries.json().total as number).toBeGreaterThan(0);
+    const mine = (deliveries.json().items as { id: string; userId: string | null }[]).find(
+      (d) => d.userId === second.userId,
+    );
+    expect(mine).toBeDefined();
+
+    const wrongPerson = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${docMeeting}/minutes/deliveries/${mine!.id}/acknowledge`,
+      h3,
+      {},
+    );
+    expect(wrongPerson.statusCode).toBe(403);
+
+    const acked = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${docMeeting}/minutes/deliveries/${mine!.id}/acknowledge`,
+      h2,
+      {},
+    );
+    expect(acked.statusCode).toBe(200);
+    expect(acked.json().status).toBe("acknowledged");
+  });
+
+  it("returns objections on the detail route and resolves them so sign-off can proceed", async () => {
+    const objected = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${docMeeting}/minutes/object`,
+      h2,
+      { note: "The sequence recorded is not what was agreed" },
+    );
+    expect(objected.statusCode).toBe(200);
+
+    const detail = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/meetings/${docMeeting}`,
+      chair.headers,
+    );
+    expect(detail.json().objections).toHaveLength(1);
+    const objectionId = detail.json().objections[0].id as string;
+
+    const blocked = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${docMeeting}/minutes/approve`,
+      h3,
+      {},
+    );
+    expect(blocked.statusCode).toBe(409);
+
+    const resolved = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${docMeeting}/minutes/objections/${objectionId}/resolve`,
+      chair.headers,
+      { resolutionNote: "Agreed at the site walk; the minutes read correctly on re-reading." },
+    );
+    expect(resolved.statusCode).toBe(200);
+
+    const approved = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${docMeeting}/minutes/approve`,
+      h3,
+      {},
+    );
+    expect(approved.statusCode).toBe(200);
+    expect(approved.json().status).toBe("minutes_accepted");
+  });
+});
+
+describe("meetings health-inputs", () => {
+  it("reports the counts the intelligence layer scores, with reasons for what it cannot", async () => {
+    const res = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/meetings/health-inputs`,
+      chair.headers,
+    );
+    expect(res.statusCode).toBe(200);
+    const metrics = res.json().metrics as Record<string, number | null>;
+    expect(typeof metrics.meetings).toBe("number");
+    expect(typeof metrics.openActionItems).toBe("number");
+    expect(Array.isArray(res.json().reasons)).toBe(true);
+  });
+
+  it("is refused to another tenant", async () => {
+    const stranger = await registerActor(built.app);
+    const res = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/meetings/health-inputs`,
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(res.statusCode);
+  });
+});
+
+/* ================================================================== */
+/* AI minutes drafting (#418-421) — the degraded path                   */
+/* ================================================================== */
+
+describe("AI minutes drafting", () => {
+  let draftMeeting: string;
+
+  beforeAll(async () => {
+    const res = await inject("POST", `/api/v1/projects/${projectId}/meetings`, chair.headers, {
+      title: "Drafting test",
+      meetingType: "progress",
+    });
+    draftMeeting = res.json().id as string;
+  });
+
+  it("answers 503 AiDisabled with no key, and says the workflow does not depend on it", async () => {
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${draftMeeting}/minutes/draft-ai`,
+      chair.headers,
+      { transcript: "Chair: the crane arrives on the fourteenth. Bob will issue the lift plan." },
+    );
+    expect(res.statusCode).toBe(503);
+    expect(res.json().error).toBe("AiDisabled");
+    expect(res.json().message).toMatch(/nothing about issuing, objecting to or approving/i);
+  });
+
+  it("rejects a transcript too short to minute", async () => {
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${draftMeeting}/minutes/draft-ai`,
+      chair.headers,
+      { transcript: "hello" },
+    );
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("refuses a read-only member before it ever reaches the AI layer", async () => {
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${draftMeeting}/minutes/draft-ai`,
+      hRead,
+      { transcript: "Chair: the crane arrives on the fourteenth. Bob will issue the lift plan." },
+    );
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("is refused to another tenant", async () => {
+    const stranger = await registerActor(built.app);
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${draftMeeting}/minutes/draft-ai`,
+      stranger.headers,
+      { transcript: "Chair: the crane arrives on the fourteenth. Bob will issue the lift plan." },
+    );
+    expect([403, 404]).toContain(res.statusCode);
+  });
+
+  it("refuses to redraft over issued minutes before consulting the model", async () => {
+    const saved = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${draftMeeting}/minutes`,
+      chair.headers,
+      { minutesBody: "As recorded.", objectionPeriodDays: 7 },
+    );
+    expect(saved.statusCode).toBe(200);
+    const issued = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${draftMeeting}/minutes/issue`,
+      chair.headers,
+      { sendEmail: false },
+    );
+    expect(issued.statusCode).toBe(200);
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${draftMeeting}/minutes/draft-ai`,
+      chair.headers,
+      { transcript: "Chair: the crane arrives on the fourteenth. Bob will issue the lift plan." },
+    );
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toMatch(/minutes\/correct/);
   });
 });

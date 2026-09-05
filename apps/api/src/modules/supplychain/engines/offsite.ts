@@ -5,8 +5,10 @@
  * WITNESSED is a separate, smaller number that a valuation may rely on:
  *
  *  - `percentComplete`            stages complete ÷ stages total (self-reported)
- *  - `percentVerifiedForPayment`  the highest percent a passed or conditional
- *                                 inspection has witnessed (never the factory's)
+ *  - `percentVerifiedForPayment`  the percent the MOST RECENT passed or
+ *                                 conditional inspection witnessed (never the
+ *                                 factory's, and never the highest ever seen:
+ *                                 a later inspection corrects an earlier one)
  *  - a failed, un-waived QA gate puts the unit on `qa_hold`; nothing advances
  *    past it (readyToShip is false) until the gate passes or is waived
  *
@@ -78,7 +80,7 @@ export function derivedProductionStatus(current: string, rollup: UnitRollup): Of
 const TRANSITIONS: Record<OffsiteUnitStatus, readonly OffsiteUnitStatus[]> = {
   planned: ["in_design", "in_production", "rejected"],
   in_design: ["in_production", "rejected"],
-  in_production: ["qa_hold", "passed_qa", "rejected"],
+  in_production: ["passed_qa", "rejected"],
   qa_hold: ["in_production", "passed_qa", "rejected"],
   passed_qa: ["ready_to_ship", "in_production", "rejected"],
   ready_to_ship: ["in_transit", "rejected"],
@@ -95,6 +97,15 @@ export function transitionAllowed(
 ): { ok: boolean; reason?: string } {
   const allowed = TRANSITIONS[current as OffsiteUnitStatus];
   if (!allowed) return { ok: false, reason: `Unknown status ${current}.` };
+  // `qa_hold` is DERIVED from a failed, un-waived QA gate. Setting it by hand
+  // would be undone by the next rollup, so it is refused with the reason
+  // rather than accepted and silently reverted.
+  if (next === "qa_hold") {
+    return {
+      ok: false,
+      reason: "A QA hold is not set by hand: record the failing QA gate on the stage and the unit goes on hold by itself.",
+    };
+  }
   if (!allowed.includes(next)) return { ok: false, reason: `A ${current.replace(/_/g, " ")} unit cannot go to ${next.replace(/_/g, " ")}.` };
   if ((next === "passed_qa" || next === "ready_to_ship") && !rollup.readyToShip) {
     return {
@@ -105,13 +116,34 @@ export function transitionAllowed(
   return { ok: true };
 }
 
+/** One inspection as the engine reads it. */
+export interface InspectionFact {
+  id?: string | null;
+  result: string;
+  percentVerified: number | null;
+  performedAt: string | null;
+  createdAt?: string | null;
+  inspectorId: string | null;
+}
+
+export interface VerifiedForPayment {
+  percent: number | null;
+  inspectionCount: number;
+  /** The inspection the percent came from — who witnessed it and when. */
+  source: { id: string | null; inspectorId: string | null; performedAt: string | null } | null;
+  /** How many passed/conditional inspections carry a percent at all. */
+  usableCount: number;
+  reasons: string[];
+}
+
 /**
- * What a valuation may rely on: the largest percent an inspector has verified
- * in a passed or conditional inspection. Never the factory's own number.
+ * What a valuation may rely on: the percent the MOST RECENT passed or
+ * conditional inspection witnessed. Never the factory's own number, and
+ * deliberately never `max()` — an inspector who records 90 in error must be
+ * correctable by a second inspector recording the true 40, and a maximum
+ * would make the first figure permanent.
  */
-export function verifiedForPayment(
-  inspections: Array<{ result: string; percentVerified: number | null; performedAt: string | null; inspectorId: string | null }>,
-): { percent: number | null; inspectionCount: number; reasons: string[] } {
+export function verifiedForPayment(inspections: InspectionFact[]): VerifiedForPayment {
   const usable = inspections.filter(
     (i) => (i.result === "passed" || i.result === "conditional") && typeof i.percentVerified === "number",
   );
@@ -119,6 +151,8 @@ export function verifiedForPayment(
     return {
       percent: null,
       inspectionCount: inspections.length,
+      source: null,
+      usableCount: 0,
       reasons: [
         inspections.length === 0
           ? "No factory inspection recorded; nothing has been independently verified."
@@ -126,6 +160,22 @@ export function verifiedForPayment(
       ],
     };
   }
-  const best = Math.max(...usable.map((i) => i.percentVerified as number));
-  return { percent: Math.min(100, Math.max(0, best)), inspectionCount: inspections.length, reasons: [] };
+  const latest = [...usable].sort((a, b) => {
+    const byPerformed = (b.performedAt ?? "").localeCompare(a.performedAt ?? "");
+    if (byPerformed !== 0) return byPerformed;
+    return (b.createdAt ?? "").localeCompare(a.createdAt ?? "");
+  })[0]!;
+  const superseded = usable.filter((i) => i !== latest && (i.percentVerified as number) > (latest.percentVerified as number));
+  return {
+    percent: Math.min(100, Math.max(0, latest.percentVerified as number)),
+    inspectionCount: inspections.length,
+    source: { id: latest.id ?? null, inspectorId: latest.inspectorId, performedAt: latest.performedAt },
+    usableCount: usable.length,
+    reasons:
+      superseded.length > 0
+        ? [
+            `The most recent inspection (${latest.performedAt ?? "undated"}) is the figure a valuation may use; ${superseded.length} earlier inspection(s) verified a higher percent and are superseded, not added.`,
+          ]
+        : [],
+  };
 }

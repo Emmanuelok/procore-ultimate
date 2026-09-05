@@ -189,6 +189,27 @@ export default function RunsTab({
     }
   }
 
+  /**
+   * Re-validate a failed run. The API accepts `failed` for validate and map
+   * precisely so a commit that failed ON THE DATA can be fixed without
+   * discarding the upload; this is the button that reaches it.
+   */
+  async function onRevalidate() {
+    if (!run) return;
+    setBusy(true);
+    setActionError(null);
+    try {
+      await api.post<unknown>(`/api/v1/ingestion/runs/${run.id}/validate`);
+      await loadRun(run.id);
+      await loadRecords(run.id);
+      await load();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Re-validation failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function onDiscard() {
     if (!run) return;
     if (
@@ -433,17 +454,41 @@ export default function RunsTab({
               <RowSplitBar run={run} />
             </div>
 
-            {/* Actions */}
+            {/*
+              Actions.
+
+              A run that FAILED during commit used to show nothing but a red
+              caveat: the API has always allowed a retry (and a discard) from
+              `failed`, but the register offered neither, so a transient
+              database error left a run stuck for ever and the only way out was
+              to re-upload the whole file. Every transition the API accepts is
+              now reachable here.
+            */}
             <div className="flex flex-wrap items-center gap-2">
-              {run.status === "validated" ? (
+              {run.status === "validated" || run.status === "failed" ? (
                 <Button onClick={() => setConfirmCommit(true)} disabled={busy || run.stagedCount === 0}>
-                  Commit {fmtInt(run.stagedCount)} rows…
+                  {run.status === "failed" ? "Retry commit" : `Commit ${fmtInt(run.stagedCount)} rows…`}
                 </Button>
               ) : null}
-              {run.status === "staging" || run.status === "validated" ? (
+              {run.status === "staging" || run.status === "validated" || run.status === "failed" ? (
                 <Button variant="danger" onClick={() => void onDiscard()} disabled={busy}>
                   Discard run
                 </Button>
+              ) : null}
+              {run.status === "failed" ? (
+                <Button
+                  variant="secondary"
+                  onClick={() => void onRevalidate()}
+                  disabled={busy}
+                >
+                  Re-validate
+                </Button>
+              ) : null}
+              {run.status === "failed" ? (
+                <span className="text-xs text-ink-400">
+                  A failed commit can be retried, re-validated after the source data is fixed, or
+                  discarded. Nothing was committed — the counts above are what the run had staged.
+                </span>
               ) : null}
               {run.status === "staging" ? (
                 <span className="text-xs text-ink-400">

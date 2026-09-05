@@ -10,6 +10,7 @@ import {
   obligations,
   projectMemberships,
   projects,
+  safetyIncidents,
   signals,
   vendors,
   workers,
@@ -103,7 +104,7 @@ beforeAll(async () => {
     { id: vendorId, companyId: owner.companyId, name: "Groundworks Ltd" },
     { id: otherVendorId, companyId: owner.companyId, name: "Steelwork Ltd" },
   ]);
-});
+}, 180_000);
 
 afterAll(async () => {
   await built.close();
@@ -433,7 +434,24 @@ describe("certificates as evidence (#780-781, ADR 0004)", () => {
 /* The expiry sweep                                                    */
 /* ================================================================== */
 
-describe("lazy expiry sweep", () => {
+/**
+ * The sweep is now a SCHEDULED JOB, not a read side effect. Reads are pure, so
+ * these tests trigger a cycle explicitly — which is also the point of the
+ * change: a policy nobody opened used to never lapse in the record, and the
+ * ledger attributed the resulting writes to whoever happened to open the page.
+ */
+async function runSweep(projectId?: string) {
+  if (projectId) {
+    const res = await post(`/projects/${projectId}/insurance/sweep`, {});
+    expect(res.statusCode).toBe(200);
+    return res.json() as { signals: number };
+  }
+  const res = await post("/insurance/sweep", {});
+  expect(res.statusCode).toBe(200);
+  return res.json() as { signals: number };
+}
+
+describe("scheduled expiry sweep", () => {
   it("expires a lapsed policy and raises policy_lapsed_during_works exactly once", async () => {
     const id = newId("pol");
     await app.db.insert(insurancePolicies).values({
@@ -450,6 +468,12 @@ describe("lazy expiry sweep", () => {
       createdBy: owner.userId,
     });
 
+    // a read does NOT sweep any more: the record is untouched until the job runs
+    const beforeSweep = await get(`/projects/${sweepProject}/insurance/policies`);
+    expect(beforeSweep.statusCode).toBe(200);
+    expect(await signalsFor("policy_lapsed_during_works", id)).toHaveLength(0);
+
+    await runSweep(sweepProject);
     const first = await get(`/projects/${sweepProject}/insurance/policies`);
     expect(first.statusCode).toBe(200);
     const swept = (first.json().items as { id: string; status: string }[]).find(
@@ -458,10 +482,10 @@ describe("lazy expiry sweep", () => {
     expect(swept?.status).toBe("expired");
     expect(await signalsFor("policy_lapsed_during_works", id)).toHaveLength(1);
 
-    // repeated reads are idempotent — the same lapse is never raised twice
-    await get(`/projects/${sweepProject}/insurance/policies`);
-    await get(`/projects/${sweepProject}/insurance/policies`);
-    await get(`/projects/${sweepProject}/insurance/summary`);
+    // repeated sweeps are idempotent — the same lapse is never raised twice
+    await runSweep(sweepProject);
+    await runSweep(sweepProject);
+    await app.scheduler.runNow("insurance.expiry");
     expect(await signalsFor("policy_lapsed_during_works", id)).toHaveLength(1);
 
     const raised = (await signalsFor("policy_lapsed_during_works", id))[0]!;
@@ -484,6 +508,7 @@ describe("lazy expiry sweep", () => {
       createdBy: owner.userId,
     });
 
+    await runSweep(sweepProject);
     const first = await get(`/projects/${sweepProject}/insurance/certificates`);
     expect(first.statusCode).toBe(200);
     const swept = (first.json().items as { id: string; status: string }[]).find(
@@ -492,7 +517,7 @@ describe("lazy expiry sweep", () => {
     expect(swept?.status).toBe("expired");
     expect(await signalsFor("insurance_certificate_expired", id)).toHaveLength(1);
 
-    await get(`/projects/${sweepProject}/insurance/certificates`);
+    await runSweep(sweepProject);
     await get(`/projects/${sweepProject}/insurance/certificates/${id}`);
     expect(await signalsFor("insurance_certificate_expired", id)).toHaveLength(1);
   });
@@ -513,6 +538,7 @@ describe("lazy expiry sweep", () => {
       status: "active",
       createdBy: owner.userId,
     });
+    await runSweep(closed);
     const res = await get(`/projects/${closed}/insurance/policies`);
     expect(res.statusCode).toBe(200);
     // still expired — expiry is a fact — but no signal, because nobody is at risk
@@ -537,10 +563,11 @@ describe("lazy expiry sweep", () => {
       status: "active",
       createdBy: owner.userId,
     });
+    await runSweep(sweepProject);
     const first = await get(`/projects/${sweepProject}/insurance/bonds`);
     expect(first.statusCode).toBe(200);
     expect(await signalsFor("bond_demand_deadline_passed", id)).toHaveLength(1);
-    await get(`/projects/${sweepProject}/insurance/bonds`);
+    await runSweep(sweepProject);
     await get(`/projects/${sweepProject}/insurance/bonds/${id}`);
     expect(await signalsFor("bond_demand_deadline_passed", id)).toHaveLength(1);
     expect((await signalsFor("bond_demand_deadline_passed", id))[0]!.explanation).toMatch(
@@ -583,15 +610,14 @@ describe("supply-chain cover gaps (#778)", () => {
     });
 
     const key = `${gapProject}:${vendorId}:employers_liability`;
-    const first = await get(`/projects/${gapProject}/insurance/policies`);
-    expect(first.statusCode).toBe(200);
+    await runSweep(gapProject);
     const raised = await signalsFor("insurance_cover_gap", key);
     expect(raised).toHaveLength(1);
     expect(raised[0]!.title).toMatch(/Groundworks Ltd/);
     expect(raised[0]!.explanation).toMatch(/uninsured link/i);
 
-    await get(`/projects/${gapProject}/insurance/certificates`);
-    await get(`/projects/${gapProject}/insurance/summary`);
+    await runSweep(gapProject);
+    await runSweep(gapProject);
     expect(await signalsFor("insurance_cover_gap", key)).toHaveLength(1);
   });
 
@@ -600,7 +626,7 @@ describe("supply-chain cover gaps (#778)", () => {
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body.coverRequirementsKnown).toBe(true);
-    expect(body.requiredTypesSource).toBe("policies_with_required_by_clause");
+    expect(body.requiredTypesSource).toBe("recorded_requirements");
     const gap = (body.coverGaps as { vendorId: string; reason: string; vendorName: string }[]).find(
       (g) => g.vendorId === vendorId,
     );
@@ -1248,5 +1274,1074 @@ describe("ledger coverage", () => {
 
     const bondCallEntries = await get("/ledger?objectType=bond_call&pageSize=200");
     expect((bondCallEntries.json().items as unknown[]).length).toBeGreaterThan(0);
+  });
+});
+
+/* ================================================================== */
+/* WP-MEET upgrade — facilities, requirements, premiums, renewals,     */
+/* wording checks, the payment-hold hook, and the audit bug fixes      */
+/* ================================================================== */
+
+describe("bonding line facilities (#796)", () => {
+  let facilityId: string;
+
+  it("refuses a facility to an ordinary member and accepts it from an admin", async () => {
+    const denied = await post(
+      "/insurance/facilities",
+      { name: "Surety line", provider: "Surety Co", limitAmount: 5_000_000 },
+      viewerHeaders,
+    );
+    expect(denied.statusCode).toBe(403);
+
+    const res = await post("/insurance/facilities", {
+      name: "Surety line",
+      provider: "Surety Co",
+      limitAmount: 5_000_000,
+      currency: "GBP",
+      permittedBondTypes: ["performance"],
+      reviewDate: daysFromToday(45),
+    });
+    expect(res.statusCode).toBe(201);
+    facilityId = res.json().id as string;
+    expect(res.json().number).toBe("FAC-0001");
+    expect(res.json().status).toBe("draft");
+    expect(res.json().utilisation.headroom).toBe(5_000_000);
+  });
+
+  it("derives headroom from the live bonds drawn against the line and never across currencies", async () => {
+    await post("/insurance/facilities/" + facilityId + "/status", { status: "active" });
+    const gbp = newId("bnd");
+    const usd = newId("bnd");
+    await app.db.insert(bonds).values([
+      {
+        id: gbp,
+        companyId: owner.companyId,
+        projectId: bondProject,
+        number: "BND-FAC-1",
+        bondType: "performance",
+        guarantor: "Surety Co",
+        amount: 1_500_000,
+        currency: "GBP",
+        status: "active",
+        facilityId,
+        createdBy: owner.userId,
+      },
+      {
+        id: usd,
+        companyId: owner.companyId,
+        projectId: bondProject,
+        number: "BND-FAC-2",
+        bondType: "performance",
+        guarantor: "Surety Co",
+        amount: 900_000,
+        currency: "USD",
+        status: "active",
+        facilityId,
+        createdBy: owner.userId,
+      },
+    ]);
+    const res = await get(`/insurance/facilities/${facilityId}`);
+    expect(res.statusCode).toBe(200);
+    const u = res.json().utilisation;
+    expect(u.drawnAmount).toBe(1_500_000);
+    expect(u.headroom).toBe(3_500_000);
+    expect(u.utilisationPct).toBe(30);
+    expect(u.excludedForeignCurrency).toHaveLength(1);
+    expect(u.reasons.join(" ")).toMatch(/different currency/i);
+    expect(u.daysToReview).toBeGreaterThan(0);
+  });
+
+  it("refuses to close a facility with line still drawn", async () => {
+    const res = await post(`/insurance/facilities/${facilityId}/status`, { status: "closed" });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toMatch(/still drawn/i);
+  });
+
+  it("reports headroom by currency on the list and ledgers the facility", async () => {
+    const res = await get("/insurance/facilities");
+    expect(res.statusCode).toBe(200);
+    const gbpLine = (res.json().headroomByCurrency as { currency: string; headroom: number }[]).find(
+      (h) => h.currency === "GBP",
+    );
+    expect(gbpLine?.headroom).toBe(3_500_000);
+
+    const ledger = await get("/ledger?objectType=bond_facility&pageSize=50");
+    expect((ledger.json().items as unknown[]).length).toBeGreaterThan(0);
+  });
+
+  it("keeps a facility out of another tenant's reach", async () => {
+    const foreign = await get(`/insurance/facilities/${facilityId}`, stranger.headers);
+    expect([403, 404]).toContain(foreign.statusCode);
+  });
+});
+
+describe("insurance requirements — a requirement belongs to a scope", () => {
+  let reqProject: string;
+  let otherProject: string;
+  let reqId: string;
+
+  it("records a requirement with the clause that demands it", async () => {
+    reqProject = await makeProject("Requirements A");
+    otherProject = await makeProject("Requirements B");
+    const missingClause = await post(`/projects/${reqProject}/insurance/requirements`, {
+      policyType: "professional_indemnity",
+    });
+    expect(missingClause.statusCode).toBe(400);
+
+    const res = await post(`/projects/${reqProject}/insurance/requirements`, {
+      policyType: "professional_indemnity",
+      requiredByClause: "NEC4 X10.3",
+      minimumLimit: 5_000_000,
+      currency: "GBP",
+      waiverOfSubrogation: true,
+    });
+    expect(res.statusCode).toBe(201);
+    reqId = res.json().id as string;
+    expect(res.json().status).toBe("required");
+    expect(res.json().waiverOfSubrogation).toBe(1);
+  });
+
+  it("does NOT apply one project's requirement to another project's vendors", async () => {
+    // a vendor at work on the OTHER project, with no PI evidence anywhere
+    await app.db.insert(workers).values({
+      id: newId("wkr"),
+      companyId: owner.companyId,
+      projectId: otherProject,
+      reference: "W-REQ",
+      fullName: "Another Worker",
+      vendorId: otherVendorId,
+      status: "active",
+      createdBy: owner.userId,
+    });
+    await runSweep();
+    const leaked = await signalsFor(
+      "insurance_cover_gap",
+      `${otherProject}:${otherVendorId}:professional_indemnity`,
+    );
+    expect(leaked).toHaveLength(0);
+
+    // the same requirement recorded company-wide DOES reach the other project
+    const companyWide = await post("/insurance/requirements", {
+      policyType: "third_party_liability",
+      requiredByClause: "Company standard 1",
+    });
+    expect(companyWide.statusCode).toBe(201);
+    await runSweep();
+    const reaches = await signalsFor(
+      "insurance_cover_gap",
+      `${otherProject}:${otherVendorId}:third_party_liability`,
+    );
+    expect(reaches).toHaveLength(1);
+
+    /* Waive it again so the rest of the suite measures its own scopes rather
+       than this one, and so the company-level waive route is exercised. */
+    const companyWideId = companyWide.json().id as string;
+    const waived = await post(`/insurance/requirements/${companyWideId}/waive`, {
+      reason: "Recorded to prove the company scope reaches every project; withdrawn afterwards",
+    });
+    expect(waived.statusCode).toBe(200);
+    expect(waived.json().status).toBe("waived");
+
+    const projectWaive = await post(
+      `/projects/${otherProject}/insurance/requirements/${companyWideId}/waive`,
+      { reason: "wrong route" },
+    );
+    expect(projectWaive.statusCode).toBe(400);
+  });
+
+  it("waives a requirement as a recorded decision, never as an edit", async () => {
+    const patchStatus = await patch(
+      `/projects/${reqProject}/insurance/requirements/${reqId}`,
+      { status: "waived" },
+    );
+    // status is not in the patch schema, so it is simply not applied
+    expect(patchStatus.statusCode).toBe(200);
+    expect(patchStatus.json().status).toBe("required");
+
+    const noReason = await post(
+      `/projects/${reqProject}/insurance/requirements/${reqId}/waive`,
+      {},
+    );
+    expect(noReason.statusCode).toBe(400);
+
+    const waived = await post(`/projects/${reqProject}/insurance/requirements/${reqId}/waive`, {
+      reason: "Design responsibility sits with the employer's own consultant",
+    });
+    expect(waived.statusCode).toBe(200);
+    expect(waived.json().status).toBe("waived");
+    expect(waived.json().waivedBy).toBe(owner.userId);
+
+    const again = await post(`/projects/${reqProject}/insurance/requirements/${reqId}/waive`, {
+      reason: "again",
+    });
+    expect(again.statusCode).toBe(409);
+  });
+
+  it("says the requirement set is unknown rather than reporting compliance", async () => {
+    const bare = await makeProject("No requirement recorded");
+    const res = await get(
+      `/projects/${bare}/insurance/requirements?includeCompanyWide=false`,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.json().items).toEqual([]);
+    expect(res.json().note).toMatch(/never 'compliant'/i);
+  });
+});
+
+describe("policy wording checks against the contract", () => {
+  let wProject: string;
+
+  it("finds the shortfall, the missing endorsement and the absent class of cover", async () => {
+    wProject = await makeProject("Wording checks");
+    await post(`/projects/${wProject}/insurance/requirements`, {
+      policyType: "professional_indemnity",
+      requiredByClause: "NEC4 X10.3",
+      minimumLimit: 10_000_000,
+      currency: "GBP",
+      waiverOfSubrogation: true,
+    });
+    await post(`/projects/${wProject}/insurance/requirements`, {
+      policyType: "decennial",
+      requiredByClause: "Special condition 4",
+    });
+    await activePolicy(wProject, {
+      policyType: "professional_indemnity",
+      policyNumber: "PI/WORDING",
+      limitOfIndemnity: 2_000_000,
+      conditions: [{ ref: "1", text: "Standard exclusions apply" }],
+    });
+
+    const res = await get(`/projects/${wProject}/insurance/wording-checks`);
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.requirements).toBe(2);
+    expect(body.nonCompliant).toBe(2);
+    const pi = (body.checks as { policyType: string; findings: { code: string }[] }[]).find(
+      (c) => c.policyType === "professional_indemnity",
+    )!;
+    const codes = pi.findings.map((f) => f.code);
+    expect(codes).toContain("limit_below_requirement");
+    expect(codes).toContain("waiver_of_subrogation_missing");
+    const dec = (body.checks as { policyType: string; findings: { code: string }[] }[]).find(
+      (c) => c.policyType === "decennial",
+    )!;
+    expect(dec.findings[0]!.code).toBe("no_policy");
+    expect(body.findingsBySeverity.critical).toBeGreaterThan(0);
+  });
+
+  it("refuses to call an unrecorded requirement set a clean bill of health", async () => {
+    const bare = await makeProject("Wording — nothing recorded");
+    const res = await get(`/projects/${bare}/insurance/wording-checks`);
+    expect(res.json().requirements).toBe(0);
+    expect(res.json().note).toMatch(/not a clean bill of health/i);
+  });
+});
+
+describe("period cover against the works (#777)", () => {
+  it("reports the uncovered days at each end and raises policy_period_gap once", async () => {
+    const id = newId("prj");
+    await app.db.insert(projects).values({
+      id,
+      companyId: owner.companyId,
+      name: "Period gap",
+      stage: "course_of_construction",
+      startDate: daysFromToday(-200),
+      finishDate: daysFromToday(200),
+    });
+    await post(`/projects/${id}/insurance/requirements`, {
+      policyType: "contractors_all_risks",
+      requiredByClause: "FIDIC 18.2",
+    });
+    await activePolicy(id, {
+      policyType: "contractors_all_risks",
+      policyNumber: "CAR/GAP",
+      periodStart: daysFromToday(-150),
+      periodEnd: daysFromToday(150),
+    });
+
+    const res = await get(`/projects/${id}/insurance/period-cover`);
+    expect(res.statusCode).toBe(200);
+    expect(res.json().gaps).toHaveLength(1);
+    expect(res.json().gaps[0].uncoveredAtStartDays).toBe(50);
+    expect(res.json().gaps[0].uncoveredAtEndDays).toBe(50);
+
+    await runSweep(id);
+    const key = res.json().gaps[0].key as string;
+    expect(await signalsFor("policy_period_gap", key)).toHaveLength(1);
+    await runSweep(id);
+    expect(await signalsFor("policy_period_gap", key)).toHaveLength(1);
+  });
+
+  it("says the works dates are unknown rather than reporting full cover", async () => {
+    const bare = await makeProject("No works dates");
+    await post(`/projects/${bare}/insurance/requirements`, {
+      policyType: "third_party_liability",
+      requiredByClause: "Clause 1",
+    });
+    const res = await get(`/projects/${bare}/insurance/period-cover`);
+    expect(res.json().gaps).toEqual([]);
+    expect((res.json().reasons as string[]).join(" ")).toMatch(/no start and end date/i);
+  });
+});
+
+describe("premium and claims experience (#782)", () => {
+  let expProject: string;
+  let expPolicy: string;
+
+  it("computes the loss ratio per currency from premiums and claims", async () => {
+    expProject = await makeProject("Experience");
+    expPolicy = await activePolicy(expProject, { policyNumber: "CAR/EXP", currency: "GBP" });
+    for (const p of [
+      { amount: 150_000 },
+      { amount: 50_000 },
+      { kind: "return_premium", amount: 20_000 },
+      { kind: "broker_fee", amount: 5_000 },
+    ]) {
+      const res = await post(
+        `/projects/${expProject}/insurance/policies/${expPolicy}/premiums`,
+        p,
+      );
+      expect(res.statusCode).toBe(201);
+    }
+    const claim = await post(`/projects/${expProject}/insurance/claims`, {
+      policyId: expPolicy,
+      title: "Storm damage",
+      incidentDate: daysFromToday(-10),
+      awareDate: daysFromToday(-8),
+      reserve: 90_000,
+      currency: "GBP",
+    });
+    expect(claim.statusCode).toBe(201);
+
+    const res = await get(`/projects/${expProject}/insurance/experience`);
+    expect(res.statusCode).toBe(200);
+    const gbp = (res.json().byCurrency as { currency: string; premiumNet: number; lossRatioPct: number }[]).find(
+      (b) => b.currency === "GBP",
+    )!;
+    expect(gbp.premiumNet).toBe(180_000);
+    expect(gbp.claimsIncurred).toBe(90_000);
+    expect(gbp.lossRatioPct).toBe(50);
+    expect((res.json().byPolicyType as unknown[]).length).toBeGreaterThan(0);
+  });
+
+  it("refuses a ratio, with a reason, where no premium is recorded", async () => {
+    const bare = await makeProject("No premium");
+    const pol = await activePolicy(bare, { policyNumber: "CAR/NOPREM" });
+    await post(`/projects/${bare}/insurance/claims`, {
+      policyId: pol,
+      title: "A loss",
+      incidentDate: daysFromToday(-5),
+      awareDate: daysFromToday(-4),
+      reserve: 10_000,
+    });
+    const res = await get(`/projects/${bare}/insurance/experience`);
+    const bucket = (res.json().byCurrency as { lossRatioPct: number | null; reasons: string[] }[])[0]!;
+    expect(bucket.lossRatioPct).toBeNull();
+    expect(bucket.reasons.join(" ")).toMatch(/No premium is recorded/i);
+  });
+
+  it("keeps a read-only member from recording premium", async () => {
+    const res = await post(
+      `/projects/${expProject}/insurance/policies/${expPolicy}/premiums`,
+      { amount: 1 },
+      viewerHeaders,
+    );
+    expect(res.statusCode).toBe(403);
+  });
+});
+
+describe("renewal pipeline (#775)", () => {
+  let renProject: string;
+  let renPolicy: string;
+
+  it("lists a policy whose renewal is behind its lead time", async () => {
+    renProject = await makeProject("Renewals");
+    renPolicy = await activePolicy(renProject, {
+      policyNumber: "CAR/RENEW",
+      periodStart: daysFromToday(-350),
+      periodEnd: daysFromToday(10),
+    });
+    const res = await get(`/projects/${renProject}/insurance/renewals?leadTimeDays=30`);
+    expect(res.statusCode).toBe(200);
+    const row = (res.json().items as { policyId: string; urgency: string; behindByDays: number }[]).find(
+      (r) => r.policyId === renPolicy,
+    )!;
+    expect(row.urgency).toBe("critical");
+    expect(row.behindByDays).toBe(20);
+  });
+
+  it("moves the policy along the pipeline and refuses 'bound' with no successor", async () => {
+    const noSuccessor = await post(
+      `/projects/${renProject}/insurance/policies/${renPolicy}/renewal`,
+      { renewalStatus: "bound" },
+    );
+    expect(noSuccessor.statusCode).toBe(400);
+    expect(noSuccessor.json().message).toMatch(/successor/i);
+
+    const instructed = await post(
+      `/projects/${renProject}/insurance/policies/${renPolicy}/renewal`,
+      { renewalStatus: "instructed", renewalTargetDate: daysFromToday(5) },
+    );
+    expect(instructed.statusCode).toBe(200);
+    expect(instructed.json().renewalStatus).toBe("instructed");
+
+    const next = await activePolicy(renProject, {
+      policyNumber: "CAR/RENEW-2",
+      periodStart: daysFromToday(11),
+      periodEnd: daysFromToday(370),
+    });
+    const bound = await post(
+      `/projects/${renProject}/insurance/policies/${renPolicy}/renewal`,
+      { renewalStatus: "bound", renewedByPolicyId: next },
+    );
+    expect(bound.statusCode).toBe(200);
+
+    const after = await get(`/projects/${renProject}/insurance/renewals`);
+    expect(
+      (after.json().items as { policyId: string }[]).some((r) => r.policyId === renPolicy),
+    ).toBe(false);
+  });
+
+  it("raises policy_renewal_overdue once for an unrenewed policy past its lead time", async () => {
+    const late = await activePolicy(renProject, {
+      policyNumber: "CAR/LATE",
+      periodStart: daysFromToday(-360),
+      periodEnd: daysFromToday(3),
+    });
+    await runSweep(renProject);
+    const key = `${late}:${daysFromToday(3)}`;
+    expect(await signalsFor("policy_renewal_overdue", key)).toHaveLength(1);
+    await runSweep(renProject);
+    expect(await signalsFor("policy_renewal_overdue", key)).toHaveLength(1);
+  });
+});
+
+describe("uninsured loss candidates (#787)", () => {
+  it("flags an insured loss for which nobody raised a claim", async () => {
+    const lossProject = await makeProject("Uninsured losses");
+    await activePolicy(lossProject, {
+      policyType: "third_party_liability",
+      policyNumber: "TPL/LOSS",
+      deductible: 5_000,
+      periodStart: daysFromToday(-100),
+      periodEnd: daysFromToday(200),
+    });
+    const incidentId = newId("inc");
+    await app.db.insert(safetyIncidents).values({
+      id: incidentId,
+      companyId: owner.companyId,
+      projectId: lossProject,
+      number: 1,
+      reference: "INC-0001",
+      incidentType: "public_impact",
+      severity: "serious",
+      title: "Falling debris damaged a neighbouring roof",
+      description: "Debris from level 6 struck the adjoining property",
+      occurredAt: new Date(Date.now() - 5 * 86_400_000).toISOString(),
+      estimatedCost: 120_000,
+      createdBy: owner.userId,
+    });
+    await runSweep(lossProject);
+    const raised = await signalsFor("uninsured_loss_candidate", `safety_incident:${incidentId}`);
+    expect(raised).toHaveLength(1);
+    expect(raised[0]!.explanation).toMatch(/condition/i);
+    expect(raised[0]!.severity).toBe("high");
+
+    await runSweep(lossProject);
+    expect(
+      await signalsFor("uninsured_loss_candidate", `safety_incident:${incidentId}`),
+    ).toHaveLength(1);
+  });
+});
+
+describe("the payment hold hook WP-FIN2 calls", () => {
+  let holdProject: string;
+  let holdVendor: string;
+
+  it("refuses to answer, rather than clearing the vendor, with no requirement recorded", async () => {
+    holdProject = await makeProject("Payment holds");
+    /* A vendor of its own: certificates are collected per vendor across the
+       whole company, so a certificate another test filed for a shared vendor
+       would silently change the answer here. */
+    holdVendor = newId("ven");
+    await app.db.insert(vendors).values({
+      id: holdVendor,
+      companyId: owner.companyId,
+      name: "Payment Hold Ltd",
+    });
+    const res = await get(
+      `/projects/${holdProject}/insurance/hold-check?vendorId=${holdVendor}`,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.json().hold).toBe(false);
+    expect(res.json().requirementsKnown).toBe(false);
+    expect(res.json().note).toMatch(/NOT a statement that the vendor is compliant/i);
+  });
+
+  it("holds when no certificate exists and releases once in-date cover is evidenced", async () => {
+    await post(`/projects/${holdProject}/insurance/requirements`, {
+      policyType: "employers_liability",
+      requiredByClause: "Subcontract cl.19",
+      minimumLimit: 5_000_000,
+      currency: "GBP",
+    });
+    const held = await get(
+      `/projects/${holdProject}/insurance/hold-check?vendorId=${holdVendor}`,
+    );
+    expect(held.json().hold).toBe(true);
+    expect(held.json().findings[0].reason).toBe("no_certificate");
+
+    const cert = await post(`/projects/${holdProject}/insurance/certificates`, {
+      vendorId: holdVendor,
+      subjectName: "Payment Hold Ltd",
+      policyType: "employers_liability",
+      limitOfIndemnity: 10_000_000,
+      currency: "GBP",
+      validFrom: daysFromToday(-10),
+      validTo: daysFromToday(200),
+    });
+    expect(cert.statusCode).toBe(201);
+    const released = await get(
+      `/projects/${holdProject}/insurance/hold-check?vendorId=${holdVendor}`,
+    );
+    expect(released.json().hold).toBe(false);
+    // unverified is a warning, never a hold: the failure is on our side
+    expect((released.json().warnings as { reason: string }[]).map((w) => w.reason)).toContain(
+      "certificate_unverified",
+    );
+  });
+
+  it("holds on a limit below the requirement", async () => {
+    const shortProject = await makeProject("Short limit");
+    await post(`/projects/${shortProject}/insurance/requirements`, {
+      policyType: "third_party_liability",
+      requiredByClause: "Subcontract cl.20",
+      minimumLimit: 10_000_000,
+      currency: "GBP",
+      vendorId: otherVendorId,
+    });
+    await post(`/projects/${shortProject}/insurance/certificates`, {
+      vendorId: otherVendorId,
+      subjectName: "Steelwork Ltd",
+      policyType: "third_party_liability",
+      limitOfIndemnity: 1_000_000,
+      currency: "GBP",
+      validFrom: daysFromToday(-5),
+      validTo: daysFromToday(200),
+    });
+    const res = await get(
+      `/projects/${shortProject}/insurance/hold-check?vendorId=${otherVendorId}`,
+    );
+    expect(res.json().hold).toBe(true);
+    expect(res.json().findings[0].reason).toBe("limit_below_requirement");
+  });
+
+  it("records the company-level hold check as an access event in the ledger", async () => {
+    const res = await get(`/insurance/hold-check?vendorId=${holdVendor}`);
+    expect(res.statusCode).toBe(200);
+    const ledger = await get("/ledger?objectType=insurance_hold_check&pageSize=20");
+    expect((ledger.json().items as { action: string }[]).some((e) => e.action === "access")).toBe(
+      true,
+    );
+  });
+});
+
+describe("health inputs for the intelligence layer", () => {
+  it("reports null rather than 0 for cover gaps where no requirement is recorded", async () => {
+    const bare = await makeProject("Health inputs — bare");
+    const res = await get(`/projects/${bare}/insurance/health-inputs`);
+    expect(res.statusCode).toBe(200);
+    expect(res.json().metrics.coverGaps).toBeNull();
+    expect((res.json().reasons as string[]).join(" ")).toMatch(/reported as null rather than 0/i);
+  });
+
+  it("counts policies, certificates, claims and open insurance signals", async () => {
+    const res = await get(`/projects/${gapProject}/insurance/health-inputs`);
+    expect(res.statusCode).toBe(200);
+    const m = res.json().metrics;
+    expect(m.policies).toBeGreaterThan(0);
+    expect(typeof m.certificatesUnverified).toBe("number");
+    expect(typeof m.openInsuranceSignals).toBe("number");
+    expect(m.coverGaps).not.toBeNull();
+  });
+});
+
+describe("audit bug fixes", () => {
+  it("[#10] rejects an unparseable or future verification date with 400, never a 500", async () => {
+    const certProject = await makeProject("Verify dates");
+    const created = await post(`/projects/${certProject}/insurance/certificates`, {
+      vendorId,
+      subjectName: "Groundworks Ltd",
+      policyType: "third_party_liability",
+      validFrom: daysFromToday(-5),
+      validTo: daysFromToday(200),
+    });
+    expect(created.statusCode).toBe(201);
+    const certId = created.json().id as string;
+
+    for (const bad of ["abcd", "2026-13-45"]) {
+      const res = await post(
+        `/projects/${certProject}/insurance/certificates/${certId}/verify`,
+        { verificationMethod: "broker_confirmation", verifiedAt: bad },
+        verifier.headers,
+      );
+      expect(res.statusCode).toBe(400);
+    }
+    const future = await post(
+      `/projects/${certProject}/insurance/certificates/${certId}/verify`,
+      { verificationMethod: "broker_confirmation", verifiedAt: daysFromToday(30) },
+      verifier.headers,
+    );
+    expect(future.statusCode).toBe(400);
+
+    const ok = await post(
+      `/projects/${certProject}/insurance/certificates/${certId}/verify`,
+      { verificationMethod: "broker_confirmation", verifiedAt: daysFromToday(-1) },
+      verifier.headers,
+    );
+    expect(ok.statusCode).toBe(200);
+  });
+
+  it("[#18] refuses to release a called bond with an outstanding demand, or an expired one", async () => {
+    const relProject = await makeProject("Bond release states");
+    const created = await post(`/projects/${relProject}/insurance/bonds`, {
+      bondType: "performance",
+      guarantor: "Surety Co",
+      amount: 400_000,
+      currency: "GBP",
+      isOnDemand: true,
+      issuedAt: daysFromToday(-30),
+      expiryAt: daysFromToday(300),
+      demandDeadline: daysFromToday(200),
+    });
+    expect(created.statusCode).toBe(201);
+    const id = created.json().id as string;
+    expect(
+      (await post(`/projects/${relProject}/insurance/bonds/${id}/status`, { status: "issued" }))
+        .statusCode,
+    ).toBe(200);
+    expect(
+      (await post(`/projects/${relProject}/insurance/bonds/${id}/status`, { status: "active" }))
+        .statusCode,
+    ).toBe(200);
+    const called = await post(`/projects/${relProject}/insurance/bonds/${id}/call`, {
+      amount: 100_000,
+      reason: "Failure to complete the remedial works within the period stated in the notice",
+      evidenceRefs: { notice: "NOT-0007", defaultDate: daysFromToday(-14) },
+    });
+    expect(called.statusCode).toBe(201);
+    const callId = called.json().call.id as string;
+
+    const blocked = await post(`/projects/${relProject}/insurance/bonds/${id}/release`, {});
+    expect(blocked.statusCode).toBe(409);
+    expect(blocked.json().message).toMatch(/still outstanding/i);
+
+    const settled = await post(
+      `/projects/${relProject}/insurance/bond-calls/${callId}/outcome`,
+      { outcome: "paid", proceedsAmount: 100_000, proceedsReceivedAt: daysFromToday(-1) },
+    );
+    expect(settled.statusCode).toBe(200);
+    const allowed = await post(`/projects/${relProject}/insurance/bonds/${id}/release`, {});
+    expect(allowed.statusCode).toBe(200);
+
+    const expiredId = newId("bnd");
+    await app.db.insert(bonds).values({
+      id: expiredId,
+      companyId: owner.companyId,
+      projectId: relProject,
+      number: "BND-EXP",
+      bondType: "performance",
+      guarantor: "Surety Co",
+      amount: 100_000,
+      currency: "GBP",
+      status: "expired",
+      expiryAt: daysFromToday(-10),
+      createdBy: owner.userId,
+    });
+    const expiredRelease = await post(
+      `/projects/${relProject}/insurance/bonds/${expiredId}/release`,
+      {},
+    );
+    expect(expiredRelease.statusCode).toBe(409);
+    expect(expiredRelease.json().message).toMatch(/not released/i);
+  });
+
+  it("[#19] refuses another tenant's vendor as a broker on a company policy", async () => {
+    const created = await post("/insurance/policies", policyPayload({ policyNumber: "CPOL/BROKER" }));
+    expect(created.statusCode).toBe(201);
+    const id = created.json().id as string;
+    const foreignVendor = newId("ven");
+    await app.db.insert(vendors).values({
+      id: foreignVendor,
+      companyId: stranger.companyId,
+      name: "Foreign Broker",
+    });
+    const res = await patch(`/insurance/policies/${id}`, { brokerVendorId: foreignVendor });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toMatch(/company directory/i);
+  });
+
+  it("[#20] does not return another project's claims through a company-level policy", async () => {
+    const a = await makeProject("OCIP project A");
+    const b = await makeProject("OCIP project B");
+    const master = await post(
+      "/insurance/policies",
+      policyPayload({ policyType: "contractors_all_risks", policyNumber: "OCIP/1" }),
+    );
+    expect(master.statusCode).toBe(201);
+    const masterId = master.json().id as string;
+    await post(`/insurance/policies/${masterId}/status`, { status: "active" });
+
+    const claimB = await post(`/projects/${b}/insurance/claims`, {
+      policyId: masterId,
+      title: "Confidential loss on project B",
+      incidentDate: daysFromToday(-3),
+      awareDate: daysFromToday(-2),
+      reserve: 500_000,
+    });
+    expect(claimB.statusCode).toBe(201);
+
+    const seenFromA = await get(`/projects/${a}/insurance/policies/${masterId}`);
+    expect(seenFromA.statusCode).toBe(200);
+    expect(seenFromA.json().claims).toEqual([]);
+    expect(seenFromA.json().claimsScope).toBe("this_project_only");
+
+    const seenFromB = await get(`/projects/${b}/insurance/policies/${masterId}`);
+    expect((seenFromB.json().claims as unknown[]).length).toBe(1);
+  });
+
+  it("[#6] keeps an ordinary member out of the company-level policy programme", async () => {
+    const create = await post("/insurance/policies", policyPayload(), viewerHeaders);
+    expect(create.statusCode).toBe(403);
+    const sweep = await post("/insurance/sweep", {}, viewerHeaders);
+    expect(sweep.statusCode).toBe(403);
+  });
+
+  it("[#5/#27] restricts the company-level reads to the caller's own projects", async () => {
+    // `viewer` is a read-only member of permProject only.
+    const list = await get("/insurance/policies", viewerHeaders);
+    expect(list.statusCode).toBe(200);
+    const projectIds = (list.json().items as { projectId: string | null }[])
+      .map((p) => p.projectId)
+      .filter((id): id is string => id !== null);
+    expect(projectIds.every((id) => id === permProject)).toBe(true);
+    expect(projectIds).not.toContain(mainProject);
+
+    const summary = await get("/insurance/summary", viewerHeaders);
+    expect(summary.statusCode).toBe(200);
+    expect(summary.json().visibility.all).toBe(false);
+
+    const expiring = await get("/insurance/expiring?days=400", viewerHeaders);
+    expect(expiring.statusCode).toBe(200);
+    expect(expiring.json().visibility.all).toBe(false);
+
+    // and the whole tenant for an owner
+    const ownerList = await get("/insurance/policies");
+    const ownerProjects = new Set(
+      (ownerList.json().items as { projectId: string | null }[]).map((p) => p.projectId),
+    );
+    expect(ownerProjects.size).toBeGreaterThan(1);
+  });
+
+  it("[#9] does not write signals, statuses or ledger entries on a read", async () => {
+    const readProject = await makeProject("Pure reads");
+    const id = newId("pol");
+    await app.db.insert(insurancePolicies).values({
+      id,
+      companyId: owner.companyId,
+      projectId: readProject,
+      number: "POL-PURE",
+      policyType: "contractors_all_risks",
+      insurer: "Acme Re",
+      policyNumber: "CAR/PURE",
+      periodStart: daysFromToday(-400),
+      periodEnd: daysFromToday(-2),
+      status: "active",
+      createdBy: owner.userId,
+    });
+    for (const url of [
+      `/projects/${readProject}/insurance/policies`,
+      `/projects/${readProject}/insurance/policies/${id}`,
+      `/projects/${readProject}/insurance/certificates`,
+      `/projects/${readProject}/insurance/bonds`,
+      `/projects/${readProject}/insurance/claims`,
+      `/projects/${readProject}/insurance/summary`,
+      `/projects/${readProject}/insurance/expiring`,
+    ]) {
+      const res = await get(url);
+      expect(res.statusCode).toBe(200);
+    }
+    const [after] = await app.db
+      .select()
+      .from(insurancePolicies)
+      .where(eq(insurancePolicies.id, id));
+    expect(after?.status).toBe("active");
+    expect(await signalsFor("policy_lapsed_during_works", id)).toHaveLength(0);
+
+    // the scheduled job, under the system actor, is what actually sweeps it
+    await app.scheduler.runNow("insurance.expiry");
+    const [swept] = await app.db
+      .select()
+      .from(insurancePolicies)
+      .where(eq(insurancePolicies.id, id));
+    expect(swept?.status).toBe("expired");
+    const raised = await signalsFor("policy_lapsed_during_works", id);
+    expect(raised).toHaveLength(1);
+  });
+
+  it("[#8] evaluates each project against its own requirement set in company scope", async () => {
+    const a = await makeProject("Scoped requirements A");
+    const b = await makeProject("Scoped requirements B");
+    const vA = newId("ven");
+    const vB = newId("ven");
+    await app.db.insert(vendors).values([
+      { id: vA, companyId: owner.companyId, name: "Vendor A" },
+      { id: vB, companyId: owner.companyId, name: "Vendor B" },
+    ]);
+    await app.db.insert(workers).values([
+      {
+        id: newId("wkr"),
+        companyId: owner.companyId,
+        projectId: a,
+        reference: "W-A",
+        fullName: "Worker A",
+        vendorId: vA,
+        status: "active",
+        createdBy: owner.userId,
+      },
+      {
+        id: newId("wkr"),
+        companyId: owner.companyId,
+        projectId: b,
+        reference: "W-B",
+        fullName: "Worker B",
+        vendorId: vB,
+        status: "active",
+        createdBy: owner.userId,
+      },
+    ]);
+    await post(`/projects/${a}/insurance/requirements`, {
+      policyType: "decennial",
+      requiredByClause: "Project A special condition",
+    });
+    await app.scheduler.runNow("insurance.expiry");
+    expect(await signalsFor("insurance_cover_gap", `${a}:${vA}:decennial`)).toHaveLength(1);
+    expect(await signalsFor("insurance_cover_gap", `${b}:${vB}:decennial`)).toHaveLength(0);
+  });
+
+  it("warns before a claim's notification deadline rather than only after it", async () => {
+    const warnProject = await makeProject("Notification warnings");
+    const pol = await activePolicy(warnProject, {
+      policyNumber: "CAR/WARN",
+      notificationDays: 30,
+    });
+    const claim = await post(`/projects/${warnProject}/insurance/claims`, {
+      policyId: pol,
+      title: "Water ingress",
+      incidentDate: daysFromToday(-25),
+      awareDate: daysFromToday(-24),
+      reserve: 25_000,
+    });
+    expect(claim.statusCode).toBe(201);
+    const claimId = claim.json().id as string;
+
+    await app.scheduler.runNow("insurance.claim-notification-warnings");
+    const warned = await signalsFor("insurance_notification_missed", `${claimId}:warn`);
+    expect(warned).toHaveLength(1);
+    expect(warned[0]!.explanation).toMatch(/BEFORE the date/);
+
+    await app.scheduler.runNow("insurance.claim-notification-warnings");
+    expect(await signalsFor("insurance_notification_missed", `${claimId}:warn`)).toHaveLength(1);
+  });
+});
+
+/* ================================================================== */
+/* Claim documentation pack and the loss adjuster (#784, #785)         */
+/* ================================================================== */
+
+describe("claim documentation pack and the adjuster's task list", () => {
+  let packProject: string;
+  let packPolicy: string;
+  let packClaim: string;
+  let incidentId: string;
+
+  beforeAll(async () => {
+    packProject = await makeProject("Insurance — claim packs");
+    packPolicy = await activePolicy(packProject, {
+      policyNumber: "CAR/PACK",
+      notificationDays: 30,
+    });
+    incidentId = newId("sin");
+    await app.db.insert(safetyIncidents).values({
+      id: incidentId,
+      companyId: owner.companyId,
+      projectId: packProject,
+      number: 91,
+      reference: "INC-0091",
+      incidentType: "property_damage",
+      severity: "serious",
+      title: "Crane jib struck the façade",
+      description: "Level 8 curtain walling damaged",
+      occurredAt: new Date(Date.now() - 6 * 86_400_000).toISOString(),
+      reportedAt: new Date(Date.now() - 5 * 86_400_000).toISOString(),
+      estimatedCost: 40_000,
+      createdBy: owner.userId,
+    });
+  }, 120_000);
+
+  it("raises a claim from a recorded incident with the aware date taken from the report", async () => {
+    const res = await post(`/projects/${packProject}/insurance/claims/from-incident`, {
+      incidentId,
+      policyId: packPolicy,
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json();
+    packClaim = body.id as string;
+    expect(body.title).toContain("INC-0091");
+    expect(body.reserve).toBe(40_000);
+    expect(body.raisedFrom.awareDateSource).toBe("incident report date");
+    // aware = reported (5 days ago); the deadline is 30 days after that
+    expect(body.notificationDueAt).toBe(addDaysISO(daysFromToday(-5), 30));
+    expect(body.obligationId).toBeTruthy();
+  });
+
+  it("refuses a second claim from the same incident rather than doubling the reserve", async () => {
+    const res = await post(`/projects/${packProject}/insurance/claims/from-incident`, {
+      incidentId,
+      policyId: packPolicy,
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toMatch(/double the reserve/i);
+  });
+
+  it("404s on an incident belonging to another project", async () => {
+    const res = await post(`/projects/${mainProject}/insurance/claims/from-incident`, {
+      incidentId,
+      policyId: packPolicy,
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("records an adjuster request as a dated obligation and notifies its owner", async () => {
+    const res = await post(
+      `/projects/${packProject}/insurance/claims/${packClaim}/requests`,
+      {
+        kind: "information_request",
+        title: "Send the daily logs for the week of the incident",
+        requestedBy: "Crawford & Co",
+        dueDate: daysFromToday(5),
+        ownerId: owner.userId,
+      },
+    );
+    expect(res.statusCode).toBe(201);
+    const body = res.json();
+    expect(body.status).toBe("open");
+    expect(body.overdue).toBe(false);
+    expect(body.obligationId).toBeTruthy();
+    const [obl] = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, body.obligationId as string));
+    expect(obl!.status).toBe("open");
+    expect(obl!.trigger).toMatch(/loss adjuster/i);
+  });
+
+  it("derives overdue from the calendar rather than storing it", async () => {
+    const res = await post(
+      `/projects/${packProject}/insurance/claims/${packClaim}/requests`,
+      { title: "Photographs of the façade", dueDate: daysFromToday(-3) },
+    );
+    expect(res.statusCode).toBe(201);
+    expect(res.json().overdue).toBe(true);
+    expect(res.json().status).toBe("open");
+
+    const list = await get(`/projects/${packProject}/insurance/claims/${packClaim}/requests`);
+    expect(list.statusCode).toBe(200);
+    expect(list.json().total).toBe(2);
+    expect(list.json().overdue).toBe(1);
+  });
+
+  it("marks a late answer's obligation breached, not quietly satisfied", async () => {
+    const list = await get(`/projects/${packProject}/insurance/claims/${packClaim}/requests`);
+    const late = (list.json().items as Array<Record<string, unknown>>).find(
+      (r) => r["overdue"] === true,
+    )!;
+    const res = await post(
+      `/projects/${packProject}/insurance/claim-requests/${late["id"]}/respond`,
+      { responseNote: "Sent by email with 14 photographs" },
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.json().status).toBe("responded");
+    // the second answer is refused rather than overwriting the first
+    const again = await post(
+      `/projects/${packProject}/insurance/claim-requests/${late["id"]}/respond`,
+      { responseNote: "Again" },
+    );
+    expect(again.statusCode).toBe(409);
+  });
+
+  it("assembles a content-addressed pack whose hash is on the claim and in the ledger", async () => {
+    const res = await post(`/projects/${packProject}/insurance/claims/${packClaim}/pack`, {});
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(body.itemCount).toBe(1);
+    const [claim] = await app.db
+      .select()
+      .from(insuranceClaims)
+      .where(eq(insuranceClaims.id, packClaim));
+    expect(claim!.packSha256).toBe(body.sha256);
+    expect(claim!.packItemCount).toBe(1);
+
+    const doc = await get(`/projects/${packProject}/insurance/claims/${packClaim}/pack`);
+    expect(doc.statusCode).toBe(200);
+    expect(doc.headers["x-document-sha256"]).toBe(body.sha256);
+    expect(doc.body).toContain("INC-0091");
+    expect(doc.body).toContain("Notification chronology");
+  });
+
+  it("states the pack's gaps rather than reading as complete", async () => {
+    const res = await post(`/projects/${packProject}/insurance/claims/${packClaim}/pack`, {});
+    const gaps = res.json().gaps as string[];
+    // the claim has never been notified, and one request went past its date
+    expect(gaps.join(" ")).toMatch(/not a notice/);
+  });
+
+  it("404s the pack before one has been generated", async () => {
+    const other = await post(`/projects/${packProject}/insurance/claims`, {
+      policyId: packPolicy,
+      title: "Second loss",
+      incidentDate: daysFromToday(-2),
+      awareDate: daysFromToday(-1),
+    });
+    const res = await get(
+      `/projects/${packProject}/insurance/claims/${other.json().id}/pack`,
+    );
+    expect(res.statusCode).toBe(404);
+    expect(res.json().message).toMatch(/what it serves is what was hashed/);
+  });
+
+  it("keeps the pack inside its tenant", async () => {
+    const res = await get(
+      `/projects/${packProject}/insurance/claims/${packClaim}/pack`,
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(res.statusCode);
+  });
+
+  it("refuses a read-only member the pack generation route", async () => {
+    await app.db.insert(projectMemberships).values({
+      id: newId("pm"),
+      companyId: owner.companyId,
+      projectId: packProject,
+      userId: viewer.userId,
+      templateKey: "read_only",
+    });
+    const res = await post(
+      `/projects/${packProject}/insurance/claims/${packClaim}/pack`,
+      {},
+      viewerHeaders,
+    );
+    expect(res.statusCode).toBe(403);
   });
 });

@@ -1267,7 +1267,13 @@ export function csvEscape(value: unknown): string {
   // Neutralise, do not strip: the reader must still see what was written, so
   // the cell is prefixed with an apostrophe (OWASP guidance) which spreadsheets
   // consume as "this is text".
-  if (s.length > 0 && CSV_FORMULA_TRIGGERS.has(s[0]!)) s = `'${s}`;
+  //
+  // A NUMBER IS NEVER NEUTRALISED. Injection needs a string an untrusted party
+  // authored; a negative amount is not that, and prefixing -1200.5 with an
+  // apostrophe turns money into text in every spreadsheet and every importer
+  // that reads the file — a variance column would stop summing.
+  const numeric = typeof value === "number" || typeof value === "bigint";
+  if (!numeric && s.length > 0 && CSV_FORMULA_TRIGGERS.has(s[0]!)) s = `'${s}`;
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 

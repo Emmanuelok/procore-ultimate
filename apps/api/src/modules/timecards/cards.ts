@@ -53,9 +53,13 @@ import {
   type AppliedOvertimeRule,
   type HourSplit,
 } from "./hours.js";
+// `batches.ts` imports `splitOf` from this file; both references are inside
+// route handlers, so the ESM cycle resolves before either is called.
+import { recomputeBatch } from "./batches.js";
 import {
   actorOf,
   addDays,
+  assertSameCurrency,
   assertTimecardEditable,
   assertTransition,
   checkSelfApproval,
@@ -267,6 +271,17 @@ export function resolveHours(
     const total = round2(regular + overtime + doubleTime + premium);
     if (total <= 0) {
       throw badRequest("A timecard with no hours on it is not a timecard. Supply hours.");
+    }
+    // Each bucket is capped at 24 by the schema, and 24+24+24 passed. The
+    // classified paths cap the worked day; the explicit path did not, so a
+    // 72-hour day could be entered, costed and allocated.
+    if (total > 24) {
+      throw badRequest(
+        `${total} hours were supplied for a single day (${regular} plain + ${overtime} overtime + ` +
+          `${doubleTime} double time + ${premium} premium). A day holds 24 hours. If this is a ` +
+          "double shift spanning midnight, raise it as two cards on the two dates, which is also " +
+          "how the site-access stream will have recorded it.",
+      );
     }
     return {
       split: {
@@ -530,9 +545,40 @@ export const timecardRoutes: FastifyPluginAsync = async (app) => {
         .where(and(eq(timecardBatches.id, body.batchId), eq(timecardBatches.projectId, projectId)))
         .limit(1);
       if (!batch) throw badRequest(`batchId ${body.batchId} is not a batch on this project.`);
-      if (batch.status === "locked" || batch.status === "exported") {
-        throw conflict(`Batch ${batch.reference} is ${batch.status} and takes no further cards.`);
+      /*
+       * A CARD ONLY JOINS A BATCH THAT IS STILL OPEN.
+       *
+       * Refusing only locked/exported let a draft card be dropped into a
+       * SUBMITTED or APPROVED batch: lock and export only touch approved and
+       * submitted cards, so the draft stayed draft under an exported batch id
+       * and never reached payroll. And `collectInto` enforces one currency per
+       * batch while this path did not, so a USD card in a GBP batch made
+       * `computeBatchRollup` throw — permanently 400ing the batch detail view.
+       */
+      if (!["draft", "rejected"].includes(batch.status)) {
+        throw conflict(
+          `Batch ${batch.reference} is "${batch.status}" and takes no further cards. A week that ` +
+            "has been submitted is a claim somebody is reviewing; adding to it silently changes " +
+            "what they are reviewing. Raise the card on its own, or collect it into a new batch.",
+        );
       }
+      assertSameCurrency(
+        [
+          { label: batch.reference, currency: batch.currency },
+          {
+            label: "this card",
+            // The same precedence resolveRates uses, so the check and the
+            // stored currency can never disagree.
+            currency: (
+              body.currency ??
+              member?.currency ??
+              worker.currency ??
+              "USD"
+            ).toUpperCase(),
+          },
+        ],
+        `Adding a card to batch ${batch.reference}`,
+      );
     }
 
     const number = await nextRecordNumber(app.db, projectId, "timecard");
@@ -639,6 +685,7 @@ export const timecardRoutes: FastifyPluginAsync = async (app) => {
       resolved.rule?.kind === "weekly"
         ? await reclassifyWeek(projectId, companyId, body.workerId, body.workDate, cfg.weekStartsOn, actorId)
         : [];
+    if (body.batchId) await recomputeBatch(app.db, body.batchId);
 
     return reply.status(201).send({
       ...(await timecardView(id, companyId, projectId)),
@@ -653,12 +700,13 @@ export const timecardRoutes: FastifyPluginAsync = async (app) => {
     const companyId = companyOf(req);
     const projectId = projectOf(req);
 
-    // Lazy, idempotent sweep — never a cron. Cards raised before the gate
-    // export arrived carry no access link; the moment somebody lists them we
-    // attach any record that has since landed and recompute the variance.
-    // Cards that already carry a link, and frozen cards, are untouched, so
-    // the sweep converges and re-running it changes nothing.
-    const swept = await sweepAccessLinks(companyId, projectId);
+    /*
+     * A READ DOES NOT WRITE. This route used to run the access-link sweep on
+     * every page load, under `read` permission: up to 500 cards selected and
+     * one UPDATE issued per match, by any viewer. The links are now attached
+     * where the evidence lands (the site-access ingest calls
+     * `attachAccessLinks`) and by the `timecards.access-links` scheduled job.
+     */
 
     const clauses = [eq(timecards.companyId, companyId), eq(timecards.projectId, projectId)];
     if (q.workerId) clauses.push(eq(timecards.workerId, q.workerId));
@@ -680,12 +728,11 @@ export const timecardRoutes: FastifyPluginAsync = async (app) => {
       );
     }
     if (q.unallocated === "true") {
-      const allocated = await app.db
-        .selectDistinct({ timecardId: timecardAllocations.timecardId })
-        .from(timecardAllocations)
-        .where(eq(timecardAllocations.projectId, projectId));
-      const ids = allocated.map((a) => a.timecardId);
-      if (ids.length > 0) clauses.push(notInArray(timecards.id, ids));
+      // NOT EXISTS, not a NOT IN over every allocated card id on the project —
+      // that list grows with the job and was being materialised on every read.
+      clauses.push(
+        sql`not exists (select 1 from ${timecardAllocations} where ${timecardAllocations.timecardId} = ${timecards.id})`,
+      );
     }
     const where = and(...clauses);
     const [totalRow] = await app.db.select({ n: count() }).from(timecards).where(where);
@@ -730,7 +777,6 @@ export const timecardRoutes: FastifyPluginAsync = async (app) => {
         Number(totalRow?.n ?? 0),
         q,
       ),
-      sweep: swept,
     };
   });
 
@@ -957,13 +1003,39 @@ export const timecardRoutes: FastifyPluginAsync = async (app) => {
       set["detail"] = detail;
 
       await app.db.update(timecards).set(set).where(eq(timecards.id, timecardId));
+
+      /*
+       * A WEEKLY RULE REPRICES THE WHOLE WEEK.
+       *
+       * `reclassifyWeek` ran only from create. Editing Monday from 8h to 12h
+       * under a 40-hour weekly threshold left Friday still showing plain time
+       * although the week now crossed 40 on Thursday — the cards disagreed
+       * with the rule they were classified under, and payroll paid the cards.
+       */
+      const weekReclassified =
+        touchesHours && overtimeRuleOf(crew).kind === "weekly"
+          ? await reclassifyWeek(
+              projectId,
+              companyId,
+              card.workerId,
+              card.workDate,
+              cfg.weekStartsOn,
+              actorOf(req),
+            )
+          : [];
+      if (card.batchId) await recomputeBatch(app.db, card.batchId);
+
       await ledgerTimecards(app.db, req, "update", "timecard", timecardId, {
         reference: card.reference,
         changed: Object.keys(body),
         hours: split,
         varianceHours: variance.value,
+        weekReclassified: weekReclassified.length,
       });
-      return timecardView(timecardId, companyId, projectId);
+      return {
+        ...(await timecardView(timecardId, companyId, projectId)),
+        weekReclassified,
+      };
     },
   );
 
@@ -1214,7 +1286,21 @@ export const timecardRoutes: FastifyPluginAsync = async (app) => {
       const card = await fetchTimecard(app.db, timecardId, companyId, projectId);
       assertTimecardEditable(card, "approve");
       assertTransition(card.status, ["submitted"], "timecard", "approve");
-      const level = body.level ?? 1;
+      // Derived, not defaulted: two approvers on a two-tier crew both landing
+      // on level 1 left the card submitted for ever with nothing explaining it.
+      const priorApprovals = await loadApprovals(timecardId);
+      const level =
+        body.level ??
+        Math.min(
+          3,
+          Math.max(
+            0,
+            ...priorApprovals
+              .filter((a) => a.decision === "approved" && a.isSelfApproval === 0)
+              .map((a) => a.level),
+            0,
+          ) + 1,
+        );
 
       const self = checkSelfApproval(
         actorId,
@@ -1345,7 +1431,9 @@ export const timecardRoutes: FastifyPluginAsync = async (app) => {
       const required = crewConfig(crew).approvalLevels;
       const approvals = await loadApprovals(timecardId);
       const approvedLevels = new Set(
-        approvals.filter((a) => a.decision === "approved" && a.isSelfApproval === 0).map((a) => a.level),
+        approvals
+          .filter((a) => a.decision === "approved" && a.isSelfApproval === 0)
+          .map((a) => a.level),
       );
 
       const set: Record<string, unknown> = { updatedAt: nowIso() };
@@ -1373,11 +1461,20 @@ export const timecardRoutes: FastifyPluginAsync = async (app) => {
         approvedLevels: [...approvedLevels],
         requiredLevels: required,
       });
+      if (card.batchId) await recomputeBatch(app.db, card.batchId);
       return {
         ...(await timecardView(timecardId, companyId, projectId)),
         approvalId,
+        level,
         approvedLevels: [...approvedLevels].sort(),
         requiredLevels: required,
+        approvalProgress:
+          body.decision === "approved"
+            ? `approved ${approvedLevels.size} of ${required} tier(s)` +
+              (approvedLevels.size < required
+                ? ` — tier ${Math.min(3, approvedLevels.size + 1)} still has to sign`
+                : "")
+            : null,
       };
     },
   );
@@ -1670,78 +1767,6 @@ export const timecardRoutes: FastifyPluginAsync = async (app) => {
     return id;
   }
 
-  /**
-   * Attach access records that landed after the card did, and recompute the
-   * variance. Idempotent by construction — it only touches editable cards
-   * that carry no link yet, so a second run finds nothing.
-   */
-  async function sweepAccessLinks(
-    companyId: string,
-    projectId: string,
-  ): Promise<{ examined: number; linked: number }> {
-    const orphans = await app.db
-      .select()
-      .from(timecards)
-      .where(
-        and(
-          eq(timecards.companyId, companyId),
-          eq(timecards.projectId, projectId),
-          isNull(timecards.siteAccessRecordId),
-          inArray(timecards.status, ["draft", "submitted", "rejected"]),
-        ),
-      )
-      .limit(500);
-    if (orphans.length === 0) return { examined: 0, linked: 0 };
-    const access = await app.db
-      .select()
-      .from(siteAccessRecords)
-      .where(
-        and(
-          eq(siteAccessRecords.projectId, projectId),
-          inArray(
-            siteAccessRecords.workerId,
-            [...new Set(orphans.map((o) => o.workerId))],
-          ),
-        ),
-      );
-    const byKey = new Map(access.map((a) => [`${a.workerId}|${a.accessDate}`, a]));
-    let linked = 0;
-    for (const card of orphans) {
-      const hit = byKey.get(`${card.workerId}|${card.workDate}`);
-      if (!hit) continue;
-      const variance = accessVariance({
-        claimedHours: card.totalHours,
-        hasAccessRecord: true,
-        accessHoursOnSite: hit.hoursOnSite,
-        firstIn: hit.firstIn,
-        lastOut: hit.lastOut,
-        explanation: card.varianceExplanation,
-      });
-      await app.db
-        .update(timecards)
-        .set({
-          siteAccessRecordId: hit.id,
-          accessHoursOnSite: variance.accessHours,
-          varianceHours: variance.value,
-          detail: {
-            ...(card.detail ?? {}),
-            variance: {
-              value: variance.value,
-              accessHours: variance.accessHours,
-              accessHoursSource: variance.accessHoursSource,
-              withinTolerance: variance.withinTolerance,
-              toleranceHours: variance.toleranceHours,
-              reasons: variance.reasons,
-              linkedBy: "lazy_sweep",
-            },
-          },
-          updatedAt: nowIso(),
-        })
-        .where(eq(timecards.id, card.id));
-      linked += 1;
-    }
-    return { examined: orphans.length, linked };
-  }
 
   /**
    * Under a WEEKLY rule, adding Tuesday changes what Wednesday costs. Every
@@ -1945,3 +1970,103 @@ export function resolveRates(
     currency: (body.currency ?? member?.currency ?? worker.currency ?? "USD").toUpperCase(),
   };
 }
+
+/**
+ * Attach access records that landed after the card did, and recompute the
+ * variance. Idempotent by construction — it only touches editable cards
+ * that carry no link yet, so a second run finds nothing.
+ */
+export async function attachAccessLinks(
+  db: Db,
+  companyId: string,
+  projectId: string,
+  workerIds?: string[],
+): Promise<{ examined: number; linked: number }> {
+  const clauses = [
+    eq(timecards.companyId, companyId),
+    eq(timecards.projectId, projectId),
+    isNull(timecards.siteAccessRecordId),
+    inArray(timecards.status, ["draft", "submitted", "rejected"]),
+    /*
+     * ADJUSTMENT CARDS ARE NEVER MATCHED BY DATE.
+     *
+     * `revise` books a correction on the ADJUSTMENT date, not the date the
+     * hours were worked. Matching it against that day's access record
+     * compared last Monday's corrected 10 hours with today's 8 hours on
+     * site, produced a +2h variance out of nothing, and then the approve
+     * route refused the card until somebody "explained" a variance that did
+     * not exist.
+     */
+    isNull(timecards.revisesTimecardId),
+  ];
+  if (workerIds && workerIds.length > 0) {
+    clauses.push(inArray(timecards.workerId, workerIds));
+  }
+  const orphans = await db
+    .select()
+    .from(timecards)
+    .where(and(...clauses))
+    .limit(500);
+  if (orphans.length === 0) return { examined: 0, linked: 0 };
+  const access = await db
+    .select()
+    .from(siteAccessRecords)
+    .where(
+      and(
+        eq(siteAccessRecords.projectId, projectId),
+        inArray(
+          siteAccessRecords.workerId,
+          [...new Set(orphans.map((o) => o.workerId))],
+        ),
+      ),
+    );
+  const byKey = new Map(access.map((a) => [`${a.workerId}|${a.accessDate}`, a]));
+  /** the crews these cards belong to, for their configured tolerance */
+  const crewIds = [...new Set(orphans.map((o) => o.crewId).filter((v): v is string => !!v))];
+  const crewRows = crewIds.length
+    ? await db.select().from(crews).where(inArray(crews.id, crewIds))
+    : [];
+  const crewById = new Map(crewRows.map((c) => [c.id, c] as const));
+  let linked = 0;
+  for (const card of orphans) {
+    const hit = byKey.get(`${card.workerId}|${card.workDate}`);
+    if (!hit) continue;
+    // The crew's own tolerance, not the platform default: a crew that
+    // configured 1.5h had its cards judged at 0.5h by this path alone.
+    const tolerance = crewConfig(card.crewId ? (crewById.get(card.crewId) ?? null) : null)
+      .varianceToleranceHours;
+    const variance = accessVariance({
+      claimedHours: card.totalHours,
+      hasAccessRecord: true,
+      accessHoursOnSite: hit.hoursOnSite,
+      firstIn: hit.firstIn,
+      lastOut: hit.lastOut,
+      explanation: card.varianceExplanation,
+      toleranceHours: tolerance,
+    });
+    await db
+      .update(timecards)
+      .set({
+        siteAccessRecordId: hit.id,
+        accessHoursOnSite: variance.accessHours,
+        varianceHours: variance.value,
+        detail: {
+          ...(card.detail ?? {}),
+          variance: {
+            value: variance.value,
+            accessHours: variance.accessHours,
+            accessHoursSource: variance.accessHoursSource,
+            withinTolerance: variance.withinTolerance,
+            toleranceHours: variance.toleranceHours,
+            reasons: variance.reasons,
+            linkedBy: "lazy_sweep",
+          },
+        },
+        updatedAt: nowIso(),
+      })
+      .where(eq(timecards.id, card.id));
+    linked += 1;
+  }
+  return { examined: orphans.length, linked };
+}
+

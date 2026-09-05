@@ -24,6 +24,7 @@ import {
   DescriptionList,
   Drawer,
   EmptyState,
+  Field,
   Input,
   NumberInput,
   Select,
@@ -821,6 +822,13 @@ function ApprovalBlock({
 
   const canSubmit = card.status === "draft" || card.status === "rejected";
   const canApprove = card.status === "submitted";
+  /** The API allows an adjustment only against a card that is already fixed —
+   *  and only once, so a chain stays readable where a fan would not. */
+  const canRevise =
+    ["approved", "locked", "exported"].includes(card.status) && !card.detail?.revisedBy;
+  const [adjustHours, setAdjustHours] = useState<number | null>(card.totalHours);
+  const [adjustDate, setAdjustDate] = useState("");
+  const [adjustReason, setAdjustReason] = useState("");
 
   return (
     <div>
@@ -975,6 +983,62 @@ function ApprovalBlock({
       ) : (
         <Timeline items={items} timeFormat="absolute" aria-label="Approval trail" />
       )}
+
+      {canRevise ? (
+        <Card className="mt-3">
+          <CardBody className="space-y-2">
+            <SectionHeading
+              title="Correct it"
+              hint="An approved, locked or exported card is never edited. The correction is a NEW dated card that references this one, so what was paid and what should have been paid both stay readable."
+            />
+            <div className="grid gap-2 sm:grid-cols-3">
+              <Field label="Corrected total hours" required>
+                <NumberInput
+                  value={adjustHours}
+                  onChange={setAdjustHours}
+                  min={0}
+                  max={24}
+                  step={0.25}
+                />
+              </Field>
+              <Field label="Adjustment date" hint="Not before the day being corrected">
+                <Input
+                  type="date"
+                  value={adjustDate}
+                  onChange={(event) => setAdjustDate(event.target.value)}
+                />
+              </Field>
+              <Field label="Reason" required>
+                <Input
+                  value={adjustReason}
+                  onChange={(event) => setAdjustReason(event.target.value)}
+                  placeholder="Two hours omitted from Tuesday"
+                />
+              </Field>
+            </div>
+            <Button
+              size="sm"
+              loading={busy === "revise"}
+              disabled={adjustHours === null || !adjustReason.trim()}
+              onClick={async () => {
+                const result = await onRun("revise", () =>
+                  api.post(`/api/v1/projects/${projectId}/timecards/${card.id}/revise`, {
+                    workedHours: adjustHours,
+                    adjustmentDate: adjustDate || undefined,
+                    reason: adjustReason.trim(),
+                  }),
+                );
+                if (result) {
+                  setAdjustReason("");
+                  onDone();
+                }
+              }}
+            >
+              Raise the adjustment
+            </Button>
+          </CardBody>
+        </Card>
+      ) : null}
 
       {card.revisesTimecardId ? (
         <Alert tone="info" size="sm" title="This card is a dated adjustment" className="mt-3">

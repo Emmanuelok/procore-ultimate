@@ -25,7 +25,6 @@ let owner: TestActor;
 let admin: TestActor;
 let adminHeaders: Record<string, string>;
 let plain: TestActor;
-let plainHeaders: Record<string, string>;
 let projectId: string;
 
 beforeAll(async () => {
@@ -52,10 +51,6 @@ beforeAll(async () => {
     userId: plain.userId,
     role: "member",
   });
-  plainHeaders = {
-    authorization: plain.headers["authorization"]!,
-    "x-company-id": owner.companyId,
-  };
 
   const project = await app.inject({
     method: "POST",
@@ -445,10 +440,23 @@ describe("vendors", () => {
   });
 
   it("refuses a duplicate scan to a non-admin", async () => {
+    // A fresh member: `plain`'s sessions are deliberately revoked by the
+    // session-revocation test above, and a revoked session answers 401 —
+    // which would prove nothing about the admin gate.
+    const nonAdmin = await registerActor(app);
+    await app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: nonAdmin.userId,
+      role: "member",
+    });
     const res = await app.inject({
       method: "GET",
       url: "/api/v1/vendors/duplicates",
-      headers: plainHeaders,
+      headers: {
+        authorization: nonAdmin.headers["authorization"]!,
+        "x-company-id": owner.companyId,
+      },
     });
     expect(res.statusCode).toBe(403);
   });

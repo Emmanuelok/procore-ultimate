@@ -7,6 +7,7 @@ import {
   drawingSheets,
   ledgerEntries,
   notifications,
+  projectMemberships,
   punchItems,
   rfis,
   signals,
@@ -134,8 +135,17 @@ describe("projects CRUD + stages", () => {
       url: `/api/v1/projects/${created.id}`,
       headers: actor.headers,
     });
-    // requireTool 403s because the project no longer exists in the tenant
-    expect(gone.statusCode).toBe(403);
+    // The delete is a SOFT delete now (recycle bin, #78): the row survives so
+    // it can be restored, and every read path filters `deletedAt` — so the
+    // answer is "no such project", not the old requireTool 403.
+    expect(gone.statusCode).toBe(404);
+    const stillListed = await built.app.inject({
+      method: "GET",
+      url: "/api/v1/projects",
+      headers: actor.headers,
+    });
+    const listed = (stillListed.json() as { items: { id: string }[] }).items;
+    expect(listed.some((p) => p.id === created.id)).toBe(false);
   });
 });
 
@@ -353,6 +363,16 @@ describe("comments, mentions, watchers, tags", () => {
   it("comment with @mention creates a mention notification", async () => {
     const prj = await createProject(actor.headers, "Comment Project");
     const member = await addCompanyUser("member");
+    // A mention only reaches somebody who can OPEN the record — company
+    // membership alone used to be enough, which leaked the comment body to
+    // people with no access to the project.
+    await built.app.db.insert(projectMemberships).values({
+      id: newId("pm"),
+      companyId: actor.companyId,
+      projectId: prj.id,
+      userId: member.userId,
+      templateKey: "project_manager",
+    });
     const rfiId = newId("rfi");
 
     const res = await built.app.inject({
@@ -385,7 +405,18 @@ describe("comments, mentions, watchers, tags", () => {
 
   it("watcher toggle is idempotent per user", async () => {
     const prj = await createProject(actor.headers, "Watch Project");
-    const recUrl = `/api/v1/projects/${prj.id}/records/submittal/${newId("sub")}/watchers`;
+    // A real record: a watcher may only be attached to something that exists
+    // in THIS project (the id used to be taken on trust across tenants).
+    const submittalId = newId("sub");
+    await built.app.db.insert(submittals).values({
+      id: submittalId,
+      companyId: actor.companyId,
+      projectId: prj.id,
+      number: 771,
+      title: "Watched submittal",
+      createdBy: actor.userId,
+    });
+    const recUrl = `/api/v1/projects/${prj.id}/records/submittal/${submittalId}/watchers`;
 
     const on = await built.app.inject({ method: "POST", url: recUrl, headers: actor.headers });
     expect(on.statusCode).toBe(201);
@@ -476,6 +507,15 @@ describe("custom fields", () => {
     const d2 = def2.json() as { id: string };
 
     const rfiId = newId("rfi");
+    await built.app.db.insert(rfis).values({
+      id: rfiId,
+      companyId: actor.companyId,
+      projectId: prj.id,
+      number: 811,
+      subject: "Custom values RFI",
+      question: "?",
+      createdBy: actor.userId,
+    });
     const put = await built.app.inject({
       method: "PUT",
       url: `/api/v1/projects/${prj.id}/records/rfi/${rfiId}/custom-values`,

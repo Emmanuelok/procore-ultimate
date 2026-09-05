@@ -47,4 +47,20 @@ ENV PORT=4000 \
 USER node
 
 EXPOSE 4000
+
+# READINESS, not liveness. "The process is up" is not the question an
+# orchestrator wants answered before it routes traffic: /api/v1/health/ready
+# executes a query against the database and reports the configuration warnings
+# that make a deployment smaller than it looks. Written with node's own fetch
+# so the image needs neither curl nor wget.
+#
+# `start-period` covers migrations: the first boot against an empty database
+# applies 0000 onward before the server listens, and a healthcheck that fails
+# during that window restarts the container mid-migration.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||4000)+'/api/v1/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+# Node is PID 1 here and installs its own SIGTERM handler (apps/api/src/index.ts):
+# the server stops accepting connections, in-flight requests finish, the
+# database pool closes, and a 25-second deadline guarantees the process exits.
+# An init shim would only duplicate that, so there is deliberately none.
 CMD ["node", "dist/index.js"]

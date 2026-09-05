@@ -58,7 +58,7 @@ import type {
   ToolboxTalkStatus,
 } from "@constructos/shared";
 import { ApiClientError, api } from "../../lib/api";
-import { Alert, Badge, Card, CardBody, Tooltip, cx } from "../../ui";
+import { Alert, Badge, Button, Card, CardBody, Tooltip, cx } from "../../ui";
 import type { Tone } from "../../ui/tokens";
 
 /* ========================================================================== */
@@ -193,6 +193,34 @@ export interface IncidentNotification {
   obligationId: string | null;
   needsHumanReview: boolean | null;
   openQuestions: string[];
+  /**
+   * One entry per regime. An incident answerable to two authorities owes two
+   * duties on two clocks, and a single "notified" flag is how the second one
+   * disappears off the register.
+   */
+  duties: RegimeDutyState[];
+  outstandingRegimes: string[];
+  missedRegimes: string[];
+  allDischarged: boolean;
+  reasons: string[];
+}
+
+export interface RegimeDutyState {
+  regime: string;
+  ruleId: string | null;
+  title: string;
+  citation: string | null;
+  authority: string | null;
+  dueAt: string | null;
+  immediateNotificationRequired: boolean;
+  notificationMethod: string | null;
+  consequenceIfMissed: string | null;
+  state: "not_required" | "outstanding" | "notified" | "notified_late" | "missed";
+  notifiedAt: string | null;
+  reference: string | null;
+  method: string | null;
+  hoursLate: number | null;
+  hoursRemaining: number | null;
 }
 
 export interface IncidentInvestigation {
@@ -294,6 +322,14 @@ export interface SafetyIncident {
   createdAt: string;
   /** decorateIncident */
   reportingDelay: { hours: number | null; reasons: string[] } | null;
+  /**
+   * The injured person's name, resolved by the API from the WORKER register.
+   *
+   * `workerId` points at workforce.workers, not at the company user directory,
+   * so resolving it through the user map printed a raw `wrk_` id in the column
+   * an inspector reads first. The API resolves it once per response.
+   */
+  injuredPersonDisplayName: string | null;
   reportability: ReportabilityDetermination | null;
   notification: IncidentNotification;
   investigation: IncidentInvestigation;
@@ -566,6 +602,25 @@ export interface ProgrammeRecord {
   reviewOverdue: boolean;
   acknowledgementShortfall: number | null;
   isCriticalKind: boolean;
+  /** the live permit-to-work in site operations this document authorises */
+  sitePermitId?: string | null;
+  /**
+   * Who has confirmed they read it, and — the field that matters after an
+   * incident — whether they confirmed it themselves or somebody recorded it
+   * on their behalf.
+   */
+  acknowledgements?: Acknowledgement[];
+}
+
+export interface Acknowledgement {
+  workerId: string | null;
+  userId: string | null;
+  acknowledgedAt: string;
+  method: string;
+  recordedBy?: string | null;
+  selfRecorded?: boolean;
+  recordedOnBehalf?: { by: string; role: string | null } | null;
+  attestation?: string | null;
 }
 
 /* --- rates.ts ------------------------------------------------------------- */
@@ -620,12 +675,7 @@ export interface SafetyStatistics {
   incomputable: string[];
   ratios: { nearMissToInjury: number | null; reasons: string[] };
   caveats: string[];
-  reportable: {
-    reportableCount: number;
-    notifiedCount: number;
-    awaitingNotification: number;
-    needsHumanReview: number;
-  };
+  reportable: StatutoryStanding;
   leadingIndicators: {
     observationsPositive: number;
     observationsNegative: number;
@@ -640,9 +690,37 @@ export interface Tally {
   total: number;
 }
 
+export interface StatutoryRef {
+  id: string;
+  reference: string;
+  regimes?: string[];
+}
+
+/**
+ * The standing of the statutory duties across a whole register, counted per
+ * DUTY. The workspace header is driven from this rather than from the rows on
+ * screen: a filter that hides the offending incident must not take a live
+ * statutory warning off the workspace.
+ */
+export interface StatutoryStanding {
+  reportableCount: number;
+  notifiedCount: number;
+  awaitingNotification: number;
+  missedNotification: number;
+  outstandingDuties: number;
+  missedDuties: number;
+  needsHumanReview: number;
+  missedRefs: StatutoryRef[];
+  awaitingRefs: StatutoryRef[];
+  reviewRefs: StatutoryRef[];
+  note: string;
+}
+
 export interface SafetySummary {
   projectId: string;
   asOf: string;
+  /** unfiltered and unwindowed — what the header banners are driven from */
+  statutory: StatutoryStanding;
   observations: Tally;
   incidents: Tally;
   correctiveActions: Tally & { overdue: number; awaitingEffectivenessCheck: number };
@@ -1839,3 +1917,319 @@ export function FactTile({ label, children }: { label: ReactNode; children: Reac
     </div>
   );
 }
+
+/* ========================================================================== */
+/* Paging                                                                      */
+/* ========================================================================== */
+
+/**
+ * The page size every safety register asks for.
+ *
+ * It used to be 200 — the server maximum — with no paging control anywhere, so
+ * a project holding more than two hundred observations silently lost the rest
+ * of them off the register AND off the header counts derived from it. A
+ * register that quietly truncates is worse than one that refuses to load: the
+ * reader has no way to know the row they are looking for is simply not there.
+ */
+export const REGISTER_PAGE_SIZE = 100;
+
+/** A filter object's `page` value as a number, defaulting to the first page. */
+export function pageNumber(value: string | undefined): number {
+  const n = Number(value ?? "1");
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1;
+}
+
+/** `page` and `pageSize` for a register query, from the filter object. */
+export function pageParams(page: string | undefined): URLSearchParams {
+  return new URLSearchParams({
+    page: String(pageNumber(page)),
+    pageSize: String(REGISTER_PAGE_SIZE),
+  });
+}
+
+/**
+ * The pager under a register. It states the range being shown out of the
+ * total, so "45 of 45" and "1–100 of 812" are visibly different situations.
+ */
+export function RegisterPager({
+  page,
+  loaded,
+  total,
+  noun,
+  onPage,
+  loading,
+}: {
+  page: string;
+  loaded: number;
+  total: number | null;
+  noun: string;
+  onPage: (page: string) => void;
+  loading?: boolean;
+}) {
+  const current = pageNumber(page);
+  if (total === null) return null;
+  const first = total === 0 ? 0 : (current - 1) * REGISTER_PAGE_SIZE + 1;
+  const last = (current - 1) * REGISTER_PAGE_SIZE + loaded;
+  const hasMore = last < total;
+  if (total <= REGISTER_PAGE_SIZE && current === 1) {
+    return (
+      <p className="text-2xs text-content-subtle">
+        {count(total)} {noun}
+        {total === 1 ? "" : "s"} — the whole register is on this page.
+      </p>
+    );
+  }
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-surface-raised px-3 py-2">
+      <p className="text-meta text-content-muted">
+        Showing <span className="font-medium text-content">{count(first)}</span>–
+        <span className="font-medium text-content">{count(last)}</span> of{" "}
+        <span className="font-medium text-content">{count(total)}</span> {noun}
+        {total === 1 ? "" : "s"}.{" "}
+        {hasMore || current > 1 ? (
+          <span className="text-content-subtle">
+            This register is longer than one page — anything computed from what is on screen is
+            computed from a slice of it.
+          </span>
+        ) : null}
+      </p>
+      <div className="flex items-center gap-1.5">
+        <Button
+          size="xs"
+          variant="secondary"
+          disabled={current <= 1 || loading === true}
+          onClick={() => onPage(String(current - 1))}
+        >
+          Previous
+        </Button>
+        <span className="text-2xs text-content-subtle">page {count(current)}</span>
+        <Button
+          size="xs"
+          variant="secondary"
+          disabled={!hasMore || loading === true}
+          onClick={() => onPage(String(current + 1))}
+        >
+          Next
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/* ========================================================================== */
+/* Platform upgrade wave — devices, statutory forms, index, scorecards         */
+/* ========================================================================== */
+
+export interface SensorEvent {
+  id: string;
+  projectId: string;
+  number: number;
+  reference: string;
+  source: string;
+  kind: string;
+  severity: string;
+  deviceId: string | null;
+  deviceModel: string | null;
+  workerId: string | null;
+  reportedPersonName: string | null;
+  vendorId: string | null;
+  occurredAt: string;
+  receivedAt: string;
+  locationText: string | null;
+  measurementValue: number | null;
+  measurementUnit: string | null;
+  thresholdValue: number | null;
+  status: string;
+  acknowledgeDueAt: string | null;
+  acknowledgedAt: string | null;
+  acknowledgedBy: string | null;
+  responseSeconds: number | null;
+  responseNote: string | null;
+  resolvedAt: string | null;
+  resolvedBy: string | null;
+  outcome: string | null;
+  incidentId: string | null;
+  observationId: string | null;
+  signalId: string | null;
+  externalId: string | null;
+  createdAt: string;
+  /** decorateSensorEvent */
+  isLifeSafety: boolean;
+  responseDeadlineMinutes: number;
+  acknowledgementOverdue: boolean;
+  minutesLate: number | null;
+  responseMinutes: number | null;
+  note: string | null;
+}
+
+export interface SensorEventDetail extends SensorEvent {
+  workerName: string | null;
+}
+
+export interface FormField<T> {
+  value: T | null;
+  reason: string | null;
+}
+
+export interface RegulatoryReportRow {
+  id: string;
+  reference: string;
+  form: string;
+  status: string;
+  periodYear: number | null;
+  periodFrom: string | null;
+  periodTo: string | null;
+  incidentId: string | null;
+  sha256: string;
+  fileId: string | null;
+  rowCount: number;
+  caveats: string[];
+  certifiedBy: string | null;
+  certifiedAt: string | null;
+  certifierTitle: string | null;
+  submittedAt: string | null;
+  submissionReference: string | null;
+  supersedesId: string | null;
+  supersededById: string | null;
+  generatedBy: string;
+  createdAt: string;
+}
+
+export interface RegulatoryPreview {
+  form: string;
+  stored: boolean;
+  note: string;
+  payload: Record<string, unknown>;
+  rowCount: number;
+  caveats: string[];
+  periodYear: number | null;
+  incidentId: string | null;
+}
+
+export interface RiskComponent {
+  key: string;
+  name: string;
+  value: number | null;
+  weight: number;
+  contribution: number | null;
+  basis: string;
+  inputs: Record<string, number | null>;
+  reasons: string[];
+}
+
+export interface RiskIndex {
+  projectId: string;
+  from: string;
+  to: string;
+  asOf: string;
+  score: number | null;
+  band: string;
+  components: RiskComponent[];
+  coverage: number;
+  reasons: string[];
+  drivers: Array<{ key: string; name: string; contribution: number; advice: string }>;
+  explanation: string;
+  trend: Array<{ asOfDate: string; score: number | null; band: string; coverage: number | null }>;
+  note: string;
+  snapshotId?: string | null;
+  signalId?: string | null;
+}
+
+export interface UnderReportingFinding {
+  key: string;
+  title: string;
+  confidence: number;
+  severity: string;
+  expected: string;
+  observed: string;
+  explanation: string;
+  refutedBy: string;
+  inputs: Record<string, number | string | null>;
+}
+
+export interface UnderReportingResult {
+  projectId: string;
+  from: string;
+  to: string;
+  findings: UnderReportingFinding[];
+  reasons: string[];
+  note: string;
+}
+
+export interface ScorecardMetric {
+  key: string;
+  name: string;
+  value: number | null;
+  unit: string;
+  direction: "higher_is_better" | "lower_is_better";
+  basis: string;
+  inputs: Record<string, number | string | null>;
+  reasons: string[];
+  points: number | null;
+  weight: number;
+}
+
+export interface VendorScorecard {
+  vendorId: string;
+  vendorName: string | null;
+  projectId: string | null;
+  from: string;
+  to: string;
+  metrics: ScorecardMetric[];
+  score: number | null;
+  grade: string;
+  coverage: number;
+  recordCount: number;
+  reasons: string[];
+  flags: string[];
+  computedAt: string;
+}
+
+export interface ScorecardResponse {
+  from: string;
+  to: string;
+  scorecards: VendorScorecard[];
+  reasons: string[];
+  note: string;
+}
+
+export const RISK_BAND_LABEL: Record<string, string> = {
+  low: "Low",
+  elevated: "Elevated",
+  high: "High",
+  severe: "Severe",
+  unrated: "Unrated",
+};
+
+export const RISK_BAND_TONE_MAP: Record<string, Tone> = {
+  low: "success",
+  elevated: "info",
+  high: "warning",
+  severe: "danger",
+  unrated: "neutral",
+};
+
+export const ALARM_STATUS_TONE: Record<string, Tone> = {
+  open: "danger",
+  acknowledged: "warning",
+  auto_resolved: "info",
+  resolved: "success",
+  escalated: "danger",
+  false_alarm: "neutral",
+  void: "neutral",
+};
+
+export const REGULATORY_FORM_LABEL: Record<string, string> = {
+  osha_300: "OSHA 300 log",
+  osha_300a: "OSHA 300A annual summary",
+  osha_301: "OSHA 301 incident report",
+  riddor_f2508: "RIDDOR F2508",
+  riddor_f2508a: "RIDDOR F2508A (disease)",
+};
+
+export const REGULATORY_STATUS_TONE: Record<string, Tone> = {
+  generated: "info",
+  submitted: "success",
+  superseded: "neutral",
+  void: "neutral",
+};

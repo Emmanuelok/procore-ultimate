@@ -42,6 +42,7 @@ import {
   corrApi,
   count,
   dateTime,
+  downloadCsv,
   isoDate,
   responseTone,
   titleCase,
@@ -793,6 +794,7 @@ function ResponsesView({ projectId, onChanged }: { projectId: string; onChanged:
   const [templateId, setTemplateId] = useState("");
   const [openId, setOpenId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const exportAction = useAction();
 
   const params = new URLSearchParams({ page: "1", pageSize: "200" });
   if (status) params.set("status", status);
@@ -888,13 +890,16 @@ function ResponsesView({ projectId, onChanged }: { projectId: string; onChanged:
               variant="ghost"
               icon={IconDownload}
               disabled={!templateId}
+              loading={exportAction.busy === "export"}
               title={templateId ? undefined : "Choose a form first — the export has one column per field"}
               onClick={() =>
-                window.open(
-                  `/api/v1/projects/${projectId}/correspondence/form-responses/export?templateId=${templateId}`,
-                  "_blank",
-                  "noopener",
-                )
+                void exportAction.run("export", async () => {
+                  await downloadCsv(
+                    `/api/v1/projects/${projectId}/correspondence/form-responses/export?templateId=${templateId}`,
+                    `${byTemplate.get(templateId) ?? "form"}-responses.csv`,
+                  );
+                  return true;
+                })
               }
             >
               Export
@@ -905,6 +910,12 @@ function ResponsesView({ projectId, onChanged }: { projectId: string; onChanged:
           </div>
         </CardBody>
       </Card>
+
+      {exportAction.error ? (
+        <Alert tone="danger" size="sm">
+          {exportAction.error}
+        </Alert>
+      ) : null}
 
       {list.error ? (
         <LoadError message={list.error} onRetry={list.reload} />

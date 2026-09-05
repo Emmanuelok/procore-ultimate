@@ -129,7 +129,7 @@ export default function RisksTab({ projectId, onChanged }: { projectId: string; 
             <div className="border-b border-border px-4 py-2 text-2xs text-content-subtle">
               Last scan {dateTime(lastScan.ranAt)}: {count(lastScan.overduePeriods)} overdue returns, {count(lastScan.verificationsExpired)} verifications lapsed, {count(lastScan.missingRegistrations)} missing registrations raised (
               {count(lastScan.missingRegistrationsCleared)} cleared), {count(lastScan.whtNotDeducted)} payments without a deduction certificate, {count(lastScan.reverseChargeMisapplied)} reverse charges misapplied,{" "}
-              {count(lastScan.peRecomputed)} PE exposures recomputed ({count(lastScan.peSignalsRaised)} signals). The sweep runs company-wide.
+              {count(lastScan.peRecomputed)} PE exposures recomputed ({count(lastScan.peSignalsRaised)} signals). This scan covers this project only; the scheduled sweep covers every project in the company.
             </div>
           ) : null}
           {risks.error ? (

@@ -507,12 +507,20 @@ function isDeliverableUrl(value: string): boolean {
   try {
     const u = new URL(value);
     if (u.protocol !== "http:" && u.protocol !== "https:") return false;
-    const host = u.hostname.toLowerCase();
+    // A trailing dot is the DNS root and resolves identically ("localhost."
+    // reaches loopback), so it is stripped before every test below — without
+    // this, "http://localhost./" walked straight past the name checks.
+    const host = u.hostname.toLowerCase().replace(/\.+$/, "");
     // Refuse the obvious ways to turn a rule into an internal port scanner.
     if (host === "localhost" || host === "0.0.0.0" || host.endsWith(".localhost")) return false;
     if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host)) return false;
     if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return false;
-    if (host === "::1" || host === "[::1]") return false;
+    // Any IPv6 literal is refused outright. The WHATWG parser normalises
+    // "[::ffff:127.0.0.1]" to "[::ffff:7f00:1]", so a per-range test on the
+    // text would miss the v4-mapped form that still reaches loopback — and
+    // fc00::/7 and fe80::/10 are just as internal. A public receiver is
+    // always reachable by name or by IPv4.
+    if (host.startsWith("[")) return false;
     return true;
   } catch {
     return false;

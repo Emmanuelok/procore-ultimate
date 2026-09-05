@@ -78,6 +78,24 @@ describe("UK — VAT, domestic reverse charge and CIS", () => {
     expect(out.explanation).toContain("Net payable GBP 8400.00");
   });
 
+  it("says so — and drops confidence — when the deduction is taken on the gross because no materials split was supplied (#802)", () => {
+    const out = determine(input({ materialsAmount: 0 }));
+    expect(out.withholdingBase).toBe("gross_excl_materials");
+    expect(out.withholdingBaseAmount).toBe(10000);
+    expect(out.withholdingAmount).toBe(2000);
+    expect(out.assumptions.some((a) => /no materials split/i.test(a))).toBe(true);
+    expect(out.confidence).toBeLessThan(1);
+    // labour-only work has no materials to split out, so no caveat is added
+    const labour = determine(input({ supplyType: "labour_only", materialsAmount: 0 }));
+    expect(labour.assumptions.some((a) => /materials split/i.test(a))).toBe(false);
+    // and neither does a gross-payment-status subcontractor (nothing deducted)
+    const gross = determine(
+      input({ materialsAmount: 0, supplier: party({ deductionRate: 0 }) }),
+    );
+    expect(gross.withholdingAmount).toBe(0);
+    expect(gross.assumptions.some((a) => /materials split/i.test(a))).toBe(false);
+  });
+
   it("gives gross payment status a 0% deduction and the unmatched subcontractor 30%", () => {
     const gross = determine(input({ supplier: party({ deductionRate: 0 }) }));
     expect(gross.withholdingRate).toBe(0);
@@ -468,8 +486,8 @@ describe("positionFromRegistrations", () => {
     const pos = positionFromRegistrations(
       "uk",
       [
-        { regime: "uk", kind: "vat", status: "active", verificationStatus: "unverified", deductionRate: null, validTo: null },
-        { regime: "uk", kind: "cis", status: "active", verificationStatus: "verified", deductionRate: 0, validTo: null },
+        { regime: "uk", kind: "vat", status: "active", verificationStatus: "unverified", deductionRate: null, validFrom: null, validTo: null },
+        { regime: "uk", kind: "cis", status: "active", verificationStatus: "verified", deductionRate: 0, validFrom: null, validTo: null },
       ],
       "GB",
       asOf,
@@ -480,14 +498,14 @@ describe("positionFromRegistrations", () => {
   it("treats a lapsed or expired registration as absent, and no rows at all as unknown", () => {
     const lapsed = positionFromRegistrations(
       "uk",
-      [{ regime: "uk", kind: "vat", status: "lapsed", verificationStatus: "verified", deductionRate: null, validTo: null }],
+      [{ regime: "uk", kind: "vat", status: "lapsed", verificationStatus: "verified", deductionRate: null, validFrom: null, validTo: null }],
       "GB",
       asOf,
     );
     expect(lapsed.vatRegistered).toBe(false);
     const expired = positionFromRegistrations(
       "uk",
-      [{ regime: "uk", kind: "vat", status: "active", verificationStatus: "verified", deductionRate: null, validTo: "2025-01-01" }],
+      [{ regime: "uk", kind: "vat", status: "active", verificationStatus: "verified", deductionRate: null, validFrom: null, validTo: "2025-01-01" }],
       "GB",
       asOf,
     );
@@ -498,10 +516,41 @@ describe("positionFromRegistrations", () => {
     // registrations under another regime say nothing about this one
     const other = positionFromRegistrations(
       "uk",
-      [{ regime: "ie", kind: "vat", status: "active", verificationStatus: "verified", deductionRate: null, validTo: null }],
+      [{ regime: "ie", kind: "vat", status: "active", verificationStatus: "verified", deductionRate: null, validFrom: null, validTo: null }],
       "GB",
       asOf,
     );
     expect(other.vatRegistered).toBeNull();
+  });
+
+  it("does not count a registration that has not started yet", () => {
+    // Recorded today, valid from next April: it says nothing about a supply
+    // made today, and must not zero the deduction or suppress VAT early.
+    const future = positionFromRegistrations(
+      "uk",
+      [
+        { regime: "uk", kind: "vat", status: "active", verificationStatus: "unverified", deductionRate: null, validFrom: "2027-04-06", validTo: null },
+        { regime: "uk", kind: "cis", status: "active", verificationStatus: "verified", deductionRate: 0, validFrom: "2027-04-06", validTo: null },
+      ],
+      "GB",
+      asOf,
+    );
+    expect(future.vatRegistered).toBe(false);
+    expect(future.deductionRegistered).toBe(false);
+    expect(future.deductionVerified).toBeNull();
+    expect(future.deductionRate).toBeNull();
+
+    // the same rows once the start date has arrived
+    const live = positionFromRegistrations(
+      "uk",
+      [
+        { regime: "uk", kind: "vat", status: "active", verificationStatus: "unverified", deductionRate: null, validFrom: "2027-04-06", validTo: null },
+        { regime: "uk", kind: "cis", status: "active", verificationStatus: "verified", deductionRate: 0, validFrom: "2027-04-06", validTo: null },
+      ],
+      "GB",
+      "2027-04-06",
+    );
+    expect(live.vatRegistered).toBe(true);
+    expect(live.deductionRate).toBe(0);
   });
 });

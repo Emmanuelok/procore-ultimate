@@ -11,12 +11,16 @@ import {
   delayEvents,
   evidence,
   ledgerEntries,
+  obligations,
   projects,
   rfis,
   scheduleBaselines,
   scheduleDependencies,
   scheduleTasks,
   schedules,
+  signals,
+  siteWeatherAnalyses,
+  timecards,
   variations,
 } from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
@@ -27,6 +31,8 @@ let app: FastifyInstance;
 let owner: TestActor;
 let assessor: TestActor; // second user (company admin) for determination independence
 let assessorHeaders: Record<string, string>;
+let approver: TestActor; // third user — determination must differ from the assessor too
+let approverHeaders: Record<string, string>;
 
 let projectId: string; // main project with schedule A(5) -> B(10)
 let project2Id: string; // windows-analysis project
@@ -53,6 +59,17 @@ beforeAll(async () => {
   });
   assessorHeaders = {
     authorization: assessor.headers["authorization"]!,
+    "x-company-id": owner.companyId,
+  };
+  approver = await registerActor(app);
+  await app.db.insert(companyMemberships).values({
+    id: newId("cm"),
+    companyId: owner.companyId,
+    userId: approver.userId,
+    role: "admin",
+  });
+  approverHeaders = {
+    authorization: approver.headers["authorization"]!,
     "x-company-id": owner.companyId,
   };
 
@@ -590,6 +607,7 @@ describe("windows analysis", () => {
       compensableDays: 5,
       nonExcusableDays: 0,
       tiaDeltaDays: 5,
+      staleTia: 0,
     });
     expect(w0.events[0].tiaDeltaDays).toBe(5);
 
@@ -616,6 +634,8 @@ describe("windows analysis", () => {
 /* Prolongation (#299-301 seed)                                        */
 /* ------------------------------------------------------------------ */
 
+let mainBoqId: string;
+
 describe("prolongation", () => {
   it("computes from an explicit rate", async () => {
     const res = await app.inject({
@@ -634,11 +654,14 @@ describe("prolongation", () => {
 
   it("derives the rate from prelims_time BQ items over the programme duration", async () => {
     const boqId = newId("boq");
+    mainBoqId = boqId;
     await app.db.insert(boqs).values({
       id: boqId,
       companyId: owner.companyId,
       projectId,
       name: "Main BQ",
+      status: "agreed",
+      currency: "GBP",
       createdBy: owner.userId,
     });
     await app.db.insert(boqItems).values([
@@ -685,11 +708,91 @@ describe("prolongation", () => {
     // 1500 prelims over the active schedule's 15-day duration = 100/day
     expect(body.prelimsRatePerDay).toBe(100);
     expect(body.amount).toBe(1200);
+    expect(body.currency).toBe("GBP");
     expect(body.sources).toEqual({
       prelimsTimeTotal: 1500,
       scheduleDurationDays: 15,
       scheduleId,
+      boqIds: [boqId],
+      currency: "GBP",
+      basis: "agreed bills of quantities",
     });
+  });
+
+  it("refuses to price prolongation from a draft bill, and from two bills without a choice", async () => {
+    // A draft bill is not a priced position — deriving a rate from it is wrong
+    // by construction, so the caller is told to choose or supply a rate.
+    const draftOnlyProject = newId("prj");
+    await app.db.insert(projects).values({
+      id: draftOnlyProject,
+      companyId: owner.companyId,
+      name: "Draft BQ project",
+    });
+    await app.db.insert(boqs).values({
+      id: newId("boq"),
+      companyId: owner.companyId,
+      projectId: draftOnlyProject,
+      name: "Draft BQ",
+      status: "draft",
+      createdBy: owner.userId,
+    });
+    const draftRes = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${draftOnlyProject}/forensics/prolongation`,
+      headers: owner.headers,
+      payload: { compensableDays: 5 },
+    });
+    expect(draftRes.statusCode).toBe(400);
+    expect(draftRes.json().message).toMatch(/none is agreed or issued/i);
+
+    // Two agreed bills: summing them would mix versions, so the caller chooses.
+    const secondAgreed = newId("boq");
+    await app.db.insert(boqs).values({
+      id: secondAgreed,
+      companyId: owner.companyId,
+      projectId,
+      name: "Main BQ v2",
+      status: "agreed",
+      currency: "GBP",
+      version: 2,
+      createdBy: owner.userId,
+    });
+    const ambiguous = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/forensics/prolongation`,
+      headers: owner.headers,
+      payload: { compensableDays: 5 },
+    });
+    expect(ambiguous.statusCode).toBe(400);
+    expect(ambiguous.json().message).toMatch(/pass boqId/i);
+
+    // Different currencies are refused outright — money is never summed across them.
+    await app.db
+      .update(boqs)
+      .set({ currency: "USD" })
+      .where(eq(boqs.id, secondAgreed));
+    const mixed = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/forensics/prolongation`,
+      headers: owner.headers,
+      payload: { compensableDays: 5 },
+    });
+    expect(mixed.statusCode).toBe(400);
+    expect(mixed.json().message).toMatch(/never summed across currencies/i);
+
+    // Naming a bill resolves the ambiguity and reports which one was used.
+    const chosen = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/forensics/prolongation`,
+      headers: owner.headers,
+      payload: { compensableDays: 12, boqId: mainBoqId },
+    });
+    expect(chosen.statusCode).toBe(200);
+    expect(chosen.json().sources.boqIds).toEqual([mainBoqId]);
+    expect(chosen.json().amount).toBe(1200);
+
+    // Clean up so later suites see a single agreed bill again.
+    await app.db.delete(boqs).where(eq(boqs.id, secondAgreed));
   });
 
   it("400s when the rate is neither given nor derivable", async () => {
@@ -783,13 +886,34 @@ describe("claims", () => {
     expect(assess.json().daysAssessed).toBe(2);
     expect(assess.json().assessedBy).toBe(assessor.userId);
 
+    // Segregation of duties on the DETERMINATION, not just the assessment:
+    // neither the claimant nor the assessor may agree the claim.
+    const selfAgree = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims/${claim1Id}/status`,
+      headers: owner.headers, // owner created it
+      payload: { status: "agreed" },
+    });
+    expect(selfAgree.statusCode).toBe(403);
+    expect(selfAgree.json().message).toMatch(/created it/i);
+
+    const assessorAgrees = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims/${claim1Id}/status`,
+      headers: assessorHeaders, // assessor assessed it
+      payload: { status: "agreed" },
+    });
+    expect(assessorAgrees.statusCode).toBe(403);
+    expect(assessorAgrees.json().message).toMatch(/assessed it/i);
+
     const agree = await app.inject({
       method: "POST",
       url: `/api/v1/projects/${projectId}/claims/${claim1Id}/status`,
-      headers: owner.headers,
+      headers: approverHeaders,
       payload: { status: "agreed" },
     });
     expect(agree.statusCode).toBe(200);
+    expect(agree.json().decidedBy).toBe(approver.userId);
 
     // agreed is terminal — no withdrawal after agreement
     const withdrawAgreed = await app.inject({
@@ -815,16 +939,25 @@ describe("claims", () => {
       method: "PATCH",
       url: `/api/v1/projects/${projectId}/claims/${id}`,
       headers: owner.headers,
-      payload: { chain: { cause: "Compensable delays", effect: "Site held 5 days" } },
+      payload: {
+        chain: {
+          cause: "Compensable delays",
+          effect: "Site held 5 days",
+          entitlement: "Clause 60.1",
+          quantum: "Prolongation at the site overhead rate",
+        },
+        daysClaimed: 5,
+      },
     });
     expect(draftPatch.statusCode).toBe(200);
 
-    await app.inject({
+    const submitted = await app.inject({
       method: "POST",
       url: `/api/v1/projects/${projectId}/claims/${id}/status`,
       headers: owner.headers,
       payload: { status: "submitted" },
     });
+    expect(submitted.statusCode).toBe(200);
     const frozenPatch = await app.inject({
       method: "PATCH",
       url: `/api/v1/projects/${projectId}/claims/${id}`,
@@ -833,13 +966,16 @@ describe("claims", () => {
     });
     expect(frozenPatch.statusCode).toBe(400);
 
+    // Everything that defines the claim is frozen after draft — including the
+    // title and, critically, the quantum: an assessed claim whose amount could
+    // still be raised is an assessment of numbers nobody assessed.
     const titlePatch = await app.inject({
       method: "PATCH",
       url: `/api/v1/projects/${projectId}/claims/${id}`,
       headers: owner.headers,
       payload: { title: "Prolongation claim (rev A)" },
     });
-    expect(titlePatch.statusCode).toBe(200);
+    expect(titlePatch.statusCode).toBe(400);
 
     const withdraw = await app.inject({
       method: "POST",
@@ -934,5 +1070,1529 @@ describe("chronology", () => {
     });
     expect(one.json().chronology).toHaveLength(body.count);
     expect(one.json().chronologyAt).toBeTruthy();
+  });
+});
+
+/* ================================================================== */
+/* WP-SCHED upgrade — audit regressions and the forensic method suite  */
+/* ================================================================== */
+
+/* ------------------------------------------------------------------ */
+/* Claim quantum integrity (audit: editable after submission)          */
+/* ------------------------------------------------------------------ */
+
+describe("claim quantum integrity", () => {
+  let id: string;
+
+  it("refuses to change the claimed amount on a submitted or assessed claim", async () => {
+    const create = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims`,
+      headers: owner.headers,
+      payload: {
+        title: "Quantum integrity",
+        kind: "prolongation",
+        chain: { cause: "c", effect: "e", entitlement: "ent", quantum: "q" },
+        amountClaimed: 100_000,
+        daysClaimed: 10,
+      },
+    });
+    expect(create.statusCode).toBe(201);
+    id = create.json().id as string;
+
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims/${id}/status`,
+      headers: owner.headers,
+      payload: { status: "submitted" },
+    });
+    const raise = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}/claims/${id}`,
+      headers: owner.headers,
+      payload: { amountClaimed: 500_000 },
+    });
+    expect(raise.statusCode).toBe(400);
+    expect(raise.json().message).toMatch(/amountClaimed/);
+
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims/${id}/status`,
+      headers: assessorHeaders,
+      payload: { status: "assessed", amountAssessed: 60_000, daysAssessed: 6 },
+    });
+    const raiseAgain = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}/claims/${id}`,
+      headers: owner.headers,
+      payload: { amountClaimed: 500_000, daysClaimed: 40 },
+    });
+    expect(raiseAgain.statusCode).toBe(400);
+    const still = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/claims/${id}`,
+      headers: owner.headers,
+    });
+    expect(still.json().amountClaimed).toBe(100_000);
+    expect(still.json().amountAssessed).toBe(60_000);
+  });
+
+  it("the revise transition clears the assessment and lets the quantum change", async () => {
+    const noReason = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims/${id}/status`,
+      headers: owner.headers,
+      payload: { status: "draft" },
+    });
+    expect(noReason.statusCode).toBe(400);
+
+    const revise = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims/${id}/status`,
+      headers: owner.headers,
+      payload: { status: "draft", reason: "Quantum restated after the measured mile" },
+    });
+    expect(revise.statusCode).toBe(200);
+    const revised = revise.json();
+    expect(revised.status).toBe("draft");
+    expect(revised.amountAssessed).toBeNull();
+    expect(revised.assessedBy).toBeNull();
+    expect(revised.revisionCount).toBe(1);
+
+    const patched = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}/claims/${id}`,
+      headers: owner.headers,
+      payload: { amountClaimed: 500_000 },
+    });
+    expect(patched.statusCode).toBe(200);
+    expect(patched.json().amountClaimed).toBe(500_000);
+  });
+
+  it("refuses to submit a claim with an incomplete chain (#305)", async () => {
+    const create = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims`,
+      headers: owner.headers,
+      payload: { title: "Empty chain", kind: "delay" },
+    });
+    const emptyId = create.json().id as string;
+    const submit = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims/${emptyId}/status`,
+      headers: owner.headers,
+      payload: { status: "submitted" },
+    });
+    expect(submit.statusCode).toBe(400);
+    expect(submit.json().message).toMatch(/cause, effect, entitlement, quantum/);
+
+    // Complete chain but nothing claimed and no events — still nothing to assess.
+    await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}/claims/${emptyId}`,
+      headers: owner.headers,
+      payload: { chain: { cause: "c", effect: "e", entitlement: "ent", quantum: "q" } },
+    });
+    const stillEmpty = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims/${emptyId}/status`,
+      headers: owner.headers,
+      payload: { status: "submitted" },
+    });
+    expect(stillEmpty.statusCode).toBe(400);
+    expect(stillEmpty.json().message).toMatch(/nothing to assess/);
+
+    await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}/claims/${emptyId}`,
+      headers: owner.headers,
+      payload: { daysClaimed: 4 },
+    });
+    const ok = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims/${emptyId}/status`,
+      headers: owner.headers,
+      payload: { status: "submitted" },
+    });
+    expect(ok.statusCode).toBe(200);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Delay event state machine (audit: any status -> any status)         */
+/* ------------------------------------------------------------------ */
+
+describe("delay event state machine", () => {
+  let eventId: string;
+
+  it("enforces the transition table and demands a reason to withdraw", async () => {
+    const created = await createDelayEvent(project2Id, {
+      title: "Raised in error",
+      cause: "other",
+      excusable: true,
+      compensable: true,
+      startDate: "2026-01-20",
+      durationDays: 20,
+    });
+    expect(created.statusCode).toBe(201);
+    eventId = created.json().id as string;
+
+    const noReason = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project2Id}/delay-events/${eventId}/status`,
+      headers: owner.headers,
+      payload: { status: "withdrawn" },
+    });
+    expect(noReason.statusCode).toBe(400);
+    expect(noReason.json().message).toMatch(/reason is required/i);
+
+    const withdrawn = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project2Id}/delay-events/${eventId}/status`,
+      headers: owner.headers,
+      payload: { status: "withdrawn", reason: "Duplicate of DE-1" },
+    });
+    expect(withdrawn.statusCode).toBe(200);
+    expect(withdrawn.json().statusReason).toBe("Duplicate of DE-1");
+
+    // withdrawn -> assessed is not a legal move
+    const illegal = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project2Id}/delay-events/${eventId}/status`,
+      headers: owner.headers,
+      payload: { status: "assessed", reason: "x" },
+    });
+    expect(illegal.statusCode).toBe(400);
+
+    // reopening is allowed but must be justified
+    const reopenNoReason = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project2Id}/delay-events/${eventId}/status`,
+      headers: owner.headers,
+      payload: { status: "open" },
+    });
+    expect(reopenNoReason.statusCode).toBe(400);
+  });
+
+  it("keeps a withdrawn event out of windows totals", async () => {
+    const withdrawnStillCounted = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${project2Id}/forensics/windows?boundaries=2026-02-01`,
+      headers: owner.headers,
+    });
+    expect(withdrawnStillCounted.statusCode).toBe(200);
+    const body = withdrawnStillCounted.json();
+    const firstWindow = body.windows[0];
+    expect(body.statuses).not.toContain("withdrawn");
+    expect(firstWindow.events.map((e: { id: string }) => e.id)).not.toContain(eventId);
+    // The 20 compensable days of the withdrawn event must not be in the totals.
+    expect(firstWindow.totals.compensableDays).toBe(5);
+
+    // …unless the caller explicitly asks for them, and then the filter is stated.
+    const asked = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${project2Id}/forensics/windows?boundaries=2026-02-01&statuses=open,withdrawn`,
+      headers: owner.headers,
+    });
+    expect(asked.statusCode).toBe(200);
+    expect(asked.json().statuses).toContain("withdrawn");
+    expect(asked.json().method).toContain("withdrawn");
+    expect(asked.json().windows[0].totals.compensableDays).toBe(25);
+  });
+
+  it("refuses to link a withdrawn event to a claim and refuses to edit it", async () => {
+    const link = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project2Id}/claims`,
+      headers: owner.headers,
+      payload: { title: "Built on a withdrawn event", kind: "delay", delayEventIds: [eventId] },
+    });
+    expect(link.statusCode).toBe(400);
+    expect(link.json().message).toMatch(/withdrawn/i);
+
+    const edit = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${project2Id}/delay-events/${eventId}`,
+      headers: owner.headers,
+      payload: { durationDays: 3 },
+    });
+    expect(edit.statusCode).toBe(400);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Stale TIA (audit: cached results never invalidated)                 */
+/* ------------------------------------------------------------------ */
+
+describe("TIA staleness", () => {
+  it("marks a cached TIA stale once the schedule is recomputed", async () => {
+    // Compute once so the schedule carries a version stamp; a TIA run against
+    // an unstamped schedule can only report that it predates stamping.
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/schedules/${scheduleId}/compute`,
+      headers: owner.headers,
+    });
+    const created = await createDelayEvent(projectId, {
+      title: "Stale check",
+      cause: "client_change",
+      excusable: true,
+      compensable: true,
+      startDate: "2026-01-07",
+      durationDays: 4,
+      taskId: taskB,
+    });
+    const id = created.json().id as string;
+
+    const tia = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/delay-events/${id}/tia`,
+      headers: owner.headers,
+    });
+    expect(tia.statusCode).toBe(200);
+    expect(tia.json().completionDeltaDays).toBeGreaterThan(0);
+
+    const fresh = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/delay-events/${id}`,
+      headers: owner.headers,
+    });
+    expect(fresh.json().tia.stale).toBe(false);
+    expect(fresh.json().tia.deltaDays).toBeGreaterThan(0);
+
+    // The schedule is recomputed by an unrelated edit: the cached delta no
+    // longer describes the programme, so it must read as stale, not as current.
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/schedules/${scheduleId}/compute`,
+      headers: owner.headers,
+    });
+    const after = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/delay-events/${id}`,
+      headers: owner.headers,
+    });
+    expect(after.json().tia.stale).toBe(true);
+    expect(after.json().tia.deltaDays).toBeNull();
+    expect(after.json().tia.reason).toMatch(/recomputed/);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Method suite, float rules, quantum, disruption, sufficiency         */
+/* ------------------------------------------------------------------ */
+
+describe("forensic method suite (#270-277)", () => {
+  let iapEventId: string;
+
+  it("recommends methods from the AACE selection factors", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/forensics/method-selection`,
+      headers: owner.headers,
+      payload: {
+        perspective: "retrospective",
+        updatesAvailable: true,
+        baselineAvailable: true,
+        asBuiltComplete: true,
+        concurrencyInIssue: true,
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { recommendations: { method: string; suitability: string; rationale: string }[] };
+    expect(body.recommendations.some((r) => r.method === "windows" && r.suitability === "recommended")).toBe(true);
+    expect(body.recommendations.every((r) => r.rationale.length > 10)).toBe(true);
+  });
+
+  it("runs an impacted as-planned analysis and records it with its MIP code", async () => {
+    const created = await createDelayEvent(projectId, {
+      title: "IAP event",
+      cause: "client_change",
+      excusable: true,
+      compensable: true,
+      party: "owner",
+      startDate: "2026-01-07",
+      durationDays: 6,
+      taskId: taskB,
+    });
+    iapEventId = created.json().id as string;
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/forensics/analyses`,
+      headers: owner.headers,
+      payload: {
+        method: "impacted_as_planned",
+        title: "IAP of the January events",
+        scheduleId,
+        baselineId,
+        eventIds: [iapEventId],
+        rationale: "Prospective additive modelling agreed with the Engineer",
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as {
+      id: string;
+      method: string;
+      mipCode: string;
+      sclReference: string;
+      resultDays: number | null;
+      output: { steps: { incrementalDays: number; driving: boolean }[] };
+      summary: string;
+      rationale: string;
+    };
+    expect(body.method).toBe("impacted_as_planned");
+    expect(body.mipCode).toBe("3.6");
+    expect(body.sclReference).toMatch(/SCL/);
+    expect(body.resultDays).toBeGreaterThan(0);
+    expect(body.output.steps).toHaveLength(1);
+    expect(body.rationale).toMatch(/Engineer/);
+
+    const list = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/forensics/analyses?method=impacted_as_planned`,
+      headers: owner.headers,
+    });
+    expect((list.json() as { total: number }).total).toBeGreaterThan(0);
+
+    const one = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/forensics/analyses/${body.id}`,
+      headers: owner.headers,
+    });
+    expect(one.statusCode).toBe(200);
+    expect((one.json() as { inputs: { eventIds: string[] } }).inputs.eventIds).toEqual([iapEventId]);
+  });
+
+  it("runs a collapsed as-built analysis for a chosen party", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/forensics/analyses`,
+      headers: owner.headers,
+      payload: {
+        method: "collapsed_as_built",
+        title: "But-for the employer's delays",
+        scheduleId,
+        party: "owner",
+        eventIds: [iapEventId],
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as { output: { removed: unknown[]; butForFinish: string | null }; summary: string };
+    expect(body.output.removed).toHaveLength(1);
+    expect(body.summary).toMatch(/owner/);
+  });
+
+  it("refuses collapsed as-built without a party", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/forensics/analyses`,
+      headers: owner.headers,
+      payload: { method: "collapsed_as_built", title: "No party", scheduleId },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("runs a windows analysis with per-window critical-path attribution", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/forensics/analyses`,
+      headers: owner.headers,
+      payload: {
+        method: "windows",
+        title: "Windows to February",
+        scheduleId,
+        boundaries: ["2026-02-01"],
+        eventIds: [iapEventId],
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as {
+      output: { windows: { start: string; events: { driving: boolean }[]; unattributedDays: number | null }[] };
+    };
+    expect(body.output.windows.length).toBe(2);
+    expect(body.output.windows[0]!.events.length).toBeGreaterThan(0);
+  });
+
+  it("returns the retrospective longest path with activity names", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/forensics/analyses`,
+      headers: owner.headers,
+      payload: { method: "longest_path", title: "As-built driving chain", scheduleId },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as { output: { path: { taskId: string; name: string }[] } };
+    expect(body.output.path.map((p) => p.name)).toEqual(["Excavation", "Concrete Works"]);
+  });
+
+  it("refuses to analyse withdrawn events", async () => {
+    const created = await createDelayEvent(projectId, {
+      title: "To be withdrawn",
+      cause: "other",
+      excusable: false,
+      compensable: false,
+      startDate: "2026-01-07",
+      durationDays: 2,
+      taskId: taskB,
+    });
+    const id = created.json().id as string;
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/delay-events/${id}/status`,
+      headers: owner.headers,
+      payload: { status: "withdrawn", reason: "raised in error" },
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/forensics/analyses`,
+      headers: owner.headers,
+      payload: { method: "impacted_as_planned", title: "Uses a withdrawn event", scheduleId, eventIds: [id] },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toMatch(/withdrawn/);
+  });
+});
+
+describe("float doctrine and concurrency (#278-281)", () => {
+  it("reports platform defaults until a doctrine is recorded, then cites the recorded one", async () => {
+    const before = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/forensics/float-rules`,
+      headers: owner.headers,
+    });
+    expect(before.statusCode).toBe(200);
+    expect(before.json().configured).toBe(false);
+    expect(before.json().explanation).toMatch(/defaults/);
+
+    const put = await app.inject({
+      method: "PUT",
+      url: `/api/v1/projects/${projectId}/forensics/float-rules`,
+      headers: owner.headers,
+      payload: {
+        ownership: "contractor",
+        concurrencyRule: "apportionment",
+        pacingThresholdDays: 3,
+        basis: "Contract particular condition 8.4",
+      },
+    });
+    expect(put.statusCode).toBe(200);
+    expect(put.json()).toMatchObject({ ownership: "contractor", concurrencyRule: "apportionment", configured: true });
+
+    const after = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/forensics/float-rules`,
+      headers: owner.headers,
+    });
+    expect(after.json().basis).toMatch(/8.4/);
+  });
+
+  it("runs a concurrency analysis that cites the project doctrine", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/forensics/analyses`,
+      headers: owner.headers,
+      payload: { method: "concurrency", title: "Concurrency assessment", scheduleId },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as {
+      output: { recommendations: { rule: string; time: string; money: string }[]; rulesConfigured: boolean };
+      summary: string;
+    };
+    expect(body.output.rulesConfigured).toBe(true);
+    expect(body.summary).toMatch(/apportionment/);
+    expect(body.output.recommendations.length).toBeGreaterThan(0);
+  });
+});
+
+describe("quantum engines (#300-303)", () => {
+  it("computes Hudson from the contract and records the assumptions", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/forensics/quantum`,
+      headers: owner.headers,
+      payload: {
+        method: "hudson",
+        contractSum: 10_000_000,
+        contractPeriodDays: 500,
+        hoProfitPercent: 7,
+        delayDays: 30,
+        currency: "GBP",
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as { amount: number; currency: string; assumptions: string[]; workings: string };
+    expect(body.amount).toBe(42_000);
+    expect(body.currency).toBe("GBP");
+    expect(body.assumptions.length).toBeGreaterThan(0);
+    expect(body.workings).toContain("42,000");
+  });
+
+  it("refuses to produce a figure from missing inputs and says which", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/forensics/quantum`,
+      headers: owner.headers,
+      payload: { method: "eichleay", delayDays: 10 },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toMatch(/contractBillings/);
+    expect(res.json().message).toMatch(/never produced from assumed inputs/);
+  });
+
+  it("lists calculations and links them to a claim", async () => {
+    const create = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims`,
+      headers: owner.headers,
+      payload: { title: "Quantum-linked claim", kind: "prolongation" },
+    });
+    const claimId = create.json().id as string;
+    const calc = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/forensics/quantum`,
+      headers: owner.headers,
+      payload: {
+        method: "finance_charge",
+        claimId,
+        principal: 365_000,
+        annualRatePercent: 10,
+        days: 365,
+        basis: "simple",
+      },
+    });
+    expect(calc.statusCode).toBe(201);
+    expect(calc.json().amount).toBe(36_500);
+
+    const list = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/forensics/quantum?claimId=${claimId}`,
+      headers: owner.headers,
+    });
+    expect((list.json() as { total: number }).total).toBe(1);
+  });
+});
+
+describe("claim valuation and portfolio exposure (#312-313, #320)", () => {
+  it("computes a provision from the range and probability", async () => {
+    const create = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims`,
+      headers: owner.headers,
+      payload: { title: "Valued claim", kind: "delay", currency: "GBP", amountClaimed: 400_000 },
+    });
+    const id = create.json().id as string;
+    const res = await app.inject({
+      method: "PUT",
+      url: `/api/v1/projects/${projectId}/claims/${id}/valuation`,
+      headers: owner.headers,
+      payload: { quantumBest: 100_000, quantumLikely: 250_000, quantumWorst: 500_000, successProbability: 0.6 },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().provisionAmount).toBe(150_000);
+    expect(res.json().provision.expectedValue).toBeCloseTo(266_666.67, 1);
+
+    const exposure = await app.inject({
+      method: "GET",
+      url: `/api/v1/claims/exposure`,
+      headers: owner.headers,
+    });
+    expect(exposure.statusCode).toBe(200);
+    const body = exposure.json() as {
+      byCurrency: { currency: string; claims: number; provision: number }[];
+      reasons: string[];
+    };
+    const gbp = body.byCurrency.find((c) => c.currency === "GBP")!;
+    expect(gbp.provision).toBe(150_000);
+    // Claims exist in more than one currency, so nothing is summed across them.
+    expect(body.byCurrency.length).toBeGreaterThan(1);
+    expect(body.reasons.join(" ")).toMatch(/never summed across them/);
+  });
+
+  it("narrows exposure to one project when asked, and refuses an unknown one", async () => {
+    // A claim with no amount claimed must be reported apart, never as zero.
+    const unpricedClaim = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project3Id}/claims`,
+      headers: owner.headers,
+      payload: { title: "Unpriced claim", kind: "disruption", currency: "GBP" },
+    });
+    expect(unpricedClaim.statusCode).toBe(201);
+
+    // The claims workspace renders this endpoint narrowed to the project it is
+    // showing, so the figure on the page has to be that project's alone.
+    const scoped = await app.inject({
+      method: "GET",
+      url: `/api/v1/claims/exposure?projectId=${project3Id}`,
+      headers: owner.headers,
+    });
+    expect(scoped.statusCode).toBe(200);
+    const scopedBody = scoped.json() as {
+      totalClaims: number;
+      claims: { projectId: string }[];
+      byCurrency: { currency: string; claimed: number; unpriced: number }[];
+      reasons: string[];
+    };
+    expect(scopedBody.claims.every((c) => c.projectId === project3Id)).toBe(true);
+    const gbpBucket = scopedBody.byCurrency.find((c) => c.currency === "GBP")!;
+    expect(gbpBucket.unpriced).toBe(1);
+    expect(gbpBucket.claimed).toBe(0);
+    expect(scopedBody.reasons.join(" ")).toMatch(/counted as zero/);
+
+    const whole = await app.inject({
+      method: "GET",
+      url: `/api/v1/claims/exposure`,
+      headers: owner.headers,
+    });
+    const wholeBody = whole.json() as { totalClaims: number };
+    expect(wholeBody.totalClaims).toBeGreaterThan(scopedBody.totalClaims);
+
+    // Another tenant's project id must not act as a window into their claims.
+    const stranger = await registerActor(app);
+    const foreign = await app.inject({
+      method: "GET",
+      url: `/api/v1/claims/exposure?projectId=${projectId}`,
+      headers: stranger.headers,
+    });
+    expect([200, 403]).toContain(foreign.statusCode);
+    if (foreign.statusCode === 200) {
+      expect((foreign.json() as { totalClaims: number }).totalClaims).toBe(0);
+    }
+  });
+});
+
+describe("disruption (#290-293)", () => {
+  it("builds a productivity series from timecards and daily logs, and suggests a baseline window", async () => {
+    const weeks = ["2026-04-06", "2026-04-13", "2026-04-20", "2026-04-27", "2026-05-04", "2026-05-11"];
+    const quantities = [100, 110, 105, 60, 55, 50];
+    for (let i = 0; i < weeks.length; i += 1) {
+      const worker = newId("wkr");
+      await app.db.insert(timecards).values({
+        id: newId("tc"),
+        companyId: owner.companyId,
+        projectId,
+        number: 1000 + i,
+        reference: `TC-${1000 + i}`,
+        workerId: worker,
+        workDate: weeks[i]!,
+        trade: "steel_fixing",
+        totalHours: 100,
+        status: "approved",
+        createdBy: owner.userId,
+      });
+      await app.db.insert(dailyLogs).values({
+        id: newId("log"),
+        companyId: owner.companyId,
+        projectId,
+        logDate: weeks[i]!,
+        sections: { quantities: [{ description: "Rebar fixed", unit: "t", quantity: quantities[i] }] },
+        createdBy: owner.userId,
+      });
+    }
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/forensics/productivity-series?trade=steel_fixing&unit=t&from=2026-04-01&to=2026-05-31`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      points: { weekStart: string; hours: number; quantity: number; sourceIds: string[] }[];
+      suggestedBaseline: { from: string; to: string } | null;
+      sources: { timecards: number; dailyLogQuantities: number };
+    };
+    expect(body.points).toHaveLength(6);
+    expect(body.points[0]!.hours).toBe(100);
+    expect(body.points[0]!.sourceIds.length).toBeGreaterThan(0);
+    expect(body.suggestedBaseline!.from).toBe("2026-04-06");
+    expect(body.sources.timecards).toBe(6);
+  });
+
+  it("runs a measured mile and stores the series with its source records", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/forensics/disruption`,
+      headers: owner.headers,
+      payload: {
+        method: "measured_mile",
+        title: "Steel fixing measured mile",
+        trade: "steel_fixing",
+        unit: "t",
+        baselineFrom: "2026-04-06",
+        baselineTo: "2026-04-20",
+        impactedFrom: "2026-04-27",
+        impactedTo: "2026-05-11",
+        hourlyRate: 40,
+        currency: "GBP",
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as {
+      lostHours: number | null;
+      amount: number | null;
+      currency: string;
+      series: { window: string }[];
+      output: { baselineProductivity: number; sourceIds: string[] };
+    };
+    expect(body.lostHours).toBeGreaterThan(0);
+    expect(body.amount).toBeGreaterThan(0);
+    expect(body.currency).toBe("GBP");
+    expect(body.output.baselineProductivity).toBeCloseTo(1.05, 2);
+    expect(body.output.sourceIds.length).toBeGreaterThan(0);
+    expect(body.series.some((p) => p.window === "baseline")).toBe(true);
+  });
+
+  it("refuses an industry-curve claim with no justification", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/forensics/disruption`,
+      headers: owner.headers,
+      payload: {
+        method: "industry_curve_mcaa",
+        title: "MCAA factors",
+        baseHours: 1000,
+        factors: [{ key: "stacking_of_trades", severity: "average" }],
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toMatch(/justification/i);
+  });
+
+  it("applies MCAA factors with a justification and names each factor", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/forensics/disruption`,
+      headers: owner.headers,
+      payload: {
+        method: "industry_curve_mcaa",
+        title: "MCAA factors",
+        baseHours: 1000,
+        hourlyRate: 40,
+        factors: [
+          { key: "stacking_of_trades", severity: "average" },
+          { key: "dilution_of_supervision", severity: "minor" },
+        ],
+        justification:
+          "Three trades were compelled into the same riser zone for eleven weeks by the late release of the M&E design.",
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as { lostHours: number; amount: number; output: { applied: { label: string }[] } };
+    expect(body.lostHours).toBe(300);
+    expect(body.amount).toBe(12_000);
+    expect(body.output.applied.map((a) => a.label)).toContain("Stacking of trades");
+  });
+});
+
+describe("record sufficiency, chronology scope and the submission package", () => {
+  let claimId: string;
+  let eventId: string;
+
+  it("scores the record and finds daily-log gaps and missing notices", async () => {
+    const created = await createDelayEvent(projectId, {
+      title: "Sufficiency event",
+      cause: "late_design_information",
+      excusable: true,
+      compensable: true,
+      startDate: "2026-06-01",
+      durationDays: 5,
+      taskId: taskB,
+      evidenceIds: [evidenceId],
+      noticeDueDate: "2026-06-15",
+    });
+    expect(created.statusCode).toBe(201);
+    eventId = created.json().id as string;
+
+    await app.db.insert(dailyLogs).values({
+      id: newId("log"),
+      companyId: owner.companyId,
+      projectId,
+      logDate: "2026-06-01",
+      sections: { delays: [{ description: "design hold" }] },
+      createdBy: owner.userId,
+    });
+
+    const claim = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims`,
+      headers: owner.headers,
+      payload: {
+        title: "Sufficiency claim",
+        kind: "delay",
+        contractId,
+        delayEventIds: [eventId],
+        chain: {
+          cause: "The employer released the reinforcement drawings eleven days late.",
+          effect: "Steel fixing to grid 4-9 could not start on the programmed date.",
+          entitlement: "NEC4 cl. 60.1(1) compensation event.",
+          quantum: "Five days of prolongation at the site overhead rate.",
+        },
+        daysClaimed: 5,
+      },
+    });
+    claimId = claim.json().id as string;
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims/${claimId}/sufficiency`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      overallScore: number;
+      limbs: { key: string; present: boolean }[];
+      events: { logCoveragePercent: number; gaps: { from: string; days: number }[] }[];
+      missingNotices: { reason: string }[];
+    };
+    expect(body.limbs.every((l) => l.present)).toBe(true);
+    expect(body.events[0]!.logCoveragePercent).toBe(20); // one of five days logged
+    expect(body.events[0]!.gaps[0]).toMatchObject({ from: "2026-06-02", days: 4 });
+    expect(body.missingNotices[0]!.reason).toMatch(/no notice/i);
+    expect(body.overallScore).toBeGreaterThan(0);
+  });
+
+  it("scopes the chronology to the claim rather than the whole project", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims/${claimId}/chronology`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      window: { from: string | null; to: string | null };
+      items: { date: string; source: string; recordId: string }[];
+      scope: { delayEvents: number };
+    };
+    expect(body.scope.delayEvents).toBe(1);
+    expect(body.window.from).toBe("2026-05-02"); // 1 June minus the 30-day margin
+    // January records belong to a different claim's story and must not appear.
+    expect(body.items.every((i) => i.date >= body.window.from!)).toBe(true);
+    expect(body.items.some((i) => i.source === "daily_log")).toBe(true);
+    expect(body.items.every((i) => typeof i.recordId === "string")).toBe(true);
+  });
+
+  it("generates a Scott Schedule with the claimant columns filled and the rest empty", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims/${claimId}/scott-schedule`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      rows: {
+        item: number;
+        reference: string;
+        claimantContention: string;
+        respondentResponse: string;
+        tribunalFinding: string;
+      }[];
+    };
+    expect(body.rows).toHaveLength(1);
+    expect(body.rows[0]!.claimantContention).toMatch(/late design information/);
+    expect(body.rows[0]!.respondentResponse).toBe("");
+    expect(body.rows[0]!.tribunalFinding).toBe("");
+  });
+
+  it("assembles a submission package and reports what is still missing", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/claims/${claimId}/package`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      completeness: { ready: boolean; missing: string[] };
+      chronology: unknown[] | null;
+      scottSchedule: unknown[] | null;
+    };
+    expect(body.chronology).not.toBeNull();
+    expect(body.scottSchedule).not.toBeNull();
+    expect(body.completeness.ready).toBe(false);
+    expect(body.completeness.missing.join(" ")).toMatch(/no delay analysis/);
+  });
+});
+
+describe("forensics health inputs", () => {
+  it("reports metrics and explains missing figures rather than reporting zeros", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/forensics/health-inputs`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { metrics: Record<string, number | null>; reasons: string[] };
+    expect(body.metrics["liveDelayEvents"]).toBeGreaterThan(0);
+    expect(body.metrics).toHaveProperty("eventsWithoutNotice");
+    expect(Array.isArray(body.reasons)).toBe(true);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Tenant isolation (production blocker: forensics had no coverage)    */
+/* ------------------------------------------------------------------ */
+
+describe("tenant isolation", () => {
+  let outsider: TestActor;
+
+  beforeAll(async () => {
+    outsider = await registerActor(app);
+  });
+
+  it("another company cannot read delay events, claims or analyses", async () => {
+    for (const url of [
+      `/api/v1/projects/${projectId}/delay-events`,
+      `/api/v1/projects/${projectId}/claims`,
+      `/api/v1/projects/${projectId}/forensics/analyses`,
+      `/api/v1/projects/${projectId}/forensics/quantum`,
+      `/api/v1/projects/${projectId}/forensics/disruption`,
+      `/api/v1/projects/${projectId}/forensics/float-rules`,
+      `/api/v1/projects/${projectId}/forensics/health-inputs`,
+      `/api/v1/projects/${projectId}/forensics/as-planned-vs-as-built`,
+    ]) {
+      const res = await app.inject({ method: "GET", url, headers: outsider.headers });
+      expect([403, 404]).toContain(res.statusCode);
+    }
+  });
+
+  it("another company cannot create or mutate forensic records", async () => {
+    const create = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/delay-events`,
+      headers: outsider.headers,
+      payload: {
+        title: "Hijack",
+        cause: "other",
+        excusable: true,
+        compensable: false,
+        startDate: "2026-01-01",
+        durationDays: 1,
+      },
+    });
+    expect([403, 404]).toContain(create.statusCode);
+
+    const claim = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims`,
+      headers: outsider.headers,
+      payload: { title: "Hijack", kind: "delay" },
+    });
+    expect([403, 404]).toContain(claim.statusCode);
+
+    const analysis = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/forensics/analyses`,
+      headers: outsider.headers,
+      payload: { method: "longest_path", title: "Hijack", scheduleId },
+    });
+    expect([403, 404]).toContain(analysis.statusCode);
+
+    const rules = await app.inject({
+      method: "PUT",
+      url: `/api/v1/projects/${projectId}/forensics/float-rules`,
+      headers: outsider.headers,
+      payload: { ownership: "owner", concurrencyRule: "malmaison" },
+    });
+    expect([403, 404]).toContain(rules.statusCode);
+  });
+
+  it("a claim of one project is not reachable through another project of the same company", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${project2Id}/claims/${claim1Id}`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("a delay event of one project is not reachable through another project", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${project2Id}/delay-events/${ev1Id}`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("company-level claim exposure never leaks another tenant's claims", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/claims/exposure`,
+      headers: outsider.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    expect((res.json() as { totalClaims: number }).totalClaims).toBe(0);
+  });
+});
+
+
+/* ------------------------------------------------------------------ */
+/* Notice time bars — the sweep, the obligation and idempotence         */
+/* ------------------------------------------------------------------ */
+
+describe("notice time bars", () => {
+  const iso = (offsetDays: number) =>
+    new Date(Date.now() + offsetDays * 86_400_000).toISOString().slice(0, 10);
+
+  // The notice sweep runs on project3 (no schedule, no BoQ), so it needs its
+  // own contract event: contract events are project-scoped.
+  let p3ContractEventId: string;
+
+  beforeAll(async () => {
+    const p3ContractId = newId("con");
+    await app.db.insert(contracts).values({
+      id: p3ContractId,
+      companyId: owner.companyId,
+      projectId: project3Id,
+      name: "Bare Project Contract",
+      form: "nec4_ecc",
+      necOption: "A",
+      createdBy: owner.userId,
+    });
+    p3ContractEventId = newId("cev");
+    await app.db.insert(contractEvents).values({
+      id: p3ContractEventId,
+      companyId: owner.companyId,
+      projectId: project3Id,
+      contractId: p3ContractId,
+      number: 1,
+      kind: "early_warning",
+      title: "Notice served",
+      eventDate: "2026-02-01",
+      noticeServedAt: "2026-02-02T09:00:00Z",
+      raisedBy: owner.userId,
+    });
+  });
+
+  async function createEvent(noticeDueDate: string | null): Promise<string> {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project3Id}/delay-events`,
+      headers: owner.headers,
+      payload: {
+        title: `Notice bar ${noticeDueDate ?? "none"} ${Math.random().toString(36).slice(2, 8)}`,
+        cause: "client_change",
+        excusable: true,
+        compensable: true,
+        startDate: "2026-02-01",
+        durationDays: 4,
+        ...(noticeDueDate ? { noticeDueDate } : {}),
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    return (res.json() as { id: string }).id;
+  }
+
+  async function sweep() {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project3Id}/forensics/notice-sweep`,
+      headers: owner.headers,
+      payload: {},
+    });
+    expect(res.statusCode).toBe(200);
+    return res.json() as {
+      scanned: number;
+      obligationsOpened: number;
+      obligationsClosed: number;
+      dueSoon: number;
+      missed: number;
+      alerted: number;
+      warnDays: number;
+    };
+  }
+
+  async function eventRow(id: string) {
+    const [row] = await app.db.select().from(delayEvents).where(eq(delayEvents.id, id)).limit(1);
+    return row!;
+  }
+
+  it("opens exactly one obligation per notice deadline and never a second", async () => {
+    const id = await createEvent(iso(20));
+    const first = await sweep();
+    expect(first.obligationsOpened).toBeGreaterThanOrEqual(1);
+
+    const row = await eventRow(id);
+    expect(row.noticeObligationId).toBeTruthy();
+    const [obl] = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, row.noticeObligationId!))
+      .limit(1);
+    expect(obl!.status).toBe("open");
+    expect(obl!.deadline?.slice(0, 10)).toBe(iso(20));
+
+    // A second cycle over unchanged data must not manufacture another.
+    const again = await sweep();
+    const rowAgain = await eventRow(id);
+    expect(rowAgain.noticeObligationId).toBe(row.noticeObligationId);
+    expect(again.obligationsOpened).toBe(0);
+  });
+
+  it("raises one critical signal for a passed bar, breaches the obligation, and does not duplicate", async () => {
+    const id = await createEvent(iso(-3));
+    const first = await sweep();
+    expect(first.missed).toBeGreaterThanOrEqual(1);
+    expect(first.alerted).toBeGreaterThanOrEqual(1);
+
+    const row = await eventRow(id);
+    expect(row.noticeAlertedAt).toBeTruthy();
+    const [obl] = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, row.noticeObligationId!))
+      .limit(1);
+    expect(obl!.status).toBe("breached");
+
+    const raised = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.projectId, project3Id),
+          eq(signals.detector, "forensics.notice_time_bar_missed"),
+        ),
+      );
+    const mine = raised.filter(
+      (sg) => (sg.evidenceRefs as { key?: string } | null)?.key === id,
+    );
+    expect(mine).toHaveLength(1);
+    expect(mine[0]!.severity).toBe("critical");
+
+    const second = await sweep();
+    expect(second.alerted).toBe(0);
+    const after = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.projectId, project3Id),
+          eq(signals.detector, "forensics.notice_time_bar_missed"),
+        ),
+      );
+    expect(after.filter((sg) => (sg.evidenceRefs as { key?: string } | null)?.key === id)).toHaveLength(1);
+  });
+
+  it("warns once for a bar inside the warning window without breaching the obligation", async () => {
+    const id = await createEvent(iso(2));
+    const res = await sweep();
+    expect(res.dueSoon).toBeGreaterThanOrEqual(1);
+    const row = await eventRow(id);
+    const [obl] = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, row.noticeObligationId!))
+      .limit(1);
+    expect(obl!.status).toBe("open");
+    const due = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(eq(signals.projectId, project3Id), eq(signals.detector, "forensics.notice_time_bar_due")),
+      );
+    expect(due.filter((sg) => (sg.evidenceRefs as { key?: string } | null)?.key === id)).toHaveLength(1);
+  });
+
+  it("satisfies the obligation once a notice is recorded against the event", async () => {
+    const id = await createEvent(iso(10));
+    await sweep();
+    const before = await eventRow(id);
+    expect(before.noticeObligationId).toBeTruthy();
+
+    const patch = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${project3Id}/delay-events/${id}`,
+      headers: owner.headers,
+      payload: { contractEventId: p3ContractEventId },
+    });
+    expect(patch.statusCode).toBe(200);
+
+    const res = await sweep();
+    expect(res.obligationsClosed).toBeGreaterThanOrEqual(1);
+    const [obl] = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, before.noticeObligationId!))
+      .limit(1);
+    expect(obl!.status).toBe("satisfied");
+    expect(obl!.satisfiedEvidenceId).toBe(p3ContractEventId);
+  });
+
+  it("waives the obligation and opens a fresh one when the deadline moves", async () => {
+    const id = await createEvent(iso(15));
+    await sweep();
+    const before = await eventRow(id);
+    const originalObligation = before.noticeObligationId!;
+
+    const patch = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${project3Id}/delay-events/${id}`,
+      headers: owner.headers,
+      payload: { noticeDueDate: iso(25) },
+    });
+    expect(patch.statusCode).toBe(200);
+
+    const [waived] = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, originalObligation))
+      .limit(1);
+    expect(waived!.status).toBe("waived");
+
+    const cleared = await eventRow(id);
+    expect(cleared.noticeObligationId).toBeNull();
+
+    await sweep();
+    const reopened = await eventRow(id);
+    expect(reopened.noticeObligationId).toBeTruthy();
+    expect(reopened.noticeObligationId).not.toBe(originalObligation);
+    const [fresh] = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, reopened.noticeObligationId!))
+      .limit(1);
+    expect(fresh!.deadline?.slice(0, 10)).toBe(iso(25));
+  });
+
+  it("waives the obligation when the event is withdrawn", async () => {
+    const id = await createEvent(iso(12));
+    await sweep();
+    const before = await eventRow(id);
+
+    const status = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project3Id}/delay-events/${id}/status`,
+      headers: owner.headers,
+      payload: { status: "withdrawn", reason: "Raised in error" },
+    });
+    expect(status.statusCode).toBe(200);
+
+    await sweep();
+    const [obl] = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, before.noticeObligationId!))
+      .limit(1);
+    expect(obl!.status).toBe("waived");
+  });
+
+  it("reports notice exposure through the health-inputs endpoint", async () => {
+    await createEvent(iso(-1));
+    await sweep();
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${project3Id}/forensics/health-inputs`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { metrics: Record<string, number | null>; reasons: string[] };
+    expect(body.metrics["noticeTimeBarsMissed"]).toBeGreaterThanOrEqual(1);
+    expect(body.reasons.some((r) => r.includes("notice time bar"))).toBe(true);
+  });
+
+  it("runs as a registered scheduler job", async () => {
+    const status = await app.scheduler.runNow("forensics.notice-time-bars");
+    expect(status.lastError ?? null).toBeNull();
+  });
+
+  it("another company cannot run the notice sweep on this project", async () => {
+    const outsider = await registerActor(app);
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project3Id}/forensics/notice-sweep`,
+      headers: outsider.headers,
+      payload: {},
+    });
+    expect([403, 404]).toContain(res.statusCode);
+  });
+});
+
+
+/* ------------------------------------------------------------------ */
+/* Weather baseline linkage (delay event <-> site weather analysis)     */
+/* ------------------------------------------------------------------ */
+
+describe("weather baseline linkage", () => {
+  let weatherEventId: string;
+  let dryEventId: string;
+
+  beforeAll(async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project2Id}/delay-events`,
+      headers: owner.headers,
+      payload: {
+        title: "Exceptional rainfall, February",
+        cause: "exceptional_weather",
+        excusable: true,
+        compensable: false,
+        startDate: "2026-02-01",
+        durationDays: 12,
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    weatherEventId = (res.json() as { id: string }).id;
+
+    const dry = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${project2Id}/delay-events`,
+      headers: owner.headers,
+      payload: {
+        title: "Late design release",
+        cause: "client_change",
+        excusable: true,
+        compensable: true,
+        startDate: "2026-03-01",
+        durationDays: 5,
+      },
+    });
+    dryEventId = (dry.json() as { id: string }).id;
+
+    await app.db.insert(siteWeatherAnalyses).values({
+      id: newId("swa"),
+      companyId: owner.companyId,
+      projectId: project2Id,
+      number: 1,
+      reference: "WX-001",
+      baselineId: newId("swb"),
+      periodStart: "2026-02-01",
+      periodEnd: "2026-02-28",
+      status: "issued",
+      daysInPeriod: 28,
+      daysObserved: 26,
+      observedAdverseDays: 14,
+      baselineAdverseDays: 6,
+      exceptionalDays: 8,
+      hoursLost: 64,
+      coveragePercent: 92.9,
+      byMonth: [
+        { month: "2026-02", days: 28, observed: 14, expected: 6, exceptional: 8, reasons: ["precipitation_mm > 10"] },
+      ],
+      reasons: [],
+      delayEventId: weatherEventId,
+      generatedBy: owner.userId,
+    });
+  });
+
+  it("returns the issued weather analysis behind an exceptional-weather event", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${project2Id}/delay-events/${weatherEventId}/weather`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      analyses: { reference: string; exceptionalDays: number | null }[];
+      summary: { exceptionalDays: number | null; hoursLost: number | null; meanCoveragePercent: number | null };
+      reasons: string[];
+    };
+    expect(body.analyses).toHaveLength(1);
+    expect(body.analyses[0]!.reference).toBe("WX-001");
+    expect(body.summary.exceptionalDays).toBe(8);
+    expect(body.summary.hoursLost).toBe(64);
+    expect(body.summary.meanCoveragePercent).toBe(92.9);
+    expect(body.reasons).toHaveLength(0);
+  });
+
+  it("says exceptional days are not available rather than reporting zero", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${project2Id}/delay-events/${dryEventId}/weather`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      analyses: unknown[];
+      summary: { exceptionalDays: number | null };
+      reasons: string[];
+    };
+    expect(body.analyses).toHaveLength(0);
+    expect(body.summary.exceptionalDays).toBeNull();
+    expect(body.reasons.length).toBeGreaterThan(0);
+  });
+
+  it("another company cannot read the weather evidence of this event", async () => {
+    const outsider = await registerActor(app);
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${project2Id}/delay-events/${weatherEventId}/weather`,
+      headers: outsider.headers,
+    });
+    expect([403, 404]).toContain(res.statusCode);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Company-wide search (contract §3.3)                                 */
+/* ------------------------------------------------------------------ */
+
+describe("company search covers delay events and claims", () => {
+  let stranger: TestActor;
+  let eventId: string;
+  let claimId: string;
+
+  beforeAll(async () => {
+    stranger = await registerActor(app);
+    const ev = await createDelayEvent(projectId, {
+      title: "Unforeseen ground obstruction at pier 4",
+      description: "Reinforced concrete obstruction found during piling",
+      cause: "unforeseen_ground_conditions",
+      excusable: true,
+      compensable: true,
+      startDate: "2026-05-04",
+      durationDays: 6,
+    });
+    expect(ev.statusCode).toBe(201);
+    eventId = ev.json().id;
+
+    const claim = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims`,
+      headers: owner.headers,
+      payload: {
+        title: "Pier 4 obstruction extension of time",
+        kind: "delay",
+        clauseRef: "Cl. 8.5(a)",
+      },
+    });
+    expect(claim.statusCode).toBe(201);
+    claimId = claim.json().id;
+  });
+
+  it("finds a delay event and links to its drawer", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/v1/search?q=obstruction&types=delay_event",
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { items: { id: string; href: string; status: string }[] };
+    const hit = body.items.find((i) => i.id === eventId);
+    expect(hit).toBeDefined();
+    expect(hit!.href).toBe(`/projects/${projectId}/forensics?tab=events&id=${eventId}`);
+    expect(hit!.status).toBe("open");
+  });
+
+  it("finds a claim and links to its drawer", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/v1/search?q=pier%204&types=forensic_claim",
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { items: { id: string; href: string; subtitle: string | null }[] };
+    const hit = body.items.find((i) => i.id === claimId);
+    expect(hit).toBeDefined();
+    expect(hit!.href).toBe(`/projects/${projectId}/forensics?tab=claims&id=${claimId}`);
+    expect(hit!.subtitle).toBe("Cl. 8.5(a)");
+  });
+
+  it("never returns another tenant's delay events or claims", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/v1/search?q=obstruction%20pier&types=delay_event,forensic_claim",
+      headers: stranger.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().items).toEqual([]);
   });
 });

@@ -173,16 +173,32 @@ export interface LockoutConfig {
   NODE_ENV: string;
 }
 
-export function accountPolicy(config: LockoutConfig): LockoutPolicy {
+/**
+ * A tenant may tighten the thresholds (spec #25's neighbour, the lockout half
+ * of the security policy). `overrides` comes from
+ * modules/account/policy.ts `resolvePolicies`, which has already folded every
+ * company the address belongs to into the strictest of them; `undefined`
+ * means nobody has set anything and the platform default applies.
+ */
+export interface LockoutOverrides {
+  lockoutMaxAttempts?: number | null;
+  lockoutWindowMinutes?: number | null;
+  lockoutDurationMinutes?: number | null;
+}
+
+export function accountPolicy(
+  config: LockoutConfig,
+  overrides?: LockoutOverrides,
+): LockoutPolicy {
   return {
-    maxAttempts: config.LOGIN_MAX_FAILED_ATTEMPTS,
-    windowMs: config.LOGIN_FAILURE_WINDOW_MINUTES * 60_000,
-    lockoutMs: config.LOGIN_LOCKOUT_MINUTES * 60_000,
+    maxAttempts: overrides?.lockoutMaxAttempts ?? config.LOGIN_MAX_FAILED_ATTEMPTS,
+    windowMs: (overrides?.lockoutWindowMinutes ?? config.LOGIN_FAILURE_WINDOW_MINUTES) * 60_000,
+    lockoutMs: (overrides?.lockoutDurationMinutes ?? config.LOGIN_LOCKOUT_MINUTES) * 60_000,
   };
 }
 
-export function ipPolicy(config: LockoutConfig): LockoutPolicy {
-  const base = accountPolicy(config);
+export function ipPolicy(config: LockoutConfig, overrides?: LockoutOverrides): LockoutPolicy {
+  const base = accountPolicy(config, overrides);
   return { ...base, maxAttempts: base.maxAttempts * IP_ATTEMPT_MULTIPLIER };
 }
 
@@ -196,8 +212,9 @@ export async function accountLockout(
   config: LockoutConfig,
   email: string,
   nowMs = Date.now(),
+  overrides?: LockoutOverrides,
 ): Promise<LockoutState> {
-  const policy = accountPolicy(config);
+  const policy = accountPolicy(config, overrides);
   const horizon = new Date(nowMs - (policy.windowMs + policy.lockoutMs + 60_000)).toISOString();
   const events = await loadEvents(
     db,
@@ -219,9 +236,10 @@ export async function ipLockout(
   config: LockoutConfig,
   ip: string | null,
   nowMs = Date.now(),
+  overrides?: LockoutOverrides,
 ): Promise<LockoutState> {
   if (!ip) return UNLOCKED;
-  const policy = ipPolicy(config);
+  const policy = ipPolicy(config, overrides);
   const horizon = new Date(nowMs - (policy.windowMs + policy.lockoutMs + 60_000)).toISOString();
   const events = await loadEvents(
     db,

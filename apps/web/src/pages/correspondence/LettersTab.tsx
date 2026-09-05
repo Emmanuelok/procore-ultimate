@@ -43,6 +43,7 @@ import {
   corrApi,
   dateTime,
   days,
+  downloadCsv,
   isoDate,
   letterTone,
   titleCase,
@@ -201,6 +202,16 @@ export default function LettersTab({
     }
   }
 
+  async function exportRegister() {
+    await action.run("export", async () => {
+      await downloadCsv(
+        `/api/v1/projects/${projectId}/correspondence/register`,
+        "correspondence-register.csv",
+      );
+      return true;
+    });
+  }
+
   return (
     <div className="space-y-4">
       <Card>
@@ -268,13 +279,8 @@ export default function LettersTab({
             <Button
               variant="ghost"
               icon={IconDownload}
-              onClick={() => {
-                window.open(
-                  `/api/v1/projects/${projectId}/correspondence/register`,
-                  "_blank",
-                  "noopener",
-                );
-              }}
+              loading={action.busy === "export"}
+              onClick={exportRegister}
             >
               Export register
             </Button>

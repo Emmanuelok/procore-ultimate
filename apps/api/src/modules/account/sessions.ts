@@ -10,6 +10,8 @@ import { unauthorized } from "../../lib/errors.js";
 import { isExpired } from "../../lib/time.js";
 import type { Db } from "../../lib/db.js";
 import type { PreHandler } from "../../types.js";
+import { recordAuthEvent } from "./events.js";
+import { effectivePolicyForUser, isIdleExpired } from "./policy.js";
 
 /**
  * Sessions as DEVICES, not as tokens.
@@ -138,6 +140,13 @@ export interface IssueSessionOptions {
   identityId?: string | null;
   providerId?: string | null;
   nowMs?: number;
+  /**
+   * #23 — the tenant's absolute session lifetime in hours, from the resolved
+   * security policy (modules/account/policy.ts). Unset falls back to
+   * SESSION_ABSOLUTE_TTL_DAYS, which is what every caller did before tenant
+   * policy existed.
+   */
+  absoluteTtlHours?: number | null;
 }
 
 export interface IssuedSession {
@@ -183,9 +192,11 @@ export async function issueUserSession(
 
   const deviceLabel = deviceLabelFor(ctx.userAgent);
   const fingerprint = deviceFingerprintOf(ctx.userAgent, ctx.ip);
-  const expiresAt = new Date(
-    nowMs + app.appConfig.SESSION_ABSOLUTE_TTL_DAYS * 24 * 3600 * 1000,
-  ).toISOString();
+  const ttlHours =
+    options.absoluteTtlHours && options.absoluteTtlHours > 0
+      ? Math.min(options.absoluteTtlHours, app.appConfig.SESSION_ABSOLUTE_TTL_DAYS * 24)
+      : app.appConfig.SESSION_ABSOLUTE_TTL_DAYS * 24;
+  const expiresAt = new Date(nowMs + ttlHours * 3600 * 1000).toISOString();
 
   if (options.sessionId) {
     const [existing] = await app.db
@@ -333,9 +344,56 @@ export function requireLiveSession(app: FastifyInstance): PreHandler {
       });
       throw unauthorized("Session has expired");
     }
+    // #23 — THE IDLE TIMEOUT, enforced before `last_seen_at` is refreshed.
+    //
+    // Order matters and is the whole correctness of this block: refreshing
+    // first would reset the very clock the check reads, and the timeout would
+    // never fire for anybody who kept a tab open. The policy is the STRICTEST
+    // across the user's tenants (policy.ts `resolvePolicies`), because a
+    // session admitted under a lax tenant's rules is a session a strict
+    // tenant's data is then read through.
+    //
+    // The session is REVOKED, not merely refused: a session that timed out is
+    // over, and leaving the row live would let the same token work again from
+    // a second tab that happened to touch a route this gate is not on.
+    //
+    // THE COST. Reading the policy is a query, and this gate runs on every
+    // account request, so it is taken only when the session has not been seen
+    // for a minute — the same threshold that already decides whether to write
+    // `last_seen_at`. That is sound rather than merely cheap: the shortest
+    // idle timeout the policy route accepts is five minutes (security-routes.ts
+    // `min(5)`), so a session seen within the last minute cannot have crossed
+    // any timeable threshold. The tenant's policy is read at most once a
+    // minute per session instead of once per request.
+    const lastSeenMs = Date.parse(session.lastSeenAt);
+    const stale = !Number.isFinite(lastSeenMs) || nowMs - lastSeenMs > 60_000;
+    if (stale) {
+      const policy = await effectivePolicyForUser(app.db, session.userId);
+      if (isIdleExpired(policy, session.lastSeenAt, nowMs)) {
+        await revokeSessions(app.db, [session.id], {
+          reason: "expired",
+          byUser: false,
+          actorId: null,
+          nowMs,
+        });
+        const ctx = requestContext(req);
+        await recordAuthEvent(app.db, {
+          kind: "session_idle_timeout",
+          outcome: "success",
+          userId: session.userId,
+          companyId: session.companyId ?? null,
+          sessionId: session.id,
+          ip: ctx.ip,
+          userAgent: ctx.userAgent,
+          reason: `Signed out after ${policy.sessionIdleTimeoutMinutes} minutes of inactivity, as this organisation requires.`,
+        });
+        throw unauthorized(
+          `Session ended after ${policy.sessionIdleTimeoutMinutes} minutes of inactivity, as this organisation requires.`,
+        );
+      }
+    }
     req.accountSessionId = session.id;
-    const lastSeen = Date.parse(session.lastSeenAt);
-    if (!Number.isFinite(lastSeen) || nowMs - lastSeen > 60_000) {
+    if (stale) {
       await app.db
         .update(authSessions)
         .set({ lastSeenAt: new Date(nowMs).toISOString() })

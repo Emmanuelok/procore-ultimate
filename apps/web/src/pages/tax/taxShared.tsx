@@ -335,6 +335,7 @@ export interface Certificate {
   currency: string;
   grossAmount: number;
   materialsAmount: number;
+  withholdingBase: string;
   baseAmount: number;
   rate: number;
   withheldAmount: number;
@@ -499,6 +500,8 @@ export interface ScanResult {
   signalsRaised: number;
   peRecomputed: number;
   peSignalsRaised: number;
+  /** the on-demand scan covers this project only; the scheduler covers the company */
+  scope: "project";
   ranAt: string;
 }
 
@@ -893,6 +896,8 @@ export const taxApi = {
     api.post<Period>(`/api/v1/projects/${projectId}/tax/periods/${id}/file`, body),
   markPeriodPaid: (projectId: string, id: string) =>
     api.post<Period>(`/api/v1/projects/${projectId}/tax/periods/${id}/mark-paid`, {}),
+  reopenPeriod: (projectId: string, id: string, reason: string) =>
+    api.post<Period>(`/api/v1/projects/${projectId}/tax/periods/${id}/reopen`, { reason }),
   createExposure: (projectId: string, body: Record<string, unknown>) =>
     api.post<Exposure>(`/api/v1/projects/${projectId}/tax/pe-exposures`, body),
   patchExposure: (projectId: string, id: string, body: Record<string, unknown>) =>

@@ -686,4 +686,102 @@ describe("commissioning test records", () => {
     });
     expect(record.json().deficiencyRecordIds).toHaveLength(1);
   });
+
+  /*
+   * The sequential guard above is a read; two submissions arriving together
+   * both passed it and both ran the deficiency loop, so one defect reached the
+   * field register twice. The result is claimed with a conditional UPDATE now,
+   * and the loser is refused.
+   */
+  it("raises a deficiency once when the same result is submitted twice at once", async () => {
+    const second = await app.inject({
+      method: "POST",
+      url: api(`/projects/${p}/commissioning/test-records`),
+      payload: { systemId, testKind: "functional_performance", title: "Functional run" },
+      headers: owner.headers,
+    });
+    const id = second.json().id as string;
+
+    const payload = {
+      result: "pass_with_deficiencies" as const,
+      deficiencies: [{ description: "Damper actuator stalls", raiseAs: "punch_item" as const }],
+    };
+    const [a, b] = await Promise.all([
+      app.inject({
+        method: "POST",
+        url: api(`/projects/${p}/commissioning/test-records/${id}/result`),
+        payload,
+        headers: owner.headers,
+      }),
+      app.inject({
+        method: "POST",
+        url: api(`/projects/${p}/commissioning/test-records/${id}/result`),
+        payload,
+        headers: owner.headers,
+      }),
+    ]);
+    const codes = [a!.statusCode, b!.statusCode].sort();
+    expect(codes[0]).toBe(200);
+    expect(codes[1]).toBeGreaterThanOrEqual(400);
+
+    const after = await app.inject({
+      method: "GET",
+      url: api(`/projects/${p}/commissioning/test-records/${id}`),
+      headers: owner.headers,
+    });
+    expect(after.json().deficiencyRecordIds).toHaveLength(1);
+  });
+
+  it("refuses to mark a test complete or accepted by editing it", async () => {
+    const created = await app.inject({
+      method: "POST",
+      url: api(`/projects/${p}/commissioning/test-records`),
+      payload: { systemId, testKind: "pressure_test", title: "Pressure test PT-01" },
+      headers: owner.headers,
+    });
+    const id = created.json().id as string;
+    for (const status of ["complete", "accepted"]) {
+      const patched = await app.inject({
+        method: "PATCH",
+        url: api(`/projects/${p}/commissioning/test-records/${id}`),
+        payload: { status },
+        headers: owner.headers,
+      });
+      expect(patched.statusCode).toBe(400);
+      expect(patched.json().message).toContain("result");
+    }
+    const after = await app.inject({
+      method: "GET",
+      url: api(`/projects/${p}/commissioning/test-records/${id}`),
+      headers: owner.headers,
+    });
+    expect(after.json().status).toBe("scheduled");
+    expect(after.json().result).toBeNull();
+  });
+
+  it("refuses a result on a void record rather than reading against a withdrawn test", async () => {
+    const created = await app.inject({
+      method: "POST",
+      url: api(`/projects/${p}/commissioning/test-records`),
+      payload: { systemId, testKind: "loop_check", title: "Loop check LC-01" },
+      headers: owner.headers,
+    });
+    const id = created.json().id as string;
+    const voided = await app.inject({
+      method: "PATCH",
+      url: api(`/projects/${p}/commissioning/test-records/${id}`),
+      payload: { status: "void" },
+      headers: owner.headers,
+    });
+    expect(voided.statusCode).toBe(200);
+
+    const result = await app.inject({
+      method: "POST",
+      url: api(`/projects/${p}/commissioning/test-records/${id}/result`),
+      payload: { result: "pass" },
+      headers: owner.headers,
+    });
+    expect(result.statusCode).toBe(400);
+    expect(result.json().message).toContain("void");
+  });
 });

@@ -49,8 +49,10 @@ import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { addDaysISO, isoDateSchema, todayISO } from "../field/dates.js";
 import { pushNotifications } from "../notifications/service.js";
 import { determine, DeterminationError, type DeterminationInput, type DeterminationOutput } from "./determine.js";
+import { companyTaxGate } from "./gates.js";
 import { addMonthsISO, daysInclusive } from "./pe.js";
 import {
+  countryCodeFor,
   findReturnDef,
   findTaxRegime,
   summariseRegime,
@@ -69,6 +71,7 @@ import {
   vendorPosition,
   type DeterminationRow,
 } from "./service.js";
+import { registerTaxSearch } from "./search.js";
 import { registerTaxJobs, runTaxRiskSweep, sweepPeExposures } from "./sweeps.js";
 
 /* ------------------------------------------------------------------ */
@@ -226,6 +229,8 @@ const certificateCreateSchema = z.object({
   currency: currencyCode.optional(),
   grossAmount: z.number().finite().nonnegative().optional(),
   materialsAmount: z.number().finite().nonnegative().optional(),
+  /** what the rate applies to; defaults to the determination's, else the scheme's */
+  withholdingBase: z.enum(TAX_WITHHOLDING_BASES).optional(),
   rate: z.number().min(0).max(100).optional(),
   detail: z.record(z.string(), z.unknown()).optional(),
 });
@@ -306,6 +311,30 @@ const mitigateSchema = z.object({ note: z.string().min(5).max(4000) });
 
 const OPEN_SIGNAL_DISPOSITIONS = ["new", "under_review", "confirmed", "escalated"];
 
+/** Postgres unique_violation — the constraint decided, not our read-then-write. */
+function isUniqueViolation(err: unknown): boolean {
+  const seen = new Set<unknown>();
+  let cur: unknown = err;
+  while (cur && typeof cur === "object" && !seen.has(cur)) {
+    seen.add(cur);
+    if ((cur as { code?: unknown }).code === "23505") return true;
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/**
+ * What the withholding rate applies to when no determination produced the
+ * figures. CIS and RCT deduct on the amount net of materials (#802): taking
+ * the gross would over-withhold from the payee on every hand-recorded
+ * statement.
+ */
+function baseForScheme(regime: TaxRegime, scheme: string): TaxWithholdingBase {
+  const rd = findTaxRegime(regime)?.withholding;
+  if (rd?.scheme === scheme && rd.registrationDriven) return rd.registrationDriven.base;
+  return scheme === "cis" || scheme === "rct" ? "gross_excl_materials" : "gross_excl_vat";
+}
+
 function serialiseDetermination(row: DeterminationRow) {
   return { ...row, reverseCharge: row.reverseCharge === 1 };
 }
@@ -340,12 +369,20 @@ function supplyTypeForLine(source: string, fallback: TaxSupplyType): TaxSupplyTy
  *
  * Deliberately not here: payroll tax and certified payroll (#808–811, the
  * timecards module), transfer pricing documentation (#812–813), customs
- * allocation (#814, noted on imported goods), stamp duty (#815).
+ * allocation (#814, noted on imported goods), stamp duty (#815), industry
+ * training levies such as CITB (#817 — an annual levy on payroll and net CIS
+ * payments, not a per-supply tax; it belongs with payroll) and tax-audit
+ * evidence assembly (#820 — the determinations, certificates and periods
+ * carry everything a pack needs, but no assembler is built).
  */
 export const taxModule: FastifyPluginAsync = async (app) => {
   const readGate = [app.authenticate, app.requireCompany, app.requireTool("tax", "read")];
   const standardGate = [app.authenticate, app.requireCompany, app.requireTool("tax", "standard")];
-  const companyGate = [app.authenticate, app.requireCompany];
+  // Company-level tax routes carry the same tool at the same level, resolved
+  // across the caller's projects (gates.ts) — `requireTool` needs a
+  // `:projectId` and there is none above the projects.
+  const companyReadGate = [app.authenticate, app.requireCompany, companyTaxGate(app, "read")];
+  const companyWriteGate = [app.authenticate, app.requireCompany, companyTaxGate(app, "standard")];
   const companyAdminGate = [
     app.authenticate,
     app.requireCompany,
@@ -353,6 +390,7 @@ export const taxModule: FastifyPluginAsync = async (app) => {
   ];
 
   registerTaxJobs(app);
+  registerTaxSearch();
 
   /* ================================================================ */
   /* Regime library (reference data, not tenant data)                  */
@@ -404,7 +442,7 @@ export const taxModule: FastifyPluginAsync = async (app) => {
     throw badRequest("holderName is required for this holder");
   }
 
-  app.get("/tax/registrations", { preHandler: companyGate }, async (req) => {
+  app.get("/tax/registrations", { preHandler: companyReadGate }, async (req) => {
     const q = registrationListQuery.parse(req.query);
     const clauses = [eq(taxRegistrations.companyId, req.companyId!)];
     if (q.holderType) clauses.push(eq(taxRegistrations.holderType, q.holderType));
@@ -426,7 +464,7 @@ export const taxModule: FastifyPluginAsync = async (app) => {
     return paginate(items, Number(totalRow?.n ?? 0), q);
   });
 
-  app.post("/tax/registrations", { preHandler: companyGate }, async (req, reply) => {
+  app.post("/tax/registrations", { preHandler: companyWriteGate }, async (req, reply) => {
     const body = registrationCreateSchema.parse(req.body);
     if (body.holderType !== "company" && !body.holderId) {
       throw badRequest("holderId is required for a vendor or entity registration");
@@ -466,13 +504,13 @@ export const taxModule: FastifyPluginAsync = async (app) => {
     return reply.status(201).send(await fetchRegistration(id, req.companyId!));
   });
 
-  app.get("/tax/registrations/:registrationId", { preHandler: companyGate }, async (req) => {
+  app.get("/tax/registrations/:registrationId", { preHandler: companyReadGate }, async (req) => {
     const { registrationId } = req.params as { registrationId: string };
     const row = await fetchRegistration(registrationId, req.companyId!);
     return { ...row, regimeDef: findTaxRegime(row.regime) ? summariseRegime(findTaxRegime(row.regime)!) : null };
   });
 
-  app.patch("/tax/registrations/:registrationId", { preHandler: companyGate }, async (req) => {
+  app.patch("/tax/registrations/:registrationId", { preHandler: companyWriteGate }, async (req) => {
     const { registrationId } = req.params as { registrationId: string };
     const body = registrationPatchSchema.parse(req.body);
     const row = await fetchRegistration(registrationId, req.companyId!);
@@ -500,7 +538,7 @@ export const taxModule: FastifyPluginAsync = async (app) => {
    * person from whoever recorded the registration: the claim and the check
    * are not authored through the same pathway.
    */
-  app.post("/tax/registrations/:registrationId/verify", { preHandler: companyGate }, async (req) => {
+  app.post("/tax/registrations/:registrationId/verify", { preHandler: companyWriteGate }, async (req) => {
     const { registrationId } = req.params as { registrationId: string };
     const body = verifySchema.parse(req.body);
     const row = await fetchRegistration(registrationId, req.companyId!);
@@ -683,13 +721,26 @@ export const taxModule: FastifyPluginAsync = async (app) => {
     }
     let determination: DeterminationRow | null = null;
     if (body.persist) {
+      // A persisted what-if is a MANUAL record. Accepting a caller-supplied
+      // sourceType/sourceId here would let hand-typed figures supersede the
+      // engine's determination for a real invoice line (persistDetermination
+      // supersedes by source triple) with no override reason and no chain —
+      // exactly what the override route at
+      // POST …/determinations/:id/override exists to prevent (#802).
+      if ((body.sourceType ?? "manual") !== "manual") {
+        throw badRequest(
+          "A persisted determination from this route is a manual record. Determine an invoice through " +
+            "POST /projects/:projectId/tax/invoices/:invoiceId/determine, and change an existing one through " +
+            "POST /projects/:projectId/tax/determinations/:determinationId/override so the reason and the chain are kept.",
+        );
+      }
       determination = await persistDetermination(app.db, {
         companyId: req.companyId!,
         projectId: req.projectId!,
         actorId: req.user!.id,
         input: result.input,
         output: result.output,
-        sourceType: body.sourceType ?? "manual",
+        sourceType: "manual",
         sourceId: body.sourceId ?? null,
         sourceLineId: body.sourceLineId ?? null,
         vendorId: result.vendor.vendor?.id ?? null,
@@ -1175,61 +1226,85 @@ export const taxModule: FastifyPluginAsync = async (app) => {
     const gross = body.grossAmount ?? det?.amount;
     if (gross === undefined) throw badRequest("grossAmount is required when no determination is referenced");
     const detInput = det ? (det.inputs as unknown as DeterminationInput) : null;
-    const materials = body.materialsAmount ?? detInput?.materialsAmount ?? 0;
-    if (materials > gross + 0.005) throw badRequest("materialsAmount cannot exceed grossAmount");
     const rate = body.rate ?? det?.withholdingRate;
     if (rate === undefined) throw badRequest("rate is required when no determination is referenced");
-    const base: TaxWithholdingBase = (det?.withholdingBase as TaxWithholdingBase | undefined) ?? "gross_excl_vat";
-    const baseAmount = base === "gross_excl_vat" || base === "none" ? round2(gross) : round2(Math.max(0, gross - materials));
+    // The base follows the determination when there is one and the SCHEME
+    // otherwise — never a flat "gross". A hand-recorded CIS statement that
+    // deducted 20% of the gross while printing "materials excluded" short-pays
+    // the subcontractor and contradicts itself (#802).
+    const base: TaxWithholdingBase =
+      body.withholdingBase ?? (det?.withholdingBase as TaxWithholdingBase | undefined) ?? baseForScheme(regime, scheme);
+    const baseExcludesMaterials = base === "gross_excl_materials" || base === "labour_only";
+    if (!baseExcludesMaterials && body.materialsAmount !== undefined && body.materialsAmount > 0) {
+      throw badRequest(
+        `A ${scheme.toUpperCase()} deduction on this base (${base.replace(/_/g, " ")}) is computed on the whole amount, so materialsAmount must be 0 or omitted.`,
+      );
+    }
+    const materials = baseExcludesMaterials ? (body.materialsAmount ?? detInput?.materialsAmount ?? 0) : 0;
+    if (materials > gross + 0.005) throw badRequest("materialsAmount cannot exceed grossAmount");
+    const baseAmount = baseExcludesMaterials ? round2(Math.max(0, gross - materials)) : base === "none" ? 0 : round2(gross);
     const withheld = round2((baseAmount * rate) / 100);
     if (withheld <= 0) throw badRequest("Nothing to certify: the computed deduction is zero");
-    if (body.paymentId) {
-      const [dup] = await app.db
-        .select({ id: withholdingCertificates.id })
-        .from(withholdingCertificates)
-        .where(
-          and(
-            eq(withholdingCertificates.paymentId, body.paymentId),
-            eq(withholdingCertificates.companyId, req.companyId!),
-            ne(withholdingCertificates.status, "cancelled"),
-          ),
-        )
-        .limit(1);
-      if (dup) throw conflict("A certificate already exists for this payment; cancel it before issuing another");
-    }
     const number = await nextRecordNumber(app.db, req.projectId!, "withholding_certificate");
     const id = newId("whc");
-    await app.db.insert(withholdingCertificates).values({
-      id,
-      companyId: req.companyId!,
-      projectId: req.projectId!,
-      number,
-      determinationId: det?.id ?? null,
-      paymentId: body.paymentId ?? null,
-      invoiceId: body.invoiceId ?? (det?.sourceType === "invoice_line" || det?.sourceType === "invoice" ? det.sourceId : null),
-      vendorId,
-      vendorName,
-      regime,
-      scheme,
-      paymentDate: body.paymentDate,
-      currency,
-      grossAmount: round2(gross),
-      materialsAmount: round2(materials),
-      baseAmount,
-      rate,
-      withheldAmount: withheld,
-      netPaid: round2(gross - withheld),
-      status: "draft",
-      detail: body.detail ?? {},
-      createdBy: req.user!.id,
-    });
+    // One live statement per payment. The duplicate check and the insert run
+    // in one transaction and the partial unique index decides the race
+    // (schema/tax.ts): two payment runs must not both certify one payment.
+    try {
+      await app.db.transaction(async (tx) => {
+        if (body.paymentId) {
+          const [dup] = await tx
+            .select({ id: withholdingCertificates.id })
+            .from(withholdingCertificates)
+            .where(
+              and(
+                eq(withholdingCertificates.paymentId, body.paymentId),
+                eq(withholdingCertificates.companyId, req.companyId!),
+                ne(withholdingCertificates.status, "cancelled"),
+              ),
+            )
+            .limit(1);
+          if (dup) throw conflict("A certificate already exists for this payment; cancel it before issuing another");
+        }
+        await tx.insert(withholdingCertificates).values({
+          id,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          number,
+          determinationId: det?.id ?? null,
+          paymentId: body.paymentId ?? null,
+          invoiceId: body.invoiceId ?? (det?.sourceType === "invoice_line" || det?.sourceType === "invoice" ? det.sourceId : null),
+          vendorId,
+          vendorName,
+          regime,
+          scheme,
+          paymentDate: body.paymentDate,
+          currency,
+          grossAmount: round2(gross),
+          materialsAmount: round2(materials),
+          withholdingBase: base,
+          baseAmount,
+          rate,
+          withheldAmount: withheld,
+          netPaid: round2(gross - withheld),
+          status: "draft",
+          detail: body.detail ?? {},
+          createdBy: req.user!.id,
+        });
+      });
+    } catch (err) {
+      if (isUniqueViolation(err)) {
+        throw conflict("A certificate already exists for this payment; cancel it before issuing another");
+      }
+      throw err;
+    }
     await appendLedger(app.db, {
       companyId: req.companyId!,
       actorId: req.user!.id,
       action: "create",
       objectType: "withholding_certificate",
       objectId: id,
-      payload: { number, scheme, regime, vendorId, paymentDate: body.paymentDate, currency, grossAmount: round2(gross), baseAmount, rate, withheldAmount: withheld, determinationId: det?.id ?? null, paymentId: body.paymentId ?? null },
+      payload: { number, scheme, regime, vendorId, paymentDate: body.paymentDate, currency, grossAmount: round2(gross), materialsAmount: round2(materials), withholdingBase: base, baseAmount, rate, withheldAmount: withheld, determinationId: det?.id ?? null, paymentId: body.paymentId ?? null },
       projectId: req.projectId!,
       storePayload: true,
     });
@@ -1364,35 +1439,47 @@ export const taxModule: FastifyPluginAsync = async (app) => {
     if (dup) throw conflict("A period with this regime, return kind and start date already exists");
 
     const obligationId = newId("obl");
-    await app.db.insert(obligations).values({
-      id: obligationId,
-      companyId: req.companyId!,
-      projectId: req.projectId!,
-      sourceClause: `${def.name} — ${ret?.name ?? body.returnKind}`,
-      trigger: `File ${ret?.name ?? body.returnKind} for ${body.periodStart} to ${periodEnd}`,
-      deadline: `${dueDate}T23:59:59Z`,
-      warnDaysBefore: 7,
-      evidenceRequirement: "Filing reference / authority receipt",
-      status: "open",
-      createdBy: req.user!.id,
-    });
     const id = newId("txn");
-    await app.db.insert(taxPeriods).values({
-      id,
-      companyId: req.companyId!,
-      projectId: req.projectId!,
-      regime,
-      returnKind: body.returnKind,
-      periodStart: body.periodStart,
-      periodEnd,
-      dueDate,
-      paymentDueDate,
-      currency,
-      status: "open",
-      obligationId,
-      notes: body.notes ?? null,
-      createdBy: req.user!.id,
-    });
+    // Both rows or neither: the deadline obligation exists to be satisfied by
+    // its period, and the duplicate check above is racy against tax_periods_uq,
+    // so a losing request must not leave an open obligation nothing can close.
+    try {
+      await app.db.transaction(async (tx) => {
+        await tx.insert(obligations).values({
+          id: obligationId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          sourceClause: `${def.name} — ${ret?.name ?? body.returnKind}`,
+          trigger: `File ${ret?.name ?? body.returnKind} for ${body.periodStart} to ${periodEnd}`,
+          deadline: `${dueDate}T23:59:59Z`,
+          warnDaysBefore: 7,
+          evidenceRequirement: "Filing reference / authority receipt",
+          status: "open",
+          createdBy: req.user!.id,
+        });
+        await tx.insert(taxPeriods).values({
+          id,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          regime,
+          returnKind: body.returnKind,
+          periodStart: body.periodStart,
+          periodEnd,
+          dueDate,
+          paymentDueDate,
+          currency,
+          status: "open",
+          obligationId,
+          notes: body.notes ?? null,
+          createdBy: req.user!.id,
+        });
+      });
+    } catch (err) {
+      if (isUniqueViolation(err)) {
+        throw conflict("A period with this regime, return kind and start date already exists");
+      }
+      throw err;
+    }
     await appendLedger(app.db, {
       companyId: req.companyId!,
       actorId: req.user!.id,
@@ -1416,9 +1503,22 @@ export const taxModule: FastifyPluginAsync = async (app) => {
     return { ...row, live, obligation: obl ?? null, returnDef: findReturnDef(row.regime, row.returnKind as TaxReturnKind) ?? null };
   });
 
+  /**
+   * Recompute the aggregates. Refused once the return is filed or paid: the
+   * determinations and certificates inside the window keep moving (a re-run
+   * supersedes, a certificate is cancelled), so recomputing would quietly
+   * replace the figures that were filed while filedAt, filedBy and the filing
+   * reference still claim they are the submitted ones (plan §6.2). Correcting
+   * a filed return goes through /reopen, which clears the filing first.
+   */
   app.post("/projects/:projectId/tax/periods/:periodId/compute", { preHandler: standardGate }, async (req) => {
     const { periodId } = req.params as { periodId: string };
     const row = await fetchPeriod(periodId, req.companyId!, req.projectId!);
+    if (row.status === "filed" || row.status === "paid") {
+      throw conflict(
+        `This return is ${row.status}${row.filingReference ? ` under reference ${row.filingReference}` : ""}; its figures are the ones submitted. Re-open it first if the return has to be corrected.`,
+      );
+    }
     const agg = await computePeriodAggregates(app.db, row);
     const at = new Date().toISOString();
     await app.db
@@ -1438,14 +1538,74 @@ export const taxModule: FastifyPluginAsync = async (app) => {
     return fetchPeriod(periodId, req.companyId!, req.projectId!);
   });
 
+  /**
+   * Re-open a filed (or paid) return so it can be corrected: the filing is
+   * cleared, not kept over new numbers, and the obligation goes back to open
+   * so the deadline is live again. The reversal is ledgered with the reason.
+   */
+  app.post("/projects/:projectId/tax/periods/:periodId/reopen", { preHandler: standardGate }, async (req) => {
+    const { periodId } = req.params as { periodId: string };
+    const body = reasonSchema.parse(req.body);
+    const row = await fetchPeriod(periodId, req.companyId!, req.projectId!);
+    if (row.status !== "filed" && row.status !== "paid") {
+      throw conflict(`Only a filed or paid return can be re-opened; this one is ${row.status}`);
+    }
+    const at = new Date().toISOString();
+    const reopenedStatus = row.dueDate < todayISO() ? "overdue" : "open";
+    await app.db
+      .update(taxPeriods)
+      .set({
+        status: reopenedStatus,
+        filedAt: null,
+        filedBy: null,
+        filingReference: null,
+        paidAt: null,
+        paidBy: null,
+        updatedAt: at,
+      })
+      .where(eq(taxPeriods.id, periodId));
+    await setObligationStatus(app.db, row.obligationId, "satisfied", reopenedStatus === "overdue" ? "breached" : "open");
+    await appendLedger(app.db, {
+      companyId: req.companyId!,
+      actorId: req.user!.id,
+      action: "state_change",
+      objectType: "tax_period",
+      objectId: periodId,
+      payload: {
+        from: row.status,
+        to: reopenedStatus,
+        reason: body.reason,
+        clearedFiling: { filingReference: row.filingReference, filedAt: row.filedAt, filedBy: row.filedBy },
+        figuresAtReopen: {
+          outputTax: row.outputTax,
+          inputTax: row.inputTax,
+          withheldTotal: row.withheldTotal,
+          netPayable: row.netPayable,
+        },
+      },
+      projectId: req.projectId!,
+      storePayload: true,
+    });
+    return fetchPeriod(periodId, req.companyId!, req.projectId!);
+  });
+
   app.post("/projects/:projectId/tax/periods/:periodId/file", { preHandler: standardGate }, async (req) => {
     const { periodId } = req.params as { periodId: string };
     const body = fileSchema.parse(req.body);
     const row = await fetchPeriod(periodId, req.companyId!, req.projectId!);
     if (row.status === "filed" || row.status === "paid") throw conflict(`Period is already ${row.status}`);
     if (!row.computedAt) throw badRequest("Compute the period before filing so the filed figures are on record");
-    const filedAt = body.filedAt ?? new Date().toISOString();
-    const late = filedAt.slice(0, 10) > row.dueDate;
+    const now = new Date();
+    const filedAt = body.filedAt ?? now.toISOString();
+    // `filedAt` is back-entry for a return filed before it was recorded here;
+    // it may not be in the future, and it never decides lateness — a late
+    // return recorded with an on-time date would leave the obligation
+    // "satisfied" from open instead of breached and silently contradict the
+    // overdue signal.
+    if (Date.parse(filedAt) > now.getTime() + 60_000) {
+      throw badRequest("filedAt cannot be in the future");
+    }
+    const late = now.toISOString().slice(0, 10) > row.dueDate;
     await app.db
       .update(taxPeriods)
       .set({ status: "filed", filedAt, filedBy: req.user!.id, filingReference: body.filingReference, notes: body.notes ?? row.notes, updatedAt: new Date().toISOString() })
@@ -1458,7 +1618,16 @@ export const taxModule: FastifyPluginAsync = async (app) => {
       action: "state_change",
       objectType: "tax_period",
       objectId: periodId,
-      payload: { from: row.status, to: "filed", filingReference: body.filingReference, filedAt, late, netPayable: row.netPayable },
+      payload: {
+        from: row.status,
+        to: "filed",
+        filingReference: body.filingReference,
+        filedAt,
+        recordedAt: now.toISOString(),
+        late,
+        lateBasis: "the return was still unfiled here at its deadline; filedAt is the filer's claim",
+        netPayable: row.netPayable,
+      },
       projectId: req.projectId!,
       storePayload: true,
     });
@@ -1527,8 +1696,16 @@ export const taxModule: FastifyPluginAsync = async (app) => {
     const res = await resolveRegime(app.db, req.companyId!, req.projectId!);
     const regime = body.regime ?? res.regime;
     const def = regime ? findTaxRegime(regime) : undefined;
-    const hostCountry = body.hostCountry ?? (def?.countryCode || res.project?.country?.toUpperCase().slice(0, 2)) ?? null;
-    if (!hostCountry || hostCountry.length !== 2) throw badRequest("hostCountry is required when the project has no regime or country");
+    // The project's country is free text ("United Kingdom"), so it is
+    // normalised through the library's alias table rather than truncated to
+    // two letters — the code is written to the register and printed in the
+    // signal, and "UN" is not a country.
+    const hostCountry = body.hostCountry ?? (def?.countryCode || countryCodeFor(res.project?.country)) ?? null;
+    if (!hostCountry || !/^[A-Z]{2}$/.test(hostCountry)) {
+      throw badRequest(
+        `hostCountry is required: the regime carries no country code and the project's country (${res.project?.country ?? "not set"}) is not an ISO-3166 alpha-2 code or a country the library knows.`,
+      );
+    }
     if (!regime) throw badRequest("regime is required when the project has no resolvable regime");
     const isPerson = body.entityType === "person";
     const thresholdDays =
@@ -1754,10 +1931,16 @@ export const taxModule: FastifyPluginAsync = async (app) => {
     return paginate(rows, Number(totalRow?.n ?? 0), q);
   });
 
+  /**
+   * On-demand scan of THIS project. The caller holds `tax` on this project and
+   * may not even be a member of the next one, so the sweeps are scoped to it:
+   * the company-wide fan-out belongs to the `tax.risk-sweep` scheduler job,
+   * which runs as the system actor over every company (plan §6.3).
+   */
   app.post("/projects/:projectId/tax/risks/scan", { preHandler: standardGate }, async (req) => {
     const now = new Date();
-    const counts = await runTaxRiskSweep(app.db, req.companyId!, now);
-    const pe = await sweepPeExposures(app.db, req.companyId!, now);
+    const counts = await runTaxRiskSweep(app.db, req.companyId!, now, req.projectId!);
+    const pe = await sweepPeExposures(app.db, req.companyId!, now, req.projectId!);
     await appendLedger(app.db, {
       companyId: req.companyId!,
       actorId: req.user!.id,
@@ -1767,7 +1950,7 @@ export const taxModule: FastifyPluginAsync = async (app) => {
       payload: { ...counts, peRecomputed: pe.recomputed, peRaised: pe.raised },
       projectId: req.projectId!,
     });
-    return { ...counts, peRecomputed: pe.recomputed, peSignalsRaised: pe.raised, ranAt: now.toISOString() };
+    return { ...counts, peRecomputed: pe.recomputed, peSignalsRaised: pe.raised, scope: "project" as const, ranAt: now.toISOString() };
   });
 
   /** Vendors being paid on this project and their registration coverage under the resolved regime. */
@@ -1911,7 +2094,7 @@ export const taxModule: FastifyPluginAsync = async (app) => {
   });
 
   // Company-level rollup of open tax signals with no project (verification lapses).
-  app.get("/tax/company-signals", { preHandler: companyGate }, async (req) => {
+  app.get("/tax/company-signals", { preHandler: companyReadGate }, async (req) => {
     const rows = await app.db
       .select()
       .from(signals)

@@ -6,13 +6,31 @@ import { companies, companyMemberships, userMfa, users } from "@constructos/db";
 import { AppError, badRequest, conflict, unauthorized } from "../../lib/errors.js";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
-import { equalizeVerifyTiming } from "../account/password.js";
+import { equalizeVerifyTiming, verifyPassword } from "../account/password.js";
+import {
+  completeLogin,
+  guardLoginAttempt,
+  guardLoginIpAllowlist,
+  loginPolicyFor,
+  noteLoginFailure,
+} from "../account/login.js";
+import { recordLegacyAuthEvent } from "../account/events.js";
+import { dispatchEmail } from "../account/mailer.js";
+import { buildAppUrl, renderMfaEnrolled } from "../../lib/email.js";
+import { isPasswordLoginAllowedForUser } from "../sso/index.js";
 import {
   challengeEnvelope,
   mintChallengeToken,
   verifyChallengeToken,
   type ChallengeScope,
 } from "./challenge.js";
+import {
+  assertChallengeLive,
+  consumeChallenge,
+  liveChallengeCount,
+  registerChallenge,
+  sweepExpiredChallenges,
+} from "./challenge-store.js";
 import { deriveKey, KEY_PURPOSE, keyId, sealSecret } from "./secrets.js";
 import {
   assertFactor,
@@ -197,7 +215,7 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
 
   /** Confirm a pending factor and hand over its one and only recovery batch. */
   async function confirmFactor(
-    user: { id: string; email: string },
+    user: { id: string; email: string; name?: string },
     code: string,
     context: { ip: string | null; userAgent: string | null; purpose: string },
   ) {
@@ -241,6 +259,27 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
       objectType: "user_mfa",
       objectId: factor.id,
       payload: { event: "mfa_enrolled", method: "totp", status: "active", at: nowIso },
+    });
+    // TELL THE ACCOUNT HOLDER. `renderMfaEnrolled` has existed in lib/email.ts
+    // since the module was written and nothing ever dispatched it, so the one
+    // change that most needs to reach a human — "a second factor now guards
+    // your account, and if it was not you, someone else holds your password"
+    // — was recorded and never sent. The message never fails the enrolment:
+    // dispatchEmail records `dispatched:false` with a reason when no provider
+    // is configured, exactly as the invitation and reset paths do.
+    const rendered = renderMfaEnrolled({
+      name: user.name ?? user.email,
+      method: "authenticator app (TOTP)",
+      recoveryCodeCount: issued.codes.length,
+      at: nowIso,
+      securityUrl: buildAppUrl(cfg.APP_BASE_URL, "/account/security"),
+    });
+    await dispatchEmail(app, {
+      message: { to: { email: user.email, name: user.name ?? user.email }, ...rendered },
+      userId: user.id,
+      variables: { method: "totp", recoveryCodeCount: issued.codes.length, at: nowIso },
+      relatedType: "user_mfa",
+      relatedId: factor.id,
     });
     return { factorId: factor.id, confirmedAt: nowIso, issued };
   }
@@ -292,6 +331,11 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
           ? await countRecoveryCodes(app.db, user.id, factor.id)
           : null,
       stepUp: freshness,
+      // Half-finished sign-ins: a password was accepted and the second factor
+      // was never produced. Usually one, from the tab the user is looking at.
+      // More than one is the signal worth seeing — somebody else has this
+      // account's password — which is why it is reported rather than hidden.
+      challengesInFlight: await liveChallengeCount(app.db, user.id, Date.now()),
       policy: {
         required: requiredBy.length > 0,
         requiredBy: requiredBy.map((r) => ({ companyId: r.companyId, name: r.name })),
@@ -537,40 +581,108 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
   /* Login and challenge                                               */
   /* ---------------------------------------------------------------- */
 
+  /**
+   * MFA-aware password sign-in — the route the SPA actually calls.
+   *
+   * ------------------------------------------------------------------------
+   * WHAT WAS WRONG HERE, and why the fix is this shape
+   * ------------------------------------------------------------------------
+   * This handler used to run `bcrypt.compare` and record a `login_failure`
+   * row, and nothing else. It never called `guardLoginAttempt` or
+   * `noteLoginFailure` (modules/account/login.ts), so an attacker could guess
+   * passwords against one address indefinitely: no account lockout, no per-IP
+   * lockout, no doubling delay, no `account_locked` event. Only the per-IP
+   * network limiter applied, and that one is per-replica and off under test.
+   * Meanwhile `POST /auth/login` — the route nobody's browser used — had every
+   * one of those defences. The lockout engine was real and unreachable.
+   *
+   * It also skipped `completeLogin`, so a sign-in through the SPA got no
+   * transparent bcrypt rehash, no new-device message and no `isNewDevice`
+   * metadata in the trail. Three features that existed and never ran.
+   *
+   * So this route now runs exactly the same gauntlet as identity's
+   * `/auth/login`, in the same order, and calls the same helpers:
+   *
+   *   1. the tenant's resolved policy (lockout thresholds come from it, #25)
+   *   2. guardLoginAttempt  — refuse a locked address BEFORE the compare
+   *   3. the password, with `equalizeVerifyTiming` for an unknown address
+   *   4. noteLoginFailure   — count it, arm the lock, pay the delay
+   *   5. the tenant SSO policy (`allowPasswordLogin`)
+   *   6. the tenant IP allowlist (#24)
+   *   7. the MFA branch — challenge, never a session
+   *   8. completeLogin      — rehash, session row, trail, new-device message
+   */
   app.post("/auth/mfa/login", authLimited, async (req) => {
     const body = loginSchema.parse(req.body);
     const context = requestContext(req);
+    const policy = await loginPolicyFor(app, body.email);
+    // BEFORE the password is looked at, and identical for an address with an
+    // account and one without: the counter is keyed on what was typed.
+    await guardLoginAttempt(app, req, body.email, Date.now(), policy);
+
     const rows = await app.db.select().from(users).where(eq(users.email, body.email)).limit(1);
     const user = rows[0];
     // Always run a comparison, even when there is no account: an early return
     // makes the response time an account-enumeration oracle.
     const ok = user
-      ? await bcrypt.compare(body.password, user.passwordHash)
+      ? await verifyPassword(body.password, user.passwordHash)
       : await equalizeVerifyTiming(body.password, cfg);
-    if (!user || !ok) {
+    if (!user || !ok || !user.isActive) {
+      const reason = !user
+        ? "No account with this address"
+        : !ok
+          ? "Password did not match"
+          : "Account is deactivated";
       await recordSecurityEvent(app.db, {
-        kind: "login_failure",
-        outcome: "failure",
+        kind: user && ok ? "login_blocked_inactive" : "login_failure",
+        outcome: user && ok ? "blocked" : "failure",
         userId: user?.id ?? null,
         email: body.email,
         ip: context.ip,
         userAgent: context.userAgent,
-        reason: user ? "Password did not match" : "No account with this address",
+        reason,
       });
+      await recordLegacyAuthEvent(app.db, {
+        userId: user?.id ?? null,
+        email: body.email,
+        kind: user && ok ? "login_blocked_inactive" : "login_failure",
+        ip: context.ip,
+        userAgent: context.userAgent,
+      });
+      // The lock, the doubling delay and the `account_locked` row. This single
+      // call is the difference between a rate limit and a lockout.
+      await noteLoginFailure(
+        app,
+        req,
+        {
+          email: body.email,
+          userId: user?.id ?? null,
+          reason: !user ? "unknown_address" : !ok ? "invalid_password" : "account_inactive",
+          overrides: policy,
+        },
+      );
       throw unauthorized("Invalid credentials");
     }
-    if (!user.isActive) {
+
+    // Tenant policy: a company that requires SSO must not be reachable with a
+    // password here either. The same uniform 401, with the real reason in the
+    // trail rather than in the body.
+    if (!(await isPasswordLoginAllowedForUser(app.db, user.id))) {
       await recordSecurityEvent(app.db, {
-        kind: "login_blocked_inactive",
+        kind: "login_blocked_password_disabled",
         outcome: "blocked",
         userId: user.id,
         email: user.email,
         ip: context.ip,
         userAgent: context.userAgent,
-        reason: "Account is deactivated",
+        reason: "A company this account belongs to requires single sign-on",
       });
       throw unauthorized("Invalid credentials");
     }
+
+    // #24 — the tenant IP allowlist. After the password, so it is not an
+    // enumeration oracle, and before any token exists.
+    await guardLoginIpAllowlist(app, req, user);
 
     const factor = await activeFactor(app.db, user.id);
     const requiredBy = await companiesRequiringMfa(app.db, user.id);
@@ -581,6 +693,15 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
         userId: user.id,
         scope,
         ttlMinutes: cfg.MFA_CHALLENGE_TTL_MINUTES,
+      });
+      // The server-side half. A challenge is now a row that can be spent once
+      // and revoked in flight; see challenge-store.ts for why registration is
+      // best-effort and the single-use guarantee is not.
+      await registerChallenge(app.db, {
+        claims: minted.claims,
+        origin: "password",
+        ip: context.ip,
+        userAgent: context.userAgent,
       });
       await recordSecurityEvent(app.db, {
         kind: "login_success",
@@ -614,33 +735,34 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
       };
     }
 
-    const session = await issueSession(app, {
-      user: { id: user.id, email: user.email },
-      authMethod: "password",
-      mfaSatisfied: false,
-      ip: context.ip,
-      userAgent: context.userAgent,
-    });
     await app.db
       .update(users)
       .set({ lastLoginAt: new Date().toISOString() })
       .where(eq(users.id, user.id));
-    await recordSecurityEvent(app.db, {
-      kind: "login_success",
+    await recordLegacyAuthEvent(app.db, {
       userId: user.id,
       email: user.email,
-      sessionId: session.sessionId,
+      kind: "login_success",
       ip: context.ip,
       userAgent: context.userAgent,
-      reason: "Password only — no second factor enrolled and none required",
+    });
+    // completeLogin, not a bare issueSession: the transparent rehash to the
+    // current bcrypt cost, the `login_success` trail row with `newDevice`, and
+    // the "someone signed in from a new device" message all live in there, and
+    // this route silently did without all three.
+    const completed = await completeLogin(app, req, {
+      user,
+      password: body.password,
+      policy,
     });
     return {
       mfaRequired: false,
       user: { id: user.id, email: user.email, name: user.name },
-      accessToken: session.accessToken,
-      refreshToken: session.refreshToken,
-      expiresIn: session.expiresIn,
-      sessionId: session.sessionId,
+      accessToken: completed.accessToken,
+      refreshToken: completed.refreshToken,
+      expiresIn: completed.expiresIn,
+      sessionId: completed.sessionId,
+      session: completed.session,
     };
   });
 
@@ -663,6 +785,22 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
       throw badRequest("This challenge does not carry enrolment authority.", {
         reasons: ["Only an `enrol` challenge may provision a new second factor."],
       });
+    }
+    // A seed must not be minted against authority that has already been spent
+    // or cut. The challenge is READ here, never consumed: the same challenge
+    // has to survive to confirm the factor it is about to provision.
+    const live = await assertChallengeLive(app.db, verified.claims.jti, Date.now());
+    if (!live.ok) {
+      await recordSecurityEvent(app.db, {
+        kind: "mfa_challenge_failure",
+        outcome: "failure",
+        userId: verified.claims.uid,
+        ip: context.ip,
+        userAgent: context.userAgent,
+        reason: live.reason ?? "Challenge is no longer live",
+        metadata: { challengeId: verified.claims.jti, verdict: live.code },
+      });
+      throw unauthorized(live.reason ?? "Challenge is not valid");
     }
     const user = await loadActiveUser(verified.claims.uid);
     const provisioned = await provisionFactor(user);
@@ -730,7 +868,7 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
         ...context,
         purpose: "challenge_enrol",
       });
-      const session = await completeSignIn(user, "password", claims.jti, context);
+      const session = await completeSignIn(user, "password", claims, context);
       return {
         ...session,
         mfa: {
@@ -763,7 +901,7 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
     const session = await completeSignIn(
       user,
       outcome.method === "recovery_code" ? "recovery_code" : "password",
-      claims.jti,
+      claims,
       context,
     );
     return {
@@ -790,9 +928,29 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
   async function completeSignIn(
     user: { id: string; email: string; name: string },
     authMethod: "password" | "recovery_code",
-    challengeId: string,
+    challenge: { jti: string; uid: string; scope: ChallengeScope; exp: number },
     context: { ip: string | null; userAgent: string | null },
   ) {
+    const challengeId = challenge.jti;
+    // SPEND THE CHALLENGE, and do it here — after the factor was proved and
+    // before any token exists. Consuming earlier would burn the challenge on
+    // a mistyped digit and strand a legitimate user; consuming later would
+    // leave a window in which two concurrent exchanges of one challenge both
+    // produce a session.
+    const spent = await consumeChallenge(app.db, challenge, Date.now());
+    if (!spent.ok) {
+      await recordSecurityEvent(app.db, {
+        kind: "mfa_challenge_failure",
+        outcome: "failure",
+        userId: user.id,
+        email: user.email,
+        ip: context.ip,
+        userAgent: context.userAgent,
+        reason: spent.reason ?? "Challenge could not be spent",
+        metadata: { challengeId, verdict: spent.code },
+      });
+      throw unauthorized(spent.reason ?? "Challenge is not valid");
+    }
     const session = await issueSession(app, {
       user: { id: user.id, email: user.email },
       authMethod,
@@ -895,13 +1053,27 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
         payload: { required: body.required, previous: previous.required, at: nowIso },
         storePayload: true,
       });
-      // NOTE, deliberately not a security-trail row. AUTH_EVENT_KINDS has no
-      // `mfa_policy_changed` member, and this module does not own
-      // packages/shared/src/enums.ts. Borrowing a neighbouring kind
-      // (`identity_provider_updated`) to make the row fit would put a false
-      // statement into the one log an auditor is entitled to read literally.
-      // The change IS recorded — hash-chained, above, in the company ledger —
-      // which is the stronger record of the two. See the module notes.
+      // AND a security-trail row, under its OWN name. This used to be a note
+      // explaining why the change could not be recorded here: AUTH_EVENT_KINDS
+      // had no `mfa_policy_changed` member, `enums.ts` is frozen, and
+      // borrowing a neighbouring kind would have put a false statement into
+      // the one log an auditor reads literally. `enums-auth.ts` now carries
+      // the kind and `recordSecurityEvent` accepts the widened union, so the
+      // gap is closed rather than described. The ledger entry above remains
+      // the stronger record; this one is what the tenant's SIEM receives.
+      const policyCtx = requestContext(req);
+      await recordSecurityEvent(app.db, {
+        kind: "mfa_policy_changed",
+        companyId,
+        userId: user.id,
+        email: user.email,
+        ip: policyCtx.ip,
+        userAgent: policyCtx.userAgent,
+        reason: body.required
+          ? "Second factor is now required for every member of this company"
+          : "Second factor is no longer required for this company",
+        metadata: { required: body.required, previous: previous.required },
+      });
 
       const coverage = await enrolmentCoverage(companyId);
       return {
@@ -943,6 +1115,21 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
     const enrolled = new Set(enrolledRows.map((r) => r.userId)).size;
     return { members: members.length, enrolled, notEnrolled: members.length - enrolled };
   }
+
+  /* ---------------------------------------------------------------- */
+  /* Scheduled work                                                    */
+  /* ---------------------------------------------------------------- */
+
+  // `mfa_challenges` gains a row per sign-in into a tenant that requires a
+  // second factor, and every one of them is dead within ten minutes. Deleting
+  // them on a read would put an unbounded DELETE on the login path; this is
+  // the job that keeps the table the size of the last hour.
+  app.scheduler.register({
+    name: "mfa.challenge-sweep",
+    description: "Delete spent and expired MFA challenges past their grace window",
+    everyMs: 15 * 60_000,
+    run: async ({ db, now }) => ({ deleted: await sweepExpiredChallenges(db, now.getTime()) }),
+  });
 };
 
 /* ------------------------------------------------------------------ */
@@ -1004,22 +1191,19 @@ export type { ChallengeEnvelope, ChallengeScope } from "./challenge.js";
  *    Both routes then speak one protocol and redeem at the same
  *    `POST /auth/mfa/challenge`.
  *
- * 2. AUTH_EVENT_KINDS (packages/shared/src/enums.ts) has no
- *    `mfa_policy_changed` member, and this module does not own that file. The
- *    tenant policy change is therefore recorded in the hash-chained company
- *    ledger (objectType `company_mfa_policy`) and NOT in
- *    `auth_security_events` — borrowing a neighbouring kind to make the row
- *    fit would put a false statement into the one log an auditor reads
- *    literally. Adding the kind is a one-line change for the enum's owner,
- *    after which `recordSecurityEvent` can carry it too.
+ * 2. RESOLVED. `mfa_policy_changed` is now a member of EXTRA_AUTH_EVENT_KINDS
+ *    (packages/shared/src/enums-auth.ts, which this package owns) and
+ *    `SecurityEventInput.kind` accepts the widened union, so the tenant policy
+ *    change is recorded in `auth_security_events` under its own name AND in
+ *    the hash-chained ledger. Nothing is written under a borrowed kind.
  *
- * 3. The challenge token is STATELESS. The schema this module builds against
- *    has no `mfa_challenges` table and this module does not own the schema, so
- *    the token carries MAC-authenticated claims instead of naming a row. See
- *    challenge.ts for the full argument; the short version is that a challenge
- *    is only ever redeemed together with a single-use factor, so replaying one
- *    inside its ten-minute life buys an attacker nothing they did not already
- *    have. What it costs is server-side revocation of a challenge in flight.
+ * 3. RESOLVED. The challenge token is still a stateless MAC — that is what
+ *    lets three modules mint one without coordinating — but it now names a row
+ *    in `mfa_challenges` (packages/db/src/schema/auth.ts). Consumption is an
+ *    upsert on the token's own `jti`, so a challenge is SINGLE-USE even when
+ *    the minting module never registered it, and an administrator can revoke
+ *    one in flight (`admin_mfa_reset` does). See challenge-store.ts for why
+ *    the store fails open on an infrastructure error and closed on a replay.
  *
  * 4. `requireStepUp` is wired to NOTHING here. The six routes that should
  *    adopt it live in modules this one does not own; STEP_UP_ACTIONS carries

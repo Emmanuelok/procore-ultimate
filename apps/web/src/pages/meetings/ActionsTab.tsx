@@ -539,7 +539,7 @@ export default function ActionsTab({
         />
       )}
 
-      <SweepNote sweep={actions.data?.sweep} />
+      <SweepNote sweptBy={actions.data?.sweptBy} />
       {report ? (
         <p className="text-2xs text-content-subtle">
           {count(report.summary.openActions)} open action

@@ -26,6 +26,7 @@ import {
 import { formatDateTime, humanize } from "../format";
 import {
   CopyButton,
+  downloadAuthenticated,
   HashChip,
   ScoreMeter,
   type EvidenceRow,
@@ -315,12 +316,22 @@ export default function EvidencePackTab({ projectId }: { projectId: string }) {
                           {formatDateTime(p.generatedAt)}
                         </Td>
                         <Td className="whitespace-nowrap">
-                          <a
+                          <button
+                            type="button"
                             className="text-xs text-brand-700 underline"
-                            href={`/api/v1/evidence-packs/${p.id}/download`}
+                            onClick={() => {
+                              void downloadAuthenticated(
+                                `/api/v1/evidence-packs/${p.id}/download`,
+                                `constructos-evidence-pack-${p.id}.json`,
+                              ).catch((err: unknown) =>
+                                setStoredError(
+                                  err instanceof Error ? err.message : "Download failed",
+                                ),
+                              );
+                            }}
                           >
                             Download JSON
-                          </a>
+                          </button>
                         </Td>
                       </tr>
                     ))}

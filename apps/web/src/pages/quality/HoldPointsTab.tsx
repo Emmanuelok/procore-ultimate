@@ -27,6 +27,7 @@ import {
   type DataColumns,
 } from "../../ui";
 import { IconAlert } from "../../ui/icons";
+import { api } from "../../lib/api";
 import ActivityCard, { ProceedCell, isOverdueHoldPoint } from "./ActivityCard";
 import {
   ACTIVITY_STATUSES,
@@ -36,13 +37,16 @@ import {
   INTERVENTION_TONE,
   LoadError,
   NothingHere,
+  ReasonList,
   dateTime,
   isoDate,
   labelize,
+  nameOf,
   plural,
+  useResource,
   type Resource,
 } from "./qualityShared";
-import type { HoldPointPage, ItpActivity } from "./types";
+import type { HoldPointPage, ItpActivity, SurveillanceRegister } from "./types";
 
 export interface HoldPointFilters {
   interventionPoint: string;
@@ -83,6 +87,20 @@ export default function HoldPointsTab({
   onOpenItp: (itpId: string) => void;
 }) {
   const [mode, setMode] = useState<"board" | "grid">("board");
+  /*
+   * The legs held by somebody OUTSIDE this company — a notified body, the
+   * regulator, the client's engineer. They are drawn apart from the board
+   * because they are the ones nobody here can clear: chasing them is the work,
+   * and the register exists so the chasing is a list rather than a memory.
+   */
+  const surveillance = useResource<SurveillanceRegister>(
+    (signal) =>
+      api.get<SurveillanceRegister>(
+        `/api/v1/projects/${projectId}/surveillance?openOnly=true`,
+        { signal },
+      ),
+    [projectId, holdPoints.data],
+  );
 
   const rows = useMemo(() => {
     const items = [...(holdPoints.data?.items ?? [])];
@@ -255,6 +273,8 @@ export default function HoldPointsTab({
         </Alert>
       ) : null}
 
+      <ThirdPartyPanel register={surveillance} users={users} />
+
       <Card>
         <CardBody className="grid gap-3 md:grid-cols-3">
           <Field label="Intervention point">
@@ -413,5 +433,99 @@ function BoardView({
         </p>
       ) : null}
     </div>
+  );
+}
+
+/**
+ * WHAT IS WAITING ON SOMEBODY OUTSIDE.
+ *
+ * A third-party surveillance leg has three states worth telling apart, and the
+ * difference decides who to ring: nobody has told them yet, they have been
+ * told and have not turned up, or they attended and have not signed. Drawn as
+ * a count each, with the joints named, because "the notified body is holding
+ * us up" is only actionable when it says which points and since when.
+ */
+function ThirdPartyPanel({
+  register,
+  users,
+}: {
+  register: Resource<SurveillanceRegister>;
+  users: Map<string, string>;
+}) {
+  if (register.error) {
+    return (
+      <LoadError
+        message={register.error}
+        onRetry={register.reload}
+        title="The third-party surveillance register could not be loaded"
+      />
+    );
+  }
+  const data = register.data;
+  if (!data || data.total === 0) return null;
+
+  const unnotified = data.items.filter((r) => !r.notifiedAt);
+  const notNotYetAttended = data.items.filter((r) => r.notifiedAt && !r.attendedAt);
+  const attendedUnsigned = data.items.filter((r) => r.attendedAt && !r.releasedAt);
+
+  const line = (
+    label: string,
+    rows: SurveillanceRegister["items"],
+    tone: "danger" | "warning" | "info",
+  ) =>
+    rows.length === 0 ? null : (
+      <li key={label} className="text-meta">
+        <span
+          className={
+            tone === "danger"
+              ? "font-medium text-danger"
+              : tone === "warning"
+                ? "font-medium text-warning"
+                : "font-medium text-content"
+          }
+        >
+          {rows.length} {label}
+        </span>
+        <span className="ml-1 text-2xs text-content-subtle">
+          {rows
+            .map((r) => {
+              const who =
+                r.organisation ??
+                r.contactName ??
+                (r.userId ? nameOf(users, r.userId) : labelize(r.party));
+              const what = r.activity
+                ? (r.activity.activityCode ?? r.activity.activity)
+                : "an activity that no longer exists";
+              const since = r.attendedAt ?? r.notifiedAt;
+              return `${what} — ${who}${since ? ` since ${isoDate(since)}` : ""}`;
+            })
+            .slice(0, 6)
+            .join("; ")}
+          {rows.length > 6 ? ` … and ${rows.length - 6} more` : ""}
+        </span>
+      </li>
+    );
+
+  return (
+    <Card>
+      <CardBody className="space-y-1.5">
+        <div className="flex items-center justify-between gap-2">
+          <h3 className="text-sm font-semibold text-content">Waiting on a third party</h3>
+          <Badge tone="info" size="xs" variant="outline">
+            {data.total} outstanding {plural(data.total, "leg")}
+          </Badge>
+        </div>
+        <ul className="space-y-1">
+          {line("nobody has been told about yet", unnotified, "danger")}
+          {line("notified and not yet attended", notNotYetAttended, "warning")}
+          {line("attended and not yet signed off", attendedUnsigned, "info")}
+        </ul>
+        <ReasonList
+          reasons={[
+            "A surveillance leg is held by an organisation outside this company. It cannot be released from here, and marking it released without their signature is the one thing this register exists to make impossible.",
+          ]}
+        />
+      </CardBody>
+    </Card>
   );
 }

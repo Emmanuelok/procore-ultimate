@@ -37,7 +37,9 @@ import {
   LoadError,
   NotificationCountdown,
   REGIME_LABEL,
+  RegisterPager,
   count,
+  pageParams,
   dateTime,
   labelize,
   nameOf,
@@ -47,6 +49,8 @@ import {
 } from "./safetyShared";
 
 export interface IncidentFilters {
+  /** 1-based; the register is paged rather than silently truncated */
+  page: string;
   incidentType: string;
   severity: string;
   status: string;
@@ -56,7 +60,7 @@ export interface IncidentFilters {
   to: string;
 }
 
-export const EMPTY_INCIDENT_FILTERS: IncidentFilters = {
+export const EMPTY_INCIDENT_FILTERS: IncidentFilters = { page: "1",
   incidentType: "",
   severity: "",
   status: "",
@@ -261,12 +265,13 @@ export default function IncidentsTab({
       {
         id: "person",
         header: "Injured person",
-        accessor: (row) =>
-          row.injuredPersonName ?? (row.workerId ? nameOf(users, row.workerId) : ""),
+        // the API resolves workerId against the WORKER register; the company
+        // user directory does not contain workers and printed a raw id here
+        accessor: (row) => row.injuredPersonDisplayName ?? row.injuredPersonName ?? "",
         type: "text",
         width: 190,
         cell: ({ row }) => {
-          const who = row.injuredPersonName ?? (row.workerId ? nameOf(users, row.workerId) : null);
+          const who = row.injuredPersonDisplayName ?? row.injuredPersonName ?? null;
           if (!who) return <span className="text-content-subtle">—</span>;
           return (
             <span className="block min-w-0">
@@ -617,6 +622,15 @@ export default function IncidentsTab({
         aria-label="Incident register"
       />
 
+      <RegisterPager
+        page={filters.page}
+        loaded={rows.length}
+        total={incidents.data?.total ?? null}
+        noun="incident"
+        loading={incidents.loading}
+        onPage={(page) => onFilters({ ...filters, page })}
+      />
+
       <p className="text-2xs text-content-subtle">
         The clock column is live. It is computed from the deadline the reportability engine stored on
         the incident, and it counts up once passed — because the consequence of a missed statutory
@@ -627,7 +641,7 @@ export default function IncidentsTab({
 }
 
 export function incidentQueryString(filters: IncidentFilters): string {
-  const params = new URLSearchParams({ page: "1", pageSize: "200" });
+  const params = pageParams(filters.page);
   if (filters.incidentType) params.set("incidentType", filters.incidentType);
   if (filters.severity) params.set("severity", filters.severity);
   if (filters.status) params.set("status", filters.status);
