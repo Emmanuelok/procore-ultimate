@@ -35,6 +35,9 @@ export const landParcels = pgTable(
     ownerEntityId: text("owner_entity_id"),
     encumbrances: text("encumbrances"),
     status: text("status").default("identified").notNull(), // ParcelStatus
+    /** how title actually passed — AcquisitionBasis (#551-554) */
+    acquisitionBasis: text("acquisition_basis"),
+    acquiredAt: text("acquired_at"), // ISO date
     valuationAmount: doublePrecision("valuation_amount"),
     compensationAmount: doublePrecision("compensation_amount"),
     currency: text("currency").default("USD").notNull(),
@@ -127,6 +130,11 @@ export const grievances = pgTable(
     verifiedBy: text("verified_by"),
     complainantSatisfied: integer("complainant_satisfied"),
     status: text("status").default("received").notNull(), // GrievanceStatus
+    /** escalation ladder position (#572): 0 site officer .. 3 external route */
+    escalationTier: integer("escalation_tier").default(0).notNull(),
+    escalatedAt: timestamp("escalated_at", { withTimezone: true, mode: "string" }),
+    /** [{ at, fromTier, toTier, reason, automatic, assigneeId }] */
+    escalationHistory: jsonb("escalation_history").$type<unknown[]>().default([]).notNull(),
     assigneeId: text("assignee_id"),
     obligationId: text("obligation_id"),
     createdBy: text("created_by").notNull(),
@@ -183,4 +191,219 @@ export const engagements = pgTable(
     createdAt: createdAt(),
   },
   (t) => [index("engagements_project_idx").on(t.projectId, t.engagementDate)],
+);
+
+/* ------------------------------------------------------------------ */
+/* WP-SAFEG — resettlement depth                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Replacement-cost verification (#550, IFC PS5 para 27 and its footnote 22).
+ *
+ * The single most common finding on a lender supervision mission is that a
+ * project paid the government's depreciated schedule rate rather than full
+ * replacement cost. Full replacement cost = the market value of the asset
+ * with NO deduction for depreciation, plus the transaction costs the
+ * household actually has to bear (registration, transfer duty, moving) —
+ * so the study has to carry the market survey behind it and the gap it
+ * leaves against what was offered.
+ */
+export const replacementCostStudies = pgTable(
+  "replacement_cost_studies",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    parcelId: text("parcel_id"),
+    papId: text("pap_id"),
+    assetType: text("asset_type").notNull(), // ReplacementAssetType
+    description: text("description").notNull(),
+    method: text("method").notNull(), // ValuationMethod
+    /** the surveyed market value of an equivalent asset */
+    marketValue: doublePrecision("market_value").notNull(),
+    /** depreciation the government schedule would have deducted — recorded so
+     *  the difference between schedule rate and replacement cost is visible */
+    depreciationDeducted: doublePrecision("depreciation_deducted").default(0).notNull(),
+    /** registration, transfer duty, moving costs the household must bear */
+    transactionCosts: doublePrecision("transaction_costs").default(0).notNull(),
+    /** computed at write: marketValue + transactionCosts (no depreciation) */
+    replacementCost: doublePrecision("replacement_cost").notNull(),
+    /** what the project actually offered or paid, when known */
+    compensationOffered: doublePrecision("compensation_offered"),
+    currency: text("currency").default("USD").notNull(),
+    /** computed: replacementCost − compensationOffered, positive = shortfall */
+    shortfall: doublePrecision("shortfall"),
+    verdict: text("verdict").default("unverified").notNull(), // ReplacementVerdict
+    surveyDate: text("survey_date").notNull(),
+    valuerName: text("valuer_name"),
+    /** independent valuer = not the acquiring authority or the contractor */
+    valuerIndependent: integer("valuer_independent").default(0).notNull(),
+    evidenceIds: jsonb("evidence_ids").$type<string[]>().default([]).notNull(),
+    notes: text("notes"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("replacement_cost_project_idx").on(t.projectId),
+    index("replacement_cost_parcel_idx").on(t.parcelId),
+    index("replacement_cost_pap_idx").on(t.papId),
+    index("replacement_cost_verdict_idx").on(t.projectId, t.verdict),
+  ],
+);
+
+/**
+ * Indigenous Peoples plans, cultural heritage management plans, FPIC
+ * processes and chance-find procedures (IFC PS7 / PS8, spec #575-578).
+ * A plan with commitments nobody tracks is a document, not a safeguard, so
+ * every commitment carries a due date and is counted in the RAP dashboard.
+ */
+export const heritagePlans = pgTable(
+  "heritage_plans",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    kind: text("kind").notNull(), // HeritagePlanKind
+    title: text("title").notNull(),
+    /** the community, group or asset the plan is for */
+    subject: text("subject"),
+    status: text("status").default("draft").notNull(), // HeritagePlanStatus
+    /** FPIC standing where PS7 para 12-17 is engaged */
+    consentStatus: text("consent_status"), // ConsentStatus
+    consentEvidenceIds: jsonb("consent_evidence_ids").$type<string[]>().default([]).notNull(),
+    /** [{ id, text, dueDate, owner, status, closedAt, note }] */
+    commitments: jsonb("commitments").$type<unknown[]>().default([]).notNull(),
+    stakeholderIds: jsonb("stakeholder_ids").$type<string[]>().default([]).notNull(),
+    disclosedAt: text("disclosed_at"),
+    reviewDueAt: text("review_due_at"),
+    fileIds: jsonb("file_ids").$type<string[]>().default([]).notNull(),
+    notes: text("notes"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("heritage_plans_project_idx").on(t.projectId),
+    index("heritage_plans_status_idx").on(t.projectId, t.status),
+  ],
+);
+
+/**
+ * Chance finds (PS8 para 16). A find stops the works in the affected area
+ * until the authority has spoken; the register is what proves it did.
+ */
+export const chanceFinds = pgTable(
+  "chance_finds",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    number: integer("number").notNull(),
+    planId: text("plan_id"),
+    discoveredAt: text("discovered_at").notNull(),
+    locationId: text("location_id"),
+    locationDescription: text("location_description"),
+    description: text("description").notNull(),
+    workStoppedAt: timestamp("work_stopped_at", { withTimezone: true, mode: "string" }),
+    authorityNotifiedAt: timestamp("authority_notified_at", {
+      withTimezone: true,
+      mode: "string",
+    }),
+    authority: text("authority"),
+    assessment: text("assessment"),
+    disposition: text("disposition"),
+    releasedAt: timestamp("released_at", { withTimezone: true, mode: "string" }),
+    status: text("status").default("reported").notNull(), // ChanceFindStatus
+    affectedTaskIds: jsonb("affected_task_ids").$type<string[]>().default([]).notNull(),
+    evidenceIds: jsonb("evidence_ids").$type<string[]>().default([]).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("chance_finds_uq").on(t.projectId, t.number),
+    index("chance_finds_project_idx").on(t.projectId, t.status),
+  ],
+);
+
+/**
+ * Livelihood restoration activities per household (#561, PS5 paras 27-29).
+ *
+ * "Livelihood restored" is a measured claim, not a tick: it holds when
+ * income after the intervention is at least the pre-displacement baseline.
+ * Recording the baseline and the current figure is what turns a training
+ * course into evidence.
+ */
+export const livelihoodActivities = pgTable(
+  "livelihood_activities",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    papId: text("pap_id").notNull(),
+    kind: text("kind").notNull(), // LivelihoodActivityKind
+    description: text("description").notNull(),
+    status: text("status").default("planned").notNull(), // LivelihoodActivityStatus
+    plannedAt: text("planned_at"),
+    deliveredAt: text("delivered_at"),
+    verifiedAt: text("verified_at"),
+    verifiedBy: text("verified_by"),
+    cost: doublePrecision("cost"),
+    currency: text("currency").default("USD").notNull(),
+    /** monthly household income before displacement and at last measurement */
+    incomeBaseline: doublePrecision("income_baseline"),
+    incomeCurrent: doublePrecision("income_current"),
+    incomeMeasuredAt: text("income_measured_at"),
+    evidenceIds: jsonb("evidence_ids").$type<string[]>().default([]).notNull(),
+    notes: text("notes"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("livelihood_activities_project_idx").on(t.projectId),
+    index("livelihood_activities_pap_idx").on(t.papId),
+    index("livelihood_activities_status_idx").on(t.projectId, t.status),
+  ],
+);
+
+/**
+ * RAP completion audit (#568) and lender supervision pack (#558-560).
+ * The audit is a point-in-time assertion about the register, so it stores
+ * the indicator set it computed AND the ledger sequence range it was built
+ * from: an auditor can replay the same window and get the same numbers.
+ */
+export const rapAudits = pgTable(
+  "rap_audits",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    number: integer("number").notNull(),
+    kind: text("kind").default("completion_audit").notNull(),
+    auditor: text("auditor").notNull(),
+    /** independent monitor = not the implementing agency (#568) */
+    auditorIndependent: integer("auditor_independent").default(0).notNull(),
+    auditDate: text("audit_date").notNull(),
+    scope: text("scope"),
+    /** computed indicator set, frozen at the moment of the audit */
+    indicators: jsonb("indicators").$type<Record<string, unknown>>().default({}).notNull(),
+    /** [{ id, ref, severity, finding, recommendation, status, dueDate }] */
+    findings: jsonb("findings").$type<unknown[]>().default([]).notNull(),
+    conclusion: text("conclusion").default("not_assessed").notNull(), // RapAuditConclusion
+    /** the ledger window the pack was assembled from */
+    ledgerSeqFrom: integer("ledger_seq_from"),
+    ledgerSeqTo: integer("ledger_seq_to"),
+    evidenceIds: jsonb("evidence_ids").$type<string[]>().default([]).notNull(),
+    fileIds: jsonb("file_ids").$type<string[]>().default([]).notNull(),
+    notes: text("notes"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("rap_audits_uq").on(t.projectId, t.number),
+    index("rap_audits_project_idx").on(t.projectId, t.auditDate),
+  ],
 );

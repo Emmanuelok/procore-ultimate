@@ -226,6 +226,32 @@ describe("regressions", () => {
     expect([401, 403]).toContain(ours.statusCode);
   });
 
+  /*
+   * Plan §6.3: a company-level list over project data is narrowed to the
+   * projects the caller can see. The gate admitted the read-only member
+   * because they hold `equipment` on project A; that is not permission to
+   * enumerate project B's plant, nor to reach it by guessing its id.
+   */
+  it("shows a member the plant on their own job and the yard, not another job's", async () => {
+    const onB = await makeMachine({ name: "Machine on B" });
+    await mobilise(projectB, onB);
+    const inTheYard = await makeMachine({ name: "Machine in the yard" });
+
+    const list = await get("/companies/current/equipment", readerHeaders);
+    expect(list.statusCode).toBe(200);
+    const names = (list.json().items as Array<{ id: string }>).map((m) => m.id);
+    expect(names).toContain(inTheYard);
+    expect(names).not.toContain(onB);
+
+    // and not by naming it directly either
+    const direct = await get(`/companies/current/equipment/${onB}`, readerHeaders);
+    expect(direct.statusCode).toBe(404);
+
+    // the owner still sees the whole fleet
+    const all = await get("/companies/current/equipment?pageSize=200");
+    expect((all.json().items as Array<{ id: string }>).map((m) => m.id)).toContain(onB);
+  });
+
   it("does not flag a machine out of certificate when this year's renewal exists", async () => {
     const machineId = await makeMachine({ name: "Renewed crane", isCritical: true });
     await mobilise(projectA, machineId);

@@ -21,7 +21,7 @@
  * for a human, it does not call a model.
  */
 import { createHmac } from "node:crypto";
-import { and, eq, gte, inArray, isNull, or } from "drizzle-orm";
+import { and, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
 import {
   aiReviewQueue,
   assuranceGrants,
@@ -458,19 +458,24 @@ export async function executeCreateSignal(
     : "medium";
   const confidence = Math.min(1, Math.max(0, num(params["confidence"]) ?? 0.7));
   const key = `${facts.ruleId}:${facts.objectType}:${facts.objectId}`;
-  // Idempotent while a signal for this rule+record is still open.
-  const open = await deps.db
-    .select({ id: signals.id, refs: signals.evidenceRefs })
+  // Idempotent while a signal for this rule+record is still open. The dedupe
+  // key is matched IN SQL (jsonb ->>) with a LIMIT: a schedule scan runs this
+  // once per matched candidate, and reading a mature tenant's whole open
+  // backlog for the detector to filter it in JS is exactly the unbounded read
+  // plan §6.4 forbids.
+  const dup = await deps.db
+    .select({ id: signals.id })
     .from(signals)
     .where(
       and(
         eq(signals.companyId, facts.companyId),
         eq(signals.detector, detector),
         inArray(signals.disposition, ["new", "under_review", "confirmed", "escalated"]),
+        sql`${signals.evidenceRefs} ->> 'key' = ${key}`,
       ),
-    );
-  const dup = open.find((s) => (s.refs as { key?: unknown } | null)?.key === key);
-  if (dup) return skipped("an open signal for this rule and record already exists", { signalId: dup.id });
+    )
+    .limit(1);
+  if (dup[0]) return skipped("an open signal for this rule and record already exists", { signalId: dup[0].id });
   const id = newId("sig");
   const title = renderTemplate(params["title"], ctx) || `${facts.ruleName}: ${facts.recordTitle}`;
   const explanation = renderTemplate(params["explanation"], ctx) || `Raised by automation rule "${facts.ruleName}".`;
@@ -515,6 +520,16 @@ function isDeliverableUrl(value: string): boolean {
     if (host === "localhost" || host === "0.0.0.0" || host.endsWith(".localhost")) return false;
     if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host)) return false;
     if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return false;
+    // 100.64.0.0/10 (carrier-grade NAT) is as internal as RFC1918 on a cloud host.
+    if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(host)) return false;
+    // Names that only ever resolve inside an infrastructure boundary: the
+    // cloud metadata services and container/LAN suffixes. This is a name
+    // filter, not a resolver — a public name pointed at an internal address
+    // still gets through, which only an egress proxy can close (documented).
+    if (host === "metadata.google.internal" || host === "metadata" || host === "instance-data") return false;
+    for (const suffix of [".internal", ".local", ".localdomain", ".intranet", ".lan", ".home.arpa"]) {
+      if (host.endsWith(suffix)) return false;
+    }
     // Any IPv6 literal is refused outright. The WHATWG parser normalises
     // "[::ffff:127.0.0.1]" to "[::ffff:7f00:1]", so a per-range test on the
     // text would miss the v4-mapped form that still reaches loopback — and

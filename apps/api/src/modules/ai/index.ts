@@ -57,6 +57,7 @@ import {
 import {
   AGENT_AUTHORISATIONS,
   AGENT_REPORT_KINDS,
+  COMPANY_ROLES,
   DRAWING_DISCIPLINES,
   SIGNAL_SEVERITIES,
   SUBMITTAL_RESPONSES,
@@ -69,6 +70,7 @@ import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import {
   claimReviewItem,
+  recordAgentAction,
   revertAction,
   type ActionRow,
   type ReviewRow,
@@ -171,7 +173,9 @@ const policyBodySchema = z.object({
   autoApplyMinConfidence: z.number().min(0).max(1).nullable().optional(),
   minConfidence: z.number().min(0).max(1).nullable().optional(),
   allowedTargetTypes: z.array(z.string().max(64)).max(40).optional(),
-  allowedRoles: z.array(z.string().max(32)).max(10).optional(),
+  // A real company role, not free text: a policy naming a role that cannot
+  // exist would silently lock every caller out of the agent.
+  allowedRoles: z.array(z.enum(COMPANY_ROLES)).max(COMPANY_ROLES.length).optional(),
   maxRunsPerDay: z.number().int().min(0).max(100_000).nullable().optional(),
   maxInputTokensPerDay: z.number().int().min(0).max(1_000_000_000).nullable().optional(),
   maxOutputTokensPerDay: z.number().int().min(0).max(1_000_000_000).nullable().optional(),
@@ -372,9 +376,20 @@ export function interleave<T>(groups: T[][], limit: number): T[] {
   return out;
 }
 
-/** Which operational tool must the reviewer hold to apply a proposal? */
+/**
+ * Which operational tool must the reviewer hold to READ or APPLY a proposal?
+ *
+ * Every target type maps to the tool that owns the data the proposal carries,
+ * not just the ones that mutate a record on approval. An advisory proposal is
+ * not harmless: a `cost_forecast` body quotes budget lines, a `bid_levelling`
+ * body quotes competing bidders' rates, an `incident_classification` body
+ * quotes an injured worker's account. Returning null for those (the old
+ * behaviour) gated them at `ai` level, so an ai:standard / budget:none member
+ * could read every budget figure out of the queue.
+ */
 export function targetTool(targetType: string): ToolKey | null {
   switch (targetType) {
+    /* operational targets: approval moves the record */
     case "daily_log":
       return "daily_logs";
     case "rfi_response":
@@ -385,6 +400,37 @@ export function targetTool(targetType: string): ToolKey | null {
       return "submittals";
     case "signal_explanation":
       return "assurance";
+    // agent_actions.targetType only: the photo-intelligence write.
+    case "photo":
+      return "photos";
+    /* advisory targets: approval records acceptance, but the BODY is data */
+    case "obligation_finding":
+    case "notice_draft":
+      return "contracts";
+    case "claim_narrative":
+    case "rebuttal":
+      return "forensics";
+    case "evidence_assessment":
+    case "counterfactual":
+    case "integrity_memo":
+      return "assurance";
+    case "risk_finding":
+      return "risk";
+    case "document_synthesis":
+      return "drawings";
+    case "cost_forecast":
+    case "change_impact":
+      return "budget";
+    case "schedule_risk":
+      return "schedule";
+    case "meeting_minutes":
+      return "meetings";
+    case "incident_classification":
+      return "safety";
+    case "spec_compliance":
+      return "specifications";
+    case "bid_levelling":
+      return "bidding";
     default:
       return null;
   }
@@ -1329,7 +1375,13 @@ export const aiModule: FastifyPluginAsync = async (app) => {
   /* /photo-intel (#770, #771)                                         */
   /* ================================================================ */
 
-  app.post("/projects/:projectId/ai/photo-intel", { preHandler: aiStandard }, async (req) => {
+  app.post(
+    "/projects/:projectId/ai/photo-intel",
+    // `photos` at standard as well as `ai`: this route WRITES photos.aiTags /
+    // aiSummary and raises safety signals. Gating it on ai:standard alone let
+    // a member with photos:none overwrite the field team's tags.
+    { preHandler: [...aiStandard, app.requireTool("photos", "standard")] },
+    async (req) => {
     requireAi();
     const body = photoIntelBodySchema.parse(req.body);
     const projectId = req.projectId!;
@@ -1408,6 +1460,13 @@ export const aiModule: FastifyPluginAsync = async (app) => {
       result.grounding.dropped,
     );
 
+    // The write is recorded as an agent action with a before-image, so it
+    // appears in /agents/actions and can be rolled back like every other
+    // operational change an agent causes (#1023). It used to be the one
+    // agent-caused write on the platform with no inverse.
+    const beforeImage = { aiTags: photo.aiTags ?? [], aiSummary: photo.aiSummary };
+    const nowIso = new Date().toISOString();
+    const policy = await loadEffectivePolicy(app, companyId, "photo_intelligence");
     await app.db
       .update(photos)
       .set({
@@ -1415,13 +1474,40 @@ export const aiModule: FastifyPluginAsync = async (app) => {
         aiSummary: parsed.progressSummary ?? photo.aiSummary,
       })
       .where(eq(photos.id, photo.id));
+    const actionId = await recordAgentAction(app.db, {
+      companyId,
+      projectId,
+      agentKind: "photo_intelligence",
+      runId: result.runId,
+      reviewId: null,
+      draft: {
+        actionType: "tag_photo",
+        targetType: "photo",
+        targetId: photo.id,
+        beforeImage,
+        afterImage: { aiTags: parsed.tags, aiSummary: parsed.progressSummary ?? photo.aiSummary },
+        reversible: true,
+        irreversibleReason: null,
+      },
+      appliedBy: req.user!.id,
+      now: nowIso,
+      authorisation: "direct",
+      policyId: policy.policyId,
+      confidence: recorded,
+      summary: `Tagged photo ${photo.id} with ${parsed.tags.length} tag(s)`,
+    });
     await appendLedger(app.db, {
       companyId,
       actorId: req.user!.id,
       action: "update",
       objectType: "photo",
       objectId: photo.id,
-      payload: { aiTags: parsed.tags, aiSummary: parsed.progressSummary, runId: result.runId },
+      payload: {
+        aiTags: parsed.tags,
+        aiSummary: parsed.progressSummary,
+        runId: result.runId,
+        actionId,
+      },
       projectId,
     });
 
@@ -1462,8 +1548,10 @@ export const aiModule: FastifyPluginAsync = async (app) => {
       confidence: recorded,
       modelConfidence: parsed.confidence ?? null,
       signalsCreated,
+      actionId,
     };
-  });
+    },
+  );
 
   /* ================================================================ */
   /* /assist — grounded conversational assistant (#759, #760)          */
@@ -2208,6 +2296,7 @@ export const aiModule: FastifyPluginAsync = async (app) => {
           inputs: a.inputs,
           outputs: a.outputs,
           dataCategories: a.dataCategories,
+          requiredTools: a.requiredTools,
           targetTypes: a.targetTypes,
           consequential: a.consequential,
           runnable: a.runnable,
@@ -2263,8 +2352,48 @@ export const aiModule: FastifyPluginAsync = async (app) => {
     return { policy };
   });
 
+  /**
+   * The two authorisation checks that must happen BEFORE an agent gathers.
+   *
+   *  1. The tenant's policy may restrict a kind to certain company roles
+   *     (#1022). That field was stored, ledgered and rendered but never read,
+   *     which told an administrator a limit was in force when it was not.
+   *  2. The caller must hold every tool that owns the tables the agent reads
+   *     (agents/types.ts `requiredTools`) at level "read" on the run's
+   *     project. The gathered rows land verbatim in `ai_runs.prompt`, which
+   *     anyone with `ai:read` on that project can read back, so gating the
+   *     run on `ai:standard` alone laundered budget, safety and bid data
+   *     around the tool that denies it.
+   */
+  async function authoriseAgentRun(
+    req: FastifyRequest,
+    reply: FastifyReply,
+    def: { kind: string; requiredTools: readonly ToolKey[] },
+    projectId: string | null,
+  ): Promise<void> {
+    const policy = await loadEffectivePolicy(app, req.companyId!, def.kind);
+    if (
+      policy.allowedRoles.length > 0 &&
+      !policy.allowedRoles.includes(req.companyRole ?? "")
+    ) {
+      throw forbidden(
+        `Company policy restricts the "${def.kind}" agent to: ${policy.allowedRoles.join(", ")}`,
+      );
+    }
+    if (!projectId) {
+      // A company-wide run is owner/admin only (see the route gates), and
+      // owners and admins bypass tool levels by design, so there is nothing
+      // narrower to enforce here.
+      return;
+    }
+    for (const tool of def.requiredTools) {
+      await requireProjectTool(req, reply, projectId, tool, "read");
+    }
+  }
+
   async function runFleetAgent(
     req: FastifyRequest,
+    reply: FastifyReply,
     kind: string,
     projectId: string | null,
     params: Record<string, unknown>,
@@ -2282,6 +2411,7 @@ export const aiModule: FastifyPluginAsync = async (app) => {
     if (def.scope === "project" && !projectId) {
       throw badRequest(`The "${kind}" agent needs a projectId`);
     }
+    await authoriseAgentRun(req, reply, def, projectId);
     const result = await executeAgent({
       app,
       req,
@@ -2322,7 +2452,7 @@ export const aiModule: FastifyPluginAsync = async (app) => {
       // run is an owner/admin action.
       await app.requireCompanyRole(["owner", "admin"])(req, reply);
     }
-    const result = await runFleetAgent(req, kind, body.projectId ?? null, body.params);
+    const result = await runFleetAgent(req, reply, kind, body.projectId ?? null, body.params);
     return reply.status(result.skipped ? 200 : 201).send(result);
   });
 
@@ -2332,7 +2462,7 @@ export const aiModule: FastifyPluginAsync = async (app) => {
     async (req, reply) => {
       const { kind } = req.params as { kind: string };
       const body = projectRunAgentBodySchema.parse(req.body ?? {});
-      const result = await runFleetAgent(req, kind, req.projectId!, body.params);
+      const result = await runFleetAgent(req, reply, kind, req.projectId!, body.params);
       return reply.status(result.skipped ? 200 : 201).send(result);
     },
   );
@@ -2412,6 +2542,9 @@ export const aiModule: FastifyPluginAsync = async (app) => {
         throw badRequest(`The "${body.agentKind}" agent needs a projectId`);
       }
     }
+    // Scheduled runs have no human actor, so the authorisation moment is HERE:
+    // whoever puts an agent on a clock must be allowed to run it by hand.
+    await authoriseAgentRun(req, reply, def, body.projectId ?? null);
     const row = await createSchedule(app.db, {
       companyId: req.companyId!,
       projectId: body.projectId ?? null,
@@ -2507,7 +2640,16 @@ export const aiModule: FastifyPluginAsync = async (app) => {
     if (!row) throw notFound("Schedule not found");
     if (row.projectId) await requireProjectTool(req, reply, row.projectId, "ai", "standard");
     else await app.requireCompanyRole(["owner", "admin"])(req, reply);
-    return runSchedule(app, row, new Date());
+    const def = getAgentDefinition(row.agentKind);
+    if (def) await authoriseAgentRun(req, reply, def, row.projectId);
+    // runSchedule claims the row first (conditional UPDATE on next_run_at), so
+    // "Run now" and a tick that has just picked the same schedule up cannot
+    // both call the model.
+    const outcome = await runSchedule(app, row, new Date(), { force: true });
+    if (outcome.status === "skipped" && outcome.detail.startsWith("Already running")) {
+      throw conflict(outcome.detail);
+    }
+    return outcome;
   });
 
   /** Manual scheduler cycle for this company (plan §3.2). */
@@ -2520,7 +2662,12 @@ export const aiModule: FastifyPluginAsync = async (app) => {
   /* Governance reports (#1024–#1027)                                  */
   /* ================================================================ */
 
-  app.get("/agents/reports", { preHandler: companyGate }, async (req) => {
+  // Reading is gated exactly like generating (adminGate). A bias report names
+  // the vendors the fleet flags adversely and how often; a validation report
+  // aggregates every project's runs in the tenant. Neither is project-scoped,
+  // so there is no ACL to filter them by — the only honest gate is the one
+  // that already governs who may create them.
+  app.get("/agents/reports", { preHandler: adminGate }, async (req) => {
     const rows = await app.db
       .select()
       .from(agentReports)
@@ -2530,7 +2677,7 @@ export const aiModule: FastifyPluginAsync = async (app) => {
     return { items: rows, kinds: AGENT_REPORT_KINDS };
   });
 
-  app.get("/agents/reports/:id", { preHandler: companyGate }, async (req) => {
+  app.get("/agents/reports/:id", { preHandler: adminGate }, async (req) => {
     const { id } = req.params as { id: string };
     const [row] = await app.db
       .select()
@@ -2567,7 +2714,9 @@ export const aiModule: FastifyPluginAsync = async (app) => {
       const report = await buildValidationReport(app.db, req.companyId!, windowFrom, now);
       data = report as unknown as Record<string, unknown>;
       title = `Model validation report (${q.days} days)`;
-      summary = `${report.totals.runs} run(s) across ${report.agents.length} agent(s); ${report.totals.approved} proposal(s) approved, ${report.totals.rejected} rejected`;
+      summary = `${report.totals.runs} run(s) across ${report.agents.length} agent(s); ${report.totals.approved} proposal(s) approved, ${report.totals.rejected} rejected${
+        report.truncated ? " — PARTIAL: the window was truncated, so no rates are stated" : ""
+      }`;
     }
 
     const id = newId("arep");

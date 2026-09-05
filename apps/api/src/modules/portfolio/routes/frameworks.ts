@@ -55,7 +55,7 @@ import {
   type MiniCompetitionResponse,
   type SorItem,
 } from "../frameworks.js";
-import { loadCallOffs, termContractConsumption } from "../service.js";
+import { loadCallOffs, termContractConsumption, visibleProjectIds } from "../service.js";
 import {
   assertPortfolio,
   assertProject,
@@ -455,12 +455,26 @@ export const frameworkRoutes: FastifyPluginAsync = async (app) => {
         ),
       )
       .orderBy(desc(frameworkMiniCompetitions.createdAt));
+    /* Utilisation counts every order against the framework — a ceiling is a
+       property of the framework, not of who is looking. The order ROWS are
+       project data, so they are filtered to the caller's projects (§6.3) and
+       the response says when the list was narrowed. */
+    const visible = await visibleProjectIds(app.db, req.companyId!, req.user!.id, req.companyRole);
+    const shownCallOffs =
+      visible === null ? callOffs : callOffs.filter((c) => visible.includes(c.projectId));
+    const reasons: string[] = [];
+    if (visible !== null && shownCallOffs.length < callOffs.length) {
+      reasons.push(
+        `${callOffs.length - shownCallOffs.length} call-off(s) against this framework belong to projects you are not a member of and are not listed; the utilisation above still counts them.`,
+      );
+    }
     return {
       ...fw,
       lots,
       suppliers,
       miniCompetitions: competitions,
-      callOffs,
+      callOffs: shownCallOffs,
+      reasons,
       utilisation: frameworkUtilisation(
         toFrameworkRow(fw),
         lots.map(toLotRow),

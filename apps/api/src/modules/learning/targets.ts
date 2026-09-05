@@ -273,7 +273,9 @@ const ENTRIES: Array<{ aliases: string[]; entry: TargetEntry }> = [
       idColumn: obligations.id,
       companyColumn: obligations.companyId,
       projectColumn: obligations.projectId,
-      labelColumns: [obligations.title],
+      /* An obligation has no title: what identifies it is the clause it
+         comes from and what that clause requires. */
+      labelColumns: [obligations.sourceClause, obligations.trigger],
       href: projectHref("contracts"),
     },
   },

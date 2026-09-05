@@ -138,6 +138,8 @@ export interface ClaimEventLite {
   startDate: string;
   durationDays: number;
   tiaResult: TiaResult | null;
+  /** staleness verdict from the API — the claim detail stamps every event */
+  tia?: TiaStatus;
 }
 
 export interface ClaimDetail extends ClaimRow {

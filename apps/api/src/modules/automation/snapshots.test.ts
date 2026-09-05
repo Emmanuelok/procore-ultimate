@@ -87,28 +87,53 @@ describe("loadSnapshot", () => {
 describe("scanCandidates", () => {
   it("returns only live records of this company, bounded and optionally per project", async () => {
     const all = await scanCandidates(t.app.db, owner.companyId, "rfi", null);
-    const ids = all.map((c) => c.record["id"]);
+    const ids = all.candidates.map((c) => c.record["id"]);
     expect(ids).toContain(rfiOpen);
     expect(ids).not.toContain(rfiClosed);
-    expect(all.length).toBe(2);
+    expect(all.candidates.length).toBe(2);
+    expect(all.truncated).toBe(false);
     const scoped = await scanCandidates(t.app.db, owner.companyId, "rfi", projectId);
-    expect(scoped.map((c) => c.record["id"])).toEqual([rfiOpen]);
-    expect(await scanCandidates(t.app.db, owner.companyId, "rfi", null, 1)).toHaveLength(1);
-    expect(await scanCandidates(t.app.db, outsider.companyId, "rfi", null)).toHaveLength(0);
-    expect(await scanCandidates(t.app.db, owner.companyId, "widget", null)).toHaveLength(0);
+    expect(scoped.candidates.map((c) => c.record["id"])).toEqual([rfiOpen]);
+    const capped = await scanCandidates(t.app.db, owner.companyId, "rfi", null, 1);
+    expect(capped.candidates).toHaveLength(1);
+    // Honesty: a capped scan says there was more to look at.
+    expect(capped.truncated).toBe(true);
+    expect(capped.limit).toBe(1);
+    expect((await scanCandidates(t.app.db, outsider.companyId, "rfi", null)).candidates).toHaveLength(0);
+    expect((await scanCandidates(t.app.db, owner.companyId, "widget", null)).candidates).toHaveLength(0);
+  });
+
+  /**
+   * Regression (verifier, major): the scan used to order newest-first, so on a
+   * tenant with more live records than the cap the OVERDUE ones — exactly what
+   * every shipped schedule template matches — fell outside the window and were
+   * never evaluated, silently.
+   */
+  it("orders a capped scan oldest-deadline-first so the overdue records are the ones inside the cap", async () => {
+    const scanProject = await createProject(t.app, owner, "Overdue ordering");
+    const oldest = await createRfi(t.app, owner, scanProject, { subject: "Most overdue", dueDate: "2020-01-01" });
+    await createRfi(t.app, owner, scanProject, { subject: "Less overdue", dueDate: "2024-01-01" });
+    await createRfi(t.app, owner, scanProject, { subject: "Not yet due", dueDate: "2099-01-01" });
+    const page = await scanCandidates(t.app.db, owner.companyId, "rfi", scanProject);
+    expect(page.orderedBy).toBe("dueDate asc");
+    expect(page.candidates.map((c) => c.title)).toEqual(["Most overdue", "Less overdue", "Not yet due"]);
+    // The cap keeps the oldest deadline, not the newest row.
+    const one = await scanCandidates(t.app.db, owner.companyId, "rfi", scanProject, 1);
+    expect(one.candidates.map((c) => c.record["id"])).toEqual([oldest.id]);
+    expect(one.truncated).toBe(true);
   });
 
   it("scans company-level types per company and refuses to scan them per project", async () => {
     await t.app.db.insert(vendors).values({ id: newId("vnd"), companyId: owner.companyId, name: "Acme Steel" });
     const perCompany = await scanCandidates(t.app.db, owner.companyId, "vendor", null);
-    expect(perCompany.map((c) => c.title)).toContain("Acme Steel");
-    expect(await scanCandidates(t.app.db, owner.companyId, "vendor", projectId)).toEqual([]);
+    expect(perCompany.candidates.map((c) => c.title)).toContain("Acme Steel");
+    expect((await scanCandidates(t.app.db, owner.companyId, "vendor", projectId)).candidates).toEqual([]);
   });
 
   it("bounds a no-company-column type to this company's projects", async () => {
     const mine = await scanCandidates(t.app.db, owner.companyId, "schedule_task", null);
-    expect(mine.map((c) => c.title)).toContain("Pour slab");
-    expect(await scanCandidates(t.app.db, outsider.companyId, "schedule_task", null)).toEqual([]);
+    expect(mine.candidates.map((c) => c.title)).toContain("Pour slab");
+    expect((await scanCandidates(t.app.db, outsider.companyId, "schedule_task", null)).candidates).toEqual([]);
   });
 });
 

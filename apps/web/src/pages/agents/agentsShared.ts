@@ -46,6 +46,8 @@ export interface AgentDescriptor {
   inputs: string[];
   outputs: string[];
   dataCategories: string[];
+  /** tools the caller must hold on the project before this agent may run */
+  requiredTools?: string[];
   targetTypes: string[];
   consequential: boolean;
   runnable: boolean;

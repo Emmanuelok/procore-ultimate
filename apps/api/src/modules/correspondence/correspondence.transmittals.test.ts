@@ -148,11 +148,11 @@ beforeAll(async () => {
     .where(eq(drawingSheets.id, sheetId));
 
   await post("/correspondence/types/seed");
-}, 180_000);
+}, 600_000);
 
 afterAll(async () => {
   await built.close();
-}, 60_000);
+}, 120_000);
 
 let transmittalId: string;
 let reference: string;

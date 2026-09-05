@@ -140,8 +140,159 @@ export const localContentReadings = pgTable(
     /** computed at write against the target */
     compliant: integer("compliant").notNull(),
     basis: text("basis"),
+    /** manual | computed | certified — how the figure was arrived at */
+    source: text("source").default("manual").notNull(), // LocalContentSource
+    /** the reporting window the figure covers, when it is a period measure */
+    periodStart: text("period_start"),
+    periodEnd: text("period_end"),
+    /** the source records a computed reading was derived from */
+    inputs: jsonb("inputs").$type<Record<string, unknown>>().default({}).notNull(),
+    /** a reading is never edited: a correction supersedes it */
+    supersededById: text("superseded_by_id"),
+    supersedesId: text("supersedes_id"),
     recordedBy: text("recorded_by").notNull(),
     createdAt: createdAt(),
   },
-  (t) => [index("local_content_readings_target_idx").on(t.targetId)],
+  (t) => [
+    index("local_content_readings_target_idx").on(t.targetId, t.readingDate),
+    index("local_content_readings_company_idx").on(t.companyId),
+  ],
+);
+
+/* ------------------------------------------------------------------ */
+/* WP-SAFEG — group entities, consolidation, ICV certificates          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Reporting entities for multi-entity consolidation (#600-607).
+ *
+ * A cross-border programme is delivered through a parent, local
+ * subsidiaries, branches and JV vehicles, each with its own FUNCTIONAL
+ * currency (IAS 21 para 9: the currency of the primary economic environment
+ * it operates in) which is frequently NOT the currency the group reports
+ * in. Recording the two separately is what makes a translation auditable —
+ * and what makes the IAS 29 hyperinflation question answerable at all.
+ */
+export const reportingEntities = pgTable(
+  "reporting_entities",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    name: text("name").notNull(),
+    code: text("code"),
+    role: text("role").default("subsidiary").notNull(), // EntityRole
+    country: text("country").notNull(),
+    /** IAS 21 functional currency of the entity */
+    functionalCurrency: text("functional_currency").notNull(),
+    /** the currency the group presents in — usually the parent's */
+    presentationCurrency: text("presentation_currency").notNull(),
+    /** IAS 29: the functional currency is that of a hyperinflationary economy */
+    hyperinflationary: integer("hyperinflationary").default(0).notNull(),
+    /** general price index series used for IAS 29 restatement: [{ period, index }] */
+    priceIndex: jsonb("price_index").$type<unknown[]>().default([]).notNull(),
+    parentEntityId: text("parent_entity_id"),
+    ownershipPercent: doublePrecision("ownership_percent").default(100).notNull(),
+    /** the entity graph node when the entity is also a counterparty */
+    entityGraphId: text("entity_graph_id"),
+    taxIdentifier: text("tax_identifier"),
+    active: integer("active").default(1).notNull(),
+    notes: text("notes"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("reporting_entities_uq").on(t.companyId, t.name),
+    index("reporting_entities_company_idx").on(t.companyId, t.active),
+  ],
+);
+
+/** Which entity delivers which project, and for what share (#600-603). */
+export const entityProjectLinks = pgTable(
+  "entity_project_links",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    entityId: text("entity_id").notNull(),
+    projectId: text("project_id").notNull(),
+    sharePercent: doublePrecision("share_percent").default(100).notNull(),
+    role: text("role"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    uniqueIndex("entity_project_links_uq").on(t.entityId, t.projectId),
+    index("entity_project_links_project_idx").on(t.projectId),
+  ],
+);
+
+/**
+ * A consolidation run (#604-607): each entity's position translated into the
+ * presentation currency at a stated method and date, with the translation
+ * reserve falling out of the difference. Frozen at write, because a
+ * consolidation whose numbers move when you reopen it is not a consolidation.
+ */
+export const consolidationRuns = pgTable(
+  "consolidation_runs",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    /** null = whole company; set = one project's entities */
+    projectId: text("project_id"),
+    asOf: text("as_of").notNull(),
+    presentationCurrency: text("presentation_currency").notNull(),
+    method: text("method").default("closing_rate").notNull(), // TranslationMethod
+    ias29Applied: integer("ias29_applied").default(0).notNull(),
+    /** [{ entityId, name, functionalCurrency, amount, rate, ratePath, rateSource,
+     *     translated, restatementFactor, notes }] */
+    lines: jsonb("lines").$type<unknown[]>().default([]).notNull(),
+    totals: jsonb("totals").$type<Record<string, unknown>>().default({}).notNull(),
+    /** entities that could not be translated, and why — never silently zeroed */
+    unpriced: jsonb("unpriced").$type<unknown[]>().default([]).notNull(),
+    notes: text("notes"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    index("consolidation_runs_company_idx").on(t.companyId, t.asOf),
+    index("consolidation_runs_project_idx").on(t.projectId, t.asOf),
+  ],
+);
+
+/**
+ * In-Country Value / local content certificates (#612-615). Gulf ICV and
+ * Nigerian NCDMB regimes make the certificate itself the tender currency:
+ * an expired one is an exclusion, so the expiry is an Obligation.
+ */
+export const icvCertificates = pgTable(
+  "icv_certificates",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    targetId: text("target_id"),
+    /** the certified party — the delivering entity or a vendor */
+    entityName: text("entity_name").notNull(),
+    vendorId: text("vendor_id"),
+    jurisdiction: text("jurisdiction").notNull(),
+    issuer: text("issuer").notNull(),
+    certificateNumber: text("certificate_number").notNull(),
+    score: doublePrecision("score"),
+    scoreUnit: text("score_unit").default("%").notNull(),
+    issuedAt: text("issued_at").notNull(),
+    expiresAt: text("expires_at"),
+    status: text("status").default("issued").notNull(), // IcvCertificateStatus
+    obligationId: text("obligation_id"),
+    fileIds: jsonb("file_ids").$type<string[]>().default([]).notNull(),
+    supersededById: text("superseded_by_id"),
+    notes: text("notes"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("icv_certificates_uq").on(t.projectId, t.issuer, t.certificateNumber),
+    index("icv_certificates_project_idx").on(t.projectId, t.status),
+    index("icv_certificates_expiry_idx").on(t.status, t.expiresAt),
+  ],
 );

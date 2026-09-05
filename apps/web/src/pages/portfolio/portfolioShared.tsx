@@ -13,10 +13,21 @@
  *     currencies — the API buckets and this workspace shows the buckets.
  *   · Every panel loads, fails and empties on its own.
  */
-import { useCallback, useState, type ReactNode } from "react";
+import { useCallback, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { api, ApiClientError } from "../../lib/api";
 import { useAuth } from "../../lib/auth";
-import { Alert, Badge, Skeleton, cx, type Tone } from "../../ui";
+import {
+  Alert,
+  Badge,
+  Button,
+  Field,
+  Input,
+  Select,
+  Skeleton,
+  Textarea,
+  cx,
+  type Tone,
+} from "../../ui";
 import { useResource, type Loadable, type Paginated } from "../../layouts/project/lib";
 
 export { useResource };
@@ -1345,6 +1356,201 @@ export function BreachBadge({ breached, by, currency }: { breached: boolean; by:
     <Badge tone="danger" size="xs" dot>
       Over by {moneyShort(by, currency)}
     </Badge>
+  );
+}
+
+/* ================================ Editing ================================= */
+
+/**
+ * One field of an inline edit form. The workspace edits records through the
+ * SAME drawer that shows them, so what you correct is what you were reading.
+ */
+export interface EditFieldSpec {
+  key: string;
+  label: string;
+  type: "text" | "number" | "date" | "textarea" | "select" | "checkbox";
+  options?: readonly string[];
+  optionLabel?: (option: string) => string;
+  hint?: string;
+  placeholder?: string;
+  /** An emptied control sends `null` rather than being left out of the patch. */
+  nullable?: boolean;
+  min?: number;
+  step?: number;
+  rows?: number;
+  /** Take the full width of the two-column grid. */
+  wide?: boolean;
+}
+
+function toInput(spec: EditFieldSpec, value: unknown): string | boolean {
+  if (spec.type === "checkbox") return value === true || value === 1;
+  if (value === null || value === undefined) return "";
+  if (spec.type === "date") return String(value).slice(0, 10);
+  return String(value);
+}
+
+/**
+ * An inline edit form over an existing record.
+ *
+ * It sends ONLY the fields that actually changed. That matters: a PATCH that
+ * resends every field would re-assert values the operator never touched, and
+ * on this module several PATCH routes revert an approval when the money moves.
+ * Nothing changed means nothing is sent, and the form says so.
+ */
+export function EditForm({
+  fields,
+  initial,
+  busy = false,
+  error = null,
+  submitLabel = "Save changes",
+  note,
+  onSubmit,
+  onCancel,
+}: {
+  fields: readonly EditFieldSpec[];
+  initial: Record<string, unknown>;
+  busy?: boolean;
+  error?: string | null;
+  submitLabel?: string;
+  note?: ReactNode;
+  onSubmit: (patch: Record<string, unknown>) => void | Promise<void>;
+  onCancel: () => void;
+}) {
+  const base = useMemo(() => {
+    const out: Record<string, string | boolean> = {};
+    for (const f of fields) out[f.key] = toInput(f, initial[f.key]);
+    return out;
+  }, [fields, initial]);
+  const [values, setValues] = useState<Record<string, string | boolean>>(base);
+  const [nothing, setNothing] = useState(false);
+
+  const changedKeys = fields.filter((f) => values[f.key] !== base[f.key]).map((f) => f.key);
+
+  function set(key: string, value: string | boolean) {
+    setNothing(false);
+    setValues((v) => ({ ...v, [key]: value }));
+  }
+
+  function submit(event: FormEvent) {
+    event.preventDefault();
+    const patch: Record<string, unknown> = {};
+    for (const f of fields) {
+      if (values[f.key] === base[f.key]) continue;
+      const raw = values[f.key];
+      if (f.type === "checkbox") {
+        patch[f.key] = raw === true;
+        continue;
+      }
+      const text = String(raw ?? "").trim();
+      if (text === "") {
+        if (f.nullable) patch[f.key] = null;
+        continue;
+      }
+      if (f.type === "number") {
+        const parsed = Number(text);
+        if (!Number.isFinite(parsed)) continue;
+        patch[f.key] = parsed;
+        continue;
+      }
+      patch[f.key] = text;
+    }
+    if (Object.keys(patch).length === 0) {
+      setNothing(true);
+      return;
+    }
+    void onSubmit(patch);
+  }
+
+  return (
+    <form onSubmit={submit} className="space-y-3 rounded-md border border-border bg-surface-sunken p-3">
+      {error ? (
+        <Alert tone="danger" size="sm">
+          {error}
+        </Alert>
+      ) : null}
+      {nothing ? (
+        <Alert tone="info" size="sm">
+          Nothing was changed, so nothing was sent.
+        </Alert>
+      ) : null}
+      <div className="grid gap-3 sm:grid-cols-2">
+        {fields.map((f) => (
+          <div key={f.key} className={f.wide ? "sm:col-span-2" : undefined}>
+            {f.type === "checkbox" ? (
+              <label className="flex items-start gap-2 text-meta text-content">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={values[f.key] === true}
+                  onChange={(e) => set(f.key, e.target.checked)}
+                />
+                <span>
+                  {f.label}
+                  {f.hint ? <span className="block text-2xs text-content-subtle">{f.hint}</span> : null}
+                </span>
+              </label>
+            ) : (
+              <Field label={f.label} hint={f.hint}>
+                {f.type === "select" ? (
+                  <Select
+                    size="sm"
+                    value={String(values[f.key] ?? "")}
+                    onChange={(e) => set(f.key, e.target.value)}
+                  >
+                    {f.nullable ? <option value="">{f.placeholder ?? "—"}</option> : null}
+                    {(f.options ?? []).map((o) => (
+                      <option key={o} value={o}>
+                        {f.optionLabel ? f.optionLabel(o) : titleCase(o)}
+                      </option>
+                    ))}
+                  </Select>
+                ) : f.type === "textarea" ? (
+                  <Textarea
+                    rows={f.rows ?? 3}
+                    value={String(values[f.key] ?? "")}
+                    placeholder={f.placeholder}
+                    onChange={(e) => set(f.key, e.target.value)}
+                  />
+                ) : (
+                  <Input
+                    size="sm"
+                    type={f.type === "number" ? "number" : f.type === "date" ? "date" : "text"}
+                    min={f.min}
+                    step={f.step}
+                    value={String(values[f.key] ?? "")}
+                    placeholder={f.placeholder}
+                    onChange={(e) => set(f.key, e.target.value)}
+                  />
+                )}
+              </Field>
+            )}
+          </div>
+        ))}
+      </div>
+      {note ? <div className="text-2xs text-content-subtle">{note}</div> : null}
+      <div className="flex items-center gap-2">
+        <Button type="submit" size="sm" loading={busy}>
+          {submitLabel}
+        </Button>
+        <Button type="button" size="sm" variant="ghost" onClick={onCancel}>
+          Cancel
+        </Button>
+        <span className="text-2xs text-content-subtle">
+          {changedKeys.length === 0
+            ? "Only changed fields are sent."
+            : `${changedKeys.length} field${changedKeys.length === 1 ? "" : "s"} changed.`}
+        </span>
+      </div>
+    </form>
+  );
+}
+
+/** The "Edit" affordance every detail drawer in this workspace carries. */
+export function EditButton({ editing, onToggle }: { editing: boolean; onToggle: () => void }) {
+  return (
+    <Button size="sm" variant="ghost" onClick={onToggle}>
+      {editing ? "Stop editing" : "Edit"}
+    </Button>
   );
 }
 

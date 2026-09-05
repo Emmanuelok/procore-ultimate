@@ -2659,7 +2659,7 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
         ? await app.db
             .select({ id: schedules.id, lastComputedAt: schedules.lastComputedAt })
             .from(schedules)
-            .where(inArray(schedules.id, scheduleIds))
+            .where(and(inArray(schedules.id, scheduleIds), eq(schedules.projectId, req.projectId!)))
         : [];
     const computedAtById = new Map(scheduleRows.map((s) => [s.id, s.lastComputedAt] as const));
     const enriched = events.map((e) => ({
@@ -3392,7 +3392,9 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
           ? await app.db
               .select({ id: schedules.id, lastComputedAt: schedules.lastComputedAt })
               .from(schedules)
-              .where(inArray(schedules.id, scheduleIds))
+              .where(
+                and(inArray(schedules.id, scheduleIds), eq(schedules.projectId, req.projectId!)),
+              )
           : [];
       const computedAtById = new Map(scheduleRows.map((s) => [s.id, s.lastComputedAt] as const));
 

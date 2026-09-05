@@ -425,10 +425,24 @@ describe("runs, summary, engine operations and health inputs", () => {
     expect((await get(noProject, "/automation/status")).statusCode).toBe(403);
     const status = await get(owner, "/automation/status");
     expect(status.statusCode).toBe(200);
-    const s = status.json() as { engine: { eventsSeen: number }; jobs: Array<{ name: string }>; scheduler: { enabled: boolean } };
+    type StatusBody = {
+      engine: { eventsSeen: number; lastError: string | null; scansTruncated: number };
+      scan: { limit: number; cappedRules: Array<{ id: string }> };
+      jobs: Array<{ name: string }>;
+      scheduler: { enabled: boolean };
+    };
+    const s = status.json() as StatusBody;
     expect(s.engine.eventsSeen).toBeGreaterThan(0);
     expect(s.jobs.map((j) => j.name).sort()).toEqual(["automation.drain", "automation.schedules"]);
     expect(s.scheduler.enabled).toBe(false);
+    expect(s.scan.limit).toBeGreaterThan(0);
+    expect(s.scan.cappedRules).toEqual([]);
+    // Regression (verifier, minor): the counters and the last error text used
+    // to be one process-wide object, so this admin saw another tenant's rule
+    // and run ids. A company that has done nothing reports zeroes, not ours.
+    const theirs = (await get(outsider, "/automation/status")).json() as StatusBody;
+    expect(theirs.engine.eventsSeen).toBeLessThan(s.engine.eventsSeen);
+    expect(theirs.engine.lastError === null || theirs.engine.lastError !== s.engine.lastError).toBe(true);
 
     expect((await post(noProject, "/automation/run", {})).statusCode).toBe(403);
     const cycle = await post(owner, "/automation/run", { force: true });

@@ -59,8 +59,12 @@ import {
   type AppetiteRule,
   type PlanPoint,
 } from "./contingency.js";
-import { riskAdjustedCost } from "./simulation.js";
+import { riskAdjustedCost, runQcraBatched, runQsraBatched } from "./simulation.js";
 import { SimulationQueue, type SimulationJobParams } from "./runner.js";
+
+/** Releases the event loop between simulation batches (see the audit note on
+ *  synchronous Monte Carlo blocking every other request). */
+const yieldToEventLoop = (): Promise<void> => new Promise<void>((r) => setImmediate(r));
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -1060,7 +1064,13 @@ export const riskModule: FastifyPluginAsync = async (app) => {
       if (sim.kind === "qcra") {
         const inputs = sim.inputs as { risks?: QcraRiskInput[] };
         if (!Array.isArray(inputs.risks)) throw badRequest("Stored QCRA inputs are incomplete");
-        fresh = runQcra(inputs.risks, { iterations: sim.iterations, seed: sim.seed }).summary;
+        fresh = (
+          await runQcraBatched(inputs.risks, {
+            iterations: sim.iterations,
+            seed: sim.seed,
+            onBatch: yieldToEventLoop,
+          })
+        ).result.summary;
       } else {
         const inputs = sim.inputs as {
           tasks?: QsraTaskInput[];
@@ -1070,11 +1080,14 @@ export const riskModule: FastifyPluginAsync = async (app) => {
         if (!Array.isArray(inputs.tasks) || !Array.isArray(inputs.deps) || !inputs.projectStart) {
           throw badRequest("Stored QSRA inputs are incomplete");
         }
-        fresh = runQsra(inputs.tasks, inputs.deps, {
-          projectStart: inputs.projectStart,
-          iterations: sim.iterations,
-          seed: sim.seed,
-        }).summary;
+        fresh = (
+          await runQsraBatched(inputs.tasks, inputs.deps, {
+            projectStart: inputs.projectStart,
+            iterations: sim.iterations,
+            seed: sim.seed,
+            onBatch: yieldToEventLoop,
+          })
+        ).result.summary;
       }
       const stored = (sim.results["summary"] ?? {}) as SummaryLike;
       const reproduced =

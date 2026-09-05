@@ -49,6 +49,7 @@ import {
   idSchema,
   isoDateSchema,
   ledger,
+  moveObligationDeadline,
   nowISO,
   openObligation,
   settleObligation,
@@ -352,8 +353,30 @@ export const transmittalRoutes: FastifyPluginAsync = async (app) => {
       action: "create",
       objectType: "transmittal",
       objectId: id,
-      payload: { reference, purpose: body.purpose, method: body.method },
+      payload: { reference, purpose: body.purpose, method: body.method, letterId: body.letterId ?? null },
     });
+    // The link is worth nothing if only one side carries it: a letter opened on
+    // its own must say which transmittal it covered.
+    if (body.letterId) {
+      await app.db
+        .update(correspondenceLetters)
+        .set({ transmittalId: id, updatedAt: nowISO() })
+        .where(
+          and(
+            eq(correspondenceLetters.id, body.letterId),
+            eq(correspondenceLetters.companyId, companyId),
+          ),
+        );
+      await ledger(app.db, {
+        companyId,
+        projectId,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "correspondence_letter",
+        objectId: body.letterId,
+        payload: { transmittalId: id, reference },
+      });
+    }
 
     const items = await addItems(companyId, projectId, id, req.user!.id, body.items, 0);
     const recipientRows = [];
@@ -432,13 +455,19 @@ export const transmittalRoutes: FastifyPluginAsync = async (app) => {
       const body = transmittalPatchSchema.parse(req.body);
       const companyId = req.companyId!;
       const record = await loadTransmittal(companyId, projectId, transmittalId);
-      if (record.status !== "draft") {
+      const issued = record.status !== "draft";
+      if (issued) {
         // Once issued, only the acknowledgement deadline may move — and moving
         // it is itself ledgered, because it changes who is late.
         const allowed = Object.keys(body).every((k) => k === "ackDueDate");
         if (!allowed) {
           throw conflict(
             `${record.reference} has been issued; its subject, purpose and contents are frozen. Issue a revised transmittal instead.`,
+          );
+        }
+        if (body.ackDueDate === null && record.ackRequired === 1) {
+          throw badRequest(
+            `${record.reference} asks its recipients to acknowledge receipt, so it must keep a date they can be late against. Move the date, or close the transmittal.`,
           );
         }
       }
@@ -461,7 +490,47 @@ export const transmittalRoutes: FastifyPluginAsync = async (app) => {
         objectId: transmittalId,
         payload: { changed: Object.keys(set).filter((k) => k !== "updatedAt") },
       });
-      return row;
+
+      // The obligation opened at issue IS the deadline as far as the assurance
+      // register is concerned. Moving the date on the transmittal without
+      // moving it there would leave two dates for one promise.
+      let obligationId = record.obligationId;
+      if (issued && body.ackDueDate !== undefined && body.ackDueDate !== null) {
+        const moved = await moveObligationDeadline(
+          app.db,
+          companyId,
+          projectId,
+          req.user!.id,
+          obligationId,
+          body.ackDueDate,
+          `The acknowledgement date on ${record.reference} moved from ${record.ackDueDate ?? "no date"} to ${body.ackDueDate}.`,
+        );
+        if (!moved && record.ackRequired === 1) {
+          // Issued with an acknowledgement asked for but no date (a record from
+          // before that was refused, or an obligation already settled): give the
+          // new date an obligation rather than leaving nobody to chase.
+          const recipients = await loadRecipients(app.db, companyId, "transmittal", transmittalId);
+          if (recipients.some((r) => r.acknowledgementRequired === 1 && r.acknowledgedAt === null)) {
+            obligationId = await openObligation(app.db, {
+              companyId,
+              projectId,
+              actorId: req.user!.id,
+              sourceClause: `${record.reference} — transmittal ${record.purpose.replace(/_/g, " ")}`,
+              trigger: `Every recipient of ${record.reference} ("${record.subject}") must acknowledge receipt by ${body.ackDueDate}.`,
+              deadlineDate: body.ackDueDate,
+              warnDaysBefore: 2,
+              evidenceRequirement: `An acknowledgement recorded against each recipient of ${record.reference}.`,
+              objectType: "transmittal",
+              objectId: transmittalId,
+            });
+            await app.db
+              .update(transmittals)
+              .set({ obligationId, updatedAt: nowISO() })
+              .where(eq(transmittals.id, transmittalId));
+          }
+        }
+      }
+      return { ...row, obligationId };
     },
   );
 
@@ -624,6 +693,14 @@ export const transmittalRoutes: FastifyPluginAsync = async (app) => {
 
       let obligationId = record.obligationId;
       const requiresAck = record.ackRequired === 1 && recipients.some((r) => r.acknowledgementRequired === 1);
+      // A deadline nobody can be late for is not a deadline: without a date no
+      // obligation is opened and the acknowledgement sweep skips the record
+      // entirely, so the recipients would never be chased. Refuse instead.
+      if (requiresAck && ackDueDate === null) {
+        throw badRequest(
+          `${record.reference} asks ${recipients.filter((r) => r.acknowledgementRequired === 1).length} recipient(s) to acknowledge receipt but names no date to do it by. Set an acknowledgement due date, or issue it for information only (ackRequired: false).`,
+        );
+      }
       if (requiresAck && ackDueDate !== null && obligationId === null) {
         obligationId = await openObligation(app.db, {
           companyId,

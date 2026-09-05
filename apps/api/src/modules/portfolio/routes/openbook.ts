@@ -654,6 +654,29 @@ export const openBookRoutes: FastifyPluginAsync = async (app) => {
         );
       }
 
+      /* A verdict may be re-taken — the module's own PATCH refusal tells the
+         user to reset an item to pending and try again — so the register has
+         to survive that. Without this, each re-verdict inserted ANOTHER
+         disallowance against the same item and the register showed more
+         disallowed than was ever claimed, with both rows independently
+         deductible. A prior finding is superseded, not stacked. */
+      const priorDisallowances = await app.db
+        .select()
+        .from(disallowedCosts)
+        .where(
+          and(
+            eq(disallowedCosts.companyId, req.companyId!),
+            eq(disallowedCosts.definedCostItemId, itemId),
+          ),
+        );
+      const settled = priorDisallowances.find((d) => d.status === "deducted");
+      if (settled) {
+        throw conflict(
+          `Disallowance DC-${pad3(settled.number)} against this item has already been deducted; the money has moved. Re-open that disallowance before re-taking the verdict.`,
+        );
+      }
+      const standing = priorDisallowances.filter((d) => d.status !== "withdrawn");
+
       let verifiedAmount = 0;
       if (body.verdict === "verified") {
         verifiedAmount = body.verifiedAmount ?? item.claimedAmount;
@@ -689,6 +712,45 @@ export const openBookRoutes: FastifyPluginAsync = async (app) => {
           updatedAt: at,
         })
         .where(eq(definedCostItems.id, itemId));
+
+      /* Withdraw whatever the previous verdict put on the register. Doing it
+         here — after the item has moved — means a revert to `verified` or
+         `pending` also clears the standing disallowance, instead of leaving
+         an amount disallowed against a cost that is now verified. */
+      const supersededDisallowanceIds: string[] = [];
+      for (const prior of standing) {
+        await app.db
+          .update(disallowedCosts)
+          .set({
+            status: "withdrawn",
+            resolvedBy: req.user!.id,
+            resolvedAt: at,
+            resolutionNote: `Withdrawn: the verdict on the cost item it rests on was re-taken as "${body.verdict.replace(/_/g, " ")}".`,
+            updatedAt: at,
+          })
+          .where(eq(disallowedCosts.id, prior.id));
+        await setObligationStatus(app.db, prior.obligationId, "open", "waived");
+        await setObligationStatus(app.db, prior.obligationId, "breached", "waived");
+        supersededDisallowanceIds.push(prior.id);
+        await ledger(app.db, {
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          actorId: req.user!.id,
+          action: "state_change",
+          objectType: "disallowed_cost",
+          objectId: prior.id,
+          payload: {
+            from: prior.status,
+            to: "withdrawn",
+            reason: "verdict_retaken",
+            definedCostItemId: itemId,
+            amount: prior.amount,
+            currency: prior.currency,
+            newVerdict: body.verdict,
+          },
+          storePayload: true,
+        });
+      }
 
       /* A disallowance recorded here lands in the register with its ground,
          and its response deadline becomes an obligation like any other. */
@@ -768,6 +830,7 @@ export const openBookRoutes: FastifyPluginAsync = async (app) => {
           verifiedAmount,
           currency: item.currency,
           disallowedCostId: disallowedId,
+          supersededDisallowanceIds,
         },
         storePayload: true,
       });
@@ -780,6 +843,7 @@ export const openBookRoutes: FastifyPluginAsync = async (app) => {
       return {
         item: row,
         disallowedCostId: disallowedId,
+        supersededDisallowanceIds,
         totals: verificationTotals(await itemsOf(req.companyId!, verificationId), verification.currency),
       };
     },

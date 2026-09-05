@@ -24,9 +24,13 @@
  * days, expiring within 30. Ordering a capped scan newest-first would put the
  * matches outside the cap on any mature tenant, so the scan is ordered by the
  * type's deadline field ascending (Postgres puts NULL deadlines last) and
- * falls back to oldest-created-first. When the cap is reached the scan says
- * so (`truncated`), and the caller records it on the rule so a capped scan is
- * never a silent miss.
+ * falls back to oldest-created-first. The caller may name the field its rule
+ * actually ages on ("open 14+ days" → createdAt), which wins over the type's
+ * deadline. When the cap is reached the scan says so (`truncated`), and the
+ * caller records it on the rule so a capped scan is never a silent miss —
+ * including the case oldest-first still cannot serve, a "due within 30 days"
+ * rule on a type carrying thousands of long-past deadlines: the honest answer
+ * there is the truncation flag, and a narrower rule.
  */
 import { and, asc, eq, inArray, type SQL } from "drizzle-orm";
 import type { AnyPgTable, PgColumn } from "drizzle-orm/pg-core";
@@ -772,11 +776,18 @@ export interface ScanPage {
 
 const EMPTY_SCAN = (limit: number): ScanPage => ({ candidates: [], truncated: false, limit, orderedBy: "none" });
 
-/** The column a schedule scan should order by, and its name for the report. */
-function scanOrderColumn(entry: SnapshotEntry): { column: PgColumn; field: string } | null {
-  if (entry.dueField) {
-    const col = (entry.table as unknown as Record<string, PgColumn | undefined>)[entry.dueField];
-    if (col) return { column: col, field: entry.dueField };
+/**
+ * The column a schedule scan should order by, and its name for the report.
+ * `preferField` is the field the RULE ages on (e.g. a "created 14+ days ago"
+ * condition orders by createdAt, not by the type's deadline — a change event
+ * with no due date would otherwise sort last and fall outside the cap).
+ */
+function scanOrderColumn(entry: SnapshotEntry, preferField?: string | null): { column: PgColumn; field: string } | null {
+  const columns = entry.table as unknown as Record<string, PgColumn | undefined>;
+  for (const field of [preferField, entry.dueField]) {
+    if (!field) continue;
+    const col = columns[field];
+    if (col) return { column: col, field };
   }
   if (entry.createdAtColumn) return { column: entry.createdAtColumn, field: "createdAt" };
   return null;
@@ -794,6 +805,7 @@ export async function scanCandidates(
   objectType: string,
   projectId: string | null,
   limit = SCAN_LIMIT,
+  preferField: string | null = null,
 ): Promise<ScanPage> {
   const cap = Math.max(1, Math.min(limit, SCAN_LIMIT));
   const entry = BY_TYPE.get(objectType);
@@ -817,7 +829,7 @@ export async function scanCandidates(
   if (entry.statusColumn && entry.openStatuses && entry.openStatuses.length > 0) {
     conds.push(inArray(entry.statusColumn, [...entry.openStatuses]));
   }
-  const order = scanOrderColumn(entry);
+  const order = scanOrderColumn(entry, preferField);
   let q = db.select().from(entry.table).$dynamic();
   if (conds.length > 0) q = q.where(and(...conds));
   // Ties on a shared deadline are broken by id so paging/ordering is stable.

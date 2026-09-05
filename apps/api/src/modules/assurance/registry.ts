@@ -197,6 +197,19 @@ export const DETECTOR_REGISTRY: DetectorDescriptor[] = [
     defaultPrecisionFloor: 0.5,
   },
   {
+    id: "self_certified_claim",
+    family: "certification",
+    scope: "project",
+    name: "Self-certified claim",
+    description:
+      "Every evidence row a reconciliation could use came from the claimant or from the author " +
+      "of the assertion, so the claim was tested only against itself.",
+    specRef: "Vol III §4 (design rule); Domain A #65",
+    requires: ["assertions", "evidence submitted by someone other than the claimant"],
+    defaultThresholds: {},
+    defaultPrecisionFloor: null,
+  },
+  {
     id: "certified_above_evidenced",
     family: "certification",
     scope: "project",
@@ -405,12 +418,24 @@ export function detectorById(id: string): DetectorDescriptor | undefined {
   return BY_ID.get(id);
 }
 
+/**
+ * Detector ids that a RUN never executes because another path raises them:
+ * the chain-integrity family comes out of anchoring's verdicts and the
+ * evidence-download re-hash, and the two certification detectors are raised by
+ * the reconciliation routes at the moment a claim is actually tested.
+ *
+ * Listing them explicitly (rather than deriving the set from one family)
+ * matters because `detectorsForScope` excludes them: offering an operator a
+ * "Run" button for a detector no run can execute is a lie about the
+ * programme's cadence.
+ */
+export const PASSIVE_DETECTORS = new Set<string>([
+  ...DETECTOR_REGISTRY.filter((d) => d.family === "chain_integrity").map((d) => d.id),
+  "certified_above_evidenced",
+  "self_certified_claim",
+]);
+
 /** Detector ids a run of this scope may execute. */
 export function detectorsForScope(scope: DetectorRunScope): DetectorDescriptor[] {
-  return DETECTOR_REGISTRY.filter((d) => d.scope === scope && d.family !== "chain_integrity");
+  return DETECTOR_REGISTRY.filter((d) => d.scope === scope && !PASSIVE_DETECTORS.has(d.id));
 }
-
-/** Detector ids that a run never executes (they are raised by other paths). */
-export const PASSIVE_DETECTORS = new Set(
-  DETECTOR_REGISTRY.filter((d) => d.family === "chain_integrity").map((d) => d.id),
-);

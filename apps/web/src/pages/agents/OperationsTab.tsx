@@ -443,14 +443,26 @@ function ReportsPanel({ isAdmin }: { isAdmin: boolean }) {
   const [open, setOpen] = useState<AgentReport | null>(null);
 
   const load = useCallback(async () => {
+    if (!isAdmin) {
+      // Reading is gated exactly like generating: a bias report names the
+      // vendors the fleet flags adversely, a validation report aggregates
+      // every project in the tenant. Say so rather than showing an empty list.
+      setRows([]);
+      setError(null);
+      return;
+    }
     try {
       const res = await api.get<{ items: AgentReport[] }>("/api/v1/agents/reports");
       setRows(res.items);
     } catch (err) {
       setRows([]);
-      setError(errorMessage(err, "Failed to load reports"));
+      setError(
+        errorStatus(err) === 403
+          ? "Governance reports are an owner/admin surface."
+          : errorMessage(err, "Failed to load reports"),
+      );
     }
-  }, []);
+  }, [isAdmin]);
 
   useEffect(() => {
     void load();
@@ -506,7 +518,12 @@ function ReportsPanel({ isAdmin }: { isAdmin: boolean }) {
 
         <ErrorAlert message={error} />
 
-        {rows === null ? (
+        {!isAdmin ? (
+          <EmptyState
+            title="Owner or admin only"
+            hint="A bias report names the vendors the fleet flags adversely, and a validation report covers every project in the company, so reading one is gated the same way generating one is."
+          />
+        ) : rows === null ? (
           <Spinner />
         ) : rows.length === 0 ? (
           <EmptyState
@@ -543,6 +560,21 @@ function ReportsPanel({ isAdmin }: { isAdmin: boolean }) {
         </Drawer>
       </CardBody>
     </Card>
+  );
+}
+
+/** The window this report could actually read, when it is not the whole one. */
+function TruncationNotice({ data }: { data: Record<string, unknown> }) {
+  const reasons = Array.isArray(data["reasons"]) ? (data["reasons"] as string[]) : [];
+  if (data["truncated"] !== true || reasons.length === 0) return null;
+  return (
+    <Alert tone="warning" title="This report covers only part of the window">
+      <ul className="list-disc space-y-1 pl-4 text-xs">
+        {reasons.map((r, i) => (
+          <li key={i}>{r}</li>
+        ))}
+      </ul>
+    </Alert>
   );
 }
 
@@ -588,6 +620,7 @@ function ReportBody({ report }: { report: AgentReport }) {
     const groups = Array.isArray(data["groups"]) ? (data["groups"] as Array<Record<string, unknown>>) : [];
     return (
       <div className="space-y-3">
+        <TruncationNotice data={data} />
         <Alert tone="info" title="Verdict">
           {String(data["verdict"] ?? "")}
         </Alert>
@@ -629,6 +662,7 @@ function ReportBody({ report }: { report: AgentReport }) {
   const agents = Array.isArray(data["agents"]) ? (data["agents"] as Array<Record<string, unknown>>) : [];
   return (
     <div className="space-y-3">
+      <TruncationNotice data={data} />
       <p className="text-xs text-ink-500">{report.summary}</p>
       <Table>
         <thead>

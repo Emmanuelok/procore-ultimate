@@ -36,6 +36,15 @@ export const CORRESPONDENCE_STATUSES = [
 ] as const;
 export type CorrespondenceStatus = (typeof CORRESPONDENCE_STATUSES)[number];
 
+/**
+ * How a type's response period is counted. A contract that says "within 5
+ * working days" is not the same promise as five calendar days, so the basis
+ * is configured on the type and recorded on every deadline it produces.
+ * Public holidays are jurisdictional and are deliberately not modelled.
+ */
+export const RESPONSE_DAY_BASES = ["calendar", "working"] as const;
+export type ResponseDayBasis = (typeof RESPONSE_DAY_BASES)[number];
+
 export const CORRESPONDENCE_PRIORITIES = ["low", "normal", "high", "urgent"] as const;
 export type CorrespondencePriority = (typeof CORRESPONDENCE_PRIORITIES)[number];
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  ageingOrderField,
   evaluateCondition,
   evaluateLeaf,
   getPath,
@@ -170,5 +171,28 @@ describe("referencedFields", () => {
       }).sort(),
     ).toEqual(["record.a", "record.b"]);
     expect(referencedFields(null)).toEqual([]);
+  });
+});
+
+describe("ageingOrderField", () => {
+  /**
+   * A capped schedule scan must be ordered by the field the rule ages on, or
+   * the records that match sit outside the cap (verifier, major).
+   */
+  it("names the record field a rule ages on, in condition order", () => {
+    expect(ageingOrderField({ all: [{ field: "record.status", op: "eq", value: "open" }, { field: "record.dueDate", op: "overdue_by_days", value: 3 }] })).toBe(
+      "dueDate",
+    );
+    expect(ageingOrderField({ all: [{ field: "record.createdAt", op: "older_than_days", value: 14 }] })).toBe("createdAt");
+    expect(ageingOrderField({ any: [{ field: "record.validTo", op: "due_within_days", value: 30 }] })).toBe("validTo");
+    expect(ageingOrderField({ not: { field: "record.expiresAt", op: "before", value: "2026-01-01" } })).toBe("expiresAt");
+  });
+
+  it("returns null when nothing in the rule ages, so the caller falls back to the type's deadline", () => {
+    expect(ageingOrderField(null)).toBeNull();
+    expect(ageingOrderField({ all: [{ field: "record.status", op: "eq", value: "open" }] })).toBeNull();
+    // Only a direct column can be ordered by in SQL; derived and nested paths are not columns.
+    expect(ageingOrderField({ all: [{ field: "derived.vendorInsuranceValid", op: "is_false" }] })).toBeNull();
+    expect(ageingOrderField({ all: [{ field: "record.meta.dueDate", op: "overdue_by_days", value: 1 }] })).toBeNull();
   });
 });

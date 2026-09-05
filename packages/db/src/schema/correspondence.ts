@@ -115,6 +115,15 @@ export const correspondenceTypes = pgTable(
     /** a response is expected; drives the due date and the obligation */
     requiresResponse: integer("requires_response").default(0).notNull(),
     responseDays: integer("response_days"),
+    /**
+     * Whether `responseDays` is counted in calendar days or WORKING days
+     * (Mon–Fri). A contract that says "within 5 working days" and a register
+     * that counts 5 calendar days disagree about who is late, so the basis is
+     * configuration rather than an assumption. Public holidays are
+     * jurisdictional and deliberately not modelled; the basis is recorded on
+     * every deadline the type produces.
+     */
+    responseDaysBasis: text("response_days_basis").default("calendar").notNull(), // ResponseDayBasis
     /** the record is a contractual act (a notice under the contract) */
     isContractual: integer("is_contractual").default(0).notNull(),
     /** an obligation is opened for the response deadline */

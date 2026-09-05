@@ -269,17 +269,31 @@ export function decideVote(
   }
 
   let thresholdPercent = options.thresholdPercent;
+  /* A threshold the deed states is a bar the vote must REACH. A simple
+     majority we derive because the deed is silent is a bar the vote must
+     BEAT: half the shares present is a deadlock, not a majority, and a
+     deadlocked board resolution minuted as carried is how a venture ends up
+     bound by a decision it never took. */
+  let thresholdBasis: "stated" | "reserved_unanimity" | "simple_majority" = "stated";
   if (options.decisionType === "reserved_matter" && thresholdPercent === null) {
     thresholdPercent = present;
+    thresholdBasis = "reserved_unanimity";
     reasons.push(
       "This is a reserved matter and the deed records no threshold, so unanimity of the shares present is required.",
     );
   }
   if (thresholdPercent === null) {
     thresholdPercent = present / 2;
-    reasons.push("No threshold is recorded; a simple majority of the shares present is applied.");
+    thresholdBasis = "simple_majority";
+    reasons.push(
+      "No threshold is recorded; a simple majority of the shares present is applied, and a simple majority means MORE than half — an even split is a deadlock, not a decision.",
+    );
   }
-  const thresholdMet = forShare > thresholdPercent - 1e-9 && forShare > 0;
+  const thresholdMet =
+    forShare > 0 &&
+    (thresholdBasis === "simple_majority"
+      ? forShare > thresholdPercent + 1e-9
+      : forShare > thresholdPercent - 1e-9);
 
   let outcome: DecisionOutcome["outcome"];
   if (!quorumMet) outcome = "not_quorate";
@@ -294,9 +308,20 @@ export function decideVote(
     reasons.push(
       `Not quorate: ${present}% of the shares were present and the venture requires ${quorumPercent}%. Nothing was decided, whichever way the votes fell.`,
     );
+  } else if (outcome === "rejected" && thresholdBasis === "simple_majority") {
+    const tied = Math.abs(forShare - thresholdPercent) < 1e-9;
+    reasons.push(
+      tied
+        ? `Not carried: the board is deadlocked — ${forShare}% of the shares voted in favour and ${againstShare}% against, of ${present}% present. A simple majority needs more than half, so the matter fails.`
+        : `Not carried: ${forShare}% of the shares voted in favour, which is not more than half of the ${present}% present (${againstShare}% against, ${abstainShare}% abstained).`,
+    );
   } else if (outcome === "rejected") {
     reasons.push(
       `Not carried: ${forShare}% of the shares voted in favour and ${round2(thresholdPercent)}% was required (${againstShare}% against, ${abstainShare}% abstained).`,
+    );
+  } else if (outcome === "approved" && thresholdBasis === "simple_majority") {
+    reasons.push(
+      `Carried: ${forShare}% of the shares voted in favour, more than half of the ${present}% present (${againstShare}% against, ${abstainShare}% abstained).`,
     );
   } else if (outcome === "approved") {
     reasons.push(

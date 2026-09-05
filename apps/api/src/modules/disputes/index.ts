@@ -2309,7 +2309,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
       const contract = dispute.contractId
         ? (
             await app.db
-              .select({ reference: contracts.reference, title: contracts.title })
+              .select({ name: contracts.name, form: contracts.form })
               .from(contracts)
               .where(eq(contracts.id, dispute.contractId))
               .limit(1)
@@ -2321,7 +2321,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
         jurisdiction: dispute.jurisdiction ?? "custom",
         forum: dispute.forum,
         rules: dispute.rules,
-        contractReference: contract?.reference ?? null,
+        contractReference: contract?.name ?? null,
         contractFamily: dispute.contractFamily,
         projectName: projectRow?.name ?? "(project name not recorded)",
         referringParty: "The referring party (record it on the dispute before sending)",

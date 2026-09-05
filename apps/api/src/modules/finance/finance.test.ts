@@ -18,6 +18,8 @@ let app: FastifyInstance;
 let owner: TestActor;
 let approver: TestActor; // second admin in owner's company — SoD counterparty
 let approverHeaders: Record<string, string>;
+let payer: TestActor; // third admin — certifies and pays (SoD: never the requester/approver)
+let payerHeaders: Record<string, string>;
 let projectId: string;
 
 beforeAll(async () => {
@@ -33,6 +35,17 @@ beforeAll(async () => {
   });
   approverHeaders = {
     authorization: approver.headers["authorization"]!,
+    "x-company-id": owner.companyId,
+  };
+  payer = await registerActor(app);
+  await app.db.insert(companyMemberships).values({
+    id: newId("cm"),
+    companyId: owner.companyId,
+    userId: payer.userId,
+    role: "admin",
+  });
+  payerHeaders = {
+    authorization: payer.headers["authorization"]!,
     "x-company-id": owner.companyId,
   };
   projectId = newId("prj");
@@ -79,6 +92,23 @@ async function createFacility(pid: string, payload: Record<string, unknown>) {
       committedAmount: 100000,
       ...payload,
     },
+  });
+}
+
+/** Certifies (loan/blended facilities require it) then pays, honouring the
+ *  three-way separation of duties: requester ≠ approver ≠ certifier/payer. */
+async function certifyAndDisburse(pid: string, id: string, payload: Record<string, unknown> = {}) {
+  await app.inject({
+    method: "POST",
+    url: `/api/v1/projects/${pid}/disbursements/${id}/certify`,
+    headers: payerHeaders,
+    payload: { note: "Independent engineer certification" },
+  });
+  return app.inject({
+    method: "POST",
+    url: `/api/v1/projects/${pid}/disbursements/${id}/disburse`,
+    headers: payerHeaders,
+    payload,
   });
 }
 
@@ -534,11 +564,28 @@ describe("disbursement conditionality gate", () => {
     });
     expect(reApprove.statusCode).toBe(400);
 
-    const disbursed = await app.inject({
+    // the requester cannot also pay (#744 separation of duties)
+    const selfPay = await app.inject({
       method: "POST",
       url: `/api/v1/projects/${pid}/disbursements/${d.id}/disburse`,
       headers: owner.headers,
-      payload: { disbursedAt: `${todayISO()}T12:00:00Z` },
+      payload: {},
+    });
+    expect(selfPay.statusCode).toBe(403);
+    expect((selfPay.json() as { message: string }).message).toContain("Separation of duties");
+
+    // a loan facility must be certified by the independent engineer first
+    const uncertified = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/disbursements/${d.id}/disburse`,
+      headers: payerHeaders,
+      payload: {},
+    });
+    expect(uncertified.statusCode).toBe(409);
+    expect((uncertified.json() as { message: string }).message).toContain("certification");
+
+    const disbursed = await certifyAndDisburse(pid, d.id, {
+      disbursedAt: `${todayISO()}T12:00:00Z`,
     });
     expect(disbursed.statusCode).toBe(200);
     expect((disbursed.json() as { status: string }).status).toBe("disbursed");
@@ -584,12 +631,7 @@ describe("disbursement conditionality gate", () => {
       headers: approverHeaders,
       payload: {},
     });
-    await app.inject({
-      method: "POST",
-      url: `/api/v1/projects/${pid}/disbursements/${d1.id}/disburse`,
-      headers: owner.headers,
-      payload: {},
-    });
+    await certifyAndDisburse(pid, d1.id);
     const d2 = (
       await createDisbursement(pid, fac.id, { amount: 15000, categoryId: supervision })
     ).json() as { id: string };
@@ -622,17 +664,31 @@ describe("disbursement conditionality gate", () => {
     });
     expect(res.statusCode).toBe(200);
     const s = res.json() as {
-      committed: number;
-      disbursed: number;
-      undisbursed: number;
+      committedByCurrency: { currency: string; amount: number }[];
+      disbursedByCurrency: { currency: string; amount: number }[];
+      undisbursedByCurrency: { currency: string; amount: number }[];
+      committedTotal: { value: number | null; currency?: string; reasons?: string[] };
+      disbursedTotal: { value: number | null; currency?: string };
+      undisbursedTotal: { value: number | null; currency?: string };
       pendingRequests: number;
       openConditions: number;
       covenantStatus: string;
-      byCategory: { name: string; limit: number; disbursed: number; remaining: number }[];
+      byCategory: {
+        name: string;
+        limit: number;
+        disbursed: number;
+        pipeline: number;
+        available: number;
+        remaining: number;
+      }[];
     };
-    expect(s.committed).toBe(100000);
-    expect(s.disbursed).toBe(40000);
-    expect(s.undisbursed).toBe(60000);
+    // single-currency project: the headline figure is allowed
+    expect(s.committedTotal).toMatchObject({ value: 100000, currency: "USD" });
+    expect(s.disbursedTotal).toMatchObject({ value: 40000, currency: "USD" });
+    expect(s.undisbursedTotal).toMatchObject({ value: 60000, currency: "USD" });
+    expect(s.committedByCurrency).toEqual([
+      { currency: "USD", amount: 100000, recordCount: 1 },
+    ]);
     expect(s.pendingRequests).toBe(1);
     expect(s.openConditions).toBe(1);
     expect(s.covenantStatus).toBe("compliant");
@@ -792,12 +848,7 @@ describe("statement of expenditure", () => {
       headers: approverHeaders,
       payload: {},
     });
-    await app.inject({
-      method: "POST",
-      url: `/api/v1/projects/${pid}/disbursements/${d1.id}/disburse`,
-      headers: owner.headers,
-      payload: {},
-    });
+    await certifyAndDisburse(pid, d1.id);
     const d2 = (
       await createDisbursement(pid, fac.id, { amount: 5000, purpose: "Site supervision" })
     ).json() as { id: string };

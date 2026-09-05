@@ -164,6 +164,9 @@ const storedFields = (value: unknown): FormFieldDef[] =>
 const storedLogic = (value: unknown): Record<string, FormLogicRule> =>
   value && typeof value === "object" ? (value as Record<string, FormLogicRule>) : {};
 
+/** How many responses one CSV export will carry before it says it is partial. */
+const RESPONSE_EXPORT_CAP = 10_000;
+
 function csvCell(value: unknown): string {
   if (value === null || value === undefined) return "";
   const text = Array.isArray(value) ? value.join("; ") : typeof value === "object" ? JSON.stringify(value) : String(value);
@@ -693,7 +696,10 @@ export const formRoutes: FastifyPluginAsync = async (app) => {
           ),
         )
         .orderBy(asc(formResponses.number))
-        .limit(10_000);
+        .limit(RESPONSE_EXPORT_CAP + 1);
+      // A partial export that looks complete is worse than no export.
+      const truncated = rows.length > RESPONSE_EXPORT_CAP;
+      const responses = rows.slice(0, RESPONSE_EXPORT_CAP);
       const fields = storedFields(template.fields).filter((f) => f.type !== "heading");
       const header = [
         "reference",
@@ -705,7 +711,7 @@ export const formRoutes: FastifyPluginAsync = async (app) => {
         ...fields.map((f) => f.key),
       ];
       const lines = [header.map(csvCell).join(",")];
-      for (const row of rows) {
+      for (const row of responses) {
         const values = (row.values ?? {}) as Record<string, unknown>;
         lines.push(
           [
@@ -728,11 +734,20 @@ export const formRoutes: FastifyPluginAsync = async (app) => {
         action: "access",
         objectType: "form_template",
         objectId: q.templateId,
-        payload: { export: "csv", rows: rows.length },
+        payload: { export: "csv", rows: responses.length, truncated },
       });
+      if (truncated) {
+        lines.push("");
+        lines.push(
+          csvCell(
+            `PARTIAL EXPORT: this form has more than ${RESPONSE_EXPORT_CAP.toLocaleString("en-GB")} responses on this project. Only the first ${responses.length.toLocaleString("en-GB")} by reference are listed above.`,
+          ),
+        );
+      }
       return reply
         .header("content-type", "text/csv; charset=utf-8")
         .header("content-disposition", `attachment; filename="${template.key}-responses.csv"`)
+        .header("x-register-complete", truncated ? "false" : "true")
         .send(lines.join("\n"));
     },
   );

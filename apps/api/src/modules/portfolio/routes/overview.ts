@@ -15,7 +15,7 @@
  * knows it.
  */
 import type { FastifyPluginAsync } from "fastify";
-import { and, count, desc, eq, inArray, isNull, ne, type SQL } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNull, ne, or, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import {
   auditRightsExecutions,
@@ -531,6 +531,17 @@ export const overviewRoutes: FastifyPluginAsync = async (app) => {
       inArray(signals.detector, q.detector ? [q.detector] : [...PORTFOLIO_SIGNAL_DETECTORS]),
     ];
     if (!q.includeClosed) clauses.push(ne(signals.disposition, "closed"));
+    /* Company-wide signals carry no project; project-scoped ones are visible
+       only to members (plan §6.3). The clause goes into the WHERE, not into a
+       filter over the page — filtering after LIMIT/OFFSET reports a total the
+       caller cannot see and hands back short, shifting pages. */
+    if (visible !== null) {
+      const visibilityClause =
+        visible.length === 0
+          ? isNull(signals.projectId)
+          : or(isNull(signals.projectId), inArray(signals.projectId, visible));
+      if (visibilityClause) clauses.push(visibilityClause);
+    }
     const where = and(...clauses);
     const [totalRow] = await app.db.select({ n: count() }).from(signals).where(where);
     const rows = await app.db
@@ -540,13 +551,7 @@ export const overviewRoutes: FastifyPluginAsync = async (app) => {
       .orderBy(desc(signals.createdAt))
       .limit(q.pageSize)
       .offset(pageOffset(q));
-    /* Company-wide signals carry no project; project-scoped ones are filtered
-       to the projects the caller may see (plan §6.3). */
-    const items =
-      visible === null
-        ? rows
-        : rows.filter((r) => r.projectId === null || visible.includes(r.projectId));
-    return paginate(items, Number(totalRow?.n ?? 0), q);
+    return paginate(rows, Number(totalRow?.n ?? 0), q);
   });
 
   /** Run every portfolio sweep for this company, now. */

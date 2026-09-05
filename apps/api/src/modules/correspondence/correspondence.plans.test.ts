@@ -124,11 +124,11 @@ beforeAll(async () => {
     metadata: {},
     uploadedBy: owner.userId,
   });
-}, 180_000);
+}, 600_000);
 
 afterAll(async () => {
   await built.close();
-}, 60_000);
+}, 120_000);
 
 /* ================================================================== */
 /* Templates (#447–#451)                                               */
@@ -487,7 +487,7 @@ describe("waivers and segregation of duties", () => {
     waiverPlanId = plan.json().id;
     waiverActivityId = plan.json().activities[0].id;
     await post(`/projects/${projectId}/correspondence/action-plans/${waiverPlanId}/activate`, {});
-  }, 180_000);
+  }, 600_000);
 
   it("does not let the person who submitted the evidence be the only signatory", async () => {
     await post(

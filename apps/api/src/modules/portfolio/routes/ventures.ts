@@ -461,6 +461,27 @@ export const ventureRoutes: FastifyPluginAsync = async (app) => {
         )
         .limit(1);
       if (!partner) throw notFound("Partner not found in this venture");
+      /* The same rule the create route enforces: a venture has one "our
+         share". Without it here, flipping a second partner's flag makes
+         venturePosition report an arbitrary partner's numbers as ours. */
+      if (body.isSelf === true && partner.isSelf !== 1) {
+        const [existing] = await app.db
+          .select({ id: jvPartners.id, name: jvPartners.name })
+          .from(jvPartners)
+          .where(
+            and(
+              eq(jvPartners.companyId, req.companyId!),
+              eq(jvPartners.jvId, jvId),
+              eq(jvPartners.isSelf, 1),
+            ),
+          )
+          .limit(1);
+        if (existing) {
+          throw conflict(
+            `"${existing.name}" is already recorded as this company's own participation; a venture has one "our share". Clear that flag before setting this one.`,
+          );
+        }
+      }
       const set = patchSet(body as Record<string, unknown>);
       if (body.isSelf !== undefined) set["isSelf"] = body.isSelf ? 1 : 0;
       await app.db.update(jvPartners).set(set).where(eq(jvPartners.id, partnerId));

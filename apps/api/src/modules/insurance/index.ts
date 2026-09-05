@@ -100,7 +100,12 @@ import {
   scopeProjectsOrCompanyWide,
 } from "../meetings/scope.js";
 import { aiDisabledError, aiEnabled, runAgent, streamToBuffer } from "../ai/service.js";
-import { buildAppUrl, resolveEmailTransport, type EmailTransport } from "../../lib/email.js";
+import {
+  buildAppUrl,
+  escapeHtml,
+  resolveEmailTransport,
+  type EmailTransport,
+} from "../../lib/email.js";
 import {
   buildExtractionSystemPrompt,
   buildExtractionUserPrompt,
@@ -6109,11 +6114,18 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         .filter((l) => l !== null)
         .join("\n");
 
-      const result = await emailTransport().send({
-        to: { email: body.recipientEmail, name: body.recipientName ?? undefined },
-        subject: `Confirmation of insurance — ${cert.subjectName} (${cert.policyType})`,
-        text: lines,
-      });
+      const result = await emailTransport().send(
+        {
+          to: { email: body.recipientEmail, name: body.recipientName ?? undefined },
+          subject: `Confirmation of insurance — ${cert.subjectName} (${cert.policyType})`,
+          text: lines,
+          /* Same words, escaped: some mail clients never show the text part,
+             and a confirmation request the recipient cannot read is not one. */
+          html: `<pre style="font:14px/1.5 ui-monospace,Menlo,monospace;white-space:pre-wrap">${escapeHtml(lines)}</pre>`,
+        },
+        /* The token is a bearer credential: keep it out of the stored body. */
+        [token],
+      );
       await app.db
         .update(insuranceConfirmations)
         .set({

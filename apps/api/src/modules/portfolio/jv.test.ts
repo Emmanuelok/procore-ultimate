@@ -154,6 +154,39 @@ describe("decideVote (#1058)", () => {
     expect(out.reasons.join(" ")).toMatch(/appears more than once/);
   });
 
+  it("does not carry a 50/50 deadlock when the deed states no threshold", () => {
+    /* Regression: a derived simple majority must be BEATEN, not merely met.
+       Two 50% partners splitting for/against is a deadlock; minuting it as
+       carried would bind the venture to a decision it never took. */
+    const even: PartnerRow[] = [
+      { ...partners[0]!, sharePercent: 50 },
+      { ...partners[1]!, sharePercent: 50 },
+    ];
+    const out = decideVote(even, [
+      { partnerId: "pa", vote: "for" },
+      { partnerId: "pb", vote: "against" },
+    ], { quorumPercent: null, thresholdPercent: null, decisionType: "ordinary" });
+    expect(out.sharePresentPercent).toBe(100);
+    expect(out.shareForPercent).toBe(50);
+    expect(out.thresholdPercent).toBe(50);
+    expect(out.thresholdMet).toBe(false);
+    expect(out.outcome).toBe("rejected");
+    expect(out.reasons.join(" ")).toMatch(/deadlocked/);
+  });
+
+  it("still carries a 50/50 split where the deed itself sets the bar at 50%", () => {
+    const even: PartnerRow[] = [
+      { ...partners[0]!, sharePercent: 50 },
+      { ...partners[1]!, sharePercent: 50 },
+    ];
+    const out = decideVote(even, [
+      { partnerId: "pa", vote: "for" },
+      { partnerId: "pb", vote: "against" },
+    ], { quorumPercent: null, thresholdPercent: 50, decisionType: "ordinary" });
+    expect(out.thresholdMet).toBe(true);
+    expect(out.outcome).toBe("approved");
+  });
+
   it("defers when nobody voted", () => {
     const out = decideVote(partners, [], { quorumPercent: null, thresholdPercent: 0, decisionType: "ordinary" });
     expect(out.sharePresentPercent).toBe(0);

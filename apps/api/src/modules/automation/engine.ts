@@ -13,10 +13,15 @@
  *    can ever fail the business write that produced the event.
  *  · schedule rules: `scanSchedules` runs from the scheduler job
  *    `automation.schedules`. For each due rule it lists the company's live
- *    records of the trigger type (bounded by SCAN_LIMIT), evaluates conditions
- *    BEFORE creating a run so a daily scan over 500 open RFIs does not leave
- *    500 "skipped" rows, dedupes against runs inside the cooldown window, and
- *    executes the matches.
+ *    records of the trigger type — bounded by `scanLimit` and ordered OLDEST
+ *    FIRST on the field the rule ages on (its "overdue by"/"older than" field,
+ *    else the type's deadline, else createdAt), because every schedule rule is
+ *    about the records that have waited LONGEST — evaluates conditions BEFORE creating a
+ *    run so a daily scan over 500 open RFIs does not leave 500 "skipped" rows,
+ *    dedupes against runs inside the cooldown window, and executes the
+ *    matches. When the cap cuts the list short the rule is stamped
+ *    (`lastScanTruncated`) and the scan says so: a partial scan is never
+ *    reported as "nothing matched".
  *  · queued (non-immediate) runs are executed by the `automation.drain` job.
  *
  * LOOP GUARD
@@ -55,8 +60,8 @@ import {
   type ExecutorDeps,
   type RunFacts,
 } from "./actions.js";
-import { evaluateCondition, referencedFields, type EvaluationContext } from "./predicates.js";
-import { loadSnapshot, scanCandidates, snapshotEntry, type LoadedSnapshot } from "./snapshots.js";
+import { ageingOrderField, evaluateCondition, referencedFields, type EvaluationContext } from "./predicates.js";
+import { loadSnapshot, scanCandidates, SCAN_LIMIT, snapshotEntry, type LoadedSnapshot } from "./snapshots.js";
 
 export type RuleRow = typeof automationRules.$inferSelect;
 export type RunRow = typeof automationRuns.$inferSelect;
@@ -66,6 +71,8 @@ export interface EngineOptions {
   maxChainDepth: number;
   maxAttempts: number;
   drainBatch: number;
+  /** rows one schedule scan may look at (hard-capped by SCAN_LIMIT) */
+  scanLimit: number;
   requestTimeoutMs: number;
   responseBodyLimit: number;
   /** origin entries older than this are forgotten */
@@ -90,6 +97,7 @@ export function defaultEngineOptions(
     maxChainDepth: Math.max(0, intFromEnv(env, "AUTOMATION_MAX_CHAIN_DEPTH", 3)),
     maxAttempts: Math.max(1, intFromEnv(env, "AUTOMATION_MAX_ATTEMPTS", 5)),
     drainBatch: Math.max(1, intFromEnv(env, "AUTOMATION_DRAIN_BATCH", 50)),
+    scanLimit: Math.min(SCAN_LIMIT, Math.max(1, intFromEnv(env, "AUTOMATION_SCAN_LIMIT", SCAN_LIMIT))),
     requestTimeoutMs: intFromEnv(env, "AUTOMATION_WEBHOOK_TIMEOUT_MS", 10_000),
     responseBodyLimit: intFromEnv(env, "AUTOMATION_RESPONSE_BODY_LIMIT", 2_048),
     originTtlMs: 5 * 60_000,
@@ -775,7 +783,16 @@ export class AutomationEngine {
       let truncated = false;
       let orderedBy = "none";
       try {
-        const page = await scanCandidates(this.db, companyId, rule.triggerObjectType, rule.projectId);
+        // Order the capped scan by the field this rule ages on when it has
+        // one ("open 14+ days" → createdAt), otherwise by the type's deadline.
+        const page = await scanCandidates(
+          this.db,
+          companyId,
+          rule.triggerObjectType,
+          rule.projectId,
+          this.options.scanLimit,
+          ageingOrderField(rule.conditions ?? null),
+        );
         const candidates = page.candidates;
         scanned = candidates.length;
         truncated = page.truncated;

@@ -38,7 +38,13 @@ import {
   summariseBias,
   summariseValidation,
 } from "./reports.js";
-import { AGENT_INVENTORY, getAgentDefinition, KNOWN_AGENT_KINDS } from "./registry.js";
+import {
+  AGENT_DEFINITIONS,
+  AGENT_INVENTORY,
+  getAgentDefinition,
+  KNOWN_AGENT_KINDS,
+} from "./registry.js";
+import { TOOLS } from "@constructos/shared";
 
 const policy = (over: Partial<EffectivePolicy> = {}): EffectivePolicy => ({
   ...GLOBAL_POLICY_DEFAULT,
@@ -338,7 +344,59 @@ describe("reviewer tool mapping", () => {
     expect(targetTool("drawing_sheet")).toBe("drawings");
     expect(targetTool("submittal_review")).toBe("submittals");
     expect(targetTool("signal_explanation")).toBe("assurance");
-    expect(targetTool("cost_forecast")).toBeNull();
+  });
+
+  // REGRESSION. An advisory proposal used to map to null, which gated it at
+  // `ai` level: an ai:standard / budget:none member could read every budget
+  // figure out of a cost_forecast proposal body. The body is data, so the tool
+  // that owns the data gates it.
+  it("gates an ADVISORY target type by the tool that owns the data it quotes", () => {
+    expect(targetTool("cost_forecast")).toBe("budget");
+    expect(targetTool("change_impact")).toBe("budget");
+    expect(targetTool("bid_levelling")).toBe("bidding");
+    expect(targetTool("incident_classification")).toBe("safety");
+    expect(targetTool("spec_compliance")).toBe("specifications");
+    expect(targetTool("schedule_risk")).toBe("schedule");
+    expect(targetTool("meeting_minutes")).toBe("meetings");
+    expect(targetTool("risk_finding")).toBe("risk");
+    expect(targetTool("notice_draft")).toBe("contracts");
+    expect(targetTool("obligation_finding")).toBe("contracts");
+    expect(targetTool("claim_narrative")).toBe("forensics");
+    expect(targetTool("rebuttal")).toBe("forensics");
+    expect(targetTool("evidence_assessment")).toBe("assurance");
+    expect(targetTool("counterfactual")).toBe("assurance");
+    expect(targetTool("integrity_memo")).toBe("assurance");
+    expect(targetTool("document_synthesis")).toBe("drawings");
+    // agent_actions.targetType for the photo-intelligence write
+    expect(targetTool("photo")).toBe("photos");
+    // an unknown type still falls back to the `ai` gate at the call site
+    expect(targetTool("something_new")).toBeNull();
+  });
+
+  it("leaves no fleet target type ungated", () => {
+    for (const entry of AGENT_INVENTORY) {
+      for (const t of entry.targetTypes) {
+        expect(targetTool(t), `${entry.kind} → ${t}`).not.toBeNull();
+      }
+    }
+  });
+});
+
+describe("every agent declares the tools that own what it reads", () => {
+  it("names at least one real tool per fleet agent", () => {
+    const toolSet = new Set<string>(TOOLS);
+    for (const def of AGENT_DEFINITIONS.values()) {
+      expect(def.requiredTools.length, def.kind).toBeGreaterThan(0);
+      for (const tool of def.requiredTools) {
+        expect(toolSet.has(tool), `${def.kind} requires unknown tool ${tool}`).toBe(true);
+      }
+    }
+  });
+
+  it("publishes them on the inventory so an administrator can see the real gate", () => {
+    for (const entry of AGENT_INVENTORY) {
+      expect(entry.requiredTools.length, entry.kind).toBeGreaterThan(0);
+    }
   });
 });
 

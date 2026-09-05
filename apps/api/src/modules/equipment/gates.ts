@@ -15,7 +15,11 @@
  * on AT LEAST ONE project in the company (owners and admins bypass, as they
  * do everywhere else; an assurance grant confers read only). And because
  * "holding equipment on one project" is not "may see every project's plant",
- * `visibleProjectIds` narrows what the list routes actually return.
+ * the gate stashes the caller's scope on the request and `scopeProjectFilter`
+ * narrows what the registers actually return — the fleet list, the
+ * certificate and maintenance registers, the raw telematics feed, the
+ * availability calendar and the ownership comparison — while a per-machine
+ * route answers 404 for plant outside that scope.
  */
 import type { FastifyInstance, FastifyRequest, preHandlerHookHandler } from "fastify";
 import { and, eq, inArray, isNull, or } from "drizzle-orm";

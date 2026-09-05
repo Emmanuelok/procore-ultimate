@@ -311,8 +311,21 @@ export const fundingRoutes: FastifyPluginAsync = async (app) => {
   app.get("/portfolio/funding-sources/:sourceId", { preHandler: companyGate }, async (req) => {
     const { sourceId } = req.params as { sourceId: string };
     const row = await fetchSource(sourceId, req.companyId!);
+    /* The facility's POSITION is computed over every allocation drawn on it —
+       headroom is a property of the facility, not of who is looking. The rows
+       themselves are project data, so they are filtered to the projects the
+       caller may see (§6.3), and the response says when the list was narrowed
+       rather than quietly showing a short one. */
     const allocations = await loadAllocations(app.db, req.companyId!);
+    const visible = await visibleProjectIds(app.db, req.companyId!, req.user!.id, req.companyRole);
     const mine = allocations.filter((a) => a.fundingSourceId === sourceId);
+    const shown = visible === null ? mine : mine.filter((a) => visible.includes(a.projectId));
+    const reasons: string[] = [];
+    if (visible !== null && shown.length < mine.length) {
+      reasons.push(
+        `${mine.length - shown.length} allocation(s) on this facility belong to projects you are not a member of and are not listed; the position above still counts them.`,
+      );
+    }
     return {
       ...row,
       position: fundingSourcePosition(
@@ -325,8 +338,9 @@ export const fundingRoutes: FastifyPluginAsync = async (app) => {
         },
         allocations,
       ),
-      allocations: mine,
-      classificationSplit: classificationSplit(mine),
+      allocations: shown,
+      classificationSplit: classificationSplit(shown),
+      reasons,
     };
   });
 
@@ -581,12 +595,22 @@ export const fundingRoutes: FastifyPluginAsync = async (app) => {
               .limit(1)
           )[0] ?? null)
         : null;
+      const mine = allocations.filter((a) => a.appropriationId === appropriationId);
+      const visible = await visibleProjectIds(app.db, req.companyId!, req.user!.id, req.companyRole);
+      const shown = visible === null ? mine : mine.filter((a) => visible.includes(a.projectId));
+      const reasons: string[] = [];
+      if (visible !== null && shown.length < mine.length) {
+        reasons.push(
+          `${mine.length - shown.length} allocation(s) against this appropriation belong to projects you are not a member of and are not listed; the position above still counts them.`,
+        );
+      }
       return {
         ...row,
         position: appropriationPosition(toAppropriationRow(row), allocations),
-        allocations: allocations.filter((a) => a.appropriationId === appropriationId),
+        allocations: shown,
         virements,
         carriedForwardFrom: carriedFrom,
+        reasons,
       };
     },
   );
@@ -937,6 +961,18 @@ export const fundingRoutes: FastifyPluginAsync = async (app) => {
             )
             .for("update");
           if (!from || !to) throw notFound("A named appropriation no longer exists");
+          /* Authority cannot be moved into or out of a year that has been
+             settled. Writing virementNet on a closed, lapsed or carried-forward
+             appropriation changes an `authorised` figure the successor's
+             carry-forward was already reconciled against. Same rule, same
+             words, as allocating against one. */
+          for (const side of [from, to]) {
+            if (["draft", "closed", "lapsed", "carried_forward"].includes(side.status)) {
+              throw conflict(
+                `"${side.name}" is ${side.status.replace(/_/g, " ")}; only approved or committed authority can be vired. Reopen or supersede it first.`,
+              );
+            }
+          }
           const allocations = await loadAllocations(tx, companyId);
           const afterFrom = appropriationPosition(
             { ...toAppropriationRow(from), virementNet: round2(from.virementNet - virement.amount) },
@@ -1022,6 +1058,7 @@ export const fundingRoutes: FastifyPluginAsync = async (app) => {
       appropriationId: string | null;
       currency: string;
       amount: number;
+      fiscalYear?: string | null;
       excludeAllocationId?: string;
     },
   ): Promise<void> {
@@ -1064,6 +1101,19 @@ export const fundingRoutes: FastifyPluginAsync = async (app) => {
       if (["draft", "closed", "lapsed", "carried_forward"].includes(appropriation.status)) {
         throw conflict(
           `The appropriation is ${appropriation.status.replace(/_/g, " ")}; only approved or committed authority can be allocated.`,
+        );
+      }
+      /* An allocation's fiscal year is the year its demand is measured in
+         (affordability matches envelope to demand on year + currency + class).
+         Drawing on FY2026 authority while declaring FY2030 would measure the
+         same money against a ceiling that never authorised it. */
+      if (
+        input.fiscalYear !== undefined &&
+        input.fiscalYear !== null &&
+        input.fiscalYear !== appropriation.fiscalYear
+      ) {
+        throw badRequest(
+          `This allocation declares fiscal year ${input.fiscalYear} but draws on "${appropriation.name}", which is ${appropriation.fiscalYear} authority. An allocation is measured in the year of the authority behind it.`,
         );
       }
       const position = appropriationPosition(toAppropriationRow(appropriation), withProbe);
@@ -1179,6 +1229,7 @@ export const fundingRoutes: FastifyPluginAsync = async (app) => {
         appropriationId: body.appropriationId ?? null,
         currency: body.currency,
         amount: body.amount,
+        fiscalYear: body.fiscalYear ?? null,
       });
       await tx.insert(portfolioAllocations).values({
         id,
@@ -1236,10 +1287,15 @@ export const fundingRoutes: FastifyPluginAsync = async (app) => {
     const companyId = req.companyId!;
     const row = await fetchAllocation(allocationId, companyId);
     if (row.status === "cancelled") throw conflict("A cancelled allocation cannot be edited.");
+    /* fiscalYear is the key affordability() matches demand on, so moving it
+       moves the allocation from one envelope's demand to another's. That is a
+       money change like any other: it may not ride an approval given against
+       the old year. */
     const changesMoney =
       (body.amount !== undefined && body.amount !== row.amount) ||
       (body.appropriationId !== undefined && body.appropriationId !== row.appropriationId) ||
-      (body.fundingSourceId !== undefined && body.fundingSourceId !== row.fundingSourceId);
+      (body.fundingSourceId !== undefined && body.fundingSourceId !== row.fundingSourceId) ||
+      (body.fiscalYear !== undefined && (body.fiscalYear ?? null) !== row.fiscalYear);
     if (changesMoney && row.drawnAmount > 0.005) {
       throw conflict(
         `${row.drawnAmount} ${row.currency} has already been drawn against this allocation; its source and amount can no longer be changed.`,
@@ -1270,6 +1326,7 @@ export const fundingRoutes: FastifyPluginAsync = async (app) => {
           appropriationId: nextAppropriation,
           currency: row.currency,
           amount: body.amount ?? row.amount,
+          fiscalYear: body.fiscalYear !== undefined ? (body.fiscalYear ?? null) : row.fiscalYear,
           excludeAllocationId: row.id,
         });
       }
@@ -1531,25 +1588,56 @@ export const fundingRoutes: FastifyPluginAsync = async (app) => {
         throw conflict("A superseded envelope cannot be reactivated; create a new one.");
       }
       if (row.status === "active") return row;
-      const clashes = await app.db
-        .select()
-        .from(portfolioEnvelopes)
-        .where(
-          and(
-            eq(portfolioEnvelopes.companyId, req.companyId!),
-            eq(portfolioEnvelopes.status, "active"),
-            eq(portfolioEnvelopes.fiscalYear, row.fiscalYear),
-            eq(portfolioEnvelopes.currency, row.currency),
-            eq(portfolioEnvelopes.expenditureClass, row.expenditureClass),
-          ),
-        );
-      const same = clashes.filter((c) => (c.portfolioId ?? null) === (row.portfolioId ?? null));
       const at = nowISO();
-      for (const c of same) {
-        await app.db
+      /* Read, supersede and activate as ONE act, with the envelopes for this
+         (portfolio, year, currency, class) locked. Two concurrent activations
+         run as separate statements each see no clash and both end active,
+         which is exactly the "two live ceilings over the same money" this
+         route exists to prevent. */
+      const same = await app.db.transaction(async (tx) => {
+        const clashes = await tx
+          .select()
+          .from(portfolioEnvelopes)
+          .where(
+            and(
+              eq(portfolioEnvelopes.companyId, req.companyId!),
+              eq(portfolioEnvelopes.status, "active"),
+              eq(portfolioEnvelopes.fiscalYear, row.fiscalYear),
+              eq(portfolioEnvelopes.currency, row.currency),
+              eq(portfolioEnvelopes.expenditureClass, row.expenditureClass),
+            ),
+          )
+          .for("update");
+        const clashing = clashes.filter((c) => (c.portfolioId ?? null) === (row.portfolioId ?? null));
+        /* Re-read the target under the same lock: a concurrent activation may
+           have moved it since it was fetched. */
+        const [target] = await tx
+          .select()
+          .from(portfolioEnvelopes)
+          .where(
+            and(
+              eq(portfolioEnvelopes.id, envelopeId),
+              eq(portfolioEnvelopes.companyId, req.companyId!),
+            ),
+          )
+          .for("update");
+        if (!target) throw notFound("Envelope not found");
+        if (target.status === "superseded") {
+          throw conflict("A superseded envelope cannot be reactivated; create a new one.");
+        }
+        for (const c of clashing) {
+          await tx
+            .update(portfolioEnvelopes)
+            .set({ status: "superseded", supersededById: row.id, updatedAt: at })
+            .where(eq(portfolioEnvelopes.id, c.id));
+        }
+        await tx
           .update(portfolioEnvelopes)
-          .set({ status: "superseded", supersededById: row.id, updatedAt: at })
-          .where(eq(portfolioEnvelopes.id, c.id));
+          .set({ status: "active", updatedAt: at })
+          .where(eq(portfolioEnvelopes.id, envelopeId));
+        return clashing;
+      });
+      for (const c of same) {
         await ledger(app.db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
@@ -1560,10 +1648,6 @@ export const fundingRoutes: FastifyPluginAsync = async (app) => {
           storePayload: true,
         });
       }
-      await app.db
-        .update(portfolioEnvelopes)
-        .set({ status: "active", updatedAt: at })
-        .where(eq(portfolioEnvelopes.id, envelopeId));
       await ledger(app.db, {
         companyId: req.companyId!,
         actorId: req.user!.id,

@@ -371,7 +371,13 @@ export async function sweepResponseDue(
   result.scanned = rows.length;
   if (rows.length === 0) return result;
 
-  const seen = await alreadySignalled(db, companyId, ["correspondence_response_overdue"], projectId);
+  const seen = await alreadySignalled(
+    db,
+    companyId,
+    ["correspondence_response_overdue"],
+    projectId,
+    rows.map((row) => `corr:letter:${row.id}:response_overdue`),
+  );
   for (const row of rows) {
     const assessment = assessLetter(toLetterInput(row), today);
     if (!assessment.overdue || assessment.daysOverdue === null) continue;
@@ -446,7 +452,13 @@ export async function sweepAckDue(
   result.scanned = rows.length;
   if (rows.length === 0) return result;
 
-  const seen = await alreadySignalled(db, companyId, ["correspondence_ack_overdue"], projectId);
+  const seen = await alreadySignalled(
+    db,
+    companyId,
+    ["correspondence_ack_overdue"],
+    projectId,
+    rows.map((row) => `corr:transmittal:${row.id}:ack_overdue`),
+  );
   for (const row of rows) {
     const recipients = (await loadRecipients(db, companyId, "transmittal", row.id)).map(
       toRecipientInput,
@@ -522,7 +534,13 @@ export async function sweepPlanDue(
   result.scanned = plans.length;
   if (plans.length === 0) return result;
 
-  const seen = await alreadySignalled(db, companyId, ["correspondence_plan_overdue"], projectId);
+  const seen = await alreadySignalled(
+    db,
+    companyId,
+    ["correspondence_plan_overdue"],
+    projectId,
+    plans.map((plan) => `corr:plan:${plan.id}:overdue`),
+  );
   for (const plan of plans) {
     const activities = (await loadPlanActivities(db, companyId, plan.id)).map(toActivityInput);
     const report = completionReport(activities, today);
@@ -602,7 +620,13 @@ export async function sweepFormDue(
   result.scanned = rows.length;
   if (rows.length === 0) return result;
 
-  const seen = await alreadySignalled(db, companyId, ["correspondence_form_overdue"], projectId);
+  const seen = await alreadySignalled(
+    db,
+    companyId,
+    ["correspondence_form_overdue"],
+    projectId,
+    rows.map((row) => `corr:form_assignment:${row.id}:overdue`),
+  );
   for (const row of rows) {
     const late = daysBetween(row.dueDate, today);
     if (late === null || late <= 0) continue;
@@ -712,13 +736,40 @@ export interface CorrespondenceSummary {
   reasons: string[];
 }
 
+/**
+ * The row caps the summary reads under. A register bigger than its cap would
+ * otherwise produce a confidently wrong figure; instead the read fetches one
+ * row past the cap, keeps the cap, and says in `reasons` that the numbers do
+ * not cover the whole register. A figure the platform cannot derive honestly
+ * is stated as partial, never presented as complete.
+ */
+export const SUMMARY_ROW_CAP = 20_000;
+export const SUMMARY_ACTIVITY_CAP = 50_000;
+export const SUMMARY_TEMPLATE_CAP = 5_000;
+
+function capped<T>(rows: T[], cap: number, what: string, reasons: string[]): T[] {
+  if (rows.length <= cap) return rows;
+  reasons.push(
+    `This project holds more than ${cap.toLocaleString("en-GB")} ${what}. Every figure below counts only the ${cap.toLocaleString("en-GB")} rows read, so treat them as a floor rather than the whole register.`,
+  );
+  return rows.slice(0, cap);
+}
+
 export async function correspondenceSummary(
   db: Db,
   companyId: string,
   projectId: string,
   today: string,
 ): Promise<CorrespondenceSummary> {
-  const [letterRows, transmittalRows, planRows, activityRows, templateRows, assignmentRows, responseRows] =
+  const [
+    letterRowsRaw,
+    transmittalRowsRaw,
+    planRowsRaw,
+    activityRowsRaw,
+    templateRowsRaw,
+    assignmentRowsRaw,
+    responseRowsRaw,
+  ] =
     await Promise.all([
       db
         .select(LETTER_COLUMNS)
@@ -729,17 +780,17 @@ export async function correspondenceSummary(
             eq(correspondenceLetters.projectId, projectId),
           ),
         )
-        .limit(20_000),
+        .limit(SUMMARY_ROW_CAP + 1),
       db
         .select()
         .from(transmittals)
         .where(and(eq(transmittals.companyId, companyId), eq(transmittals.projectId, projectId)))
-        .limit(20_000),
+        .limit(SUMMARY_ROW_CAP + 1),
       db
         .select()
         .from(actionPlans)
         .where(and(eq(actionPlans.companyId, companyId), eq(actionPlans.projectId, projectId)))
-        .limit(20_000),
+        .limit(SUMMARY_ROW_CAP + 1),
       db
         .select({
           status: actionPlanActivities.status,
@@ -752,7 +803,7 @@ export async function correspondenceSummary(
             eq(actionPlanActivities.projectId, projectId),
           ),
         )
-        .limit(50_000),
+        .limit(SUMMARY_ACTIVITY_CAP + 1),
       db
         .select({ status: formTemplates.status, projectId: formTemplates.projectId })
         .from(formTemplates)
@@ -762,20 +813,32 @@ export async function correspondenceSummary(
             or(isNull(formTemplates.projectId), eq(formTemplates.projectId, projectId)),
           ),
         )
-        .limit(5000),
+        .limit(SUMMARY_TEMPLATE_CAP + 1),
       db
         .select()
         .from(formAssignments)
         .where(and(eq(formAssignments.companyId, companyId), eq(formAssignments.projectId, projectId)))
-        .limit(20_000),
+        .limit(SUMMARY_ROW_CAP + 1),
       db
         .select({ status: formResponses.status })
         .from(formResponses)
         .where(and(eq(formResponses.companyId, companyId), eq(formResponses.projectId, projectId)))
-        .limit(20_000),
+        .limit(SUMMARY_ROW_CAP + 1),
     ]);
 
   const reasons: string[] = [];
+  const letterRows = capped(letterRowsRaw, SUMMARY_ROW_CAP, "letters", reasons);
+  const transmittalRows = capped(transmittalRowsRaw, SUMMARY_ROW_CAP, "transmittals", reasons);
+  const planRows = capped(planRowsRaw, SUMMARY_ROW_CAP, "action plans", reasons);
+  const activityRows = capped(
+    activityRowsRaw,
+    SUMMARY_ACTIVITY_CAP,
+    "action plan activities",
+    reasons,
+  );
+  const assignmentRows = capped(assignmentRowsRaw, SUMMARY_ROW_CAP, "form assignments", reasons);
+  const templateRows = capped(templateRowsRaw, SUMMARY_TEMPLATE_CAP, "form templates", reasons);
+  const responseRows = capped(responseRowsRaw, SUMMARY_ROW_CAP, "form responses", reasons);
   const letters = registerStats(letterRows.map(toLetterInput), today);
 
   const transmittalStatuses: Record<string, number> = {};

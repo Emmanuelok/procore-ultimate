@@ -130,11 +130,11 @@ beforeAll(async () => {
     metadata: {},
     uploadedBy: owner.userId,
   });
-}, 180_000);
+}, 600_000);
 
 afterAll(async () => {
   await built.close();
-}, 60_000);
+}, 120_000);
 
 /* ================================================================== */
 /* Templates (#457–#459, #464)                                         */

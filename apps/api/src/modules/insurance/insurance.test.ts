@@ -2767,16 +2767,33 @@ describe("certificate extraction and insurer confirmation", () => {
   });
 
   it("keeps the company-level confirmation register inside the caller's projects", async () => {
-    const mine = await get(`/insurance/confirmations`);
+    const mine = await get(`/insurance/confirmations?pageSize=100`);
     expect(mine.statusCode).toBe(200);
-    expect((mine.json().items as unknown[]).length).toBeGreaterThan(0);
+    const myIds = (mine.json().items as Array<Record<string, unknown>>).map((r) => r.id);
+    expect(myIds.length).toBeGreaterThan(0);
 
+    /*
+     * The stranger OWNS their own company, so the route is open to them and
+     * answers about their tenant — which holds nothing. "You may not ask" and
+     * "there is nothing of yours here" are different answers; the second is
+     * the right one. What must never happen is a row of ours in their list.
+     */
     const other = await app.inject({
       method: "GET",
-      url: "/api/v1/insurance/confirmations",
+      url: "/api/v1/insurance/confirmations?pageSize=100",
       headers: stranger.headers,
     });
-    expect(other.statusCode).toBe(403);
+    expect(other.statusCode).toBe(200);
+    const theirs = (other.json().items as Array<Record<string, unknown>>).map((r) => r.id);
+    expect(theirs).toEqual([]);
+    for (const id of myIds) expect(theirs).not.toContain(id);
+
+    /* A read-only member of one project sees the confirmations of that
+       project and nothing else. */
+    const viewerView = await get(`/insurance/confirmations?pageSize=100`, viewerHeaders);
+    expect(viewerView.statusCode).toBe(200);
+    const rows = viewerView.json().items as Array<Record<string, unknown>>;
+    expect(rows.every((r) => r.projectId === authProject)).toBe(true);
   });
 
   it("refuses to raise a confirmation on another tenant's certificate", async () => {

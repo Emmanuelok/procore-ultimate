@@ -394,10 +394,106 @@ describe("schedule rules", () => {
     await t.app.inject({ method: "POST", url: url(`/automation/rules/${rule.id}/pause`), headers: owner.headers });
   });
 
+  /**
+   * Regression (verifier, major): a capped scan used to take the NEWEST rows
+   * and say nothing about it, so on a tenant with more live records than the
+   * cap the overdue ones — what every schedule template matches — were never
+   * evaluated and the run log showed nothing wrong.
+   */
+  it("takes the oldest-deadline records when the scan is capped, and says the scan was capped", async () => {
+    const capProject = await createProject(t.app, owner, "Capped scan project");
+    const rule = await createRule(owner, {
+      name: "Capped overdue scan",
+      projectId: capProject,
+      trigger: { kind: "schedule", objectType: "rfi", everyMinutes: 60, cooldownHours: 24 },
+      conditions: { all: [{ field: "record.dueDate", op: "overdue_by_days", value: 3 }] },
+      actions: [{ type: "tag", params: { name: "capped" } }],
+    });
+    // Oldest deadline created FIRST, newest row created LAST: a newest-first
+    // scan with a cap of 1 would see only the record that does not match.
+    const mostOverdue = await createRfi(t.app, owner, capProject, { subject: "Most overdue", dueDate: dayOffset(-30) });
+    await createRfi(t.app, owner, capProject, { subject: "Newest, not due", dueDate: dayOffset(60) });
+
+    const previous = t.engine.options.scanLimit;
+    t.engine.configure({ scanLimit: 1 });
+    try {
+      const scan = await t.engine.scanSchedules(owner.companyId, new Date(), true);
+      expect(scan.candidates).toBe(1);
+      expect(scan.matched).toBe(1);
+      expect(scan.executed).toBe(1);
+      expect(scan.truncated.map((x) => x.ruleId)).toContain(rule.id);
+      expect(scan.truncated.find((x) => x.ruleId === rule.id)).toMatchObject({ limit: 1, orderedBy: "dueDate asc" });
+      const runs = await runsFor(rule.id);
+      expect(runs.map((r) => r.objectId)).toEqual([mostOverdue.id]);
+      // The truncation is durable on the rule, and counted for THIS company.
+      const [row] = await t.app.db.select().from(automationRules).where(eq(automationRules.id, rule.id));
+      expect(row?.lastScanTruncated).toBe(1);
+      expect(row?.lastScanCandidates).toBe(1);
+      expect(row?.lastScanOrderedBy).toBe("dueDate asc");
+      expect(t.engine.getHealth(owner.companyId).scansTruncated).toBeGreaterThanOrEqual(1);
+    } finally {
+      t.engine.configure({ scanLimit: previous });
+    }
+    // With the full cap the same scan is honest about seeing everything.
+    const full = await t.engine.scanSchedules(owner.companyId, new Date(Date.now() + 26 * 3_600_000), true);
+    expect(full.truncated.some((x) => x.ruleId === rule.id)).toBe(false);
+    const [after] = await t.app.db.select().from(automationRules).where(eq(automationRules.id, rule.id));
+    expect(after?.lastScanTruncated).toBe(0);
+    expect(after?.lastScanCandidates).toBe(2);
+    await t.app.inject({ method: "POST", url: url(`/automation/rules/${rule.id}/pause`), headers: owner.headers });
+  });
+
   it("the scheduler job scans every company", async () => {
     const job = await t.app.scheduler.runNow("automation.schedules");
     expect(job.state).toBe("succeeded");
     expect((job.lastResult as { companies: number }).companies).toBeGreaterThanOrEqual(2);
+  });
+});
+
+/* ================================================================== */
+/* Drain re-entrancy and per-company counters                          */
+/* ================================================================== */
+
+describe("engine bookkeeping", () => {
+  /**
+   * Regression (verifier, minor): a manual cycle colliding with the drain job
+   * returned an all-zero summary indistinguishable from "nothing was queued",
+   * and the Engine tab toasted "Drained 0 queued run(s)".
+   */
+  it("a drain that collides with one already running says so instead of reporting zero work", async () => {
+    const rule = await createRule(owner, {
+      name: "Queued for the drain",
+      trigger: { kind: "event", objectType: "rfi", action: "create" },
+      actions: [{ type: "tag", params: { name: "drained" } }],
+    });
+    await createRfi(t.app, owner, projectId, { subject: "Drain me" });
+    const [first, second] = await Promise.all([t.engine.drain(undefined, owner.companyId), t.engine.drain(undefined, owner.companyId)]);
+    const busy = [first, second].find((d) => d.busy);
+    const worked = [first, second].find((d) => !d.busy);
+    expect(busy).toBeDefined();
+    expect(busy!.reason).toMatch(/already running/i);
+    expect(worked!.executed).toBeGreaterThanOrEqual(1);
+    // A drain with nothing to do is distinguishable from a refused one.
+    const idle = await t.engine.drain(undefined, owner.companyId);
+    expect(idle.busy).toBe(false);
+    expect(idle.reason).toBeNull();
+    await t.app.inject({ method: "POST", url: url(`/automation/rules/${rule.id}/pause`), headers: owner.headers });
+  });
+
+  /**
+   * Regression (verifier, minor): the counters and the last error text were a
+   * single process-wide object, so a tenant admin's status page carried other
+   * tenants' rule/run ids and totals.
+   */
+  it("keeps counters and error text per company", async () => {
+    const mine = t.engine.getHealth(owner.companyId);
+    expect(mine.eventsSeen).toBeGreaterThan(0);
+    const theirs = t.engine.getHealth(outsider.companyId);
+    expect(theirs.eventsSeen).toBeLessThan(mine.eventsSeen);
+    expect(t.engine.getHealth("company_that_does_not_exist")).toMatchObject({ eventsSeen: 0, runsExecuted: 0, lastError: null });
+    // The process-wide view carries no error text at all.
+    expect(t.engine.getHealth().lastError).toBeNull();
+    expect(t.engine.getHealth().eventsSeen).toBeGreaterThanOrEqual(mine.eventsSeen);
   });
 });
 
@@ -558,6 +654,19 @@ describe("executors", () => {
     expect(row).toMatchObject({ severity: "high", confidence: 1, title: "Watch Executor target" });
     expect((row?.evidenceRefs as { key: string }).key).toBe(`arule_test:rfi:${rfiId}`);
     expect((await executeAction(deps, facts, ctx, "create_signal", { detector: "rfi_watch" })).outcome).toBe("skipped");
+    // The dedupe is on the (rule, object) key, matched in SQL — not on the
+    // detector alone. A different record and a different rule still raise.
+    const otherRecord = await executeAction(deps, { ...facts, objectId: "rfi_other" }, ctx, "create_signal", { detector: "rfi_watch" });
+    expect(otherRecord.outcome).toBe("done");
+    const otherRule = await executeAction(deps, { ...facts, ruleId: "arule_second" }, ctx, "create_signal", { detector: "rfi_watch" });
+    expect(otherRule.outcome).toBe("done");
+    const keys = await t.app.db
+      .select({ refs: signals.evidenceRefs })
+      .from(signals)
+      .where(and(eq(signals.companyId, owner.companyId), eq(signals.detector, "automation.rfi_watch")));
+    expect(keys.map((k) => (k.refs as { key: string }).key).sort()).toEqual(
+      [`arule_second:rfi:${rfiId}`, `arule_test:rfi:${rfiId}`, `arule_test:rfi:rfi_other`].sort(),
+    );
   });
 
   it("webhook posts a signed envelope and refuses non-public hosts", async () => {

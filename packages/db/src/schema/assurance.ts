@@ -1,5 +1,6 @@
 import {
   bigserial,
+  boolean,
   doublePrecision,
   index,
   integer,
@@ -96,6 +97,17 @@ export const reconciliations = pgTable(
     reviewerId: text("reviewer_id"),
     disposition: text("disposition"),
     notes: text("notes"),
+    /**
+     * True when EVERY evidence row this reconciliation actually used was
+     * submitted by the claimant or by the author of the assertion.
+     *
+     * Such a row is a claim restated, not a claim tested, and it must never be
+     * offered to the owner dashboard as a verified variance. The manual route
+     * refuses outright unless an integrity reviewer knowingly overrides; the
+     * bulk auto route cannot refuse (it processes a whole project), so it
+     * marks the row here and downgrades the result instead.
+     */
+    selfCertified: boolean("self_certified").default(false).notNull(),
     createdBy: text("created_by").notNull(),
     createdAt: createdAt(),
   },
@@ -305,6 +317,12 @@ export const detectorRuns = pgTable(
     signalsAutoClosed: integer("signals_auto_closed").default(0).notNull(),
     /** signals a lower-severity predecessor was superseded by */
     signalsSuperseded: integer("signals_superseded").default(0).notNull(),
+    /**
+     * Findings this run REOPENED: auto-closed on an earlier run because the
+     * condition had cleared, and true again now. A recurrence is news, and it
+     * is not the same fact as a first sighting.
+     */
+    signalsReopened: integer("signals_reopened").default(0).notNull(),
     perDetector: jsonb("per_detector").$type<Record<string, number>>().default({}).notNull(),
     durationMs: integer("duration_ms"),
     error: text("error"),

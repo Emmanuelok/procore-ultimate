@@ -32,6 +32,8 @@ import {
   CARRY_FORWARD_POLICIES,
   DASH,
   EXPENDITURE_CLASSES,
+  EditButton,
+  EditForm,
   FUNDING_KINDS,
   LoadError,
   ReasonList,
@@ -49,6 +51,7 @@ import {
   useIsCompanyAdmin,
   useProjects,
   useResource,
+  type EditFieldSpec,
   type Allocation,
   type Appropriation,
   type FundingSource,
@@ -605,6 +608,58 @@ function VirementDecision({ virement, onDecided }: { virement: Virement; onDecid
   );
 }
 
+/* ============================ Edit field sets ============================= */
+
+const SOURCE_FIELDS: readonly EditFieldSpec[] = [
+  { key: "name", label: "Facility name", type: "text" },
+  { key: "reference", label: "Reference", type: "text", nullable: true },
+  { key: "kind", label: "Kind", type: "select", options: FUNDING_KINDS },
+  { key: "provider", label: "Provider", type: "text", nullable: true },
+  {
+    key: "amount",
+    label: "Facility amount",
+    type: "number",
+    min: 0,
+    step: 0.01,
+    hint: "Cannot be cut below what is already allocated; the API says by how much.",
+  },
+  { key: "expenditureClass", label: "Expenditure class", type: "select", options: EXPENDITURE_CLASSES },
+  { key: "availableFrom", label: "Available from", type: "date", nullable: true },
+  { key: "availableTo", label: "Available to", type: "date", nullable: true },
+  { key: "notes", label: "Notes", type: "textarea", nullable: true, wide: true },
+];
+
+const APPROPRIATION_FIELDS: readonly EditFieldSpec[] = [
+  { key: "name", label: "Name", type: "text" },
+  { key: "fiscalYear", label: "Fiscal year", type: "text", placeholder: "2026 or 2026-27" },
+  { key: "appropriatedAmount", label: "Appropriated", type: "number", min: 0, step: 0.01 },
+  { key: "expenditureClass", label: "Expenditure class", type: "select", options: EXPENDITURE_CLASSES },
+  {
+    key: "carryForwardPolicy",
+    label: "Carry-forward policy",
+    type: "select",
+    options: CARRY_FORWARD_POLICIES,
+    hint: "Decides what happens to the unspent balance when the year closes.",
+  },
+  { key: "periodStart", label: "Period start", type: "date", nullable: true },
+  { key: "periodEnd", label: "Period end", type: "date", nullable: true },
+  { key: "notes", label: "Notes", type: "textarea", nullable: true, wide: true },
+];
+
+const ALLOCATION_FIELDS: readonly EditFieldSpec[] = [
+  { key: "amount", label: "Allocated amount", type: "number", min: 0, step: 0.01 },
+  {
+    key: "fiscalYear",
+    label: "Fiscal year",
+    type: "text",
+    nullable: true,
+    hint: "Must match the appropriation behind it; that is the year the demand is measured in.",
+  },
+  { key: "expenditureClass", label: "Expenditure class", type: "select", options: EXPENDITURE_CLASSES },
+  { key: "wholeLifeCost", label: "Whole-life cost", type: "number", min: 0, step: 0.01, nullable: true },
+  { key: "notes", label: "Notes", type: "textarea", nullable: true, wide: true },
+];
+
 /* =============================== Drawers ================================== */
 
 function SourceDrawer({
@@ -619,8 +674,24 @@ function SourceDrawer({
   isAdmin: boolean;
 }) {
   const action = useAction();
+  const [editing, setEditing] = useState(false);
+  useEffect(() => {
+    setEditing(false);
+    action.clear();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [source?.id]);
   if (!source) return <Drawer open={false} onClose={onClose} title="Facility" />;
   const p = source.position;
+
+  async function save(patch: Record<string, unknown>) {
+    if (!source) return;
+    const res = await action.run("edit", () => portfolioApi.patchSource(source.id, patch));
+    if (res) {
+      toast.success("Facility updated");
+      setEditing(false);
+      onChanged();
+    }
+  }
 
   async function setStatus(status: string) {
     if (!source) return;
@@ -645,6 +716,22 @@ function SourceDrawer({
           <Alert tone="danger" size="sm">
             {action.error}
           </Alert>
+        ) : null}
+        {isAdmin ? (
+          <div className="flex justify-end">
+            <EditButton editing={editing} onToggle={() => setEditing((v) => !v)} />
+          </div>
+        ) : null}
+        {editing ? (
+          <EditForm
+            key={source.id}
+            fields={SOURCE_FIELDS}
+            initial={source as unknown as Record<string, unknown>}
+            busy={action.busy === "edit"}
+            onSubmit={save}
+            onCancel={() => setEditing(false)}
+            note="The currency is not editable: re-denominating a facility that already carries allocations is not a correction."
+          />
         ) : null}
         <dl className="divide-y divide-border">
           <Row label="Provider">{source.provider ?? DASH}</Row>
@@ -717,9 +804,11 @@ function AppropriationDrawer({
 }) {
   const action = useAction();
   const [successor, setSuccessor] = useState("");
+  const [editing, setEditing] = useState(false);
 
   useEffect(() => {
     setSuccessor("");
+    setEditing(false);
     action.clear();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [appropriation?.id]);
@@ -727,6 +816,15 @@ function AppropriationDrawer({
   if (!appropriation) return <Drawer open={false} onClose={onClose} title="Appropriation" />;
   const p = appropriation.position;
   const a = appropriation;
+
+  async function save(patch: Record<string, unknown>) {
+    const res = await action.run("edit", () => portfolioApi.patchAppropriation(a.id, patch));
+    if (res) {
+      toast.success("Appropriation updated");
+      setEditing(false);
+      onChanged();
+    }
+  }
 
   async function approve() {
     const res = await action.run("approve", () => portfolioApi.approveAppropriation(a.id));
@@ -771,6 +869,22 @@ function AppropriationDrawer({
           <Alert tone="danger" size="sm">
             {action.error}
           </Alert>
+        ) : null}
+        {isAdmin ? (
+          <div className="flex justify-end">
+            <EditButton editing={editing} onToggle={() => setEditing((v) => !v)} />
+          </div>
+        ) : null}
+        {editing ? (
+          <EditForm
+            key={a.id}
+            fields={APPROPRIATION_FIELDS}
+            initial={a as unknown as Record<string, unknown>}
+            busy={action.busy === "edit"}
+            onSubmit={save}
+            onCancel={() => setEditing(false)}
+            note="Changing the appropriated amount on an approved appropriation clears the approval; the approval was given on a figure."
+          />
         ) : null}
         <dl className="divide-y divide-border">
           <Row label="Appropriated">{money(a.appropriatedAmount, a.currency)}</Row>
@@ -861,16 +975,31 @@ function AllocationDrawer({
   const action = useAction();
   const [drawAmount, setDrawAmount] = useState("");
   const [cancelReason, setCancelReason] = useState("");
+  const [editing, setEditing] = useState(false);
 
   useEffect(() => {
     setDrawAmount("");
     setCancelReason("");
+    setEditing(false);
     action.clear();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [allocation?.id]);
 
   if (!allocation) return <Drawer open={false} onClose={onClose} title="Allocation" />;
   const a = allocation;
+
+  async function save(patch: Record<string, unknown>) {
+    const res = await action.run("edit", () => portfolioApi.patchAllocation(a.id, patch));
+    if (res) {
+      toast.success(
+        res.status === "planned"
+          ? "Allocation updated — the approval was cleared because the money changed"
+          : "Allocation updated",
+      );
+      setEditing(false);
+      onChanged();
+    }
+  }
 
   async function approve() {
     const res = await action.run("approve", () => portfolioApi.approveAllocation(a.id));
@@ -914,6 +1043,22 @@ function AllocationDrawer({
           <Alert tone="danger" size="sm">
             {action.error}
           </Alert>
+        ) : null}
+        {isAdmin && a.status !== "cancelled" ? (
+          <div className="flex justify-end">
+            <EditButton editing={editing} onToggle={() => setEditing((v) => !v)} />
+          </div>
+        ) : null}
+        {editing ? (
+          <EditForm
+            key={a.id}
+            fields={ALLOCATION_FIELDS}
+            initial={a as unknown as Record<string, unknown>}
+            busy={action.busy === "edit"}
+            onSubmit={save}
+            onCancel={() => setEditing(false)}
+            note="Changing the amount, the year or the source re-checks headroom and reverts an approved allocation to planned."
+          />
         ) : null}
         <dl className="divide-y divide-border">
           <Row label="Fiscal year">{a.fiscalYear ?? DASH}</Row>

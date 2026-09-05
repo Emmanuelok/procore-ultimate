@@ -292,21 +292,54 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
    * guest could read the whole fleet, every certificate and the raw telematics
    * feed while any member could register, off-hire and verify plant.
    */
+  /**
+   * A company route that names ONE machine must also respect what the caller
+   * may see: the register is narrowed by project, and a narrowing you can
+   * step around by guessing an id is not a narrowing. No-ops when the route
+   * has no `:equipmentId`, and for owners, admins and company-wide assurance
+   * grants (whose scope is already "all"). It answers 404, not 403 — a
+   * caller who may not see a machine may not learn it exists either.
+   */
+  const machineScopeGate = async (req: FastifyRequest): Promise<void> => {
+    const params = req.params as { equipmentId?: string };
+    if (!params.equipmentId) return;
+    const scope = companyScopeOf(req);
+    if (scope.all) return;
+    const [row] = await app.db
+      .select({ projectId: equipment.projectId })
+      .from(equipment)
+      .where(
+        and(
+          eq(equipment.id, params.equipmentId),
+          eq(equipment.companyId, req.companyId!),
+        ),
+      )
+      .limit(1);
+    if (row && row.projectId && !scope.projectIds.includes(row.projectId)) {
+      throw notFound(
+        `Equipment ${params.equipmentId} was not found in this company's register.`,
+      );
+    }
+  };
+
   const companyRead = [
     app.authenticate,
     app.requireCompany,
     companyToolGate(app, "equipment", "read"),
+    machineScopeGate,
   ];
   const companyWrite = [
     app.authenticate,
     app.requireCompany,
     companyToolGate(app, "equipment", "standard"),
+    machineScopeGate,
   ];
   /** Verification, off-hire and device remapping — the irreversible three. */
   const companyAdmin = [
     app.authenticate,
     app.requireCompany,
     companyToolGate(app, "equipment", "admin"),
+    machineScopeGate,
   ];
 
   /* ---------------------------------------------------------------- */
@@ -659,6 +692,45 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       lastSweptAt.set(companyId, now);
     }
     await sweepEquipment(companyId, null);
+  }
+
+  /**
+   * The machines a company-level route may show THIS caller.
+   *
+   * `companyToolGate` answers "may you be here at all"; this answers "whose
+   * plant may you see once you are". Holding `equipment` on one job is not
+   * permission to enumerate every machine on every other job, so a caller who
+   * is neither owner, admin nor company-wide assurance sees the machines on
+   * the projects they hold the tool on, plus the ones on no project at all —
+   * yard plant is a company asset, and hiding it would make the register
+   * useless to the plant manager the gate just admitted.
+   *
+   * Returns null when there is no restriction to apply, so the caller can
+   * skip the extra query entirely.
+   */
+  async function visibleMachineIds(req: FastifyRequest): Promise<string[] | null> {
+    const scope = companyScopeOf(req);
+    if (scope.all) return null;
+    const filter = scopeProjectFilter(scope, equipment.projectId);
+    const rows = await app.db
+      .select({ id: equipment.id })
+      .from(equipment)
+      .where(
+        filter
+          ? and(eq(equipment.companyId, req.companyId!), filter)
+          : eq(equipment.companyId, req.companyId!),
+      );
+    return rows.map((r) => r.id);
+  }
+
+  /** A clause restricting `column` to those machines; `false` when none. */
+  function machineScopeClause(
+    ids: string[] | null,
+    column: Parameters<typeof eq>[0],
+  ) {
+    if (ids === null) return undefined;
+    if (ids.length === 0) return sql`false`;
+    return inArray(column as never, ids);
   }
 
   /** Which machines are on a project right now? An expired certificate in
@@ -1274,6 +1346,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       await maybeSweep(companyId);
       const asOf = todayISO();
       const clauses = [eq(equipment.companyId, companyId)];
+      // Holding the tool on one job admits you to the register; it does not
+      // hand you every other job's plant (plan §6.3).
+      const fleetScope = scopeProjectFilter(companyScopeOf(req), equipment.projectId);
+      if (fleetScope) clauses.push(fleetScope);
       if (q.category) clauses.push(eq(equipment.category, q.category));
       if (q.ownership) clauses.push(eq(equipment.ownership, q.ownership));
       if (q.status) clauses.push(eq(equipment.status, q.status));
@@ -3587,6 +3663,11 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       const asOf = todayISO();
       const inService = await inServiceEquipmentIds(companyId);
       const clauses = [eq(equipmentCertificates.companyId, companyId)];
+      const certScope = machineScopeClause(
+        await visibleMachineIds(req),
+        equipmentCertificates.equipmentId,
+      );
+      if (certScope) clauses.push(certScope);
       if (q.certificateType)
         clauses.push(
           eq(equipmentCertificates.certificateType, q.certificateType),
@@ -4115,6 +4196,11 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       await maybeSweep(companyId);
       const asOf = todayISO();
       const clauses = [eq(equipmentMaintenanceSchedules.companyId, companyId)];
+      const maintScope = machineScopeClause(
+        await visibleMachineIds(req),
+        equipmentMaintenanceSchedules.equipmentId,
+      );
+      if (maintScope) clauses.push(maintScope);
       if (q.status)
         clauses.push(eq(equipmentMaintenanceSchedules.status, q.status));
       if (q.statutoryOnly)
@@ -5405,6 +5491,20 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       const clauses = [
         eq(equipmentTelematicsReadings.companyId, req.companyId!),
       ];
+      // The raw feed is the strongest evidence in the module and the least
+      // interpreted; it is narrowed to the plant the caller may see, with
+      // the still-unmapped devices kept visible so somebody can map them.
+      const visible = await visibleMachineIds(req);
+      if (visible !== null) {
+        clauses.push(
+          visible.length === 0
+            ? isNull(equipmentTelematicsReadings.equipmentId)
+            : or(
+                isNull(equipmentTelematicsReadings.equipmentId),
+                inArray(equipmentTelematicsReadings.equipmentId, visible),
+              )!,
+        );
+      }
       if (q.equipmentId)
         clauses.push(
           eq(equipmentTelematicsReadings.equipmentId, q.equipmentId),

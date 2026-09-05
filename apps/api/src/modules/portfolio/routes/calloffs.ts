@@ -216,16 +216,27 @@ export const callOffRoutes: FastifyPluginAsync = async (app) => {
   async function assertCeiling(
     db: Db,
     companyId: string,
-    order: { id: string; frameworkId: string | null; lotId: string | null; currency: string; orderValue: number },
+    order: {
+      id: string;
+      route: string;
+      frameworkId: string | null;
+      lotId: string | null;
+      currency: string;
+      orderValue: number;
+    },
   ): Promise<void> {
     if (!order.frameworkId) return;
+    /* §6.2: a headroom check takes the parent row FOR UPDATE. Without the
+       lock two concurrent issues both read the same pre-existing ordered
+       total, both find room, and both write — putting the framework past its
+       maximum with no refusal anywhere. */
     const [fw] = await db
       .select()
       .from(frameworkAgreements)
       .where(
         and(eq(frameworkAgreements.id, order.frameworkId), eq(frameworkAgreements.companyId, companyId)),
       )
-      .limit(1);
+      .for("update");
     if (!fw) throw badRequest("frameworkId does not name a framework in this company");
     if (fw.status !== "live") {
       throw conflict(
@@ -238,6 +249,27 @@ export const callOffRoutes: FastifyPluginAsync = async (app) => {
       .where(
         and(eq(frameworkLots.companyId, companyId), eq(frameworkLots.frameworkId, order.frameworkId)),
       );
+
+    /* The direct-award rule is tested AGAINST THE VALUE BEING ISSUED, not
+       against the value the order happened to carry when it was drafted. A
+       draft's value is editable, so a threshold checked only at create is a
+       threshold that can be walked around by editing the draft and issuing
+       it. Re-run the rule here, inside the same transaction. */
+    if (order.route === "direct_award") {
+      const lotRow = order.lotId ? (lots.find((l) => l.id === order.lotId) ?? null) : null;
+      if (order.lotId && !lotRow) {
+        throw conflict("The lot named on this order is not a lot of its framework; it cannot be issued.");
+      }
+      const check = checkDirectAward(
+        toFrameworkRow(fw),
+        lotRow ? toLotRow(lotRow) : null,
+        order.orderValue,
+        order.currency,
+      );
+      if (!check.permitted) {
+        throw conflict(`A direct award is not permissible here: ${check.reasons.join(" ")}`);
+      }
+    }
     const existing = (await loadCallOffs(db, companyId, { frameworkId: order.frameworkId })).filter(
       (c) => c.id !== order.id,
     );
@@ -480,6 +512,17 @@ export const callOffRoutes: FastifyPluginAsync = async (app) => {
         );
       }
 
+      /* A lot only means something as a lot OF a framework. An order carrying
+         a lot id that belongs to another framework (or another tenant) would
+         be inserted as-is, and the lot ceiling would then be silently skipped
+         at issue while the framework ceiling still consumed the value — so
+         the lot is validated for EVERY route that carries one, not just the
+         direct-award path that happens to look it up. */
+      if (lotId && !frameworkId) {
+        throw badRequest(
+          "A lot is a lot of a framework; name the framework this order is called off before naming its lot.",
+        );
+      }
       if (frameworkId) {
         const [fw] = await app.db
           .select({ currency: frameworkAgreements.currency, reference: frameworkAgreements.reference })
@@ -493,6 +536,20 @@ export const callOffRoutes: FastifyPluginAsync = async (app) => {
           throw badRequest(
             `The order is in ${body.currency} but framework ${fw.reference} is in ${fw.currency}; it cannot consume that framework's ceiling.`,
           );
+        }
+        if (lotId) {
+          const [lotRow] = await app.db
+            .select({ id: frameworkLots.id })
+            .from(frameworkLots)
+            .where(
+              and(
+                eq(frameworkLots.id, lotId),
+                eq(frameworkLots.companyId, companyId),
+                eq(frameworkLots.frameworkId, frameworkId),
+              ),
+            )
+            .limit(1);
+          if (!lotRow) throw badRequest("lotId does not name a lot of this framework");
         }
       }
 
@@ -667,6 +724,7 @@ export const callOffRoutes: FastifyPluginAsync = async (app) => {
       await app.db.transaction(async (tx) => {
         await assertCeiling(tx, companyId, {
           id: row.id,
+          route: row.route,
           frameworkId: row.frameworkId,
           lotId: row.lotId,
           currency: row.currency,

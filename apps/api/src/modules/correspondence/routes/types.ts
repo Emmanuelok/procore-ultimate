@@ -14,7 +14,7 @@ import type { FastifyPluginAsync } from "fastify";
 import { and, asc, eq, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { correspondenceLetters, correspondenceTypes, projects } from "@constructos/db";
-import { CORRESPONDENCE_DIRECTIONS } from "@constructos/shared";
+import { CORRESPONDENCE_DIRECTIONS, RESPONSE_DAY_BASES } from "@constructos/shared";
 import { badRequest, conflict, notFound } from "../../../lib/errors.js";
 import { newId } from "../../../lib/ids.js";
 import { buildGates, idSchema, keySchema, ledger, nowISO, patchSchemaOf, patchSet } from "../shared.js";
@@ -40,6 +40,8 @@ const typeBodySchema = z.object({
   defaultDirection: z.enum(CORRESPONDENCE_DIRECTIONS).default("outbound"),
   requiresResponse: z.boolean().default(false),
   responseDays: z.number().int().min(0).max(365).nullable().optional(),
+  /** calendar days, or working days (Mon–Fri) as most contracts count them */
+  responseDaysBasis: z.enum(RESPONSE_DAY_BASES).default("calendar"),
   isContractual: z.boolean().default(false),
   createsObligation: z.boolean().default(true),
   approvalSteps: z.array(approvalStepSchema).max(10).default([]),
@@ -66,6 +68,7 @@ const SEED_TYPES: Array<z.input<typeof typeBodySchema>> = [
     description: "An instruction issued under the contract. Recipients must acknowledge and comply.",
     requiresResponse: true,
     responseDays: 7,
+    responseDaysBasis: "working",
     isContractual: true,
   },
   {
@@ -75,6 +78,7 @@ const SEED_TYPES: Array<z.input<typeof typeBodySchema>> = [
     description: "A notice served under the contract — the record a time bar turns on.",
     requiresResponse: true,
     responseDays: 7,
+    responseDaysBasis: "working",
     isContractual: true,
   },
   {
@@ -170,6 +174,7 @@ export const typeRoutes: FastifyPluginAsync = async (app) => {
         defaultDirection: body.defaultDirection,
         requiresResponse: body.requiresResponse ? 1 : 0,
         responseDays: body.responseDays ?? null,
+        responseDaysBasis: body.responseDaysBasis,
         isContractual: body.isContractual ? 1 : 0,
         createsObligation: body.createsObligation ? 1 : 0,
         approvalSteps: body.approvalSteps.map((s) => ({
@@ -215,6 +220,7 @@ export const typeRoutes: FastifyPluginAsync = async (app) => {
         defaultDirection: body.defaultDirection,
         requiresResponse: body.requiresResponse ? 1 : 0,
         responseDays: body.responseDays ?? null,
+        responseDaysBasis: body.responseDaysBasis,
         isContractual: body.isContractual ? 1 : 0,
         createsObligation: body.createsObligation ? 1 : 0,
         approvalSteps: [],
@@ -298,6 +304,7 @@ export const typeRoutes: FastifyPluginAsync = async (app) => {
         "defaultDirection",
         "requiresResponse",
         "responseDays",
+        "responseDaysBasis",
         "isContractual",
         "createsObligation",
         "approvalSteps",
