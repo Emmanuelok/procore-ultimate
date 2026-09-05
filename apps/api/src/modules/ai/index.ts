@@ -1665,7 +1665,16 @@ export const aiModule: FastifyPluginAsync = async (app) => {
     level: PermissionLevel,
   ): Promise<void> {
     refuseGuest(req);
-    if (!row.projectId) return;
+    if (!row.projectId) {
+      // A company-scoped proposal has no project ACL to consult, and the run
+      // behind it gathered records from EVERY project in the tenant (only an
+      // owner/admin can start a company-wide run or schedule one). Company
+      // membership alone is therefore not a gate for reading or approving it.
+      if (req.companyRole !== "owner" && req.companyRole !== "admin") {
+        throw forbidden("A company-wide AI proposal is an owner/admin surface");
+      }
+      return;
+    }
     const tool = targetTool(row.targetType) ?? "ai";
     await requireProjectTool(req, reply, row.projectId, tool, level);
   }
@@ -2060,7 +2069,17 @@ export const aiModule: FastifyPluginAsync = async (app) => {
     if (run.projectId) {
       await requireProjectTool(req, reply, run.projectId, "ai", "read");
     } else {
+      // A company-scoped run's prompt can carry records from EVERY project (a
+      // company-wide fleet run gathers across the tenant), and there is no
+      // project ACL to consult. It is readable by the person who asked for it
+      // and by company owners/admins — not by every company member.
       refuseGuest(req);
+      const admin = req.companyRole === "owner" || req.companyRole === "admin";
+      if (!admin && run.requestedBy !== req.user!.id) {
+        throw forbidden(
+          "This company-wide AI run is visible to its requester and to company owners/admins",
+        );
+      }
     }
     const meta = await loadRunMeta(app.db, req.companyId!, run.id);
     const reviews = await app.db

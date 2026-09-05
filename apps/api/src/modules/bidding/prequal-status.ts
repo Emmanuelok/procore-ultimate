@@ -180,11 +180,27 @@ export async function batchVendorPrequalStatus(
   return out;
 }
 
-function emptyStatus(vendorId: string, vendorName: string | null): VendorPrequalStatus {
+/**
+ * A vendor with no questionnaire on the record.
+ *
+ * The financial screening is carried anyway when there is one. Screening and
+ * prequalification are separate acts: accounts are frequently filed for a
+ * vendor long before (or entirely without) a questionnaire, and the answer to
+ * "what is the largest contract this balance sheet supports" does not depend
+ * on whether anybody has asked them about their safety record. Dropping it
+ * here meant a balance-sheet-insolvent contractor's hard stop — the single
+ * most important thing the screen produces — was computed, stored, and then
+ * thrown away by the endpoint every other module asks.
+ */
+function emptyStatus(
+  vendorId: string,
+  vendorName: string | null,
+  screening: RecommendedLimit | null = null,
+): VendorPrequalStatus {
   return {
     vendorId,
     vendorName,
-    recommendedLimit: null,
+    recommendedLimit: screening,
     submissionId: null,
     reference: null,
     questionnaireId: null,
@@ -203,7 +219,10 @@ function emptyStatus(vendorId: string, vendorName: string | null): VendorPrequal
     knockoutReason: null,
     note:
       `${vendorName ?? "This vendor"} has never been prequalified: there is no ` +
-      "questionnaire submission of any kind on the record for them.",
+      "questionnaire submission of any kind on the record for them." +
+      (screening
+        ? ` A financial screening does exist: ${screening.basis}`
+        : ""),
   };
 }
 
@@ -222,7 +241,7 @@ export function computePrequalStatus(
     recommendedLimit: null as RecommendedLimit | null,
   };
 
-  if (rows.length === 0) return emptyStatus(vendorId, vendorRow?.name ?? null);
+  if (rows.length === 0) return emptyStatus(vendorId, vendorRow?.name ?? null, screening);
 
   /*
    * A SUPERSEDED APPROVAL IS NOT THE CURRENT ONE. Renewal creates a new
@@ -707,6 +726,37 @@ export async function sweepPrequalification(
           .set({ status: "satisfied" })
           .where(and(eq(obligations.id, row.obligationId), eq(obligations.status, "open")));
       }
+      /*
+       * AND THE LAPSE SIGNAL IS CLOSED, NOT LEFT STANDING.
+       *
+       * An approval that expires BEFORE its renewal is approved is lapsed at
+       * the moment it expires, and the signal raised then was correct. Once
+       * the renewal is approved the condition has cleared, so leaving the
+       * signal open puts a high-severity "nothing has been checked about this
+       * company" finding on a vendor the register reports as approved — the
+       * same disagreement between the register and the signals that the
+       * supersession rule exists to end. The signal is auto-closed with the
+       * renewal named, rather than deleted: it happened.
+       */
+      await db
+        .update(signals)
+        .set({
+          disposition: "closed",
+          autoClosedAt: now,
+          closedAt: now,
+          reviewerNotes:
+            `Closed automatically: ${row.reference} was superseded by ${replacedBy}, which is ` +
+            "approved. The vendor's standing is current again and the renewal is the evidence " +
+            "the lapse asked for.",
+        })
+        .where(
+          and(
+            eq(signals.companyId, companyId),
+            eq(signals.detector, "prequalification_lapsed"),
+            eq(signals.fingerprint, `prequalification_lapsed:${row.id}`),
+            isNull(signals.closedAt),
+          ),
+        );
       result.notes.push(
         `${row.reference} expired on ${row.expiresAt} but was superseded by ${replacedBy}, which ` +
           "is approved. No lapse was raised and its renewal obligation is satisfied — the " +

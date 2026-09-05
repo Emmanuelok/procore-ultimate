@@ -61,6 +61,7 @@ import {
   watchers,
   wbsSegments,
   workflowInstances,
+  workflowStepInstances,
   workflowTemplates,
 } from "@constructos/db";
 import {
@@ -846,6 +847,28 @@ export const projectsModule: FastifyPluginAsync = async (app) => {
           .where(eq(notifications.projectId, projectId))
           .returning({ id: notifications.id }),
       );
+      /*
+       * Workflow instances AND their steps.
+       *
+       * `workflow_step_instances` carries only `instance_id` — no tenant or
+       * project column — so deleting the instances alone left every step row
+       * behind, orphaned and unreachable: the same dangling-child problem the
+       * purge exists to end.
+       */
+      const doomedInstances = await tx
+        .select({ id: workflowInstances.id })
+        .from(workflowInstances)
+        .where(eq(workflowInstances.projectId, projectId));
+      const doomedIds = doomedInstances.map((r) => r.id);
+      counts["workflowSteps"] =
+        doomedIds.length === 0
+          ? 0
+          : (
+              await tx
+                .delete(workflowStepInstances)
+                .where(inArray(workflowStepInstances.instanceId, doomedIds))
+                .returning({ id: workflowStepInstances.id })
+            ).length;
       await del("workflowInstances", () =>
         tx
           .delete(workflowInstances)

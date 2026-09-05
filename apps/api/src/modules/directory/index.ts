@@ -18,7 +18,7 @@
  */
 import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
-import { and, asc, count, desc, eq, ilike, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, ilike, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
 import {
   bidInvitations,
   bidSubmissions,
@@ -478,6 +478,9 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
       .where(and(eq(invoices.companyId, req.companyId!), eq(invoices.vendorId, vendorId)))
       .groupBy(invoices.currency, invoices.status);
 
+    // OPEN NCRs, not every NCR ever raised: the figure is labelled "open" on
+    // the vendor-360 drawer, and a closed or voided non-conformance is not
+    // one. Counting them all overstated the vendor's quality exposure.
     const [ncrRow] = await app.db
       .select({ n: count() })
       .from(nonConformanceReports)
@@ -485,6 +488,7 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
         and(
           eq(nonConformanceReports.companyId, req.companyId!),
           eq(nonConformanceReports.raisedAgainstVendorId, vendorId),
+          notInArray(nonConformanceReports.status, ["closed", "rejected", "void"]),
         ),
       );
     const [incidentRow] = await app.db

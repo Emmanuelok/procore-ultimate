@@ -765,6 +765,9 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
           `re-dated or closed is how a project loses the thread of what it agreed: either close ` +
           `it, re-date it (which is recorded as slippage), or promote it to an obligation so the ` +
           `time bar is enforced.`,
+        fingerprint: `${OVERDUE_DETECTOR}:${item.id}`,
+        subjectType: "meeting_action_item",
+        subjectId: item.id,
         evidenceRefs: {
           key: item.id,
           actionItemId: item.id,
@@ -839,6 +842,9 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
           `without being closed. An item that survives this many meetings is not an agenda ` +
           `item, it is an undecided question: give it an owner and a date, escalate it, or ` +
           `record the decision not to decide it.`,
+        fingerprint: `${CARRY_DETECTOR}:${rootId}`,
+        subjectType: "meeting_agenda_item",
+        subjectId: rootId,
         evidenceRefs: {
           key: rootId,
           rootItemId: rootId,
@@ -4962,6 +4968,9 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
           `record — so a disagreement raised afterwards is a new agenda item, not a correction. ` +
           `This warning exists because a deeming clock that only reports itself once it has run ` +
           `out has told you nothing you could act on.`,
+        fingerprint: `${OBJECTION_DETECTOR}:${key}`,
+        subjectType: "meeting",
+        subjectId: meeting.id,
         evidenceRefs: {
           key,
           meetingId: meeting.id,

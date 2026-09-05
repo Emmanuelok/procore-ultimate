@@ -1187,7 +1187,13 @@ export const prequalRegisterRoutes: FastifyPluginAsync = async (app) => {
     return {
       reference: submission.reference,
       status: submission.status,
-      dueAt: submission.dueAt,
+      /*
+       * The vendor's deadline is the life of their link, not an invented
+       * "due date": a prequalification submission carries no due column, and
+       * returning one would be a date nobody set. When the token expires the
+       * portal closes, so that IS the date the vendor is working to.
+       */
+      respondBy: submission.portalTokenExpiresAt,
       questionnaire: {
         reference: questionnaire.reference,
         name: questionnaire.name,

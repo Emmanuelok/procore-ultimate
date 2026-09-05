@@ -28,6 +28,7 @@ import {
   assertVendor,
   buildGates,
   countryCodeSchema,
+  currencyCodeSchema,
   idSchema,
   isoDateSchema,
   ledger,
@@ -59,7 +60,7 @@ const itemBodySchema = z.object({
   quantity: z.number().min(0).nullable().optional(),
   unit: z.string().max(20).nullable().optional(),
   value: z.number().min(0).nullable().optional(),
-  currency: z.string().length(3).toUpperCase().optional(),
+  currency: currencyCodeSchema.optional(),
   incoterms: z.enum(INCOTERMS).nullable().optional(),
   originCountry: countryCodeSchema.nullable().optional(),
   customsRequired: z.boolean().default(false),
@@ -181,14 +182,19 @@ export const longLeadRoutes: FastifyPluginAsync = async (app) => {
   app.get("/projects/:projectId/supply-chain/long-lead/:itemId", { preHandler: readGate }, async (req) => {
     const { projectId, itemId } = req.params as { projectId: string; itemId: string };
     const row = await loadItem(req.companyId!, projectId, itemId);
-    const [log, ctx] = await Promise.all([
-      app.db.select().from(longLeadExpeditingLog).where(eq(longLeadExpeditingLog.itemId, itemId)).orderBy(desc(longLeadExpeditingLog.loggedAt)),
+    // The chase log is bounded like every other register read: the newest 200
+    // entries, and `expeditingLogHasMore` says when older ones exist.
+    const LOG_LIMIT = 200;
+    const [logRows, ctx] = await Promise.all([
+      app.db.select().from(longLeadExpeditingLog).where(eq(longLeadExpeditingLog.itemId, itemId)).orderBy(desc(longLeadExpeditingLog.loggedAt)).limit(LOG_LIMIT + 1),
       loadLongLeadContext(app.db, projectId, [row]),
     ]);
+    const log = logRows.slice(0, LOG_LIMIT);
     const assessed = assessItem(row, ctx, todayISO());
     return {
       ...row,
       expeditingLog: log,
+      expeditingLogHasMore: logRows.length > LOG_LIMIT,
       assessment: assessed.assessment,
       task: row.scheduleTaskId ? (ctx.tasks.get(row.scheduleTaskId) ?? null) : null,
       supplierNode: row.supplierNodeId ? (ctx.nodes.get(row.supplierNodeId) ?? null) : null,

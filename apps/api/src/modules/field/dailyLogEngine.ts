@@ -79,14 +79,23 @@ export function normaliseAiSections(sections: Sections | null | undefined): Sect
     return row;
   });
   if (delays.length > 0) out["delays"] = delays;
-  const manpower = asRows(sections["manpower"]).map((row) => ({
-    company: str(row["company"] ?? row["contractor"] ?? row["trade"] ?? "Unknown"),
-    workers: Math.max(0, Math.round(num(row["workers"] ?? row["headcount"]))),
-    hours: Math.max(0, num(row["hours"])),
-    ...(row["notes"] !== undefined || row["activity"] !== undefined
-      ? { notes: str(row["notes"] ?? row["activity"]) }
-      : {}),
-  }));
+  // Rewrite only the keys the AI shape gets wrong and keep the rest of the
+  // row: `trade` is a column the UI collects and `manpowerRow` validates, and
+  // rebuilding the row from scratch deleted it on the FIRST save of every day
+  // (dailyLogs.ts runs this over the incoming body, not just over AI drafts).
+  const manpower = asRows(sections["manpower"]).map((row) => {
+    const normalised: Record<string, unknown> = { ...row };
+    delete normalised["contractor"];
+    delete normalised["headcount"];
+    delete normalised["activity"];
+    normalised["company"] = str(row["company"] ?? row["contractor"] ?? row["trade"] ?? "Unknown");
+    normalised["workers"] = Math.max(0, Math.round(num(row["workers"] ?? row["headcount"])));
+    normalised["hours"] = Math.max(0, num(row["hours"]));
+    if (row["notes"] !== undefined || row["activity"] !== undefined) {
+      normalised["notes"] = str(row["notes"] ?? row["activity"]);
+    }
+    return normalised;
+  });
   if (manpower.length > 0) out["manpower"] = manpower;
   return out;
 }

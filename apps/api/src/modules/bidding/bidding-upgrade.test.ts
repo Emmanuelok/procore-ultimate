@@ -763,7 +763,7 @@ describe("regression: award approval is atomic and validated", () => {
       items: [{ description: "All works", itemCode: "A", isMandatory: true }],
     });
     const itemId = items.json().items[0].id;
-    await post(`/projects/${projectA}/bid-packages/${pkg.id}/levelling/entries`, {
+    const entries = await post(`/projects/${projectA}/bid-packages/${pkg.id}/levelling/entries`, {
       entries: [
         {
           levellingItemId: itemId,
@@ -773,19 +773,26 @@ describe("regression: award approval is atomic and validated", () => {
           adjustmentAmount: 0,
         },
         {
-          // The cheaper bidder excluded the temporary works; levelling adds
-          // them back and the "lowest" bid changes.
+          // The cheaper bidder priced the row but excluded the temporary
+          // works within it, so the row is PARTIALLY included: levelling adds
+          // the missing scope back and the "lowest" bid changes. Marking it
+          // "excluded" while carrying the 190,000 is refused by the engine,
+          // and rightly — excluded scope is not in the price.
           levellingItemId: itemId,
           submissionId: b.id,
-          includedStatus: "excluded",
+          includedStatus: "partially_included",
           asBidAmount: 190_000,
           adjustmentAmount: 40_000,
-          adjustmentReason: "excluded_scope_priced_elsewhere",
+          adjustmentReason: "exclusion_priced_elsewhere",
           adjustmentNote: "Temporary works excluded; priced from the next bidder's rate.",
         },
       ],
     });
-    await post(`/projects/${projectA}/bid-packages/${pkg.id}/levelling/complete`);
+    expect(entries.statusCode).toBe(201);
+    const completed = await post(
+      `/projects/${projectA}/bid-packages/${pkg.id}/levelling/complete`,
+    );
+    expect(completed.statusCode).toBe(200);
     const rec = await post(`/projects/${projectA}/bid-packages/${pkg.id}/award/recommend`, {
       submissionId: a.id,
       recommendationBasis:
@@ -887,6 +894,17 @@ describe("award withdrawal", () => {
       notLowestJustification:
         "The lowest bidder entered administration and cannot contract; their price is not " +
         "available to be taken.",
+      /*
+       * The first award was approved seconds after it was recommended, which
+       * the approval-velocity detector raises as a high-severity finding —
+       * correctly, and it is still open. A later recommendation on the same
+       * package must therefore say something about it, which is the control
+       * working rather than an obstacle to route around.
+       */
+      integrityAcknowledgement:
+        "The rapid approval flagged on the first award was the emergency board decision minuted " +
+        "on the day the winner's administration was announced; the approver and the recommender " +
+        "are different people and the minute is on file.",
     });
     expect(again.statusCode).toBe(201);
   });
@@ -1160,7 +1178,20 @@ describe("regression: prequalification", () => {
     const forThisVendor = lapseSignals.filter(
       (s) => (s.evidenceRefs as Record<string, unknown>)["vendorId"] === vendorId,
     );
-    expect(forThisVendor).toHaveLength(0);
+    /*
+     * The first approval expired two days before the renewal was approved, so
+     * a lapse WAS raised at that moment and raising it was correct — for
+     * those two days nothing current was known about this vendor. What must
+     * not survive the renewal is an OPEN finding: a high-severity "nothing
+     * has been checked about this company" against a vendor the register
+     * reports as approved is the register and the signals disagreeing.
+     */
+    const open = forThisVendor.filter((s) => s.closedAt === null);
+    expect(open).toHaveLength(0);
+    for (const closed of forThisVendor) {
+      expect(closed.disposition).toBe("closed");
+      expect(closed.reviewerNotes).toMatch(/superseded by/i);
+    }
 
     const standing = await get(`/companies/current/prequalification/vendors/${vendorId}`);
     expect(standing.json().state).toBe("approved");
@@ -1279,9 +1310,19 @@ describe("regression: a balance-sheet-insolvent contractor gets no limit", () =>
     const body = JSON.stringify(standing.json());
     expect(body).toMatch(/hard_stop/);
     expect(body).toMatch(/net assets/i);
-    // The turnover test would otherwise have allowed 25% of 10m.
-    expect(body).not.toMatch(/2500000/);
-    expect(standing.json().recommendedLimit.value).toBe(0);
+    const limit = standing.json().recommendedLimit;
+    // The screening is carried even though this vendor has no questionnaire:
+    // solvency does not wait for a PQQ.
+    expect(limit.value).toBe(0);
+    expect(limit.bindingTest).toBe("hard_stop");
+    // The turnover test would otherwise have allowed 25% of 10m. It is named
+    // ONLY as the figure that was refused, never offered as a limit: no test
+    // in the breakdown produces it, and the sentence that mentions it says so.
+    expect(limit.tests).toEqual([]);
+    expect(
+      (limit.reasons as string[]).some((r) => /would otherwise have allowed/i.test(r)),
+    ).toBe(true);
+    expect((limit.reasons as string[]).join(" ")).toMatch(/2500000/);
   });
 });
 

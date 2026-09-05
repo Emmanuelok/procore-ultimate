@@ -2,6 +2,7 @@ import type { FastifyPluginAsync } from "fastify";
 import { analyticsRoutes } from "./analytics.js";
 import { awardRoutes } from "./awards.js";
 import { engagementRoutes } from "./engagement.js";
+import { evaluationAiRoutes } from "./evaluation-routes.js";
 import { integrityRoutes } from "./integrity-routes.js";
 import { invitationRoutes } from "./invitations.js";
 import { registerBiddingJobs } from "./jobs.js";
@@ -101,7 +102,9 @@ import { submissionRoutes } from "./submissions.js";
  * Route surface, all under `/api/v1`:
  *   /projects/:projectId/bid-packages ... (+ invitations, submissions,
  *     levelling, scoring, awards, addenda, tabulation, questions, meetings,
- *     bonds, integrity, scope-gaps, document-access, publish, health-inputs)
+ *     bonds, integrity, scope-gaps, document-access, publish, health-inputs,
+ *     evaluation/propose — the AI levelling assistant, which PROPOSES cited
+ *     drafts and writes nothing; 503 AiDisabled with no key)
  *   /bid-invitations/:invitationId/...      /bid-portal/...   (hashed token)
  *   /bid-submissions/:submissionId/...      /bid-levelling-*  /bid-awards/...
  *   /bid-bonds/:bondId/status
@@ -130,6 +133,7 @@ export const biddingModule: FastifyPluginAsync = async (app) => {
   await app.register(prequalRegisterRoutes);
   /* platform upgrade wave */
   await app.register(engagementRoutes);
+  await app.register(evaluationAiRoutes);
   await app.register(integrityRoutes);
   await app.register(opportunityRoutes);
   await app.register(analyticsRoutes);

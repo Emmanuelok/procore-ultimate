@@ -11,7 +11,7 @@ import { supplierRiskAssessments, supplyChainNodes } from "@constructos/db";
 import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.js";
 import { countryConcentration } from "../engines/supplierRisk.js";
 import { latestAssessments, runSupplierRisk } from "../service.js";
-import { buildGates, idSchema, todayISO } from "../shared.js";
+import { ROLLUP_CAP, buildGates, capped, idSchema, todayISO } from "../shared.js";
 
 export const riskRoutes: FastifyPluginAsync = async (app) => {
   const { readGate, standardGate } = buildGates(app);
@@ -20,14 +20,17 @@ export const riskRoutes: FastifyPluginAsync = async (app) => {
   app.get(base, { preHandler: readGate }, async (req) => {
     const { projectId } = req.params as { projectId: string };
     const companyId = req.companyId!;
-    const [nodes, latest] = await Promise.all([
+    const [allNodes, latest] = await Promise.all([
       app.db
         .select()
         .from(supplyChainNodes)
         .where(and(eq(supplyChainNodes.companyId, companyId), eq(supplyChainNodes.projectId, projectId)))
-        .orderBy(asc(supplyChainNodes.tier), asc(supplyChainNodes.name)),
+        .orderBy(asc(supplyChainNodes.tier), asc(supplyChainNodes.name))
+        .limit(ROLLUP_CAP + 1),
       latestAssessments(app.db, companyId, projectId),
     ]);
+    const capNodes = capped(allNodes, "supply chain nodes");
+    const nodes = capNodes.rows;
     const concentration = countryConcentration(
       nodes.map((n) => ({ id: n.id, name: n.name, tier: n.tier, country: n.country, criticality: n.criticality, categories: n.categories, vendorId: n.vendorId, entityId: n.entityId, status: n.status })),
       0.5,
@@ -61,7 +64,18 @@ export const riskRoutes: FastifyPluginAsync = async (app) => {
       summary,
       concentration,
       lastRunAt,
-      reasons: nodes.length === 0 ? ["No supply chain nodes on the map; add the tier-1 suppliers and their upstream sources first."] : lastRunAt === null ? ["The supplier risk engine has not run for this project yet."] : [],
+      truncated: capNodes.notice ? [capNodes.notice] : [],
+      reasons: [
+        capNodes.notice,
+        nodes.length === 0
+          ? "No supply chain nodes on the map; add the tier-1 suppliers and their upstream sources first."
+          : lastRunAt === null
+            ? "The supplier risk engine has not run for this project yet."
+            : null,
+        summary["not_assessed"] && summary["not_assessed"] > 0
+          ? `${summary["not_assessed"]} node(s) have never been scored: they are counted as not assessed, not as low risk.`
+          : null,
+      ].filter((r): r is string => r !== null),
     };
   });
 

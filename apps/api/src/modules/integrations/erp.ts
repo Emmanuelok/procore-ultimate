@@ -323,7 +323,12 @@ const FORMULA_TRIGGERS = new Set(["=", "+", "-", "@", "\t", "\r"]);
 
 export function erpCsvEscape(value: unknown): string {
   let s = value === null || value === undefined ? "" : String(value);
-  if (s.length > 0 && FORMULA_TRIGGERS.has(s[0]!)) s = `'${s}`;
+  // A NUMBER IS NEVER NEUTRALISED. Injection needs an untrusted string; a
+  // negative amount (a credit note, a retainage release) is not one, and
+  // prefixing -1200.5 with an apostrophe makes an ERP import read money as
+  // text — which is worse than the risk it would be guarding against.
+  const numeric = typeof value === "number" || typeof value === "bigint";
+  if (!numeric && s.length > 0 && FORMULA_TRIGGERS.has(s[0]!)) s = `'${s}`;
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 

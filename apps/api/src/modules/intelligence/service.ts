@@ -14,7 +14,7 @@
  * happens. Every write is company-scoped; every read that lists across
  * projects accepts a visibility set (plan §6.3).
  */
-import { and, asc, count, desc, eq, gte, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import {
   attentionItems,
   projectHealthSnapshots,
@@ -53,6 +53,8 @@ const HEALTH_RETENTION_DAYS = 90;
 const PULSE_RETENTION_DAYS = 30;
 const TREND_DAYS = 14;
 const MAX_PROJECTS_PER_COMPANY = 1000;
+/** above this, a first Pulse read does not recompute the whole portfolio inline */
+const COLD_READ_PROJECT_LIMIT = 25;
 
 const n = (v: unknown): number => {
   const x = typeof v === "number" ? v : Number(v);
@@ -127,7 +129,10 @@ function snapshotToHealth(
     computedAt: new Date(row.computedAt).toISOString(),
     trend,
     ratedDimensions: row.ratedDimensions,
-    basis: overallBasisFromDims(dims, row.level as HealthLevel, row.ratedDimensions),
+    // the engine's own sentence, so a re-read explains the verdict exactly as
+    // the computation did; the rebuild is only for rows written before the
+    // column existed
+    basis: row.basis && row.basis.length > 0 ? row.basis : overallBasisFromDims(dims, row.level as HealthLevel, row.ratedDimensions),
     snapshotId: row.id,
   };
 }
@@ -248,6 +253,7 @@ export async function computeProjectHealth(
         score: computed.score,
         ratedDimensions: computed.ratedDimensions,
         dimensions: computed.dimensions,
+        basis: computed.basis,
         trigger,
         computedAt: now.toISOString(),
       })
@@ -420,20 +426,41 @@ export interface AttentionRefreshResult {
   upserted: number;
   resolved: number;
   open: number;
+  /** source types that hold more than the sweep may keep — nothing there is resolved */
+  truncatedSources: string[];
+}
+
+export interface RefreshAttentionOptions {
+  /** refresh only this project's items (the single-project recompute path) */
+  projectId?: string | null;
+  /** true when the project list itself was capped: resolution is unsafe */
+  projectsTruncated?: boolean;
+  /** per-source row cap override (tests) */
+  sourceLimit?: number;
 }
 
 /**
  * Idempotent: the same conditions produce the same ids, so a second run
  * updates rather than duplicates; rows whose source condition is gone are
  * resolved; a person's dismissal is preserved.
+ *
+ * Resolution is a claim ("the underlying condition is gone"), so it is only
+ * made where the sweep actually looked: a source whose query hit its cap, and
+ * every source at all when the project list was capped, is left alone — an
+ * item pushed out of the top N by newer, more urgent ones is still live.
  */
 export async function refreshAttention(
   db: Db,
   companyId: string,
   projectList: ProjectLite[],
   now: Date,
+  opts: RefreshAttentionOptions = {},
 ): Promise<AttentionRefreshResult> {
-  const candidates = await collectAttentionCandidates(db, companyId, projectList, now);
+  const onlyProject = opts.projectId ?? null;
+  const { candidates, truncatedSources } = await collectAttentionCandidates(db, companyId, projectList, now, {
+    projectId: onlyProject,
+    sourceLimit: opts.sourceLimit,
+  });
   const ranked = rankCandidates(candidates, now);
   const nowIso = now.toISOString();
   const seen = new Set<string>();
@@ -480,23 +507,52 @@ export async function refreshAttention(
         },
       });
   }
-  // resolve open rows the refresh no longer produced
-  const stale = await db
-    .select({ id: attentionItems.id })
-    .from(attentionItems)
-    .where(and(eq(attentionItems.companyId, companyId), eq(attentionItems.status, "open"), lte(attentionItems.lastSeenAt, nowIso)));
-  const toResolve = stale.map((s) => s.id).filter((id) => !seen.has(id));
-  if (toResolve.length > 0) {
-    await db
-      .update(attentionItems)
-      .set({ status: "resolved", resolvedAt: nowIso })
-      .where(and(eq(attentionItems.companyId, companyId), inArray(attentionItems.id, toResolve)));
+  // Resolve open rows this sweep no longer produced — but only from the
+  // sources it actually exhausted, and only within the scope it swept.
+  let toResolve: string[] = [];
+  if (!opts.projectsTruncated) {
+    const stale = await db
+      .select({ id: attentionItems.id })
+      .from(attentionItems)
+      .where(
+        and(
+          eq(attentionItems.companyId, companyId),
+          eq(attentionItems.status, "open"),
+          lte(attentionItems.lastSeenAt, nowIso),
+          onlyProject ? eq(attentionItems.projectId, onlyProject) : undefined,
+          truncatedSources.length > 0 ? notInArray(attentionItems.sourceType, truncatedSources) : undefined,
+        ),
+      );
+    toResolve = stale.map((s) => s.id).filter((id) => !seen.has(id));
+    if (toResolve.length > 0) {
+      await db
+        .update(attentionItems)
+        .set({ status: "resolved", resolvedAt: nowIso })
+        .where(and(eq(attentionItems.companyId, companyId), inArray(attentionItems.id, toResolve)));
+    }
   }
   const [openRow] = await db
     .select({ n: count() })
     .from(attentionItems)
     .where(and(eq(attentionItems.companyId, companyId), eq(attentionItems.status, "open")));
-  return { candidates: candidates.length, upserted: ranked.length, resolved: toResolve.length, open: n(openRow?.n) };
+  const truncated = opts.projectsTruncated ? [...truncatedSources, "projects"].sort() : truncatedSources;
+  return { candidates: candidates.length, upserted: ranked.length, resolved: toResolve.length, open: n(openRow?.n), truncatedSources: truncated };
+}
+
+/**
+ * Refresh one project's slice of the feed. This is what a person pressing
+ * "recompute" on a project pays for: their project's sources, not the whole
+ * company's (a company-wide sweep is the scheduler's job).
+ */
+export async function refreshProjectAttention(
+  db: Db,
+  companyId: string,
+  projectId: string,
+  now: Date,
+): Promise<AttentionRefreshResult | null> {
+  const project = await loadProjectLite(db, companyId, projectId);
+  if (!project) return null;
+  return refreshAttention(db, companyId, [project], now, { projectId });
 }
 
 type AttentionRow = typeof attentionItems.$inferSelect;
@@ -565,6 +621,58 @@ export async function listAttention(
     db.select({ n: count() }).from(attentionItems).where(where),
   ]);
   return { items: rows.map(rowToAttention), total: n(totalRow[0]?.n) };
+}
+
+/** The company-level bucket of the per-project rollup (items with no project). */
+export const COMPANY_ROLLUP_KEY = "_company";
+
+export type ProjectRollup = Record<string, { level: string; attention: Record<string, number> }>;
+
+const emptySeverityCounts = (): Record<string, number> => ({ critical: 0, high: 0, medium: 0, low: 0, info: 0 });
+
+/**
+ * Open attention counted per project and severity, so a snapshot can be
+ * re-read by someone who may only see part of the portfolio without either
+ * leaking the company's totals or inventing a number.
+ */
+export async function attentionCountsByProject(db: Db, companyId: string): Promise<Record<string, Record<string, number>>> {
+  const rows = await db
+    .select({ projectId: attentionItems.projectId, severity: attentionItems.severity, n: count() })
+    .from(attentionItems)
+    .where(and(eq(attentionItems.companyId, companyId), eq(attentionItems.status, "open")))
+    .groupBy(attentionItems.projectId, attentionItems.severity);
+  const out: Record<string, Record<string, number>> = {};
+  for (const r of rows) {
+    const key = r.projectId ?? COMPANY_ROLLUP_KEY;
+    const bucket = out[key] ?? emptySeverityCounts();
+    bucket[r.severity] = n(r.n);
+    out[key] = bucket;
+  }
+  return out;
+}
+
+/** Sum a stored rollup over the projects a caller may see (company items always count). */
+export function rollupForVisible(
+  rollup: ProjectRollup,
+  visible: Set<string> | null,
+): { byHealth: PortfolioRollup["byHealth"]; projects: number; openAttention: number; attentionBySeverity: Record<string, number> } {
+  const byHealth = { on_track: 0, watch: 0, off_track: 0, unrated: 0 };
+  const attentionBySeverity = emptySeverityCounts();
+  let projectsCounted = 0;
+  let open = 0;
+  for (const [key, entry] of Object.entries(rollup)) {
+    const isCompanyBucket = key === COMPANY_ROLLUP_KEY;
+    if (!isCompanyBucket) {
+      if (visible !== null && !visible.has(key)) continue;
+      projectsCounted += 1;
+      if (entry.level in byHealth) byHealth[entry.level as HealthLevel] += 1;
+    }
+    for (const [severity, value] of Object.entries(entry.attention ?? {})) {
+      attentionBySeverity[severity] = (attentionBySeverity[severity] ?? 0) + value;
+      open += value;
+    }
+  }
+  return { byHealth, projects: projectsCounted, openAttention: open, attentionBySeverity };
 }
 
 export async function attentionBySeverity(
@@ -716,30 +824,55 @@ async function computeChanges(
   };
 }
 
-function samePulse(prev: PulseRow, portfolio: PortfolioRollup, bySeverity: Record<string, number>, open: number): boolean {
+function samePulse(
+  prev: PulseRow,
+  portfolio: PortfolioRollup,
+  bySeverity: Record<string, number>,
+  open: number,
+  truncatedSources: string[],
+): boolean {
   return (
     JSON.stringify(prev.portfolio) === JSON.stringify(portfolio) &&
     JSON.stringify(prev.attentionBySeverity) === JSON.stringify(bySeverity) &&
+    JSON.stringify(prev.truncatedSources ?? []) === JSON.stringify(truncatedSources) &&
     prev.openAttention === open
   );
 }
 
+export interface RefreshPulseOptions {
+  force?: boolean;
+  /** what the attention sweep that preceded this snapshot could not exhaust */
+  truncatedSources?: string[];
+}
+
 /** Build and store the company snapshot. Identical snapshots inside six hours are not re-inserted. */
-export async function refreshPulse(db: Db, companyId: string, now: Date, force = false): Promise<PulseRow> {
+export async function refreshPulse(db: Db, companyId: string, now: Date, opts: RefreshPulseOptions = {}): Promise<PulseRow> {
   const projectList = await listCompanyProjects(db, companyId);
   const scores = await portfolioScores(db, companyId, projectList, now);
   const portfolio = rollup(scores);
-  const { counts, open } = await attentionBySeverity(db, companyId, null);
+  const [{ counts, open }, byProject] = await Promise.all([
+    attentionBySeverity(db, companyId, null),
+    attentionCountsByProject(db, companyId),
+  ]);
+  const projectRollup: ProjectRollup = {};
+  for (const s of scores) {
+    projectRollup[s.projectId] = { level: s.level, attention: byProject[s.projectId] ?? emptySeverityCounts() };
+  }
+  const companyBucket = byProject[COMPANY_ROLLUP_KEY];
+  if (companyBucket) projectRollup[COMPANY_ROLLUP_KEY] = { level: "unrated", attention: companyBucket };
   const [latest] = await db
     .select()
     .from(pulseSnapshots)
     .where(eq(pulseSnapshots.companyId, companyId))
     .orderBy(desc(pulseSnapshots.generatedAt))
     .limit(1);
+  // A refresh that did not sweep the sources (a project-scoped recompute)
+  // carries the last sweep's truncation forward rather than claiming none.
+  const truncatedSources = opts.truncatedSources ?? ((latest?.truncatedSources ?? []) as string[]);
   if (
-    !force &&
+    !opts.force &&
     latest &&
-    samePulse(latest, portfolio, counts, open) &&
+    samePulse(latest, portfolio, counts, open, truncatedSources) &&
     now.getTime() - Date.parse(latest.generatedAt) < SNAPSHOT_DEDUPE_MS
   ) {
     return latest;
@@ -756,6 +889,8 @@ export async function refreshPulse(db: Db, companyId: string, now: Date, force =
       scores,
       attentionBySeverity: counts,
       openAttention: open,
+      projectRollup,
+      truncatedSources,
       changes: { ...changes },
     })
     .returning();
@@ -772,12 +907,28 @@ export async function latestPulseSnapshot(db: Db, companyId: string): Promise<Pu
   return row ?? null;
 }
 
+export interface PulseHistoryPoint {
+  generatedAt: string;
+  byHealth: PortfolioRollup["byHealth"];
+  projects: number;
+  openAttention: number;
+  attentionBySeverity: Record<string, number>;
+}
+
+/**
+ * The daily portfolio series. A caller who can only see some projects gets
+ * their slice, rebuilt from the snapshot's per-project rollup — never the
+ * company's totals (plan §6.3). A snapshot taken before the rollup existed
+ * cannot be sliced honestly, so it is left out of a restricted series rather
+ * than reported as zeros.
+ */
 export async function pulseHistory(
   db: Db,
   companyId: string,
   now: Date,
   days: number,
-): Promise<Array<{ generatedAt: string; byHealth: PortfolioRollup["byHealth"]; projects: number; openAttention: number; attentionBySeverity: Record<string, number> }>> {
+  visible: Set<string> | null = null,
+): Promise<PulseHistoryPoint[]> {
   const since = new Date(now.getTime() - days * DAY_MS).toISOString();
   const dayExpr = sql`date_trunc('day', ${pulseSnapshots.generatedAt})`;
   const rows = await db
@@ -786,23 +937,32 @@ export async function pulseHistory(
       portfolio: pulseSnapshots.portfolio,
       openAttention: pulseSnapshots.openAttention,
       attentionBySeverity: pulseSnapshots.attentionBySeverity,
+      projectRollup: pulseSnapshots.projectRollup,
     })
     .from(pulseSnapshots)
     .where(and(eq(pulseSnapshots.companyId, companyId), gte(pulseSnapshots.generatedAt, since)))
     .orderBy(dayExpr, desc(pulseSnapshots.generatedAt))
     .limit(days + 1);
-  return rows
-    .map((r) => {
+  const out: PulseHistoryPoint[] = [];
+  for (const r of rows) {
+    const generatedAt = new Date(r.generatedAt).toISOString();
+    if (visible === null) {
       const pf = r.portfolio as unknown as PortfolioRollup;
-      return {
-        generatedAt: new Date(r.generatedAt).toISOString(),
+      out.push({
+        generatedAt,
         byHealth: pf.byHealth ?? { on_track: 0, watch: 0, off_track: 0, unrated: 0 },
         projects: pf.projects ?? 0,
         openAttention: r.openAttention,
         attentionBySeverity: r.attentionBySeverity,
-      };
-    })
-    .sort((a, b) => a.generatedAt.localeCompare(b.generatedAt));
+      });
+      continue;
+    }
+    const stored = (r.projectRollup ?? {}) as ProjectRollup;
+    if (Object.keys(stored).length === 0) continue;
+    const slice = rollupForVisible(stored, visible);
+    out.push({ generatedAt, ...slice });
+  }
+  return out.sort((a, b) => a.generatedAt.localeCompare(b.generatedAt));
 }
 
 export async function latestBriefing(db: Db, companyId: string, projectId: string | null) {
@@ -852,7 +1012,20 @@ export async function readPulse(db: Db, companyId: string, now: Date, opts: Read
   let snap = await latestPulseSnapshot(db, companyId);
   let computedOnRead = false;
   if (!snap) {
-    await runCompanyRefresh(db, companyId, now, "read");
+    // First ever read for this company: build something honest inside the
+    // request, but never a whole portfolio's health — past a handful of
+    // projects the scheduler's sweep (boot + every 15 min) does that work,
+    // and this read shows "unrated" until it has, rather than blocking.
+    const projectList = await listCompanyProjects(db, companyId);
+    if (projectList.length <= COLD_READ_PROJECT_LIMIT) {
+      await runCompanyRefresh(db, companyId, now, "read");
+    } else {
+      const attention = await refreshAttention(db, companyId, projectList, now, {
+        projectsTruncated: projectList.length >= MAX_PROJECTS_PER_COMPANY,
+      });
+      await refreshPulse(db, companyId, now, { truncatedSources: attention.truncatedSources });
+      for (const p of projectList) markProjectDirty(db, companyId, p.id, "project", "read");
+    }
     snap = await latestPulseSnapshot(db, companyId);
     computedOnRead = true;
   }
@@ -866,14 +1039,20 @@ export async function readPulse(db: Db, companyId: string, now: Date, opts: Read
   ]);
   const storedChanges = (snap?.changes ?? {}) as Partial<PulseChanges>;
   const visibleIds = opts.visible;
-  const changes: PulseChanges = {
-    since: storedChanges.since ?? null,
-    levelChanges: (storedChanges.levelChanges ?? []).filter((c) => visibleIds === null || visibleIds.has(c.projectId)),
-    newAttention: storedChanges.newAttention ?? 0,
-    resolvedAttention: storedChanges.resolvedAttention ?? 0,
-    openAttentionFrom: storedChanges.openAttentionFrom ?? null,
-    openAttentionTo: storedChanges.openAttentionTo ?? sev.open,
-  };
+  const changes: PulseChanges =
+    visibleIds === null
+      ? {
+          since: storedChanges.since ?? null,
+          levelChanges: storedChanges.levelChanges ?? [],
+          newAttention: storedChanges.newAttention ?? 0,
+          resolvedAttention: storedChanges.resolvedAttention ?? 0,
+          openAttentionFrom: storedChanges.openAttentionFrom ?? null,
+          openAttentionTo: storedChanges.openAttentionTo ?? sev.open,
+        }
+      : // A partial view must not carry the company's totals beside its own
+        // filtered figures: recount the movements over the visible projects
+        // and read the "from" out of the snapshot this one is compared against.
+        await visibleChanges(db, companyId, storedChanges, visibleIds, sev.open, now);
   return {
     generatedAt: snap ? new Date(snap.generatedAt).toISOString() : now.toISOString(),
     portfolio,
@@ -883,7 +1062,48 @@ export async function readPulse(db: Db, companyId: string, now: Date, opts: Read
     scores,
     briefing: briefingSummary(briefing, opts.aiEnabled),
     changes,
+    attentionTruncated: (snap?.truncatedSources ?? []) as string[],
     computedOnRead,
+  };
+}
+
+/** The "since yesterday" figures counted over the projects this caller may see. */
+async function visibleChanges(
+  db: Db,
+  companyId: string,
+  stored: Partial<PulseChanges>,
+  visible: Set<string>,
+  openNow: number,
+  now: Date,
+): Promise<PulseChanges> {
+  const since = stored.since ?? new Date(now.getTime() - DAY_MS).toISOString();
+  const scope = visibilityCondition(visible);
+  const [newRow] = await db
+    .select({ n: count() })
+    .from(attentionItems)
+    .where(and(eq(attentionItems.companyId, companyId), eq(attentionItems.status, "open"), gte(attentionItems.firstSeenAt, since), scope));
+  const [resolvedRow] = await db
+    .select({ n: count() })
+    .from(attentionItems)
+    .where(and(eq(attentionItems.companyId, companyId), eq(attentionItems.status, "resolved"), gte(attentionItems.resolvedAt, since), scope));
+  let openFrom: number | null = null;
+  if (stored.since) {
+    const [prevSnap] = await db
+      .select({ projectRollup: pulseSnapshots.projectRollup })
+      .from(pulseSnapshots)
+      .where(and(eq(pulseSnapshots.companyId, companyId), lte(pulseSnapshots.generatedAt, stored.since)))
+      .orderBy(desc(pulseSnapshots.generatedAt))
+      .limit(1);
+    const rollupRow = (prevSnap?.projectRollup ?? {}) as ProjectRollup;
+    if (Object.keys(rollupRow).length > 0) openFrom = rollupForVisible(rollupRow, visible).openAttention;
+  }
+  return {
+    since: stored.since ?? null,
+    levelChanges: (stored.levelChanges ?? []).filter((c) => visible.has(c.projectId)),
+    newAttention: n(newRow?.n),
+    resolvedAttention: n(resolvedRow?.n),
+    openAttentionFrom: openFrom,
+    openAttentionTo: openNow,
   };
 }
 
@@ -897,6 +1117,8 @@ export interface CompanyRefreshResult {
   levelChanges: number;
   attention: AttentionRefreshResult;
   pulseId: string;
+  /** sources holding more than the sweep may keep (see refreshAttention) */
+  truncatedSources: string[];
 }
 
 /** Recompute every project, refresh the feed, take the company snapshot, prune history. */
@@ -916,10 +1138,19 @@ export async function runCompanyRefresh(
     if (r.inserted) recomputed += 1;
     if (r.levelChanged) levelChanges += 1;
   }
-  const attention = await refreshAttention(db, companyId, projectList, now);
-  const pulse = await refreshPulse(db, companyId, now);
+  const attention = await refreshAttention(db, companyId, projectList, now, {
+    projectsTruncated: projectList.length >= MAX_PROJECTS_PER_COMPANY,
+  });
+  const pulse = await refreshPulse(db, companyId, now, { truncatedSources: attention.truncatedSources });
   await pruneHistory(db, companyId, now);
-  return { projects: targets.length, recomputed, levelChanges, attention, pulseId: pulse.id };
+  return {
+    projects: targets.length,
+    recomputed,
+    levelChanges,
+    attention,
+    pulseId: pulse.id,
+    truncatedSources: attention.truncatedSources,
+  };
 }
 
 export async function pruneHistory(db: Db, companyId: string, now: Date): Promise<void> {
@@ -997,8 +1228,10 @@ export async function drainDirtyProjects(db: Db, now: Date): Promise<{ projects:
       projectsDone += 1;
       if (r.levelChanged) levelChanges += 1;
     }
-    await refreshAttention(db, companyId, projectList, now);
-    await refreshPulse(db, companyId, now);
+    const attention = await refreshAttention(db, companyId, projectList, now, {
+      projectsTruncated: projectList.length >= MAX_PROJECTS_PER_COMPANY,
+    });
+    await refreshPulse(db, companyId, now, { truncatedSources: attention.truncatedSources });
   }
   return { projects: projectsDone, companies: byCompany.size, levelChanges };
 }

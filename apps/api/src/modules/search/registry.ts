@@ -152,6 +152,17 @@ export function tableSource(spec: TableSourceSpec): SearchSource {
       if (spec.scope === "project" && ctx.projectIds !== null && ctx.projectIds.length === 0) {
         return [];
       }
+      // A named project narrows the caller's scope, never widens it: asking
+      // for a project the caller cannot see returns nothing, not that
+      // project's rows.
+      if (
+        spec.scope === "project" &&
+        ctx.projectId &&
+        ctx.projectIds !== null &&
+        !ctx.projectIds.includes(ctx.projectId)
+      ) {
+        return [];
+      }
       const conds: SQL[] = [eq(spec.columns.companyId, ctx.companyId)];
       if (spec.filter) conds.push(spec.filter);
 

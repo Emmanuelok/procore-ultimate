@@ -1118,6 +1118,9 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
             `balance sheet, and where the cover is a contractual requirement the lapse is itself a breach ` +
             `that can found a determination. Renew, confirm replacement cover, or record the decision to ` +
             `carry the risk.`,
+          fingerprint: `policy_lapsed_during_works:${p.policyId}`,
+          subjectType: "insurance_policy",
+          subjectId: p.policyId,
           evidenceRefs: {
             key: p.policyId,
             policyId: p.policyId,
@@ -1166,6 +1169,9 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
             `Evidence of cover is not cover, but its absence is the only thing you can see: until a ` +
             `replacement certificate is collected, this party is working with no demonstrable insurance ` +
             `and any indemnity given back to you is unsupported.`,
+          fingerprint: `insurance_certificate_expired:${c.certificateId}`,
+          subjectType: "insurance_certificate",
+          subjectId: c.certificateId,
           evidenceRefs: {
             key: c.certificateId,
             certificateId: c.certificateId,
@@ -1198,6 +1204,9 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
             `A demand made now will not be honoured however well founded it is: the security is spent. ` +
             `If a claim against the principal is live, the recovery must now be pursued against the ` +
             `principal directly, and the failure to demand in time should be recorded as a loss event.`,
+          fingerprint: `bond_demand_deadline_passed:${b.bondId}`,
+          subjectType: "bond",
+          subjectId: b.bondId,
           evidenceRefs: {
             key: b.bondId,
             bondId: b.bondId,
@@ -1283,6 +1292,9 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
               `the supply chain is not their exposure, it is yours: their liability to you is worth what ` +
               `their balance sheet is worth, and your own policy will look to the indemnity you were ` +
               `supposed to have taken. Collect and verify a certificate before further work.`,
+            fingerprint: `insurance_cover_gap:${gap.key}`,
+            subjectType: "vendor",
+            subjectId: gap.vendorId,
             evidenceRefs: {
               key: gap.key,
               vendorId: gap.vendorId,
@@ -1346,6 +1358,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
           confidence: 1,
           title: `Policy period does not cover the works — ${gap.policyType} on ${project.name}`,
           explanation: gap.detail,
+          fingerprint: `policy_period_gap:${gap.key}`,
           evidenceRefs: {
             key: gap.key,
             policyType: gap.policyType,
@@ -1414,6 +1427,9 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
                 ? `Insured loss with no claim raised — ${f.title}`
                 : `Uninsured loss — ${f.title}`,
             explanation: f.detail,
+            fingerprint: `uninsured_loss_candidate:${f.key}`,
+            subjectType: f.recordType,
+            subjectId: f.recordId,
             evidenceRefs: {
               key: f.key,
               recordType: f.recordType,
@@ -1467,6 +1483,9 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
           confidence: 1,
           title: `Renewal behind — ${r.policyType} ${r.number} (${r.insurer})`,
           explanation: r.reason,
+          fingerprint: `policy_renewal_overdue:${key}`,
+          subjectType: "insurance_policy",
+          subjectId: r.policyId,
           evidenceRefs: {
             key,
             policyId: r.policyId,
@@ -3286,6 +3305,9 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
               `Treat the loss as uninsured until the insurer confirms otherwise in writing, notify ` +
               `your broker and your own professional indemnity insurers, and preserve the record of ` +
               `when awareness actually arose — that date is now the whole argument.`,
+            fingerprint: `insurance_notification_missed:${claimId}`,
+            subjectType: "insurance_claim",
+            subjectId: claimId,
             evidenceRefs: {
               key: claimId,
               claimId,
@@ -5730,6 +5752,9 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
           `liability: a good claim notified late is usually not a claim at all. This warning is ` +
           `raised BEFORE the date, because a warning that arrives after it is only a record of ` +
           `the loss.`,
+        fingerprint: `insurance_notification_missed:${key}`,
+        subjectType: "insurance_claim",
+        subjectId: claim.id,
         evidenceRefs: {
           key,
           claimId: claim.id,

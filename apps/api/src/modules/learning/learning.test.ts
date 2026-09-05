@@ -1466,3 +1466,51 @@ describe("supplier performance scorecard", () => {
     expect(body).toHaveLength(0);
   });
 });
+
+/* ================================================================== */
+/* Audit bug regressions                                               */
+/* ================================================================== */
+
+describe("audit bug regressions", () => {
+  it("[#21] numbers lessons on a COMPANY counter, so two projects cannot both hold LL-0001", async () => {
+    const a = await post(`/projects/${projectId}/learning/lessons`, lessonBody({ title: "A" }));
+    const b = await post(
+      `/projects/${bareProjectId}/learning/lessons`,
+      lessonBody({ title: "B" }),
+    );
+    expect(a.statusCode).toBe(201);
+    expect(b.statusCode).toBe(201);
+    const na = (a.json() as Json).number as string;
+    const nb = (b.json() as Json).number as string;
+    expect(na).toMatch(/^LL-\d{4}$/);
+    expect(nb).toMatch(/^LL-\d{4}$/);
+    // Published lessons are a company-wide register and their number is cited
+    // as the reference. Two lessons sharing LL-0001 makes every citation
+    // ambiguous, which is precisely what a per-project counter produced.
+    expect(na).not.toBe(nb);
+  });
+
+  it("[#9] leaves the trigger list a pure read — no obligation, trigger or ledger entry", async () => {
+    const before = await app.db
+      .select()
+      .from(lessonTriggers)
+      .where(eq(lessonTriggers.projectId, projectId));
+    const oblBefore = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.projectId, projectId));
+    const res = await get(`/projects/${projectId}/learning/triggers`, readerHeaders);
+    expect(res.statusCode).toBe(200);
+    expect((res.json() as Json).sweptBy).toMatch(/performs no writes/);
+    const after = await app.db
+      .select()
+      .from(lessonTriggers)
+      .where(eq(lessonTriggers.projectId, projectId));
+    const oblAfter = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.projectId, projectId));
+    expect(after.length).toBe(before.length);
+    expect(oblAfter.length).toBe(oblBefore.length);
+  });
+});

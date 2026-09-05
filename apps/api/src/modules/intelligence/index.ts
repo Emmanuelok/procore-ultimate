@@ -134,12 +134,13 @@ export const intelligenceModule: FastifyPluginAsync = async (app) => {
 
   app.get("/pulse", { preHandler: companyGate }, async (req) => {
     const q = pulseQuery.parse(req.query);
-    const visible = await visibleProjectIds(app, req);
+    const [visible, actable] = await Promise.all([visibleProjectIds(app, req), actableProjectIds(app, req)]);
     const pulse = await readPulse(app.db, req.companyId!, new Date(), {
       visible,
       attentionLimit: q.attentionLimit,
       aiEnabled: aiEnabled(app),
     });
+    pulse.attention = pulse.attention.map((i) => ({ ...i, canAct: canActWith(actable, i.projectId) }));
     // A company-wide briefing is written over every project; a caller who
     // can only see some of them gets the reason, not the text.
     if (visible !== null && pulse.briefing.text !== null) {
@@ -163,10 +164,14 @@ export const intelligenceModule: FastifyPluginAsync = async (app) => {
     return result;
   });
 
+  // Visibility-filtered like /pulse: a caller who sees three of forty projects
+  // gets the series for those three, rebuilt from each snapshot's per-project
+  // rollup, never the company's mix (plan §6.3).
   app.get("/pulse/history", { preHandler: companyGate }, async (req) => {
     const q = historyQuery.parse(req.query);
-    const items = await pulseHistory(app.db, req.companyId!, new Date(), q.days);
-    return { items, days: q.days };
+    const visible = await visibleProjectIds(app, req);
+    const items = await pulseHistory(app.db, req.companyId!, new Date(), q.days, visible);
+    return { items, days: q.days, scope: visible === null ? "company" : "visible_projects" };
   });
 
   app.get("/pulse/activity", { preHandler: companyGate }, async (req) => {
@@ -244,9 +249,9 @@ export const intelligenceModule: FastifyPluginAsync = async (app) => {
 
   app.get("/attention", { preHandler: companyGate }, async (req) => {
     const q = attentionQuery.parse(req.query);
-    const visible = await visibleProjectIds(app, req);
+    const [visible, actable] = await Promise.all([visibleProjectIds(app, req), actableProjectIds(app, req)]);
     if (q.projectId && !canSeeProject(visible, q.projectId)) throw forbidden("Project is not visible to you");
-    return listAttention(app.db, req.companyId!, {
+    const page = await listAttention(app.db, req.companyId!, {
       visible,
       projectId: q.projectId ?? null,
       status: q.status,
@@ -255,6 +260,7 @@ export const intelligenceModule: FastifyPluginAsync = async (app) => {
       limit: q.limit,
       offset: q.offset,
     });
+    return { ...page, items: page.items.map((i) => ({ ...i, canAct: canActWith(actable, i.projectId) })) };
   });
 
   const loadVisibleItem = async (req: FastifyRequest, projectId?: string) => {

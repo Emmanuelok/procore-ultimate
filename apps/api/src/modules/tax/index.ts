@@ -71,6 +71,7 @@ import {
   vendorPosition,
   type DeterminationRow,
 } from "./service.js";
+import { registerTaxSearch } from "./search.js";
 import { registerTaxJobs, runTaxRiskSweep, sweepPeExposures } from "./sweeps.js";
 
 /* ------------------------------------------------------------------ */
@@ -312,8 +313,14 @@ const OPEN_SIGNAL_DISPOSITIONS = ["new", "under_review", "confirmed", "escalated
 
 /** Postgres unique_violation — the constraint decided, not our read-then-write. */
 function isUniqueViolation(err: unknown): boolean {
-  const code = (err as { code?: unknown } | null)?.code;
-  return code === "23505" || (typeof code === "string" && code === "23505");
+  const seen = new Set<unknown>();
+  let cur: unknown = err;
+  while (cur && typeof cur === "object" && !seen.has(cur)) {
+    seen.add(cur);
+    if ((cur as { code?: unknown }).code === "23505") return true;
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return false;
 }
 
 /**
@@ -383,6 +390,7 @@ export const taxModule: FastifyPluginAsync = async (app) => {
   ];
 
   registerTaxJobs(app);
+  registerTaxSearch();
 
   /* ================================================================ */
   /* Regime library (reference data, not tenant data)                  */
@@ -1274,6 +1282,7 @@ export const taxModule: FastifyPluginAsync = async (app) => {
           currency,
           grossAmount: round2(gross),
           materialsAmount: round2(materials),
+          withholdingBase: base,
           baseAmount,
           rate,
           withheldAmount: withheld,
@@ -1295,7 +1304,7 @@ export const taxModule: FastifyPluginAsync = async (app) => {
       action: "create",
       objectType: "withholding_certificate",
       objectId: id,
-      payload: { number, scheme, regime, vendorId, paymentDate: body.paymentDate, currency, grossAmount: round2(gross), baseAmount, rate, withheldAmount: withheld, determinationId: det?.id ?? null, paymentId: body.paymentId ?? null },
+      payload: { number, scheme, regime, vendorId, paymentDate: body.paymentDate, currency, grossAmount: round2(gross), materialsAmount: round2(materials), withholdingBase: base, baseAmount, rate, withheldAmount: withheld, determinationId: det?.id ?? null, paymentId: body.paymentId ?? null },
       projectId: req.projectId!,
       storePayload: true,
     });
@@ -1609,7 +1618,16 @@ export const taxModule: FastifyPluginAsync = async (app) => {
       action: "state_change",
       objectType: "tax_period",
       objectId: periodId,
-      payload: { from: row.status, to: "filed", filingReference: body.filingReference, filedAt, late, netPayable: row.netPayable },
+      payload: {
+        from: row.status,
+        to: "filed",
+        filingReference: body.filingReference,
+        filedAt,
+        recordedAt: now.toISOString(),
+        late,
+        lateBasis: "the return was still unfiled here at its deadline; filedAt is the filer's claim",
+        netPayable: row.netPayable,
+      },
       projectId: req.projectId!,
       storePayload: true,
     });

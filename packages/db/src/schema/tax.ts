@@ -193,6 +193,8 @@ export const withholdingCertificates = pgTable(
     currency: text("currency").notNull(),
     grossAmount: doublePrecision("gross_amount").notNull(),
     materialsAmount: doublePrecision("materials_amount").default(0).notNull(),
+    /** what the rate was applied to — TaxWithholdingBase, from the determination or the scheme */
+    withholdingBase: text("withholding_base").default("gross_excl_vat").notNull(),
     baseAmount: doublePrecision("base_amount").notNull(),
     rate: doublePrecision("rate").notNull(),
     withheldAmount: doublePrecision("withheld_amount").notNull(),

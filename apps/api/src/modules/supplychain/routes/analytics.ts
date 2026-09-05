@@ -12,16 +12,19 @@ import { isExpeditingStale } from "../engines/longLead.js";
 import { onTimeDelivery } from "../engines/logistics.js";
 import { traceCoverage } from "../engines/traceability.js";
 import { OPEN_ITEM_STATUSES, computeJitConflicts, isoTs, sweepJit } from "../service.js";
-import { buildGates, figure, todayISO } from "../shared.js";
+import { ROLLUP_CAP, buildGates, capped, figure, todayISO } from "../shared.js";
 
 const OPEN_DISPOSITIONS = ["new", "under_review", "confirmed", "escalated"] as const;
 
-/**
- * A roll-up never loads a register without a ceiling. If a project ever
- * exceeds one, the figures say which register was truncated rather than
- * quietly reporting a smaller number as if it were the whole truth.
+/** The open-signal feed is a list people read, not a register: a tighter ceiling. */
+const SIGNAL_CAP = 200;
+
+/*
+ * A roll-up never loads a register without a ceiling (ROLLUP_CAP, shared.ts).
+ * Each read asks for one row MORE than the cap, so a project holding exactly
+ * the cap is reported as the whole truth and only a project holding more is
+ * announced as a lower bound.
  */
-const ROLLUP_CAP = 5000;
 
 export const analyticsRoutes: FastifyPluginAsync = async (app) => {
   const { readGate, standardGate } = buildGates(app);
@@ -30,32 +33,40 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
   async function gather(companyId: string, projectId: string) {
     const today = todayISO();
     const [nodes, links, items, units, slots, traces, openSignals] = await Promise.all([
-      app.db.select({ id: supplyChainNodes.id, tier: supplyChainNodes.tier, country: supplyChainNodes.country, criticality: supplyChainNodes.criticality, riskLevel: supplyChainNodes.riskLevel, riskAssessedAt: supplyChainNodes.riskAssessedAt, status: supplyChainNodes.status }).from(supplyChainNodes).where(and(eq(supplyChainNodes.companyId, companyId), eq(supplyChainNodes.projectId, projectId))).limit(ROLLUP_CAP),
-      app.db.select({ isSoleSource: supplyChainLinks.isSoleSource }).from(supplyChainLinks).where(and(eq(supplyChainLinks.companyId, companyId), eq(supplyChainLinks.projectId, projectId))).limit(ROLLUP_CAP),
-      app.db.select({ id: longLeadItems.id, reference: longLeadItems.reference, name: longLeadItems.name, status: longLeadItems.status, riskLevel: longLeadItems.riskLevel, orderByDate: longLeadItems.orderByDate, floatDays: longLeadItems.floatDays, lastExpeditedAt: longLeadItems.lastExpeditedAt, actualArrivalDate: longLeadItems.actualArrivalDate, requiredOnSite: longLeadItems.requiredOnSite, riskAssessedAt: longLeadItems.riskAssessedAt, value: longLeadItems.value, currency: longLeadItems.currency }).from(longLeadItems).where(and(eq(longLeadItems.companyId, companyId), eq(longLeadItems.projectId, projectId))).limit(ROLLUP_CAP),
-      app.db.select({ id: offsiteUnits.id, status: offsiteUnits.status, percentComplete: offsiteUnits.percentComplete, percentVerifiedForPayment: offsiteUnits.percentVerifiedForPayment, qaGatesFailed: offsiteUnits.qaGatesFailed, value: offsiteUnits.value, currency: offsiteUnits.currency, storageInsuredUntil: offsiteUnits.storageInsuredUntil, vestingCertifiedAt: offsiteUnits.vestingCertifiedAt }).from(offsiteUnits).where(and(eq(offsiteUnits.companyId, companyId), eq(offsiteUnits.projectId, projectId))).limit(ROLLUP_CAP),
-      app.db.select({ id: deliverySlots.id, status: deliverySlots.status, startsAt: deliverySlots.startsAt, wasOnTime: deliverySlots.wasOnTime, lateMinutes: deliverySlots.lateMinutes, waitingMinutes: deliverySlots.waitingMinutes, issueKind: deliverySlots.issueKind, carbonKgCo2e: deliverySlots.carbonKgCo2e, transportKm: deliverySlots.transportKm }).from(deliverySlots).where(and(eq(deliverySlots.companyId, companyId), eq(deliverySlots.projectId, projectId))).limit(ROLLUP_CAP),
-      app.db.select({ chainComplete: materialTraceRecords.chainComplete, status: materialTraceRecords.status, certificateCount: materialTraceRecords.certificateCount }).from(materialTraceRecords).where(and(eq(materialTraceRecords.companyId, companyId), eq(materialTraceRecords.projectId, projectId))).limit(ROLLUP_CAP),
+      app.db.select({ id: supplyChainNodes.id, tier: supplyChainNodes.tier, country: supplyChainNodes.country, criticality: supplyChainNodes.criticality, riskLevel: supplyChainNodes.riskLevel, riskAssessedAt: supplyChainNodes.riskAssessedAt, status: supplyChainNodes.status }).from(supplyChainNodes).where(and(eq(supplyChainNodes.companyId, companyId), eq(supplyChainNodes.projectId, projectId))).limit(ROLLUP_CAP + 1),
+      app.db.select({ isSoleSource: supplyChainLinks.isSoleSource }).from(supplyChainLinks).where(and(eq(supplyChainLinks.companyId, companyId), eq(supplyChainLinks.projectId, projectId))).limit(ROLLUP_CAP + 1),
+      app.db.select({ id: longLeadItems.id, reference: longLeadItems.reference, name: longLeadItems.name, status: longLeadItems.status, riskLevel: longLeadItems.riskLevel, orderByDate: longLeadItems.orderByDate, floatDays: longLeadItems.floatDays, lastExpeditedAt: longLeadItems.lastExpeditedAt, actualArrivalDate: longLeadItems.actualArrivalDate, requiredOnSite: longLeadItems.requiredOnSite, riskAssessedAt: longLeadItems.riskAssessedAt, value: longLeadItems.value, currency: longLeadItems.currency }).from(longLeadItems).where(and(eq(longLeadItems.companyId, companyId), eq(longLeadItems.projectId, projectId))).limit(ROLLUP_CAP + 1),
+      app.db.select({ id: offsiteUnits.id, status: offsiteUnits.status, percentComplete: offsiteUnits.percentComplete, percentVerifiedForPayment: offsiteUnits.percentVerifiedForPayment, qaGatesFailed: offsiteUnits.qaGatesFailed, value: offsiteUnits.value, currency: offsiteUnits.currency, storageInsuredUntil: offsiteUnits.storageInsuredUntil, vestingCertifiedAt: offsiteUnits.vestingCertifiedAt }).from(offsiteUnits).where(and(eq(offsiteUnits.companyId, companyId), eq(offsiteUnits.projectId, projectId))).limit(ROLLUP_CAP + 1),
+      app.db.select({ id: deliverySlots.id, status: deliverySlots.status, startsAt: deliverySlots.startsAt, wasOnTime: deliverySlots.wasOnTime, lateMinutes: deliverySlots.lateMinutes, waitingMinutes: deliverySlots.waitingMinutes, issueKind: deliverySlots.issueKind, carbonKgCo2e: deliverySlots.carbonKgCo2e, transportKm: deliverySlots.transportKm }).from(deliverySlots).where(and(eq(deliverySlots.companyId, companyId), eq(deliverySlots.projectId, projectId))).limit(ROLLUP_CAP + 1),
+      app.db.select({ chainComplete: materialTraceRecords.chainComplete, status: materialTraceRecords.status, certificateCount: materialTraceRecords.certificateCount }).from(materialTraceRecords).where(and(eq(materialTraceRecords.companyId, companyId), eq(materialTraceRecords.projectId, projectId))).limit(ROLLUP_CAP + 1),
       app.db
         .select({ id: signals.id, detector: signals.detector, severity: signals.severity, title: signals.title, explanation: signals.explanation, disposition: signals.disposition, createdAt: signals.createdAt, evidenceRefs: signals.evidenceRefs })
         .from(signals)
         .where(and(eq(signals.companyId, companyId), eq(signals.projectId, projectId), inArray(signals.detector, [...SUPPLY_CHAIN_DETECTORS]), inArray(signals.disposition, [...OPEN_DISPOSITIONS])))
         .orderBy(desc(signals.createdAt))
-        .limit(200),
+        .limit(SIGNAL_CAP + 1),
     ]);
-    const truncated = (
-      [
-        [nodes.length, "supply chain nodes"],
-        [links.length, "supply chain links"],
-        [items.length, "long-lead items"],
-        [units.length, "offsite units"],
-        [slots.length, "delivery bookings"],
-        [traces.length, "traceability records"],
-      ] as Array<[number, string]>
-    )
-      .filter(([n]) => n >= ROLLUP_CAP)
-      .map(([, label]) => `More than ${ROLLUP_CAP} ${label} on this project: the roll-up reads the first ${ROLLUP_CAP} and the figures below are a lower bound.`);
-    return { today, nodes, links, items, units, slots, traces, openSignals, truncated };
+    const capSignals = capped(openSignals, "open supply signals", SIGNAL_CAP);
+    const capNodes = capped(nodes, "supply chain nodes");
+    const capLinks = capped(links, "supply chain links");
+    const capItems = capped(items, "long-lead items");
+    const capUnits = capped(units, "offsite units");
+    const capSlots = capped(slots, "delivery bookings");
+    const capTraces = capped(traces, "traceability records");
+    const truncated = [capNodes, capLinks, capItems, capUnits, capSlots, capTraces, capSignals]
+      .map((c) => c.notice)
+      .filter((n): n is string => n !== null);
+    return {
+      today,
+      nodes: capNodes.rows,
+      links: capLinks.rows,
+      items: capItems.rows,
+      units: capUnits.rows,
+      slots: capSlots.rows,
+      traces: capTraces.rows,
+      openSignals: capSignals.rows,
+      truncated,
+    };
   }
 
   app.get(`${base}/summary`, { preHandler: readGate }, async (req) => {
@@ -172,8 +183,15 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
     const openItems = items.filter((i) => (OPEN_ITEM_STATUSES as readonly string[]).includes(i.status));
     const onTime = onTimeDelivery(slots);
     const coverage = traceCoverage(traces);
-    const conflicts = await computeJitConflicts(app.db, req.companyId!, projectId, today);
+    // JIT conflicts come from the signals the `supplychain.jit` sweep already
+    // persisted — `gather()` has read them. Re-running the engine here would
+    // make the endpoint WP-INTEL polls per project the most expensive read in
+    // the module; the live run stays on GET /jit/conflicts and POST /jit/run.
+    const jitSignals = openSignals.filter((s) => s.detector === "supply_jit_conflict");
     const reasons: string[] = [...truncated];
+    if (jitSignals.length === 0) {
+      reasons.push("Just-in-time conflicts are counted from the signals the supply chain sweep raised; none is open. Run POST /supply-chain/jit/run for a live check.");
+    }
     if (openItems.length === 0) reasons.push("No open long-lead items: long-lead metrics are null.");
     if (onTime.onTimePercent === null) reasons.push(onTime.reasons[0] ?? "No delivery assessed.");
     if (nodes.length === 0) reasons.push("No supply chain nodes: supplier risk metrics are null.");
@@ -188,8 +206,8 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
         expeditingBacklog: openItems.length > 0 ? openItems.filter((i) => isExpeditingStale({ status: i.status, lastExpeditedAt: isoTs(i.lastExpeditedAt), actualArrivalDate: i.actualArrivalDate }, today)).length : null,
         onTimeDeliveryPercent: onTime.onTimePercent,
         deliveryNoShows: slots.length > 0 ? onTime.noShow : null,
-        jitConflicts: conflicts.filter((c) => c.severity !== "low").length,
-        jitConflictsCritical: conflicts.filter((c) => c.severity === "critical").length,
+        jitConflicts: jitSignals.length,
+        jitConflictsCritical: jitSignals.filter((s) => s.severity === "critical").length,
         supplierRiskCritical: nodes.length > 0 ? assessedNodes.filter((n) => n.riskLevel === "critical").length : null,
         supplierRiskHigh: nodes.length > 0 ? assessedNodes.filter((n) => n.riskLevel === "high").length : null,
         supplierNodesUnassessed: nodes.length > 0 ? nodes.length - assessedNodes.length : null,

@@ -1885,7 +1885,6 @@ export const learningModule: FastifyPluginAsync = async (app) => {
         validTo: insuranceCertificates.validTo,
         verifiedAt: insuranceCertificates.verifiedAt,
         status: insuranceCertificates.status,
-        projectId: insuranceCertificates.projectId,
       })
       .from(insuranceCertificates)
       .where(

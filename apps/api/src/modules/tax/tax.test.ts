@@ -16,9 +16,11 @@ import {
   taxPeriods,
   taxRegistrations,
   vendors,
+  withholdingCertificates,
 } from "@constructos/db";
 import { TAX_REGIMES } from "@constructos/shared";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
+import { listSearchSources } from "../search/registry.js";
 import { newId } from "../../lib/ids.js";
 import { addDaysISO, todayISO } from "../field/dates.js";
 import { taxModule } from "./index.js";
@@ -227,7 +229,7 @@ beforeAll(async () => {
     { id: subB, companyId: owner.companyId, name: "Steelwork Ltd", country: "GB" },
     { id: overseas, companyId: owner.companyId, name: "Dublin Fitout Ltd", country: "IE" },
   ]);
-});
+}, 180_000);
 
 afterAll(async () => {
   await built.close();
@@ -1225,5 +1227,335 @@ describe("summary, health inputs and access", () => {
       expect([403, 404]).toContain((await get(url, stranger.headers)).statusCode);
     }
     expect((await app.inject({ method: "GET", url: `/api/v1/projects/${ukProject}/tax/summary` })).statusCode).toBe(401);
+  });
+});
+
+/* ================================================================== */
+/* Adversarial-review regressions                                      */
+/* ================================================================== */
+
+describe("a filed return's figures do not move (plan §6.2)", () => {
+  let filedProject: string;
+  let periodId: string;
+  let obligationId: string;
+
+  beforeAll(async () => {
+    filedProject = await makeProject("Tax — filed figures", "GB");
+    await put(`/projects/${filedProject}/tax/profile`, {
+      regime: "uk",
+      customerVatRegistered: true,
+      customerDeductionRegistered: true,
+    });
+  }, 60_000);
+
+  async function issueCert(paymentDate: string, gross: number): Promise<void> {
+    const c = await post(`/projects/${filedProject}/tax/withholding-certificates`, {
+      regime: "uk", scheme: "cis", vendorId: subA, paymentDate, currency: "GBP", grossAmount: gross, rate: 20,
+    });
+    expect(c.statusCode).toBe(201);
+    expect((await post(`/projects/${filedProject}/tax/withholding-certificates/${c.json().id}/issue`, {}, admin2Headers)).statusCode).toBe(200);
+  }
+
+  it("refuses to recompute a filed or paid period, so the filing reference never sits on top of new numbers", async () => {
+    const created = await post(`/projects/${filedProject}/tax/periods`, { returnKind: "cis_monthly", periodStart: "2026-01-06" });
+    expect(created.statusCode).toBe(201);
+    periodId = created.json().id as string;
+    obligationId = created.json().obligationId as string;
+
+    await issueCert("2026-01-20", 5000);
+    const computed = await post(`/projects/${filedProject}/tax/periods/${periodId}/compute`);
+    expect(computed.json().withheldTotal).toBe(1000);
+
+    const filed = await post(`/projects/${filedProject}/tax/periods/${periodId}/file`, { filingReference: "CIS300-2026-01" });
+    expect(filed.statusCode).toBe(200);
+    expect(filed.json().status).toBe("filed");
+
+    // the window keeps moving after filing
+    await issueCert("2026-01-25", 3000);
+    const again = await post(`/projects/${filedProject}/tax/periods/${periodId}/compute`);
+    expect(again.statusCode).toBe(409);
+    expect(again.json().message).toMatch(/filed/i);
+
+    const detail = await get(`/projects/${filedProject}/tax/periods/${periodId}`);
+    expect(detail.json().withheldTotal).toBe(1000); // what was filed
+    expect(detail.json().filingReference).toBe("CIS300-2026-01");
+    expect(detail.json().live.withheldTotal).toBe(1600); // what is true now, shown separately
+
+    const paid = await post(`/projects/${filedProject}/tax/periods/${periodId}/mark-paid`);
+    expect(paid.json().status).toBe("paid");
+    expect((await post(`/projects/${filedProject}/tax/periods/${periodId}/compute`)).statusCode).toBe(409);
+  });
+
+  it("re-opening clears the filing, puts the obligation back on the clock and lets the return be corrected", async () => {
+    const reopened = await post(`/projects/${filedProject}/tax/periods/${periodId}/reopen`, {
+      reason: "The January CIS return was filed before two subcontractor statements were issued.",
+    });
+    expect(reopened.statusCode).toBe(200);
+    expect(["open", "overdue"]).toContain(reopened.json().status);
+    expect(reopened.json().filingReference).toBeNull();
+    expect(reopened.json().filedAt).toBeNull();
+    expect(reopened.json().paidAt).toBeNull();
+    expect(reopened.json().withheldTotal).toBe(1000); // still the old figures until recomputed
+
+    const [obl] = await app.db.select().from(obligations).where(eq(obligations.id, obligationId));
+    expect(["open", "breached"]).toContain(obl!.status);
+
+    const ledger = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(and(eq(ledgerEntries.objectType, "tax_period"), eq(ledgerEntries.objectId, periodId)));
+    expect(ledger.some((l) => (l.payload as { clearedFiling?: { filingReference?: string } } | null)?.clearedFiling?.filingReference === "CIS300-2026-01")).toBe(true);
+
+    const recomputed = await post(`/projects/${filedProject}/tax/periods/${periodId}/compute`);
+    expect(recomputed.statusCode).toBe(200);
+    expect(recomputed.json().withheldTotal).toBe(1600);
+    const refiled = await post(`/projects/${filedProject}/tax/periods/${periodId}/file`, { filingReference: "CIS300-2026-01-A" });
+    expect(refiled.json().status).toBe("filed");
+    expect((await post(`/projects/${filedProject}/tax/periods/${periodId}/reopen`, { reason: "x" })).statusCode).toBe(200);
+  });
+
+  it("refuses a filing date in the future and dates lateness by the server clock", async () => {
+    const p = await post(`/projects/${filedProject}/tax/periods`, {
+      returnKind: "cis_monthly", periodStart: d(120), periodEnd: d(91), dueDate: d(70),
+    });
+    expect(p.statusCode).toBe(201);
+    const id = p.json().id as string;
+    await post(`/projects/${filedProject}/tax/periods/${id}/compute`);
+
+    const future = await post(`/projects/${filedProject}/tax/periods/${id}/file`, {
+      filingReference: "AHEAD",
+      filedAt: new Date(Date.now() + 3 * 86_400_000).toISOString(),
+    });
+    expect(future.statusCode).toBe(400);
+
+    // back-entry with an on-time date must not make a late return look on time
+    const filed = await post(`/projects/${filedProject}/tax/periods/${id}/file`, {
+      filingReference: "BACK-DATED",
+      filedAt: `${d(75)}T09:00:00Z`,
+    });
+    expect(filed.statusCode).toBe(200);
+    const ledger = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(and(eq(ledgerEntries.objectType, "tax_period"), eq(ledgerEntries.objectId, id)));
+    expect(ledger.some((l) => (l.payload as { late?: boolean } | null)?.late === true)).toBe(true);
+  });
+});
+
+describe("the on-demand scan is scoped to its project (plan §6.3)", () => {
+  it("leaves another project's overdue return alone; the scheduler job is what sweeps the company", async () => {
+    const scanned = await makeProject("Tax — scanned", "GB");
+    const untouched = await makeProject("Tax — untouched", "GB");
+    for (const id of [scanned, untouched]) {
+      await put(`/projects/${id}/tax/profile`, { regime: "uk", customerVatRegistered: true, customerDeductionRegistered: true });
+    }
+    const other = await post(`/projects/${untouched}/tax/periods`, {
+      returnKind: "cis_monthly", periodStart: d(60), periodEnd: d(31), dueDate: d(10),
+    });
+    expect(other.statusCode).toBe(201);
+    const otherId = other.json().id as string;
+    const mine = await post(`/projects/${scanned}/tax/periods`, {
+      returnKind: "cis_monthly", periodStart: d(120), periodEnd: d(91), dueDate: d(70),
+    });
+    const mineId = mine.json().id as string;
+
+    const scan = await post(`/projects/${scanned}/tax/risks/scan`);
+    expect(scan.statusCode).toBe(200);
+    expect(scan.json().scope).toBe("project");
+
+    const [mineRow] = await app.db.select().from(taxPeriods).where(eq(taxPeriods.id, mineId));
+    expect(mineRow?.status).toBe("overdue");
+    const [otherRow] = await app.db.select().from(taxPeriods).where(eq(taxPeriods.id, otherId));
+    expect(otherRow?.status).toBe("open");
+    expect((await signalsFor("tax_return_overdue", untouched)).length).toBe(0);
+
+    await app.scheduler.runNow("tax.risk-sweep");
+    const [swept] = await app.db.select().from(taxPeriods).where(eq(taxPeriods.id, otherId));
+    expect(swept?.status).toBe("overdue");
+  });
+});
+
+describe("hand-recorded withholding certificates", () => {
+  let certProject: string;
+
+  beforeAll(async () => {
+    certProject = await makeProject("Tax — typed certificates", "GB");
+    await put(`/projects/${certProject}/tax/profile`, { regime: "uk", customerVatRegistered: true, customerDeductionRegistered: true });
+  }, 60_000);
+
+  it("deducts on the amount net of materials when the scheme says so, with no determination behind it (#802)", async () => {
+    const res = await post(`/projects/${certProject}/tax/withholding-certificates`, {
+      regime: "uk", scheme: "cis", vendorId: subA, paymentDate: "2026-03-10",
+      currency: "GBP", grossAmount: 10000, materialsAmount: 4000, rate: 20,
+    });
+    expect(res.statusCode).toBe(201);
+    const c = res.json();
+    expect(c.materialsAmount).toBe(4000);
+    expect(c.withholdingBase).toBe("gross_excl_materials");
+    expect(c.baseAmount).toBe(6000);
+    expect(c.withheldAmount).toBe(1200);
+    expect(c.netPaid).toBe(8800);
+  });
+
+  it("refuses a materials figure on a scheme that deducts on the whole amount", async () => {
+    const bad = await post(`/projects/${certProject}/tax/withholding-certificates`, {
+      regime: "ng", scheme: "wht", vendorName: "Lagos Fitout", paymentDate: "2026-03-11",
+      currency: "NGN", grossAmount: 10000, materialsAmount: 1000, rate: 5,
+    });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json().message).toMatch(/materialsAmount/);
+
+    const ok = await post(`/projects/${certProject}/tax/withholding-certificates`, {
+      regime: "ng", scheme: "wht", vendorName: "Lagos Fitout", paymentDate: "2026-03-11",
+      currency: "NGN", grossAmount: 10000, rate: 5,
+    });
+    expect(ok.statusCode).toBe(201);
+    expect(ok.json().baseAmount).toBe(10000);
+    expect(ok.json().materialsAmount).toBe(0);
+    expect(ok.json().withheldAmount).toBe(500);
+
+    // the base is the library's, not a guess from the scheme name: Irish RCT
+    // is deducted on the full payment, materials included
+    const rct = await post(`/projects/${certProject}/tax/withholding-certificates`, {
+      regime: "ie", scheme: "rct", vendorId: overseas, paymentDate: "2026-03-12",
+      currency: "EUR", grossAmount: 10000, materialsAmount: 4000, rate: 20,
+    });
+    expect(rct.statusCode).toBe(400);
+    const rctOk = await post(`/projects/${certProject}/tax/withholding-certificates`, {
+      regime: "ie", scheme: "rct", vendorId: overseas, paymentDate: "2026-03-12",
+      currency: "EUR", grossAmount: 10000, rate: 20,
+    });
+    expect(rctOk.json().withholdingBase).toBe("gross_excl_vat");
+    expect(rctOk.json().baseAmount).toBe(10000);
+    expect(rctOk.json().withheldAmount).toBe(2000);
+  });
+
+  it("keeps the one-per-payment rule in the database, not only in the route", async () => {
+    // The route's check is read-then-insert; two concurrent payment runs would
+    // both pass it. The partial unique index is what actually decides.
+    const paymentId = newId("pay");
+    const row = (n: number) => ({
+      id: newId("whc"),
+      companyId: owner.companyId,
+      projectId: certProject,
+      number: 9000 + n,
+      paymentId,
+      vendorName: "Race Condition Ltd",
+      regime: "uk",
+      scheme: "cis",
+      paymentDate: "2026-03-13",
+      currency: "GBP",
+      grossAmount: 1000,
+      baseAmount: 1000,
+      rate: 20,
+      withheldAmount: 200,
+      netPaid: 800,
+      createdBy: owner.userId,
+    });
+    await app.db.insert(withholdingCertificates).values(row(1) as typeof withholdingCertificates.$inferInsert);
+    await expect(
+      app.db.insert(withholdingCertificates).values(row(2) as typeof withholdingCertificates.$inferInsert),
+    ).rejects.toThrow();
+    // a cancelled statement leaves the payment free again
+    await app.db
+      .update(withholdingCertificates)
+      .set({ status: "cancelled" })
+      .where(eq(withholdingCertificates.paymentId, paymentId));
+    await app.db.insert(withholdingCertificates).values(row(3) as typeof withholdingCertificates.$inferInsert);
+  });
+
+  it("allows one live certificate per payment", async () => {
+    const paymentId = newId("pay");
+    const body = {
+      regime: "uk", scheme: "cis", vendorId: subA, paymentDate: "2026-03-12",
+      currency: "GBP", grossAmount: 2000, rate: 20, paymentId,
+    };
+    const first = await post(`/projects/${certProject}/tax/withholding-certificates`, body);
+    expect(first.statusCode).toBe(201);
+    const second = await post(`/projects/${certProject}/tax/withholding-certificates`, body);
+    expect(second.statusCode).toBe(409);
+    await post(`/projects/${certProject}/tax/withholding-certificates/${first.json().id}/cancel`, { reason: "wrong payment" });
+    expect((await post(`/projects/${certProject}/tax/withholding-certificates`, body)).statusCode).toBe(201);
+  });
+});
+
+describe("company-level registration writes are tool-gated", () => {
+  it("a read-only member may read the register but not record or verify a registration", async () => {
+    expect((await get("/tax/registrations", viewerHeaders)).statusCode).toBe(200);
+
+    const create = await post(
+      "/tax/registrations",
+      { holderType: "vendor", holderId: subB, regime: "uk", kind: "cis", number: "9999999999" },
+      viewerHeaders,
+    );
+    expect(create.statusCode).toBe(403);
+
+    const mine = await post("/tax/registrations", { holderType: "vendor", holderId: subB, regime: "uk", kind: "cis", number: "8888888888" });
+    expect(mine.statusCode).toBe(201);
+    const id = mine.json().id as string;
+    expect((await patch(`/tax/registrations/${id}`, { number: "7777777777" }, viewerHeaders)).statusCode).toBe(403);
+    expect(
+      (await post(`/tax/registrations/${id}/verify`, { outcome: "verified", deductionRate: 0 }, viewerHeaders)).statusCode,
+    ).toBe(403);
+    // the second admin (tax at admin level through the company role) still can
+    expect((await post(`/tax/registrations/${id}/verify`, { outcome: "verified", deductionRate: 0 }, admin2Headers)).statusCode).toBe(200);
+    expect((await del(`/tax/registrations/${id}`)).statusCode).toBe(204);
+  });
+});
+
+describe("a persisted what-if cannot impersonate a source-bound determination (#802)", () => {
+  it("refuses a caller-supplied sourceType on the what-if route", async () => {
+    const res = await post(`/projects/${ukProject}/tax/determine`, {
+      amount: 1000,
+      persist: true,
+      sourceType: "invoice_line",
+      sourceId: "inv_made_up",
+      sourceLineId: "inl_made_up",
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toMatch(/override/i);
+
+    const manual = await post(`/projects/${ukProject}/tax/determine`, { amount: 1000, persist: true });
+    expect(manual.statusCode).toBe(201);
+    expect(manual.json().determination.sourceType).toBe("manual");
+  });
+});
+
+describe("PE host country is normalised, never truncated", () => {
+  it("reads a free-text project country through the library's aliases and refuses one it cannot resolve", async () => {
+    const named = await makeProject("Tax — named country", "United Kingdom");
+    await put(`/projects/${named}/tax/profile`, { regime: "custom" });
+    const ok = await post(`/projects/${named}/tax/pe-exposures`, {
+      entityType: "person", entityName: "Rota engineer", homeCountry: "US",
+    });
+    expect(ok.statusCode).toBe(201);
+    expect(ok.json().hostCountry).toBe("GB");
+
+    const nowhere = await makeProject("Tax — unknown country", "Atlantis");
+    await put(`/projects/${nowhere}/tax/profile`, { regime: "custom" });
+    const bad = await post(`/projects/${nowhere}/tax/pe-exposures`, {
+      entityType: "person", entityName: "Rota engineer", homeCountry: "US",
+    });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json().message).toMatch(/hostCountry/);
+  });
+});
+
+describe("company-wide search coverage (§3.3)", () => {
+  it("registers the tax records people look up by name, gated by the tax tool", () => {
+    const byType = new Map(listSearchSources().map((src) => [src.type, src]));
+    const cert = byType.get("withholding_certificate");
+    expect(cert?.tool).toBe("tax");
+    expect(cert?.scope).toBe("project");
+    expect(cert?.href({ id: "whc_1", projectId: ukProject, title: "Brickwork Ltd", subtitle: null, reference: null, status: null, updatedAt: null })).toBe(
+      `/projects/${ukProject}/tax?tab=certificates`,
+    );
+    const pe = byType.get("pe_exposure");
+    expect(pe?.tool).toBe("tax");
+    expect(pe?.href({ id: "pex_1", projectId: ukProject, title: "A B", subtitle: null, reference: null, status: null, updatedAt: null })).toBe(
+      `/projects/${ukProject}/tax?tab=pe`,
+    );
+    // numbered records stay out of the palette on purpose
+    expect(byType.has("tax_determination")).toBe(false);
   });
 });

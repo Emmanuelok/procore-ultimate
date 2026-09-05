@@ -484,6 +484,47 @@ describe("partial award — approval", () => {
   });
 });
 
+describe("the AI evaluation assistant degrades to nothing", () => {
+  it("answers 503 AiDisabled with no key, while levelling by hand keeps working", async () => {
+    const { pkg, row } = await splitPackage("AI off");
+    const res = await post(
+      `/projects/${projectA}/bid-packages/${pkg.id}/evaluation/propose`,
+      {},
+    );
+    expect(res.statusCode).toBe(503);
+    expect(res.json().error).toBe("AiDisabled");
+
+    // The non-AI path is untouched: the grid still reads and still levels.
+    const grid = await get(`/projects/${projectA}/bid-packages/${pkg.id}/levelling/grid`);
+    expect(grid.statusCode).toBe(200);
+    expect(grid.json().items.some((i: { id: string }) => i.id === row("G10"))).toBe(true);
+  });
+
+  it("refuses the proposal route to another tenant before it refuses it for AI", async () => {
+    const { pkg } = await splitPackage("AI tenancy");
+    const res = await post(
+      `/projects/${projectA}/bid-packages/${pkg.id}/evaluation/propose`,
+      {},
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(res.statusCode);
+  });
+
+  it("refuses a proposal on a package with no scope rows", async () => {
+    const pkg = await createPackage({ title: "No scope" });
+    await issuePackage(pkg.id);
+    await submitBid(pkg.id, alpha, 100_000);
+    const res = await post(
+      `/projects/${projectA}/bid-packages/${pkg.id}/evaluation/propose`,
+      {},
+    );
+    // The scope check runs before the AI check: a package with nothing
+    // neutral to level against is refused whether or not a key is present.
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toMatch(/no levelling scope rows/i);
+  });
+});
+
 describe("partial award — tenancy", () => {
   it("refuses a stranger's company every partial-award route on this package", async () => {
     const { pkg, bidA, row } = await splitPackage("Tenancy");

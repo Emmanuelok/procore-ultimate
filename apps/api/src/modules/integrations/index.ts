@@ -465,9 +465,13 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
     isActive: row.isActive === 1,
     // Re-derive and compare: if the master key was rotated or the fallback
     // swapped for a dedicated key, the secret an operator holds no longer
-    // works and this is where they find out.
+    // works and this is where they find out. The endpoint's CURRENT secret
+    // version is what the fingerprint was taken over — deriving version 1 here
+    // would report every rotated endpoint as unreproducible and tell its owner
+    // to delete it.
     secretFingerprintMatches:
-      secretFingerprint(deriveEndpointSecret(signingKey, row.id)) === row.secretFingerprint,
+      secretFingerprint(deriveEndpointSecret(signingKey, row.id, row.secretVersion)) ===
+      row.secretFingerprint,
   });
 
   const viewClient = (row: ClientRow) => {
@@ -530,7 +534,7 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
       secretWarning:
         "This signing secret is shown exactly once. It is not stored — the database holds only " +
         "its sha256 fingerprint — and no route will return it again. Save it now; to replace it, " +
-        "delete the endpoint and create another.",
+        "POST .../rotate-secret, which issues a new one and signs with both for a grace window.",
       signing: signingContract(),
       insecureTransport: body.url.startsWith("http://")
         ? "This endpoint is http://, so signed payloads travel in clear text. The signature " +

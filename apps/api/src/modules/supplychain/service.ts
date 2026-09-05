@@ -873,12 +873,33 @@ export interface UnitRecompute {
   verified: ReturnType<typeof verifiedForPayment>;
 }
 
+/** The columns a rollup materialises onto the unit row. */
+function rollupColumns(rollup: UnitRollup, verified: ReturnType<typeof verifiedForPayment>, status: string) {
+  return {
+    stagesTotal: rollup.stagesTotal,
+    stagesComplete: rollup.stagesComplete,
+    percentComplete: rollup.percentComplete,
+    qaGatesTotal: rollup.qaGatesTotal,
+    qaGatesPassed: rollup.qaGatesPassed,
+    qaGatesFailed: rollup.qaGatesFailed,
+    status,
+    percentVerifiedForPayment: verified.percent,
+    verifiedForPaymentBy: verified.source?.inspectorId ?? null,
+    // `performedAt` is a calendar date; the column is a timestamp.
+    verifiedForPaymentAt: verified.source?.performedAt
+      ? verified.source.performedAt.length === 10
+        ? `${verified.source.performedAt}T00:00:00.000Z`
+        : verified.source.performedAt
+      : null,
+  };
+}
+
 /**
- * Materialise what the stages and inspections say onto the unit row: counts,
- * percent complete, QA gate tallies, the production status (never regressing
- * a shipped unit) and the independently verified percent for payment.
+ * READ PATH. Work out what the stages and inspections say WITHOUT writing:
+ * a GET must never mutate the row (it would churn `updatedAt` on every page
+ * view and let a read-only caller change state off the ledger).
  */
-export async function recomputeUnit(db: Db, unit: UnitRow): Promise<UnitRecompute> {
+export async function computeUnit(db: Db, unit: UnitRow): Promise<UnitRecompute> {
   const [stages, inspections] = await Promise.all([
     db
       .select()
@@ -902,32 +923,43 @@ export async function recomputeUnit(db: Db, unit: UnitRow): Promise<UnitRecomput
     })),
   );
   const verified = verifiedForPayment(
-    inspections.map((i) => ({ result: i.result, percentVerified: i.percentVerified, performedAt: i.performedAt, inspectorId: i.inspectorId })),
+    inspections.map((i) => ({
+      id: i.id,
+      result: i.result,
+      percentVerified: i.percentVerified,
+      performedAt: i.performedAt,
+      createdAt: isoTs(i.createdAt),
+      inspectorId: i.inspectorId,
+    })),
   );
   const status = derivedProductionStatus(unit.status, rollup);
-  const best = verified.percent !== null
-    ? inspections
-        .filter((i) => (i.result === "passed" || i.result === "conditional") && i.percentVerified === verified.percent)
-        .sort((a, b) => (b.performedAt ?? "").localeCompare(a.performedAt ?? ""))[0]
-    : undefined;
+  return {
+    unit: { ...unit, ...rollupColumns(rollup, verified, status) },
+    stages,
+    inspections,
+    rollup,
+    verified,
+  };
+}
+
+/**
+ * WRITE PATH. Materialise what the stages and inspections say onto the unit
+ * row: counts, percent complete, QA gate tallies, the production status
+ * (never regressing a shipped unit) and the independently verified percent
+ * for payment — the MOST RECENT inspection's figure, so a corrective
+ * inspection replaces an over-stated one.
+ */
+export async function recomputeUnit(db: Db, unit: UnitRow): Promise<UnitRecompute> {
+  const computed = await computeUnit(db, unit);
   const [updated] = await db
     .update(offsiteUnits)
     .set({
-      stagesTotal: rollup.stagesTotal,
-      stagesComplete: rollup.stagesComplete,
-      percentComplete: rollup.percentComplete,
-      qaGatesTotal: rollup.qaGatesTotal,
-      qaGatesPassed: rollup.qaGatesPassed,
-      qaGatesFailed: rollup.qaGatesFailed,
-      status,
-      percentVerifiedForPayment: verified.percent,
-      verifiedForPaymentBy: best?.inspectorId ?? null,
-      verifiedForPaymentAt: best ? (isoTs(best.updatedAt) ?? nowISO()) : null,
+      ...rollupColumns(computed.rollup, computed.verified, computed.unit.status),
       updatedAt: nowISO(),
     })
     .where(eq(offsiteUnits.id, unit.id))
     .returning();
-  return { unit: updated ?? unit, stages, inspections, rollup, verified };
+  return { ...computed, unit: updated ?? computed.unit };
 }
 
 /* ------------------------------------------------------------------ */

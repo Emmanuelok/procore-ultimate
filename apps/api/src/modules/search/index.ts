@@ -99,7 +99,23 @@ export const searchModule: FastifyPluginAsync = async (app) => {
       ? new Set(q.types.split(",").map((t) => t.trim()).filter(Boolean))
       : null;
 
-    const permitted = await permittedSources(req, wanted);
+    /*
+     * `projectId` NARROWS the caller's own scope; it never widens it.
+     *
+     * Without this filter a member of project A could ask for
+     * `?projectId=<project B>` and receive project B's RFIs: the per-source
+     * project restriction was replaced by the requested id rather than
+     * intersected with it, so the one thing this endpoint promises — the
+     * caller's permissions applied before any row is returned — did not hold
+     * as soon as a project was named.
+     */
+    const permitted = (await permittedSources(req, wanted)).filter(
+      ({ source, projectIds }) =>
+        !q.projectId ||
+        source.scope !== "project" ||
+        projectIds === null ||
+        projectIds.includes(q.projectId),
+    );
     // Over-fetch per source so ranking has something to choose between, then
     // cut once globally. Bounded so a broad query cannot pull the platform
     // into memory.

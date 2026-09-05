@@ -99,7 +99,9 @@ export function planAwardScope(input: {
   items: readonly ScopeItem[];
   liveAwards: readonly LiveAwardScope[];
   requested: readonly string[] | undefined;
+  packageReference?: string;
 }): ScopePlan {
+  const packageReference = input.packageReference ?? "This package";
   const items = [...input.items].sort((a, b) => a.position - b.position || a.id.localeCompare(b.id));
   const byId = new Map(items.map((i) => [i.id, i] as const));
   const requested = [...new Set(input.requested ?? [])];
@@ -127,7 +129,7 @@ export function planAwardScope(input: {
         ok: false,
         code: "full_award_exists",
         message:
-          `${fullLive[0]!.reference} already covers this package at status ` +
+          `${packageReference} already carries award ${fullLive[0]!.reference} at status ` +
           `"${fullLive[0]!.status}". Reject or withdraw it before recommending a different ` +
           "bidder.",
         detail: { liveAwardIds: fullLive.map((a) => a.awardId) },

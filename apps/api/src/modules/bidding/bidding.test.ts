@@ -969,8 +969,37 @@ describe("levelling", () => {
 /* ================================================================== */
 
 describe("award", () => {
-  async function levelledPackage(title: string, amounts: { vendorId: string; amount: number }[]) {
-    const pkg = await createPackage(awardProject, { title, engineersEstimate: 200_000 });
+  /**
+   * THE CROSS-PACKAGE DETECTORS FIRE ON THIS FIXTURE, AND THAT IS CORRECT.
+   *
+   * Two vendors bidding against each other on a dozen packages inside one
+   * company, with one of them winning repeatedly, is exactly the pattern the
+   * cover-bidding and winner-rotation detectors exist to raise. The control
+   * is not "no findings"; it is "an open high or critical finding must be
+   * ACKNOWLEDGED IN WRITING before a bidder is recommended". So the tests
+   * acknowledge, in the words a buyer would use — and the one test that
+   * checks the refusal itself lives in bidding-upgrade.test.ts.
+   */
+  const ACK =
+    "The bidder overlap across these packages was checked against the company's tender log: " +
+    "this is a small trade with four capable firms in the region, the prices differ by more " +
+    "than the field's spread, and no relationship between the bidders is on the record.";
+
+  /**
+   * NO PRE-TENDER ESTIMATE UNLESS THE TEST IS ABOUT ONE.
+   *
+   * An estimate turns every bid into a measurable deviation from it, and a
+   * fixture that quietly makes every bid 20% "abnormally low" tests the
+   * abnormally-low control instead of whatever the test was written for —
+   * the control has its own tests in bidding-upgrade.test.ts. Tests that
+   * need an estimate state one, and then their bids sit inside its band.
+   */
+  async function levelledPackage(
+    title: string,
+    amounts: { vendorId: string; amount: number }[],
+    estimate: number | null = null,
+  ) {
+    const pkg = await createPackage(awardProject, { title, engineersEstimate: estimate });
     await issuePackage(awardProject, pkg.id);
     const bids = [];
     for (const a of amounts) {
@@ -980,10 +1009,14 @@ describe("award", () => {
   }
 
   it("refuses a not-lowest recommendation without a written justification", async () => {
-    const { pkg, bids } = await levelledPackage("Not lowest", [
-      { vendorId: alpha, amount: 190_000 },
-      { vendorId: bravo, amount: 175_000 },
-    ]);
+    const { pkg, bids } = await levelledPackage(
+      "Not lowest",
+      [
+        { vendorId: alpha, amount: 190_000 },
+        { vendorId: bravo, amount: 175_000 },
+      ],
+      200_000,
+    );
     const res = await post(`/projects/${awardProject}/bid-packages/${pkg.id}/award/recommend`, {
       submissionId: bids[0]!.id,
       recommendationBasis:
@@ -996,10 +1029,14 @@ describe("award", () => {
   });
 
   it("records the justification AND the lowest bid amount when the lowest is not taken", async () => {
-    const { pkg, bids } = await levelledPackage("Justified", [
-      { vendorId: alpha, amount: 190_000 },
-      { vendorId: bravo, amount: 175_000 },
-    ]);
+    const { pkg, bids } = await levelledPackage(
+      "Justified",
+      [
+        { vendorId: alpha, amount: 190_000 },
+        { vendorId: bravo, amount: 175_000 },
+      ],
+      200_000,
+    );
     const res = await post(`/projects/${awardProject}/bid-packages/${pkg.id}/award/recommend`, {
       submissionId: bids[0]!.id,
       recommendationBasis:
@@ -1007,6 +1044,7 @@ describe("award", () => {
       notLowestJustification:
         "Bravo's price excludes the temporary works design and their programme is six weeks " +
         "longer, which costs more in preliminaries than the GBP 15,000 headline difference.",
+      integrityAcknowledgement: ACK,
       standstillDays: 10,
     });
     expect(res.statusCode).toBe(201);
@@ -1027,6 +1065,7 @@ describe("award", () => {
     const res = await post(`/projects/${awardProject}/bid-packages/${pkg.id}/award/recommend`, {
       submissionId: bids[1]!.id,
       recommendationBasis: "Bravo is the lowest compliant bid and their programme fits the works.",
+      integrityAcknowledgement: ACK,
     });
     expect(res.statusCode).toBe(201);
     expect(res.json().isLowestBid).toBe(true);
@@ -1054,7 +1093,9 @@ describe("award", () => {
     const award = await post(`/projects/${awardProject}/bid-packages/${pkg.id}/award/recommend`, {
       submissionId: bids[0]!.id,
       recommendationBasis: "Alpha is the lowest bid and is compliant on every requirement.",
+      integrityAcknowledgement: ACK,
     });
+    expect(award.statusCode).toBe(201);
     const awardId = award.json().id as string;
 
     const self = await post(`/bid-awards/${awardId}/approve`, {});
@@ -1075,6 +1116,7 @@ describe("award", () => {
       submissionId: bids[0]!.id,
       recommendationBasis: "Charlie is the lowest compliant bid with the best programme fit.",
       scopeSummary: "Piling, ground beams and drainage as tendered.",
+      integrityAcknowledgement: ACK,
     });
     const awardId = award.json().id as string;
     const approved = await post(`/bid-awards/${awardId}/approve`, {}, approver.headers);
@@ -1124,6 +1166,7 @@ describe("award", () => {
     const award = await post(`/projects/${awardProject}/bid-packages/${pkg.id}/award/recommend`, {
       submissionId: bids[0]!.id,
       recommendationBasis: "Alpha is the lowest compliant bid on a like-for-like basis.",
+      integrityAcknowledgement: ACK,
       standstillDays: 10,
     });
     const awardId = award.json().id as string;
@@ -1148,6 +1191,7 @@ describe("award", () => {
     const award = await post(`/projects/${awardProject}/bid-packages/${pkg.id}/award/recommend`, {
       submissionId: bids[0]!.id,
       recommendationBasis: "Sole compliant bidder on a negotiated package with an agreed price.",
+      integrityAcknowledgement: ACK,
     });
     const awardId = award.json().id as string;
     await post(`/bid-awards/${awardId}/approve`, {}, approver.headers);
@@ -1169,12 +1213,14 @@ describe("award", () => {
     await post(`/projects/${awardProject}/bid-packages/${pkg.id}/award/recommend`, {
       submissionId: bids[0]!.id,
       recommendationBasis: "Alpha is the lowest compliant bid on this package.",
+      integrityAcknowledgement: ACK,
     });
     const second = await post(`/projects/${awardProject}/bid-packages/${pkg.id}/award/recommend`, {
       submissionId: bids[1]!.id,
       recommendationBasis: "We changed our minds after seeing the prices, which is the problem.",
       notLowestJustification:
         "This justification exists purely to get past the not-lowest gate in this test case.",
+      integrityAcknowledgement: ACK,
     });
     expect(second.statusCode).toBe(409);
     expect(second.json().message).toMatch(/already carries award/i);
