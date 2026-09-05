@@ -478,6 +478,9 @@ every tenant the holder belongs to.
 | `ipAllowlistMode` + `ipAllowlist` | `off`, `monitor` (records) or `enforce` (refuses) | off |
 | `ipAllowlistBreakGlassUserIds` | Members exempt from the allowlist | empty |
 | `mfaRequired` | Require a second factor, including for SSO | off |
+| `securityEventRetentionDays` | Age past which the sign-in audit is pseudonymised (floor 30) | none — kept |
+| `emailDispatchRetentionDays` | Age past which the message log is deleted (floor 30) | none — kept |
+| `legalHold` + `legalHoldReason` | Suspend every retention sweep for this tenant | off |
 
 **Introduce an allowlist in `monitor` first.** It records every sign-in it would have
 refused (`login_blocked_ip`, outcome `pending`) without refusing anything, so you can
@@ -512,6 +515,45 @@ attempts; twenty consecutive failures disable the endpoint with a stated reason,
 a webhook that has been silently failing for a month is worse than one that is visibly
 off. Destinations are re-checked against the SSRF policy on **every** delivery, not only
 at registration, because DNS moves.
+
+### 4.9 Retention and the data-subject export (spec §0.2 #45, #46, #47)
+
+Two logs accumulate personal data as a side effect of working correctly:
+`auth_security_events` (an address, an IP and a user agent per sign-in, failure, lockout
+and provisioning call) and `email_dispatches` (a recipient, a subject and a preview per
+message composed). Both are evidence, so neither is swept by default.
+
+- **The default is KEEP.** `securityEventRetentionDays` and
+  `emailDispatchRetentionDays` are null until an owner sets them. A retention default
+  that deleted records would opt every existing customer into destroying evidence they
+  never agreed to lose.
+- **The trail is pseudonymised, not deleted.** Past the retention age the email, IP and
+  user agent are cleared and the kind, outcome and timestamp are kept, so "how many
+  failed sign-ins last quarter" stays answerable. The message log is deleted outright: a
+  redacted preview of a message nobody can identify is not evidence of anything.
+- **A legal hold always beats a retention period.** With `legalHold` on, the sweep skips
+  the tenant and *says so* — it does not report zero rows and let an operator conclude
+  there was nothing to do.
+- The sweep is the scheduler job `account.trail-retention` (daily). An owner can run it
+  on demand at `POST /api/v1/company/security/retention/run`; every run is written to the
+  company ledger as `auth_retention_run`, including a run that removed nothing.
+- `GET /api/v1/account/export` returns everything the authentication layer holds about
+  the caller — account, memberships, sessions, linked providers, second-factor state,
+  trail, messages, invitations — and **no credential of any kind**: no password hash, no
+  TOTP seed, no recovery-code hash, no session or refresh token. Each export is ledgered
+  as an `access` on every company the caller belongs to.
+
+### 4.10 MFA challenges are single-use
+
+A challenge token (`mfachal_v1.…`) is a MAC, so any module can mint one without a shared
+write; the CHALLENGE is a row in `mfa_challenges`, and consumption is an upsert on the
+token's `jti`. The first exchange wins and every later exchange is refused as a replay —
+including a challenge minted by a module that never registered it. An administrator's
+`POST /company/security/users/:id/mfa/reset` revokes every challenge in flight, because a
+challenge minted a minute earlier is authority issued on the strength of the factor being
+removed. Spent and expired rows are deleted by the `mfa.challenge-sweep` job an hour after
+expiry; the grace exists so a replay of a just-expired token is still answered with
+"already used" rather than silently treated as a first use.
 
 ---
 

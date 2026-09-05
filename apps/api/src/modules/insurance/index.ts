@@ -34,7 +34,7 @@ import {
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
-import { badRequest, forbidden, notFound } from "../../lib/errors.js";
+import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { isExpired } from "../../lib/time.js";
 import { isoDateSchema, todayISO } from "../field/dates.js";
@@ -364,6 +364,98 @@ const CLAIM_TRANSITIONS: Record<string, string[]> = {
 const windowQuery = z.object({
   days: z.coerce.number().int().min(1).max(730).default(30),
   requiredTypes: z.string().max(500).optional(),
+});
+
+/* ---- WP-MEET upgrade: facilities, requirements, premiums, renewal ---- */
+
+const facilityCreateSchema = z.object({
+  name: z.string().min(1).max(300),
+  provider: z.string().min(1).max(300),
+  providerVendorId: z.string().max(64).nullable().optional(),
+  facilityReference: z.string().max(200).nullable().optional(),
+  projectId: z.string().max(64).nullable().optional(),
+  limitAmount: z.number().positive(),
+  currency: z.string().length(3).optional(),
+  permittedBondTypes: z.array(z.enum(BOND_TYPES)).max(20).optional(),
+  commissionRatePct: z.number().min(0).max(100).nullable().optional(),
+  collateralAmount: z.number().nonnegative().nullable().optional(),
+  collateralNote: z.string().max(2000).nullable().optional(),
+  effectiveFrom: isoDateSchema.nullable().optional(),
+  effectiveTo: isoDateSchema.nullable().optional(),
+  reviewDate: isoDateSchema.nullable().optional(),
+  notes: z.string().max(4000).nullable().optional(),
+});
+
+/* No `status` — /facilities/:id/status owns the transitions. */
+const facilityPatchSchema = facilityCreateSchema.partial().omit({ projectId: true });
+
+const facilityStatusSchema = z.object({
+  status: z.enum(BOND_FACILITY_STATUSES),
+  reason: z.string().max(4000).optional(),
+});
+
+const requirementCreateSchema = z.object({
+  policyType: z.enum(POLICY_TYPES),
+  /** a requirement with no clause is an opinion, so this is mandatory */
+  requiredByClause: z.string().min(1).max(200),
+  contractId: z.string().max(64).nullable().optional(),
+  vendorId: z.string().max(64).nullable().optional(),
+  minimumLimit: z.number().nonnegative().nullable().optional(),
+  limitBasis: z.enum(LIMIT_BASES).nullable().optional(),
+  currency: z.string().length(3).optional(),
+  maximumDeductible: z.number().nonnegative().nullable().optional(),
+  waiverOfSubrogation: z.boolean().optional(),
+  additionalInsuredRequired: z.boolean().optional(),
+  maintainMonthsAfterCompletion: z.number().int().min(0).max(600).nullable().optional(),
+  territorialLimits: z.string().max(2000).nullable().optional(),
+  notes: z.string().max(4000).nullable().optional(),
+});
+
+/* No `status` — /requirements/:id/waive records WHO waived it and why. */
+const requirementPatchSchema = requirementCreateSchema.partial();
+
+const requirementWaiveSchema = z.object({
+  reason: z.string().min(1).max(4000),
+});
+
+const requirementListQuery = pageQuerySchema.extend({
+  policyType: z.enum(POLICY_TYPES).optional(),
+  status: z.enum(INSURANCE_REQUIREMENT_STATUSES).optional(),
+  vendorId: z.string().max(64).optional(),
+  /** include the company-wide standards that also bind this project */
+  includeCompanyWide: z.coerce.boolean().optional(),
+});
+
+const premiumCreateSchema = z.object({
+  kind: z.enum(INSURANCE_PREMIUM_KINDS).optional(),
+  amount: z.number().positive(),
+  currency: z.string().length(3).optional(),
+  periodStart: isoDateSchema.nullable().optional(),
+  periodEnd: isoDateSchema.nullable().optional(),
+  dueDate: isoDateSchema.nullable().optional(),
+  paidAt: isoDateSchema.nullable().optional(),
+  reference: z.string().max(200).nullable().optional(),
+  note: z.string().max(2000).nullable().optional(),
+});
+
+const renewalPatchSchema = z.object({
+  renewalStatus: z.enum(POLICY_RENEWAL_STATUSES),
+  renewalOwnerId: z.string().max(64).nullable().optional(),
+  renewalTargetDate: isoDateSchema.nullable().optional(),
+  renewalNotes: z.string().max(4000).nullable().optional(),
+  /** the policy that renewed this one, once it exists */
+  renewedByPolicyId: z.string().max(64).nullable().optional(),
+});
+
+const renewalQuery = z.object({
+  horizonDays: z.coerce.number().int().min(1).max(730).default(120),
+  leadTimeDays: z.coerce.number().int().min(0).max(365).default(30),
+});
+
+const holdQuery = z.object({
+  vendorId: z.string().min(1).max(64),
+  projectId: z.string().max(64).optional(),
+  asOf: isoDateSchema.optional(),
 });
 
 /* ------------------------------------------------------------------ */
@@ -1621,6 +1713,12 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
             eq(insuranceCertificates.policyId, policyId),
           ),
         );
+      /*
+       * Scoped to THIS project. For a company-level (OCIP) policy visible
+       * from every project, the unscoped query returned claims raised on
+       * other projects — titles, reserves, adjusters — to a member of this
+       * one. A claim belongs to the project it was raised on.
+       */
       const claimRows = await app.db
         .select()
         .from(insuranceClaims)
@@ -1628,12 +1726,14 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
           and(
             eq(insuranceClaims.companyId, req.companyId!),
             eq(insuranceClaims.policyId, policyId),
+            eq(insuranceClaims.projectId, req.projectId!),
           ),
         );
       return {
         ...decoratePolicy(policy, asOf),
         certificates: certs.map((c) => decorateCertificate(c, asOf)),
         claims: claimRows.map((c) => decorateClaim(c, asOf)),
+        claimsScope: "this_project_only" as const,
         notificationRule:
           policy.notificationDays === null
             ? {
