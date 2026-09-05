@@ -28,7 +28,15 @@ import { IconEquipment } from "../../ui/icons";
 import CertificatesTab from "./CertificatesTab";
 import {
   AssignPlantModal,
+  AssignmentActionModal,
   CertificateModal,
+  DeliveryModal,
+  DeviceMapModal,
+  MaintenanceRecordModal,
+  MaintenanceScheduleModal,
+  OffHireModal,
+  ReadingModal,
+  ReceiveDeliveryModal,
   RegisterPlantModal,
   StockMovementModal,
   UtilisationModal,
@@ -54,8 +62,14 @@ import {
   useIdleReport,
   useInvoiceMatch,
   useMaintenance,
+  useMaterialSupply,
   useMaterials,
   useProjectPlant,
+  useCompanyProjects,
+  useResource,
+  useSupplierScorecard,
+  useTelematicsDevices,
+  useTelematicsIntelligence,
   useStockLedger,
   useStockMovements,
   useTelematics,
@@ -110,8 +124,26 @@ export default function EquipmentPage() {
   const [deliveryId, setDeliveryId] = useState<string | null>(null);
   /** which write form is open — the module's whole write side lives here */
   const [form, setForm] = useState<
-    "register" | "assign" | "utilisation" | "certificate" | "stock" | null
+    | "register"
+    | "assign"
+    | "utilisation"
+    | "certificate"
+    | "stock"
+    | "schedule"
+    | "maintenance"
+    | "reading"
+    | "device"
+    | "delivery"
+    | "receive"
+    | "offhire"
+    | "assignment"
+    | null
   >(null);
+  /** which assignment transition the AssignmentActionModal is running */
+  const [assignmentAction, setAssignmentAction] = useState<
+    "approve" | "mobilise" | "demobilise" | "cancel" | "transfer" | null
+  >(null);
+  const [assignmentId, setAssignmentId] = useState<string | null>(null);
 
   const utilisationTo = useMemo(() => today(), []);
   const utilisationFrom = useMemo(
@@ -147,6 +179,12 @@ export default function EquipmentPage() {
   const deliveries = useDeliveries(projectId, tab === "materials");
   const invoiceMatch = useInvoiceMatch(projectId, tab === "materials");
   const materials = useMaterials(projectId, tab === "materials" || form === "stock");
+  const supply = useMaterialSupply(projectId, tab === "materials");
+  const scorecard = useSupplierScorecard(tab === "materials");
+  const devices = useTelematicsDevices(tab === "telematics" || form === "device");
+  const companyProjects = useCompanyProjects(form === "assignment");
+  const machineSchedules = useMachineSchedules(openMachine, form === "maintenance");
+  const intelligence = useTelematicsIntelligence(projectId, telematicsDays, tab === "telematics");
   const stockLedger = useStockLedger(projectId, materialItemId);
   const stockMovements = useStockMovements(projectId, materialItemId);
   const deliveryDetail = useDeliveryDetail(projectId, deliveryId);
@@ -272,9 +310,44 @@ export default function EquipmentPage() {
               />
             ) : null}
             {tab === "materials" ? (
-              <Button size="sm" variant="secondary" onClick={() => setForm("stock")}>
-                Move stock
+              <>
+                <Button size="sm" variant="secondary" onClick={() => setForm("delivery")}>
+                  Book a delivery
+                </Button>
+                {deliveryId ? (
+                  <Button size="sm" variant="secondary" onClick={() => setForm("receive")}>
+                    Receive
+                  </Button>
+                ) : null}
+                <Button size="sm" variant="secondary" onClick={() => setForm("stock")}>
+                  Move stock
+                </Button>
+              </>
+            ) : null}
+            {tab === "telematics" ? (
+              <Button size="sm" variant="secondary" onClick={() => setForm("device")}>
+                Map a device
               </Button>
+            ) : null}
+            {tab === "maintenance" && openMachine ? (
+              <>
+                <Button size="sm" variant="secondary" onClick={() => setForm("schedule")}>
+                  Add schedule
+                </Button>
+                <Button size="sm" variant="secondary" onClick={() => setForm("maintenance")}>
+                  Record a service
+                </Button>
+              </>
+            ) : null}
+            {openMachine ? (
+              <>
+                <Button size="sm" variant="secondary" onClick={() => setForm("reading")}>
+                  Add a reading
+                </Button>
+                <Button size="sm" variant="secondary" onClick={() => setForm("offhire")}>
+                  Off-hire
+                </Button>
+              </>
             ) : null}
             {tab === "utilisation" || tab === "idle" ? (
               <Button size="sm" variant="secondary" onClick={() => setForm("utilisation")}>
@@ -354,6 +427,7 @@ export default function EquipmentPage() {
         />
       ) : tab === "utilisation" ? (
         <UtilisationTab
+          projectId={projectId}
           summary={utilisationSummary}
           rows={utilisationRows}
           windowDays={utilisationDays}
@@ -363,6 +437,7 @@ export default function EquipmentPage() {
       ) : tab === "telematics" ? (
         <TelematicsTab
           report={telematics}
+          intelligence={intelligence}
           days={telematicsDays}
           onDays={setTelematicsDays}
           onOpenMachine={openMachineDrawer}
@@ -379,6 +454,8 @@ export default function EquipmentPage() {
           selectedDeliveryId={deliveryId}
           onSelectDelivery={setDeliveryId}
           deliveryDetail={deliveryDetail}
+          supply={supply}
+          scorecard={scorecard}
         />
       )}
 
@@ -425,8 +502,96 @@ export default function EquipmentPage() {
         materials={materials.data?.items ?? []}
         defaultItemId={materialItemId}
       />
+      <MaintenanceScheduleModal
+        open={form === "schedule"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        equipmentId={openMachine}
+        machineLabel={machineDetail.data?.reference ?? "this machine"}
+      />
+      <MaintenanceRecordModal
+        open={form === "maintenance"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        equipmentId={openMachine}
+        machineLabel={machineDetail.data?.reference ?? "this machine"}
+        schedules={machineSchedules.data?.items ?? []}
+      />
+      <ReadingModal
+        open={form === "reading"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        equipmentId={openMachine}
+        machineLabel={machineDetail.data?.reference ?? "this machine"}
+        projectId={projectId}
+      />
+      <OffHireModal
+        open={form === "offhire"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        equipmentId={openMachine}
+        machineLabel={machineDetail.data?.reference ?? "this machine"}
+      />
+      <DeviceMapModal
+        open={form === "device"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        fleet={fleet.data?.items ?? []}
+        devices={devices.data?.items ?? []}
+      />
+      <DeliveryModal
+        open={form === "delivery"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        projectId={projectId}
+        materials={materials.data?.items ?? []}
+      />
+      {deliveryDetail.data ? (
+        <ReceiveDeliveryModal
+          open={form === "receive"}
+          onClose={() => setForm(null)}
+          onDone={refresh}
+          projectId={projectId}
+          delivery={deliveryDetail.data}
+        />
+      ) : null}
+      <AssignmentActionModal
+        open={form === "assignment"}
+        action={assignmentAction}
+        onClose={() => {
+          setForm(null);
+          setAssignmentAction(null);
+        }}
+        onDone={refresh}
+        projectId={projectId}
+        assignmentId={assignmentId}
+        machineLabel={machineDetail.data?.reference ?? "this machine"}
+        projects={(companyProjects.data?.items ?? []).filter((entry) => entry.id !== projectId)}
+      />
     </div>
   );
+}
+
+/**
+ * The schedules on ONE machine, for the "which service is this closing"
+ * picker. A maintenance record with no schedule is a repair; a record against
+ * a schedule is the thing that moves the next due date, which is why the
+ * picker has to be populated from the machine and not typed.
+ */
+function useMachineSchedules(
+  equipmentId: string | null,
+  enabled: boolean,
+): { data: { items: Array<{ scheduleId: string; name: string }> } | null } {
+  const res = useResource<{ items: Array<{ id: string; name: string }> }>(
+    enabled && equipmentId
+      ? `/api/v1/companies/current/equipment/${equipmentId}/maintenance-schedules`
+      : null,
+  );
+  return {
+    data: res.data
+      ? { items: res.data.items.map((s) => ({ scheduleId: s.id, name: s.name })) }
+      : null,
+  };
 }
 
 /** The single biggest currency bucket, for the page header. Never a sum. */

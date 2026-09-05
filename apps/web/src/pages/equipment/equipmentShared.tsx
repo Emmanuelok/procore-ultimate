@@ -1568,3 +1568,217 @@ export function useCompanyProjects(enabled: boolean): Loadable<ListResponse<Proj
     enabled ? "/api/v1/projects?page=1&pageSize=200" : null,
   );
 }
+
+/* ========================================================================== */
+/* Materials supply, telematics intelligence and fleet availability            */
+/* ========================================================================== */
+
+export type SupplyRisk =
+  | "ok"
+  | "order_now"
+  | "order_by_date_missed"
+  | "shortage"
+  | "unknown";
+
+export const SUPPLY_RISK_LABEL: Record<SupplyRisk, string> = {
+  ok: "On track",
+  order_now: "Order now",
+  order_by_date_missed: "Order-by date missed",
+  shortage: "Shortage forecast",
+  unknown: "No order-by date",
+};
+
+export const SUPPLY_RISK_TONE: Record<SupplyRisk, Tone> = {
+  ok: "success",
+  order_now: "warning",
+  order_by_date_missed: "danger",
+  shortage: "danger",
+  unknown: "muted",
+};
+
+export interface SupplyItemAssessment {
+  id: string;
+  reference: string;
+  name: string;
+  unit: string;
+  orderByDate: string | null;
+  daysUntilOrderBy: number | null;
+  shortfall: number | null;
+  earliestArrivalIfOrderedToday: string | null;
+  risk: SupplyRisk;
+  exposure: number | null;
+  currency: string;
+  activityAtRisk: { id: string; name: string | null; start: string | null } | null;
+  reasons: string[];
+}
+
+export interface DeliveryDelay {
+  id: string;
+  reference: string;
+  scheduledFor: string | null;
+  daysLate: number;
+  status: string;
+  supplierVendorId: string | null;
+  itemIds: string[];
+  reasons: string[];
+}
+
+export interface InventoryValuation {
+  byCurrency: Array<{
+    currency: string;
+    onHandValue: number;
+    wasteValue: number;
+    items: number;
+  }>;
+  unpricedItems: Array<{ id: string; reference: string; quantityOnHand: number }>;
+  wasteRatePercent: number | null;
+  totals: {
+    itemsWithStock: number;
+    quantityWasted: number;
+    quantityDelivered: number;
+  };
+  reasons: string[];
+}
+
+export interface SupplyReport {
+  asOf: string;
+  items: SupplyItemAssessment[];
+  atRisk: SupplyItemAssessment[];
+  delayedDeliveries: DeliveryDelay[];
+  valuation: InventoryValuation;
+  summary: {
+    items: number;
+    orderByDateMissed: number;
+    orderNow: number;
+    shortages: number;
+    unknown: number;
+    delayedDeliveries: number;
+  };
+  method: string;
+}
+
+export function useMaterialSupply(
+  projectId: string | undefined,
+  enabled: boolean,
+): Loadable<SupplyReport> {
+  return useResource<SupplyReport>(
+    enabled && projectId ? `/api/v1/projects/${projectId}/materials/supply` : null,
+  );
+}
+
+export interface SupplierScore {
+  vendorId: string;
+  vendorName: string | null;
+  deliveries: number;
+  onTimePercent: number | null;
+  onTimeBasis: number;
+  discrepancyPercent: number | null;
+  rejectionPercent: number | null;
+  averageWaitingMinutes: number | null;
+  invoiceMatchPercent: number | null;
+  invoiceVarianceByCurrency: Array<{ currency: string; amount: number }>;
+  score: number | null;
+  reasons: string[];
+}
+
+export function useSupplierScorecard(enabled: boolean): Loadable<{
+  items: SupplierScore[];
+  total: number;
+  method: string;
+}> {
+  return useResource(enabled ? "/api/v1/companies/current/materials/supplier-scorecard" : null);
+}
+
+export interface GeofenceVerdict {
+  breaches: Array<{ recordedAt: string; distanceMetres: number }>;
+  maxDistanceMetres: number | null;
+  spanHours: number | null;
+  reasons: string[];
+}
+
+export interface FuelReconciliation {
+  burnLitres: number | null;
+  filledLitres: number;
+  differenceLitres: number | null;
+  ratio: number | null;
+  unexplained: boolean;
+  reasons: string[];
+}
+
+export interface TelematicsFault {
+  code: string;
+  description?: string | null;
+  severity?: string | null;
+  activeSince?: string | null;
+}
+
+export interface FaultVerdict {
+  actionable: TelematicsFault[];
+  worst: string | null;
+  stopWork: boolean;
+  reason: string | null;
+}
+
+export interface TelematicsIntelligence {
+  from: string;
+  to: string;
+  site: { latitude: number; longitude: number } | null;
+  machines: Array<{
+    equipmentId: string;
+    reference: string;
+    name: string;
+    readings: number;
+    geofence: GeofenceVerdict;
+    fuel: FuelReconciliation;
+    faults: FaultVerdict;
+  }>;
+  reasons: string[];
+}
+
+export function useTelematicsIntelligence(
+  projectId: string | undefined,
+  days: number,
+  enabled: boolean,
+): Loadable<TelematicsIntelligence> {
+  return useResource<TelematicsIntelligence>(
+    enabled && projectId
+      ? `/api/v1/projects/${projectId}/equipment-telematics/intelligence?days=${days}`
+      : null,
+  );
+}
+
+export interface AvailabilityRow {
+  id: string;
+  reference: string;
+  name: string;
+  category: string;
+  ownership: string;
+  status: string;
+  currency: string;
+  hireRateAmount: number | null;
+  hireRateUnit: string | null;
+  internalRateAmount: number | null;
+  outOfCertificate: boolean;
+  nextCertificateExpiry: string | null;
+  clashes: Array<{
+    assignmentId: string;
+    projectId: string;
+    status: string;
+    assignedFrom: string;
+    assignedTo: string | null;
+  }>;
+  serviceDue: Array<{ scheduleId: string; name: string; nextDueAt: string | null }>;
+  caveats: string[];
+}
+
+export function useAvailability(
+  from: string,
+  to: string,
+  enabled: boolean,
+): Loadable<{ from: string; to: string; available: AvailabilityRow[]; busy: AvailabilityRow[]; note?: string }> {
+  return useResource(
+    enabled
+      ? `/api/v1/companies/current/equipment-availability?from=${from}&to=${to}`
+      : null,
+  );
+}

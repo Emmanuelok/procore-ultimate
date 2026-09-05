@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": true },
+  "include": [
+    "src/modules/meetings/**/*.ts",
+    "src/modules/learning/**/*.ts",
+    "src/modules/insurance/**/*.ts",
+    "src/types.d.ts"
+  ],
+  "exclude": []
+}

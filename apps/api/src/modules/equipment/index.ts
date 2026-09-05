@@ -2731,6 +2731,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       let uncoded = 0;
       let unverified = 0;
       let incomplete = 0;
+      let uncosted = 0;
       for (const row of rows) {
         if (!row.budgetLineItemId) {
           uncoded += 1;
@@ -2755,10 +2756,16 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           currency: row.currency,
           hours: h,
         });
-        if (cost.totalCost === null || !cost.totalIsComplete) {
-          incomplete += 1;
+        if (cost.totalCost === null) {
+          uncosted += 1;
           continue;
         }
+        // A day that could be costed only in part IS posted — at the figure
+        // that could be computed — and the stamp says it is a floor. The
+        // alternative, posting nothing, leaves plant off the cost report
+        // entirely, which is the failure this route exists to end. What is
+        // never done is presenting the floor as the whole cost.
+        if (!cost.totalIsComplete) incomplete += 1;
         const held = byLine.get(row.budgetLineItemId) ?? {
           cost: 0,
           hours: 0,
@@ -2793,10 +2800,17 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
             "them anyway — the stamp records that you did.",
         );
       }
+      if (uncosted > 0) {
+        reasons.push(
+          `${uncosted} plant day(s) could not be costed at all (no hire rate and no internal ` +
+            "charge-out rate on the machine) and were not posted at zero.",
+        );
+      }
       if (incomplete > 0) {
         reasons.push(
-          `${incomplete} plant day(s) could not be costed in full (no hire, internal or operator ` +
-            "rate) and were not posted at a partial figure.",
+          `${incomplete} plant day(s) were costed only in part — an operator rate or a fuel cost ` +
+            "is missing — so the figure posted for them is a FLOOR on the day's cost, not the " +
+            "day's cost. The stamp on each budget line records this.",
         );
       }
 
@@ -2844,6 +2858,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
             plantDays: held.days,
             currency: held.currency,
             includedUnverified: body.includeUnverified,
+            isFloor: incomplete > 0,
             postedAt: now,
             postedBy: req.user!.id,
             note:
@@ -2884,7 +2899,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           days: posted.reduce((s, p) => s + p.plantDays, 0),
           uncodedDays: uncoded,
           unverifiedDays: unverified,
-          incompleteDays: incomplete,
+          uncostedDays: uncosted,
+          partiallyCostedDays: incomplete,
           includedUnverified: body.includeUnverified,
         },
       });
@@ -3864,6 +3880,172 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         .where(eq(equipmentMaintenanceSchedules.id, id))
         .limit(1);
       return reply.status(201).send({ ...rows[0], due });
+    },
+  );
+
+  /**
+   * SUSPEND, RETIRE OR REINSTATE A SCHEDULE, and correct its interval.
+   *
+   * A schedule with no way out is a schedule people work around: a machine
+   * that has left the fleet, or whose statutory regime changed, kept
+   * generating overdue services and — for a statutory one — kept the plant
+   * flagged. `suspended` stops the sweep counting it while keeping the
+   * history; `retired` ends it. A STATUTORY schedule cannot be quietly
+   * suspended without saying why, because that is the paperwork that keeps a
+   * machine lawful.
+   */
+  app.patch(
+    "/companies/current/equipment/:equipmentId/maintenance-schedules/:scheduleId",
+    { preHandler: companyWrite },
+    async (req) => {
+      const { equipmentId, scheduleId } = req.params as {
+        equipmentId: string;
+        scheduleId: string;
+      };
+      const body = z
+        .object({
+          status: z.enum(["active", "suspended", "retired"]).optional(),
+          reason: z.string().max(2000).optional(),
+          name: nonEmpty(200).optional(),
+          description: z.string().max(4000).nullable().optional(),
+          intervalValue: z.number().finite().positive().optional(),
+          warnAheadValue: z.number().finite().min(0).nullable().optional(),
+          providerVendorId: idRef.nullable().optional(),
+          estimatedCost: money.nullable().optional(),
+          estimatedDowntimeHours: hours.nullable().optional(),
+        })
+        .parse(req.body ?? {});
+      const companyId = req.companyId!;
+      const machine = await fetchEquipment(equipmentId, companyId);
+      const [schedule] = await app.db
+        .select()
+        .from(equipmentMaintenanceSchedules)
+        .where(
+          and(
+            eq(equipmentMaintenanceSchedules.id, scheduleId),
+            eq(equipmentMaintenanceSchedules.companyId, companyId),
+            eq(equipmentMaintenanceSchedules.equipmentId, equipmentId),
+          ),
+        )
+        .limit(1);
+      if (!schedule) throw notFound("Maintenance schedule not found");
+      if (schedule.status === "retired" && body.status !== "active") {
+        throw conflict(
+          `${schedule.name} is retired. Reinstate it with status "active" before changing it, so ` +
+            "the reinstatement is a decision somebody made rather than a side effect of an edit.",
+        );
+      }
+      if (
+        schedule.isStatutory === 1 &&
+        (body.status === "suspended" || body.status === "retired") &&
+        !(body.reason ?? "").trim()
+      ) {
+        throw badRequest(
+          `${schedule.name} is a STATUTORY schedule — it is the regime that keeps this machine ` +
+            "lawful to operate. Say why it is being " +
+            `${body.status}, and the reason is kept on the ledger.`,
+        );
+      }
+      const now = new Date().toISOString();
+      const intervalValue = body.intervalValue ?? schedule.intervalValue;
+      const warnAheadValue =
+        body.warnAheadValue !== undefined ? body.warnAheadValue : schedule.warnAheadValue;
+      // Recompute the due date from the new interval; a suspended or retired
+      // schedule keeps its stored due date and simply stops being counted.
+      const due =
+        body.status === "suspended" || body.status === "retired"
+          ? null
+          : computeNextDue({
+              intervalKind: schedule.intervalKind as MaintenanceIntervalKind,
+              intervalValue,
+              warnAheadValue,
+              lastPerformedAt: schedule.lastPerformedAt,
+              lastPerformedMeter: schedule.lastPerformedMeter,
+              currentMeter: machine.currentMeterReading,
+              meterType: machine.meterType as MeterType,
+              baselineDate: machine.hireStartDate ?? machine.purchaseDate,
+              averageDailyUsage: await observedDailyUsage(equipmentId),
+              asOf: todayISO(),
+            });
+      const status =
+        body.status === undefined
+          ? schedule.status
+          : body.status === "active"
+            ? due?.status === "overdue"
+              ? "overdue"
+              : due?.status === "due_soon"
+                ? "due"
+                : "active"
+            : body.status;
+      await app.db
+        .update(equipmentMaintenanceSchedules)
+        .set({
+          ...(body.name !== undefined ? { name: body.name } : {}),
+          ...(body.description !== undefined ? { description: body.description } : {}),
+          ...(body.providerVendorId !== undefined
+            ? { providerVendorId: body.providerVendorId }
+            : {}),
+          ...(body.estimatedCost !== undefined ? { estimatedCost: body.estimatedCost } : {}),
+          ...(body.estimatedDowntimeHours !== undefined
+            ? { estimatedDowntimeHours: body.estimatedDowntimeHours }
+            : {}),
+          intervalValue,
+          warnAheadValue,
+          ...(due ? { nextDueAt: due.nextDueAt, nextDueMeter: due.nextDueMeter } : {}),
+          status,
+          detail: {
+            ...(schedule.detail ?? {}),
+            ...(body.status && body.status !== schedule.status
+              ? {
+                  statusChange: {
+                    from: schedule.status,
+                    to: body.status,
+                    reason: body.reason ?? null,
+                    at: now,
+                    by: req.user!.id,
+                  },
+                }
+              : {}),
+          },
+          updatedAt: now,
+        })
+        .where(eq(equipmentMaintenanceSchedules.id, scheduleId));
+      await appendLedger(app.db, {
+        companyId,
+        actorId: req.user!.id,
+        action: body.status && body.status !== schedule.status ? "state_change" : "update",
+        objectType: "equipment_maintenance_schedule",
+        objectId: scheduleId,
+        projectId: schedule.projectId,
+        payload: {
+          equipmentId,
+          equipmentReference: machine.reference,
+          name: body.name ?? schedule.name,
+          from: schedule.status,
+          to: status,
+          reason: body.reason ?? null,
+          isStatutory: schedule.isStatutory === 1,
+          intervalValue,
+        },
+        storePayload: true,
+      });
+      const [after] = await app.db
+        .select()
+        .from(equipmentMaintenanceSchedules)
+        .where(eq(equipmentMaintenanceSchedules.id, scheduleId))
+        .limit(1);
+      return {
+        ...after,
+        isStatutory: after?.isStatutory === 1,
+        due,
+        note:
+          status === "suspended"
+            ? "This schedule no longer raises a due or overdue service. Its history is kept and " +
+              "reinstating it recomputes the next due date from the last service performed."
+            : status === "retired"
+              ? "This schedule is closed. Raise a new one if the regime returns."
+              : null,
+      };
     },
   );
 

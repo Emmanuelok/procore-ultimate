@@ -305,8 +305,24 @@ export function registerSecurityRoutes(app: FastifyInstance): void {
       email: actor.email,
       ip: ctx.ip,
       userAgent: ctx.userAgent,
-      reason: "Tenant security policy updated",
-      metadata: { changed: Object.keys(body) },
+      reason:
+        // A legal hold turning on or off decides whether records survive, so
+        // it is named in the trail line rather than left to be inferred from
+        // a list of changed keys. The generic reason still covers everything
+        // else; the ledger entry above carries the full before/after.
+        next.legalHold !== current.legalHold
+          ? next.legalHold
+            ? "Legal hold placed: every retention sweep is suspended for this organisation"
+            : "Legal hold lifted: retention sweeps resume for this organisation"
+          : "Tenant security policy updated",
+      metadata: {
+        changed: Object.keys(body),
+        legalHold: next.legalHold,
+        retention: {
+          securityEventDays: next.securityEventRetentionDays,
+          emailDispatchDays: next.emailDispatchRetentionDays,
+        },
+      },
     });
 
     const [company] = await app.db

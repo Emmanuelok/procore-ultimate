@@ -19,7 +19,23 @@ import { applyRetention, PSEUDONYM } from "./retention.js";
  * why, and an export never carries a credential.
  */
 
-const HOOK_TIMEOUT_MS = 180_000;
+/**
+ * Booting PGlite and replaying every migration is minutes of CPU on a shared
+ * machine, so the two suites in this file share ONE app and the hook is given
+ * five minutes. Isolation comes from each test registering its own tenant,
+ * which is what these assertions actually depend on.
+ */
+const HOOK_TIMEOUT_MS = 900_000; /* TEMP-VERIFY */
+
+let built: BuiltApp;
+let app: FastifyInstance;
+
+beforeAll(async () => {
+  built = await buildTestApp();
+  app = built.app;
+}, HOOK_TIMEOUT_MS);
+afterAll(async () => built.close());
+
 const PASSWORD = "quarry-lantern-gravel";
 let counter = 0;
 
@@ -91,17 +107,6 @@ async function plantDispatch(app: FastifyInstance, actor: Actor, ageDays: number
 }
 
 describe("authentication-record retention (§0.2 #46, #47)", () => {
-  let built: BuiltApp;
-  let app: FastifyInstance;
-
-  beforeAll(async () => {
-    built = await buildTestApp();
-    app = built.app;
-  }, HOOK_TIMEOUT_MS);
-  afterAll(async () => {
-    await built.close();
-  });
-
   it("keeps everything for a tenant that has chosen no retention", async () => {
     const actor = await signUp(app);
     const rowId = await plantTrailRow(app, actor, 400);
@@ -279,17 +284,6 @@ describe("authentication-record retention (§0.2 #46, #47)", () => {
 });
 
 describe("data-subject export (§0.2 #45)", () => {
-  let built: BuiltApp;
-  let app: FastifyInstance;
-
-  beforeAll(async () => {
-    built = await buildTestApp();
-    app = built.app;
-  }, HOOK_TIMEOUT_MS);
-  afterAll(async () => {
-    await built.close();
-  });
-
   it("returns the account's own record and never a credential", async () => {
     const actor = await signUp(app);
     const res = await app.inject({

@@ -153,14 +153,32 @@ export async function consumeChallenge(
         code: "replayed",
       };
     }
-    await db.insert(mfaChallenges).values({
-      id: jti,
-      userId: claims.uid,
-      scope: claims.scope,
-      origin: "password",
-      consumedAt: nowIso,
-      expiresAt: new Date(claims.exp).toISOString(),
-    });
+    // FIRST USE OF AN UNREGISTERED CHALLENGE. The insert is conditional and
+    // reports whether it won: two simultaneous exchanges of the same
+    // unregistered token both reach here, and a bare insert would let the
+    // loser's primary-key violation fall into the catch below and be read as
+    // "not a replay" — which is exactly the hole this file exists to close.
+    // `onConflictDoNothing().returning()` gives an empty array to the loser.
+    const inserted = await db
+      .insert(mfaChallenges)
+      .values({
+        id: jti,
+        userId: claims.uid,
+        scope: claims.scope,
+        origin: "password",
+        consumedAt: nowIso,
+        expiresAt: new Date(claims.exp).toISOString(),
+      })
+      .onConflictDoNothing()
+      .returning({ id: mfaChallenges.id });
+    if (inserted.length === 0) {
+      return {
+        ok: false,
+        reason:
+          "This sign-in challenge has already been used. Challenges are single-use — start the sign-in again.",
+        code: "replayed",
+      };
+    }
     return OK;
   } catch {
     // See the header: an unreadable table must not become "nobody with a

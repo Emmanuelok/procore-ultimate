@@ -5,10 +5,12 @@
  * Five surfaces, each one backed by a control the API enforces rather than
  * suggests (Vol I §0.1 #21, #23, #24, #25 and §0.2):
  *
- *   Policy      session timeouts, password rules, lockout thresholds and the
- *               IP allowlist. Every field shows the platform default beside
+ *   Policy      session timeouts, password rules, lockout thresholds, the IP
+ *               allowlist and how long the authentication record is kept
+ *               about a person. Every field shows the platform default beside
  *               it, so "we have not chosen" is visibly different from "we
- *               chose the same number".
+ *               chose the same number" — which is exactly the distinction
+ *               retention turns on: blank means KEEP, not zero days.
  *   Activity    the login audit, filterable, with a CSV/JSON export. It says
  *               out loud what it CANNOT show — attempts against an address
  *               that belongs to nobody carry no company and are the

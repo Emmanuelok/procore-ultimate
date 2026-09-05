@@ -332,8 +332,17 @@ Workspace → Usage/Billing settings:
   - Each replica opens up to **10 Postgres connections** (`postgres(url, { max: 10 })`,
     `apps/api/src/lib/db.ts`). Budget accordingly.
 - **The database is the bottleneck**, not the app. Scale Postgres vertically first. When
-  connection counts grow (many replicas, or sidecar jobs), put Railway's **PgBouncer
-  template** between app and DB and point `DATABASE_URL` at it (transaction pooling mode).
+  connection counts grow (many replicas, or sidecar jobs), lower `DATABASE_POOL_MAX`
+  before reaching for a pooler.
+- **A connection pooler needs one code change first, and this runbook used to omit it.**
+  `apps/api/src/lib/db.ts` opens `postgres(url, { max })` with postgres-js defaults, which
+  means **named prepared statements**. Those are per-session, so under PgBouncer in
+  *transaction* pooling mode a statement prepared on one backend is executed on another
+  and the query fails with `prepared statement "…" does not exist` — intermittently, under
+  load, which is the worst way to find out. Either point `DATABASE_URL` at PgBouncer in
+  **session** pooling mode (safe, and pools far less), or set `prepare: false` on the
+  client before switching to transaction mode. Do not switch on the strength of this
+  runbook's earlier advice.
 
 ---
 
@@ -372,7 +381,7 @@ boot). "Image" = value baked into `Dockerfile`; set in Railway only what §2.5 l
 | `UPLOAD_MAX_BYTES` | `268435456` (256 MiB) | — | Bounds memory per in-flight upload (multipart is buffered per request). |
 | `UPLOAD_MAX_FILES` | `25` | — | Optional tuning |
 | `DATABASE_POOL_MAX` | `10` | — | Multiply by replica count and compare with Postgres `max_connections` before raising. |
-| `SCHEDULER_ENABLED` | `true` | — | Leave on. Off means the sweeps (session/invitation expiry, security-webhook delivery, deadline detection, heartbeat seals) do not run at all — not "later". |
+| `SCHEDULER_ENABLED` | `true` | — | Leave on. Off means the sweeps (session/invitation expiry, security-webhook delivery, MFA-challenge and trail retention, deadline detection, heartbeat seals) do not run at all — not "later". |
 | `SCHEDULER_TICK_MS` | `60000` | — | Tick granularity; a job's `everyMs` rounds up to it. |
 | `RATE_LIMIT_ENABLED` | `true` | — | — |
 | `RATE_LIMIT_MAX_PER_MINUTE` | `300` | — | Optional tuning (per IP, per replica) |
@@ -393,7 +402,8 @@ policy, lockout thresholds or IP allowlist. Those are **per tenant**, set by an 
 admin at `PUT /api/v1/company/security-policy` (web app → Security). The `LOGIN_*`,
 `SESSION_*` and `BCRYPT_COST` values are the platform DEFAULTS a tenant that has chosen
 nothing inherits; a tenant may tighten them and can never loosen them below the platform
-floor. See §4.6.
+floor. See §4.6. The same is true of **retention and legal hold** (§4.9): there is no
+environment variable, the platform default is "keep", and only an owner can change it.
 
 ### 4.2 Upgrade and rollback
 
@@ -458,7 +468,7 @@ floor. See §4.6.
 | Ledger appends | Yes — serialised per company by an advisory lock | `lib/ledger.ts` |
 | Account and IP lockout counters | Yes — derived from `auth_security_events`, not from process memory | `modules/account/lockout.ts` |
 | `@fastify/rate-limit` counters | **No** — per process | In-memory. `RATE_LIMIT_MAX_PER_MINUTE` is therefore per replica; the lockout engine, which is not, is the control that actually stops credential guessing. |
-| MFA challenge tokens | N/A — stateless, MAC-authenticated | `modules/mfa/challenge.ts` |
+| MFA challenges | Yes — the token is a stateless MAC, the challenge is a row consumed by upsert, so a challenge minted on one replica cannot be exchanged twice on another | `modules/mfa/challenge.ts` + `mfa_challenges` |
 
 ### 4.6 Tenant security policy (spec #23, #24, #25)
 

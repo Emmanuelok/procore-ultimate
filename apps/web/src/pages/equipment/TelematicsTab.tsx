@@ -38,6 +38,7 @@ import type { Tone } from "../../ui/tokens";
 import { IconZap } from "../../ui/icons";
 import {
   CurrencyRail,
+  EM_DASH,
   FigureCell,
   LoadError,
   NOT_COMPARABLE_CLASSES,
@@ -51,6 +52,7 @@ import {
   type DayVariance,
   type EquipmentReconciliation,
   type Loadable,
+  type TelematicsIntelligence,
   type TelematicsReport,
 } from "./equipmentShared";
 
@@ -58,11 +60,13 @@ const WINDOWS = [7, 14, 30, 60];
 
 export default function TelematicsTab({
   report,
+  intelligence,
   days,
   onDays,
   onOpenMachine,
 }: {
   report: Loadable<TelematicsReport>;
+  intelligence: Loadable<TelematicsIntelligence>;
   days: number;
   onDays: (next: number) => void;
   onOpenMachine: (equipmentId: string) => void;
@@ -413,7 +417,191 @@ export default function TelematicsTab({
           )}
         </>
       )}
+
+      <IntelligencePanel intelligence={intelligence} onOpenMachine={onOpenMachine} />
     </div>
+  );
+}
+
+/* ========================================================================== */
+/* What the feed says beyond hours                                             */
+/* ========================================================================== */
+
+/**
+ * WHERE, WHAT IT BURNED, AND WHAT IT IS COMPLAINING ABOUT.
+ *
+ * Three findings the hours reconciliation cannot make, each of which refuses
+ * rather than guesses:
+ *
+ *  · GEOFENCE. Only readings with the ENGINE RUNNING count — a machine parked
+ *    in a yard overnight is not misuse — and a single breaching reading is
+ *    reported without a duration, because one point says where the machine
+ *    was, not how long it was there. No project coordinates means no fence and
+ *    no verdict at all.
+ *  · FUEL. Litres put in against litres the machine says it burned, with both
+ *    an absolute and a proportional tolerance. A feed reporting no consumption
+ *    produces a reason, not an accusation: "burned nothing and took 400
+ *    litres" is nearly always a device that does not report fuel.
+ *  · FAULTS. Severe and above only. A critical fault is the manufacturer
+ *    telling you to stop the machine.
+ */
+function IntelligencePanel({
+  intelligence,
+  onOpenMachine,
+}: {
+  intelligence: Loadable<TelematicsIntelligence>;
+  onOpenMachine: (equipmentId: string) => void;
+}) {
+  const data = intelligence.data;
+  const flagged = useMemo(
+    () =>
+      (data?.machines ?? []).filter(
+        (m) =>
+          m.geofence.breaches.length > 0 || m.fuel.unexplained || m.faults.actionable.length > 0,
+      ),
+    [data],
+  );
+
+  return (
+    <Card>
+      <CardBody className="space-y-3">
+        <SectionHeading
+          title="What the feed says beyond hours"
+          hint="Where the machine was worked, what it burned against what was put in it, and what it is complaining about. Every one of these refuses rather than guesses."
+          className="mb-0"
+        />
+        {intelligence.error ? (
+          <LoadError message={intelligence.error} onRetry={intelligence.reload} />
+        ) : intelligence.loading ? (
+          <SkeletonTable rows={3} />
+        ) : !data ? (
+          <EmptyState
+            icon={<IconZap />}
+            title="Nothing asked yet"
+            description="The feed has not been read for this window."
+          />
+        ) : (
+          <>
+            <ReasonList reasons={data.reasons} />
+            {data.machines.length === 0 ? (
+              <EmptyState
+                icon={<IconZap />}
+                title="No plant on this project"
+                description="No machine is assigned here, so there is no feed to read."
+              />
+            ) : flagged.length === 0 ? (
+              <EmptyState
+                icon={<IconZap />}
+                title="Nothing to raise"
+                description={`${data.machines.length} machine(s) read between ${data.from} and ${data.to}. No off-site running, no unexplained fuel and no actionable fault code.`}
+              />
+            ) : (
+              <div className="space-y-3">
+                {flagged.map((machine) => (
+                  <div key={machine.equipmentId} className="rounded-md border border-border p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="flex flex-wrap items-center gap-2">
+                        <span className="font-mono text-content">{machine.reference}</span>
+                        <span className="text-content-muted">{machine.name}</span>
+                        <Badge tone="neutral" size="xs">
+                          {machine.readings} reading{machine.readings === 1 ? "" : "s"}
+                        </Badge>
+                      </span>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => onOpenMachine(machine.equipmentId)}
+                      >
+                        Open the machine
+                      </Button>
+                    </div>
+                    <div className="mt-2 grid gap-3 md:grid-cols-3">
+                      <div>
+                        <div className="text-label uppercase tracking-wide text-content-subtle">
+                          Off site
+                        </div>
+                        {machine.geofence.breaches.length === 0 ? (
+                          machine.geofence.reasons.length > 0 ? (
+                            <NotComparable reasons={machine.geofence.reasons} />
+                          ) : (
+                            <div className="text-content-muted">Worked inside the fence</div>
+                          )
+                        ) : (
+                          <div>
+                            <Badge tone="danger" size="xs" dot>
+                              {machine.geofence.breaches.length} running reading(s) outside
+                            </Badge>
+                            <div className="mt-1 text-meta text-content-muted">
+                              furthest{" "}
+                              {machine.geofence.maxDistanceMetres === null
+                                ? EM_DASH
+                                : `${Math.round(machine.geofence.maxDistanceMetres)} m`}
+                              {machine.geofence.spanHours !== null
+                                ? ` · spanning ${machine.geofence.spanHours} h`
+                                : ""}
+                            </div>
+                            <ReasonList reasons={machine.geofence.reasons} className="mt-1" />
+                          </div>
+                        )}
+                      </div>
+                      <div>
+                        <div className="text-label uppercase tracking-wide text-content-subtle">
+                          Fuel
+                        </div>
+                        {machine.fuel.burnLitres === null ? (
+                          <NotComparable reasons={machine.fuel.reasons} />
+                        ) : (
+                          <div>
+                            <div
+                              className={machine.fuel.unexplained ? "text-danger" : "text-content"}
+                            >
+                              {machine.fuel.filledLitres} L filled · {machine.fuel.burnLitres} L
+                              burned
+                            </div>
+                            <div className="text-meta text-content-muted">
+                              difference{" "}
+                              {machine.fuel.differenceLitres === null
+                                ? EM_DASH
+                                : `${machine.fuel.differenceLitres} L`}
+                              {machine.fuel.ratio !== null ? ` · ratio ${machine.fuel.ratio}` : ""}
+                            </div>
+                            <ReasonList reasons={machine.fuel.reasons} className="mt-1" />
+                          </div>
+                        )}
+                      </div>
+                      <div>
+                        <div className="text-label uppercase tracking-wide text-content-subtle">
+                          Faults
+                        </div>
+                        {machine.faults.actionable.length === 0 ? (
+                          <div className="text-content-muted">No actionable fault reported</div>
+                        ) : (
+                          <div>
+                            <Badge
+                              tone={machine.faults.stopWork ? "danger" : "warning"}
+                              size="xs"
+                              dot
+                            >
+                              {machine.faults.actionable.length} active ·{" "}
+                              {machine.faults.worst ?? "severe"}
+                            </Badge>
+                            {machine.faults.reason ? (
+                              <p className="mt-1 text-meta text-content-muted">
+                                {machine.faults.reason}
+                              </p>
+                            ) : null}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </CardBody>
+    </Card>
   );
 }
 

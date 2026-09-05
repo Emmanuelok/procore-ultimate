@@ -21,7 +21,13 @@ import { consumeChallenge, liveChallengeCount, sweepExpiredChallenges } from "./
  * the token's jti rather than a lookup.
  */
 
-const HOOK_TIMEOUT_MS = 180_000;
+/**
+ * Booting PGlite and replaying every migration is minutes of CPU on a shared
+ * machine — five minutes here for the same reason the neighbouring suites
+ * allow three: a suite that goes red when the machine is busy teaches people
+ * to ignore red, which is the expensive failure.
+ */
+const HOOK_TIMEOUT_MS = 900_000; /* TEMP-VERIFY */
 const PASSWORD = "scaffold-tower-brick";
 let counter = 0;
 

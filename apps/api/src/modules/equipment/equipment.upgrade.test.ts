@@ -8,6 +8,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, eq } from "drizzle-orm";
 import {
+  budgetLineItems,
+  budgets,
   companyMemberships,
   equipment,
   equipmentCertificates,
@@ -737,5 +739,201 @@ describe("patching a machine", () => {
     });
     expect(res.statusCode).toBe(200);
     expect(res.json().internalRateAmount).toBe(55);
+  });
+});
+
+/* ================================================================== */
+/* Plant cost onto the cost report (#715)                              */
+/* ================================================================== */
+
+describe("plant cost onto the budget", () => {
+  it("posts verified plant days as direct cost and replaces on a re-post", async () => {
+    const budgetId = newId("bud");
+    await app.db.insert(budgets).values({
+      id: budgetId,
+      companyId: owner.companyId,
+      projectId: projectB,
+      name: "Plant budget",
+      createdBy: owner.userId,
+    });
+    const lineId = newId("bli");
+    await app.db.insert(budgetLineItems).values({
+      id: lineId,
+      companyId: owner.companyId,
+      projectId: projectB,
+      budgetId,
+      costCode: "01-5000",
+      costType: "equipment",
+      description: "Plant hire",
+      originalBudget: 50_000,
+      revisedBudget: 50_000,
+      createdBy: owner.userId,
+    });
+
+    const machineId = await makeMachine({
+      name: "Costed excavator",
+      hireRateAmount: 100,
+      hireRateUnit: "hour",
+      currency: "GBP",
+    });
+    await mobilise(projectB, machineId);
+    const day = await post(`/projects/${projectB}/equipment-utilisation`, {
+      equipmentId: machineId,
+      utilisationDate: daysAgo(1),
+      availableHours: 10,
+      workingHours: 8,
+      idleHours: 2,
+      idleReason: "awaiting_operator",
+      budgetLineItemId: lineId,
+    });
+    expect(day.statusCode).toBe(201);
+    const utilisationId = day.json().id as string;
+
+    // Unverified days are reported as skipped, not posted at a guess.
+    const first = await post(`/projects/${projectB}/equipment-utilisation/post-to-budget`, {
+      from: daysAgo(3),
+      to: today(),
+    });
+    expect(first.statusCode).toBe(201);
+    expect(first.json().posted).toBe(0);
+    expect(first.json().reasons.join(" ")).toContain("not been verified");
+
+    const verified = await post(
+      `/projects/${projectB}/equipment-utilisation/${utilisationId}/verify`,
+      {},
+      verifier.headers,
+    );
+    expect(verified.statusCode).toBe(200);
+
+    const posted = await post(`/projects/${projectB}/equipment-utilisation/post-to-budget`, {
+      from: daysAgo(3),
+      to: today(),
+    });
+    expect(posted.statusCode).toBe(201);
+    expect(posted.json().posted).toBe(1);
+    const [line] = await app.db
+      .select()
+      .from(budgetLineItems)
+      .where(eq(budgetLineItems.id, lineId));
+    const firstCost = line?.directCosts ?? 0;
+    expect(firstCost).toBeGreaterThan(0);
+
+    // Re-posting the same window REPLACES rather than doubles.
+    const again = await post(`/projects/${projectB}/equipment-utilisation/post-to-budget`, {
+      from: daysAgo(3),
+      to: today(),
+    });
+    expect(again.statusCode).toBe(201);
+    const [after] = await app.db
+      .select()
+      .from(budgetLineItems)
+      .where(eq(budgetLineItems.id, lineId));
+    expect(after?.directCosts).toBe(firstCost);
+    expect(after?.jobToDateCosts).toBe(firstCost);
+  });
+
+  it("says why nothing was posted rather than reporting a zero cost", async () => {
+    const res = await post(`/projects/${projectA}/equipment-utilisation/post-to-budget`, {
+      from: daysAhead(60),
+      to: daysAhead(70),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().posted).toBe(0);
+    expect(res.json().reasons.join(" ")).toContain("nothing to post");
+  });
+
+  it("refuses another company's project", async () => {
+    const res = await post(
+      `/projects/${projectA}/equipment-utilisation/post-to-budget`,
+      {},
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(res.statusCode);
+  });
+});
+
+/* ================================================================== */
+/* Maintenance schedule lifecycle                                      */
+/* ================================================================== */
+
+describe("maintenance schedule lifecycle", () => {
+  async function makeSchedule(over: Record<string, unknown> = {}) {
+    const machineId = await makeMachine({ name: "Suspendable machine" });
+    const created = await post(
+      `/companies/current/equipment/${machineId}/maintenance-schedules`,
+      {
+        name: "Annual service",
+        maintenanceType: "preventive",
+        intervalKind: "calendar_months",
+        intervalValue: 12,
+        lastPerformedAt: daysAgo(400),
+        ...over,
+      },
+    );
+    expect(created.statusCode).toBe(201);
+    return { machineId, scheduleId: created.json().id as string };
+  }
+
+  it("suspends a schedule so the sweep stops raising it, and reinstates it", async () => {
+    const { machineId, scheduleId } = await makeSchedule();
+    await sweep();
+    const before = await app.db
+      .select()
+      .from(equipmentMaintenanceSchedules)
+      .where(eq(equipmentMaintenanceSchedules.id, scheduleId));
+    expect(before[0]?.status).toBe("overdue");
+
+    const suspended = await patch(
+      `/companies/current/equipment/${machineId}/maintenance-schedules/${scheduleId}`,
+      { status: "suspended", reason: "machine off hire" },
+    );
+    expect(suspended.statusCode).toBe(200);
+    await sweep();
+    const still = await app.db
+      .select()
+      .from(equipmentMaintenanceSchedules)
+      .where(eq(equipmentMaintenanceSchedules.id, scheduleId));
+    expect(still[0]?.status).toBe("suspended");
+
+    const back = await patch(
+      `/companies/current/equipment/${machineId}/maintenance-schedules/${scheduleId}`,
+      { status: "active" },
+    );
+    expect(back.statusCode).toBe(200);
+    expect(back.json().status).toBe("overdue");
+  });
+
+  it("will not suspend a statutory schedule without a reason", async () => {
+    const { machineId, scheduleId } = await makeSchedule({ isStatutory: true });
+    const res = await patch(
+      `/companies/current/equipment/${machineId}/maintenance-schedules/${scheduleId}`,
+      { status: "suspended" },
+    );
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("STATUTORY");
+  });
+
+  it("refuses to edit a retired schedule until it is reinstated", async () => {
+    const { machineId, scheduleId } = await makeSchedule();
+    const retired = await patch(
+      `/companies/current/equipment/${machineId}/maintenance-schedules/${scheduleId}`,
+      { status: "retired", reason: "regime withdrawn" },
+    );
+    expect(retired.statusCode).toBe(200);
+    const edit = await patch(
+      `/companies/current/equipment/${machineId}/maintenance-schedules/${scheduleId}`,
+      { intervalValue: 6 },
+    );
+    expect(edit.statusCode).toBe(409);
+  });
+
+  it("refuses the schedule edit to a read-only member", async () => {
+    const { machineId, scheduleId } = await makeSchedule();
+    const res = await patch(
+      `/companies/current/equipment/${machineId}/maintenance-schedules/${scheduleId}`,
+      { status: "suspended" },
+      readerHeaders,
+    );
+    expect(res.statusCode).toBe(403);
   });
 });

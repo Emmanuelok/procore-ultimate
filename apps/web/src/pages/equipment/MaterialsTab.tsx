@@ -56,11 +56,20 @@ import {
   type ListResponse,
   type Loadable,
   type MaterialRow,
+  bucketsOf,
+  percent,
+  NOT_AVAILABLE,
+  SUPPLY_RISK_LABEL,
+  SUPPLY_RISK_TONE,
   type StockLedger,
   type StockMovementRow,
+  type SupplierScore,
+  type SupplyItemAssessment,
+  type SupplyReport,
+  type SupplyRisk,
 } from "./equipmentShared";
 
-type View = "deliveries" | "match" | "stock";
+type View = "deliveries" | "match" | "stock" | "supply";
 
 export default function MaterialsTab({
   deliveries,
@@ -73,6 +82,8 @@ export default function MaterialsTab({
   selectedDeliveryId,
   onSelectDelivery,
   deliveryDetail,
+  supply,
+  scorecard,
 }: {
   deliveries: Loadable<ListResponse<DeliveryRow>>;
   invoiceMatch: Loadable<InvoiceMatchReport>;
@@ -84,6 +95,8 @@ export default function MaterialsTab({
   selectedDeliveryId: string | null;
   onSelectDelivery: (deliveryId: string | null) => void;
   deliveryDetail: Loadable<DeliveryDetail>;
+  supply: Loadable<SupplyReport>;
+  scorecard: Loadable<{ items: SupplierScore[]; total: number; method: string }>;
 }) {
   const [view, setView] = useState<View>("deliveries");
 
@@ -112,6 +125,10 @@ export default function MaterialsTab({
                 label: `Invoice match (${invoiceMatch.data?.unmatchedCount ?? 0} unmatched)`,
               },
               { value: "stock", label: "Stock ledger" },
+              {
+                value: "supply",
+                label: `Supply (${supply.data ? supply.data.atRisk.length : 0} at risk)`,
+              },
             ]}
           />
         </CardBody>
@@ -128,6 +145,8 @@ export default function MaterialsTab({
         />
       ) : view === "match" ? (
         <InvoiceMatchView report={invoiceMatch} />
+      ) : view === "supply" ? (
+        <SupplyView supply={supply} scorecard={scorecard} />
       ) : (
         <StockView
           materials={materials}
@@ -1096,4 +1115,543 @@ function deliveryTone(status: string): Tone {
     default:
       return "neutral";
   }
+}
+
+/* ========================================================================== */
+/* Supply — order-by dates, shortages, delayed shipments, supplier scorecard    */
+/* ========================================================================== */
+
+/**
+ * The procurement question the delivery register cannot answer: what has NOT
+ * been ordered yet that is already late.
+ *
+ * Every figure here is refused rather than guessed. An item with no lead time
+ * or no required-on-site date has NO order-by date and is listed as "unknown",
+ * never as safe — a default lead time of zero would quietly clear the exact
+ * items nobody has thought about. Exposure is bucketed per currency and never
+ * summed across them, and a supplier with too few deliveries gets its measured
+ * rates and no score, because ranking a haulier on one delivery is how a
+ * scorecard loses its credibility with the people it judges.
+ */
+function SupplyView({
+  supply,
+  scorecard,
+}: {
+  supply: Loadable<SupplyReport>;
+  scorecard: Loadable<{ items: SupplierScore[]; total: number; method: string }>;
+}) {
+  const report = supply.data;
+  const atRisk = useMemo(() => report?.atRisk ?? [], [report]);
+  const exposureByCurrency = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const item of atRisk) {
+      if (item.exposure === null) continue;
+      map[item.currency] = Math.round(((map[item.currency] ?? 0) + item.exposure) * 100) / 100;
+    }
+    return map;
+  }, [atRisk]);
+
+  const itemColumns = useMemo<DataColumns<SupplyItemAssessment>>(
+    () => [
+      {
+        id: "reference",
+        header: "Item",
+        accessor: "reference",
+        type: "code",
+        sticky: "start",
+        width: 130,
+        mono: true,
+      },
+      { id: "name", header: "Description", accessor: "name", type: "text", width: 220 },
+      {
+        id: "risk",
+        header: "Risk",
+        accessor: "risk",
+        type: "enum",
+        width: 180,
+        groupable: true,
+        options: (Object.keys(SUPPLY_RISK_LABEL) as SupplyRisk[]).map((value) => ({
+          value,
+          label: SUPPLY_RISK_LABEL[value],
+          text: SUPPLY_RISK_LABEL[value],
+          tone: SUPPLY_RISK_TONE[value],
+        })),
+        cell: ({ row }) => (
+          <Badge tone={SUPPLY_RISK_TONE[row.risk]} size="xs" dot>
+            {SUPPLY_RISK_LABEL[row.risk]}
+          </Badge>
+        ),
+      },
+      {
+        id: "orderByDate",
+        header: "Order by",
+        headerTooltip:
+          "Required on site − lead time − the days it takes to place the order. No lead time means no order-by date, and the item is listed as unknown rather than as safe.",
+        accessor: (row) => row.orderByDate ?? "",
+        type: "text",
+        width: 170,
+        cell: ({ row }) =>
+          row.orderByDate === null ? (
+            <span className="text-content-muted">{NOT_AVAILABLE}</span>
+          ) : (
+            <span>
+              {isoDate(row.orderByDate)}
+              {row.daysUntilOrderBy !== null ? (
+                <span
+                  className={
+                    row.daysUntilOrderBy < 0
+                      ? "ml-1 text-meta text-danger"
+                      : "ml-1 text-meta text-content-muted"
+                  }
+                >
+                  {row.daysUntilOrderBy < 0
+                    ? `${-row.daysUntilOrderBy}d past`
+                    : `in ${row.daysUntilOrderBy}d`}
+                </span>
+              ) : null}
+            </span>
+          ),
+      },
+      {
+        id: "shortfall",
+        header: "Shortfall",
+        accessor: (row) => row.shortfall ?? 0,
+        type: "number",
+        align: "right",
+        width: 130,
+        cell: ({ row }) => <span>{quantity(row.shortfall, row.unit)}</span>,
+      },
+      {
+        id: "exposure",
+        header: "Money at risk",
+        accessor: (row) => row.exposure ?? 0,
+        type: "number",
+        align: "right",
+        width: 150,
+        cell: ({ row }) =>
+          row.exposure === null ? (
+            <Tooltip content="No unit cost is held for this item, so the money at risk cannot be stated. It is not zero.">
+              <span className="text-content-muted">{NOT_AVAILABLE}</span>
+            </Tooltip>
+          ) : (
+            <span>{money(row.exposure, row.currency)}</span>
+          ),
+      },
+      {
+        id: "why",
+        header: "Why",
+        headerTooltip: "The engine's own words. Nothing here is inferred by this screen.",
+        accessor: (row) => row.reasons.join(" "),
+        type: "text",
+        width: 320,
+        truncate: true,
+        cell: ({ row }) =>
+          row.reasons.length === 0 ? (
+            <span className="text-content-muted">{EM_DASH}</span>
+          ) : (
+            <Tooltip content={<ReasonList reasons={row.reasons} />}>
+              <span className="text-content-muted">{row.reasons[0]}</span>
+            </Tooltip>
+          ),
+      },
+      {
+        id: "activity",
+        header: "Activity at risk",
+        accessor: (row) => row.activityAtRisk?.name ?? "",
+        type: "text",
+        width: 200,
+        cell: ({ row }) =>
+          row.activityAtRisk ? (
+            <span>
+              {row.activityAtRisk.name ?? row.activityAtRisk.id}
+              {row.activityAtRisk.start ? (
+                <span className="ml-1 text-meta text-content-muted">
+                  starts {isoDate(row.activityAtRisk.start)}
+                </span>
+              ) : null}
+            </span>
+          ) : (
+            <span className="text-content-muted">{EM_DASH}</span>
+          ),
+      },
+    ],
+    [],
+  );
+
+  const scoreColumns = useMemo<DataColumns<SupplierScore>>(
+    () => [
+      {
+        id: "vendorName",
+        header: "Supplier",
+        accessor: (row) => row.vendorName ?? row.vendorId,
+        type: "text",
+        sticky: "start",
+        width: 220,
+      },
+      {
+        id: "deliveries",
+        header: "Deliveries",
+        accessor: "deliveries",
+        type: "number",
+        align: "right",
+        width: 110,
+      },
+      {
+        id: "score",
+        header: "Score",
+        accessor: (row) => row.score ?? -1,
+        type: "number",
+        align: "right",
+        width: 110,
+        cell: ({ row }) =>
+          row.score === null ? (
+            <Tooltip content={row.reasons.join(" ") || "Not enough deliveries to score."}>
+              <span className="text-content-muted">{NOT_AVAILABLE}</span>
+            </Tooltip>
+          ) : (
+            <Badge
+              size="xs"
+              tone={row.score >= 80 ? "success" : row.score >= 60 ? "warning" : "danger"}
+            >
+              {row.score.toFixed(0)}
+            </Badge>
+          ),
+      },
+      {
+        id: "onTimePercent",
+        header: "On time",
+        accessor: (row) => row.onTimePercent ?? -1,
+        type: "number",
+        align: "right",
+        width: 110,
+        cell: ({ row }) => <span>{percent(row.onTimePercent)}</span>,
+      },
+      {
+        id: "discrepancyPercent",
+        header: "Discrepancies",
+        accessor: (row) => row.discrepancyPercent ?? -1,
+        type: "number",
+        align: "right",
+        width: 130,
+        cell: ({ row }) => <span>{percent(row.discrepancyPercent)}</span>,
+      },
+      {
+        id: "rejectionPercent",
+        header: "Rejected",
+        accessor: (row) => row.rejectionPercent ?? -1,
+        type: "number",
+        align: "right",
+        width: 120,
+        cell: ({ row }) => <span>{percent(row.rejectionPercent)}</span>,
+      },
+      {
+        id: "invoiceMatchPercent",
+        header: "Invoice match",
+        accessor: (row) => row.invoiceMatchPercent ?? -1,
+        type: "number",
+        align: "right",
+        width: 130,
+        cell: ({ row }) => <span>{percent(row.invoiceMatchPercent)}</span>,
+      },
+      {
+        id: "averageWaitingMinutes",
+        header: "Avg wait",
+        accessor: (row) => row.averageWaitingMinutes ?? -1,
+        type: "number",
+        align: "right",
+        width: 120,
+        cell: ({ row }) =>
+          row.averageWaitingMinutes === null ? (
+            <span className="text-content-muted">{EM_DASH}</span>
+          ) : (
+            <span>{row.averageWaitingMinutes.toFixed(0)} min</span>
+          ),
+      },
+      {
+        id: "reasons",
+        header: "Caveats",
+        accessor: (row) => row.reasons.join(" "),
+        type: "text",
+        width: 280,
+        truncate: true,
+        cell: ({ row }) =>
+          row.reasons.length === 0 ? (
+            <span className="text-content-muted">{EM_DASH}</span>
+          ) : (
+            <Tooltip content={<ReasonList reasons={row.reasons} />}>
+              <span className="text-content-muted">{row.reasons[0]}</span>
+            </Tooltip>
+          ),
+      },
+    ],
+    [],
+  );
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardBody className="space-y-3">
+          <SectionHeading
+            title="Procurement risk"
+            hint="What has to be ordered, by when — and what is already past that date. The delivery register answers what arrived; this answers what has not been ordered yet."
+            className="mb-0"
+          />
+          {supply.error ? (
+            <LoadError message={supply.error} onRetry={supply.reload} />
+          ) : supply.loading ? (
+            <SkeletonTable rows={4} />
+          ) : !report ? (
+            <EmptyState
+              icon={<IconMaterial />}
+              title="No supply assessment"
+              description="Nothing has been asked for yet."
+            />
+          ) : (
+            <>
+              <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
+                <SupplyFigure label="Items tracked" value={String(report.summary.items)} />
+                <SupplyFigure
+                  label="Order-by missed"
+                  value={String(report.summary.orderByDateMissed)}
+                  tone={report.summary.orderByDateMissed > 0 ? "danger" : "neutral"}
+                />
+                <SupplyFigure
+                  label="Order now"
+                  value={String(report.summary.orderNow)}
+                  tone={report.summary.orderNow > 0 ? "warning" : "neutral"}
+                />
+                <SupplyFigure
+                  label="Shortages forecast"
+                  value={String(report.summary.shortages)}
+                  tone={report.summary.shortages > 0 ? "danger" : "neutral"}
+                />
+                <SupplyFigure
+                  label="Deliveries late"
+                  value={String(report.summary.delayedDeliveries)}
+                  tone={report.summary.delayedDeliveries > 0 ? "warning" : "neutral"}
+                />
+              </div>
+              <CurrencyRail label="Money at risk" buckets={bucketsOf(exposureByCurrency)} />
+              {Object.keys(exposureByCurrency).length === 0 && atRisk.length > 0 ? (
+                <p className="text-meta text-content-muted">
+                  No item at risk carries a unit cost, so the money at risk cannot be stated. It is
+                  not zero.
+                </p>
+              ) : null}
+              <p className="text-meta text-content-muted">{report.method}</p>
+            </>
+          )}
+        </CardBody>
+      </Card>
+
+      {report ? (
+        <Card>
+          <CardBody>
+            <SectionHeading
+              title={`Items at risk (${atRisk.length})`}
+              hint={`Assessed as of ${isoDate(report.asOf)}. An item with no lead time or no required-on-site date is listed as unknown, never as safe.`}
+            />
+            {atRisk.length === 0 ? (
+              <EmptyState
+                icon={<IconMaterial />}
+                title="Nothing at risk"
+                description={`${report.summary.items} item(s) assessed. Every one either has cover on site or on a booked delivery, or was ordered in time.`}
+              />
+            ) : (
+              <DataTable<SupplyItemAssessment>
+                tableId="material-supply-risk"
+                data={atRisk}
+                columns={itemColumns}
+                getRowId={(row) => row.id}
+                loading={supply.loading}
+                height={Math.min(460, 140 + atRisk.length * 40)}
+                stickyHeader
+                gridLines
+                exportFileName="material-supply-risk"
+                searchPlaceholder="Search items…"
+                rowTone={(row) =>
+                  row.risk === "order_by_date_missed" || row.risk === "shortage"
+                    ? ("danger" as Tone)
+                    : row.risk === "order_now"
+                      ? ("warning" as Tone)
+                      : undefined
+                }
+                empty={{ title: "Nothing at risk" }}
+                aria-label="Material items at supply risk"
+              />
+            )}
+          </CardBody>
+        </Card>
+      ) : null}
+
+      {report && report.delayedDeliveries.length > 0 ? (
+        <Card>
+          <CardBody>
+            <SectionHeading
+              title={`Deliveries past their booked day (${report.delayedDeliveries.length})`}
+              hint="Booked, not arrived, and the day has passed. The activities they feed are named where the item is linked to the programme."
+            />
+            <Table>
+              <THead>
+                <Tr>
+                  <Th>Delivery</Th>
+                  <Th>Booked for</Th>
+                  <Th align="right">Days late</Th>
+                  <Th>Status</Th>
+                  <Th>What it means</Th>
+                </Tr>
+              </THead>
+              <TBody>
+                {report.delayedDeliveries.map((d) => (
+                  <Tr key={d.id}>
+                    <Td className="font-mono">{d.reference}</Td>
+                    <Td>{isoDate(d.scheduledFor)}</Td>
+                    <Td align="right">{d.daysLate}</Td>
+                    <Td>
+                      <Badge tone="warning" size="xs" dot>
+                        {labelize(d.status)}
+                      </Badge>
+                    </Td>
+                    <Td>
+                      <ReasonList reasons={d.reasons} />
+                    </Td>
+                  </Tr>
+                ))}
+              </TBody>
+            </Table>
+          </CardBody>
+        </Card>
+      ) : null}
+
+      {report ? (
+        <Card>
+          <CardBody>
+            <SectionHeading
+              title="Compound valuation"
+              hint="What the compound holds at cost, and how much of what was delivered never became work. An item with stock and no unit cost is listed, not valued at zero."
+            />
+            {report.valuation.byCurrency.length === 0 ? (
+              <EmptyState
+                icon={<IconMaterial />}
+                title="Nothing to value"
+                description="No item carries both stock and a unit cost, so the compound cannot be valued. That is not the same as a compound worth nothing."
+              />
+            ) : (
+              <Table>
+                <THead>
+                  <Tr>
+                    <Th>Currency</Th>
+                    <Th align="right">On hand at cost</Th>
+                    <Th align="right">Waste at cost</Th>
+                    <Th align="right">Items</Th>
+                  </Tr>
+                </THead>
+                <TBody>
+                  {report.valuation.byCurrency.map((b) => (
+                    <Tr key={b.currency}>
+                      <Td>{b.currency}</Td>
+                      <Td align="right">{money(b.onHandValue, b.currency)}</Td>
+                      <Td align="right">{money(b.wasteValue, b.currency)}</Td>
+                      <Td align="right">{b.items}</Td>
+                    </Tr>
+                  ))}
+                </TBody>
+              </Table>
+            )}
+            <div className="mt-3 grid grid-cols-2 gap-3 md:grid-cols-3">
+              <SupplyFigure
+                label="Waste rate"
+                value={percent(report.valuation.wasteRatePercent)}
+                tone={
+                  report.valuation.wasteRatePercent !== null &&
+                  report.valuation.wasteRatePercent > 5
+                    ? "warning"
+                    : "neutral"
+                }
+              />
+              <SupplyFigure
+                label="Items holding stock"
+                value={String(report.valuation.totals.itemsWithStock)}
+              />
+              <SupplyFigure
+                label="Unpriced items"
+                value={String(report.valuation.unpricedItems.length)}
+                tone={report.valuation.unpricedItems.length > 0 ? "warning" : "neutral"}
+              />
+            </div>
+            <ReasonList reasons={report.valuation.reasons} className="mt-2" />
+          </CardBody>
+        </Card>
+      ) : null}
+
+      <Card>
+        <CardBody>
+          <SectionHeading
+            title="Supplier scorecard"
+            hint="Measured from deliveries alone — no survey, no opinion. A supplier with too few deliveries gets its rates and no score."
+          />
+          {scorecard.error ? (
+            <LoadError message={scorecard.error} onRetry={scorecard.reload} />
+          ) : scorecard.loading ? (
+            <SkeletonTable rows={3} />
+          ) : !scorecard.data || scorecard.data.items.length === 0 ? (
+            <EmptyState
+              icon={<IconMaterial />}
+              title="No supplier can be scored yet"
+              description={
+                scorecard.data?.method ??
+                "No delivery names a supplier, so nobody can be scored. A scorecard built on deliveries with no vendor would rank the blank."
+              }
+            />
+          ) : (
+            <>
+              <DataTable<SupplierScore>
+                tableId="material-supplier-scorecard"
+                data={scorecard.data.items}
+                columns={scoreColumns}
+                getRowId={(row) => row.vendorId}
+                loading={scorecard.loading}
+                height={Math.min(420, 140 + scorecard.data.items.length * 40)}
+                stickyHeader
+                gridLines
+                exportFileName="supplier-scorecard"
+                searchPlaceholder="Search suppliers…"
+                defaultSort={[{ id: "score", desc: true }]}
+                empty={{ title: "No supplier scored" }}
+                aria-label="Supplier scorecard"
+              />
+              <p className="mt-2 text-meta text-content-muted">{scorecard.data.method}</p>
+            </>
+          )}
+        </CardBody>
+      </Card>
+    </div>
+  );
+}
+
+function SupplyFigure({
+  label,
+  value,
+  tone = "neutral",
+}: {
+  label: string;
+  value: string;
+  tone?: "neutral" | "warning" | "danger";
+}) {
+  return (
+    <div className="rounded-md border border-border p-3">
+      <div className="text-meta text-content-muted">{label}</div>
+      <div
+        className={
+          tone === "danger"
+            ? "text-h4 font-semibold text-danger"
+            : tone === "warning"
+              ? "text-h4 font-semibold text-warning"
+              : "text-h4 font-semibold text-content"
+        }
+      >
+        {value}
+      </div>
+    </div>
+  );
 }

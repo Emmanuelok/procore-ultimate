@@ -552,13 +552,31 @@ export const accountModule: FastifyPluginAsync = async (app) => {
         email: users.email,
         name: users.name,
         isActive: users.isActive,
+        title: users.title,
+        phone: users.phone,
         createdAt: users.createdAt,
         lastLoginAt: users.lastLoginAt,
-        emailVerifiedAt: users.emailVerifiedAt,
       })
       .from(users)
       .where(eq(users.id, actor.id))
       .limit(1);
+
+    // Address verification lives in `email_verifications`, not in a column on
+    // `users` — the proof is the row, and an export that invented a
+    // `verifiedAt` field would be asserting something the schema does not
+    // hold. Only what was proved and when; never the token.
+    const verifications = await app.db
+      .select({
+        email: emailVerifications.email,
+        purpose: emailVerifications.purpose,
+        createdAt: emailVerifications.createdAt,
+        consumedAt: emailVerifications.consumedAt,
+        expiresAt: emailVerifications.expiresAt,
+      })
+      .from(emailVerifications)
+      .where(eq(emailVerifications.userId, actor.id))
+      .orderBy(desc(emailVerifications.createdAt))
+      .limit(100);
 
     const memberships = await app.db
       .select({
@@ -683,6 +701,7 @@ export const accountModule: FastifyPluginAsync = async (app) => {
       memberships,
       sessions,
       identities,
+      emailVerifications: verifications,
       mfaFactors: factors,
       securityTrail: trail.map((row) => ({
         id: row.id,

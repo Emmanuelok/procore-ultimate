@@ -27,6 +27,7 @@ import {
 import {
   assertChallengeLive,
   consumeChallenge,
+  liveChallengeCount,
   registerChallenge,
   sweepExpiredChallenges,
 } from "./challenge-store.js";
@@ -330,6 +331,11 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
           ? await countRecoveryCodes(app.db, user.id, factor.id)
           : null,
       stepUp: freshness,
+      // Half-finished sign-ins: a password was accepted and the second factor
+      // was never produced. Usually one, from the tab the user is looking at.
+      // More than one is the signal worth seeing — somebody else has this
+      // account's password — which is why it is reported rather than hidden.
+      challengesInFlight: await liveChallengeCount(app.db, user.id, Date.now()),
       policy: {
         required: requiredBy.length > 0,
         requiredBy: requiredBy.map((r) => ({ companyId: r.companyId, name: r.name })),
@@ -1055,13 +1061,14 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
       // the kind and `recordSecurityEvent` accepts the widened union, so the
       // gap is closed rather than described. The ledger entry above remains
       // the stronger record; this one is what the tenant's SIEM receives.
+      const policyCtx = requestContext(req);
       await recordSecurityEvent(app.db, {
         kind: "mfa_policy_changed",
         companyId,
         userId: user.id,
         email: user.email,
-        ip: requestContext(req).ip,
-        userAgent: requestContext(req).userAgent,
+        ip: policyCtx.ip,
+        userAgent: policyCtx.userAgent,
         reason: body.required
           ? "Second factor is now required for every member of this company"
           : "Second factor is no longer required for this company",

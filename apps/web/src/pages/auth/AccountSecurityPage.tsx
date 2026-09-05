@@ -105,6 +105,8 @@ interface MfaStatus {
   /** null — never 0 — where no factor exists to count codes for */
   recoveryCodesRemaining: number | null;
   stepUp: { satisfied: boolean; at?: string | null };
+  /** half-finished sign-ins: password accepted, second factor never produced */
+  challengesInFlight: number;
   policy: { required: boolean; requiredBy: Array<{ companyId: string; name: string }> };
   reasons: string[];
 }
@@ -590,6 +592,15 @@ function MfaPanel({
         <Alert tone="danger" size="sm" title="Locked out of the second factor">
           Too many failed attempts. Try again after {when(status.lockedUntil)} (
           {status.retryAfterSeconds} seconds).
+        </Alert>
+      ) : null}
+
+      {status.challengesInFlight > 1 ? (
+        <Alert tone="warning" size="sm" title="More than one sign-in is waiting for a code">
+          {status.challengesInFlight} sign-ins have passed the password step and not yet produced
+          a second factor. One is usually the tab you are reading this in. More than one means the
+          password was accepted somewhere else too — change it, and sign out every device below.
+          Each challenge can be exchanged once and expires on its own.
         </Alert>
       ) : null}
 

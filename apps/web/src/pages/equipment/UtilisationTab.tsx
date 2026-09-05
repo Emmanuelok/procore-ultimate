@@ -18,16 +18,25 @@
  * `totalIsComplete` is printed, so a partial figure is never dressed as a
  * full one.
  */
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
+import { toast } from "sonner";
 import {
   Badge,
+  Button,
   Card,
   CardBody,
   EmptyState,
   Select,
   SkeletonTable,
+  Table,
+  TBody,
+  Td,
+  Th,
+  THead,
   Tooltip,
+  Tr,
 } from "../../ui";
+import { api } from "../../lib/api";
 import { DataTable, type DataColumns } from "../../ui/data";
 import { ChartCard, StackedBarChart } from "../../ui/charts";
 import type { Tone } from "../../ui/tokens";
@@ -38,6 +47,8 @@ import {
   FigureCell,
   IDLE_REASON_LABEL,
   LoadError,
+  ReasonList,
+  RefusalNotice,
   SectionHeading,
   bucketsOf,
   hours,
@@ -45,6 +56,7 @@ import {
   labelize,
   money,
   percent,
+  useAction,
   utilisationTone,
   type ListResponse,
   type Loadable,
@@ -53,15 +65,33 @@ import {
   type UtilisationSummaryItem,
 } from "./equipmentShared";
 
+interface PostToBudgetResult {
+  runId: string | null;
+  from: string;
+  to: string;
+  posted: number;
+  lines: Array<{
+    budgetLineItemId: string;
+    costCode: string;
+    plantCost: number;
+    plantHours: number;
+    plantDays: number;
+    currency: string;
+  }>;
+  reasons: string[];
+}
+
 const WINDOWS = [7, 14, 30, 60, 90];
 
 export default function UtilisationTab({
+  projectId,
   summary,
   rows,
   windowDays,
   onWindowDays,
   onOpenMachine,
 }: {
+  projectId: string | undefined;
   summary: Loadable<UtilisationSummary>;
   rows: Loadable<ListResponse<UtilisationRow>>;
   windowDays: number;
@@ -548,6 +578,16 @@ export default function UtilisationTab({
         note={data.currencyNote}
       />
 
+      <PostToBudget
+        projectId={projectId}
+        from={data.from}
+        to={data.to}
+        onDone={() => {
+          summary.reload();
+          rows.reload();
+        }}
+      />
+
       {chartRows.length > 0 ? (
         <ChartCard
           title="Where the paid window went"
@@ -651,6 +691,126 @@ export default function UtilisationTab({
         </>
       )}
     </div>
+  );
+}
+
+/**
+ * PUT THE PLANT ON THE COST REPORT (#715).
+ *
+ * `equipment_utilisation.budgetLineItemId` is the column that makes plant a
+ * cost rather than a diary entry. Posting is deliberately explicit and
+ * deliberately narrow:
+ *
+ *  · Only VERIFIED days post. The plant sheet is the claim; the verification
+ *    is the check. Posting unverified hours would put an unchecked claim on
+ *    the cost report as fact — the tick below says so before you send it.
+ *  · A day that could not be costed AT ALL is not posted at zero; a day that
+ *    could be costed only in part is posted at the figure that could be
+ *    computed and the budget line's stamp records it as a FLOOR.
+ *  · Re-posting the same window REPLACES this module's contribution rather
+ *    than adding to it, so a second click is safe.
+ *
+ * Every refusal and every exclusion the server reports is rendered verbatim.
+ */
+function PostToBudget({
+  projectId,
+  from,
+  to,
+  onDone,
+}: {
+  projectId: string | undefined;
+  from: string;
+  to: string;
+  onDone: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [includeUnverified, setIncludeUnverified] = useState(false);
+  const [result, setResult] = useState<PostToBudgetResult | null>(null);
+
+  if (!projectId) return null;
+
+  return (
+    <Card>
+      <CardBody className="space-y-3">
+        <SectionHeading
+          title="Plant cost onto the cost report"
+          hint="Posts the window's coded, verified plant days onto the budget lines they were coded to. Without this the budget shows a job with no plant on it."
+          className="mb-0"
+          actions={
+            <Button
+              size="sm"
+              variant="primary"
+              loading={busy === "post"}
+              onClick={async () => {
+                const res = await run("post", () =>
+                  api.post<PostToBudgetResult>(
+                    `/api/v1/projects/${projectId}/equipment-utilisation/post-to-budget`,
+                    { from, to, includeUnverified },
+                  ),
+                );
+                if (res) {
+                  setResult(res);
+                  toast.success(
+                    res.posted === 0
+                      ? "Nothing was posted — the reasons are below"
+                      : `Posted to ${res.posted} budget line(s)`,
+                  );
+                  onDone();
+                }
+              }}
+            >
+              Post {from} to {to}
+            </Button>
+          }
+        />
+        {refusal ? <RefusalNotice refusal={refusal} onDismiss={clear} /> : null}
+        <label className="flex items-start gap-2 text-meta text-content-muted">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            checked={includeUnverified}
+            onChange={(event) => setIncludeUnverified(event.target.checked)}
+          />
+          <span>
+            Include days nobody has verified. The plant sheet is the claim and the verification is
+            the check; ticking this posts unchecked claims, and the stamp on the budget line
+            records that you did.
+          </span>
+        </label>
+        {result ? (
+          <div className="space-y-2 rounded-md border border-border p-3">
+            <div className="text-meta text-content-muted">
+              {result.posted === 0
+                ? "Nothing was posted."
+                : `Posted to ${result.posted} budget line(s) for ${result.from} to ${result.to}.`}
+            </div>
+            {result.lines.length > 0 ? (
+              <Table>
+                <THead>
+                  <Tr>
+                    <Th>Cost code</Th>
+                    <Th align="right">Plant cost</Th>
+                    <Th align="right">Hours</Th>
+                    <Th align="right">Days</Th>
+                  </Tr>
+                </THead>
+                <TBody>
+                  {result.lines.map((line) => (
+                    <Tr key={line.budgetLineItemId}>
+                      <Td className="font-mono">{line.costCode}</Td>
+                      <Td align="right">{money(line.plantCost, line.currency)}</Td>
+                      <Td align="right">{hours(line.plantHours)}</Td>
+                      <Td align="right">{line.plantDays}</Td>
+                    </Tr>
+                  ))}
+                </TBody>
+              </Table>
+            ) : null}
+            <ReasonList reasons={result.reasons} />
+          </div>
+        ) : null}
+      </CardBody>
+    </Card>
   );
 }
 

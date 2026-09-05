@@ -45,6 +45,39 @@ import {
   type TieringVerdict,
 } from "./tiering.js";
 import { latestScreening } from "./prequal-status.js";
+import {
+  isStructuralItemType,
+  validateAnswer,
+  type ChecklistItemSpec,
+} from "../quality/checklistItems.js";
+
+/**
+ * The question, in the shared checklist vocabulary the validator speaks.
+ * Mirrors `questionSpec` in prequalification.ts: one question means one thing
+ * whether the buyer or the vendor is answering it.
+ */
+function prequalQuestionSpec(
+  q: typeof prequalificationQuestions.$inferSelect,
+): ChecklistItemSpec {
+  return {
+    id: q.id,
+    itemNumber: q.questionCode,
+    text: q.text,
+    itemType: q.itemType,
+    required: q.required === 1,
+    options: (q.options as string[]) ?? [],
+    targetValue: null,
+    minValue: q.minValue,
+    maxValue: q.maxValue,
+    tolerancePlus: null,
+    toleranceMinus: null,
+    unit: q.unit,
+    weight: q.weight,
+    isCritical: q.isKnockout === 1,
+    photoRequired: false,
+    raisesNcrOnFail: false,
+  };
+}
 
 /**
  * WHAT A PREQUALIFICATION ACTUALLY TURNS ON — AND WHO FILLS IT IN.
@@ -1150,9 +1183,9 @@ export const prequalRegisterRoutes: FastifyPluginAsync = async (app) => {
         unit: q.unit,
         required: q.required === 1,
         evidenceRequired: q.evidenceRequired === 1,
-        answer: answered.get(q.id)?.answer ?? null,
-        answerText: answered.get(q.id)?.answerText ?? null,
-        answerNumber: answered.get(q.id)?.answerNumber ?? null,
+        response: answered.get(q.id)?.response ?? null,
+        numericValue: answered.get(q.id)?.numericValue ?? null,
+        selectedOptions: answered.get(q.id)?.selectedOptions ?? [],
         fileIds: answered.get(q.id)?.fileIds ?? [],
       })),
       outstanding: questions
@@ -1179,14 +1212,16 @@ export const prequalRegisterRoutes: FastifyPluginAsync = async (app) => {
     };
   });
 
+  /* The SAME answer shape the staff route takes — one vocabulary, so an
+   * answer means the same thing whichever door it came through. */
   const vendorAnswerSchema = z.object({
     responses: z
       .array(
         z.object({
           questionId: z.string().min(1).max(64),
-          answer: z.string().max(4000).nullable().optional(),
-          answerText: z.string().max(20000).nullable().optional(),
-          answerNumber: z.number().finite().nullable().optional(),
+          response: z.string().max(20000).nullable().optional(),
+          numericValue: z.number().finite().nullable().optional(),
+          selectedOptions: z.array(z.string().min(1).max(200)).max(100).optional(),
           fileIds: z.array(z.string().min(1).max(64)).max(50).optional(),
         }),
       )
@@ -1205,15 +1240,37 @@ export const prequalRegisterRoutes: FastifyPluginAsync = async (app) => {
       );
     }
     const questions = await app.db
-      .select({ id: prequalificationQuestions.id })
+      .select()
       .from(prequalificationQuestions)
       .where(eq(prequalificationQuestions.questionnaireId, submission.questionnaireId));
-    const valid = new Set(questions.map((q) => q.id));
-    const strays = body.responses.filter((r) => !valid.has(r.questionId));
+    const byId = new Map(questions.map((q) => [q.id, q] as const));
+    const strays = body.responses.filter((r) => !byId.has(r.questionId));
     if (strays.length > 0) {
       throw badRequest(
         `${strays.length} answer(s) reference a question that is not on this questionnaire.`,
-        { questionIds: strays.map((s) => s.questionId) },
+        { questionIds: strays.map((x) => x.questionId) },
+      );
+    }
+    /*
+     * THE VENDOR'S ANSWERS GO THROUGH THE SAME VALIDATOR AS THE BUYER'S.
+     * A portal that accepts "maybe" to a yes/no knockout question has moved
+     * the assessment's hardest moment into an assessor's inbox.
+     */
+    const errors: string[] = [];
+    for (const r of body.responses) {
+      const question = byId.get(r.questionId)!;
+      const validation = validateAnswer(prequalQuestionSpec(question), {
+        response: r.response ?? null,
+        numericValue: r.numericValue ?? null,
+        selectedOptions: r.selectedOptions ?? [],
+        fileIds: r.fileIds ?? [],
+      });
+      if (!validation.ok) errors.push(...validation.errors);
+    }
+    if (errors.length > 0) {
+      throw badRequest(
+        `${errors.length} answer(s) do not match the question they answer.`,
+        { errors },
       );
     }
     const existing = await app.db
@@ -1223,15 +1280,24 @@ export const prequalRegisterRoutes: FastifyPluginAsync = async (app) => {
     const byQuestion = new Map(existing.map((r) => [r.questionId, r] as const));
     const now = new Date().toISOString();
     for (const answer of body.responses) {
+      const question = byId.get(answer.questionId)!;
       const prior = byQuestion.get(answer.questionId);
       const values = {
-        answer: answer.answer ?? null,
-        answerText: answer.answerText ?? null,
-        answerNumber: answer.answerNumber ?? null,
+        companyId: submission.companyId,
+        projectId: submission.projectId,
+        submissionId: submission.id,
+        questionnaireId: submission.questionnaireId,
+        questionId: answer.questionId,
+        questionCode: question.questionCode,
+        /* snapshot: the assessment must stay readable after a revision */
+        questionText: question.text,
+        category: question.category,
+        itemType: question.itemType,
+        response: answer.response ?? null,
+        numericValue: answer.numericValue ?? null,
+        selectedOptions: answer.selectedOptions ?? [],
         fileIds: answer.fileIds ?? prior?.fileIds ?? [],
-        /* The VENDOR answered. No platform user did, and none is invented. */
-        answeredBy: null,
-        answeredAt: now,
+        maxScore: question.maxScore,
         updatedAt: now,
       };
       if (prior) {
@@ -1242,12 +1308,8 @@ export const prequalRegisterRoutes: FastifyPluginAsync = async (app) => {
       } else {
         await app.db.insert(prequalificationResponses).values({
           id: newId("pqr"),
-          companyId: submission.companyId,
-          submissionId: submission.id,
-          questionId: answer.questionId,
           ...values,
-          score: null,
-          maxScore: null,
+          /* The VENDOR answered. No platform user did, and none is invented. */
           detail: { via: "prequal_token" },
         });
       }
@@ -1293,10 +1355,14 @@ export const prequalRegisterRoutes: FastifyPluginAsync = async (app) => {
       .where(eq(prequalificationResponses.submissionId, submission.id));
     const answered = new Map(responses.map((r) => [r.questionId, r] as const));
     const missing = questions.filter((q) => {
-      if (q.required !== 1) return false;
+      if (q.required !== 1 || isStructuralItemType(q.itemType)) return false;
       const r = answered.get(q.id);
       if (!r) return true;
-      return r.answer === null && r.answerText === null && r.answerNumber === null;
+      return (
+        r.response === null &&
+        r.numericValue === null &&
+        ((r.selectedOptions as string[] | null) ?? []).length === 0
+      );
     });
     if (missing.length > 0) {
       throw conflict(

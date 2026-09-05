@@ -75,6 +75,24 @@ jobs:
       - name: Test the ledger package
         run: pnpm --filter @constructos/ledger test
 
+      # The web package's `test` script is still `echo 'no tests'`. Running it
+      # anyway would put a green tick next to "web tests" and teach everyone
+      # reading this log that the SPA is covered, which is the expensive kind
+      # of false statement. So the step runs it AND says out loud that it
+      # asserted nothing, as a warning annotation on every build until
+      # apps/web has a runner. It does not fail the build: WP-AUTH does not own
+      # apps/web/package.json and cannot add one.
+      - name: Test the web app (and say so when it asserts nothing)
+        run: |
+          set -euo pipefail
+          output="$(pnpm --filter @constructos/web test 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          if echo "$output" | grep -q "no tests"; then
+            echo "::warning file=apps/web/package.json,line=11::The web package has no test runner: this step asserted nothing about the SPA."
+            echo "### Web tests asserted nothing" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`apps/web\` declares \`test: echo 'no tests'\`. Routing, the auth redirect and the API contract of every page are unverified by CI." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # The detector harness measures precision against planted schemes. A
       # regression here is a product regression, not a flake.
       - name: Retrospective detection harness
