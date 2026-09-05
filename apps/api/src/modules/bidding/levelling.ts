@@ -330,6 +330,8 @@ export const levellingRoutes: FastifyPluginAsync = async (app) => {
     const { itemId } = req.params as { itemId: string };
     const item = await fetchItem(itemId, req.companyId!);
     await requireBiddingLevel(app, req, reply, item.projectId, "standard");
+    /* A scope row is part of the basis a live award was decided on. */
+    await assertNoLiveAward(item.packageId, "Editing a levelling scope row");
     const body = itemSchema.partial().parse(req.body);
     const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
     for (const key of [
@@ -365,6 +367,7 @@ export const levellingRoutes: FastifyPluginAsync = async (app) => {
     const { itemId } = req.params as { itemId: string };
     const item = await fetchItem(itemId, req.companyId!);
     await requireBiddingLevel(app, req, reply, item.projectId, "standard");
+    await assertNoLiveAward(item.packageId, "Deleting a levelling scope row");
     const entries = await app.db
       .select({ id: bidLevellingEntries.id })
       .from(bidLevellingEntries)

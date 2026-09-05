@@ -89,7 +89,21 @@ function GeometrySketch({
   colour: string | null;
 }) {
   const stroke = colour && /^#[0-9a-fA-F]{6}$/.test(colour) ? colour : "currentColor";
-  const pts = geometry.points;
+  const raw = geometry.points;
+  // A rectangle is stored as two opposite corners; the engine expands it the
+  // same way before it measures anything, so the sketch must too or it draws
+  // the diagonal instead of the shape.
+  const a = raw[0];
+  const b = raw[1];
+  const pts =
+    geometry.kind === "rectangle" && raw.length === 2 && a && b
+      ? [
+          { x: a.x, y: a.y },
+          { x: b.x, y: a.y },
+          { x: b.x, y: b.y },
+          { x: a.x, y: b.y },
+        ]
+      : raw;
   if (pts.length === 0) return null;
 
   const r = geometry.radius ?? 0;

@@ -207,9 +207,23 @@ describe("regressions", () => {
     expect(write.json().message).toContain("standard");
   });
 
-  it("refuses the fleet to a stranger from another company", async () => {
-    const res = await get("/companies/current/equipment", stranger.headers);
-    expect(res.statusCode).toBe(403);
+  /*
+   * "companies/current" is the CALLER's company, so a stranger asking for it
+   * gets their own (empty) fleet, not a refusal — the tenancy boundary is
+   * that they cannot reach OURS. Both halves are asserted: presenting our
+   * company id is refused outright, and their own register is empty rather
+   * than a window onto ours.
+   */
+  it("never shows a stranger from another company our fleet", async () => {
+    const own = await get("/companies/current/equipment", stranger.headers);
+    expect(own.statusCode).toBe(200);
+    expect(own.json().items).toHaveLength(0);
+
+    const ours = await get("/companies/current/equipment", {
+      authorization: stranger.headers["authorization"]!,
+      "x-company-id": owner.companyId,
+    });
+    expect([401, 403]).toContain(ours.statusCode);
   });
 
   it("does not flag a machine out of certificate when this year's renewal exists", async () => {

@@ -141,6 +141,32 @@ describe("desiredEdges", () => {
     expect(seeAlso[0]!.targetLabel).toBe("semantic similarity: 0.42");
   });
 
+  it("canonicalises the record type BEFORE the dedupe, so the projection is re-runnable", () => {
+    /*
+     * The store keeps the canonical type ("dispute"); users type the tool
+     * ("disputes"). Canonicalising only at write time made the next diff see
+     * a stored "dispute" and a desired "disputes" as different rows, and the
+     * insert collided with the unique index — a 500 on the second run.
+     */
+    const canon = (t: string) => (t === "disputes" ? "dispute" : t);
+    const edges = desiredEdges(
+      lesson({
+        evidenceRefs: [
+          { tool: "disputes", recordId: "d1" },
+          { tool: "dispute", recordId: "d1" },
+        ],
+      }),
+      [],
+      [],
+      { normaliseType: canon },
+    );
+    const records = edges.filter((e) => e.edgeKind === "record");
+    expect(records.every((e) => e.targetType === "dispute")).toBe(true);
+    // both refs collapse onto one identity once the alias is resolved
+    expect(new Set(records.map(edgeKey)).size).toBe(records.length);
+    expect(records).toHaveLength(2); // origin + evidence, same target, two roles
+  });
+
   it("is deterministic and deduplicated on the unique-index identity", () => {
     const a = desiredEdges(lesson());
     const b = desiredEdges(lesson());

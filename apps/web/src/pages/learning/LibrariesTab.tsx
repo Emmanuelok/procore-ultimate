@@ -17,7 +17,7 @@
  *   · No estimate means no accuracy. An entry with nothing to compare against
  *     shows "—", never a flattering 0%.
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { api } from "../../lib/api";
 import {
   Badge,
@@ -379,8 +379,8 @@ function EntryShell({
   projects: string[];
   computedAt: string;
   note: string | null;
-  children: React.ReactNode;
-  actions: React.ReactNode;
+  children: ReactNode;
+  actions: ReactNode;
 }) {
   const [open, setOpen] = useState(false);
   return (

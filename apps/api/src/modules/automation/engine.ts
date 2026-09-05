@@ -98,6 +98,12 @@ export function defaultEngineOptions(
   };
 }
 
+/**
+ * Engine counters. They are kept PER COMPANY: one process serves every
+ * tenant, and an error message routinely embeds another tenant's rule or run
+ * id, so a company-scoped status route must never be handed the platform's
+ * numbers or the platform's last error text.
+ */
 export interface EngineHealth {
   eventsSeen: number;
   eventsMatched: number;
@@ -106,6 +112,7 @@ export interface EngineHealth {
   runsFailed: number;
   runsThrottled: number;
   hookFailures: number;
+  scansTruncated: number;
   lastError: string | null;
   lastErrorAt: string | null;
 }
@@ -117,6 +124,21 @@ export interface DrainSummary {
   skipped: number;
   deferred: number;
   throttled: number;
+  /**
+   * true when this call did no work because another drain was already in
+   * flight. Zero counters then mean "nothing was attempted", not "there was
+   * nothing to do" — the caller must say which.
+   */
+  busy: boolean;
+  reason: string | null;
+}
+
+export interface TruncatedScan {
+  ruleId: string;
+  ruleName: string;
+  objectType: string;
+  limit: number;
+  orderedBy: string;
 }
 
 export interface ScanSummary {
@@ -125,6 +147,8 @@ export interface ScanSummary {
   matched: number;
   deduped: number;
   executed: number;
+  /** rules whose scan hit the SCAN_LIMIT cap: some live records were not looked at */
+  truncated: TruncatedScan[];
 }
 
 interface Origin {
@@ -145,17 +169,7 @@ export class AutomationEngine {
   private http: AutomationHttpClient;
   private readonly origins = new Map<string, Origin>();
   private draining = false;
-  private readonly health: EngineHealth = {
-    eventsSeen: 0,
-    eventsMatched: 0,
-    runsEnqueued: 0,
-    runsExecuted: 0,
-    runsFailed: 0,
-    runsThrottled: 0,
-    hookFailures: 0,
-    lastError: null,
-    lastErrorAt: null,
-  };
+  private readonly healthByCompany = new Map<string, EngineHealth>();
 
   constructor(
     private readonly db: Db,
@@ -174,15 +188,64 @@ export class AutomationEngine {
     this.options = { ...this.options, ...partial };
   }
 
-  getHealth(): EngineHealth {
-    return { ...this.health };
+  private static emptyHealth(): EngineHealth {
+    return {
+      eventsSeen: 0,
+      eventsMatched: 0,
+      runsEnqueued: 0,
+      runsExecuted: 0,
+      runsFailed: 0,
+      runsThrottled: 0,
+      hookFailures: 0,
+      scansTruncated: 0,
+      lastError: null,
+      lastErrorAt: null,
+    };
   }
 
-  private recordError(err: unknown, where: string): void {
+  /** The mutable counter bucket for one company (created on first use). */
+  private health(companyId: string): EngineHealth {
+    let h = this.healthByCompany.get(companyId);
+    if (!h) {
+      h = AutomationEngine.emptyHealth();
+      this.healthByCompany.set(companyId, h);
+    }
+    return h;
+  }
+
+  /**
+   * Counters for ONE company. Called without a company id it returns the
+   * process-wide totals with NO error text — those messages name another
+   * tenant's records, so only the per-company view carries them.
+   */
+  getHealth(companyId?: string): EngineHealth {
+    if (companyId !== undefined) {
+      const h = this.healthByCompany.get(companyId);
+      return h ? { ...h } : AutomationEngine.emptyHealth();
+    }
+    const total = AutomationEngine.emptyHealth();
+    for (const h of this.healthByCompany.values()) {
+      total.eventsSeen += h.eventsSeen;
+      total.eventsMatched += h.eventsMatched;
+      total.runsEnqueued += h.runsEnqueued;
+      total.runsExecuted += h.runsExecuted;
+      total.runsFailed += h.runsFailed;
+      total.runsThrottled += h.runsThrottled;
+      total.hookFailures += h.hookFailures;
+      total.scansTruncated += h.scansTruncated;
+      if (h.lastErrorAt && (!total.lastErrorAt || h.lastErrorAt > total.lastErrorAt)) total.lastErrorAt = h.lastErrorAt;
+    }
+    return total;
+  }
+
+  private recordError(err: unknown, where: string, companyId: string | null): void {
     const message = `${where}: ${err instanceof Error ? err.message : String(err)}`;
-    this.health.lastError = message.slice(0, 1000);
-    this.health.lastErrorAt = this.options.now().toISOString();
-    this.logger.error({ err: message }, "automation engine error");
+    if (companyId) {
+      const h = this.health(companyId);
+      h.lastError = message.slice(0, 1000);
+      h.lastErrorAt = this.options.now().toISOString();
+    }
+    this.logger.error({ err: message, companyId }, "automation engine error");
   }
 
   /* ---------------------------------------------------------------- */
@@ -236,7 +299,7 @@ export class AutomationEngine {
    * Returns the number of runs enqueued.
    */
   async onLedgerEvent(event: LedgerEvent): Promise<number> {
-    this.health.eventsSeen += 1;
+    this.health(event.companyId).eventsSeen += 1;
     if (event.objectType.startsWith(AUTOMATION_PREFIX)) return 0;
     // Consumed before the rule lookup so a mark never outlives the event it
     // was made for, whether or not any rule matches that event.
@@ -256,7 +319,7 @@ export class AutomationEngine {
         )
         .orderBy(asc(automationRules.priority), asc(automationRules.createdAt));
       if (rules.length === 0) return 0;
-      this.health.eventsMatched += 1;
+      this.health(event.companyId).eventsMatched += 1;
 
       const snapshot = await loadSnapshot(this.db, event.companyId, event.objectType, event.objectId);
       const projectId = event.projectId ?? snapshot?.projectId ?? null;
@@ -296,14 +359,14 @@ export class AutomationEngine {
           try {
             await this.executeRun(run.id);
           } catch (err) {
-            this.recordError(err, `immediate run ${run.id}`);
+            this.recordError(err, `immediate run ${run.id}`, run.companyId);
           }
         }
       }
       return enqueued;
     } catch (err) {
-      this.health.hookFailures += 1;
-      this.recordError(err, "ledger hook");
+      this.health(event.companyId).hookFailures += 1;
+      this.recordError(err, "ledger hook", event.companyId);
       return 0;
     }
   }
@@ -345,7 +408,7 @@ export class AutomationEngine {
       queuedAt: now,
     };
     const inserted = await this.db.insert(automationRuns).values(row).returning();
-    this.health.runsEnqueued += 1;
+    this.health(rule.companyId).runsEnqueued += 1;
     return inserted[0]!;
   }
 
@@ -484,7 +547,7 @@ export class AutomationEngine {
         )
         .where(eq(automationRuns.id, run.id))
         .returning();
-      if (exhausted) this.health.runsThrottled += 1;
+      if (exhausted) this.health(run.companyId).runsThrottled += 1;
       return row!;
     }
 
@@ -565,7 +628,7 @@ export class AutomationEngine {
     } catch (err) {
       finalStatus = "failed";
       error = (err instanceof Error ? err.message : String(err)).slice(0, 1000);
-      this.recordError(err, `run ${run.id}`);
+      this.recordError(err, `run ${run.id}`, run.companyId);
     }
 
     const finishedAt = this.options.now().toISOString();
@@ -583,8 +646,9 @@ export class AutomationEngine {
       .where(eq(automationRuns.id, run.id))
       .returning();
 
-    this.health.runsExecuted += 1;
-    if (finalStatus === "failed") this.health.runsFailed += 1;
+    const health = this.health(run.companyId);
+    health.runsExecuted += 1;
+    if (finalStatus === "failed") health.runsFailed += 1;
 
     // Rule statistics — only when the rule actually did something or failed.
     if (finalStatus !== "skipped") {
@@ -616,7 +680,7 @@ export class AutomationEngine {
           },
         });
       } catch (err) {
-        this.recordError(err, `ledger for run ${run.id}`);
+        this.recordError(err, `ledger for run ${run.id}`, run.companyId);
       }
     }
     return final!;
@@ -629,13 +693,29 @@ export class AutomationEngine {
    * drive — or count — another company's runs.
    */
   async drain(limit = this.options.drainBatch, companyId?: string): Promise<DrainSummary> {
-    const summary: DrainSummary = { executed: 0, succeeded: 0, failed: 0, skipped: 0, deferred: 0, throttled: 0 };
-    if (this.draining) return summary;
+    const summary: DrainSummary = {
+      executed: 0,
+      succeeded: 0,
+      failed: 0,
+      skipped: 0,
+      deferred: 0,
+      throttled: 0,
+      busy: false,
+      reason: null,
+    };
+    // Re-entrancy: the scheduler job drains the whole platform and can still
+    // be running when an operator clicks "Run cycle". Say so — all-zero
+    // counters must never be reported as "nothing was queued".
+    if (this.draining) {
+      summary.busy = true;
+      summary.reason = "A drain is already running; queued runs were left for it.";
+      return summary;
+    }
     this.draining = true;
     try {
       const nowIso = this.options.now().toISOString();
       const due = await this.db
-        .select({ id: automationRuns.id })
+        .select({ id: automationRuns.id, companyId: automationRuns.companyId })
         .from(automationRuns)
         .where(
           and(
@@ -739,11 +819,11 @@ export class AutomationEngine {
             await this.executeRun(run.id);
             summary.executed += 1;
           } catch (err) {
-            this.recordError(err, `schedule run ${run.id}`);
+            this.recordError(err, `schedule run ${run.id}`, companyId);
           }
         }
       } catch (err) {
-        this.recordError(err, `scan rule ${rule.id}`);
+        this.recordError(err, `scan rule ${rule.id}`, companyId);
       }
       await this.db
         .update(automationRules)

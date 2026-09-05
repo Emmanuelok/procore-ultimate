@@ -117,6 +117,7 @@ export default function LevellingTab({
   );
   const action = useAction();
   const [addOpen, setAddOpen] = useState(false);
+  const [manageOpen, setManageOpen] = useState(false);
   const [proposals, setProposals] = useState<AiProposalResponse | null>(null);
   const [editing, setEditing] = useState<{
     submission: ComparisonSubmission;
@@ -265,9 +266,14 @@ export default function LevellingTab({
           description of the work and contain no bidder's price. {data.submissions.length} bid(s)
           are waiting behind the seal.
         </Alert>
-        <Button icon={IconPlus} onClick={() => setAddOpen(true)}>
-          Add scope rows
-        </Button>
+        <div className="flex flex-wrap gap-2">
+          <Button icon={IconPlus} onClick={() => setAddOpen(true)}>
+            Add scope rows
+          </Button>
+          <Button variant="ghost" onClick={() => setManageOpen(true)}>
+            Manage rows
+          </Button>
+        </div>
         <AddItemsModal
           open={addOpen}
           projectId={projectId}
@@ -278,6 +284,12 @@ export default function LevellingTab({
             setAddOpen(false);
             refresh();
           }}
+        />
+        <ManageRowsModal
+          open={manageOpen}
+          items={data.items}
+          onClose={() => setManageOpen(false)}
+          onDone={refresh}
         />
       </div>
     );
@@ -392,6 +404,9 @@ export default function LevellingTab({
             </Button>
             <Button size="sm" variant="secondary" icon={IconPlus} onClick={() => setAddOpen(true)}>
               Add scope rows
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => setManageOpen(true)}>
+              Manage rows
             </Button>
             <Button
               size="sm"
@@ -608,6 +623,13 @@ export default function LevellingTab({
           setAddOpen(false);
           refresh();
         }}
+      />
+
+      <ManageRowsModal
+        open={manageOpen}
+        items={data?.items ?? []}
+        onClose={() => setManageOpen(false)}
+        onDone={refresh}
       />
     </div>
   );
@@ -1122,6 +1144,111 @@ function AddItemsModal({
           </span>
         </label>
       </div>
+    </Modal>
+  );
+}
+
+/* ================================================================== */
+/* Managing the scope rows the buyer wrote                             */
+/* ================================================================== */
+
+/**
+ * A scope row is the buyer's own words, and buyers mistype. Rows could be
+ * written and never corrected or removed, so a row added to the wrong package
+ * stayed on the grid forever — blocking completion when it was mandatory and
+ * inviting an adjustment against scope nobody meant to ask for. Renaming and
+ * deleting are refused once a live award exists; the API says so and this
+ * panel shows the refusal rather than hiding the buttons.
+ */
+function ManageRowsModal({
+  open,
+  items,
+  onClose,
+  onDone,
+}: {
+  open: boolean;
+  items: LevellingGrid["items"];
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const action = useAction();
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+
+  async function rename(id: string, current: string) {
+    const next = (drafts[id] ?? current).trim();
+    if (next.length === 0 || next === current) return;
+    const done = await action.run(`rename:${id}`, () =>
+      api.patch(`/api/v1/bid-levelling-items/${id}`, { description: next }),
+    );
+    if (done) onDone();
+  }
+
+  async function remove(id: string) {
+    /* DELETE answers 204 with no body, so the call must report its own success. */
+    const done = await action.run(`delete:${id}`, async () => {
+      await api.del(`/api/v1/bid-levelling-items/${id}`);
+      return { deleted: id };
+    });
+    if (done) onDone();
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Scope rows"
+      size="lg"
+      description="Correct or remove a row. A row a bidder has already answered cannot be deleted — that would erase what they said about the scope; make it non-mandatory instead."
+      footer={
+        <div className="flex justify-end">
+          <Button variant="ghost" onClick={onClose}>
+            Close
+          </Button>
+        </div>
+      }
+    >
+      <RefusalPanel refusal={action.refusal} onDismiss={action.clear} />
+      {items.length === 0 ? (
+        <p className="text-meta text-content-subtle">No scope rows have been written yet.</p>
+      ) : (
+        <ul className="divide-y divide-border-subtle">
+          {items.map((item) => (
+            <li key={item.id} className="flex flex-wrap items-center gap-2 py-2">
+              {item.itemCode ? (
+                <code className="font-mono text-2xs text-content-subtle">{item.itemCode}</code>
+              ) : null}
+              <Input
+                size="sm"
+                className="min-w-[16rem] flex-1"
+                value={drafts[item.id] ?? item.description}
+                onChange={(e) =>
+                  setDrafts((d) => ({ ...d, [item.id]: e.currentTarget.value }))
+                }
+              />
+              <Badge tone={item.isMandatory ? "warning" : "neutral"} size="xs" variant="subtle">
+                {item.isMandatory ? "mandatory" : "optional"}
+              </Badge>
+              <Button
+                size="xs"
+                variant="secondary"
+                loading={action.busy === `rename:${item.id}`}
+                disabled={(drafts[item.id] ?? item.description).trim() === item.description}
+                onClick={() => void rename(item.id, item.description)}
+              >
+                Rename
+              </Button>
+              <Button
+                size="xs"
+                variant="danger"
+                loading={action.busy === `delete:${item.id}`}
+                onClick={() => void remove(item.id)}
+              >
+                Delete
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
     </Modal>
   );
 }

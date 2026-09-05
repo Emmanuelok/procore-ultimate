@@ -305,6 +305,10 @@ export interface BidSubmission {
   currency: string;
   exclusions: string | null;
   qualifications: string | null;
+  assumptions?: string | null;
+  clarificationsRequested?: string | null;
+  clarificationResponse?: string | null;
+  validUntil?: string | null;
   complianceStatus: string;
   nonComplianceNote: string | null;
   evaluationNote: string | null;

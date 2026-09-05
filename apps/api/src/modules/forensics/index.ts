@@ -19,7 +19,8 @@
  * with assumptions and sources kept apart from inputs; #304-320 the claims
  * workspace — lifecycle with segregation of duties, valuation range and
  * provision, claim-scoped chronology, record sufficiency and gap detection,
- * Scott Schedule and submission package, and company-level exposure per
+ * Scott Schedule and a submission package served both as JSON and as one
+ * self-contained printable HTML document, and company-level exposure per
  * currency.
  *
  * HONESTY RULES APPLIED HERE: a figure with no source is null with a reason,
@@ -126,6 +127,7 @@ import {
   type ChainLimbInput,
   type EventSufficiencyInput,
 } from "./sufficiency.js";
+import { renderClaimPackageHtml, type ClaimPackage } from "./submission.js";
 import { NOTICE_WARN_DAYS, noticeExposure, sweepNoticeTimeBars } from "./sweeps.js";
 import { forEachCompany } from "../../lib/scheduler.js";
 import { registerSearchSource, tableSource } from "../search/registry.js";
@@ -3437,17 +3439,20 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
     },
   );
 
-  /** Submission package: everything the claim rests on, in one payload. */
-  app.get("/projects/:projectId/claims/:claimId/package", { preHandler: readGate }, async (req) => {
-    const { claimId } = req.params as { claimId: string };
-    const claim = await fetchClaim(claimId, req.companyId!, req.projectId!);
+  /**
+   * Submission package: everything the claim rests on, in one shape, so the
+   * JSON route and the printable HTML route can never disagree about what is
+   * in the package or what is still missing from it.
+   */
+  async function assembleClaimPackage(claimId: string, companyId: string, projectId: string) {
+    const claim = await fetchClaim(claimId, companyId, projectId);
     const ids = claim.delayEventIds ?? [];
     const eventRows =
       ids.length > 0
         ? await app.db
             .select()
             .from(delayEvents)
-            .where(and(inArray(delayEvents.id, ids), eq(delayEvents.projectId, req.projectId!)))
+            .where(and(inArray(delayEvents.id, ids), eq(delayEvents.projectId, projectId)))
             .orderBy(asc(delayEvents.number))
         : [];
     const analyses = await app.db
@@ -3456,8 +3461,8 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
       .where(
         and(
           eq(forensicAnalyses.claimId, claimId),
-          eq(forensicAnalyses.companyId, req.companyId!),
-          eq(forensicAnalyses.projectId, req.projectId!),
+          eq(forensicAnalyses.companyId, companyId),
+          eq(forensicAnalyses.projectId, projectId),
         ),
       )
       .orderBy(asc(forensicAnalyses.createdAt))
@@ -3468,8 +3473,8 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
       .where(
         and(
           eq(quantumCalculations.claimId, claimId),
-          eq(quantumCalculations.companyId, req.companyId!),
-          eq(quantumCalculations.projectId, req.projectId!),
+          eq(quantumCalculations.companyId, companyId),
+          eq(quantumCalculations.projectId, projectId),
         ),
       )
       .orderBy(asc(quantumCalculations.createdAt))
@@ -3480,8 +3485,8 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
       .where(
         and(
           eq(disruptionAnalyses.claimId, claimId),
-          eq(disruptionAnalyses.companyId, req.companyId!),
-          eq(disruptionAnalyses.projectId, req.projectId!),
+          eq(disruptionAnalyses.companyId, companyId),
+          eq(disruptionAnalyses.projectId, projectId),
         ),
       )
       .orderBy(asc(disruptionAnalyses.createdAt))
@@ -3508,7 +3513,34 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
       },
       generatedAt: new Date().toISOString(),
     };
+  }
+
+  app.get("/projects/:projectId/claims/:claimId/package", { preHandler: readGate }, async (req) => {
+    const { claimId } = req.params as { claimId: string };
+    return assembleClaimPackage(claimId, req.companyId!, req.projectId!);
   });
+
+  /**
+   * The same package as a printable document (#317-319). The platform has no
+   * PDF renderer; the house pattern (estimating proposals) is a self-contained
+   * HTML page the reader prints to PDF from the browser, which also keeps the
+   * text selectable for a tribunal bundle. Everything that is MISSING from the
+   * package is printed at the top rather than left for the reader to notice.
+   */
+  app.get(
+    "/projects/:projectId/claims/:claimId/package/html",
+    { preHandler: readGate },
+    async (req, reply) => {
+      const { claimId } = req.params as { claimId: string };
+      const pkg = await assembleClaimPackage(claimId, req.companyId!, req.projectId!);
+      // The renderer names only the fields it prints; the drizzle rows carry
+      // more (and type their jsonb columns loosely), so the shape is asserted
+      // once here rather than widened in the pure module.
+      return reply
+        .type("text/html; charset=utf-8")
+        .send(renderClaimPackageHtml(pkg as unknown as ClaimPackage));
+    },
+  );
 
   /* ---------------------------------------------------------------- */
   /* Exposure & health inputs                                          */

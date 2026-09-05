@@ -654,7 +654,11 @@ export async function sweepChangeFrequency(
       isPostFreeze: designChangeNotices.isPostFreeze,
     })
     .from(designChangeNotices)
-    .where(and(eq(designChangeNotices.companyId, companyId), eq(designChangeNotices.projectId, projectId)));
+    .where(and(eq(designChangeNotices.companyId, companyId), eq(designChangeNotices.projectId, projectId)))
+    // Newest first and capped: churn is measured over a 90-day window, so the
+    // oldest notices cannot change the verdict (PLAN §6.4).
+    .orderBy(desc(designChangeNotices.submittedAt))
+    .limit(ROLLUP_ROW_CAP);
 
   const verdicts = changeFrequency(
     rows.map((r) => ({

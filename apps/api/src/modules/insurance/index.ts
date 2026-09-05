@@ -56,6 +56,7 @@ import { isExpired } from "../../lib/time.js";
 import { addDaysISO, isoDateSchema, todayISO } from "../field/dates.js";
 import {
   bondCurrentExposure,
+  bondsExpiringWithin,
   bondsPastDemandDeadline,
   certificatesExpiringWithin,
   computeCoverGaps,
@@ -132,6 +133,13 @@ const BOND_CALL_OUTCOMES = [
 const NOTIFICATION_METHODS = ["email", "letter", "portal", "broker", "telephone"] as const;
 
 /** Every detector this module owns — the summary counts exactly these. */
+/**
+ * How far ahead a bond's demand deadline is warned about. Long enough that a
+ * quantum can actually be assembled and a demand served; short enough that the
+ * warning still means something when it arrives.
+ */
+const BOND_DEMAND_WARN_DAYS = 45;
+
 const INSURANCE_DETECTORS = [
   "insurance_certificate_expired",
   "insurance_cover_gap",
@@ -144,6 +152,8 @@ const INSURANCE_DETECTORS = [
   "policy_renewal_overdue",
   /* The document disagrees with the record, or the insurer says it is not on risk */
   "insurance_certificate_mismatch",
+  /* Warn while the demand can still be made, not after the security is spent */
+  "bond_demand_deadline_approaching",
 ] as const;
 
 /** Obligations created here all carry this prefix so they can be counted back. */
@@ -1240,6 +1250,52 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
             key: b.bondId,
             bondId: b.bondId,
             demandDeadline: b.demandDeadline,
+            amount: b.currentAmount,
+            currency: b.currency,
+          },
+        });
+      }
+    }
+
+    /*
+     * (3b) BONDS WHOSE DEMAND DEADLINE IS COMING UP.
+     *
+     * Reporting the deadline after it passed tells somebody their security is
+     * spent. The useful signal is the one raised while a demand can still be
+     * made, so this warns inside the window and says how many days are left.
+     * Keyed per bond, so a bond warns once and does not re-warn every cycle.
+     */
+    const approaching = bondsExpiringWithin(scope.bonds, asOf, BOND_DEMAND_WARN_DAYS).filter(
+      (b) => b.demandDeadline !== null,
+    );
+    if (approaching.length > 0) {
+      const keys = approaching.map((b) => b.bondId);
+      const seen = await alreadySignalled(companyId, "bond_demand_deadline_approaching", keys);
+      for (const b of approaching) {
+        if (seen.has(b.bondId)) continue;
+        seen.add(b.bondId);
+        await app.db.insert(signals).values({
+          id: newId("sig"),
+          companyId,
+          projectId: b.projectId,
+          detector: "bond_demand_deadline_approaching",
+          severity: (b.daysRemaining ?? 0) <= 14 ? "high" : "medium",
+          confidence: 1,
+          title: `Bond demand deadline in ${b.daysRemaining} day(s) — ${b.bondType} bond ${b.number}`,
+          explanation:
+            `The last date for making a demand under ${b.bondType} bond ${b.number} ` +
+            `(${b.guarantor}, ${b.currency} ${b.currentAmount}) is ${b.demandDeadline}, ` +
+            `${b.daysRemaining} day(s) away. After that date the security is spent however well ` +
+            `founded a claim is, so any live default against the principal must be quantified and ` +
+            `demanded now, or the decision not to demand recorded with its reasons.`,
+          fingerprint: `bond_demand_deadline_approaching:${b.bondId}`,
+          subjectType: "bond",
+          subjectId: b.bondId,
+          evidenceRefs: {
+            key: b.bondId,
+            bondId: b.bondId,
+            demandDeadline: b.demandDeadline,
+            daysRemaining: b.daysRemaining,
             amount: b.currentAmount,
             currency: b.currency,
           },
@@ -6151,7 +6207,25 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
    * question about this certificate. It is stored hashed, so a database read
    * does not yield a usable link.
    */
-  app.post("/insurance/confirmations/:token/respond", async (req) => {
+  /**
+   * Per-IP limit, the same one the credential endpoints use. The token is 24
+   * random bytes and is not guessable by brute force, but an unauthenticated
+   * route that reaches the database deserves a ceiling regardless: the cost of
+   * being wrong about that arithmetic is a tenant's data.
+   */
+  const confirmLimited =
+    app.appConfig.RATE_LIMIT_ENABLED && app.appConfig.NODE_ENV !== "test"
+      ? {
+          config: {
+            rateLimit: {
+              max: app.appConfig.AUTH_RATE_LIMIT_MAX_PER_MINUTE,
+              timeWindow: "1 minute",
+            },
+          },
+        }
+      : {};
+
+  app.post("/insurance/confirmations/:token/respond", confirmLimited, async (req) => {
     const { token } = req.params as { token: string };
     const body = z
       .object({

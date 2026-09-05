@@ -639,6 +639,8 @@ function SubmissionDrawer({
   const [lateReason, setLateReason] = useState("");
   const [complianceStatus, setComplianceStatus] = useState("compliant");
   const [complianceNote, setComplianceNote] = useState("");
+  const [clarificationText, setClarificationText] = useState("");
+  const [withdrawReason, setWithdrawReason] = useState("");
   const sub = detail.data;
 
   async function acceptLate() {
@@ -665,6 +667,49 @@ function SubmissionDrawer({
     );
     if (done) {
       setComplianceNote("");
+      detail.reload();
+      onMutated();
+    }
+  }
+
+  /**
+   * ASKING, AND RECORDING THE ANSWER.
+   *
+   * A levelling cell that cannot be resolved yields no number and names the
+   * bidder who has to answer. This is where the question goes out and the
+   * answer comes back, on the record: an evaluation that resolves an
+   * ambiguity from memory is one the losing bidder can take apart.
+   */
+  async function clarify(response: boolean) {
+    if (!submissionId) return;
+    const text = clarificationText.trim();
+    if (!text) return;
+    const done = await action.run(response ? "clarified" : "clarify", () =>
+      api.post(`/api/v1/bid-submissions/${submissionId}/clarification`, {
+        ...(response ? { response: text } : { requested: text }),
+      }),
+    );
+    if (done) {
+      setClarificationText("");
+      detail.reload();
+      onMutated();
+    }
+  }
+
+  /**
+   * Taking a bid out of contention. The reason is required: "they withdrew"
+   * and "we disqualified them" are different facts and only one of them is
+   * the bidder's decision.
+   */
+  async function withdrawBid() {
+    if (!submissionId) return;
+    const text = withdrawReason.trim();
+    if (text.length < 3) return;
+    const done = await action.run("withdraw", () =>
+      api.post(`/api/v1/bid-submissions/${submissionId}/withdraw`, { reason: text }),
+    );
+    if (done) {
+      setWithdrawReason("");
       detail.reload();
       onMutated();
     }
@@ -839,6 +884,77 @@ function SubmissionDrawer({
               >
                 Record the finding
               </Button>
+            </div>
+          </section>
+
+          <section>
+            <h3 className="text-label uppercase text-content-subtle">
+              Clarifications and withdrawal
+            </h3>
+            {sub.clarificationsRequested ? (
+              <p className="mt-1 whitespace-pre-wrap text-meta leading-relaxed text-content-muted">
+                <span className="font-medium">Asked:</span> {sub.clarificationsRequested}
+              </p>
+            ) : null}
+            {sub.clarificationResponse ? (
+              <p className="mt-1 whitespace-pre-wrap text-meta leading-relaxed text-content-muted">
+                <span className="font-medium">Answered:</span> {sub.clarificationResponse}
+              </p>
+            ) : null}
+            <Field
+              className="mt-2"
+              label="Question to the bidder, or their answer"
+              hint="Recorded on the bid and in the ledger. A clarification cannot be raised against a withdrawn, unsuccessful or awarded bid."
+            >
+              <Textarea
+                rows={2}
+                value={clarificationText}
+                onChange={(e) => setClarificationText(e.target.value)}
+                placeholder="Confirm whether item 3.4 (temporary works) is included in your price."
+              />
+            </Field>
+            <div className="mt-2 flex flex-wrap justify-end gap-2">
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={clarificationText.trim().length < 3}
+                loading={action.busy === "clarify"}
+                onClick={() => void clarify(false)}
+              >
+                Raise the question
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={clarificationText.trim().length < 3}
+                loading={action.busy === "clarified"}
+                onClick={() => void clarify(true)}
+              >
+                Record their answer
+              </Button>
+            </div>
+            <div className="mt-3 border-t border-border-subtle pt-3">
+              <Field
+                label="Withdraw this bid"
+                hint="Why it is out of contention — the bidder pulled it, or it was never a compliant offer."
+              >
+                <Input
+                  value={withdrawReason}
+                  onChange={(e) => setWithdrawReason(e.target.value)}
+                  placeholder="Bidder withdrew by email of today."
+                />
+              </Field>
+              <div className="mt-2 flex justify-end">
+                <Button
+                  size="sm"
+                  variant="danger"
+                  disabled={withdrawReason.trim().length < 3}
+                  loading={action.busy === "withdraw"}
+                  onClick={() => void withdrawBid()}
+                >
+                  Withdraw the bid
+                </Button>
+              </div>
             </div>
           </section>
 

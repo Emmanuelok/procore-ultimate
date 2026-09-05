@@ -6,7 +6,7 @@
  */
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { CLAIM_KINDS } from "@constructos/shared";
-import { api, ApiClientError } from "../../lib/api";
+import { api, ApiClientError, fetchBlobUrl } from "../../lib/api";
 import {
   Alert,
   Badge,
@@ -187,6 +187,7 @@ export default function ClaimsTab({
   const [valuationBusy, setValuationBusy] = useState(false);
   const [scottBusy, setScottBusy] = useState(false);
   const [packageInfo, setPackageInfo] = useState<{ ready: boolean; missing: string[] } | null>(null);
+  const [printBusy, setPrintBusy] = useState(false);
 
   const [reasonFor, setReasonFor] = useState<string | null>(null);
   const [reasonText, setReasonText] = useState("");
@@ -386,6 +387,33 @@ export default function ClaimsTab({
       setPackageInfo(res.completeness);
     } catch (err) {
       setDrawerError(err instanceof ApiClientError ? err.message : "The package could not be assembled.");
+    }
+  }
+
+  /**
+   * Open the printable submission package in a new tab. The document is
+   * guarded by the same gates as everything else, so a plain link would send
+   * neither the bearer token nor the tenant header and the reader would get a
+   * 401 body where the submission should be; fetch + object URL sends both.
+   */
+  async function openPackage() {
+    if (!selected) return;
+    setDrawerError(null);
+    setPrintBusy(true);
+    let url: string | null = null;
+    try {
+      url = await fetchBlobUrl(`${base}/claims/${selected.id}/package/html`);
+      const opened = window.open(url, "_blank", "noopener");
+      if (!opened) throw new Error("The browser blocked the new tab. Allow pop-ups for this site.");
+      const toRevoke = url;
+      window.setTimeout(() => URL.revokeObjectURL(toRevoke), 60_000);
+    } catch (err) {
+      if (url) URL.revokeObjectURL(url);
+      setDrawerError(
+        err instanceof Error ? err.message : "The submission package could not be opened.",
+      );
+    } finally {
+      setPrintBusy(false);
     }
   }
 
@@ -944,12 +972,17 @@ export default function ClaimsTab({
                 <Button size="sm" variant="secondary" onClick={() => void checkPackage()}>
                   Check readiness
                 </Button>
+                <Button size="sm" disabled={printBusy} onClick={() => void openPackage()}>
+                  {printBusy ? "Opening…" : "Open submission"}
+                </Button>
               </div>
             </div>
             <p className="text-xs text-ink-400">
               The Scott Schedule fills the claimant columns from the register and leaves the
               respondent and tribunal columns empty — this platform does not write the other side's
-              case.
+              case. <strong>Open submission</strong> assembles the whole package — chain,
+              chronology, events, analysis, quantum and Scott Schedule — as one printable document,
+              with anything still missing stated at the top rather than left out.
             </p>
             {selected.scottSchedule ? (
               <div className="mt-1 text-xs text-ink-600">

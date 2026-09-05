@@ -84,6 +84,7 @@ import {
   toolAffinity,
   type RankableLesson,
   type SearchableLesson,
+  type TfIdfIndex,
 } from "./relevance.js";
 import {
   desiredEdges,
@@ -2932,6 +2933,13 @@ export const learningModule: FastifyPluginAsync = async (app) => {
     companyId: string,
     lessonId: string,
     actorId: string | null,
+    /*
+     * The tf-idf index over the published register, when the caller already
+     * has one. The nightly projection walks up to 200 lessons per company and
+     * rebuilding the index for each of them would be quadratic in the size of
+     * the register for no gain — the register does not change mid-sweep.
+     */
+    preparedIndex?: TfIdfIndex,
   ): Promise<{
     inserted: number;
     deleted: number;
@@ -2945,7 +2953,7 @@ export const learningModule: FastifyPluginAsync = async (app) => {
        person's account, not something to send a reader to. */
     let seeAlso: Array<{ lessonId: string; similarity: number }> = [];
     if (lesson.status === "published") {
-      const { index } = await registerIndex(companyId);
+      const index = preparedIndex ?? (await registerIndex(companyId)).index;
       seeAlso = similarLessons(index, lessonId, {
         floor: SEE_ALSO_FLOOR,
         limit: SEE_ALSO_LIMIT,
@@ -2967,6 +2975,8 @@ export const learningModule: FastifyPluginAsync = async (app) => {
       },
       applications,
       seeAlso,
+      /* Canonicalise BEFORE the diff — see the note in desiredEdges. */
+      { normaliseType: (t) => targetEntryFor(t)?.recordType ?? t },
     );
 
     const stored = await app.db
@@ -3118,7 +3128,16 @@ export const learningModule: FastifyPluginAsync = async (app) => {
     const { lessonId } = req.params as { lessonId: string };
     const lesson = await fetchLesson(lessonId, req.companyId!);
     const scope = companyScopeOf(req, "learning");
-    if (!scopeAllows(scope, lesson.projectId ?? lesson.originProjectId)) {
+    /*
+     * A PUBLISHED lesson is a tenant asset — the register shows it to anyone
+     * who holds the tool anywhere, and hiding its provenance from the same
+     * people would make the citation unverifiable while leaving the claim
+     * visible. An UNPUBLISHED one is still one project's unvalidated account
+     * of what went wrong, naming people, and stays inside that project.
+     */
+    const owningProject =
+      lesson.status === "published" ? null : (lesson.projectId ?? lesson.originProjectId);
+    if (!scopeAllows(scope, owningProject)) {
       throw forbidden("This lesson belongs to a project you do not hold the learning tool on");
     }
     const edges = await app.db
@@ -3453,6 +3472,9 @@ export const learningModule: FastifyPluginAsync = async (app) => {
           inArray(valuations.status, ["certified", "paid"]),
         ),
       )
+      /* Newest first: when the cap bites, the sample it keeps is the recent
+         work, not an arbitrary slice of the company's history. */
+      .orderBy(desc(valuations.valuationDate))
       .limit(LIBRARY_SCAN_LIMIT);
 
     const latestByItem = new Map<string, (typeof rows)[number]>();
@@ -3512,6 +3534,7 @@ export const learningModule: FastifyPluginAsync = async (app) => {
           isNotNull(scheduleTasks.actualFinish),
         ),
       )
+      .orderBy(desc(scheduleTasks.actualFinish))
       .limit(LIBRARY_SCAN_LIMIT);
     const samples: DurationSample[] = [];
     for (const row of rows) {
@@ -3623,7 +3646,15 @@ export const learningModule: FastifyPluginAsync = async (app) => {
         supersedesId: existing?.id ?? null,
         computedAt: now,
       });
-      if (existing) {
+      /*
+       * AN ACCEPTED ENTRY STAYS ACCEPTED UNTIL THE REPLACEMENT IS ACCEPTED.
+       *
+       * Retiring it the moment a fresher sample arrives would empty the
+       * library between the sweep and somebody looking at it — the company
+       * would be pricing against nothing, silently. Only an unaccepted
+       * proposal is replaced outright, because nobody ever agreed to it.
+       */
+      if (existing && existing.status === "proposed") {
         await app.db
           .update(rateLibraryEntries)
           .set({ status: "superseded", updatedAt: now })
@@ -3711,7 +3742,9 @@ export const learningModule: FastifyPluginAsync = async (app) => {
         supersedesId: existing?.id ?? null,
         computedAt: now,
       });
-      if (existing) {
+      /* Same rule as rates: an accepted entry is what the company plans
+         against and it stands until its replacement is accepted. */
+      if (existing && existing.status === "proposed") {
         await app.db
           .update(durationLibraryEntries)
           .set({ status: "superseded", updatedAt: now })
@@ -3837,6 +3870,19 @@ export const learningModule: FastifyPluginAsync = async (app) => {
           updatedAt: now,
         })
         .where(eq(rateLibraryEntries.id, entryId));
+      /* The entry this one replaces is retired HERE — at acceptance — so the
+         library never has a gap between the sweep and the decision. */
+      if (decision === "accept" && entry.supersedesId) {
+        await app.db
+          .update(rateLibraryEntries)
+          .set({ status: "superseded", updatedAt: now })
+          .where(
+            and(
+              eq(rateLibraryEntries.id, entry.supersedesId),
+              eq(rateLibraryEntries.companyId, req.companyId!),
+            ),
+          );
+      }
       await appendLedger(app.db, {
         companyId: req.companyId!,
         actorId: req.user!.id,
@@ -3900,6 +3946,17 @@ export const learningModule: FastifyPluginAsync = async (app) => {
           updatedAt: now,
         })
         .where(eq(durationLibraryEntries.id, entryId));
+      if (decision === "accept" && entry.supersedesId) {
+        await app.db
+          .update(durationLibraryEntries)
+          .set({ status: "superseded", updatedAt: now })
+          .where(
+            and(
+              eq(durationLibraryEntries.id, entry.supersedesId),
+              eq(durationLibraryEntries.companyId, req.companyId!),
+            ),
+          );
+      }
       await appendLedger(app.db, {
         companyId: req.companyId!,
         actorId: req.user!.id,
@@ -4261,8 +4318,11 @@ export const learningModule: FastifyPluginAsync = async (app) => {
         let inserted = 0;
         let deleted = 0;
         let unverified = 0;
+        /* One index for the whole batch: the register is not moving while the
+           sweep runs, and rebuilding it per lesson would be quadratic. */
+        const { index } = await registerIndex(companyId);
         for (const row of recent) {
-          const result = await projectLessonEdges(companyId, row.id, null);
+          const result = await projectLessonEdges(companyId, row.id, null, index);
           inserted += result.inserted;
           deleted += result.deleted;
           unverified += result.unverified.length;

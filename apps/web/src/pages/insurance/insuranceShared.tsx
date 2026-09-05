@@ -670,6 +670,7 @@ export const DETECTOR_LABELS: Record<string, string> = {
   uninsured_loss_candidate: "Uninsured loss candidate",
   policy_renewal_overdue: "Renewal overdue",
   insurance_certificate_mismatch: "Certificate does not match the document",
+  bond_demand_deadline_approaching: "Bond demand deadline approaching",
 };
 
 /* --------------------------- Transition tables ---------------------------- */

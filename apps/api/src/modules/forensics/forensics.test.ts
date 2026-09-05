@@ -2144,6 +2144,26 @@ describe("record sufficiency, chronology scope and the submission package", () =
     expect(body.completeness.ready).toBe(false);
     expect(body.completeness.missing.join(" ")).toMatch(/no delay analysis/);
   });
+
+  it("serves the same package as a printable HTML document", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/claims/${claimId}/package/html`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-type"]).toMatch(/text\/html/);
+    const html = res.body;
+    expect(html.startsWith("<!doctype html>")).toBe(true);
+    // self-contained: a bundle document must render with no network
+    expect(html).not.toMatch(/<script/i);
+    expect(html).not.toMatch(/https?:\/\//);
+    // it leads with what is missing rather than hiding it
+    expect(html).toContain("Not yet complete");
+    expect(html).toContain("no delay analysis has been recorded");
+    expect(html).toContain("Chronology");
+    expect(html).toContain("Scott Schedule");
+  });
 });
 
 describe("forensics health inputs", () => {
@@ -2182,6 +2202,7 @@ describe("tenant isolation", () => {
       `/api/v1/projects/${projectId}/forensics/float-rules`,
       `/api/v1/projects/${projectId}/forensics/health-inputs`,
       `/api/v1/projects/${projectId}/forensics/as-planned-vs-as-built`,
+      `/api/v1/projects/${projectId}/claims/${claim1Id}/package/html`,
     ]) {
       const res = await app.inject({ method: "GET", url, headers: outsider.headers });
       expect([403, 404]).toContain(res.statusCode);

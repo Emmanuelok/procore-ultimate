@@ -20,6 +20,9 @@ import {
 } from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
 import { newId } from "../../lib/ids.js";
+
+// The 503 assertions below only mean something with the AI layer OFF by default.
+delete process.env.ANTHROPIC_API_KEY;
 import { addDaysISO, todayISO } from "../field/dates.js";
 
 let built: Awaited<ReturnType<typeof buildTestApp>>;
@@ -2412,7 +2415,7 @@ describe("certificate extraction and insurer confirmation", () => {
     authProject = await makeProject("Authenticity Works");
     const withFile = await post(`/projects/${authProject}/insurance/certificates`, {
       subjectName: "Ridgeway Groundworks Limited",
-      policyType: "public_liability",
+      policyType: "third_party_liability",
       certificateNumber: "PL-99881",
       insurer: "Northgate Insurance plc",
       limitOfIndemnity: 5_000_000,
@@ -2430,11 +2433,14 @@ describe("certificate extraction and insurer confirmation", () => {
 
     const without = await post(`/projects/${authProject}/insurance/certificates`, {
       subjectName: "Paperless Plant Hire",
-      policyType: "public_liability",
+      policyType: "third_party_liability",
       validFrom: daysFromToday(-10),
       validTo: daysFromToday(100),
     });
     noFileCertId = without.json().id as string;
+    /* Explicit: the first extraction assertions are about the disabled path. */
+    delete app.appConfig.ANTHROPIC_API_KEY;
+    setAiClientFactory(null);
   }, 120_000);
 
   afterAll(() => {

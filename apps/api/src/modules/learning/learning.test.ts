@@ -1812,6 +1812,15 @@ describe("knowledge graph, onboarding packs and the feedback libraries", () => {
     expect([403, 404]).toContain(res.statusCode);
   });
 
+  it("shows a published lesson's provenance to anyone who holds the tool anywhere", async () => {
+    /* A published lesson is a tenant asset. Showing the claim while hiding the
+       evidence it rests on would make the citation unverifiable. */
+    const lesson = await publishLesson({ title: "Published provenance is company-wide" });
+    const res = await get(`/learning/lessons/${lesson.id as string}/graph`, readerHeaders);
+    expect(res.statusCode).toBe(200);
+    expect(((res.json() as Json).counts as Json).total).toBeGreaterThan(0);
+  });
+
   it("refuses a graph rebuild from a plain member — the projection is an admin act", async () => {
     const lesson = await publishLesson({ title: "Rebuild permission" });
     const res = await post(
@@ -1970,15 +1979,28 @@ describe("knowledge graph, onboarding packs and the feedback libraries", () => {
     expect(((after.json() as Json).items as Array<Json>).length).toBe(countBefore);
   });
 
-  it("refuses a rebuild from a plain member and a read of another tenant's library", async () => {
+  it("refuses a rebuild from a plain member and shows another tenant none of this library", async () => {
     const member = await post(`/learning/libraries/rebuild`, undefined, readerHeaders);
     expect(member.statusCode).toBe(403);
+    /*
+     * The outsider is the OWNER of their own company, so the route is open to
+     * them — and answers about their tenant, which is empty. "You may not ask"
+     * and "there is nothing of yours here" are different answers and the
+     * second is the correct one; what must never happen is this company's
+     * entries appearing in it.
+     */
     const other = await app.inject({
       method: "GET",
-      url: "/api/v1/learning/libraries/rates",
+      url: "/api/v1/learning/libraries/rates?pageSize=100",
       headers: outsider.headers,
     });
-    expect(other.statusCode).toBe(403);
+    expect(other.statusCode).toBe(200);
+    const mine = await get(`/learning/libraries/rates?pageSize=100`);
+    const myIds = ((mine.json() as Json).items as Array<Json>).map((i) => i.id);
+    expect(myIds.length).toBeGreaterThan(0);
+    const theirs = ((other.json() as Json).items as Array<Json>).map((i) => i.id);
+    expect(theirs).toEqual([]);
+    for (const id of myIds) expect(theirs).not.toContain(id);
   });
 
   /* ---------------- risk realisation ---------------- */
@@ -2040,12 +2062,64 @@ describe("knowledge graph, onboarding packs and the feedback libraries", () => {
   });
 
   it("keeps risk realisations inside the tenant", async () => {
+    const mine = await get(`/learning/risk-realisations?pageSize=100`);
+    const myIds = ((mine.json() as Json).items as Array<Json>).map((i) => i.id);
+    expect(myIds.length).toBeGreaterThan(0);
     const res = await app.inject({
       method: "GET",
-      url: "/api/v1/learning/risk-realisations",
+      url: "/api/v1/learning/risk-realisations?pageSize=100",
       headers: outsider.headers,
     });
-    expect(res.statusCode).toBe(403);
+    expect(res.statusCode).toBe(200);
+    const theirs = ((res.json() as Json).items as Array<Json>).map((i) => i.id);
+    expect(theirs).toEqual([]);
+    for (const id of myIds) expect(theirs).not.toContain(id);
+  });
+
+  it("shows a project member only the realisations of projects they can see", async () => {
+    /* `reader` holds learning on `projectId` alone, and the realisations live
+       there — so they see them, and nothing from a project they are not on. */
+    const res = await get(`/learning/risk-realisations?pageSize=100`, readerHeaders);
+    expect(res.statusCode).toBe(200);
+    const rows = (res.json() as Json).items as Array<Json>;
+    expect(rows.every((r) => r.projectId === projectId)).toBe(true);
+  });
+
+  it("keeps the accepted rate in force until its replacement is accepted", async () => {
+    /* Move the outturn on project B so the median genuinely changes. */
+    const boq = await app.db
+      .select({ id: boqs.id })
+      .from(boqs)
+      .where(eq(boqs.projectId, libProjectB));
+    const items = await app.db
+      .select({ id: boqItems.id })
+      .from(boqItems)
+      .where(eq(boqItems.boqId, boq[0]!.id));
+    await app.db
+      .update(valuationLines)
+      .set({ amountToDate: 30_000 })
+      .where(eq(valuationLines.boqItemId, items[0]!.id));
+
+    const before = await get(`/learning/libraries/rates?code=E10&status=accepted`);
+    const accepted = ((before.json() as Json).items as Array<Json>)[0]!;
+
+    await post(`/learning/libraries/rebuild`);
+    const proposals = await get(`/learning/libraries/rates?code=E10&status=proposed`);
+    const proposal = ((proposals.json() as Json).items as Array<Json>)[0]!;
+    expect(proposal).toBeDefined();
+    expect(proposal.supersedesId).toBe(accepted.id);
+
+    // the library is never empty in between: the accepted entry still stands
+    const still = await get(`/learning/libraries/rates?code=E10&status=accepted`);
+    expect(((still.json() as Json).items as Array<Json>)[0]!.id).toBe(accepted.id);
+
+    await post(`/learning/libraries/rates/${proposal.id as string}/accept`);
+    const after = await get(`/learning/libraries/rates?code=E10&status=accepted`);
+    const nowAccepted = (after.json() as Json).items as Array<Json>;
+    expect(nowAccepted).toHaveLength(1);
+    expect(nowAccepted[0]!.id).toBe(proposal.id);
+    const retired = await get(`/learning/libraries/rates?code=E10&status=superseded`);
+    expect(((retired.json() as Json).items as Array<Json>).map((i) => i.id)).toContain(accepted.id);
   });
 
   it("registers the knowledge-graph and library sweeps with the platform scheduler", async () => {

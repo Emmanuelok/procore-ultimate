@@ -2771,3 +2771,108 @@ describe("prequalification suspension", () => {
     expect([403, 404]).toContain(res.statusCode);
   });
 });
+
+/* ================================================================== */
+/* SCOPE ROWS — correcting and removing the buyer's own words          */
+/* ================================================================== */
+
+describe("levelling scope row maintenance", () => {
+  it("renames a row, refuses deletion once a bidder has answered it, and keeps another company out", async () => {
+    const pkg = await createPackage(projectA, { title: "Scope row maintenance" });
+    await issuePackage(projectA, pkg.id);
+    const created = await post(`/projects/${projectA}/bid-packages/${pkg.id}/levelling/items`, {
+      items: [
+        { description: "Excavation and disposal", itemCode: "E10", isMandatory: true },
+        { description: "Typo row", itemCode: "Z99", isMandatory: false },
+      ],
+    });
+    expect(created.statusCode).toBe(201);
+    const rows = created.json().items as Array<{ id: string; itemCode: string }>;
+    const keep = rows.find((r) => r.itemCode === "E10")!;
+    const spare = rows.find((r) => r.itemCode === "Z99")!;
+
+    const renamed = await patch(`/bid-levelling-items/${keep.id}`, {
+      description: "Excavation, disposal and temporary support",
+    });
+    expect(renamed.statusCode).toBe(200);
+    expect(renamed.json().description).toMatch(/temporary support/);
+
+    // An unanswered row can be removed.
+    const removed = await del(`/bid-levelling-items/${spare.id}`);
+    expect(removed.statusCode).toBe(204);
+
+    // Once a bidder has answered a row, deleting it would erase what they said.
+    const bid = await submitBid(projectA, pkg.id, alpha, { baseBidAmount: 220_000 });
+    const entry = await post(`/projects/${projectA}/bid-packages/${pkg.id}/levelling/entries`, {
+      entries: [
+        {
+          levellingItemId: keep.id,
+          submissionId: bid.id,
+          includedStatus: "included",
+          asBidAmount: 220_000,
+          adjustmentAmount: 0,
+        },
+      ],
+    });
+    expect(entry.statusCode).toBe(201);
+    const refused = await del(`/bid-levelling-items/${keep.id}`);
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json().message).toMatch(/bidder answer/i);
+
+    const stranger1 = await patch(
+      `/bid-levelling-items/${keep.id}`,
+      { description: "Should never land" },
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(stranger1.statusCode);
+    const stranger2 = await del(`/bid-levelling-items/${keep.id}`, stranger.headers);
+    expect([403, 404]).toContain(stranger2.statusCode);
+  });
+
+  it("freezes the scope rows once a live award exists", async () => {
+    const pkg = await createPackage(projectA, { title: "Scope frozen by award" });
+    await issuePackage(projectA, pkg.id);
+    const created = await post(`/projects/${projectA}/bid-packages/${pkg.id}/levelling/items`, {
+      items: [{ description: "All works", itemCode: "F10", isMandatory: false }],
+    });
+    const itemId = created.json().items[0].id as string;
+    const winner = await submitBid(projectA, pkg.id, bravo, { baseBidAmount: 260_000 });
+    const rec = await post(`/projects/${projectA}/bid-packages/${pkg.id}/award/recommend`, {
+      submissionId: winner.id,
+      recommendationBasis: "The only compliant bid received against this enquiry.",
+    });
+    expect(rec.statusCode).toBe(201);
+
+    const renamed = await patch(`/bid-levelling-items/${itemId}`, {
+      description: "Rewritten after the award",
+    });
+    expect(renamed.statusCode).toBe(409);
+    expect(renamed.json().message).toMatch(/scope row/i);
+
+    const removed = await del(`/bid-levelling-items/${itemId}`);
+    expect(removed.statusCode).toBe(409);
+  });
+  it("freezes the scope rows once a live award exists", async () => {
+    const pkg = await createPackage(projectA, { title: "Scope frozen by award" });
+    await issuePackage(projectA, pkg.id);
+    const created = await post(`/projects/${projectA}/bid-packages/${pkg.id}/levelling/items`, {
+      items: [{ description: "All works", itemCode: "F10", isMandatory: false }],
+    });
+    const itemId = created.json().items[0].id as string;
+    const winner = await submitBid(projectA, pkg.id, bravo, { baseBidAmount: 260_000 });
+    const rec = await post(`/projects/${projectA}/bid-packages/${pkg.id}/award/recommend`, {
+      submissionId: winner.id,
+      recommendationBasis: "The only compliant bid received against this enquiry.",
+    });
+    expect(rec.statusCode).toBe(201);
+
+    const renamed = await patch(`/bid-levelling-items/${itemId}`, {
+      description: "Rewritten after the award",
+    });
+    expect(renamed.statusCode).toBe(409);
+    expect(renamed.json().message).toMatch(/scope row/i);
+
+    const removed = await del(`/bid-levelling-items/${itemId}`);
+    expect(removed.statusCode).toBe(409);
+  });
+});
