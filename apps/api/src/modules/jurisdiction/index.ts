@@ -40,8 +40,13 @@ import {
   type RateQuote,
 } from "./fx.js";
 import { PERMIT_REAPPLY_FROM, PERMIT_TRANSITIONS } from "./reference.js";
+// The consent-to-programme engine is shared with the land module: a task
+// blocked by both an unacquired parcel and an ungranted permit is ONE
+// problem, so both workspaces quantify it with the same arithmetic.
+import { loadConsentView } from "../land/consent-service.js";
 import { registerJurisdictionJobs, runJurisdictionDetectors } from "./detectors.js";
 import { registerGroupRoutes } from "./group.js";
+import { registerSearchSource, tableSource } from "../search/registry.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -256,6 +261,33 @@ const AWAITING_STATUSES = ["applied", "in_review"] as const;
  * SYSTEM actor.
  */
 export const jurisdictionModule: FastifyPluginAsync = async (app) => {
+  /*
+   * Company-wide search (contract §3.3): a consent is looked for by its
+   * title, its authority or its reference number — "environmental permit",
+   * "EA/2026/119" — long before anyone remembers which project it sits on.
+   */
+  registerSearchSource(
+    tableSource({
+      type: "permit",
+      label: "Permit / consent",
+      tool: "jurisdiction",
+      scope: "project",
+      table: permits,
+      columns: {
+        id: permits.id,
+        companyId: permits.companyId,
+        projectId: permits.projectId,
+        title: permits.title,
+        subtitle: permits.authority,
+        reference: permits.number,
+        status: permits.status,
+        updatedAt: permits.updatedAt,
+      },
+      searchColumns: [permits.title, permits.authority, permits.reference],
+      href: (r) => (r.projectId ? `/projects/${r.projectId}/jurisdiction?tab=permits` : "/"),
+    }),
+  );
+
   const readGate = [app.authenticate, app.requireCompany, app.requireTool("jurisdiction", "read")];
   const standardGate = [
     app.authenticate,
@@ -1011,7 +1043,7 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
      * deadline the assurance sweep would later breach against a permit that
      * does not exist.
      */
-    const { number, obligationId } = await app.db.transaction(async (tx) => {
+    await app.db.transaction(async (tx) => {
       let obligationId: string | null = null;
       if (dueAt) {
         obligationId = newId("obl");
@@ -1071,10 +1103,7 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
         },
         storePayload: true,
       });
-      return { number, obligationId };
     });
-    void number;
-    void obligationId;
     const created = await fetchPermit(id, req.companyId!, req.projectId!);
     return reply.status(201).send({ ...created, ...permitDerived(created) });
   });
@@ -1160,8 +1189,40 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
           isCritical: task.isCritical === 1,
           // the point of the view: work that cannot lawfully start on time
           blocked: permit.status !== "granted",
+          /* filled in below from the shared consent engine */
+          daysAtRisk: null as number | null,
+          expectedResolutionDate: null as string | null,
+          estimateSource: null as string | null,
+          estimateSampleSize: null as number | null,
+          slipContribution: null as number | null,
+          startedUnconsented: false,
         });
       }
+    }
+    /*
+     * Quantify the blocked links with the SAME engine the land workspace
+     * uses (#591): expected resolution from this company's own median
+     * durations per state, days-at-risk against the planned start, and the
+     * slip that survives the task's float. Two views of one programme must
+     * not report two different delays, so neither computes its own.
+     */
+    const { view } = await loadConsentView(app.db, req.companyId!, req.projectId!, {
+      horizonDays: q.days,
+      withObservations: true,
+    });
+    const quantified = new Map<string, (typeof view.tasks)[number]>();
+    for (const task of view.tasks) quantified.set(task.taskId, task);
+    for (const item of items) {
+      const task = quantified.get(item.taskId);
+      if (!task) continue;
+      const dep = task.dependencies.find((d) => d.kind === "permit" && d.id === item.permitId);
+      if (!dep) continue;
+      item.daysAtRisk = dep.daysAtRisk;
+      item.expectedResolutionDate = dep.expectedResolutionDate;
+      item.estimateSource = dep.estimateSource;
+      item.estimateSampleSize = dep.estimateSampleSize;
+      item.slipContribution = task.slipContribution;
+      item.startedUnconsented = task.startedUnconsented;
     }
     items.sort((a, b) => a.daysUntilStart - b.daysUntilStart);
     const blocked = items.filter((i) => i.blocked);
@@ -1175,6 +1236,22 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
         blockingPermits: new Set(blocked.map((i) => i.permitId)).size,
         criticalBlocked: blocked.filter((i) => i.isCritical).length,
         soonestBlockedStart: blocked[0]?.startDate ?? null,
+        /**
+         * Worst quantified slip among tasks a PERMIT blocks — not the
+         * programme-wide figure, which also carries land dependencies and
+         * belongs to the land workspace's consent view.
+         */
+        projectedSlipDays:
+          blocked.reduce<number | null>(
+            (worst, i) =>
+              i.slipContribution === null
+                ? worst
+                : worst === null
+                  ? i.slipContribution
+                  : Math.max(worst, i.slipContribution),
+            null,
+          ),
+        startedUnconsented: blocked.filter((i) => i.startedUnconsented).length,
       },
     };
   });
@@ -1516,8 +1593,16 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
           .where(inArray(localContentReadings.targetId, ids))
           .orderBy(asc(localContentReadings.readingDate), asc(localContentReadings.createdAt))
       : [];
+    /*
+     * A superseded reading is a figure that was WITHDRAWN. It stays on file
+     * because a regulator asks what was once reported, but it is never the
+     * current position: a correction dated earlier than the reading it
+     * replaces would otherwise leave the withdrawn (later-dated) figure
+     * standing as "latest".
+     */
+    const current = readings.filter((r) => r.supersededById === null);
     const latest = new Map<string, (typeof readings)[number]>();
-    for (const r of readings) latest.set(r.targetId, r); // ascending — last wins
+    for (const r of current) latest.set(r.targetId, r); // ascending — last wins
     const items = rows.map((target) => {
       const reading = latest.get(target.id) ?? null;
       return {
@@ -1527,7 +1612,10 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
         compliant: reading ? reading.compliant === 1 : null,
         // positive gap = distance still to travel to reach the target
         gap: reading ? round2(target.targetValue - reading.value) : null,
-        readingCount: readings.filter((r) => r.targetId === target.id).length,
+        readingCount: current.filter((r) => r.targetId === target.id).length,
+        supersededCount: readings.filter(
+          (r) => r.targetId === target.id && r.supersededById !== null,
+        ).length,
       };
     });
     return paginate(items, Number(totalRow?.n ?? 0), q);
@@ -1604,12 +1692,17 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
         ...r,
         gap: round2(target.targetValue - r.value),
         compliantBool: r.compliant === 1,
+        superseded: r.supersededById !== null,
       }));
+      // The trail keeps withdrawn figures visible; the counts describe the
+      // position that stands, so a corrected breach is not counted twice.
+      const live = items.filter((r) => !r.superseded);
       return {
         target,
         items,
-        total: items.length,
-        breaches: items.filter((r) => !r.compliantBool).length,
+        total: live.length,
+        supersededCount: items.length - live.length,
+        breaches: live.filter((r) => !r.compliantBool).length,
       };
     },
   );

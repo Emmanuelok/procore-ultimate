@@ -23,6 +23,7 @@ import {
   EmptyState,
   ErrorAlert,
   Field,
+  Input,
   Modal,
   Select,
   Spinner,
@@ -189,6 +190,9 @@ export default function CaptureTab({
         onInspect={(id) => setOpenLessonId(id)}
         onApplied={() => void load()}
       />
+
+      {/* --------------- the reverse question: what did we learn? -------------- */}
+      <ForRecordPanel projectId={projectId} onInspect={(id) => setOpenLessonId(id)} />
 
       {/* ------------------------------ the lifecycle ------------------------- */}
       <Card>

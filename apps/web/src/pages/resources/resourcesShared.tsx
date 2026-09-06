@@ -13,9 +13,9 @@
  *     records no standard working day — is "—" with that sentence attached,
  *     never an assumed eight-hour division.
  */
-import { useCallback, useState, type ReactNode } from "react";
+import { useCallback, useMemo, useState, type ReactNode } from "react";
 import { api, ApiClientError } from "../../lib/api";
-import { Alert, Badge, cx } from "../../ui";
+import { Alert, Badge, Combobox, cx } from "../../ui";
 import type { Tone } from "../../ui/tokens";
 import { useResource, type Loadable, type Paginated } from "../../layouts/project/lib";
 
@@ -58,6 +58,32 @@ export interface ResourceSkill {
   status: string;
   expires?: boolean;
   expiryNote?: string;
+}
+
+/**
+ * A bookable crew, worker or machine, as the booking picker sees it.
+ *
+ * This module keeps no second register of people or plant: the ids belong to
+ * workforce, timecards and equipment, and `/resources/subjects` reads them so
+ * a create form can offer real choices instead of asking somebody to type an
+ * internal id it gave them no way to discover.
+ */
+export interface BookableSubject {
+  kind: "crew" | "worker" | "equipment";
+  id: string;
+  reference: string;
+  label: string;
+  sublabel: string | null;
+}
+
+export interface ResourceTypeDetail extends ResourceType {
+  requiredSkills: ResourceSkill[];
+  usage: { demandRows: number; availabilityRows: number };
+  headcountBasis: string;
+}
+
+export interface ResourceSkillDetail extends ResourceSkill {
+  holderCount: number;
 }
 
 export interface ResourcePlan {
@@ -199,6 +225,8 @@ export interface Histogram {
     availableHours: number | null;
     overAllocatedCells: number;
     unknownSupplyCells: number;
+    /** Blank cells that actually carry planned hours — the ones that matter. */
+    unknownSupplyDemandCells?: number;
     peakWeekStart: string | null;
     peakDemandHours: number;
   };
@@ -766,6 +794,88 @@ export function Pill({ status, map }: { status: string; map: Record<string, Tone
   );
 }
 
+/**
+ * THE BOOKING PICKER.
+ *
+ * A booking, and a certification record, name a crew, a worker or a machine by
+ * its id in ITS OWN register — this module deliberately keeps no second copy
+ * of those records. Asking a human to type that id is not a create path
+ * anybody can use, so the picker reads the registers through
+ * `/resources/subjects` and offers real choices.
+ *
+ * Typing an id that is not offered still works: the register may hold
+ * something this project's filters exclude, and refusing the booking outright
+ * would lose the requirement that produced it. The typed value is used
+ * verbatim and the server has the final say.
+ */
+export function SubjectPicker({
+  projectId,
+  kind,
+  value,
+  onChange,
+  disabled,
+}: {
+  projectId: string;
+  kind: "crew" | "worker" | "equipment";
+  value: string;
+  onChange: (id: string) => void;
+  disabled?: boolean;
+}) {
+  const list = useResource<{ items: BookableSubject[]; total: number; reasons: string[] }>(
+    projectId ? `/api/v1/projects/${projectId}/resources/subjects?kind=${kind}&limit=500` : null,
+  );
+  const options = useMemo(
+    () =>
+      (list.data?.items ?? []).map((s) => ({
+        value: s.id,
+        label: s.label,
+        description: s.sublabel ?? undefined,
+        meta: s.reference,
+        keywords: [s.reference, s.id],
+      })),
+    [list.data],
+  );
+
+  const noun = kind === "equipment" ? "machine" : kind;
+  return (
+    <div className="space-y-1">
+      <Combobox
+        value={value === "" ? null : value}
+        onChange={(next) => onChange(next ?? "")}
+        options={options}
+        disabled={disabled}
+        clearable
+        allowCreate
+        createLabel={(q) => `Use “${q}” as a record id`}
+        onCreate={(q) => ({ value: q.trim(), label: q.trim(), description: "Typed id" })}
+        placeholder={
+          list.loading
+            ? `Loading ${noun}s…`
+            : `Search the ${noun} register, or paste an id…`
+        }
+        emptyMessage={
+          list.error
+            ? `The ${noun} register could not be read: ${list.error}. Paste the id instead.`
+            : `Nothing on this project's ${noun} register matches. Paste the id if you have it.`
+        }
+        aria-label={`${noun} to book`}
+      />
+      {list.data && list.data.reasons.length > 0 ? (
+        <ReasonList reasons={list.data.reasons} />
+      ) : null}
+      {list.data && list.data.items.length === 0 && !list.loading ? (
+        <p className="text-2xs text-content-subtle">
+          {kind === "crew"
+            ? "No crews are set up on this project yet — they are created in Timecards."
+            : kind === "worker"
+              ? "No active workers are enrolled on this project yet — they are enrolled in Workforce."
+              : "No plant is available to this project yet — machines are registered in Equipment."}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 /* ================================ Hooks =================================== */
 
 export function useAction(): {
@@ -804,18 +914,14 @@ const p = (projectId: string) => `/api/v1/projects/${projectId}`;
 
 export const resourcesApi = {
   /* library */
-  types: (params = "") => api.get<Paginated<ResourceType>>(`/api/v1/resource-types?${params}`),
   createType: (body: unknown) => api.post<ResourceType>("/api/v1/resource-types", body),
   patchType: (id: string, body: unknown) =>
     api.patch<ResourceType>(`/api/v1/resource-types/${id}`, body),
-  skills: (params = "") => api.get<Paginated<ResourceSkill>>(`/api/v1/resource-skills?${params}`),
   createSkill: (body: unknown) => api.post<ResourceSkill>("/api/v1/resource-skills", body),
+  patchSkill: (id: string, body: unknown) =>
+    api.patch<ResourceSkill>(`/api/v1/resource-skills/${id}`, body),
 
   /* plans */
-  plans: (projectId: string, params = "") =>
-    api.get<Paginated<ResourcePlan>>(`${p(projectId)}/resource-plans?${params}`),
-  plan: (projectId: string, id: string) =>
-    api.get<PlanDetail>(`${p(projectId)}/resource-plans/${id}`),
   createPlan: (projectId: string, body: unknown) =>
     api.post<PlanDetail>(`${p(projectId)}/resource-plans`, body),
   activatePlan: (projectId: string, id: string) =>
@@ -824,56 +930,28 @@ export const resourcesApi = {
     api.post<PlanDetail>(`${p(projectId)}/resource-plans/${id}/archive`, {}),
   derive: (projectId: string, id: string, body: unknown) =>
     api.post<DeriveResult>(`${p(projectId)}/resource-plans/${id}/derive`, body),
-  demand: (projectId: string, planId: string, params = "") =>
-    api.get<Paginated<DemandRow>>(`${p(projectId)}/resource-plans/${planId}/demand?${params}`),
   addDemand: (projectId: string, planId: string, body: unknown) =>
     api.post<DemandRow>(`${p(projectId)}/resource-plans/${planId}/demand`, body),
   deleteDemand: (projectId: string, planId: string, id: string) =>
     api.del<{ id: string }>(`${p(projectId)}/resource-plans/${planId}/demand/${id}`),
 
   /* supply */
-  availability: (projectId: string, params = "") =>
-    api.get<Paginated<AvailabilityRow>>(`${p(projectId)}/resource-availability?${params}`),
   setAvailability: (projectId: string, body: unknown) =>
     api.put<AvailabilityRow>(`${p(projectId)}/resource-availability`, body),
   bulkAvailability: (projectId: string, body: unknown) =>
     api.post<{ weeks: number }>(`${p(projectId)}/resource-availability/bulk`, body),
-  histogram: (projectId: string, params = "") =>
-    api.get<Histogram>(`${p(projectId)}/resources/histogram?${params}`),
-
   /* calendar */
-  assignments: (projectId: string, params = "") =>
-    api.get<Paginated<Assignment>>(`${p(projectId)}/resource-assignments?${params}`),
   createAssignment: (projectId: string, body: unknown) =>
     api.post<Assignment>(`${p(projectId)}/resource-assignments`, body),
   transitionAssignment: (projectId: string, id: string, action: string, body: unknown = {}) =>
     api.post<Assignment>(`${p(projectId)}/resource-assignments/${id}/${action}`, body),
-  calendar: (projectId: string, params: string) =>
-    api.get<CalendarView>(`${p(projectId)}/resources/calendar?${params}`),
-  utilisation: (projectId: string, params: string) =>
-    api.get<UtilisationView>(`${p(projectId)}/resources/utilisation?${params}`),
-
   /* productivity */
-  productivity: (projectId: string, params = "") =>
-    api.get<ProductivityReport>(`${p(projectId)}/resources/productivity?${params}`),
   snapshot: (projectId: string, body: unknown) =>
     api.post<{ rowsWritten: number }>(`${p(projectId)}/resources/productivity/snapshot`, body),
-  measuredMile: (projectId: string, params = "") =>
-    api.get<MeasuredMile>(`${p(projectId)}/resources/measured-mile?${params}`),
-  forecast: (projectId: string, params = "") =>
-    api.get<ForecastView>(`${p(projectId)}/resources/forecast?${params}`),
   keepForecast: (projectId: string, body: unknown) =>
     api.post<{ id: string }>(`${p(projectId)}/resources/forecast`, body),
 
   /* skills */
-  matrix: (projectId: string, params = "") =>
-    api.get<SkillsMatrix>(`${p(projectId)}/resources/skills-matrix?${params}`),
-  gaps: (projectId: string, params = "") =>
-    api.get<{ window: { from: string; to: string }; total: number; items: SkillGap[]; reasons: string[] }>(
-      `${p(projectId)}/resources/skill-gaps?${params}`,
-    ),
-  workerSkills: (projectId: string, params = "") =>
-    api.get<Paginated<WorkerSkillRow>>(`${p(projectId)}/worker-skills?${params}`),
   recordWorkerSkill: (projectId: string, body: unknown) =>
     api.post<WorkerSkillRow>(`${p(projectId)}/worker-skills`, body),
   verifyWorkerSkill: (projectId: string, id: string, body: unknown) =>

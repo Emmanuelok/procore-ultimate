@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, or } from "drizzle-orm";
 import { z } from "zod";
 import {
   assuranceActions,
@@ -11,6 +11,7 @@ import {
   evidence,
   files,
   gateReviews,
+  lessons,
   obligations,
   projects,
   stageGates,
@@ -66,6 +67,11 @@ import {
   sweepBenefitStatuses,
   sweepGateConditions,
 } from "./jobs.js";
+import {
+  assessLessonsReadiness,
+  lessonsGateApplies,
+  type LessonForGate,
+} from "./lessons.js";
 import { companyToolGate, isIndependentReviewer, visibleProjectIds } from "./gates.js";
 import { OPTIMISM_BIAS_TABLE, referenceClassForecast, upliftFor } from "../risk/optimism.js";
 import { referenceProjects } from "@constructos/db";
@@ -191,6 +197,8 @@ const gateCreateSchema = z.object({
     .min(1)
     .max(100),
   plannedDate: isoDateSchema.nullable().optional(),
+  /** lessons closure gate (#415): block "proceed" while lessons sit unvalidated */
+  lessonsRequired: z.boolean().optional(),
 });
 
 const gatePatchSchema = z.object({
@@ -208,6 +216,7 @@ const gatePatchSchema = z.object({
     .max(100)
     .optional(),
   plannedDate: isoDateSchema.nullable().optional(),
+  lessonsRequired: z.boolean().optional(),
 });
 
 const reviewCreateSchema = z.object({
@@ -712,6 +721,61 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
     return rows[0];
   }
 
+  /**
+   * Read the project's lessons and judge whether the stage's learning is
+   * closed. Lessons are the learning module's records; this reads the four
+   * fields the gate needs and nothing more, and it never writes to them —
+   * a governance gate does not get to edit the evidence it is judging.
+   *
+   * A lesson published company-wide has its `projectId` cleared but keeps
+   * `originProjectId`, so both are matched: publishing a lesson must not
+   * make it vanish from the gate that was waiting for it.
+   */
+  async function lessonsReadinessFor(companyId: string, projectId: string, required: boolean) {
+    const rows = await app.db
+      .select({
+        id: lessons.id,
+        number: lessons.number,
+        title: lessons.title,
+        status: lessons.status,
+        phase: lessons.phase,
+        projectId: lessons.projectId,
+        originProjectId: lessons.originProjectId,
+      })
+      .from(lessons)
+      .where(
+        and(
+          eq(lessons.companyId, companyId),
+          or(eq(lessons.projectId, projectId), eq(lessons.originProjectId, projectId)),
+        ),
+      )
+      .orderBy(asc(lessons.number))
+      .limit(500);
+    const mine: LessonForGate[] = rows.map((l) => ({
+      id: l.id,
+      number: l.number,
+      title: l.title,
+      status: l.status,
+      phase: l.phase,
+    }));
+    return assessLessonsReadiness(mine, { required });
+  }
+
+  app.get(
+    "/projects/:projectId/stage-gates/:gateId/lessons-readiness",
+    { preHandler: readGate },
+    async (req) => {
+      const { gateId } = req.params as { gateId: string };
+      const gate = await fetchGate(gateId, req.companyId!, req.projectId!);
+      const readiness = await lessonsReadinessFor(
+        req.companyId!,
+        req.projectId!,
+        gate.lessonsRequired,
+      );
+      return { gateId: gate.id, gateNumber: gate.gateNumber, ...readiness };
+    },
+  );
+
   app.post("/projects/:projectId/stage-gates", { preHandler: standardGate }, async (req, reply) => {
     const body = gateCreateSchema.parse(req.body);
     // The check-then-insert below is a race against stage_gates_uq: two
@@ -746,6 +810,7 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
         description: body.description ?? null,
         criteria,
         plannedDate: body.plannedDate ?? null,
+        lessonsRequired: body.lessonsRequired ?? false,
         status: "pending",
       })
       .onConflictDoNothing({ target: [stageGates.projectId, stageGates.gateNumber] })
@@ -822,6 +887,7 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
     if (body.name !== undefined) set.name = body.name;
     if (body.description !== undefined) set.description = body.description;
     if (body.plannedDate !== undefined) set.plannedDate = body.plannedDate;
+    if (body.lessonsRequired !== undefined) set.lessonsRequired = body.lessonsRequired;
     if (body.criteria !== undefined) {
       set.criteria = body.criteria.map(
         (c): GateCriterion => ({
@@ -888,6 +954,23 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
             `Grant an assurance role (integrity_reviewer or auditor) to the reviewer, or have a ` +
             `company owner or admin record the decision.`,
         );
+      }
+
+      // Lessons closure gate (#415): a gate that carries the requirement may
+      // not be decided to PROCEED while the stage's learning is unresolved.
+      // `stop` and `hold` are never blocked — refusing to let a project stop
+      // until its paperwork is tidy would be the wrong incentive entirely.
+      if (gate.lessonsRequired && lessonsGateApplies(body.decision)) {
+        const readiness = await lessonsReadinessFor(
+          req.companyId!,
+          req.projectId!,
+          gate.lessonsRequired,
+        );
+        if (!readiness.ready) {
+          throw conflict(
+            `This gate carries a lessons closure requirement. ${readiness.reasons.join(" ")}`,
+          );
+        }
       }
 
       const knownIds = new Set(criteria.map((c) => c.id));

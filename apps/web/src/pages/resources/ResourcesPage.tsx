@@ -14,19 +14,22 @@
  *   Productivity  earned hours against actual by week, trade and crew; the
  *                 measured mile; hours at completion
  *   Skills        the certification matrix and who is booked without a ticket
+ *   Library       the trades, plant classes and tickets everything else keys
+ *                 off — on a fresh company this is where the work starts
  */
 import { useCallback, useState } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
 import { Badge, PageHeader, Stat, Tabs } from "../../ui";
 import { IconUsers } from "../../ui/icons";
 import CalendarTab from "./CalendarTab";
+import LibraryTab from "./LibraryTab";
 import OverviewTab from "./OverviewTab";
 import PlanTab from "./PlanTab";
 import ProductivityTab from "./ProductivityTab";
 import SkillsTab from "./SkillsTab";
 import { count, factor, hours, shortDate, useSummary } from "./resourcesShared";
 
-type TabKey = "overview" | "plan" | "calendar" | "productivity" | "skills";
+type TabKey = "overview" | "plan" | "calendar" | "productivity" | "skills" | "library";
 
 const TABS: Array<{ value: TabKey; label: string }> = [
   { value: "overview", label: "Overview" },
@@ -34,6 +37,7 @@ const TABS: Array<{ value: TabKey; label: string }> = [
   { value: "calendar", label: "Calendar" },
   { value: "productivity", label: "Productivity" },
   { value: "skills", label: "Skills & tickets" },
+  { value: "library", label: "Library" },
 ];
 
 const isTabKey = (value: string | null): value is TabKey =>
@@ -192,6 +196,7 @@ export default function ResourcesPage() {
         <ProductivityTab projectId={projectId} onChanged={summary.reload} />
       ) : null}
       {tab === "skills" ? <SkillsTab projectId={projectId} onChanged={summary.reload} /> : null}
+      {tab === "library" ? <LibraryTab projectId={projectId} onChanged={summary.reload} /> : null}
     </div>
   );
 }

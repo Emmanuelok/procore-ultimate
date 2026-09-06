@@ -208,7 +208,21 @@ export interface StageGateRow {
   criteria: GateCriterion[];
   plannedDate: string | null;
   status: string; // pending | in_review | decided
+  /** lessons closure gate (#415): proceed is blocked while lessons are unvalidated */
+  lessonsRequired?: boolean;
   latestReview?: { decision: string; rag: string; reviewDate: string } | null;
+}
+
+/** GET /stage-gates/:id/lessons-readiness */
+export interface LessonsReadiness {
+  gateId: string;
+  gateNumber: number;
+  required: boolean;
+  capturedCount: number;
+  closedCount: number;
+  outstanding: Array<{ id: string; number: string; title: string; status: string }>;
+  ready: boolean;
+  reasons: string[];
 }
 
 export interface StageGateDetail extends StageGateRow {

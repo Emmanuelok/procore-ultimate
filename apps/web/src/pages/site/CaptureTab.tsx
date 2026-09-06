@@ -7,7 +7,7 @@
  * deviation report against an unregistered scan reads "not assessable" with
  * the reason — never "within tolerance".
  */
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { toast } from "sonner";
 import { Alert, Badge, Button, Card, CardBody, Drawer, Field, Input, Select, Textarea } from "../../ui";
 import { DataTable, type DataColumns } from "../../ui/data";
@@ -571,6 +571,8 @@ function FlightsPanel({ base, lookups, onChanged }: { base: string; lookups: Sit
   const list = useResource<ListResponse<FlightRow>>(`${base}/flights?pageSize=200`);
   const action = useAction();
   const [open, setOpen] = useState(false);
+  /** the flight whose PLAN is being corrected, or null for a new one */
+  const [editing, setEditing] = useState<FlightRow | null>(null);
 
   const columns = useMemo<DataColumns<FlightRow>>(
     () => [
@@ -631,7 +633,14 @@ function FlightsPanel({ base, lookups, onChanged }: { base: string; lookups: Sit
           title="Drone flights"
           hint="A flight cannot be recorded as flown while its airspace or landowner permission is pending or refused. The permission is the control, so the platform will not let the record imply one that was never obtained."
           actions={
-            <Button size="sm" icon={IconPlus} onClick={() => setOpen(true)}>
+            <Button
+              size="sm"
+              icon={IconPlus}
+              onClick={() => {
+                setEditing(null);
+                setOpen(true);
+              }}
+            >
               Plan a flight
             </Button>
           }
@@ -649,6 +658,18 @@ function FlightsPanel({ base, lookups, onChanged }: { base: string; lookups: Sit
           rowTone={(row) => (row.permissionStatus === "refused" ? "danger" : row.permissionStatus === "pending" ? "warning" : undefined)}
           rowActions={(row) => (
             <span className="flex gap-1">
+              {row.status === "flown" || row.status === "processed" ? null : (
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  onClick={() => {
+                    setEditing(row);
+                    setOpen(true);
+                  }}
+                >
+                  Correct the plan
+                </Button>
+              )}
               {row.permissionStatus === "pending" ? (
                 <Button size="xs" variant="ghost" onClick={() => void grant(row)}>
                   Record permission
@@ -665,7 +686,13 @@ function FlightsPanel({ base, lookups, onChanged }: { base: string; lookups: Sit
             title: "No drone flights",
             description: "Plan the flight, record the permission, then record what was captured. Each step is a record somebody can be asked about later.",
             action: (
-              <Button size="sm" onClick={() => setOpen(true)}>
+              <Button
+                size="sm"
+                onClick={() => {
+                  setEditing(null);
+                  setOpen(true);
+                }}
+              >
                 Plan the first flight
               </Button>
             ),
@@ -674,10 +701,15 @@ function FlightsPanel({ base, lookups, onChanged }: { base: string; lookups: Sit
         <FlightForm
           base={base}
           lookups={lookups}
+          record={editing}
           open={open}
-          onClose={() => setOpen(false)}
-          onCreated={() => {
+          onClose={() => {
             setOpen(false);
+            setEditing(null);
+          }}
+          onSaved={() => {
+            setOpen(false);
+            setEditing(null);
             list.reload();
             onChanged();
           }}
@@ -687,18 +719,30 @@ function FlightsPanel({ base, lookups, onChanged }: { base: string; lookups: Sit
   );
 }
 
+/** The local-datetime value an `<input type="datetime-local">` needs, from an ISO instant. */
+function localDateTimeValue(iso: string | null | undefined): string {
+  if (!iso) return "";
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return "";
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}T${pad(at.getHours())}:${pad(at.getMinutes())}`;
+}
+
 function FlightForm({
   base,
   lookups,
+  record,
   open,
   onClose,
-  onCreated,
+  onSaved,
 }: {
   base: string;
   lookups: SiteLookups;
+  /** the flight plan being corrected, or null for a new one */
+  record: FlightRow | null;
   open: boolean;
   onClose: () => void;
-  onCreated: () => void;
+  onSaved: () => void;
 }) {
   const action = useAction();
   const [purpose, setPurpose] = useState("progress");
@@ -709,26 +753,71 @@ function FlightForm({
   const [plannedFor, setPlannedFor] = useState("");
   const [permissionStatus, setPermissionStatus] = useState("pending");
   const [permissionRef, setPermissionRef] = useState("");
+  const [airspaceNotes, setAirspaceNotes] = useState("");
+  const [maxAltitudeM, setMaxAltitudeM] = useState("");
+  const [riskAssessmentRef, setRiskAssessmentRef] = useState("");
+
+  // Prefill from the flight being corrected each time the drawer opens on a
+  // different one, so an edit starts from what is actually stored.
+  useEffect(() => {
+    if (!open) return;
+    setPurpose(record?.purpose ?? "progress");
+    setPilotName(record?.pilotName ?? "");
+    setPilotLicenceRef(record?.pilotLicenceRef ?? "");
+    setOperatorVendorId(record?.operatorVendorId ?? "");
+    setAircraft(record?.aircraft ?? "");
+    setPlannedFor(localDateTimeValue(record?.plannedFor));
+    setPermissionStatus(record?.permissionStatus ?? "pending");
+    setPermissionRef(record?.permissionRef ?? "");
+    setAirspaceNotes(record?.airspaceNotes ?? "");
+    setMaxAltitudeM(record?.maxAltitudeM === null || record?.maxAltitudeM === undefined ? "" : String(record.maxAltitudeM));
+    setRiskAssessmentRef(record?.riskAssessmentRef ?? "");
+  }, [open, record]);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
-    const payload: Record<string, unknown> = { purpose, permissionStatus };
-    if (pilotName.trim()) payload["pilotName"] = pilotName.trim();
-    if (pilotLicenceRef.trim()) payload["pilotLicenceRef"] = pilotLicenceRef.trim();
-    if (operatorVendorId) payload["operatorVendorId"] = operatorVendorId;
-    if (aircraft.trim()) payload["aircraft"] = aircraft.trim();
-    if (plannedFor) payload["plannedFor"] = new Date(plannedFor).toISOString();
-    if (permissionRef.trim()) payload["permissionRef"] = permissionRef.trim();
-    const r = await action.run("create", () => api.post<FlightRow>(`${base}/flights`, payload));
+    const payload: Record<string, unknown> = {
+      purpose,
+      permissionStatus,
+      pilotName: pilotName.trim() || null,
+      pilotLicenceRef: pilotLicenceRef.trim() || null,
+      operatorVendorId: operatorVendorId || null,
+      aircraft: aircraft.trim() || null,
+      plannedFor: plannedFor ? new Date(plannedFor).toISOString() : null,
+      permissionRef: permissionRef.trim() || null,
+      airspaceNotes: airspaceNotes.trim() || null,
+      maxAltitudeM: maxAltitudeM.trim() ? Number(maxAltitudeM) : null,
+      riskAssessmentRef: riskAssessmentRef.trim() || null,
+    };
+    // A new flight sends only what was filled in; a correction sends the
+    // cleared fields too, so emptying a box actually clears the record.
+    if (!record) {
+      for (const key of Object.keys(payload)) {
+        if (payload[key] === null) delete payload[key];
+      }
+    }
+    const r = record
+      ? await action.run("save", () => api.patch<FlightRow>(`${base}/flights/${record.id}`, payload))
+      : await action.run("save", () => api.post<FlightRow>(`${base}/flights`, payload));
     if (r) {
-      toast.success(`${r.reference} planned`);
-      setPilotName("");
-      onCreated();
+      toast.success(record ? `${r.reference} updated` : `${r.reference} planned`);
+      if (!record) setPilotName("");
+      onSaved();
     }
   }
 
   return (
-    <Drawer open={open} onClose={onClose} title="Plan a drone flight" size="sm">
+    <Drawer
+      open={open}
+      onClose={onClose}
+      title={record ? `Correct the plan for ${record.reference}` : "Plan a drone flight"}
+      description={
+        record
+          ? "The plan may be corrected until the flight is recorded as flown; after that the record is what happened, and only its outputs are added to."
+          : undefined
+      }
+      size="sm"
+    >
       <form onSubmit={(e) => void submit(e)} className="space-y-3">
         {action.refusal ? <RefusalNotice refusal={action.refusal} onDismiss={action.clear} /> : null}
         <ReasonList reasons={lookups.notes} />
@@ -773,15 +862,26 @@ function FlightForm({
             </Select>
           </Field>
         </div>
-        <Field label="Permission reference">
-          <Input value={permissionRef} onChange={(e) => setPermissionRef(e.target.value)} maxLength={200} />
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Permission reference">
+            <Input value={permissionRef} onChange={(e) => setPermissionRef(e.target.value)} maxLength={200} />
+          </Field>
+          <Field label="Risk assessment">
+            <Input value={riskAssessmentRef} onChange={(e) => setRiskAssessmentRef(e.target.value)} maxLength={200} />
+          </Field>
+          <Field label="Maximum altitude (m)">
+            <Input type="number" min={0} max={10000} step="1" value={maxAltitudeM} onChange={(e) => setMaxAltitudeM(e.target.value)} />
+          </Field>
+        </div>
+        <Field label="Airspace notes">
+          <Textarea rows={2} value={airspaceNotes} onChange={(e) => setAirspaceNotes(e.target.value)} />
         </Field>
         <div className="flex justify-end gap-2">
           <Button type="button" variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button type="submit" loading={action.busy === "create"}>
-            Plan
+          <Button type="submit" loading={action.busy === "save"}>
+            {record ? "Save" : "Plan"}
           </Button>
         </div>
       </form>

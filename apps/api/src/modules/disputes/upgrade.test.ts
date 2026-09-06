@@ -881,6 +881,203 @@ describe("outcome analytics and drafting recommendations", () => {
 });
 
 /* ------------------------------------------------------------------ */
+/* Redfern schedule — document production (#340-343)                   */
+/* ------------------------------------------------------------------ */
+
+describe("document production (Redfern schedule)", () => {
+  function post(url: string, payload?: unknown, headers = owner.headers) {
+    return app.inject({
+      method: "POST",
+      url: `/api/v1${url}`,
+      headers,
+      payload: payload as Record<string, unknown>,
+    });
+  }
+  function patchReq(url: string, payload: unknown, headers = owner.headers) {
+    return app.inject({
+      method: "PATCH",
+      url: `/api/v1${url}`,
+      headers,
+      payload: payload as Record<string, unknown>,
+    });
+  }
+  function get(url: string, headers = owner.headers) {
+    return app.inject({ method: "GET", url: `/api/v1${url}`, headers });
+  }
+
+  it("numbers requests per dispute and carries the four Redfern columns", async () => {
+    const pid = await makeProject("Redfern numbering");
+    const dispute = await createDispute(pid, { kind: "arbitration" });
+    const first = await post(`/projects/${pid}/disputes/${dispute.id}/production-requests`, {
+      requestingParty: "claimant",
+      documentsRequested: "All site diaries for weeks 20-32",
+      relevance: "Goes to the concurrency defence pleaded at paragraph 44",
+    });
+    expect(first.statusCode).toBe(201);
+    expect(first.json().number).toBe(1);
+
+    const second = await post(`/projects/${pid}/disputes/${dispute.id}/production-requests`, {
+      requestingParty: "respondent",
+      documentsRequested: "The claimant's internal tender build-up",
+      relevance: "Tests the alleged loss of margin",
+    });
+    expect(second.json().number).toBe(2);
+
+    // objection and reply are the other two columns; they belong to the row
+    const objected = await patchReq(
+      `/projects/${pid}/disputes/${dispute.id}/production-requests/${first.json().id}`,
+      {
+        objection: "Disproportionate: 13 weeks of diaries for a two-week window",
+        objectionGrounds: ["proportionality", "unreasonable_burden"],
+        reply: "Narrowed to weeks 24-26",
+      },
+    );
+    expect(objected.statusCode).toBe(200);
+    expect(objected.json().objectionGrounds).toEqual(["proportionality", "unreasonable_burden"]);
+
+    const listed = await get(`/projects/${pid}/disputes/${dispute.id}/production-requests`);
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json().items).toHaveLength(2);
+    expect(listed.json().summary.pending).toBe(2);
+    expect(listed.json().summary.objected).toBe(1);
+  });
+
+  it("a granted request needs a production date and raises an obligation the production satisfies", async () => {
+    const pid = await makeProject("Redfern ruling");
+    const dispute = await createDispute(pid, { kind: "arbitration" });
+    const created = await post(`/projects/${pid}/disputes/${dispute.id}/production-requests`, {
+      requestingParty: "claimant",
+      documentsRequested: "Weather records for the shutdown period",
+      relevance: "Supports the exceptional weather claim",
+    });
+    const reqId = created.json().id as string;
+
+    const undated = await post(
+      `/projects/${pid}/disputes/${dispute.id}/production-requests/${reqId}/decide`,
+      { decision: "granted" },
+    );
+    expect(undated.statusCode).toBe(400);
+    expect(undated.json().message).toMatch(/production date/i);
+
+    const due = addDaysISO(todayISO(), 14);
+    const granted = await post(
+      `/projects/${pid}/disputes/${dispute.id}/production-requests/${reqId}/decide`,
+      { decision: "granted_in_part", productionDueDate: due, decisionNote: "Limited to the shutdown weeks" },
+    );
+    expect(granted.statusCode).toBe(200);
+    expect(granted.json().decision).toBe("granted_in_part");
+    const obligationId = granted.json().obligationId as string;
+    expect(obligationId).toBeTruthy();
+
+    const oblRows = await app.db.select().from(obligations).where(eq(obligations.id, obligationId));
+    expect(oblRows[0]!.status).toBe("open");
+    expect(oblRows[0]?.deadline?.slice(0, 10)).toBe(due);
+
+    // a ruling is final: the schedule row closes for edits and re-rulings
+    const edit = await patchReq(
+      `/projects/${pid}/disputes/${dispute.id}/production-requests/${reqId}`,
+      { reply: "too late" },
+    );
+    expect(edit.statusCode).toBe(409);
+    const again = await post(
+      `/projects/${pid}/disputes/${dispute.id}/production-requests/${reqId}/decide`,
+      { decision: "refused" },
+    );
+    expect(again.statusCode).toBe(409);
+
+    const fileId = await insertFile(pid);
+    const produced = await post(
+      `/projects/${pid}/disputes/${dispute.id}/production-requests/${reqId}/produce`,
+      { fileIds: [fileId] },
+    );
+    expect(produced.statusCode).toBe(200);
+    expect(produced.json().producedFileIds).toEqual([fileId]);
+    const after = await app.db.select().from(obligations).where(eq(obligations.id, obligationId));
+    expect(after[0]!.status).toBe("satisfied");
+
+    const summary = (await get(`/projects/${pid}/disputes/${dispute.id}/production-requests`)).json();
+    expect(summary.summary.grantedInPart).toBe(1);
+    expect(summary.summary.awaitingProduction).toBe(0);
+  });
+
+  it("a refusal closes the row without an obligation and blocks production", async () => {
+    const pid = await makeProject("Redfern refusal");
+    const dispute = await createDispute(pid, { kind: "arbitration" });
+    const created = await post(`/projects/${pid}/disputes/${dispute.id}/production-requests`, {
+      requestingParty: "respondent",
+      documentsRequested: "Board minutes for the last five years",
+      relevance: "Fishing expedition, per the claimant",
+    });
+    const reqId = created.json().id as string;
+    const refused = await post(
+      `/projects/${pid}/disputes/${dispute.id}/production-requests/${reqId}/decide`,
+      { decision: "refused", decisionNote: "Not relevant or material" },
+    );
+    expect(refused.statusCode).toBe(200);
+    expect(refused.json().obligationId).toBeNull();
+
+    const fileId = await insertFile(pid);
+    const produce = await post(
+      `/projects/${pid}/disputes/${dispute.id}/production-requests/${reqId}/produce`,
+      { fileIds: [fileId] },
+    );
+    expect(produce.statusCode).toBe(400);
+  });
+
+  it("refuses a file from another project and refuses requests on a closed dispute", async () => {
+    const pid = await makeProject("Redfern scoping");
+    const elsewhere = await makeProject("Another project");
+    const dispute = await createDispute(pid, { kind: "arbitration" });
+    const created = await post(`/projects/${pid}/disputes/${dispute.id}/production-requests`, {
+      requestingParty: "claimant",
+      documentsRequested: "Subcontract package files",
+      relevance: "Quantum",
+    });
+    const reqId = created.json().id as string;
+    await post(`/projects/${pid}/disputes/${dispute.id}/production-requests/${reqId}/decide`, {
+      decision: "granted",
+      productionDueDate: addDaysISO(todayISO(), 7),
+    });
+    const foreignFile = await insertFile(elsewhere);
+    const produce = await post(
+      `/projects/${pid}/disputes/${dispute.id}/production-requests/${reqId}/produce`,
+      { fileIds: [foreignFile] },
+    );
+    expect(produce.statusCode).toBe(400);
+
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/disputes/${dispute.id}/status`,
+      headers: owner.headers,
+      payload: { status: "withdrawn", outcome: "Settled commercially" },
+    });
+    const late = await post(`/projects/${pid}/disputes/${dispute.id}/production-requests`, {
+      requestingParty: "claimant",
+      documentsRequested: "Anything at all",
+      relevance: "None",
+    });
+    expect(late.statusCode).toBe(400);
+  });
+
+  it("keeps the schedule invisible to another company", async () => {
+    const pid = await makeProject("Redfern isolation");
+    const dispute = await createDispute(pid, { kind: "arbitration" });
+    const stranger = await registerActor(app);
+    const read = await get(
+      `/projects/${pid}/disputes/${dispute.id}/production-requests`,
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(read.statusCode);
+    const write = await post(
+      `/projects/${pid}/disputes/${dispute.id}/production-requests`,
+      { requestingParty: "claimant", documentsRequested: "x", relevance: "y" },
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(write.statusCode);
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /* Tenant isolation                                                    */
 /* ------------------------------------------------------------------ */
 

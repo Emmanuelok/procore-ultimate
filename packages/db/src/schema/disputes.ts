@@ -275,3 +275,58 @@ export const settlementModels = pgTable(
   },
   (t) => [index("settlement_models_dispute_idx").on(t.disputeId)],
 );
+
+/**
+ * Redfern schedule (#340-343): the standard international-arbitration table
+ * for document production. One row per request, carrying the four columns a
+ * tribunal expects — what is asked for, why it is relevant and material,
+ * the objection, and the ruling — so the schedule can be produced as the
+ * document itself rather than rebuilt in a spreadsheet.
+ *
+ * Deliberately NOT modelled: automatic production of the documents a ruling
+ * grants. Granting a request tells a human what to add to the bundle; the
+ * platform will not decide on its own which files answer it.
+ */
+export const documentProductionRequests = pgTable(
+  "document_production_requests",
+  {
+    id: text("id").primaryKey(),
+    disputeId: text("dispute_id").notNull(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    /** sequential within the dispute — the schedule's request number */
+    number: integer("number").notNull(),
+    /** claimant | respondent — who is asking */
+    requestingParty: text("requesting_party").notNull(),
+    /** the documents or category of documents sought */
+    documentsRequested: text("documents_requested").notNull(),
+    /** the requesting party's relevance and materiality case (IBA Art. 3.3) */
+    relevance: text("relevance").notNull(),
+    /** the responding party's objection, if any */
+    objection: text("objection"),
+    /** grounds relied on, e.g. ["privilege", "proportionality", "commercially_sensitive"] */
+    objectionGrounds: jsonb("objection_grounds").$type<string[]>().default([]).notNull(),
+    /** the requesting party's reply to the objection */
+    reply: text("reply"),
+    /** pending | granted | granted_in_part | refused | withdrawn */
+    decision: text("decision").default("pending").notNull(),
+    decisionNote: text("decision_note"),
+    decidedAt: text("decided_at"),
+    decidedBy: text("decided_by"),
+    /** date by which granted documents must be produced */
+    productionDueDate: text("production_due_date"),
+    /** ids of dispute_bundles items or files produced in answer */
+    producedFileIds: jsonb("produced_file_ids").$type<string[]>().default([]).notNull(),
+    /** obligation raised for the production deadline, when one was set */
+    obligationId: text("obligation_id"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("document_production_requests_uq").on(t.disputeId, t.number),
+    index("document_production_requests_dispute_idx").on(t.disputeId),
+    index("document_production_requests_project_idx").on(t.projectId),
+    index("document_production_requests_decision_idx").on(t.companyId, t.decision),
+  ],
+);

@@ -26,13 +26,14 @@ import {
   Field,
   Input,
   Modal,
+  SegmentedControl,
   Select,
   Table,
   Td,
   Th,
   type DataColumns,
 } from "../../ui";
-import { IconGantt, IconPlus, IconRefresh, IconZap } from "../../ui/icons";
+import { IconGantt, IconPlus, IconRefresh, IconTrash, IconZap } from "../../ui/icons";
 import {
   HISTOGRAM_STATE_LABEL,
   HISTOGRAM_STATE_TONE,
@@ -77,17 +78,32 @@ export default function PlanTab({
   const [supplyOpen, setSupplyOpen] = useState(false);
   const [nonce, setNonce] = useState(0);
 
-  const from = mondayOf(todayIso());
-  const to = shiftIso(from, 12 * 7);
-
   const plans = useResource<Paginated<ResourcePlan>>(
     `/api/v1/projects/${projectId}/resource-plans?pageSize=100&_=${nonce}`,
   );
-  const histogram = useResource<Histogram>(
-    `/api/v1/projects/${projectId}/resources/histogram?from=${from}&to=${to}&_=${nonce}`,
-  );
   const types = useResource<Paginated<ResourceType>>(
-    `/api/v1/resource-types?pageSize=200&status=active&projectId=${projectId}`,
+    `/api/v1/resource-types?pageSize=200&status=active&projectId=${projectId}&_=${nonce}`,
+  );
+
+  /* The histogram window.
+     Defaulting to "the next twelve weeks" hides a plan whose period sits
+     further out or already in the past, and the chart then reads as empty
+     when it is only out of shot. So the default follows the ACTIVE plan's
+     period when it has one, and both ends are editable. */
+  const [windowFrom, setWindowFrom] = useState<string | null>(null);
+  const [windowTo, setWindowTo] = useState<string | null>(null);
+  const activePlan =
+    plans.data?.items.find((pl) => pl.status === "active" && pl.planKind === "current") ?? null;
+  const defaultFrom = activePlan?.periodStart ?? mondayOf(todayIso());
+  const defaultTo = activePlan?.periodEnd ?? shiftIso(mondayOf(todayIso()), 12 * 7);
+  const from = windowFrom ?? defaultFrom;
+  const to = windowTo ?? defaultTo;
+  const windowInverted = to < from;
+
+  const histogram = useResource<Histogram>(
+    windowInverted
+      ? null
+      : `/api/v1/projects/${projectId}/resources/histogram?from=${from}&to=${to}&_=${nonce}`,
   );
 
   const reload = () => {
@@ -203,11 +219,29 @@ export default function PlanTab({
         </CardBody>
       </Card>
 
+      {types.data && types.data.items.length === 0 ? (
+        <Alert tone="warning" size="sm" title="No trades or plant classes exist yet">
+          A demand plan buckets by resource type, so deriving one is refused until at least one
+          exists. Open the Library tab to create the trades and plant classes this project is
+          resourced in.
+        </Alert>
+      ) : null}
+
       <HistogramPanel
         histogram={histogram.data}
         loading={histogram.loading}
         error={histogram.error}
         onRetry={histogram.reload}
+        from={from}
+        to={to}
+        inverted={windowInverted}
+        defaultedToPlan={windowFrom === null && windowTo === null && activePlan !== null}
+        onFrom={setWindowFrom}
+        onTo={setWindowTo}
+        onReset={() => {
+          setWindowFrom(null);
+          setWindowTo(null);
+        }}
       />
 
       <CreatePlanModal
@@ -252,16 +286,70 @@ function HistogramPanel({
   loading,
   error,
   onRetry,
+  from,
+  to,
+  inverted,
+  defaultedToPlan,
+  onFrom,
+  onTo,
+  onReset,
 }: {
   histogram: Histogram | null;
   loading: boolean;
   error: string | null;
   onRetry: () => void;
+  from: string;
+  to: string;
+  inverted: boolean;
+  defaultedToPlan: boolean;
+  onFrom: (value: string) => void;
+  onTo: (value: string) => void;
+  onReset: () => void;
 }) {
-  if (error) return <LoadError message={error} onRetry={onRetry} />;
+  const windowControls = (
+    <div className="flex flex-wrap items-end gap-2">
+      <Field label="From" className="w-40">
+        <Input type="date" value={from} onChange={(e) => onFrom(e.target.value)} />
+      </Field>
+      <Field label="To" className="w-40">
+        <Input type="date" value={to} onChange={(e) => onTo(e.target.value)} />
+      </Field>
+      <Button size="xs" variant="ghost" onClick={onReset}>
+        Reset
+      </Button>
+      {defaultedToPlan ? (
+        <span className="pb-2 text-2xs text-content-subtle">Showing the active plan's period</span>
+      ) : null}
+    </div>
+  );
+
+  if (inverted) {
+    return (
+      <Card>
+        <CardHeader title="Demand against supply, week by week" actions={windowControls} />
+        <CardBody>
+          <Alert tone="warning" size="sm" title="That window runs backwards">
+            The end of the window is before its start, so nothing was requested. Move one of the
+            two dates.
+          </Alert>
+        </CardBody>
+      </Card>
+    );
+  }
+  if (error) {
+    return (
+      <Card>
+        <CardHeader title="Demand against supply, week by week" actions={windowControls} />
+        <CardBody>
+          <LoadError message={error} onRetry={onRetry} />
+        </CardBody>
+      </Card>
+    );
+  }
   if (loading && !histogram) {
     return (
       <Card>
+        <CardHeader title="Demand against supply, week by week" actions={windowControls} />
         <CardBody>
           <div className="py-8 text-center text-meta text-content-subtle">Building the histogram…</div>
         </CardBody>
@@ -283,12 +371,15 @@ function HistogramPanel({
             : "No active plan"
         }
         actions={
-          <div className="flex flex-wrap items-center gap-2 text-2xs">
-            {(["over", "tight", "ok", "idle", "unknown"] as const).map((state) => (
-              <Badge key={state} tone={HISTOGRAM_STATE_TONE[state]} size="xs" dot>
-                {HISTOGRAM_STATE_LABEL[state]}
-              </Badge>
-            ))}
+          <div className="flex flex-col items-end gap-2">
+            {windowControls}
+            <div className="flex flex-wrap items-center gap-2 text-2xs">
+              {(["over", "tight", "ok", "idle", "unknown"] as const).map((state) => (
+                <Badge key={state} tone={HISTOGRAM_STATE_TONE[state]} size="xs" dot>
+                  {HISTOGRAM_STATE_LABEL[state]}
+                </Badge>
+              ))}
+            </div>
           </div>
         }
       />
@@ -634,8 +725,19 @@ function PlanDrawer({
             </CardBody>
           </Card>
 
+          <AddDemandCard
+            projectId={projectId}
+            planId={p.id}
+            types={types}
+            disabled={p.status === "superseded" || p.status === "archived"}
+            onAdded={bump}
+          />
+
           <Card>
-            <CardHeader title="Every demand row" subtitle="Derived rows carry the activity they came from" />
+            <CardHeader
+              title="Every demand row"
+              subtitle="Derived rows carry the activity they came from. Deleting a row rewrites the plan's totals."
+            />
             <CardBody flush>
               {demand.error ? (
                 <div className="p-3">
@@ -651,6 +753,7 @@ function PlanDrawer({
                         <Th align="right">Hours</Th>
                         <Th align="right">People</Th>
                         <Th>Source</Th>
+                        <Th />
                       </tr>
                     </thead>
                     <tbody>
@@ -664,6 +767,25 @@ function PlanDrawer({
                             <Badge tone={d.source === "schedule" ? "info" : "neutral"} size="xs">
                               {titleCase(d.source)}
                             </Badge>
+                          </Td>
+                          <Td align="right">
+                            <Button
+                              size="xs"
+                              variant="ghost"
+                              icon={IconTrash}
+                              aria-label={`Delete the ${d.resourceTypeName ?? "demand"} row for the week of ${dateOnly(d.weekStart)}`}
+                              loading={action.busy === `del-${d.id}`}
+                              disabled={p.status === "superseded" || p.status === "archived"}
+                              onClick={async () => {
+                                const res = await action.run(`del-${d.id}`, () =>
+                                  resourcesApi.deleteDemand(projectId, p.id, d.id),
+                                );
+                                if (res) {
+                                  toast.success("Row deleted");
+                                  bump();
+                                }
+                              }}
+                            />
                           </Td>
                         </tr>
                       ))}
@@ -685,6 +807,115 @@ function PlanDrawer({
         </div>
       )}
     </Drawer>
+  );
+}
+
+/**
+ * A demand row entered by hand.
+ *
+ * The programme does not model everything a job needs — a banksman, a
+ * traffic marshal, a week of standby plant — and a plan that could only ever
+ * hold what the schedule knows about would understate the peak it is drawn to
+ * find. Manual rows survive every re-derive; only rows sourced from the
+ * schedule are replaced.
+ */
+function AddDemandCard({
+  projectId,
+  planId,
+  types,
+  disabled,
+  onAdded,
+}: {
+  projectId: string;
+  planId: string;
+  types: ResourceType[];
+  disabled: boolean;
+  onAdded: () => void;
+}) {
+  const action = useAction();
+  const [typeId, setTypeId] = useState("");
+  const [weekStart, setWeekStart] = useState(mondayOf(todayIso()));
+  const [demandHours, setDemandHours] = useState("40");
+  const [basis, setBasis] = useState("");
+
+  return (
+    <Card>
+      <CardHeader
+        title="Add a row by hand"
+        subtitle="For the work the programme does not model. Manual rows are never touched by a re-derive."
+      />
+      <CardBody className="space-y-3">
+        {action.error ? (
+          <Alert tone="danger" size="sm" onDismiss={action.clear}>
+            {action.error}
+          </Alert>
+        ) : null}
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Trade or plant class" required>
+            <Select value={typeId} onChange={(e) => setTypeId(e.target.value)}>
+              <option value="">Choose…</option>
+              {types.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.code} — {t.name}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field label="Week beginning" hint="Normalised to the plan's own week boundary.">
+            <Input
+              type="date"
+              value={weekStart}
+              onChange={(e) => setWeekStart(e.target.value)}
+            />
+          </Field>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Hours that week" required>
+            <Input
+              type="number"
+              value={demandHours}
+              onChange={(e) => setDemandHours(e.target.value)}
+            />
+          </Field>
+          <Field label="Why" hint="Kept on the row so a peak can always be explained.">
+            <Input
+              value={basis}
+              onChange={(e) => setBasis(e.target.value)}
+              placeholder="Traffic marshal for the crane lifts"
+            />
+          </Field>
+        </div>
+        <Button
+          size="sm"
+          icon={IconPlus}
+          loading={action.busy === "add"}
+          disabled={disabled || typeId === "" || demandHours.trim() === ""}
+          onClick={async () => {
+            const res = await action.run("add", () =>
+              resourcesApi.addDemand(projectId, planId, {
+                resourceTypeId: typeId,
+                weekStart,
+                demandHours: Number(demandHours),
+                ...(basis.trim() ? { basis: basis.trim() } : {}),
+              }),
+            );
+            if (res) {
+              toast.success("Demand row added");
+              setBasis("");
+              onAdded();
+            }
+          }}
+        >
+          Add row
+        </Button>
+        {disabled ? (
+          <p className="text-2xs text-content-subtle">
+            This plan is superseded or archived, so its rows are read-only. Versions are kept as
+            they stood.
+          </p>
+        ) : null}
+      </CardBody>
+    </Card>
   );
 }
 
@@ -777,11 +1008,14 @@ function SupplyModal({
 }) {
   const action = useAction();
   const today = mondayOf(todayIso());
+  const [mode, setMode] = useState<"term" | "week">("term");
   const [typeId, setTypeId] = useState("");
   const [from, setFrom] = useState(today);
   const [to, setTo] = useState(shiftIso(today, 12 * 7));
   const [availableHours, setAvailableHours] = useState("200");
+  const [availableHeadcount, setAvailableHeadcount] = useState("");
   const [source, setSource] = useState("roster");
+  const [note, setNote] = useState("");
 
   const existing = useResource<Paginated<AvailabilityRow>>(
     open && typeId
@@ -806,14 +1040,27 @@ function SupplyModal({
             loading={action.busy === "save"}
             disabled={typeId === "" || Number.isNaN(Number(availableHours))}
             onClick={async () => {
+              const shared = {
+                resourceTypeId: typeId,
+                availableHours: Number(availableHours),
+                source,
+                ...(availableHeadcount.trim()
+                  ? { availableHeadcount: Number(availableHeadcount) }
+                  : {}),
+                ...(note.trim() ? { note: note.trim() } : {}),
+              };
+              if (mode === "week") {
+                const res = await action.run("save", () =>
+                  resourcesApi.setAvailability(projectId, { ...shared, weekStart: from }),
+                );
+                if (res) {
+                  toast.success(`Week of ${dateOnly(res.weekStart)} set`);
+                  onSaved();
+                }
+                return;
+              }
               const res = await action.run("save", () =>
-                resourcesApi.bulkAvailability(projectId, {
-                  resourceTypeId: typeId,
-                  from,
-                  to,
-                  availableHours: Number(availableHours),
-                  source,
-                }),
+                resourcesApi.bulkAvailability(projectId, { ...shared, from, to }),
               );
               if (res) {
                 toast.success(`${res.weeks} weeks set`);
@@ -821,7 +1068,7 @@ function SupplyModal({
               }
             }}
           >
-            Set supply
+            {mode === "week" ? "Set this week" : "Set supply"}
           </Button>
         </div>
       }
@@ -832,6 +1079,15 @@ function SupplyModal({
             {action.error}
           </Alert>
         ) : null}
+        <SegmentedControl
+          value={mode}
+          onChange={(next) => setMode(next)}
+          options={[
+            { value: "term", label: "A term of weeks" },
+            { value: "week", label: "One week" },
+          ]}
+          aria-label="How much of the calendar this statement covers"
+        />
         <Field label="Trade or plant class" required>
           <Select value={typeId} onChange={(e) => setTypeId(e.target.value)}>
             <option value="">Choose…</option>
@@ -843,15 +1099,29 @@ function SupplyModal({
           </Select>
         </Field>
         <div className="grid grid-cols-2 gap-3">
-          <Field label="From (week beginning)">
+          <Field label={mode === "week" ? "Week beginning" : "From (week beginning)"}>
             <Input type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
           </Field>
-          <Field label="To">
-            <Input type="date" value={to} onChange={(e) => setTo(e.target.value)} />
-          </Field>
+          {mode === "term" ? (
+            <Field label="To">
+              <Input type="date" value={to} onChange={(e) => setTo(e.target.value)} />
+            </Field>
+          ) : (
+            <Field
+              label="People available"
+              hint="Optional. Left blank, headcount for this week reads “—”."
+            >
+              <Input
+                type="number"
+                value={availableHeadcount}
+                onChange={(e) => setAvailableHeadcount(e.target.value)}
+                placeholder="—"
+              />
+            </Field>
+          )}
         </div>
         <div className="grid grid-cols-2 gap-3">
-          <Field label="Hours available each week">
+          <Field label={mode === "week" ? "Hours available that week" : "Hours available each week"}>
             <Input
               type="number"
               value={availableHours}
@@ -870,6 +1140,9 @@ function SupplyModal({
             </Select>
           </Field>
         </div>
+        <Field label="Note" hint="Where the figure came from, so the next reader does not have to ask.">
+          <Input value={note} onChange={(e) => setNote(e.target.value)} />
+        </Field>
         {existing.data && existing.data.items.length > 0 ? (
           <div className="rounded-md border border-border-subtle p-2">
             <div className="mb-1 text-2xs font-semibold uppercase tracking-wide text-content-subtle">

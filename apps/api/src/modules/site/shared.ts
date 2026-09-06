@@ -190,29 +190,42 @@ export interface SiteSignalDraft {
 }
 
 /**
- * Dedupe keys already raised for these detectors in this project. Every key
- * this module mints names a record inside one project, so a per-project sweep
- * reads only that project's signals rather than the company's whole history.
+ * Which of these dedupe keys have already been raised for these detectors.
+ *
+ * `raiseSignal` writes the key to `signals.fingerprint` as well as into
+ * `evidenceRefs.key`, and (companyId, detector, fingerprint) is indexed — so
+ * when the caller knows the keys it is asking about (a sweep does: it has the
+ * rows in hand before it decides to raise anything) this is a point lookup
+ * over a handful of keys rather than a read of the company's whole signal
+ * history on every five-minute tick. Callers that cannot know the keys in
+ * advance fall back to the bounded scan.
  */
 export async function alreadySignalled(
   db: Db,
   companyId: string,
   detectors: readonly SiteDetector[],
-  projectId?: string | null,
+  options: { projectId?: string | null; keys?: readonly string[] } = {},
 ): Promise<Set<string>> {
+  const wanted = options.keys ? [...new Set(options.keys)] : null;
+  if (wanted && wanted.length === 0) return new Set();
   const rows = await db
-    .select({ refs: signals.evidenceRefs })
+    .select({ refs: signals.evidenceRefs, fingerprint: signals.fingerprint })
     .from(signals)
     .where(
       and(
         eq(signals.companyId, companyId),
-        projectId ? eq(signals.projectId, projectId) : undefined,
+        options.projectId ? eq(signals.projectId, options.projectId) : undefined,
         inArray(signals.detector, [...detectors]),
+        wanted ? inArray(signals.fingerprint, wanted) : undefined,
       ),
     )
-    .limit(20_000);
+    .limit(wanted ? wanted.length * 4 + 50 : 20_000);
   const keys = new Set<string>();
   for (const row of rows) {
+    // `fingerprint` is the fast path; `evidenceRefs.key` is what older rows
+    // carry, and reading both means a signal is never raised twice because
+    // the shape of the row changed.
+    if (typeof row.fingerprint === "string" && row.fingerprint.length > 0) keys.add(row.fingerprint);
     const refs = row.refs as { key?: unknown } | null;
     if (typeof refs?.key === "string") keys.add(refs.key);
   }

@@ -445,6 +445,75 @@ describe("regressions", () => {
     expect(a2?.quantityOnHand).toBe(10);
   });
 
+  it("adds up two lines of the same material rather than losing one", async () => {
+    const item = await post(`/projects/${projectA}/materials`, {
+      name: "Two-pallet rebar",
+      unit: "t",
+      quantityRequired: 40,
+      isTracked: true,
+    });
+    expect(item.statusCode).toBe(201);
+    const itemId = item.json().id as string;
+
+    // One delivery note, two lines of the SAME material — two pallets with
+    // different heat numbers, which is how steel actually arrives.
+    const delivery = await post(`/projects/${projectA}/material-deliveries`, {
+      supplierVendorId: vendorId,
+      lines: [
+        {
+          materialItemId: itemId,
+          description: "Pallet 1",
+          quantityExpected: 10,
+          unit: "t",
+          heatNumber: "H-1",
+        },
+        {
+          materialItemId: itemId,
+          description: "Pallet 2",
+          quantityExpected: 12,
+          unit: "t",
+          heatNumber: "H-2",
+        },
+      ],
+    });
+    expect(delivery.statusCode).toBe(201);
+    const deliveryId = delivery.json().id as string;
+    const lines = delivery.json().lines as Array<{ id: string; description: string }>;
+    const one = lines.find((l) => l.description === "Pallet 1")!;
+    const two = lines.find((l) => l.description === "Pallet 2")!;
+
+    const received = await post(
+      `/projects/${projectA}/material-deliveries/${deliveryId}/receive`,
+      {
+        createStockMovements: true,
+        lines: [
+          { lineId: one.id, quantityReceived: 10, quantityAccepted: 10, quantityRejected: 0 },
+          {
+            lineId: two.id,
+            quantityReceived: 12,
+            quantityAccepted: 11,
+            quantityRejected: 1,
+            rejectionReason: "one bundle out of tolerance",
+          },
+        ],
+      },
+    );
+    expect(received.statusCode).toBe(200);
+
+    const [row] = await app.db.select().from(materialItems).where(eq(materialItems.id, itemId));
+    // 10 + 12 delivered, 10 + 11 accepted, 0 + 1 rejected — the roll-up is the
+    // sum of the lines, not whichever line happened to be written last.
+    expect(row?.quantityDelivered).toBe(22);
+    expect(row?.quantityAccepted).toBe(21);
+    expect(row?.quantityRejected).toBe(1);
+    // Both receipts reached the compound, and the balance is their sum.
+    expect(row?.quantityOnHand).toBe(21);
+
+    const movements = received.json().stockMovements as Array<{ balanceAfter: number | null }>;
+    expect(movements).toHaveLength(2);
+    expect(movements.map((m) => m.balanceAfter)).toEqual([10, 21]);
+  });
+
   it("costs owned plant at its internal charge-out rate", async () => {
     const machineId = await makeMachine({
       name: "Owned dumper",

@@ -19,7 +19,15 @@ export const EQUIPMENT_DETECTORS = [
   "equipment_idle_on_hire",
   "equipment_meter_anomaly",
   "equipment_telematics_variance",
+  /* telematics intelligence — geofence, fuel and fault codes */
+  "equipment_off_site_use",
+  "equipment_fuel_unaccounted",
+  "equipment_fault_active",
   "material_stock_negative",
+  /* materials supply chain */
+  "material_order_by_date_missed",
+  "material_shortage_forecast",
+  "material_delivery_delayed",
 ] as const;
 export type EquipmentDetector = (typeof EQUIPMENT_DETECTORS)[number];
 

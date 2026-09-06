@@ -12,6 +12,7 @@ import { Badge, Card, CardBody, EmptyState, Table, Td, Th } from "../../ui";
 import { formatDate, humanize } from "../format";
 import { HBars, Meter, StackedBar, type Datum } from "./charts";
 import {
+  estimateBasisLabel,
   fmtMoney,
   fmtNum,
   fmtPercent,
@@ -130,10 +131,22 @@ export default function RapTab({
     value: rap.byVulnerability[f] ?? 0,
   }));
 
-  // Anything inside the signal horizon is what the banner is actually for.
+  /*
+   * What the banner is actually for: a dependency whose task starts inside
+   * the signal horizon, and — regardless of any horizon — a task that has
+   * ALREADY started while its parcel or permit is unresolved, which is the
+   * one thing re-planning cannot fix. A task with no planned start has no
+   * countdown; it is reported in the wider list rather than counted as
+   * "starts today", which is what reading the missing value as 0 did.
+   */
   const imminentItems = risk
-    ? risk.items.filter((i) => i.daysUntilStart <= risk.signalHorizonDays)
+    ? risk.items.filter(
+        (i) =>
+          i.startedUnconsented ||
+          (i.daysUntilStart !== null && i.daysUntilStart <= risk.signalHorizonDays),
+      )
     : [];
+  const slipDays = risk?.summary?.projectedSlipDays ?? null;
 
   return (
     <div className="space-y-4">
@@ -142,12 +155,12 @@ export default function RapTab({
         <div className="rounded-lg bg-red-50 p-4 ring-1 ring-red-200">
           <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
             <h3 className="text-sm font-semibold text-red-800">
-              Works about to start on land the project does not hold
+              Works about to start without the land or the consent in hand
               <span className="ml-1.5 font-normal text-red-500">(#591)</span>
             </h3>
             <span className="text-xs text-red-700">
-              <span className="font-semibold tabular-nums">{imminentItems.length}</span> task
-              {imminentItems.length === 1 ? "" : "s"} inside {risk.signalHorizonDays} days
+              <span className="font-semibold tabular-nums">{imminentItems.length}</span> dependenc
+              {imminentItems.length === 1 ? "y" : "ies"} inside {risk.signalHorizonDays} days
               {risk.alreadyStarted > 0 ? (
                 <> · {risk.alreadyStarted} already started</>
               ) : null}
@@ -160,43 +173,91 @@ export default function RapTab({
             </span>
           </div>
           <p className="mb-3 max-w-3xl text-xs text-red-700">
-            Each row is a schedule task whose land is still in acquisition. Starting works on land
-            the project has not lawfully acquired is the classic route to an injunction, a
-            community blockade and a lender safeguards finding — and the delay is almost never
-            recoverable from the contractor.
+            Each row is a schedule task whose land is still in acquisition or whose statutory
+            consent has not been granted. Starting works without either is the classic route to an
+            injunction, a community blockade and a lender safeguards finding — and the delay is
+            almost never recoverable from the contractor.
           </p>
+          {slipDays !== null && slipDays > 0 ? (
+            <p className="mb-3 max-w-3xl text-xs font-medium text-red-800">
+              Projected programme slip if nothing resolves sooner than typical:{" "}
+              <span className="tabular-nums">{slipDays}</span> day{slipDays === 1 ? "" : "s"}
+              {risk.summary.unquantifiedTasks > 0 ? (
+                <span className="font-normal">
+                  {" "}
+                  · {risk.summary.unquantifiedTasks} further task
+                  {risk.summary.unquantifiedTasks === 1 ? "" : "s"} carry no float figure, so their
+                  contribution is not quantified rather than guessed
+                </span>
+              ) : null}
+            </p>
+          ) : null}
           <Table>
             <thead>
               <tr>
-                <Th>Parcel</Th>
-                <Th>Acquisition status</Th>
+                <Th>Dependency</Th>
+                <Th>Status</Th>
                 <Th>Blocked task</Th>
                 <Th>Planned start</Th>
                 <Th className="text-right">Countdown</Th>
+                <Th className="text-right">Days at risk</Th>
               </tr>
             </thead>
             <tbody className="divide-y divide-ink-100">
               {imminentItems.map((r) => (
-                <tr key={`${r.parcelId}-${r.taskId}`} className="hover:bg-red-50/60">
+                <tr key={`${r.kind}-${r.dependencyId}-${r.taskId}`} className="hover:bg-red-50/60">
                   <Td>
-                    <button
-                      type="button"
-                      className="font-medium text-brand-700 hover:text-brand-800"
-                      onClick={() => onOpenParcel(r.parcelId)}
-                    >
-                      {r.reference}
-                    </button>
-                    {r.ownerName ? (
-                      <span className="ml-1.5 text-xs text-ink-400">{r.ownerName}</span>
+                    {r.kind === "parcel" && r.parcelId ? (
+                      <button
+                        type="button"
+                        className="font-medium text-brand-700 hover:text-brand-800"
+                        onClick={() => onOpenParcel(r.parcelId as string)}
+                      >
+                        {r.reference}
+                      </button>
+                    ) : (
+                      <span className="font-medium text-ink-800">{r.reference}</span>
+                    )}
+                    <Badge tone={r.kind === "permit" ? "amber" : "gray"} className="ml-1.5">
+                      {r.kind === "permit" ? "Permit" : "Parcel"}
+                    </Badge>
+                    <div className="text-xs text-ink-400">{r.label}</div>
+                  </Td>
+                  <Td>
+                    <Badge tone={r.kind === "parcel" ? parcelTone(r.status) : "amber"}>
+                      {humanize(r.status)}
+                    </Badge>
+                  </Td>
+                  <Td className="max-w-xs truncate">
+                    {r.taskName}
+                    {r.isCritical ? (
+                      <Badge tone="red" className="ml-1.5">
+                        Critical
+                      </Badge>
+                    ) : null}
+                    {r.startedUnconsented ? (
+                      <div className="text-xs font-medium text-red-700">
+                        works already started
+                      </div>
                     ) : null}
                   </Td>
-                  <Td>
-                    <Badge tone={parcelTone(r.status)}>{humanize(r.status)}</Badge>
-                  </Td>
-                  <Td className="max-w-xs truncate">{r.taskName}</Td>
-                  <Td className="tabular-nums">{formatDate(r.taskStart)}</Td>
+                  <Td className="tabular-nums">{r.taskStart ? formatDate(r.taskStart) : "—"}</Td>
                   <Td className="text-right font-medium tabular-nums text-red-700">
                     {startPhrase(r.daysUntilStart)}
+                  </Td>
+                  <Td
+                    className="text-right tabular-nums"
+                    title={`Expected to resolve ${r.expectedResolutionDate} — ${estimateBasisLabel(
+                      r.estimateSource,
+                      r.estimateSampleSize,
+                    )}. ${r.basis}`}
+                  >
+                    <span className={r.daysAtRisk > 0 ? "font-semibold text-red-700" : ""}>
+                      {r.daysAtRisk > 0 ? `${r.daysAtRisk}d` : "—"}
+                    </span>
+                    <div className="text-xs font-normal text-ink-400">
+                      {r.estimateSource === "observed_median" ? "from history" : "assumed"}
+                    </div>
                   </Td>
                 </tr>
               ))}
@@ -209,9 +270,10 @@ export default function RapTab({
             <Badge tone="amber">Watch</Badge>
             <span className="text-ink-700">
               <span className="font-semibold tabular-nums">{risk.blockedTasks}</span> task
-              {risk.blockedTasks === 1 ? "" : "s"} across {risk.blockedParcels} parcel
-              {risk.blockedParcels === 1 ? "" : "s"} still depend on land in acquisition, but none
-              starts inside {risk.signalHorizonDays} days.
+              {risk.blockedTasks === 1 ? "" : "s"} still depend on {risk.blockedParcels} parcel
+              {risk.blockedParcels === 1 ? "" : "s"} in acquisition and {risk.blockingPermits}{" "}
+              ungranted permit{risk.blockingPermits === 1 ? "" : "s"}, but none starts inside{" "}
+              {risk.signalHorizonDays} days.
             </span>
           </CardBody>
         </Card>
@@ -221,7 +283,7 @@ export default function RapTab({
             <Badge tone="green">Clear</Badge>
             <span className="text-ink-600">
               No works inside the next {risk.horizonDays} days depend on land the project has not
-              acquired.
+              acquired or a consent it has not been granted.
             </span>
           </CardBody>
         </Card>

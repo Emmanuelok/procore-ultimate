@@ -50,6 +50,17 @@ export interface ParcelDetail extends ParcelRow {
   affectedPersons: PapRow[];
   blockingTasks: BlockingTask[];
   allowedTransitions: string[];
+  /**
+   * `acquired` is not in the transition table: title passes through the
+   * evidenced /acquire route, which records the BASIS on which it passed.
+   * The server says when that route is open so the workspace never has to
+   * guess (and a state-owned or donated parcel never has to be routed
+   * through a fictitious dispute to be marked acquired).
+   */
+  acquirable: boolean;
+  acquisitionBases: string[];
+  /** bases that require compensation to have been paid before possession */
+  cashAcquisitionBases: string[];
 }
 
 export interface Entitlement {
@@ -186,25 +197,64 @@ export interface RapProgress {
   cutOffDate: string | null;
 }
 
+/**
+ * Consent to programme (#591). One row per (dependency × blocked task), and
+ * a dependency is a land parcel OR a statutory permit — the two registers
+ * are answered by one engine, because a task blocked by both an unacquired
+ * parcel and an ungranted consent is blocked once, by its worst dependency.
+ *
+ * `daysUntilStart` is null when the task carries no planned start, and
+ * `parcelId` is null on a permit row: neither may be treated as zero.
+ */
 export interface ScheduleRiskItem {
-  parcelId: string;
+  kind: "parcel" | "permit";
+  dependencyId: string;
+  /** set only on a parcel row (kept for the parcel drawer link) */
+  parcelId: string | null;
+  /** set only on a permit row */
+  permitId: string | null;
   reference: string;
+  label: string;
   status: string;
-  tenureType: string;
-  ownerName: string | null;
   taskId: string;
   taskName: string;
-  taskStart: string;
-  daysUntilStart: number;
+  taskStart: string | null;
+  daysUntilStart: number | null;
+  isCritical: boolean;
+  totalFloat: number | null;
+  /** days the dependency is expected to resolve AFTER the task should start */
+  daysAtRisk: number;
+  expectedResolutionDate: string;
+  /** where the expectation came from — evidence or a stated assumption */
+  estimateSource: "observed_median" | "default" | "unknown_state";
+  estimateSampleSize: number;
+  /** days-at-risk beyond the float that could absorb it; null when unknowable */
+  slipContribution: number | null;
+  startedUnconsented: boolean;
+  basis: string;
+  detail: Record<string, unknown>;
+}
+
+export interface ScheduleRiskSummary {
+  blockedTasks: number;
+  criticalBlockedTasks: number;
+  startedUnconsented: number;
+  blockingParcels: number;
+  blockingPermits: number;
+  projectedSlipDays: number | null;
+  unquantifiedTasks: number;
+  soonestBlockedStart: string | null;
 }
 
 export interface ScheduleRisk {
   horizonDays: number;
   blockedTasks: number;
   blockedParcels: number;
+  blockingPermits: number;
   imminent: number;
   alreadyStarted: number;
   signalHorizonDays: number;
+  summary: ScheduleRiskSummary;
   items: ScheduleRiskItem[];
 }
 
@@ -426,11 +476,27 @@ export function fmtShare(value: number | null | undefined): string {
   return `${fmtNum(value * 100, 0)}%`;
 }
 
-/** Human phrasing for the schedule-risk countdown. */
-export function startPhrase(days: number): string {
+/**
+ * Human phrasing for the schedule-risk countdown. A task with no planned
+ * start has no countdown — it says so rather than reading as "starts today",
+ * which is what treating the missing value as 0 used to do.
+ */
+export function startPhrase(days: number | null | undefined): string {
+  if (days === null || days === undefined || !Number.isFinite(days)) return "no planned start";
   if (days < 0) return `started ${Math.abs(days)}d ago`;
   if (days === 0) return "starts today";
   return `in ${days}d`;
+}
+
+/** How the days-at-risk expectation was arrived at — evidence or assumption. */
+export function estimateBasisLabel(
+  source: ScheduleRiskItem["estimateSource"],
+  sampleSize: number,
+): string {
+  if (source === "observed_median")
+    return `median of ${sampleSize} comparable resolution${sampleSize === 1 ? "" : "s"} on this company's own record`;
+  if (source === "default") return "documented default duration for this state (no history yet)";
+  return "no documented duration for this state — a conservative 90-day assumption";
 }
 
 /**

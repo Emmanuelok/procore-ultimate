@@ -26,6 +26,7 @@ import {
   Modal,
   Textarea,
   Tooltip,
+  UserPicker,
   useConfirm,
 } from "../../ui";
 import { cx } from "../../ui/cx";
@@ -47,6 +48,7 @@ import {
   type ActionItem,
   type PromoteResult,
 } from "./meetingsShared";
+import { useCompanyUsers } from "./SeriesEditor";
 
 export default function ActionItemCard({
   projectId,
@@ -64,6 +66,9 @@ export default function ActionItemCard({
   const [expanded, setExpanded] = useState(false);
   const [promoteOpen, setPromoteOpen] = useState(false);
   const [redateOpen, setRedateOpen] = useState(false);
+  const [blockOpen, setBlockOpen] = useState(false);
+  const [escalateOpen, setEscalateOpen] = useState(false);
+  const [cancelOpen, setCancelOpen] = useState(false);
   const [promoted, setPromoted] = useState<PromoteResult | null>(null);
 
   const a = action;
@@ -71,6 +76,17 @@ export default function ActionItemCard({
   const open = a.status === "open" || a.status === "in_progress" || a.status === "blocked";
   const overdue = a.isOverdue ?? (open && a.dueDate !== null && a.dueDate < todayISO());
   const promotedAlready = a.obligationId !== null;
+  /*
+   * These mirror the server's state machine exactly (index.ts:
+   * BLOCKABLE_ACTION_STATES / CANCELLABLE_ACTION_STATES, and cancel's refusal
+   * once an action has been promoted). Offering a control the API will refuse
+   * teaches people the platform is unreliable; hiding one it would accept
+   * makes the workflow unreachable — which is what happened to block,
+   * escalate and cancel, which existed only for API callers.
+   */
+  const canBlock = a.status === "open" || a.status === "in_progress";
+  const canEscalate = open;
+  const canCancel = open && !promotedAlready;
 
   async function post(key: string, verb: string, body?: unknown) {
     const done = await run(key, () => api.post(`${path}/${verb}`, body ?? {}));
@@ -210,10 +226,33 @@ export default function ActionItemCard({
             Promote to an obligation…
           </Button>
         ) : null}
+        {canBlock ? (
+          <Button size="xs" variant="ghost" onClick={() => setBlockOpen(true)}>
+            Block…
+          </Button>
+        ) : null}
+        {canEscalate ? (
+          <Button size="xs" variant="ghost" onClick={() => setEscalateOpen(true)}>
+            Escalate…
+          </Button>
+        ) : null}
+        {canCancel ? (
+          <Button size="xs" variant="danger" onClick={() => setCancelOpen(true)}>
+            Cancel…
+          </Button>
+        ) : null}
         <Button size="xs" variant="ghost" onClick={() => setExpanded((v) => !v)}>
           {expanded ? "Less" : "Detail"}
         </Button>
       </div>
+
+      {a.escalatedToId ? (
+        <p className="mt-2 text-meta text-warning-fg">
+          <span className="font-medium">Escalated</span>
+          {a.escalatedAt ? ` on ${isoDate(a.escalatedAt)}` : ""} — it is now somebody else&apos;s
+          problem to unblock, which is the only thing escalation is for.
+        </p>
+      ) : null}
 
       {expanded ? (
         <div className="mt-3 space-y-3">
@@ -274,7 +313,277 @@ export default function ActionItemCard({
           onMutated();
         }}
       />
+      <BlockModal
+        open={blockOpen}
+        path={path}
+        action={a}
+        onClose={() => setBlockOpen(false)}
+        onDone={() => {
+          setBlockOpen(false);
+          onMutated();
+        }}
+      />
+      <EscalateModal
+        open={escalateOpen}
+        path={path}
+        action={a}
+        onClose={() => setEscalateOpen(false)}
+        onDone={() => {
+          setEscalateOpen(false);
+          onMutated();
+        }}
+      />
+      <CancelModal
+        open={cancelOpen}
+        path={path}
+        action={a}
+        onClose={() => setCancelOpen(false)}
+        onDone={() => {
+          setCancelOpen(false);
+          onMutated();
+        }}
+      />
     </div>
+  );
+}
+
+/**
+ * BLOCKING — a reason, not a status flip.
+ *
+ * "Blocked" with no stated blocker is the most common way an action stops
+ * being worked on without anybody having decided to stop working on it. The
+ * API requires the reason; this form says why.
+ */
+function BlockModal({
+  open,
+  path,
+  action,
+  onClose,
+  onDone,
+}: {
+  open: boolean;
+  path: string;
+  action: ActionItem;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [reason, setReason] = useState("");
+
+  async function submit() {
+    const done = await run("block", () => api.post(`${path}/block`, { reason: reason.trim() }));
+    if (done !== null) {
+      setReason("");
+      onDone();
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={`Block ${action.reference}`}
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            disabled={reason.trim().length === 0 || busy !== null}
+            loading={busy === "block"}
+            onClick={() => void submit()}
+          >
+            Block it
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        {refusal ? (
+          <Alert tone="danger" size="sm" title="Refused" onDismiss={clear}>
+            <p className="whitespace-pre-wrap">{refusal.message}</p>
+          </Alert>
+        ) : null}
+        <Alert tone="info" variant="subtle" size="sm" title="Blocked is still open">
+          A blocked action keeps its date, keeps ageing and still raises the overdue signal.
+          Blocking records WHY it is not moving so the block itself can be chased — it is not a
+          way to stop the clock.
+        </Alert>
+        <Field label="What is blocking it?" required>
+          <Textarea
+            rows={3}
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="Waiting on the structural engineer's response to RFI-014…"
+          />
+        </Field>
+      </div>
+    </Modal>
+  );
+}
+
+/**
+ * ESCALATION — to a NAMED person, who is told.
+ *
+ * `escalatedToId` must be a user of this company: the API refuses anything
+ * else, and an escalation to nobody in particular is how an action gets
+ * quietly abandoned with a note saying it was escalated.
+ */
+function EscalateModal({
+  open,
+  path,
+  action,
+  onClose,
+  onDone,
+}: {
+  open: boolean;
+  path: string;
+  action: ActionItem;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const users = useCompanyUsers();
+  const [escalatedToId, setEscalatedToId] = useState<string | null>(null);
+  const [note, setNote] = useState("");
+
+  async function submit() {
+    if (!escalatedToId) return;
+    const done = await run("escalate", () =>
+      api.post(`${path}/escalate`, { escalatedToId, note: note.trim() || undefined }),
+    );
+    if (done !== null) {
+      setEscalatedToId(null);
+      setNote("");
+      onDone();
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={`Escalate ${action.reference}`}
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            disabled={!escalatedToId || busy !== null}
+            loading={busy === "escalate"}
+            onClick={() => void submit()}
+          >
+            Escalate it
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        {refusal ? (
+          <Alert tone="danger" size="sm" title="Refused" onDismiss={clear}>
+            <p className="whitespace-pre-wrap">{refusal.message}</p>
+          </Alert>
+        ) : null}
+        <Alert tone="info" variant="subtle" size="sm" title="Escalation notifies a person">
+          The action stays with its owner and keeps its date — escalation adds somebody senior to
+          it rather than moving it. They are notified immediately, and the escalation is recorded
+          against the action with its carry count, so a repeatedly-escalated item is visible as one.
+        </Alert>
+        <Field label="Escalate to" required>
+          <UserPicker
+            users={users}
+            value={escalatedToId}
+            placeholder="Pick the person who can unblock this…"
+            onChange={(id) => setEscalatedToId(id)}
+          />
+        </Field>
+        <Field label="Note" hint="What do you want them to do? Optional, but an escalation with no ask is a notification.">
+          <Textarea rows={3} value={note} onChange={(e) => setNote(e.target.value)} />
+        </Field>
+      </div>
+    </Modal>
+  );
+}
+
+/**
+ * CANCELLATION — refused on anything finished, and on anything promoted.
+ *
+ * The API guards both: a completed or verified action is history, and a
+ * promoted one carries its time bar on the obligation, which is what must be
+ * waived instead. The form states both so the refusal is never a surprise.
+ */
+function CancelModal({
+  open,
+  path,
+  action,
+  onClose,
+  onDone,
+}: {
+  open: boolean;
+  path: string;
+  action: ActionItem;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [reason, setReason] = useState("");
+
+  async function submit() {
+    const done = await run("cancel", () => api.post(`${path}/cancel`, { reason: reason.trim() }));
+    if (done !== null) {
+      setReason("");
+      onDone();
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={`Cancel ${action.reference}`}
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Keep it
+          </Button>
+          <Button
+            variant="danger"
+            disabled={reason.trim().length === 0 || busy !== null}
+            loading={busy === "cancel"}
+            onClick={() => void submit()}
+          >
+            Cancel the action
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        {refusal ? (
+          <Alert tone="danger" size="sm" title="Refused" onDismiss={clear}>
+            <p className="whitespace-pre-wrap">{refusal.message}</p>
+          </Alert>
+        ) : null}
+        <Alert
+          tone="warning"
+          variant="subtle"
+          size="sm"
+          title="Cancelling is recorded, not erased"
+        >
+          The action stays in the register as cancelled with your reason on it, and the ledger
+          keeps the transition. It cannot be re-opened afterwards — raise a new action instead, so
+          the history shows that the first one was abandoned.
+        </Alert>
+        <Field label="Why is it being cancelled?" required>
+          <Textarea
+            rows={3}
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="Superseded by the revised design — the question no longer arises."
+          />
+        </Field>
+      </div>
+    </Modal>
   );
 }
 

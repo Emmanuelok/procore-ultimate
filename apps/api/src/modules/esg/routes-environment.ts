@@ -666,7 +666,7 @@ export function registerEnvironmentRoutes(app: FastifyInstance): void {
       const body = incidentCreateSchema.parse(req.body);
       const id = newId("ein");
       const reportable = body.reportableToRegulator === true;
-      const number = await app.db.transaction(async (tx) => {
+      await app.db.transaction(async (tx) => {
         const number = await nextRecordNumber(tx, req.projectId!, "environmental_incident");
         let obligationId: string | null = null;
         if (reportable) {
@@ -733,9 +733,7 @@ export function registerEnvironmentRoutes(app: FastifyInstance): void {
           },
           storePayload: true,
         });
-        return number;
       });
-      void number;
       return reply.status(201).send(await fetchIncident(id, req.companyId!, req.projectId!));
     },
   );

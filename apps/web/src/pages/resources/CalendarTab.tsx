@@ -33,6 +33,7 @@ import {
   LoadError,
   Pill,
   Row,
+  SubjectPicker,
   count,
   dateOnly,
   hours,
@@ -613,7 +614,11 @@ function CreateAssignmentModal({
         <Field label="What is being booked">
           <Select
             value={subjectKind}
-            onChange={(e) => setSubjectKind(e.target.value as "crew" | "worker" | "equipment")}
+            onChange={(e) => {
+              setSubjectKind(e.target.value as "crew" | "worker" | "equipment");
+              // a crew id is not a worker id: never carry the choice across
+              setSubjectId("");
+            }}
           >
             <option value="crew">Crew</option>
             <option value="worker">Worker</option>
@@ -621,11 +626,16 @@ function CreateAssignmentModal({
           </Select>
         </Field>
         <Field
-          label={`${titleCase(subjectKind)} id`}
+          label={subjectKind === "equipment" ? "Machine" : titleCase(subjectKind)}
           required
-          hint="The record's id from the crews, workforce or equipment register — this module keeps no second register of its own."
+          hint="Read from the crews, workforce and equipment registers — this module keeps no second register of its own. An id can still be pasted in."
         >
-          <Input value={subjectId} onChange={(e) => setSubjectId(e.target.value)} />
+          <SubjectPicker
+            projectId={projectId}
+            kind={subjectKind}
+            value={subjectId}
+            onChange={setSubjectId}
+          />
         </Field>
         <Field
           label="Trade or plant class"

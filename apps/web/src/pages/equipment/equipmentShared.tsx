@@ -436,11 +436,16 @@ export interface DeliveryRow {
   purchaseOrderRef: string | null;
   carrierName: string | null;
   vehicleRegistration: string | null;
+  driverName: string | null;
   status: string;
   scheduledFor: string | null;
   arrivedAt: string | null;
   receivedAt: string | null;
   waitingMinutes: number | null;
+  /** the booking's gate reference — what the gateman calls the slot */
+  gateEntryRef: string | null;
+  craneRequired: boolean;
+  offloadLocationText: string | null;
   receivedByName: string | null;
   hasDiscrepancy: boolean;
   discrepancyKinds: string[];

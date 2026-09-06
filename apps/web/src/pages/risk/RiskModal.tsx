@@ -12,6 +12,8 @@ import { Button, ErrorAlert, Field, Input, Modal, Select, Textarea } from "../..
 import { humanize } from "../format";
 import {
   DIST_KINDS,
+  RESPONSE_STRATEGIES,
+  RESPONSE_STRATEGY_HINT,
   distProblem,
   type Dist,
   type DistKind,
@@ -211,6 +213,11 @@ export default function RiskModal({
   const [taskId, setTaskId] = useState("");
   const [durDraft, setDurDraft] = useState(draftFrom(null));
   const [mitCost, setMitCost] = useState("");
+  const [cause, setCause] = useState("");
+  const [effect, setEffect] = useState("");
+  const [strategy, setStrategy] = useState("");
+  const [proximity, setProximity] = useState("");
+  const [triggers, setTriggers] = useState("");
 
   useEffect(() => {
     if (!open) return;
@@ -234,6 +241,11 @@ export default function RiskModal({
     setTaskId(risk?.scheduleTaskId ?? "");
     setDurDraft(risk?.durationImpact ? draftFrom(risk.durationImpact as unknown as Dist) : draftFrom(null));
     setMitCost(risk?.mitigationCost != null ? String(risk.mitigationCost) : "");
+    setCause(risk?.cause ?? "");
+    setEffect(risk?.effect ?? "");
+    setStrategy(risk?.responseStrategy ?? "");
+    setProximity(risk?.proximityDate ?? "");
+    setTriggers((risk?.triggers ?? []).join("\n"));
   }, [open, risk]);
 
   const postMismatch = (postP === "") !== (postI === "");
@@ -261,6 +273,14 @@ export default function RiskModal({
         scheduleTaskId: taskId || null,
         durationImpact: taskId ? buildDist(durDraft) : null,
         mitigationCost: mitCost.trim() === "" ? null : Number(mitCost),
+        cause: cause.trim() || null,
+        effect: effect.trim() || null,
+        responseStrategy: strategy || null,
+        proximityDate: proximity || null,
+        triggers: triggers
+          .split("\n")
+          .map((t) => t.trim())
+          .filter(Boolean),
       };
       const saved = risk
         ? await api.patch<RiskRow>(`/api/v1/projects/${projectId}/risks/${risk.id}`, payload)
@@ -313,6 +333,57 @@ export default function RiskModal({
             placeholder="What could happen, and why it matters…"
           />
         </Field>
+
+        {/* cause → event → effect: the register read as a chain, not a headline */}
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <Field label="Cause" hint="The condition already present that could give rise to it">
+            <Textarea
+              className="min-h-10"
+              value={cause}
+              onChange={(e) => setCause(e.target.value)}
+              placeholder="Because the site investigation covered only the northern half…"
+            />
+          </Field>
+          <Field label="Effect" hint="The consequence for the objective if it occurs">
+            <Textarea
+              className="min-h-10"
+              value={effect}
+              onChange={(e) => setEffect(e.target.value)}
+              placeholder="…resulting in piling redesign and a four-week delay."
+            />
+          </Field>
+        </div>
+
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+          <Field
+            label="Response strategy"
+            hint={strategy ? RESPONSE_STRATEGY_HINT[strategy] : "Not chosen yet"}
+          >
+            <Select value={strategy} onChange={(e) => setStrategy(e.target.value)}>
+              <option value="">Not chosen</option>
+              {RESPONSE_STRATEGIES.map((s) => (
+                <option key={s} value={s}>
+                  {humanize(s)}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field label="Proximity" hint="When it could first materialise">
+            <Input
+              type="date"
+              value={proximity}
+              onChange={(e) => setProximity(e.target.value)}
+            />
+          </Field>
+          <Field label="Early warning triggers" hint="One per line">
+            <Textarea
+              className="min-h-10"
+              value={triggers}
+              onChange={(e) => setTriggers(e.target.value)}
+              placeholder={"Trial pit finds made ground below 3m\nPiling rig refusal on any pile"}
+            />
+          </Field>
+        </div>
 
         {/* qualitative scoring */}
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">

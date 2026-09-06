@@ -21,6 +21,7 @@ import {
   CONTINGENCY_CURVE_SHAPES,
   OPTIMISM_BIAS_CATEGORIES,
   RISK_CATEGORIES,
+  RISK_RESPONSE_STRATEGIES,
   RISK_STATUSES,
   SIMULATION_KINDS,
   type ContingencyCurveShape,
@@ -77,6 +78,15 @@ const riskCreateSchema = z.object({
   description: z.string().max(20000).nullable().optional(),
   category: z.enum(RISK_CATEGORIES),
   ownerId: z.string().min(1).nullable().optional(),
+  /* register depth (#447-450): cause → event → effect, the response chosen,
+     when it could first bite, what would warn us, and what the response
+     itself created */
+  cause: z.string().max(20000).nullable().optional(),
+  effect: z.string().max(20000).nullable().optional(),
+  responseStrategy: z.enum(RISK_RESPONSE_STRATEGIES).nullable().optional(),
+  proximityDate: isoDateSchema.nullable().optional(),
+  triggers: z.array(z.string().min(1).max(500)).max(50).optional(),
+  secondaryOfRiskId: z.string().min(1).nullable().optional(),
   probabilityScore: score,
   impactScore: score,
   postProbabilityScore: score.nullable().optional(),
@@ -316,6 +326,48 @@ export const riskModule: FastifyPluginAsync = async (app) => {
     return rows[0];
   }
 
+  /**
+   * A secondary risk is one created BY another risk's response — transfer
+   * the flood exposure to an insurer and you have bought counterparty risk.
+   * The link is only meaningful inside one project's register, and a chain
+   * that loops back on itself is not a chain: both are refused here rather
+   * than discovered later by a traversal that never terminates.
+   */
+  async function assertSecondaryParent(
+    parentId: string,
+    projectId: string,
+    companyId: string,
+    childId: string | null,
+  ): Promise<void> {
+    if (childId && parentId === childId) {
+      throw badRequest("A risk cannot be a secondary of itself");
+    }
+    let cursor: string | null = parentId;
+    const seen = new Set<string>(childId ? [childId] : []);
+    for (let depth = 0; cursor && depth < 20; depth += 1) {
+      if (seen.has(cursor)) {
+        throw badRequest("secondaryOfRiskId would create a loop in the secondary-risk chain");
+      }
+      seen.add(cursor);
+      const rows: Array<{ id: string; secondaryOfRiskId: string | null }> = await app.db
+        .select({ id: risks.id, secondaryOfRiskId: risks.secondaryOfRiskId })
+        .from(risks)
+        .where(
+          and(
+            eq(risks.id, cursor),
+            eq(risks.companyId, companyId),
+            eq(risks.projectId, projectId),
+          ),
+        )
+        .limit(1);
+      const row = rows[0];
+      if (!row) {
+        throw badRequest("secondaryOfRiskId does not name a risk on this project");
+      }
+      cursor = row.secondaryOfRiskId;
+    }
+  }
+
   async function assertScheduleTask(taskId: string, projectId: string): Promise<void> {
     const rows = await app.db
       .select({ id: scheduleTasks.id })
@@ -332,6 +384,9 @@ export const riskModule: FastifyPluginAsync = async (app) => {
   app.post("/projects/:projectId/risks", { preHandler: standardGate }, async (req, reply) => {
     const body = riskCreateSchema.parse(req.body);
     if (body.scheduleTaskId) await assertScheduleTask(body.scheduleTaskId, req.projectId!);
+    if (body.secondaryOfRiskId) {
+      await assertSecondaryParent(body.secondaryOfRiskId, req.projectId!, req.companyId!, null);
+    }
     const number = await nextRecordNumber(app.db, req.projectId!, "risk");
     const id = newId("rsk");
     await app.db.insert(risks).values({
@@ -352,6 +407,12 @@ export const riskModule: FastifyPluginAsync = async (app) => {
       costImpact: body.costImpact ?? null,
       scheduleTaskId: body.scheduleTaskId ?? null,
       durationImpact: body.durationImpact ?? null,
+      cause: body.cause ?? null,
+      effect: body.effect ?? null,
+      responseStrategy: body.responseStrategy ?? null,
+      proximityDate: body.proximityDate ?? null,
+      triggers: body.triggers ?? [],
+      secondaryOfRiskId: body.secondaryOfRiskId ?? null,
       mitigations: body.mitigations ?? [],
       mitigationCost: body.mitigationCost ?? null,
       createdBy: req.user!.id,
@@ -369,6 +430,8 @@ export const riskModule: FastifyPluginAsync = async (app) => {
         probabilityScore: body.probabilityScore,
         impactScore: body.impactScore,
         occurrenceProbability: body.occurrenceProbability ?? null,
+        responseStrategy: body.responseStrategy ?? null,
+        secondaryOfRiskId: body.secondaryOfRiskId ?? null,
       },
       storePayload: true,
     });
@@ -394,10 +457,45 @@ export const riskModule: FastifyPluginAsync = async (app) => {
     return paginate(rows.map(scored), Number(totalRow?.n ?? 0), q);
   });
 
+  /**
+   * The detail view carries the risk's own chain: the primary risk that its
+   * response created it from, and the secondary risks its own response
+   * created. Without them a "transfer" strategy reads as a resolution when
+   * it is really a substitution.
+   */
   app.get("/projects/:projectId/risks/:riskId", { preHandler: readGate }, async (req) => {
     const { riskId } = req.params as { riskId: string };
     const risk = await fetchRisk(riskId, req.companyId!, req.projectId!);
-    return scored(risk);
+    const secondaries = await app.db
+      .select()
+      .from(risks)
+      .where(
+        and(
+          eq(risks.companyId, req.companyId!),
+          eq(risks.projectId, req.projectId!),
+          eq(risks.secondaryOfRiskId, riskId),
+        ),
+      )
+      .orderBy(asc(risks.number));
+    const parentRows = risk.secondaryOfRiskId
+      ? await app.db
+          .select()
+          .from(risks)
+          .where(
+            and(
+              eq(risks.id, risk.secondaryOfRiskId),
+              eq(risks.companyId, req.companyId!),
+              eq(risks.projectId, req.projectId!),
+            ),
+          )
+          .limit(1)
+      : [];
+    const parent = parentRows[0];
+    return {
+      ...scored(risk),
+      primary: parent ? scored(parent) : null,
+      secondaries: secondaries.map(scored),
+    };
   });
 
   app.patch("/projects/:projectId/risks/:riskId", { preHandler: standardGate }, async (req) => {
@@ -405,6 +503,9 @@ export const riskModule: FastifyPluginAsync = async (app) => {
     const body = riskPatchSchema.parse(req.body);
     await fetchRisk(riskId, req.companyId!, req.projectId!);
     if (body.scheduleTaskId) await assertScheduleTask(body.scheduleTaskId, req.projectId!);
+    if (body.secondaryOfRiskId) {
+      await assertSecondaryParent(body.secondaryOfRiskId, req.projectId!, req.companyId!, riskId);
+    }
     const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
     for (const [k, v] of Object.entries(body)) {
       if (v !== undefined) set[k] = v;
@@ -2204,6 +2305,11 @@ export const riskModule: FastifyPluginAsync = async (app) => {
           realisedRisks: register.filter((r) => r.status === "realised").length,
           quantifiedRisks: quantified.length,
           unquantifiedLiveRisks: live.length - quantified.length,
+          /* register depth: a live risk with no chosen response is an entry
+             in a list, not a managed risk (#447-450) */
+          liveRisksWithoutResponse: live.filter((r) => !r.responseStrategy).length,
+          liveRisksAccepted: live.filter((r) => r.responseStrategy === "accept").length,
+          secondaryRisks: live.filter((r) => r.secondaryOfRiskId != null).length,
           expectedValueTotal: quantified.length > 0 ? round2(evTotal) : null,
           contingencyRemainingPercent,
           appetiteBreaches: appetiteRules.length === 0 ? null : breaches.length,

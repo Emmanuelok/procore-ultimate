@@ -777,7 +777,7 @@ export async function registerSafeguardRoutes(app: FastifyInstance): Promise<voi
     // norm, so recording a find without one has to be a deliberate choice.
     const stopWork = body.stopWork !== false;
     const id = newId("cfd");
-    const number = await app.db.transaction(async (tx) => {
+    await app.db.transaction(async (tx) => {
       const number = await nextRecordNumber(tx, req.projectId!, "chance_find");
       await tx.insert(chanceFinds).values({
         id,
@@ -812,9 +812,7 @@ export async function registerSafeguardRoutes(app: FastifyInstance): Promise<voi
         },
         storePayload: true,
       });
-      return number;
     });
-    void number;
     return reply.status(201).send(await fetchFind(id, req.companyId!, req.projectId!));
   });
 
@@ -1304,7 +1302,7 @@ export async function registerSafeguardRoutes(app: FastifyInstance): Promise<voi
       status: "open" as const,
     }));
     const id = newId("rap");
-    const number = await app.db.transaction(async (tx) => {
+    await app.db.transaction(async (tx) => {
       const number = await nextRecordNumber(tx, req.projectId!, "rap_audit");
       await tx.insert(rapAudits).values({
         id,
@@ -1344,9 +1342,7 @@ export async function registerSafeguardRoutes(app: FastifyInstance): Promise<voi
         },
         storePayload: true,
       });
-      return number;
     });
-    void number;
     const rows = await app.db.select().from(rapAudits).where(eq(rapAudits.id, id)).limit(1);
     return reply.status(201).send(rows[0]);
   });

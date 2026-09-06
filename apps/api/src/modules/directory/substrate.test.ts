@@ -892,3 +892,93 @@ describe("soft-deleting a vendor", () => {
     expect(afterRestore.json().items[0].vendorDeleted).toBe(false);
   });
 });
+
+/*
+ * A CSV carrying two columns is a two-column edit.
+ *
+ * Every field of the dataset used to be written on every commit, so a
+ * `name,email` re-import blanked each matched vendor's address, phone,
+ * website, tax id and registration number and reset its status, and a
+ * contacts file without a `vendor_name` column detached every matched
+ * contact from its vendor. None of it was reported.
+ */
+describe("a partial CSV does not blank the columns it omits", () => {
+  it("keeps a vendor's other fields when the file does not carry them", async () => {
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/vendors",
+      headers: owner.headers,
+      payload: {
+        name: "Partial Import Civils",
+        address: "12 Kiln Road",
+        phone: "0113 000 0000",
+        taxId: "GB123456789",
+        status: "inactive",
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    const vendorId = created.json().id as string;
+
+    const preview = await app.inject({
+      method: "POST",
+      url: "/api/v1/imports/vendors/preview",
+      headers: owner.headers,
+      payload: { csv: "name,city\nPartial Import Civils,Sheffield" },
+    });
+    const commit = await app.inject({
+      method: "POST",
+      url: `/api/v1/directory/imports/${preview.json().id}/commit`,
+      headers: owner.headers,
+    });
+    expect(commit.json()).toMatchObject({ created: 0, updated: 1 });
+
+    const read = await app.inject({
+      method: "GET",
+      url: `/api/v1/vendors/${vendorId}`,
+      headers: owner.headers,
+    });
+    expect(read.json().city).toBe("Sheffield");
+    expect(read.json().address).toBe("12 Kiln Road");
+    expect(read.json().phone).toBe("0113 000 0000");
+    expect(read.json().taxId).toBe("GB123456789");
+    expect(read.json().status).toBe("inactive");
+  });
+
+  it("keeps a contact attached to its vendor when the file has no vendor_name column", async () => {
+    const vendor = await app.inject({
+      method: "POST",
+      url: "/api/v1/vendors",
+      headers: owner.headers,
+      payload: { name: "Attachment Holding" },
+    });
+    const vendorId = vendor.json().id as string;
+    const contact = await app.inject({
+      method: "POST",
+      url: "/api/v1/contacts",
+      headers: owner.headers,
+      payload: { name: "Attached Person", email: "attached@holding.test", vendorId },
+    });
+    expect(contact.statusCode).toBe(201);
+
+    const preview = await app.inject({
+      method: "POST",
+      url: "/api/v1/imports/contacts/preview",
+      headers: owner.headers,
+      payload: { csv: "name,email,title\nAttached Person,attached@holding.test,Site Manager" },
+    });
+    const commit = await app.inject({
+      method: "POST",
+      url: `/api/v1/directory/imports/${preview.json().id}/commit`,
+      headers: owner.headers,
+    });
+    expect(commit.json()).toMatchObject({ created: 0, updated: 1 });
+
+    const read = await app.inject({
+      method: "GET",
+      url: `/api/v1/contacts?vendorId=${vendorId}`,
+      headers: owner.headers,
+    });
+    const row = (read.json().items as Array<{ id: string; title: string | null }>)[0];
+    expect(row?.title).toBe("Site Manager");
+  });
+});

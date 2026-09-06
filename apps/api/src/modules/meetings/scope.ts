@@ -217,3 +217,28 @@ export function scopeAllows(scope: CompanyScope, projectId: string | null): bool
   if (projectId === null) return true;
   return scope.projectIds.includes(projectId);
 }
+
+/**
+ * Does the caller hold ANOTHER tool on the project the request is already
+ * scoped to?
+ *
+ * WHY A ROUTE NEEDS THIS. A handler gated on one tool that CREATES a record
+ * belonging to another has widened the first tool's permission to include the
+ * second by choosing a URL — the same defect as a company-level route reading
+ * project data, one table further along. `/meeting-agenda-items/:id/raise`
+ * creates RFIs, change events and risks, so it asks here before it does.
+ *
+ * Owners and admins pass, as they do everywhere. Assurance grants do NOT:
+ * a grant confers reading, never authorship.
+ */
+export async function holdsToolOnProject(
+  app: FastifyInstance,
+  req: FastifyRequest,
+  tool: ToolKey,
+  level: PermissionLevel,
+): Promise<boolean> {
+  if (!req.user || !req.companyId || !req.projectId) return false;
+  if (req.companyRole === "owner" || req.companyRole === "admin") return true;
+  const held = await projectsWithTool(app, req, tool, level);
+  return held.includes(req.projectId);
+}

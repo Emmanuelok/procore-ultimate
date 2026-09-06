@@ -209,8 +209,39 @@ describe("land parcel register", () => {
     expect(bySneak.statusCode).toBe(400);
     expect(bySneak.json().message).toContain("/acquire");
 
+    /*
+     * The register has to TELL the workspace that the evidenced route is
+     * open. `acquired` is absent from allowedTransitions by design, so
+     * without this flag the product would offer no way at all to mark land
+     * acquired — which is how a state-owned parcel ends up routed through a
+     * fictitious dispute.
+     */
+    const detail = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/parcels/${parcel.id}`,
+      headers: owner.headers,
+    });
+    const view = detail.json() as {
+      acquirable: boolean;
+      allowedTransitions: string[];
+      acquisitionBases: string[];
+      cashAcquisitionBases: string[];
+    };
+    expect(view.acquirable).toBe(true);
+    expect(view.allowedTransitions).not.toContain("acquired");
+    expect(view.acquisitionBases).toContain("state_allocation");
+    expect(view.cashAcquisitionBases).toContain("purchase");
+
     // a compulsory-purchase determination settles the dispute into acquisition
     expect(await acquire(pid, parcel.id, "court_order")).toBe(200);
+
+    const after = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/parcels/${parcel.id}`,
+      headers: owner.headers,
+    });
+    // an acquired parcel is not acquirable again
+    expect((after.json() as { acquirable: boolean }).acquirable).toBe(false);
   });
 
   it("will not record compensation without payment evidence", async () => {
@@ -1254,5 +1285,54 @@ describe("tenant isolation", () => {
       .from(affectedPersons)
       .where(eq(affectedPersons.companyId, stranger.companyId));
     expect(paps).toHaveLength(0);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Company-wide search (contract §3.3)                                 */
+/* ------------------------------------------------------------------ */
+
+describe("search sources", () => {
+  it("finds parcels and grievances from the company search, and isolates tenants", async () => {
+    const pid = await makeProject("Searchable land");
+    const created = await createParcel(pid, {
+      reference: "CAD-KIBAALE-447",
+      ownerName: "Elders of Kibaale",
+    });
+    expect(created.statusCode).toBe(201);
+    const grievance = await createGrievance(pid, {
+      description: "Blasting vibration cracked the Kibaale schoolhouse wall",
+    });
+    expect(grievance.statusCode).toBe(201);
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/search?q=${encodeURIComponent("Kibaale")}&limit=20`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      items: { type: string; id: string; href: string; title: string }[];
+      coverage: string[];
+    };
+    expect(body.coverage).toContain("land_parcel");
+    expect(body.coverage).toContain("grievance");
+    const parcelHit = body.items.find((i) => i.type === "land_parcel");
+    expect(parcelHit?.id).toBe(created.json().id);
+    expect(parcelHit?.href).toBe(`/projects/${pid}/land?tab=parcels`);
+    const grievanceHit = body.items.find((i) => i.type === "grievance");
+    expect(grievanceHit?.id).toBe(grievance.json().id);
+    expect(grievanceHit?.href).toBe(`/projects/${pid}/land?tab=grievances`);
+
+    // another tenant searching the same words finds nothing of ours
+    const foreign = await app.inject({
+      method: "GET",
+      url: `/api/v1/search?q=${encodeURIComponent("Kibaale")}&limit=20`,
+      headers: stranger.headers,
+    });
+    expect(foreign.statusCode).toBe(200);
+    expect(
+      (foreign.json() as { items: { id: string }[] }).items.map((i) => i.id),
+    ).not.toContain(created.json().id);
   });
 });

@@ -949,102 +949,117 @@ export const esgModule: FastifyPluginAsync = async (app) => {
        * it removes this bill's prior entries inside the same transaction.
        */
       const itemIds = items.map((i) => i.id);
-      const priorRows = itemIds.length
-        ? await app.db
-            .select({ id: carbonEntries.id, boqItemId: carbonEntries.boqItemId })
-            .from(carbonEntries)
-            .where(
-              and(
-                eq(carbonEntries.companyId, req.companyId!),
-                eq(carbonEntries.projectId, req.projectId!),
-                inArray(carbonEntries.boqItemId, itemIds),
-              ),
-            )
-        : [];
       const replace = body.mode === "replace";
-      const alreadyImported = new Set(
-        replace ? [] : priorRows.map((r) => r.boqItemId).filter((v): v is string => Boolean(v)),
-      );
 
       const created: string[] = [];
       const skipped: { boqItemId: string; code: string; reason: string; detail: string }[] = [];
       let totalTco2e = 0;
-      const inserts: (typeof carbonEntries.$inferInsert)[] = [];
 
-      for (const item of items) {
-        const mapping =
-          body.mappings.find((m) => m.boqItemId === item.id) ??
-          body.mappings.find(
-            (m) => m.boqItemCodePrefix != null && item.code.startsWith(m.boqItemCodePrefix),
-          );
-        if (!mapping) continue; // out of scope for this run — not a skip
-        if (alreadyImported.has(item.id)) {
-          skipped.push({
-            boqItemId: item.id,
-            code: item.code,
-            reason: "already_imported",
-            detail:
-              "This bill item already carries a carbon entry in this project. Re-running would " +
-              "double its footprint; pass mode:\"replace\" to re-import the bill from scratch.",
-          });
-          continue;
-        }
-        const factor = factorById.get(mapping.factorId)!;
-        if (item.quantity == null || item.quantity <= 0) {
-          skipped.push({
-            boqItemId: item.id,
-            code: item.code,
-            reason: "no_quantity",
-            detail: "The BoQ item carries no measured quantity",
-          });
-          continue;
-        }
-        if (item.unit == null) {
-          skipped.push({
-            boqItemId: item.id,
-            code: item.code,
-            reason: "no_unit",
-            detail: "The BoQ item carries no unit of measurement",
-          });
-          continue;
-        }
-        if (!unitsMatch(item.unit, factor.unit)) {
-          skipped.push({
-            boqItemId: item.id,
-            code: item.code,
-            reason: "unit_mismatch",
-            detail: `BoQ item is measured in "${item.unit}" but factor "${factor.name}" is published per "${factor.unit}"`,
-          });
-          continue;
-        }
-        const tco2e = computeTco2e(item.quantity, factor.factorKgCo2ePerUnit);
-        const id = newId("cen");
-        inserts.push({
-          id,
-          companyId: req.companyId!,
-          projectId: req.projectId!,
-          budgetId: body.budgetId ?? null,
-          description: item.description,
-          // Material quantities taken off the bill are cradle-to-gate product
-          // stage, and purchased goods and services in GHG-Protocol terms.
-          lifecycleModule: "A1-A3",
-          scope: "scope_3",
-          factorId: factor.id,
-          quantity: item.quantity,
-          unit: item.unit,
-          tco2e,
-          boqItemId: item.id,
-          sourceNote: `BoQ ${boq.name} item ${item.code}`,
-          entryDate: todayISO(),
-          createdBy: req.user!.id,
-        });
-        created.push(id);
-        totalTco2e += tco2e;
-      }
-
-      // One transaction, so a failure mid-import cannot leave the footprint
-      // half-written with nothing recording which half.
+      /*
+       * ONE transaction, holding a per-(company, bill) advisory lock, and the
+       * "what is already imported?" read happens INSIDE it. Two parallel
+       * imports of the same bill — a double-submit, a retry, two engineers —
+       * would otherwise both read "nothing imported yet" and both insert,
+       * doubling the reported footprint: budgets flip to exceeded, the
+       * detector raises a phantom overrun and the disclosure CSV
+       * double-counts, with nothing anywhere reconciling or warning. The lock
+       * serialises them; the prior-entry check then makes the second one a
+       * no-op that reports `already_imported` per item rather than a silent
+       * duplication. `mode: "replace"` is the deliberate re-run: it removes
+       * this bill's prior entries in the same transaction.
+       */
       const removed = await app.db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtext(${`carbon-import:${req.companyId!}:${boq.id}`}))`,
+        );
+        const priorRows = itemIds.length
+          ? await tx
+              .select({ id: carbonEntries.id, boqItemId: carbonEntries.boqItemId })
+              .from(carbonEntries)
+              .where(
+                and(
+                  eq(carbonEntries.companyId, req.companyId!),
+                  eq(carbonEntries.projectId, req.projectId!),
+                  inArray(carbonEntries.boqItemId, itemIds),
+                ),
+              )
+          : [];
+        const alreadyImported = new Set(
+          replace ? [] : priorRows.map((r) => r.boqItemId).filter((v): v is string => Boolean(v)),
+        );
+        const inserts: (typeof carbonEntries.$inferInsert)[] = [];
+
+        for (const item of items) {
+          const mapping =
+            body.mappings.find((m) => m.boqItemId === item.id) ??
+            body.mappings.find(
+              (m) => m.boqItemCodePrefix != null && item.code.startsWith(m.boqItemCodePrefix),
+            );
+          if (!mapping) continue; // out of scope for this run — not a skip
+          if (alreadyImported.has(item.id)) {
+            skipped.push({
+              boqItemId: item.id,
+              code: item.code,
+              reason: "already_imported",
+              detail:
+                "This bill item already carries a carbon entry in this project. Re-running would " +
+                'double its footprint; pass mode:"replace" to re-import the bill from scratch.',
+            });
+            continue;
+          }
+          const factor = factorById.get(mapping.factorId)!;
+          if (item.quantity == null || item.quantity <= 0) {
+            skipped.push({
+              boqItemId: item.id,
+              code: item.code,
+              reason: "no_quantity",
+              detail: "The BoQ item carries no measured quantity",
+            });
+            continue;
+          }
+          if (item.unit == null) {
+            skipped.push({
+              boqItemId: item.id,
+              code: item.code,
+              reason: "no_unit",
+              detail: "The BoQ item carries no unit of measurement",
+            });
+            continue;
+          }
+          if (!unitsMatch(item.unit, factor.unit)) {
+            skipped.push({
+              boqItemId: item.id,
+              code: item.code,
+              reason: "unit_mismatch",
+              detail: `BoQ item is measured in "${item.unit}" but factor "${factor.name}" is published per "${factor.unit}"`,
+            });
+            continue;
+          }
+          const tco2e = computeTco2e(item.quantity, factor.factorKgCo2ePerUnit);
+          const id = newId("cen");
+          inserts.push({
+            id,
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            budgetId: body.budgetId ?? null,
+            description: item.description,
+            // Material quantities taken off the bill are cradle-to-gate product
+            // stage, and purchased goods and services in GHG-Protocol terms.
+            lifecycleModule: "A1-A3",
+            scope: "scope_3",
+            factorId: factor.id,
+            quantity: item.quantity,
+            unit: item.unit,
+            tco2e,
+            boqItemId: item.id,
+            sourceNote: `BoQ ${boq.name} item ${item.code}`,
+            entryDate: todayISO(),
+            createdBy: req.user!.id,
+          });
+          created.push(id);
+          totalTco2e += tco2e;
+        }
+
         let removed = 0;
         if (replace && priorRows.length > 0) {
           await tx.delete(carbonEntries).where(
@@ -1623,7 +1638,6 @@ export const esgModule: FastifyPluginAsync = async (app) => {
     { preHandler: readGate },
     async (req) => {
       const { commitmentId } = req.params as { commitmentId: string };
-      await fetchCommitment(commitmentId, req.companyId!, req.projectId!);
       const commitment = await fetchCommitment(commitmentId, req.companyId!, req.projectId!);
       const deliveries = await app.db
         .select()

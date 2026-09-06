@@ -597,6 +597,121 @@ describe("risk status transitions", () => {
   });
 });
 
+/* ------------------------------------------------------------------ */
+/* Register depth: cause/effect, response strategy, secondary risks    */
+/* ------------------------------------------------------------------ */
+
+describe("register depth (#447-450)", () => {
+  it("records cause, effect, the chosen response, proximity and triggers", async () => {
+    const pid = await makeProject("Register depth");
+    const created = await createQuantifiedRisk(pid, {
+      cause: "The site investigation was limited to the northern half of the plot",
+      effect: "Piling redesign and a four-week delay to the substructure",
+      responseStrategy: "reduce",
+      proximityDate: addDaysISO(todayISO(), 60),
+      triggers: ["Trial pit finds made ground below 3m", "Piling rig refusal on any pile"],
+    });
+    expect(created.cause).toContain("northern half");
+    expect(created.responseStrategy).toBe("reduce");
+    expect(created.triggers).toHaveLength(2);
+
+    const patched = await patch(`/projects/${pid}/risks/${created.id as string}`, {
+      responseStrategy: "transfer",
+      effect: "Carried by the piling subcontractor under a lump sum",
+    });
+    expect(patched.statusCode).toBe(200);
+    expect((patched.json() as Json).responseStrategy).toBe("transfer");
+
+    const bad = await post(`/projects/${pid}/risks`, {
+      title: "Bad strategy",
+      category: "technical",
+      probabilityScore: 2,
+      impactScore: 2,
+      responseStrategy: "ignore_it",
+    });
+    expect(bad.statusCode).toBe(400);
+  });
+
+  it("links a secondary risk to the primary whose response created it, both ways", async () => {
+    const pid = await makeProject("Secondary risks");
+    const primary = await createQuantifiedRisk(pid, {
+      title: "Flood damage to the ground floor",
+      responseStrategy: "transfer",
+    });
+    const secondary = await post(`/projects/${pid}/risks`, {
+      title: "Insurer disputes the claim",
+      category: "commercial",
+      probabilityScore: 2,
+      impactScore: 5,
+      cause: "The flood exposure was transferred to an insurer",
+      secondaryOfRiskId: primary.id,
+    });
+    expect(secondary.statusCode).toBe(201);
+
+    const detail = (await get(`/projects/${pid}/risks/${primary.id as string}`)).json() as {
+      secondaries: Json[];
+      primary: Json | null;
+    };
+    expect(detail.primary).toBeNull();
+    expect(detail.secondaries).toHaveLength(1);
+    expect(detail.secondaries[0]!.title).toBe("Insurer disputes the claim");
+
+    const child = (
+      await get(`/projects/${pid}/risks/${(secondary.json() as Json).id as string}`)
+    ).json() as { primary: Json | null };
+    expect(child.primary).not.toBeNull();
+    expect(child.primary!.id).toBe(primary.id);
+  });
+
+  it("refuses a secondary link that is self-referential, looping or off-project", async () => {
+    const pid = await makeProject("Secondary guards");
+    const other = await makeProject("Somewhere else");
+    const a = await createQuantifiedRisk(pid, { title: "A" });
+    const b = await post(`/projects/${pid}/risks`, {
+      title: "B",
+      category: "commercial",
+      probabilityScore: 2,
+      impactScore: 2,
+      secondaryOfRiskId: a.id,
+    });
+    expect(b.statusCode).toBe(201);
+    const bId = (b.json() as Json).id as string;
+
+    const self = await patch(`/projects/${pid}/risks/${bId}`, { secondaryOfRiskId: bId });
+    expect(self.statusCode).toBe(400);
+
+    // A ← B already; making A a secondary of B closes the loop
+    const loop = await patch(`/projects/${pid}/risks/${a.id as string}`, {
+      secondaryOfRiskId: bId,
+    });
+    expect(loop.statusCode).toBe(400);
+    expect((loop.json() as Json).message).toMatch(/loop/i);
+
+    const foreign = await post(`/projects/${other}/risks`, {
+      title: "Elsewhere",
+      category: "commercial",
+      probabilityScore: 2,
+      impactScore: 2,
+      secondaryOfRiskId: a.id,
+    });
+    expect(foreign.statusCode).toBe(400);
+  });
+
+  it("counts responses in the health inputs so an unmanaged register is visible", async () => {
+    const pid = await makeProject("Response coverage");
+    await createQuantifiedRisk(pid, { title: "No response chosen" });
+    await createQuantifiedRisk(pid, { title: "Accepted", responseStrategy: "accept" });
+    const metrics = (
+      (await get(`/projects/${pid}/risk/health-inputs`)).json() as {
+        metrics: Record<string, number | null>;
+      }
+    ).metrics;
+    expect(metrics["liveRisksWithoutResponse"]).toBe(1);
+    expect(metrics["liveRisksAccepted"]).toBe(1);
+    expect(metrics["secondaryRisks"]).toBe(0);
+  });
+});
+
 describe("risk health inputs", () => {
   it("returns metrics with reasons and never a fabricated zero", async () => {
     const pid = await makeProject("Health inputs");

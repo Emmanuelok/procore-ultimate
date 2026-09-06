@@ -6,6 +6,12 @@
  * the digest builder — exposed both as a scheduler job and as a manual run so
  * an operator can see exactly what a digest would contain before it goes out.
  *
+ * A digest cadence DEFERS ordinary notifications: `held_for_digest` keeps
+ * them out of the unread count until the sweep releases them. Turning the
+ * cadence off releases them immediately — the sweep only visits users whose
+ * digest is not `off`, so an abandoned cadence would otherwise hold its rows
+ * back for ever.
+ *
  * What this module deliberately does not do: send email. `lib/email.ts` owns
  * the transport and WP-AUTH owns its configuration; the digest returns a
  * rendered summary and records that it ran, and a transport-backed sender is
@@ -268,7 +274,34 @@ export const notificationsModule: FastifyPluginAsync = async (app) => {
         mutedTools: body.mutedTools ? [...body.mutedTools] : [],
       });
     }
-    return loadOrDefault(req.companyId!, req.user!.id);
+
+    /*
+     * Turning the digest OFF releases whatever it was holding.
+     *
+     * The hold is a deferral, and the only thing that ends it is the digest
+     * sweep — which iterates preferences with `digest <> 'off'`. Switching
+     * back to immediate delivery therefore used to strand every held row:
+     * present in the inbox, invisible to the unread count, and never released
+     * by anything. A cadence a user has abandoned owes them the notifications
+     * it was sitting on.
+     */
+    let releasedFromHold = 0;
+    if (body.digest === "off") {
+      releasedFromHold = (
+        await app.db
+          .update(notifications)
+          .set({ heldForDigest: 0 })
+          .where(
+            and(
+              eq(notifications.companyId, req.companyId!),
+              eq(notifications.userId, req.user!.id),
+              eq(notifications.heldForDigest, 1),
+            ),
+          )
+          .returning({ id: notifications.id })
+      ).length;
+    }
+    return { ...(await loadOrDefault(req.companyId!, req.user!.id)), releasedFromHold };
   });
 
   /* ---------------------------------------------------------------- */

@@ -135,32 +135,6 @@ export const environmentalRoutes: FastifyPluginAsync = async (app) => {
     const { number, reference } = await allocateReference(app.db, projectId, "site_environmental_event", "ENV");
     const id = newId("sev");
 
-    let signalId: string | null = null;
-    if (exceeded) {
-      const raised = await alreadySignalled(app.db, companyId, ["site_environmental_threshold"], projectId);
-      const key = `env:${id}`;
-      if (!raised.has(key)) {
-        signalId = await raiseSignal(app.db, companyId, projectId, req.user!.id, {
-          detector: "site_environmental_threshold",
-          severity: body.severity === "info" ? "medium" : body.severity,
-          confidence: 0.9,
-          title: `${body.category.replace(/_/g, " ")} threshold exceeded (${reference})`,
-          explanation: `A measured ${body.magnitude}${body.magnitudeUnit ?? ""} exceeds the ${body.thresholdValue}${body.thresholdUnit ?? ""} limit at ${body.occurredAt}. ${body.impact ?? ""}`.trim(),
-          key,
-          subjectType: "site_environmental_event",
-          subjectId: id,
-          evidence: {
-            eventId: id,
-            reference,
-            category: body.category,
-            magnitude: body.magnitude,
-            threshold: body.thresholdValue,
-            unit: body.magnitudeUnit ?? body.thresholdUnit ?? null,
-          },
-        });
-      }
-    }
-
     // The site record and its mirror in the platform-wide occurrence log are
     // one fact in two tables: written together, or not at all. A mirror with
     // no site record behind it would leave forensics an occurrence nothing
@@ -218,7 +192,7 @@ export const environmentalRoutes: FastifyPluginAsync = async (app) => {
           actionsTaken: body.actionsTaken ?? null,
           weatherObservationId: body.weatherObservationId ?? null,
           assuranceEventId,
-          signalId,
+          signalId: null,
           fileIds: body.fileIds,
           notes: body.notes ?? null,
           reportedByName: body.reportedByName ?? null,
@@ -228,6 +202,36 @@ export const environmentalRoutes: FastifyPluginAsync = async (app) => {
       return saved!;
     });
 
+    // The signal is raised only once the event it points at exists: an
+    // exceedance alert whose subject was never written would be an alarm about
+    // nothing. The id is minted here, so the signal is one per event by
+    // construction and needs no dedupe read.
+    let signalId: string | null = null;
+    if (exceeded) {
+      signalId = await raiseSignal(app.db, companyId, projectId, req.user!.id, {
+        detector: "site_environmental_threshold",
+        severity: body.severity === "info" ? "medium" : body.severity,
+        confidence: 0.9,
+        title: `${body.category.replace(/_/g, " ")} threshold exceeded (${reference})`,
+        explanation: `A measured ${body.magnitude}${body.magnitudeUnit ?? ""} exceeds the ${body.thresholdValue}${body.thresholdUnit ?? ""} limit at ${body.occurredAt}. ${body.impact ?? ""}`.trim(),
+        key: `env:${id}`,
+        subjectType: "site_environmental_event",
+        subjectId: id,
+        evidence: {
+          eventId: id,
+          reference,
+          category: body.category,
+          magnitude: body.magnitude,
+          threshold: body.thresholdValue,
+          unit: body.magnitudeUnit ?? body.thresholdUnit ?? null,
+        },
+      });
+      await app.db
+        .update(siteEnvironmentalEvents)
+        .set({ signalId })
+        .where(and(eq(siteEnvironmentalEvents.id, id), eq(siteEnvironmentalEvents.companyId, companyId)));
+    }
+
     await ledger(app.db, {
       companyId,
       projectId,
@@ -235,10 +239,11 @@ export const environmentalRoutes: FastifyPluginAsync = async (app) => {
       action: "create",
       objectType: "site_environmental_event",
       objectId: id,
-      payload: { reference, category: body.category, exceeded, assuranceEventId },
+      payload: { reference, category: body.category, exceeded, assuranceEventId, signalId },
     });
     return reply.code(201).send({
       ...row,
+      signalId,
       exceeded,
       thresholdVerdict:
         body.thresholdValue === null || body.thresholdValue === undefined

@@ -432,8 +432,8 @@ export async function reconcileMusterRecord(
 
   let signalId: string | null = muster.signalId;
   if (reconciliation.unaccountedCount > 0 && !signalId) {
-    const raised = await alreadySignalled(db, companyId, ["site_muster_unaccounted"], projectId);
     const key = `muster:${muster.id}`;
+    const raised = await alreadySignalled(db, companyId, ["site_muster_unaccounted"], { projectId, keys: [key] });
     if (!raised.has(key)) {
       signalId = await raiseSignal(db, companyId, projectId, actorId, {
         detector: "site_muster_unaccounted",
@@ -541,7 +541,9 @@ export async function sweepPermitExpiry(db: Db, companyId: string, now: Date, sc
   const due = expiredPermits(open, nowIso);
   if (due.length === 0) return { expired: 0, signalsRaised: 0 };
 
-  const raised = await alreadySignalled(db, companyId, ["site_permit_expired_open"]);
+  const raised = await alreadySignalled(db, companyId, ["site_permit_expired_open"], {
+    keys: due.map((permit) => `permit-expired:${permit.id}`),
+  });
   let signalsRaised = 0;
 
   for (const permit of due) {
@@ -621,7 +623,9 @@ export async function sweepPermitEntries(db: Db, companyId: string, now: Date, s
   if (due.length === 0) return { overdue: 0, signalsRaised: 0 };
 
   const byId = new Map(rows.map((r) => [r.id, r]));
-  const raised = await alreadySignalled(db, companyId, ["site_confined_space_overdue"]);
+  const raised = await alreadySignalled(db, companyId, ["site_confined_space_overdue"], {
+    keys: due.map((entry) => `entry-overdue:${entry.id}`),
+  });
   let signalsRaised = 0;
 
   for (const entry of due) {
@@ -704,7 +708,9 @@ export async function sweepLoneWorkers(db: Db, companyId: string, now: Date, sco
   if (verdicts.length === 0) return { overdue: 0, escalated: 0, signalsRaised: 0 };
 
   const byId = new Map(rows.map((r) => [r.id, r]));
-  const raised = await alreadySignalled(db, companyId, ["site_lone_worker_overdue"]);
+  const raised = await alreadySignalled(db, companyId, ["site_lone_worker_overdue"], {
+    keys: verdicts.map((verdict) => `lone-worker:${verdict.id}`),
+  });
   let signalsRaised = 0;
   let escalated = 0;
 
@@ -877,7 +883,9 @@ export async function sweepAccessCredentials(db: Db, companyId: string, now: Dat
     )
     .limit(5000);
 
-  const raised = await alreadySignalled(db, companyId, ["site_pass_without_induction"]);
+  const raised = await alreadySignalled(db, companyId, ["site_pass_without_induction"], {
+    keys: suspect.map((row) => `pass-induction:${row.passId}`),
+  });
   let signalsRaised = 0;
   for (const row of suspect) {
     const ok = row.inductionId !== null && row.inductionStatus === "valid";
@@ -962,15 +970,25 @@ export async function sweepOverstays(db: Db, companyId: string, now: Date, scope
       ),
     );
 
-  const raised = await alreadySignalled(db, companyId, ["site_overstay"]);
+  // Fold every project's register first: the keys are then known, so the
+  // dedupe read is a point lookup on the signal fingerprints rather than a
+  // scan of the company's signal history.
+  const folded: Array<{ projectId: string; register: RegisterResult }> = [];
+  for (const { projectId } of projectRows) {
+    folded.push({ projectId, register: await loadRegister(db, companyId, projectId, nowIso) });
+  }
+  const overstayKey = (projectId: string, person: { personKey: string; sinceAt: string | null }): string =>
+    `overstay:${projectId}:${person.personKey}:${person.sinceAt ?? ""}`;
+  const raised = await alreadySignalled(db, companyId, ["site_overstay"], {
+    keys: folded.flatMap(({ projectId, register }) => register.overstays.map((person) => overstayKey(projectId, person))),
+  });
   let signalsRaised = 0;
   let overstays = 0;
 
-  for (const { projectId } of projectRows) {
-    const register = await loadRegister(db, companyId, projectId, nowIso);
+  for (const { projectId, register } of folded) {
     for (const person of register.overstays) {
       overstays += 1;
-      const key = `overstay:${projectId}:${person.personKey}:${person.sinceAt ?? ""}`;
+      const key = overstayKey(projectId, person);
       if (raised.has(key)) continue;
       await raiseSignal(db, companyId, projectId, null, {
         detector: "site_overstay",

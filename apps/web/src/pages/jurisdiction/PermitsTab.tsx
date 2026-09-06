@@ -107,6 +107,19 @@ function ScheduleRiskBanner({ risk }: { risk: ScheduleRiskResponse }) {
           </>
         ) : null}
       </p>
+      {risk.summary.startedUnconsented > 0 ? (
+        <p className="mt-1 text-xs font-semibold">
+          {risk.summary.startedUnconsented} of them have already started on site without the
+          consent in hand — that one cannot be fixed by re-planning.
+        </p>
+      ) : null}
+      {risk.summary.projectedSlipDays !== null && risk.summary.projectedSlipDays > 0 ? (
+        <p className="mt-1 text-xs">
+          Projected slip if determinations take as long as they typically have:{" "}
+          <span className="font-semibold tabular-nums">{risk.summary.projectedSlipDays}</span> day
+          {risk.summary.projectedSlipDays === 1 ? "" : "s"}.
+        </p>
+      ) : null}
       <ul className="mt-2 space-y-1 text-xs">
         {blocked.slice(0, 6).map((i) => (
           <li key={`${i.permitId}-${i.taskId}`} className="flex flex-wrap items-baseline gap-x-2">
@@ -122,6 +135,18 @@ function ScheduleRiskBanner({ risk }: { risk: ScheduleRiskResponse }) {
             <span className="tabular-nums font-medium">
               starts {countdownLabel(i.daysUntilStart)}
             </span>
+            {i.daysAtRisk !== null && i.daysAtRisk > 0 ? (
+              <span
+                className="tabular-nums"
+                title={`Expected to be determined by ${i.expectedResolutionDate ?? "—"}, ${
+                  i.estimateSource === "observed_median"
+                    ? `from the median of ${i.estimateSampleSize ?? 0} comparable determinations on this company's own record`
+                    : "from the documented default for this state — no history yet"
+                }`}
+              >
+                · {i.daysAtRisk}d at risk
+              </span>
+            ) : null}
             {i.isCritical ? (
               <span className="rounded bg-red-100 px-1 text-[10px] font-semibold uppercase">
                 critical

@@ -144,15 +144,6 @@ export async function computeBatchRollup(db: Db, batchId: string): Promise<Batch
     `Batch rollup`,
   );
 
-  const allocated = await db
-    .selectDistinct({ timecardId: timecardAllocations.timecardId })
-    .from(timecardAllocations)
-    .where(inArray(timecardAllocations.timecardId, cards.map((c) => c.id)));
-  const allocatedIds = new Set(allocated.map((a) => a.timecardId));
-
-  const uncosted = cards.filter((c) => c.totalCost === null).map((c) => c.reference);
-  const unallocated = cards.filter((c) => !allocatedIds.has(c.id)).map((c) => c.reference);
-
   /*
    * ALLOCATIONS MUST STILL RECONCILE AT BATCH LEVEL.
    *
@@ -161,20 +152,23 @@ export async function computeBatchRollup(db: Db, batchId: string): Promise<Batch
    * to 10h, and approved through the batch — exported to payroll at 10h with
    * 8h on the cost report. The single-card approve route refuses exactly this;
    * the batch path, which is where approval actually happens, did not check it
-   * at all.
+   * at all. One read of the allocations answers both "is it coded" and "does
+   * the coding still add up".
    */
-  const allocationRows =
-    cards.length > 0
-      ? await db
-          .select()
-          .from(timecardAllocations)
-          .where(
-            inArray(
-              timecardAllocations.timecardId,
-              cards.map((c) => c.id),
-            ),
-          )
-      : [];
+  const allocationRows = await db
+    .select()
+    .from(timecardAllocations)
+    .where(
+      inArray(
+        timecardAllocations.timecardId,
+        cards.map((c) => c.id),
+      ),
+    );
+  const allocatedIds = new Set(allocationRows.map((a) => a.timecardId));
+
+  const uncosted = cards.filter((c) => c.totalCost === null).map((c) => c.reference);
+  const unallocated = cards.filter((c) => !allocatedIds.has(c.id)).map((c) => c.reference);
+
   const misallocated: string[] = [];
   for (const card of cards) {
     if (!allocatedIds.has(card.id)) continue;

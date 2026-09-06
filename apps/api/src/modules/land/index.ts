@@ -1,4 +1,6 @@
 import type { FastifyPluginAsync } from "fastify";
+import { grievances, landParcels } from "@constructos/db";
+import { registerSearchSource, tableSource } from "../search/registry.js";
 import { registerParcelRoutes } from "./parcels.js";
 import { registerPapRoutes } from "./paps.js";
 import { registerGrievanceRoutes } from "./grievances.js";
@@ -86,6 +88,55 @@ export const landModule: FastifyPluginAsync = async (app) => {
     stakeholderQuadrants: STAKEHOLDER_QUADRANTS,
     engagementKinds: ENGAGEMENT_KINDS,
   }));
+
+  /*
+   * Company-wide search (contract §3.3). A cadastral reference and a
+   * grievance are exactly what someone types into ⌘K — "CAD/12/447", "dust
+   * Kibaale" — and a register nobody can find from the search box is a
+   * register nobody uses. Both sources carry the `land` tool, so search
+   * respects the same gate the workspace does.
+   */
+  registerSearchSource(
+    tableSource({
+      type: "land_parcel",
+      label: "Land parcel",
+      tool: "land",
+      scope: "project",
+      table: landParcels,
+      columns: {
+        id: landParcels.id,
+        companyId: landParcels.companyId,
+        projectId: landParcels.projectId,
+        title: landParcels.reference,
+        subtitle: landParcels.ownerName,
+        status: landParcels.status,
+        updatedAt: landParcels.updatedAt,
+      },
+      searchColumns: [landParcels.reference, landParcels.ownerName, landParcels.description],
+      href: (r) => (r.projectId ? `/projects/${r.projectId}/land?tab=parcels` : "/"),
+    }),
+  );
+  registerSearchSource(
+    tableSource({
+      type: "grievance",
+      label: "Grievance",
+      tool: "land",
+      scope: "project",
+      table: grievances,
+      columns: {
+        id: grievances.id,
+        companyId: grievances.companyId,
+        projectId: grievances.projectId,
+        title: grievances.description,
+        subtitle: grievances.category,
+        reference: grievances.number,
+        status: grievances.status,
+        updatedAt: grievances.updatedAt,
+      },
+      searchColumns: [grievances.description, grievances.resolution],
+      href: (r) => (r.projectId ? `/projects/${r.projectId}/land?tab=grievances` : "/"),
+    }),
+  );
 
   await registerParcelRoutes(app);
   await registerPapRoutes(app);

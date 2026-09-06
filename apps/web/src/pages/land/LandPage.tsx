@@ -11,7 +11,7 @@
  * Standard 5 / World Bank ESS5.
  */
 import { useCallback, useEffect, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 import { api } from "../../lib/api";
 import { Badge, ErrorAlert, PageHeader, Spinner } from "../../ui";
 import { formatDate } from "../format";
@@ -48,7 +48,23 @@ export default function LandPage() {
   const { projectId } = useParams<{ projectId: string }>();
   const base = `/api/v1/projects/${projectId}`;
 
-  const [tab, setTab] = useState<TabKey>("rap");
+  /*
+   * The tab lives in the URL like the ESG and jurisdiction workspaces, so a
+   * search hit or a shared link can land on the register it is about rather
+   * than on the dashboard.
+   */
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [tab, setTabState] = useState<TabKey>(() => {
+    const t = searchParams.get("tab");
+    return t && TABS.some((x) => x.key === t) ? (t as TabKey) : "rap";
+  });
+  const setTab = useCallback(
+    (key: TabKey) => {
+      setTabState(key);
+      setSearchParams({ tab: key }, { replace: true });
+    },
+    [setSearchParams],
+  );
   const [rap, setRap] = useState<RapProgress | null>(null);
   const [risk, setRisk] = useState<ScheduleRisk | null>(null);
   const [grm, setGrm] = useState<GrievanceAnalytics | null>(null);
@@ -88,8 +104,16 @@ export default function LandPage() {
 
   if (!projectId) return null;
 
+  // A task with no planned start has no countdown: it belongs in the register,
+  // not in a banner that claims work starts today. Works that have ALREADY
+  // started without their consent are always counted — that is the finding
+  // re-planning cannot undo.
   const imminent = risk
-    ? risk.items.filter((i) => i.daysUntilStart <= risk.signalHorizonDays).length
+    ? risk.items.filter(
+        (i) =>
+          i.startedUnconsented ||
+          (i.daysUntilStart !== null && i.daysUntilStart <= risk.signalHorizonDays),
+      ).length
     : 0;
   const overdue = grm?.openOverdue ?? 0;
 
@@ -125,7 +149,8 @@ export default function LandPage() {
               {imminent > 0 ? (
                 <span className="text-red-700">
                   <span className="font-semibold tabular-nums">{imminent}</span> works package
-                  {imminent === 1 ? "" : "s"} about to start on unacquired land{" "}
+                  {imminent === 1 ? "" : "s"} about to start without the land or the consent in
+                  hand{" "}
                   <button
                     type="button"
                     className="rounded px-1.5 py-0.5 font-medium underline underline-offset-2 hover:bg-red-100"

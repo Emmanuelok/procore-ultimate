@@ -728,6 +728,52 @@ describe("permit detectors", () => {
     });
     expect(wide.json().total).toBe(2);
   });
+
+  /*
+   * The permits workspace and the land workspace look at the same programme.
+   * If each computed its own delay arithmetic they would disagree the moment
+   * a permit and a parcel blocked one task, so the permit view is quantified
+   * by the SHARED consent engine — same expected-resolution estimate, same
+   * days-at-risk, same stated basis.
+   */
+  it("quantifies blocked permit links with the shared consent engine", async () => {
+    const pid = await makeProject("Permit consent quantification");
+    const soon = await makeTask(pid, "Piling", addDaysISO(todayISO(), 5));
+    await createPermit(pid, { blockingTaskIds: [soon] });
+
+    const risk = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/permits/schedule-risk?days=60`,
+      headers: owner.headers,
+    });
+    expect(risk.statusCode).toBe(200);
+    const item = risk.json().items[0] as {
+      blocked: boolean;
+      daysAtRisk: number | null;
+      expectedResolutionDate: string | null;
+      estimateSource: string | null;
+      startedUnconsented: boolean;
+    };
+    expect(item.blocked).toBe(true);
+    // no determination history on a fresh company, so the engine says so
+    // rather than pretending to an observed median
+    expect(item.estimateSource).toBe("default");
+    expect(item.daysAtRisk).toBeGreaterThan(0);
+    expect(item.expectedResolutionDate).not.toBeNull();
+    expect(item.startedUnconsented).toBe(false);
+
+    // and the land workspace's unified view answers with the same number
+    const land = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/land/schedule-risk?days=60`,
+      headers: owner.headers,
+    });
+    expect(land.statusCode).toBe(200);
+    const landItem = (
+      land.json().items as { kind: string; taskId: string; daysAtRisk: number }[]
+    ).find((i) => i.kind === "permit" && i.taskId === soon);
+    expect(landItem?.daysAtRisk).toBe(item.daysAtRisk);
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -873,5 +919,35 @@ describe("tenant isolation", () => {
 
     const unauth = await app.inject({ method: "GET", url: "/api/v1/fx-rates" });
     expect(unauth.statusCode).toBe(401);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Company-wide search (contract §3.3)                                 */
+/* ------------------------------------------------------------------ */
+
+describe("search sources", () => {
+  it("finds permits from the company search", async () => {
+    const pid = await makeProject("Searchable permits");
+    const created = await createPermit(pid, {
+      title: "Riparian works licence",
+      authority: "Rivers Authority of Kibaale",
+    });
+    expect(created.statusCode).toBe(201);
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/search?q=${encodeURIComponent("riparian")}&limit=20`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      items: { type: string; id: string; href: string }[];
+      coverage: string[];
+    };
+    expect(body.coverage).toContain("permit");
+    const hit = body.items.find((i) => i.type === "permit");
+    expect(hit?.id).toBe(created.json().id);
+    expect(hit?.href).toBe(`/projects/${pid}/jurisdiction?tab=permits`);
   });
 });

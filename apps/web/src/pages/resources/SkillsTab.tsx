@@ -33,6 +33,7 @@ import {
   Pill,
   ReasonList,
   Row,
+  SubjectPicker,
   VALIDITY_TONE,
   count,
   dateOnly,
@@ -445,11 +446,16 @@ function RecordTicketModal({
           </Alert>
         ) : null}
         <Field
-          label="Worker id"
+          label="Worker"
           required
-          hint="From the workforce register — certifications are recorded against enrolled workers."
+          hint="Read from the workforce register — certifications are recorded against enrolled workers. An id can still be pasted in."
         >
-          <Input value={workerId} onChange={(e) => setWorkerId(e.target.value)} />
+          <SubjectPicker
+            projectId={projectId}
+            kind="worker"
+            value={workerId}
+            onChange={setWorkerId}
+          />
         </Field>
         <Field label="Ticket" required>
           <Select value={skillId} onChange={(e) => setSkillId(e.target.value)}>

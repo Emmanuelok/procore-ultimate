@@ -82,6 +82,24 @@ export type EstimateView = (typeof ESTIMATE_VIEWS)[number];
 export const RISK_APPETITE_SCOPES = ["project", "category"] as const;
 export type RiskAppetiteScope = (typeof RISK_APPETITE_SCOPES)[number];
 
+/**
+ * Risk response strategies (ISO 31000 / APM PRAM taxonomy, spec Vol II
+ * Domain H #447-450). A register that records only "mitigations" cannot say
+ * whether the team decided to remove the risk, to live with it, or to pay
+ * someone else to carry it — and that choice is the governance record, not
+ * the action list underneath it. `share` and `exploit` exist because an
+ * opportunity is managed with different verbs from a threat.
+ */
+export const RISK_RESPONSE_STRATEGIES = [
+  "avoid",
+  "reduce",
+  "transfer",
+  "share",
+  "accept",
+  "exploit",
+] as const;
+export type RiskResponseStrategy = (typeof RISK_RESPONSE_STRATEGIES)[number];
+
 /* ------------------------------------------------------------------ */
 /* Capital governance (Domain G) — benefits, assurance actions          */
 /* ------------------------------------------------------------------ */
@@ -277,6 +295,32 @@ export const BUNDLE_ITEM_PRIVILEGE = [
   "commercially_confidential",
 ] as const;
 export type BundleItemPrivilege = (typeof BUNDLE_ITEM_PRIVILEGE)[number];
+
+/**
+ * Redfern schedule rulings on a document production request (#340-343).
+ * `granted_in_part` is a real and common outcome — a tribunal narrows a
+ * category rather than refusing it — so it is not collapsed into granted.
+ */
+export const PRODUCTION_DECISIONS = [
+  "pending",
+  "granted",
+  "granted_in_part",
+  "refused",
+  "withdrawn",
+] as const;
+export type ProductionDecision = (typeof PRODUCTION_DECISIONS)[number];
+
+/** Grounds an objecting party may rely on (IBA Rules Art. 9.2 families). */
+export const PRODUCTION_OBJECTION_GROUNDS = [
+  "lack_of_relevance",
+  "privilege",
+  "proportionality",
+  "commercially_sensitive",
+  "not_in_possession",
+  "unreasonable_burden",
+  "confidentiality",
+] as const;
+export type ProductionObjectionGround = (typeof PRODUCTION_OBJECTION_GROUNDS)[number];
 
 /* ------------------------------------------------------------------ */
 /* Designated (special) accounts and availability payments (Domain O)   */

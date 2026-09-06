@@ -343,12 +343,18 @@ export interface FlightRow {
   purpose: string;
   status: string;
   pilotName: string | null;
+  pilotLicenceRef: string | null;
+  operatorVendorId: string | null;
   aircraft: string | null;
   plannedFor: string | null;
   flownAt: string | null;
   durationMinutes: number | null;
   permissionStatus: string;
   permissionRef: string | null;
+  airspaceNotes: string | null;
+  maxAltitudeM: number | null;
+  riskAssessmentRef: string | null;
+  notes: string | null;
   imageCount: number | null;
   outputs: Array<{ kind: string; fileId?: string; ref?: string; note?: string }>;
 }

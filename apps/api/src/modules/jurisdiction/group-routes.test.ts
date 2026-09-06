@@ -1166,6 +1166,83 @@ describe("local content computation", () => {
     expect(body.breaching).toBe(0);
   });
 
+  /*
+   * Regression: a correction dated EARLIER than the figure it withdraws used
+   * to leave the withdrawn (later-dated) reading standing as the register's
+   * "latest" — so the list, its compliance badge and its gap all reported a
+   * number that had been formally withdrawn, while the detector and the
+   * summary read the corrected one. Two answers to "what is our local
+   * content position?" is one too many.
+   */
+  it("never reports a superseded reading as the current position", async () => {
+    const pid = await makeProject("Local content back-dated correction");
+    const target = await makeTarget(pid, { targetValue: 80 });
+    const created = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/local-content-targets/${target.id}/readings`,
+      headers: owner.headers,
+      // dated in the future relative to the correction below
+      payload: { readingDate: addDaysISO(todayISO(), -1), value: 91, basis: "First count" },
+    });
+    expect(created.statusCode).toBe(201);
+    const reading = created.json() as { id: string };
+
+    const corrected = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/local-content-readings/${reading.id}/supersede`,
+      headers: owner.headers,
+      payload: {
+        readingDate: addDaysISO(todayISO(), -40),
+        value: 42,
+        basis: "Recount against the payroll register",
+        reason: "The first count double-counted agency workers",
+      },
+    });
+    expect(corrected.statusCode).toBe(201);
+
+    const list = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/local-content-targets?pageSize=50`,
+      headers: owner.headers,
+    });
+    const row = (
+      list.json() as {
+        items: {
+          id: string;
+          latestValue: number | null;
+          compliant: boolean | null;
+          gap: number | null;
+          readingCount: number;
+          supersededCount: number;
+        }[];
+      }
+    ).items.find((t) => t.id === target.id)!;
+    expect(row.latestValue).toBe(42);
+    expect(row.compliant).toBe(false);
+    expect(row.gap).toBe(38);
+    // the withdrawn figure is kept but never counted as a measurement
+    expect(row.readingCount).toBe(1);
+    expect(row.supersededCount).toBe(1);
+
+    const readings = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/local-content-targets/${target.id}/readings`,
+      headers: owner.headers,
+    });
+    const body = readings.json() as {
+      items: { id: string; superseded: boolean }[];
+      total: number;
+      supersededCount: number;
+      breaches: number;
+    };
+    // the trail still shows both, flagged
+    expect(body.items).toHaveLength(2);
+    expect(body.items.find((r) => r.id === reading.id)!.superseded).toBe(true);
+    expect(body.total).toBe(1);
+    expect(body.supersededCount).toBe(1);
+    expect(body.breaches).toBe(1);
+  });
+
   it("refuses to delete a target with a measurement history", async () => {
     const pid = await makeProject("Local content delete");
     const target = await makeTarget(pid);

@@ -225,6 +225,12 @@ export default function ParcelsTab({
   const [compAmount, setCompAmount] = useState("");
   const [compPaidAt, setCompPaidAt] = useState("");
   const [compEvidence, setCompEvidence] = useState<string[]>([]);
+  /* Acquisition (#551-552): the basis on which title actually passed. */
+  const [acqOpen, setAcqOpen] = useState(false);
+  const [acqBasis, setAcqBasis] = useState("purchase");
+  const [acqDate, setAcqDate] = useState("");
+  const [acqEvidence, setAcqEvidence] = useState<string[]>([]);
+  const [acqNote, setAcqNote] = useState("");
 
   async function advance(status: string) {
     if (!selected) return;
@@ -266,8 +272,38 @@ export default function ParcelsTab({
     }
   }
 
+  async function onAcquire(e: FormEvent) {
+    e.preventDefault();
+    if (!selected) return;
+    setActError(null);
+    setBusy(true);
+    try {
+      await api.post(`${base}/parcels/${selected.id}/acquire`, {
+        acquisitionBasis: acqBasis,
+        acquiredAt: acqDate,
+        evidenceIds: acqEvidence,
+        note: acqNote.trim() === "" ? null : acqNote.trim(),
+      });
+      setAcqOpen(false);
+      await openParcel(selected.id);
+      await load();
+      onChanged();
+    } catch (err) {
+      setActError(
+        err instanceof ApiClientError ? err.message : "Failed to record the acquisition.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const compensable =
     selected !== null && ["under_negotiation", "agreed", "disputed"].includes(selected.status);
+  /* Bases that need a payment on file first — the server enforces it too. */
+  const acqNeedsPayment =
+    selected !== null &&
+    (selected.cashAcquisitionBases ?? []).includes(acqBasis) &&
+    !selected.compensationPaidAt;
   const coords = selected ? fmtLatLng(selected.latitude, selected.longitude) : null;
 
   /* --------------------------------- render --------------------------------- */
@@ -568,14 +604,112 @@ export default function ParcelsTab({
                   Record compensation
                 </Button>
               ) : null}
+              {selected.acquirable ? (
+                <Button
+                  size="sm"
+                  onClick={() => {
+                    setActError(null);
+                    setAcqBasis(
+                      selected.compensationPaidAt
+                        ? "purchase"
+                        : selected.tenureType === "state"
+                          ? "state_allocation"
+                          : "donation",
+                    );
+                    setAcqDate(new Date().toISOString().slice(0, 10));
+                    setAcqEvidence([]);
+                    setAcqNote("");
+                    setAcqOpen(true);
+                  }}
+                >
+                  Record acquisition
+                </Button>
+              ) : null}
             </div>
             <p className="text-xs text-ink-400">
               A parcel only becomes <span className="font-medium">compensated</span> through the
-              evidenced payment route — the status control cannot set it, so a payment can never be
-              recorded without proof it reached the beneficiary (#554).
+              evidenced payment route, and only becomes{" "}
+              <span className="font-medium">acquired</span> through the evidenced acquisition
+              route, which records the basis on which title passed — purchase, donation, state
+              allocation, lease or court order. Neither can be set from the status control, so a
+              payment can never be recorded without proof it reached the beneficiary (#554), and a
+              state-owned or donated parcel never has to be routed through a fictitious dispute to
+              be marked acquired (#551-552).
             </p>
           </div>
         ) : null}
+      </Modal>
+
+      {/* ---------------------------- acquisition modal -------------------------- */}
+      <Modal
+        open={acqOpen}
+        title={selected ? `Record acquisition of ${selected.reference}` : "Record acquisition"}
+        onClose={() => setAcqOpen(false)}
+        wide
+      >
+        <form onSubmit={onAcquire} className="space-y-4">
+          <ErrorAlert message={actError} />
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <Field
+              label="Basis on which title passed"
+              hint="Purchase and expropriation require compensation to have been paid first (IFC PS5 para 20)."
+            >
+              <Select value={acqBasis} onChange={(e) => setAcqBasis(e.target.value)}>
+                {(selected?.acquisitionBases ?? []).map((b) => (
+                  <option key={b} value={b}>
+                    {humanize(b)}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Title passed on">
+              <Input
+                type="date"
+                required
+                value={acqDate}
+                onChange={(e) => setAcqDate(e.target.value)}
+              />
+            </Field>
+          </div>
+          <Field
+            label="Title evidence"
+            hint="Transfer deed, lease, donation deed, government allocation letter or court order."
+          >
+            <EvidencePicker
+              projectId={projectId}
+              selected={acqEvidence}
+              onChange={setAcqEvidence}
+            />
+          </Field>
+          <Field label="Note (optional)">
+            <Textarea
+              value={acqNote}
+              onChange={(e) => setAcqNote(e.target.value)}
+              className="min-h-16"
+              maxLength={10000}
+            />
+          </Field>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            {acqNeedsPayment ? (
+              <p className="mr-auto max-w-sm text-xs text-amber-700">
+                No compensation payment is on file. A purchase or expropriation cannot take
+                possession before payment — record the payment first, or state the non-cash basis
+                on which title passed.
+              </p>
+            ) : acqEvidence.length === 0 ? (
+              <p className="mr-auto max-w-sm text-xs text-amber-700">
+                Select at least one title document — an acquisition with no evidence is an
+                assertion, not a record.
+              </p>
+            ) : null}
+            <Button variant="secondary" onClick={() => setAcqOpen(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={busy || acqEvidence.length === 0 || acqNeedsPayment}>
+              {busy ? "Recording…" : "Record acquisition"}
+            </Button>
+          </div>
+        </form>
       </Modal>
 
       {/* ---------------------------- compensate modal --------------------------- */}

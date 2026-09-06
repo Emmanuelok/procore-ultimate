@@ -246,6 +246,19 @@ export interface ScheduleRiskItem {
   isCritical: boolean;
   /** the point of the view: work that cannot lawfully start on time */
   blocked: boolean;
+  /*
+   * Quantification from the shared consent-to-programme engine (#591), which
+   * the land workspace uses for the same tasks. Null on a link the engine did
+   * not quantify (a granted permit, or a task outside its horizon).
+   */
+  daysAtRisk: number | null;
+  expectedResolutionDate: string | null;
+  estimateSource: "observed_median" | "default" | "unknown_state" | null;
+  estimateSampleSize: number | null;
+  /** days-at-risk beyond the float that could absorb it; null when unknowable */
+  slipContribution: number | null;
+  /** the works have physically started while this consent is outstanding */
+  startedUnconsented: boolean;
 }
 
 export interface ScheduleRiskResponse {
@@ -258,6 +271,9 @@ export interface ScheduleRiskResponse {
     blockingPermits: number;
     criticalBlocked: number;
     soonestBlockedStart: string | null;
+    /** worst slip a blocked permit contributes, in days; null when unquantified */
+    projectedSlipDays: number | null;
+    startedUnconsented: number;
   };
 }
 
@@ -270,8 +286,46 @@ export interface LocalReadingRow {
   /** 0/1 as stored; the API also returns `compliantBool` on detail reads */
   compliant: number;
   basis: string | null;
+  /** how the figure was arrived at — keyed, derived from records, or certified */
+  source: "manual" | "computed" | "certified";
+  /** the reporting window a period measure covers */
+  periodStart: string | null;
+  periodEnd: string | null;
+  /** the source records a computed reading was derived from */
+  inputs: Record<string, unknown>;
+  /** a reading is never edited: a correction supersedes it */
+  supersededById: string | null;
+  supersedesId: string | null;
   recordedBy: string;
   createdAt: string;
+}
+
+/** One metric the platform can (or cannot) derive from its own records. */
+export interface LocalContentMetricRule {
+  key: string;
+  label: string;
+  unit: string;
+  computable: boolean;
+  derivation: string;
+}
+
+/** Result of deriving a reading from the invoice / worker registers. */
+export interface ComputedReadingResponse {
+  targetId: string;
+  metric: string;
+  jurisdiction: string;
+  targetValue: number;
+  readingDate: string;
+  periodStart: string | null;
+  periodEnd: string | null;
+  derivation: string;
+  value: number | null;
+  compliant: boolean | null;
+  basis: string;
+  inputs: Record<string, unknown>;
+  unavailableReason: string | null;
+  committed: boolean;
+  id?: string;
 }
 
 export interface LocalTargetRow {
@@ -294,13 +348,17 @@ export interface LocalTargetRow {
   compliant: boolean | null;
   /** positive gap = distance still to travel to reach the floor */
   gap: number | null;
+  /** readings that still stand — a withdrawn figure is not the position */
   readingCount: number;
+  supersededCount?: number;
 }
 
 export interface ReadingsResponse {
   target: LocalTargetRow;
-  items: (LocalReadingRow & { gap: number; compliantBool: boolean })[];
+  items: (LocalReadingRow & { gap: number; compliantBool: boolean; superseded: boolean })[];
+  /** readings that stand (superseded ones are still listed, not counted) */
   total: number;
+  supersededCount: number;
   breaches: number;
 }
 

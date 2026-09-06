@@ -79,6 +79,7 @@ export default function TelematicsTab({
   const [expanded, setExpanded] = useState<string | null>(null);
   const action = useAction();
   const [recorded, setRecorded] = useState<AssuranceRunResult | null>(null);
+  const [detectorRun, setDetectorRun] = useState<DetectorRunResult | null>(null);
   const data = report.data;
   const rows = useMemo(() => data?.rows ?? [], [data]);
 
@@ -445,7 +446,28 @@ export default function TelematicsTab({
         </>
       )}
 
-      <IntelligencePanel intelligence={intelligence} onOpenMachine={onOpenMachine} />
+      <IntelligencePanel
+        intelligence={intelligence}
+        onOpenMachine={onOpenMachine}
+        busy={action.busy === "detectors"}
+        result={detectorRun}
+        onRun={
+          projectId
+            ? async () => {
+                const out = await action.run("detectors", () =>
+                  api.post<DetectorRunResult>(
+                    `/api/v1/projects/${projectId}/equipment-telematics/intelligence/run`,
+                    {},
+                  ),
+                );
+                if (out) {
+                  setDetectorRun(out);
+                  intelligence.reload();
+                }
+              }
+            : undefined
+        }
+      />
     </div>
   );
 }
@@ -472,12 +494,32 @@ export default function TelematicsTab({
  *  · FAULTS. Severe and above only. A critical fault is the manufacturer
  *    telling you to stop the machine.
  */
+/**
+ * What the detector sweep did, as it answers. `machinesAssessed` is the plant
+ * it could read, not the plant that is flagged, so a run over a clean fleet
+ * reports "nothing raised" rather than an empty screen.
+ */
+export interface DetectorRunResult {
+  from: string;
+  to: string;
+  machinesAssessed: number;
+  signalsRaised: number;
+  takenOutOfService: string[];
+  reasons: string[];
+}
+
 function IntelligencePanel({
   intelligence,
   onOpenMachine,
+  onRun,
+  busy,
+  result,
 }: {
   intelligence: Loadable<TelematicsIntelligence>;
   onOpenMachine: (equipmentId: string) => void;
+  onRun?: (() => void) | undefined;
+  busy: boolean;
+  result: DetectorRunResult | null;
 }) {
   const data = intelligence.data;
   const flagged = useMemo(
@@ -496,7 +538,34 @@ function IntelligencePanel({
           title="What the feed says beyond hours"
           hint="Where the machine was worked, what it burned against what was put in it, and what it is complaining about. Every one of these refuses rather than guesses."
           className="mb-0"
+          action={
+            onRun ? (
+              <Button size="sm" variant="secondary" onClick={onRun} loading={busy}>
+                Raise the signals
+              </Button>
+            ) : undefined
+          }
         />
+        {result ? (
+          <Alert
+            tone={result.signalsRaised > 0 ? "warning" : "success"}
+            title={
+              result.signalsRaised > 0
+                ? `${result.signalsRaised} signal${result.signalsRaised === 1 ? "" : "s"} raised over ${result.from} → ${result.to}`
+                : `Nothing raised over ${result.from} → ${result.to}`
+            }
+          >
+            {result.machinesAssessed} machine{result.machinesAssessed === 1 ? "" : "s"} on this job
+            could be read.{" "}
+            {result.takenOutOfService.length > 0
+              ? `${result.takenOutOfService.join(", ")} ${result.takenOutOfService.length === 1 ? "was" : "were"} moved to breakdown on a critical fault code and will not come back to the available fleet until a maintenance record returns ${result.takenOutOfService.length === 1 ? "it" : "them"} to service. `
+              : ""}
+            {result.signalsRaised === 0
+              ? "A machine already signalled for this window is not signalled again — a second run says nothing new rather than accusing it twice."
+              : ""}
+            <ReasonList reasons={result.reasons} />
+          </Alert>
+        ) : null}
         {intelligence.error ? (
           <LoadError message={intelligence.error} onRetry={intelligence.reload} />
         ) : intelligence.loading ? (

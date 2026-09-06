@@ -392,3 +392,54 @@ describe("digest hold-back", () => {
     expect(after.count).toBeGreaterThanOrEqual(before.count + before.heldForDigest);
   });
 });
+
+/**
+ * Turning the cadence off must hand back what it was holding.
+ *
+ * The release only ever happened inside the digest sweep, and the sweep only
+ * looks at preferences whose digest is not `off` — so a user who tried a
+ * weekly digest and went back to immediate delivery kept a permanently
+ * uncounted pile of notifications.
+ */
+describe("switching the digest off", () => {
+  it("releases everything the cadence was holding", async () => {
+    await app.inject({
+      method: "PUT",
+      url: "/api/v1/me/notification-preferences",
+      headers: memberHeaders,
+      payload: { digest: "weekly" },
+    });
+    await pushNotifications(app.db, [
+      {
+        companyId: owner.companyId,
+        userId: member.userId,
+        projectId: projectA,
+        kind: "assignment",
+        title: "Held by a cadence about to be abandoned",
+      },
+    ]);
+    const held = await app.inject({
+      method: "GET",
+      url: "/api/v1/notifications/unread-count",
+      headers: memberHeaders,
+    });
+    expect(held.json().heldForDigest).toBeGreaterThan(0);
+
+    const off = await app.inject({
+      method: "PUT",
+      url: "/api/v1/me/notification-preferences",
+      headers: memberHeaders,
+      payload: { digest: "off" },
+    });
+    expect(off.statusCode).toBe(200);
+    expect(off.json().releasedFromHold).toBeGreaterThan(0);
+
+    const after = await app.inject({
+      method: "GET",
+      url: "/api/v1/notifications/unread-count",
+      headers: memberHeaders,
+    });
+    expect(after.json().heldForDigest).toBe(0);
+    expect(after.json().count).toBeGreaterThanOrEqual(held.json().count + 1);
+  });
+});

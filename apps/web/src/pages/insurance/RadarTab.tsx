@@ -35,6 +35,7 @@ import {
   type CoverGap,
   type ExpiryReport,
   type ListResponse,
+  type VendorLite,
 } from "./insuranceShared";
 
 const WINDOW_PRESETS = [7, 14, 30, 60, 90, 180, 365];
@@ -507,6 +508,17 @@ export default function RadarTab({
                 ))}
               </div>
             )}
+          </div>
+
+          {/* ---------------------------- payment hold ----------------------------- */}
+          <div className="mt-6">
+            <h2 className="mb-2 text-sm font-semibold text-ink-900">
+              Would a payment be held?{" "}
+              <span className="font-normal text-ink-400">
+                — the same decision the invoicing module asks for before releasing money
+              </span>
+            </h2>
+            <HoldCheckPanel projectId={projectId} />
           </div>
 
           {/* --------------------------- unverified cover --------------------------- */}
@@ -1033,6 +1045,176 @@ function ExpiryHorizon({ report, windowDays }: { report: ExpiryReport; windowDay
             bond demand deadline (or expiry where none is recorded)
           </span>
         </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* PAYMENT HOLD CHECK                                                  */
+/*                                                                     */
+/* `insuranceHoldDecision` is exported so WP-FIN2 can call it inside    */
+/* the same transaction that releases money. It is surfaced here too,   */
+/* because the person who has to fix the problem is the one reading     */
+/* this page — and because the decision's most important property is    */
+/* the one a boolean hides: when no requirement is recorded it does NOT */
+/* say "compliant", it says it was never asked.                         */
+/* ------------------------------------------------------------------ */
+
+interface HoldFindingRow {
+  reason: string;
+  policyType: string | null;
+  detail: string;
+  requirementId: string | null;
+  certificateId: string | null;
+}
+
+interface HoldDecisionRow {
+  hold: boolean;
+  vendorId: string;
+  projectId: string | null;
+  asOf: string;
+  findings: HoldFindingRow[];
+  warnings: HoldFindingRow[];
+  requirementsKnown: boolean;
+  note: string | null;
+}
+
+function HoldCheckPanel({ projectId }: { projectId: string }) {
+  const [vendors, setVendors] = useState<VendorLite[]>([]);
+  const [vendorError, setVendorError] = useState<string | null>(null);
+  const [vendorId, setVendorId] = useState("");
+  const [decision, setDecision] = useState<HoldDecisionRow | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .get<ListResponse<VendorLite>>("/api/v1/vendors?pageSize=200")
+      .then((res) => {
+        if (!cancelled) setVendors(res.items);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setVendorError(errMsg(err, "The vendor directory could not be read"));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const check = useCallback(async () => {
+    if (!vendorId) return;
+    setBusy(true);
+    setError(null);
+    setDecision(null);
+    try {
+      setDecision(
+        await api.get<HoldDecisionRow>(
+          `/api/v1/projects/${projectId}/insurance/hold-check?vendorId=${encodeURIComponent(vendorId)}`,
+        ),
+      );
+    } catch (err) {
+      setError(errMsg(err, "The hold check could not be run"));
+    } finally {
+      setBusy(false);
+    }
+  }, [projectId, vendorId]);
+
+  return (
+    <Card>
+      <CardBody className="space-y-3">
+        <ErrorAlert message={vendorError} />
+        <ErrorAlert message={error} />
+        <div className="flex flex-wrap items-end gap-2">
+          <label className="block grow">
+            <span className="mb-1 block text-xs font-medium text-ink-600">Vendor</span>
+            <select
+              className="h-9 w-full rounded-md border border-ink-200 bg-white px-2 text-sm"
+              value={vendorId}
+              onChange={(e) => {
+                setVendorId(e.target.value);
+                setDecision(null);
+              }}
+            >
+              <option value="">Choose a vendor…</option>
+              {vendors.map((v) => (
+                <option key={v.id} value={v.id}>
+                  {v.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <Button disabled={!vendorId || busy} onClick={() => void check()}>
+            {busy ? "Checking…" : "Check"}
+          </Button>
+        </div>
+
+        {decision === null ? (
+          <p className="text-sm text-ink-500">
+            Ask the question before the money moves: the check reads this vendor&apos;s recorded
+            requirements, the certificates they have given and the principal-arranged policies that
+            might discharge the requirement instead — and it is the same function the invoicing
+            module calls, so the answer here is the answer there.
+          </p>
+        ) : (
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge tone={decision.hold ? "red" : decision.requirementsKnown ? "green" : "amber"}>
+                {decision.hold
+                  ? "Payment would be held"
+                  : decision.requirementsKnown
+                    ? "No insurance ground to hold"
+                    : "Not a finding of compliance"}
+              </Badge>
+              <span className="text-xs text-ink-500">as at {formatDate(decision.asOf)}</span>
+            </div>
+            {decision.note ? (
+              <Disclosure
+                label="What this answer does and does not mean"
+                tone={decision.requirementsKnown ? "brand" : "amber"}
+              >
+                {decision.note}
+              </Disclosure>
+            ) : null}
+            {decision.findings.length > 0 ? (
+              <div className="space-y-1">
+                {decision.findings.map((f, i) => (
+                  <div
+                    key={`${f.reason}:${f.policyType ?? "any"}:${i}`}
+                    className="rounded-md border-l-4 border-l-red-600 bg-red-50/70 px-3 py-2 text-sm text-red-900"
+                  >
+                    <span className="font-semibold">{f.reason.replace(/_/g, " ")}</span>
+                    {f.policyType ? ` · ${policyTypeLabel(f.policyType)}` : ""} — {f.detail}
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            {decision.warnings.length > 0 ? (
+              <div className="space-y-1">
+                {decision.warnings.map((f, i) => (
+                  <div
+                    key={`w:${f.reason}:${f.policyType ?? "any"}:${i}`}
+                    className="rounded-md border-l-4 border-l-amber-500 bg-amber-50/70 px-3 py-2 text-sm text-amber-900"
+                  >
+                    <span className="font-semibold">{f.reason.replace(/_/g, " ")}</span>
+                    {f.policyType ? ` · ${policyTypeLabel(f.policyType)}` : ""} — {f.detail}
+                    <div className="mt-0.5 text-xs">
+                      Advisory, not blocking: withholding a subcontractor&apos;s money because
+                      nobody on your own side has verified their certificate is your failure, not
+                      theirs.
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            {decision.findings.length === 0 && decision.warnings.length === 0 ? (
+              <p className="text-sm text-ink-600">
+                Nothing recorded against this vendor blocks a payment on insurance grounds.
+              </p>
+            ) : null}
+          </div>
+        )}
       </CardBody>
     </Card>
   );

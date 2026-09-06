@@ -1301,6 +1301,17 @@ function DecisionsPanel({
   const { busy, refusal, clear, run } = useAction();
   const { confirm, dialog } = useConfirm();
   const [addOpen, setAddOpen] = useState(false);
+  /*
+   * DISPUTE AND SUPERSEDE were API-only.
+   *
+   * Both routes have always existed and the card already RENDERED their
+   * consequences (the dispute note, the "superseded by" line) — but nothing
+   * in the app could produce either, so the only way out of a decision
+   * somebody disagreed with was to leave it standing. Ratification without a
+   * way to object is not a control, it is a rubber stamp.
+   */
+  const [disputing, setDisputing] = useState<Decision | null>(null);
+  const [superseding, setSuperseding] = useState<Decision | null>(null);
 
   async function ratify(decision: Decision) {
     const ok = await confirm({
@@ -1367,16 +1378,31 @@ function DecisionsPanel({
                     ) : null}
                   </div>
                 </div>
-                {d.status === "recorded" ? (
-                  <Button
-                    size="xs"
-                    variant="secondary"
-                    disabled={busy !== null}
-                    onClick={() => void ratify(d)}
-                  >
-                    Ratify
-                  </Button>
-                ) : null}
+                <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+                  {d.status === "recorded" ? (
+                    <Button
+                      size="xs"
+                      variant="secondary"
+                      disabled={busy !== null}
+                      onClick={() => void ratify(d)}
+                    >
+                      Ratify
+                    </Button>
+                  ) : null}
+                  {/* The server allows a dispute only while the decision is
+                      still the live answer (recorded or ratified); a
+                      superseded or rescinded one is a closed record. */}
+                  {d.status === "recorded" || d.status === "ratified" ? (
+                    <Button size="xs" variant="ghost" onClick={() => setDisputing(d)}>
+                      Dispute…
+                    </Button>
+                  ) : null}
+                  {d.status !== "superseded" ? (
+                    <Button size="xs" variant="ghost" onClick={() => setSuperseding(d)}>
+                      Supersede…
+                    </Button>
+                  ) : null}
+                </div>
               </div>
               <p className="mt-2 whitespace-pre-wrap text-meta text-content">{d.decision}</p>
               {d.rationale ? (
@@ -1412,7 +1438,213 @@ function DecisionsPanel({
           onMutated();
         }}
       />
+      <DisputeDecisionModal
+        projectId={projectId}
+        decision={disputing}
+        onClose={() => setDisputing(null)}
+        onDone={() => {
+          setDisputing(null);
+          onMutated();
+        }}
+      />
+      <SupersedeDecisionModal
+        projectId={projectId}
+        meetingId={meeting.id}
+        decision={superseding}
+        agendaItems={meeting.agendaItems}
+        onClose={() => setSuperseding(null)}
+        onDone={() => {
+          setSuperseding(null);
+          onMutated();
+        }}
+      />
     </div>
+  );
+}
+
+/**
+ * DISPUTING A DECISION — recorded once, against a named objector.
+ *
+ * The API refuses a second dispute rather than letting the note be
+ * overwritten: the first objection is the one that was made at the time, and
+ * a register that keeps only the latest objection cannot show that two people
+ * disagreed. Settling a dispute means superseding the decision, not deleting
+ * the objection.
+ */
+function DisputeDecisionModal({
+  projectId,
+  decision,
+  onClose,
+  onDone,
+}: {
+  projectId: string;
+  decision: Decision | null;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [note, setNote] = useState("");
+
+  async function submit() {
+    if (!decision) return;
+    const done = await run("dispute", () =>
+      api.post(`/api/v1/projects/${projectId}/meeting-decisions/${decision.id}/dispute`, {
+        note: note.trim(),
+      }),
+    );
+    if (done !== null) {
+      setNote("");
+      onDone();
+    }
+  }
+
+  return (
+    <Modal
+      open={decision !== null}
+      onClose={onClose}
+      title={decision ? `Dispute ${decision.reference}` : "Dispute"}
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            disabled={note.trim().length === 0 || busy !== null}
+            loading={busy === "dispute"}
+            onClick={() => void submit()}
+          >
+            Record the dispute
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        {refusal ? (
+          <Alert tone="danger" size="sm" title="Refused" onDismiss={clear}>
+            <p className="whitespace-pre-wrap">{refusal.message}</p>
+          </Alert>
+        ) : null}
+        <Alert tone="info" variant="subtle" size="sm" title="A dispute does not undo the decision">
+          The decision stands as recorded and keeps its number; the dispute is recorded beside it
+          with your name and the date. That is what a later reader needs — that the decision was
+          taken AND that it was objected to at the time. To change the answer, supersede it.
+        </Alert>
+        <Field label="What is disputed, and on what basis?" required>
+          <Textarea
+            rows={4}
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            placeholder="The cost basis was not tabled and the figure minuted is not the one discussed…"
+          />
+        </Field>
+      </div>
+    </Modal>
+  );
+}
+
+/**
+ * SUPERSEDING — a new decision, recorded in both directions.
+ *
+ * This is the only honest way to change an answer that has already been
+ * minuted: the old decision keeps its number and its history and is marked
+ * superseded by the new one, so "what was agreed on the day" stays readable
+ * whatever was agreed later.
+ */
+function SupersedeDecisionModal({
+  projectId,
+  meetingId,
+  decision,
+  agendaItems,
+  onClose,
+  onDone,
+}: {
+  projectId: string;
+  meetingId: string;
+  decision: Decision | null;
+  agendaItems: AgendaItem[];
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [title, setTitle] = useState("");
+  const [text, setText] = useState("");
+  const [rationale, setRationale] = useState("");
+  const [agendaItemId, setAgendaItemId] = useState("");
+
+  async function submit() {
+    if (!decision) return;
+    const done = await run("supersede", () =>
+      api.post(`/api/v1/projects/${projectId}/meeting-decisions/${decision.id}/supersede`, {
+        meetingId,
+        title: title.trim(),
+        decision: text.trim(),
+        rationale: rationale.trim() || null,
+        agendaItemId: agendaItemId || null,
+      }),
+    );
+    if (done !== null) {
+      setTitle("");
+      setText("");
+      setRationale("");
+      setAgendaItemId("");
+      onDone();
+    }
+  }
+
+  return (
+    <Modal
+      open={decision !== null}
+      onClose={onClose}
+      size="lg"
+      title={decision ? `Supersede ${decision.reference}` : "Supersede"}
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            disabled={title.trim().length === 0 || text.trim().length === 0 || busy !== null}
+            loading={busy === "supersede"}
+            onClick={() => void submit()}
+          >
+            Record the new decision
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        {refusal ? (
+          <Alert tone="danger" size="sm" title="Refused" onDismiss={clear}>
+            <p className="whitespace-pre-wrap">{refusal.message}</p>
+          </Alert>
+        ) : null}
+        <Alert tone="warning" variant="subtle" size="sm" title="Both decisions survive">
+          {decision ? `${decision.reference} keeps its number, its text and its impacts` : "The old decision keeps its record"},
+          and is marked superseded by the new one. Nothing is edited and nothing is deleted, so the
+          decision that was in force on any given day stays answerable — which is the question
+          asked in every dispute about a change of mind.
+        </Alert>
+        <Field label="What is decided now?" required>
+          <Input value={title} onChange={(e) => setTitle(e.target.value)} autoFocus />
+        </Field>
+        <Field label="The decision" required>
+          <Textarea rows={4} value={text} onChange={(e) => setText(e.target.value)} />
+        </Field>
+        <Field label="Why it changed" hint="The reason the earlier decision no longer holds.">
+          <Textarea rows={3} value={rationale} onChange={(e) => setRationale(e.target.value)} />
+        </Field>
+        <Field label="Against which agenda item?">
+          <Select value={agendaItemId} onChange={(e) => setAgendaItemId(e.target.value)}>
+            <option value="">Not tied to an item</option>
+            {agendaItems.map((i) => (
+              <option key={i.id} value={i.id}>
+                {i.title}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      </div>
+    </Modal>
   );
 }
 

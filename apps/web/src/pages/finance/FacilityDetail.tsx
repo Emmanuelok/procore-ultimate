@@ -386,6 +386,27 @@ export default function FacilityDetail({
   const [eligibilityFor, setEligibilityFor] = useState<DisbursementRow | null>(null);
   const [certifyFor, setCertifyFor] = useState<DisbursementRow | null>(null);
 
+  /* ------------------- withdrawal application (#732, #735) -------------------- */
+
+  const [application, setApplication] = useState<WithdrawalApplication | null>(null);
+  const [applicationFor, setApplicationFor] = useState<DisbursementRow | null>(null);
+  const [applicationError, setApplicationError] = useState<string | null>(null);
+
+  async function openApplication(d: DisbursementRow) {
+    setApplicationFor(d);
+    setApplication(null);
+    setApplicationError(null);
+    try {
+      setApplication(
+        await api.get<WithdrawalApplication>(`${base}/disbursements/${d.id}/application`),
+      );
+    } catch (err) {
+      setApplicationError(
+        err instanceof ApiClientError ? err.message : "Could not assemble the application",
+      );
+    }
+  }
+
   /* ---------------------------- covenants (#742-743) --------------------------- */
 
   const [covOpen, setCovOpen] = useState(false);
@@ -828,6 +849,14 @@ export default function FacilityDetail({
                           Reject
                         </Button>
                       ) : null}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        title="The withdrawal application in the layout an IFI expects (#732, #735)"
+                        onClick={() => void openApplication(d)}
+                      >
+                        Application
+                      </Button>
                     </div>
                   </Td>
                 </tr>
@@ -1233,8 +1262,194 @@ export default function FacilityDetail({
           />
         ) : null}
       </Modal>
+
+      {/* the withdrawal application in the layout an IFI expects (#732, #735) */}
+      <Modal
+        open={applicationFor !== null}
+        title={
+          applicationFor
+            ? `Withdrawal application ${drLabel(applicationFor.number)}`
+            : "Withdrawal application"
+        }
+        onClose={() => setApplicationFor(null)}
+        wide
+      >
+        <ErrorAlert message={applicationError} />
+        {application === null && applicationError === null ? (
+          <Spinner label="Assembling the application…" />
+        ) : null}
+        {application ? (
+          <div className="space-y-4 text-sm">
+            {application.warnings.length > 0 ? (
+              <ul className="list-disc space-y-1 rounded-md bg-amber-50 px-4 py-2 pl-8 text-xs text-amber-900">
+                {application.warnings.map((w, i) => (
+                  <li key={i}>{w}</li>
+                ))}
+              </ul>
+            ) : null}
+
+            <div className="grid grid-cols-2 gap-x-6 gap-y-2 sm:grid-cols-3">
+              {[
+                ["Application no.", `#${application.header.applicationNumber}`],
+                ["Project", application.header.project ?? "—"],
+                ["Borrower reference", application.header.borrowerReference],
+                ["Lender", application.header.lender ?? "—"],
+                ["Instrument", humanize(application.header.instrument)],
+                ["Category", application.header.category?.name ?? "Not allocated"],
+                [
+                  "Amount applied for",
+                  fmtMoney(application.application.amount, application.header.currency),
+                ],
+                ["Status", humanize(application.application.status)],
+                [
+                  "Availability ends",
+                  application.header.availabilityEndDate
+                    ? formatDate(application.header.availabilityEndDate)
+                    : "—",
+                ],
+              ].map(([label, value]) => (
+                <div key={label}>
+                  <div className="text-xs text-ink-400">{label}</div>
+                  <div className="text-ink-800">{value}</div>
+                </div>
+              ))}
+            </div>
+
+            <div>
+              <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-ink-400">
+                Purpose
+              </div>
+              <p className="whitespace-pre-wrap text-ink-800">{application.application.purpose}</p>
+            </div>
+
+            <div>
+              <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-ink-400">
+                Statement of expenditure
+              </div>
+              {application.statementOfExpenditure.length === 0 ? (
+                <p className="text-xs text-ink-400">
+                  No supporting records are attached to this application.
+                </p>
+              ) : (
+                <Table>
+                  <thead>
+                    <tr>
+                      <Th>Record</Th>
+                      <Th>Source</Th>
+                      <Th>Eligibility</Th>
+                      <Th className="text-right">Amount</Th>
+                      <Th>Content hash</Th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-ink-100">
+                    {application.statementOfExpenditure.map((r) => (
+                      <tr key={r.evidenceId}>
+                        <Td className="text-xs">{humanize(r.kind)}</Td>
+                        <Td className="max-w-[220px] text-xs">
+                          <span className="line-clamp-1">{r.source}</span>
+                        </Td>
+                        <Td>
+                          <Badge
+                            tone={
+                              r.eligibility === "eligible"
+                                ? "green"
+                                : r.eligibility === "ineligible"
+                                  ? "red"
+                                  : "amber"
+                            }
+                          >
+                            {humanize(r.eligibility)}
+                          </Badge>
+                          {r.reason ? (
+                            <span className="ml-1 text-xs text-ink-500">{humanize(r.reason)}</span>
+                          ) : null}
+                        </Td>
+                        <Td className="text-right tabular-nums text-xs">
+                          {r.amount === null
+                            ? "—"
+                            : fmtMoney(r.amount, application.header.currency)}
+                        </Td>
+                        <Td className="max-w-[160px] font-mono text-[10px] text-ink-400">
+                          <span className="line-clamp-1">{r.contentHash}</span>
+                        </Td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </Table>
+              )}
+            </div>
+
+            <div>
+              <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-ink-400">
+                Certification
+              </div>
+              {application.certification.certified ? (
+                <p className="text-ink-800">
+                  Certified {formatDate(application.certification.certifiedAt)}
+                  {application.certification.note
+                    ? ` — ${application.certification.note}`
+                    : ""}
+                </p>
+              ) : (
+                <p className="text-xs text-ink-500">
+                  Not certified.{" "}
+                  {application.certification.requiredForInstrument
+                    ? "This instrument requires independent certification before payment."
+                    : "Certification is optional for this instrument."}
+                </p>
+              )}
+            </div>
+
+            <p className="border-t border-ink-100 pt-2 text-xs text-ink-500">
+              {application.basis}
+            </p>
+          </div>
+        ) : null}
+      </Modal>
     </div>
   );
+}
+
+/** GET /disbursements/:id/application — the IFI withdrawal application form (#732, #735). */
+interface WithdrawalApplication {
+  header: {
+    applicationNumber: number;
+    project: string | null;
+    borrowerReference: string;
+    lender: string | null;
+    instrument: string;
+    currency: string;
+    committedAmount: number;
+    availabilityEndDate: string | null;
+    category: { id: string; name: string; limit: number } | null;
+  };
+  application: {
+    amount: number;
+    purpose: string;
+    status: string;
+    submittedAt: string | null;
+    approvedAt: string | null;
+    disbursedAt: string | null;
+  };
+  statementOfExpenditure: Array<{
+    evidenceId: string;
+    kind: string;
+    source: string;
+    capturedAt: string | null;
+    contentHash: string;
+    eligibility: string;
+    reason: string | null;
+    amount: number | null;
+  }>;
+  certification: {
+    certified: boolean;
+    certifiedAt: string | null;
+    certifiedBy: string | null;
+    note: string | null;
+    requiredForInstrument: boolean;
+  };
+  warnings: string[];
+  basis: string;
 }
 
 /* ------------------------------ covenant card ------------------------------ */

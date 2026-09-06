@@ -1,4 +1,5 @@
 import {
+  boolean,
   doublePrecision,
   index,
   integer,
@@ -71,6 +72,13 @@ export const stageGates = pgTable(
     /** criteria: [{ id, text, evidenceRequired }] */
     criteria: jsonb("criteria").$type<unknown[]>().default([]).notNull(),
     plannedDate: text("planned_date"),
+    /**
+     * Lessons closure gate (#415, Vol II Domain W): when true the gate may
+     * not be decided to proceed while lessons captured on this project sit
+     * unvalidated. A stage boundary is the only moment the organisation is
+     * still able to learn from the stage that is ending.
+     */
+    lessonsRequired: boolean("lessons_required").default(false).notNull(),
     status: text("status").default("pending").notNull(), // pending | in_review | decided
     createdAt: createdAt(),
     updatedAt: updatedAt(),

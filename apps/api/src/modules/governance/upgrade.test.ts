@@ -15,7 +15,9 @@ import {
   benefits,
   companyMemberships,
   evidence,
+  lessons,
   obligations,
+  projectMemberships,
   projects,
 } from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
@@ -333,6 +335,96 @@ describe("gate evidence packs", () => {
     return res.json() as Json;
   }
 
+  /**
+   * The audit found approve/reject and gate reviews behind `standard`: any
+   * project member — the estimator, a contractor-side user — could approve a
+   * business case or record a Gateway "stop". Both now require
+   * governance:admin, and reviews additionally require independence.
+   */
+  it("REGRESSION: a governance:standard member cannot approve a case or record a gate review", async () => {
+    const pid = await makeProject("Standard cannot decide");
+    const member = await registerActor(app);
+    await app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: member.userId,
+      role: "member",
+    });
+    await app.db.insert(projectMemberships).values({
+      id: newId("pm"),
+      companyId: owner.companyId,
+      projectId: pid,
+      userId: member.userId,
+      templateKey: "read_only",
+      overrides: { governance: "standard" },
+    });
+    const memberHeaders = {
+      authorization: member.headers["authorization"]!,
+      "x-company-id": owner.companyId,
+    };
+
+    const bc = await createBc(pid);
+    const optRes = await put(`/projects/${pid}/business-cases/${bc.id as string}/options`, {
+      options: [
+        {
+          name: "Do minimum",
+          isCounterfactual: true,
+          capex: 100,
+          annualBenefits: [60, 60],
+          annualCosts: [],
+        },
+        {
+          name: "Full scheme",
+          capex: 100,
+          annualBenefits: [90, 90],
+          annualCosts: [],
+        },
+      ],
+    });
+    expect(optRes.statusCode).toBe(200);
+    const options = (optRes.json() as Json).options as Json[];
+    await post(`/projects/${pid}/business-cases/${bc.id as string}/select-option`, {
+      optionId: options[1]!.id,
+    });
+    await post(`/projects/${pid}/business-cases/${bc.id as string}/submit`);
+
+    // the member can still READ and can still do standard work…
+    const read = await get(`/projects/${pid}/business-cases`, memberHeaders);
+    expect(read.statusCode).toBe(200);
+    // …but not decide the case
+    const approve = await post(
+      `/projects/${pid}/business-cases/${bc.id as string}/approve`,
+      {},
+      memberHeaders,
+    );
+    expect(approve.statusCode).toBe(403);
+    const reject = await post(
+      `/projects/${pid}/business-cases/${bc.id as string}/reject`,
+      { reason: "no" },
+      memberHeaders,
+    );
+    expect(reject.statusCode).toBe(403);
+
+    const gate = (
+      await post(`/projects/${pid}/stage-gates`, {
+        gateNumber: 0,
+        name: "Gate 0",
+        criteria: [{ text: "Strategic fit" }],
+      })
+    ).json() as Json;
+    const review = await post(
+      `/projects/${pid}/stage-gates/${gate.id as string}/reviews`,
+      {
+        reviewDate: todayISO(),
+        rag: "red",
+        decision: "stop",
+        findings: (gate.criteria as Json[]).map((c) => ({ criterionId: c.id, met: false })),
+      },
+      memberHeaders,
+    );
+    expect(review.statusCode).toBe(403);
+  });
+
   it("REGRESSION: refuses a decision when an evidence-required criterion has no artefact", async () => {
     const pid = await makeProject("Pack required");
     const gate = await createGate(pid, 1);
@@ -418,6 +510,124 @@ describe("gate evidence packs", () => {
       description: "Revised scope",
     });
     expect(edit.statusCode).toBe(200);
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Lessons closure gate (#415)                                       */
+  /* ---------------------------------------------------------------- */
+
+  async function seedLesson(pid: string, status: string, number: string) {
+    const id = newId("lsn");
+    await app.db.insert(lessons).values({
+      id,
+      companyId: owner.companyId,
+      projectId: pid,
+      originProjectId: pid,
+      number,
+      title: `Lesson ${number}`,
+      category: "commercial",
+      whatHappened: "The ground investigation was too narrow.",
+      recommendation: "Investigate the whole footprint before the works contract.",
+      status,
+      createdBy: owner.userId,
+    });
+    return id;
+  }
+
+  it("reports lessons readiness and blocks a proceed decision while lessons are unvalidated", async () => {
+    const pid = await makeProject("Lessons gate");
+    const create = await post(`/projects/${pid}/stage-gates`, {
+      gateNumber: 5,
+      name: "Gate 5 — lessons closure",
+      criteria: [{ text: "Stage complete" }],
+      lessonsRequired: true,
+    });
+    expect(create.statusCode).toBe(201);
+    const gate = create.json() as Json;
+    expect(gate.lessonsRequired).toBe(true);
+
+    // nothing captured at all → not ready, and it says why
+    const empty = (
+      await get(`/projects/${pid}/stage-gates/${gate.id as string}/lessons-readiness`)
+    ).json() as { ready: boolean; capturedCount: number; reasons: string[] };
+    expect(empty.ready).toBe(false);
+    expect(empty.capturedCount).toBe(0);
+    expect(empty.reasons.join(" ")).toMatch(/No lesson has been captured/i);
+
+    await seedLesson(pid, "draft", "LSN-001");
+    const blocked = await post(`/projects/${pid}/stage-gates/${gate.id as string}/reviews`, {
+      reviewDate: todayISO(),
+      rag: "green",
+      decision: "proceed",
+      findings: (gate.criteria as Json[]).map((c) => ({ criterionId: c.id, met: true })),
+    });
+    expect(blocked.statusCode).toBe(409);
+    expect((blocked.json() as { message: string }).message).toMatch(/awaiting validation/i);
+
+    // a stop decision is never blocked by unfinished paperwork
+    const stop = await post(`/projects/${pid}/stage-gates/${gate.id as string}/reviews`, {
+      reviewDate: todayISO(),
+      rag: "red",
+      decision: "stop",
+      findings: (gate.criteria as Json[]).map((c) => ({ criterionId: c.id, met: false })),
+    });
+    expect(stop.statusCode).toBe(201);
+  });
+
+  it("lets the gate proceed once every captured lesson has been ruled on", async () => {
+    const pid = await makeProject("Lessons closed");
+    const gate = (
+      await post(`/projects/${pid}/stage-gates`, {
+        gateNumber: 5,
+        name: "Gate 5",
+        criteria: [{ text: "Stage complete" }],
+        lessonsRequired: true,
+      })
+    ).json() as Json;
+    await seedLesson(pid, "validated", "LSN-010");
+    await seedLesson(pid, "rejected", "LSN-011");
+
+    const readiness = (
+      await get(`/projects/${pid}/stage-gates/${gate.id as string}/lessons-readiness`)
+    ).json() as { ready: boolean; closedCount: number; outstanding: Json[] };
+    expect(readiness.ready).toBe(true);
+    expect(readiness.closedCount).toBe(2);
+    expect(readiness.outstanding).toEqual([]);
+
+    const res = await post(`/projects/${pid}/stage-gates/${gate.id as string}/reviews`, {
+      reviewDate: todayISO(),
+      rag: "green",
+      decision: "proceed",
+      findings: (gate.criteria as Json[]).map((c) => ({ criterionId: c.id, met: true })),
+    });
+    expect(res.statusCode).toBe(201);
+  });
+
+  it("leaves gates without the requirement untouched, and reports lessons for information", async () => {
+    const pid = await makeProject("Lessons optional");
+    const gate = (
+      await post(`/projects/${pid}/stage-gates`, {
+        gateNumber: 5,
+        name: "Gate 5",
+        criteria: [{ text: "Stage complete" }],
+      })
+    ).json() as Json;
+    expect(gate.lessonsRequired).toBe(false);
+    await seedLesson(pid, "draft", "LSN-020");
+    const readiness = (
+      await get(`/projects/${pid}/stage-gates/${gate.id as string}/lessons-readiness`)
+    ).json() as { required: boolean; ready: boolean; outstanding: Json[] };
+    expect(readiness.required).toBe(false);
+    expect(readiness.ready).toBe(true);
+    expect(readiness.outstanding).toHaveLength(1);
+
+    const res = await post(`/projects/${pid}/stage-gates/${gate.id as string}/reviews`, {
+      reviewDate: todayISO(),
+      rag: "green",
+      decision: "proceed",
+      findings: (gate.criteria as Json[]).map((c) => ({ criterionId: c.id, met: true })),
+    });
+    expect(res.statusCode).toBe(201);
   });
 
   it("REGRESSION: concurrent gate creation surfaces 409, never a 500", async () => {

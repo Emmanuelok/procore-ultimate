@@ -238,6 +238,7 @@ function RegisterTab({
                       <Th>Category</Th>
                       <Th>Score</Th>
                       <Th>Owner</Th>
+                      <Th>Response</Th>
                       <Th className="text-center">Quantified</Th>
                       <Th>Status</Th>
                     </tr>
@@ -284,6 +285,20 @@ function RegisterTab({
                             ) : null}
                           </Td>
                           <Td className="whitespace-nowrap text-xs">{ownerName(r.ownerId)}</Td>
+                          <Td className="whitespace-nowrap">
+                            {r.responseStrategy ? (
+                              <Badge tone={r.responseStrategy === "accept" ? "amber" : "blue"}>
+                                {humanize(r.responseStrategy)}
+                              </Badge>
+                            ) : (
+                              <span
+                                className="text-xs text-ink-400"
+                                title="No response strategy chosen — the risk is listed, not managed"
+                              >
+                                none
+                              </span>
+                            )}
+                          </Td>
                           <Td className="text-center">
                             {isQuantified(r) ? (
                               <span className="font-semibold text-emerald-600" title="Occurrence probability and cost impact are set — included in QCRA">

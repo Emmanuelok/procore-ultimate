@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   bundleSnapshots,
@@ -12,6 +12,7 @@ import {
   disputeCosts,
   disputeSubmissions,
   disputes,
+  documentProductionRequests,
   entities,
   evidence,
   files,
@@ -31,6 +32,8 @@ import {
   DISPUTE_ROOT_CAUSES,
   DISPUTE_STATUSES,
   ENFORCEMENT_STATUSES,
+  PRODUCTION_DECISIONS,
+  PRODUCTION_OBJECTION_GROUNDS,
   SETTLEMENT_BRANCH_KINDS,
   SETTLEMENT_OFFER_BASES,
   SUBMISSION_KINDS,
@@ -233,6 +236,35 @@ const outcomeSchema = z.object({
   enforcementStatus: z.enum(ENFORCEMENT_STATUSES).optional(),
   complianceDeadline: isoDateSchema.nullable().optional(),
   nodDeadline: isoDateSchema.nullable().optional(),
+});
+
+/* Redfern schedule — document production requests (#340-343) */
+const productionRequestSchema = z.object({
+  requestingParty: z.enum(["claimant", "respondent"]),
+  documentsRequested: z.string().min(1).max(20000),
+  relevance: z.string().min(1).max(20000),
+  productionDueDate: isoDateSchema.nullable().optional(),
+});
+
+const productionRequestPatchSchema = z.object({
+  documentsRequested: z.string().min(1).max(20000).optional(),
+  relevance: z.string().min(1).max(20000).optional(),
+  objection: z.string().max(20000).nullable().optional(),
+  objectionGrounds: z.array(z.enum(PRODUCTION_OBJECTION_GROUNDS)).max(10).optional(),
+  reply: z.string().max(20000).nullable().optional(),
+  productionDueDate: isoDateSchema.nullable().optional(),
+});
+
+const productionDecisionSchema = z.object({
+  decision: z.enum(PRODUCTION_DECISIONS).refine((d) => d !== "pending", {
+    message: "A ruling must be granted, granted_in_part, refused or withdrawn",
+  }),
+  decisionNote: z.string().max(20000).nullable().optional(),
+  productionDueDate: isoDateSchema.nullable().optional(),
+});
+
+const productionProduceSchema = z.object({
+  fileIds: z.array(z.string().min(1)).min(1).max(200),
 });
 
 const boardMemberSchema = z.object({
@@ -2893,6 +2925,343 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
   /* Health inputs (contract 3.5)                                      */
   /* ---------------------------------------------------------------- */
 
+  /* ---------------------------------------------------------------- */
+  /* Redfern schedule — document production (#340-343)                  */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * The Redfern schedule is the four-column table a tribunal expects for
+   * document production: what is asked for, why it is relevant and
+   * material, the objection, and the ruling. It is kept as records rather
+   * than a spreadsheet so the ruling has a date, an author and a ledger
+   * entry, and so a granted request with a production date lands on the
+   * obligation register like every other deadline the platform tracks.
+   *
+   * Deliberately not modelled: automatic production. Granting a request
+   * tells a human which documents to add to the bundle; the platform will
+   * not decide on its own which files answer a category request.
+   */
+  app.post(
+    "/projects/:projectId/disputes/:disputeId/production-requests",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { disputeId } = req.params as { disputeId: string };
+      const body = productionRequestSchema.parse(req.body);
+      const dispute = await fetchDispute(disputeId, req.companyId!, req.projectId!);
+      if (!ACTIVE.includes(dispute.status as DisputeStatus)) {
+        throw badRequest(
+          `Document production belongs to a live reference; dispute #${dispute.number} is ${dispute.status}`,
+        );
+      }
+      const id = newId("dpr");
+      // Numbering is per dispute and must not collide: the dispute row is
+      // locked so two clerks filing requests at once get 3 and 4, not two 3s.
+      await app.db.transaction(async (tx) => {
+        const locked = (
+          await tx.select().from(disputes).where(eq(disputes.id, disputeId)).for("update")
+        )[0];
+        if (!locked) throw notFound("Dispute not found");
+        const [maxRow] = await tx
+          .select({ n: sql<number>`coalesce(max(${documentProductionRequests.number}), 0)` })
+          .from(documentProductionRequests)
+          .where(eq(documentProductionRequests.disputeId, disputeId));
+        const next = Number(maxRow?.n ?? 0) + 1;
+        await tx.insert(documentProductionRequests).values({
+          id,
+          disputeId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          number: next,
+          requestingParty: body.requestingParty,
+          documentsRequested: body.documentsRequested,
+          relevance: body.relevance,
+          productionDueDate: body.productionDueDate ?? null,
+          createdBy: req.user!.id,
+        });
+        await appendLedger(tx as never, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "create",
+          objectType: "document_production_request",
+          objectId: id,
+          payload: {
+            disputeId,
+            number: next,
+            requestingParty: body.requestingParty,
+            documentsRequested: body.documentsRequested,
+          },
+          storePayload: true,
+          projectId: req.projectId!,
+        });
+      });
+      const [row] = await app.db
+        .select()
+        .from(documentProductionRequests)
+        .where(eq(documentProductionRequests.id, id))
+        .limit(1);
+      return reply.status(201).send(row);
+    },
+  );
+
+  app.get(
+    "/projects/:projectId/disputes/:disputeId/production-requests",
+    { preHandler: readGate },
+    async (req) => {
+      const { disputeId } = req.params as { disputeId: string };
+      await fetchDispute(disputeId, req.companyId!, req.projectId!);
+      const rows = await app.db
+        .select()
+        .from(documentProductionRequests)
+        .where(
+          and(
+            eq(documentProductionRequests.disputeId, disputeId),
+            eq(documentProductionRequests.companyId, req.companyId!),
+            eq(documentProductionRequests.projectId, req.projectId!),
+          ),
+        )
+        .orderBy(asc(documentProductionRequests.number));
+      const outstanding = rows.filter(
+        (r) => r.decision === "granted" || r.decision === "granted_in_part",
+      ).filter((r) => r.producedFileIds.length === 0);
+      return {
+        items: rows,
+        summary: {
+          total: rows.length,
+          pending: rows.filter((r) => r.decision === "pending").length,
+          granted: rows.filter((r) => r.decision === "granted").length,
+          grantedInPart: rows.filter((r) => r.decision === "granted_in_part").length,
+          refused: rows.filter((r) => r.decision === "refused").length,
+          withdrawn: rows.filter((r) => r.decision === "withdrawn").length,
+          objected: rows.filter((r) => r.objection !== null).length,
+          awaitingProduction: outstanding.length,
+        },
+      };
+    },
+  );
+
+  /**
+   * The objecting party's column, and the requesting party's reply to it.
+   * Kept separate from the ruling: whoever objects is not whoever decides.
+   */
+  app.patch(
+    "/projects/:projectId/disputes/:disputeId/production-requests/:requestId",
+    { preHandler: standardGate },
+    async (req) => {
+      const { disputeId, requestId } = req.params as { disputeId: string; requestId: string };
+      const body = productionRequestPatchSchema.parse(req.body);
+      await fetchDispute(disputeId, req.companyId!, req.projectId!);
+      const existing = (
+        await app.db
+          .select()
+          .from(documentProductionRequests)
+          .where(
+            and(
+              eq(documentProductionRequests.id, requestId),
+              eq(documentProductionRequests.disputeId, disputeId),
+              eq(documentProductionRequests.companyId, req.companyId!),
+              eq(documentProductionRequests.projectId, req.projectId!),
+            ),
+          )
+          .limit(1)
+      )[0];
+      if (!existing) throw notFound("Document production request not found");
+      if (existing.decision !== "pending") {
+        throw conflict(
+          `Request ${existing.number} has been ruled on (${existing.decision}); the schedule is closed for edits`,
+        );
+      }
+      const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
+      for (const [k, v] of Object.entries(body)) if (v !== undefined) set[k] = v;
+      if (Object.keys(set).length === 1) throw badRequest("Nothing to update");
+      await app.db
+        .update(documentProductionRequests)
+        .set(set)
+        .where(eq(documentProductionRequests.id, requestId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "document_production_request",
+        objectId: requestId,
+        payload: { changed: Object.keys(body) },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      const [row] = await app.db
+        .select()
+        .from(documentProductionRequests)
+        .where(eq(documentProductionRequests.id, requestId))
+        .limit(1);
+      return row;
+    },
+  );
+
+  /**
+   * The ruling. A grant with a production date raises an obligation so the
+   * production deadline is on the same register as every other deadline;
+   * a refusal or a withdrawal closes the row without one.
+   */
+  app.post(
+    "/projects/:projectId/disputes/:disputeId/production-requests/:requestId/decide",
+    { preHandler: standardGate },
+    async (req) => {
+      const { disputeId, requestId } = req.params as { disputeId: string; requestId: string };
+      const body = productionDecisionSchema.parse(req.body);
+      const dispute = await fetchDispute(disputeId, req.companyId!, req.projectId!);
+      const existing = (
+        await app.db
+          .select()
+          .from(documentProductionRequests)
+          .where(
+            and(
+              eq(documentProductionRequests.id, requestId),
+              eq(documentProductionRequests.disputeId, disputeId),
+              eq(documentProductionRequests.companyId, req.companyId!),
+              eq(documentProductionRequests.projectId, req.projectId!),
+            ),
+          )
+          .limit(1)
+      )[0];
+      if (!existing) throw notFound("Document production request not found");
+      if (existing.decision !== "pending") {
+        throw conflict(`Request ${existing.number} has already been ruled ${existing.decision}`);
+      }
+      const grants = body.decision === "granted" || body.decision === "granted_in_part";
+      const dueDate = body.productionDueDate ?? existing.productionDueDate;
+      if (grants && !dueDate) {
+        throw badRequest(
+          "A granted production request needs a production date — a direction without a deadline is not enforceable",
+        );
+      }
+      const decidedAt = todayISO();
+      await app.db.transaction(async (tx) => {
+        let obligationId: string | null = existing.obligationId;
+        if (grants && dueDate && !obligationId) {
+          obligationId = newId("obl");
+          await tx.insert(obligations).values({
+            id: obligationId,
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            sourceClause: `${dispute.kind} — document production request ${existing.number}`,
+            trigger: `Dispute #${dispute.number}: produce documents ordered on ${decidedAt}`,
+            deadline: `${dueDate}T23:59:59Z`,
+            warnDaysBefore: 3,
+            evidenceRequirement: existing.documentsRequested.slice(0, 500),
+            status: "open",
+            createdBy: req.user!.id,
+          });
+        }
+        if (!grants && existing.obligationId) {
+          await tx
+            .update(obligations)
+            .set({ status: "waived" })
+            .where(
+              and(eq(obligations.id, existing.obligationId), eq(obligations.status, "open")),
+            );
+        }
+        await tx
+          .update(documentProductionRequests)
+          .set({
+            decision: body.decision,
+            decisionNote: body.decisionNote ?? null,
+            decidedAt,
+            decidedBy: req.user!.id,
+            productionDueDate: grants ? dueDate : existing.productionDueDate,
+            obligationId,
+            updatedAt: new Date().toISOString(),
+          })
+          .where(eq(documentProductionRequests.id, requestId));
+        await appendLedger(tx as never, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "state_change",
+          objectType: "document_production_request",
+          objectId: requestId,
+          payload: {
+            from: "pending",
+            to: body.decision,
+            productionDueDate: grants ? dueDate : null,
+            obligationId,
+            note: body.decisionNote ?? null,
+          },
+          storePayload: true,
+          projectId: req.projectId!,
+        });
+      });
+      const [row] = await app.db
+        .select()
+        .from(documentProductionRequests)
+        .where(eq(documentProductionRequests.id, requestId))
+        .limit(1);
+      return row;
+    },
+  );
+
+  /** Record which files answered a granted request, satisfying its obligation. */
+  app.post(
+    "/projects/:projectId/disputes/:disputeId/production-requests/:requestId/produce",
+    { preHandler: standardGate },
+    async (req) => {
+      const { disputeId, requestId } = req.params as { disputeId: string; requestId: string };
+      const body = productionProduceSchema.parse(req.body);
+      await fetchDispute(disputeId, req.companyId!, req.projectId!);
+      const existing = (
+        await app.db
+          .select()
+          .from(documentProductionRequests)
+          .where(
+            and(
+              eq(documentProductionRequests.id, requestId),
+              eq(documentProductionRequests.disputeId, disputeId),
+              eq(documentProductionRequests.companyId, req.companyId!),
+              eq(documentProductionRequests.projectId, req.projectId!),
+            ),
+          )
+          .limit(1)
+      )[0];
+      if (!existing) throw notFound("Document production request not found");
+      if (existing.decision !== "granted" && existing.decision !== "granted_in_part") {
+        throw badRequest(
+          `Only a granted request can be answered with documents (request ${existing.number} is ${existing.decision})`,
+        );
+      }
+      for (const fileId of body.fileIds) {
+        await validateFileId(req.companyId!, req.projectId!, fileId);
+      }
+      const merged = [...new Set([...existing.producedFileIds, ...body.fileIds])];
+      await app.db.transaction(async (tx) => {
+        await tx
+          .update(documentProductionRequests)
+          .set({ producedFileIds: merged, updatedAt: new Date().toISOString() })
+          .where(eq(documentProductionRequests.id, requestId));
+        if (existing.obligationId) {
+          await tx
+            .update(obligations)
+            .set({ status: "satisfied" })
+            .where(
+              and(eq(obligations.id, existing.obligationId), eq(obligations.status, "open")),
+            );
+        }
+        await appendLedger(tx as never, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "update",
+          objectType: "document_production_request",
+          objectId: requestId,
+          payload: { producedFileIds: merged, obligationId: existing.obligationId },
+          storePayload: true,
+          projectId: req.projectId!,
+        });
+      });
+      const [row] = await app.db
+        .select()
+        .from(documentProductionRequests)
+        .where(eq(documentProductionRequests.id, requestId))
+        .limit(1);
+      return row;
+    },
+  );
+
   app.get("/projects/:projectId/disputes/health-inputs", { preHandler: readGate }, async (req) => {
     const companyId = req.companyId!;
     const projectId = req.projectId!;
@@ -2924,6 +3293,20 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
             inArray(
               disputeCosts.disputeId,
               rows.map((d) => d.id),
+            ),
+          )
+      : [];
+    const productionRows = rows.length
+      ? await app.db
+          .select({
+            decision: documentProductionRequests.decision,
+            producedFileIds: documentProductionRequests.producedFileIds,
+          })
+          .from(documentProductionRequests)
+          .where(
+            and(
+              eq(documentProductionRequests.companyId, companyId),
+              eq(documentProductionRequests.projectId, projectId),
             ),
           )
       : [];
@@ -2959,6 +3342,13 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
         amountInDisputeTotal,
         awaitingCompliance: rows.filter((d) => d.enforcementStatus === "awaiting_compliance").length,
         costsRecorded: costs.length,
+        /* granted document production still outstanding — an unanswered
+           tribunal direction is an adverse-inference risk, not a chore */
+        productionOutstanding: productionRows.filter(
+          (p) =>
+            (p.decision === "granted" || p.decision === "granted_in_part") &&
+            p.producedFileIds.length === 0,
+        ).length,
       },
       reasons,
     };

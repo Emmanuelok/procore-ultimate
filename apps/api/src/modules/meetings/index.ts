@@ -53,6 +53,7 @@ import {
   MEETING_TYPES,
   MINUTE_DELIVERY_CHANNELS,
   MINUTE_DELIVERY_STATUSES,
+  type ToolKey,
 } from "@constructos/shared";
 import type { Db } from "../../lib/db.js";
 import { newId } from "../../lib/ids.js";
@@ -82,6 +83,7 @@ import {
 import {
   companyScopeOf,
   companyToolGate,
+  holdsToolOnProject,
   scopeAllows,
   scopeProjects,
   scopeProjectsOrCompanyWide,
@@ -368,6 +370,16 @@ const HOLDABLE_STATES = ["scheduled", "in_progress"] as const;
 /** Action states from which cancel / block / escalate are meaningful. */
 const CANCELLABLE_ACTION_STATES = ["open", "in_progress", "blocked"] as const;
 const BLOCKABLE_ACTION_STATES = ["open", "in_progress"] as const;
+/**
+ * A decision can only be disputed while it is still the live answer.
+ *
+ * `superseded` and `rescinded` are closed records: flipping one to `disputed`
+ * overwrote the status that said the decision had been replaced (its successor
+ * still pointed back, so the register and the chain disagreed) AND re-opened
+ * the generic PATCH, which refuses only `superseded`/`rescinded` — dispute
+ * then edit was a way round the guard on certified content.
+ */
+const DISPUTABLE_DECISION_STATES = ["recorded", "ratified"] as const;
 /** How many days before the objection period closes the platform warns. */
 const OBJECTION_WARN_DAYS = 2;
 const OBJECTION_DETECTOR = "meeting_minutes_objection_closing";
@@ -2634,6 +2646,20 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       const { decisionId } = req.params as { decisionId: string };
       const body = z.object({ note: z.string().min(1).max(5000) }).parse(req.body);
       const row = await fetchDecision(req, decisionId);
+      if (row.status === "disputed") {
+        throw conflict(
+          `This decision is already disputed (by ${row.disputedBy ?? "an unrecorded actor"} on ` +
+            `${row.disputedAt ?? "an unrecorded date"}). Overwriting that note would erase the ` +
+            "first objection; settle it by superseding the decision at the next meeting.",
+        );
+      }
+      if (!DISPUTABLE_DECISION_STATES.includes(row.status as (typeof DISPUTABLE_DECISION_STATES)[number])) {
+        throw conflict(
+          `A ${row.status} decision is closed and cannot be disputed. Disputing it would replace ` +
+            "the status that records how it ended and would re-open editing of certified " +
+            "content — dispute the decision that replaced it instead.",
+        );
+      }
       const now = new Date().toISOString();
       await app.db
         .update(meetingDecisions)
@@ -4433,11 +4459,20 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
   /* answered stops being carried forward out of habit.                */
   /* ================================================================ */
 
+  /**
+   * `tool` is the permission the CREATED record lives under, and it is checked
+   * separately from `meetings`.
+   *
+   * Without it, a route gated on `meetings: standard` created RFIs, change
+   * events and risks for a caller who holds none of those tools — the same
+   * defect as a company-level route reading project data: a permission
+   * boundary crossed by choosing a URL. Raising is convenience, not authority.
+   */
   const RAISE_TARGET_TABLES = {
-    rfi: { type: "rfi", label: "RFI" },
-    change_event: { type: "change_event", label: "change event" },
-    risk: { type: "risk", label: "risk" },
-  } as const;
+    rfi: { type: "rfi", label: "RFI", tool: "rfis" },
+    change_event: { type: "change_event", label: "change event", tool: "change_management" },
+    risk: { type: "risk", label: "risk", tool: "risk" },
+  } as const satisfies Record<string, { type: string; label: string; tool: ToolKey }>;
 
   /** The live state of a linked record, whatever kind it is. */
   async function resolveLinkedRecord(
@@ -4548,6 +4583,21 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       const title = body.title ?? item.title;
       const description = body.detail ?? item.discussion ?? item.description ?? null;
       const meta = RAISE_TARGET_TABLES[body.target];
+      /*
+       * The record about to be created belongs to ANOTHER tool, so the caller
+       * must hold that tool too. `meetings: standard` is permission to run a
+       * meeting; it is not permission to open RFIs, raise change events or
+       * write the risk register, and a route that let it be would have widened
+       * one tool into three by URL. Refused with the name of the tool, not a
+       * blank 403 — the caller should be able to ask for the right thing.
+       */
+      if (!(await holdsToolOnProject(app, req, meta.tool, "standard"))) {
+        throw forbidden(
+          `Raising a ${meta.label} from an agenda item creates a record in the ${meta.tool} ` +
+            "register, so it needs standard access to that tool on this project as well as to " +
+            "meetings. Record the item and ask someone who holds it to raise the record.",
+        );
+      }
       let createdId: string;
       let reference: string;
 

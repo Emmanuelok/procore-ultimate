@@ -97,6 +97,42 @@ import { requireVerifiedEmail } from "../account/verification.js";
  */
 const MERGE_UNDO_WINDOW_MS = 24 * 60 * 60_000;
 
+/* ------------------------------------------------------------------ */
+/* CSV import: a partial file is a partial edit                        */
+/* ------------------------------------------------------------------ */
+
+/** Every column name the uploaded file actually carried. */
+function fileColumns(rows: Array<Record<string, string>>): Set<string> {
+  const out = new Set<string>();
+  for (const row of rows) for (const key of Object.keys(row)) out.add(key);
+  return out;
+}
+
+/**
+ * Keep only the fields whose SOURCE COLUMN was in the file.
+ *
+ * A two-column CSV is a two-column edit, not a statement that every other
+ * field is empty. Mapping an absent column to `null` turned a `name,email`
+ * re-import into a wipe of every matched vendor's address, phone, website,
+ * tax id and registration number — and reset its status to `active` — and
+ * detached every matched contact from its vendor, none of it reported. The
+ * downloadable template carries every column, so a full file still updates
+ * everything.
+ *
+ * `mapping` is keyed by CSV column; each entry names the database field and
+ * the value parsed from the row.
+ */
+function onlyProvided(
+  present: Set<string>,
+  mapping: Record<string, [string, unknown]>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [column, [field, value]] of Object.entries(mapping)) {
+    if (present.has(column)) out[field] = value;
+  }
+  return out;
+}
+
 const vendorCreateSchema = z.object({
   name: z.string().min(1).max(300),
   tradeCodes: z.array(z.string().min(1).max(50)).max(50).default([]),
@@ -1830,33 +1866,41 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
         ),
       ];
       const byName = await loadVendorsByName(app.db, req.companyId!, fileNames);
+      const present = fileColumns(writable);
       await app.db.transaction(async (tx) => {
         for (const row of writable) {
           const name = (row["name"] ?? "").trim();
           if (!name) continue;
-          const values = {
-            tradeCodes: (row["trade_codes"] ?? "")
-              .split(";")
-              .map((t) => t.trim())
-              .filter(Boolean),
-            address: (row["address"] ?? "").trim() || null,
-            city: (row["city"] ?? "").trim() || null,
-            country: (row["country"] ?? "").trim() || null,
-            phone: (row["phone"] ?? "").trim() || null,
-            email: (row["email"] ?? "").trim() || null,
-            website: (row["website"] ?? "").trim() || null,
-            taxId: (row["tax_id"] ?? "").trim() || null,
-            registrationNumber: (row["registration_number"] ?? "").trim() || null,
-            status: (row["status"] ?? "active").trim().toLowerCase() || "active",
-            updatedAt: new Date().toISOString(),
-          };
+          const values = onlyProvided(present, {
+            trade_codes: [
+              "tradeCodes",
+              (row["trade_codes"] ?? "")
+                .split(";")
+                .map((t) => t.trim())
+                .filter(Boolean),
+            ],
+            address: ["address", (row["address"] ?? "").trim() || null],
+            city: ["city", (row["city"] ?? "").trim() || null],
+            country: ["country", (row["country"] ?? "").trim() || null],
+            phone: ["phone", (row["phone"] ?? "").trim() || null],
+            email: ["email", (row["email"] ?? "").trim() || null],
+            website: ["website", (row["website"] ?? "").trim() || null],
+            tax_id: ["taxId", (row["tax_id"] ?? "").trim() || null],
+            registration_number: [
+              "registrationNumber",
+              (row["registration_number"] ?? "").trim() || null,
+            ],
+            status: ["status", (row["status"] ?? "active").trim().toLowerCase() || "active"],
+          });
+          values["updatedAt"] = new Date().toISOString();
+          const patch = values as Partial<typeof vendors.$inferInsert>;
           const known = byName.get(name.toLowerCase());
           if (known) {
-            await tx.update(vendors).set(values).where(eq(vendors.id, known));
+            await tx.update(vendors).set(patch).where(eq(vendors.id, known));
             updated += 1;
           } else {
             const id = newId("vnd");
-            await tx.insert(vendors).values({ id, companyId: req.companyId!, name, ...values });
+            await tx.insert(vendors).values({ ...patch, id, companyId: req.companyId!, name });
             byName.set(name.toLowerCase(), id);
             created += 1;
           }
@@ -1897,27 +1941,32 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
           if (c.email) byEmail.set(c.email.trim().toLowerCase(), c.id);
         }
       }
+      const present = fileColumns(writable);
       await app.db.transaction(async (tx) => {
         for (const row of writable) {
           const name = (row["name"] ?? "").trim();
           if (!name) continue;
           const email = (row["email"] ?? "").trim() || null;
           const vendorName = (row["vendor_name"] ?? "").trim().toLowerCase();
-          const values = {
-            name,
-            email,
-            phone: (row["phone"] ?? "").trim() || null,
-            title: (row["title"] ?? "").trim() || null,
-            vendorId: vendorName ? (vendorByName.get(vendorName) ?? null) : null,
-            updatedAt: new Date().toISOString(),
-          };
+          const values = onlyProvided(present, {
+            email: ["email", email],
+            phone: ["phone", (row["phone"] ?? "").trim() || null],
+            title: ["title", (row["title"] ?? "").trim() || null],
+            vendor_name: [
+              "vendorId",
+              vendorName ? (vendorByName.get(vendorName) ?? null) : null,
+            ],
+          });
+          values["name"] = name;
+          values["updatedAt"] = new Date().toISOString();
+          const patch = values as Partial<typeof contacts.$inferInsert>;
           const known = email ? byEmail.get(email.toLowerCase()) : undefined;
           if (known) {
-            await tx.update(contacts).set(values).where(eq(contacts.id, known));
+            await tx.update(contacts).set(patch).where(eq(contacts.id, known));
             updated += 1;
           } else {
             const id = newId("cnt");
-            await tx.insert(contacts).values({ id, companyId: req.companyId!, ...values });
+            await tx.insert(contacts).values({ ...patch, id, companyId: req.companyId!, name });
             if (email) byEmail.set(email.toLowerCase(), id);
             created += 1;
           }

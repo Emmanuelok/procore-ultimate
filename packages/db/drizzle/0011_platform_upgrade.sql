@@ -1702,6 +1702,30 @@ CREATE TABLE "dispute_costs" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
+CREATE TABLE "document_production_requests" (
+	"id" text PRIMARY KEY NOT NULL,
+	"dispute_id" text NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"number" integer NOT NULL,
+	"requesting_party" text NOT NULL,
+	"documents_requested" text NOT NULL,
+	"relevance" text NOT NULL,
+	"objection" text,
+	"objection_grounds" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"reply" text,
+	"decision" text DEFAULT 'pending' NOT NULL,
+	"decision_note" text,
+	"decided_at" text,
+	"decided_by" text,
+	"production_due_date" text,
+	"produced_file_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"obligation_id" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
 CREATE TABLE "settlement_models" (
 	"id" text PRIMARY KEY NOT NULL,
 	"dispute_id" text NOT NULL,
@@ -7944,11 +7968,18 @@ ALTER TABLE "forensic_claims" ADD COLUMN "decided_by" text;--> statement-breakpo
 ALTER TABLE "forensic_claims" ADD COLUMN "decided_at" timestamp with time zone;--> statement-breakpoint
 ALTER TABLE "forensic_claims" ADD COLUMN "revision_count" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
 ALTER TABLE "forensic_claims" ADD COLUMN "status_reason" text;--> statement-breakpoint
+ALTER TABLE "risks" ADD COLUMN "cause" text;--> statement-breakpoint
+ALTER TABLE "risks" ADD COLUMN "effect" text;--> statement-breakpoint
+ALTER TABLE "risks" ADD COLUMN "response_strategy" text;--> statement-breakpoint
+ALTER TABLE "risks" ADD COLUMN "proximity_date" text;--> statement-breakpoint
+ALTER TABLE "risks" ADD COLUMN "triggers" jsonb DEFAULT '[]'::jsonb NOT NULL;--> statement-breakpoint
+ALTER TABLE "risks" ADD COLUMN "secondary_of_risk_id" text;--> statement-breakpoint
 ALTER TABLE "business_cases" ADD COLUMN "logic_model" jsonb;--> statement-breakpoint
 ALTER TABLE "business_cases" ADD COLUMN "reference_class" jsonb;--> statement-breakpoint
 ALTER TABLE "gate_reviews" ADD COLUMN "evidence_pack" jsonb;--> statement-breakpoint
 ALTER TABLE "gate_reviews" ADD COLUMN "evidence_pack_root" text;--> statement-breakpoint
 ALTER TABLE "gate_reviews" ADD COLUMN "independence" jsonb;--> statement-breakpoint
+ALTER TABLE "stage_gates" ADD COLUMN "lessons_required" boolean DEFAULT false NOT NULL;--> statement-breakpoint
 ALTER TABLE "covenant_readings" ADD COLUMN "basis" text DEFAULT 'manual' NOT NULL;--> statement-breakpoint
 ALTER TABLE "covenant_readings" ADD COLUMN "computed_from" jsonb;--> statement-breakpoint
 ALTER TABLE "covenants" ADD COLUMN "formula" text DEFAULT 'custom' NOT NULL;--> statement-breakpoint
@@ -8276,6 +8307,10 @@ CREATE INDEX "dispute_board_members_dispute_idx" ON "dispute_board_members" USIN
 CREATE INDEX "dispute_board_visits_dispute_idx" ON "dispute_board_visits" USING btree ("dispute_id");--> statement-breakpoint
 CREATE INDEX "dispute_costs_dispute_idx" ON "dispute_costs" USING btree ("dispute_id");--> statement-breakpoint
 CREATE INDEX "dispute_costs_project_idx" ON "dispute_costs" USING btree ("project_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "document_production_requests_uq" ON "document_production_requests" USING btree ("dispute_id","number");--> statement-breakpoint
+CREATE INDEX "document_production_requests_dispute_idx" ON "document_production_requests" USING btree ("dispute_id");--> statement-breakpoint
+CREATE INDEX "document_production_requests_project_idx" ON "document_production_requests" USING btree ("project_id");--> statement-breakpoint
+CREATE INDEX "document_production_requests_decision_idx" ON "document_production_requests" USING btree ("company_id","decision");--> statement-breakpoint
 CREATE INDEX "settlement_models_dispute_idx" ON "settlement_models" USING btree ("dispute_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "chance_finds_uq" ON "chance_finds" USING btree ("project_id","number");--> statement-breakpoint
 CREATE INDEX "chance_finds_project_idx" ON "chance_finds" USING btree ("project_id","status");--> statement-breakpoint
@@ -9105,6 +9140,8 @@ CREATE INDEX "delay_events_schedule_idx" ON "delay_events" USING btree ("schedul
 CREATE INDEX "delay_events_start_idx" ON "delay_events" USING btree ("project_id","start_date");--> statement-breakpoint
 CREATE INDEX "delay_events_notice_idx" ON "delay_events" USING btree ("status","notice_due_date");--> statement-breakpoint
 CREATE INDEX "forensic_claims_status_idx" ON "forensic_claims" USING btree ("company_id","status");--> statement-breakpoint
+CREATE INDEX "risks_status_idx" ON "risks" USING btree ("company_id","project_id","status");--> statement-breakpoint
+CREATE INDEX "risks_secondary_idx" ON "risks" USING btree ("secondary_of_risk_id");--> statement-breakpoint
 CREATE INDEX "engagements_kind_idx" ON "engagements" USING btree ("project_id","kind");--> statement-breakpoint
 CREATE INDEX "engagements_stakeholders_idx" ON "engagements" USING gin ("stakeholder_ids");--> statement-breakpoint
 CREATE UNIQUE INDEX "payroll_entries_uq" ON "payroll_entries" USING btree ("worker_id","period_start","period_end","source_ref");--> statement-breakpoint

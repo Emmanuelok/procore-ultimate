@@ -18,6 +18,7 @@ import {
   signals,
   timecardAllocations,
   timecards,
+  workerSkills,
   workers,
 } from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
@@ -1409,6 +1410,366 @@ describe("summary, health inputs and sweeps", () => {
 
     const theirs = await get("/api/v1/resources/signals", stranger.headers);
     expect(theirs.json().total).toBe(0);
+  });
+});
+
+/* ================================================================== */
+/* 6b. Regressions found by the adversarial review                     */
+/* ================================================================== */
+
+describe("regressions", () => {
+  /* ---- the plan lifecycle routes the first pass left untested ---- */
+
+  it("reads one plan on its own, and hides another company's", async () => {
+    const res = await get(`/api/v1/projects/${projectA}/resource-plans/${planId}`);
+    expect(res.statusCode).toBe(200);
+    expect(res.json().reference).toBe("RP-001");
+    expect(res.json().byResourceType.length).toBeGreaterThan(0);
+    expect(typeof res.json().peakHeadcountBasis).toBe("string");
+
+    const theirs = await get(
+      `/api/v1/projects/${projectA}/resource-plans/${planId}`,
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(theirs.statusCode);
+  });
+
+  it("archives a plan, is idempotent about it, and refuses to edit it afterwards", async () => {
+    const created = await post(`/api/v1/projects/${projectA}/resource-plans`, {
+      name: "Scenario: two extra gangs",
+      planKind: "scenario",
+    });
+    expect(created.statusCode).toBe(201);
+    const scenarioId = created.json().id as string;
+
+    const first = await post(
+      `/api/v1/projects/${projectA}/resource-plans/${scenarioId}/archive`,
+      {},
+    );
+    expect(first.statusCode).toBe(200);
+    expect(first.json().status).toBe("archived");
+
+    // archiving something already archived is a no-op, not a 409
+    const again = await post(
+      `/api/v1/projects/${projectA}/resource-plans/${scenarioId}/archive`,
+      {},
+    );
+    expect(again.statusCode).toBe(200);
+    expect(again.json().status).toBe("archived");
+
+    const edit = await patch(`/api/v1/projects/${projectA}/resource-plans/${scenarioId}`, {
+      name: "Rewriting an archived version",
+    });
+    expect(edit.statusCode).toBe(409);
+    expect(edit.json().message).toContain("archived");
+
+    const theirs = await post(
+      `/api/v1/projects/${projectA}/resource-plans/${scenarioId}/archive`,
+      {},
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(theirs.statusCode);
+  });
+
+  /**
+   * Regression: a plan's week boundary may not move once rows are bucketed on
+   * it. Existing demand keeps its old weekStart while the histogram
+   * enumerates weeks on the new one, so not a single key matches: the plan
+   * header still shows 800 hours and the chart shows none.
+   */
+  it("refuses to change a plan's week boundary once demand exists", async () => {
+    const res = await patch(`/api/v1/projects/${projectA}/resource-plans/${planId}`, {
+      weekStartsOn: 0,
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toContain("histogram no longer draws");
+
+    // the rows are untouched: still bucketed on the Monday they were derived on
+    const rows = await app.db
+      .select()
+      .from(resourceDemands)
+      .where(eq(resourceDemands.planId, planId));
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((r) => new Date(`${r.weekStart}T00:00:00Z`).getUTCDay() === 1)).toBe(true);
+  });
+
+  /* ---- the library detail routes ---- */
+
+  it("reads and edits one skill, and hides both from another company", async () => {
+    const detail = await get(`/api/v1/resource-skills/${mewpSkillId}`);
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().code).toBe("MEWP");
+    expect(detail.json().expires).toBe(true);
+    expect(detail.json().holderCount).toBeGreaterThan(0);
+
+    const edited = await patch(`/api/v1/resource-skills/${mewpSkillId}`, {
+      name: "MEWP operator (3a/3b)",
+      validityMonths: 36,
+    });
+    expect(edited.statusCode).toBe(200);
+    expect(edited.json().name).toBe("MEWP operator (3a/3b)");
+    expect(edited.json().validityMonths).toBe(36);
+
+    const theirRead = await get(`/api/v1/resource-skills/${mewpSkillId}`, stranger.headers);
+    expect([403, 404]).toContain(theirRead.statusCode);
+    const theirWrite = await patch(
+      `/api/v1/resource-skills/${mewpSkillId}`,
+      { name: "Hijacked" },
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(theirWrite.statusCode);
+  });
+
+  /* ---- closed vocabularies ---- */
+
+  it("refuses a free-text shift and a free-text unit", async () => {
+    const shiftRes = await post(`/api/v1/projects/${projectA}/resource-assignments`, {
+      crewId,
+      fromDate: W0,
+      toDate: shift(W0, 1),
+      shift: "banana",
+    });
+    expect(shiftRes.statusCode).toBe(400);
+
+    const unitRes = await post("/api/v1/resource-types", {
+      code: "MADEUP",
+      name: "Made up",
+      unit: "man-hours",
+    });
+    expect(unitRes.statusCode).toBe(400);
+  });
+
+  /**
+   * Regression: an approval never stands on numbers nobody approved
+   * (master plan §6.2). Somebody confirms a crew for a window at an
+   * allocation; move either and the confirmation is about a booking that no
+   * longer exists.
+   */
+  it("withdraws a confirmation when the window or the allocation changes", async () => {
+    const created = await post(`/api/v1/projects/${projectA}/resource-assignments`, {
+      workerId,
+      fromDate: shift(W2, 7),
+      toDate: shift(W2, 11),
+      hoursPerDay: 8,
+      allocationPercent: 50,
+    });
+    expect(created.statusCode).toBe(201);
+    const id = created.json().id as string;
+
+    const confirmed = await post(
+      `/api/v1/projects/${projectA}/resource-assignments/${id}/confirm`,
+      {},
+    );
+    expect(confirmed.statusCode).toBe(200);
+    expect(confirmed.json().confirmedBy).toBe(owner.userId);
+
+    // a note is not a commitment: the confirmation stands
+    const harmless = await patch(`/api/v1/projects/${projectA}/resource-assignments/${id}`, {
+      notes: "Working the east face first.",
+    });
+    expect(harmless.statusCode).toBe(200);
+    expect(harmless.json().status).toBe("confirmed");
+    expect(harmless.json().confirmationReset).toBe(false);
+
+    const moved = await patch(`/api/v1/projects/${projectA}/resource-assignments/${id}`, {
+      toDate: shift(W2, 25),
+      allocationPercent: 100,
+    });
+    expect(moved.statusCode).toBe(200);
+    expect(moved.json().status).toBe("planned");
+    expect(moved.json().confirmedBy).toBeNull();
+    expect(moved.json().confirmedAt).toBeNull();
+    expect(moved.json().confirmationReset).toBe(true);
+    expect(moved.json().confirmationResetReason).toContain("never stand on numbers nobody approved");
+
+    const entries = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(
+        and(
+          eq(ledgerEntries.companyId, owner.companyId),
+          eq(ledgerEntries.objectType, "resource_assignment"),
+          eq(ledgerEntries.objectId, id),
+        ),
+      );
+    const payloads = entries.map((e) => JSON.stringify(e.payload));
+    expect(payloads.some((p) => p.includes("confirmationReset"))).toBe(true);
+  });
+
+  /* ---- the booking picker ---- */
+
+  it("offers the crews, workers and plant a booking can actually name", async () => {
+    const res = await get(`/api/v1/projects/${projectA}/resources/subjects`);
+    expect(res.statusCode).toBe(200);
+    const items = res.json().items as Array<{ kind: string; id: string; label: string }>;
+    expect(items.some((i) => i.kind === "crew" && i.id === crewId)).toBe(true);
+    expect(items.some((i) => i.kind === "worker" && i.id === workerId)).toBe(true);
+    // a crew belonging to another project is never offered here
+    expect(items.some((i) => i.id === equipmentlessCrewId)).toBe(false);
+
+    const workersOnly = await get(
+      `/api/v1/projects/${projectA}/resources/subjects?kind=worker&q=Mason`,
+    );
+    const filtered = workersOnly.json().items as Array<{ kind: string; label: string }>;
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0]!.label).toBe("A. Mason");
+    expect(filtered.every((i) => i.kind === "worker")).toBe(true);
+
+    const theirs = await get(
+      `/api/v1/projects/${projectA}/resources/subjects`,
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(theirs.statusCode);
+  });
+
+  /**
+   * Regression: re-recording a ticket that no longer carries an expiry date
+   * must CLEAR the old one. Merging on `??` kept a stale date the sweep would
+   * happily go on warning about, on a certificate whose real validity is
+   * unknown.
+   */
+  it("clears a nullable field on the renewal path when null is sent explicitly", async () => {
+    const renewed = await post(`/api/v1/projects/${projectA}/worker-skills`, {
+      workerId: secondWorkerId,
+      skillId: mewpSkillId,
+      certificateRef: "MEWP-0002",
+      expiresAt: null,
+    });
+    expect(renewed.statusCode).toBe(200);
+    expect(renewed.json().expiresAt).toBeNull();
+    expect(renewed.json().validity).toBe("unknown");
+    expect(renewed.json().status).toBe("claimed");
+
+    const stored = await app.db
+      .select()
+      .from(workerSkills)
+      .where(
+        and(eq(workerSkills.workerId, secondWorkerId), eq(workerSkills.skillId, mewpSkillId)),
+      );
+    expect(stored).toHaveLength(1);
+    expect(stored[0]!.expiresAt).toBeNull();
+    // an omitted field still keeps what was held
+    expect(stored[0]!.certificateRef).toBe("MEWP-0002");
+  });
+
+  /**
+   * Regression: `unknownSupplyWeeks` was built over EVERY resource type in the
+   * company library, so the number was driven by how many trades a business
+   * has rather than by anything about this project — and it is a health input.
+   */
+  it("does not count a trade this project never uses as unknown supply", async () => {
+    const before = await get(`/api/v1/projects/${projectA}/resources/summary`);
+    expect(before.statusCode).toBe(200);
+    const beforeUnknown = before.json().coverage.unknownSupplyWeeks as number;
+
+    const unused = await post("/api/v1/resource-types", {
+      code: "GLAZ",
+      name: "Glaziers",
+      kind: "labour",
+      standardHoursPerDay: 8,
+    });
+    expect(unused.statusCode).toBe(201);
+    const archived = await post("/api/v1/resource-types", {
+      code: "THATCH",
+      name: "Thatchers",
+      kind: "labour",
+      status: "archived",
+    });
+    expect(archived.statusCode).toBe(201);
+
+    const after = await get(`/api/v1/projects/${projectA}/resources/summary`);
+    expect(after.json().coverage.unknownSupplyWeeks).toBe(beforeUnknown);
+
+    const health = await get(`/api/v1/projects/${projectA}/resources/health-inputs`);
+    expect(health.json().metrics["unknownSupplyWeeks"]).toBe(beforeUnknown);
+  });
+
+  /**
+   * Regression: a manual run is gated on ONE project's `resources:admin`, so
+   * it may only touch that project. Closing another project's still-live
+   * findings because this run did not look at them is a silent data loss.
+   */
+  it("scopes a manual sweep run to the route's own project", async () => {
+    const openBefore = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "resource_assignment_conflict"),
+          eq(signals.disposition, "new"),
+        ),
+      );
+    expect(openBefore.length).toBeGreaterThan(0);
+    expect(openBefore.every((s) => s.projectId === projectA)).toBe(true);
+
+    const res = await post(`/api/v1/projects/${projectB}/resources/sweeps/run`, {
+      job: "resources.assignment-conflicts",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().scope).toBe("project");
+    expect(res.json().projectId).toBe(projectB);
+    expect(res.json().conflicts.projects).toBe(1);
+
+    const openAfter = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "resource_assignment_conflict"),
+          eq(signals.disposition, "new"),
+        ),
+      );
+    // projectA's live double booking was never looked at, so it stays open
+    expect(openAfter.length).toBe(openBefore.length);
+  });
+
+  /**
+   * Regression: the "this plan is aggregated" explanation was unreachable.
+   * `suggestLevelling` always falls back to `add_supply`, so the list is
+   * virtually never empty; the honest signal is that not one suggestion could
+   * NAME an activity.
+   */
+  it("says why no activity could be named when the plan has no traceability", async () => {
+    const plan = await post(`/api/v1/projects/${projectB}/resource-plans`, {
+      name: "Depot resourcing (typed by hand)",
+    });
+    expect(plan.statusCode).toBe(201);
+    const depotPlanId = plan.json().id as string;
+
+    const row = await post(
+      `/api/v1/projects/${projectB}/resource-plans/${depotPlanId}/demand`,
+      { resourceTypeId: labourTypeId, weekStart: W0, demandHours: 400 },
+    );
+    expect(row.statusCode).toBe(201);
+    expect(row.json().sourceTaskId).toBeNull();
+
+    expect(
+      (await post(`/api/v1/projects/${projectB}/resource-plans/${depotPlanId}/activate`, {}))
+        .statusCode,
+    ).toBe(200);
+    expect(
+      (
+        await put(`/api/v1/projects/${projectB}/resource-availability`, {
+          resourceTypeId: labourTypeId,
+          weekStart: W0,
+          availableHours: 100,
+          source: "roster",
+        })
+      ).statusCode,
+    ).toBe(200);
+
+    const res = await get(
+      `/api/v1/projects/${projectB}/resources/histogram?from=${W0}&to=${W0}`,
+    );
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.totals.overAllocatedCells).toBe(1);
+    const levelling = body.levelling as Array<{ action: string; taskId: string | null }>;
+    expect(levelling.length).toBeGreaterThan(0);
+    expect(levelling.some((l) => l.action === "defer_task")).toBe(false);
+    expect((body.reasons as string[]).join(" ")).toContain("aggregated per trade-week");
   });
 });
 

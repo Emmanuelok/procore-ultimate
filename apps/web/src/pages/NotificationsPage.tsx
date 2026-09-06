@@ -547,14 +547,27 @@ function PreferencesTab() {
         mutedProjectIds: patch.mutedProjectIds ?? prefs.mutedProjectIds,
         mutedTools: patch.mutedTools ?? prefs.mutedTools,
       };
-      const next = await api.put<NotificationPreferences>(
+      const next = await api.put<NotificationPreferences & { releasedFromHold?: number }>(
         "/api/v1/me/notification-preferences",
         body,
       );
       // The PUT answers with the stored row but without the catalogue; keep
       // the one we already have rather than blanking the form.
       setPrefs({ ...next, catalogue: prefs.catalogue });
-      toast.success("Notification preferences saved");
+      /*
+       * Turning the cadence off hands back everything it was holding, and
+       * the bell changes the moment it does — say so and re-read the counts
+       * rather than letting the badge jump with no explanation.
+       */
+      const released = next.releasedFromHold ?? 0;
+      if (released > 0) {
+        shell.refreshCounts();
+        toast.success(
+          `Notification preferences saved — ${released} notification(s) released from the digest`,
+        );
+      } else {
+        toast.success("Notification preferences saved");
+      }
     } catch (err) {
       setError(errorMessage(err, "Failed to save preferences"));
     } finally {

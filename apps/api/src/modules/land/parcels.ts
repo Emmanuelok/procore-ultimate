@@ -240,6 +240,19 @@ export async function registerParcelRoutes(app: FastifyInstance): Promise<void> 
         };
       }),
       allowedTransitions: PARCEL_TRANSITIONS[parcel.status as keyof typeof PARCEL_TRANSITIONS] ?? [],
+      /*
+       * `acquired` is deliberately absent from the transition table — title
+       * passes through the evidenced /acquire route, which records the BASIS
+       * on which it passed. The register therefore has to tell the workspace
+       * when that route is open, or the only way to mark a state-owned or
+       * donated parcel acquired would be to invent a dispute.
+       */
+      acquirable:
+        parcel.status !== "acquired" &&
+        PARCEL_ACQUIRABLE_FROM.includes(parcel.status as (typeof PARCEL_ACQUIRABLE_FROM)[number]),
+      /** bases that require a compensation payment before possession */
+      cashAcquisitionBases: CASH_ACQUISITION_BASES,
+      acquisitionBases: ACQUISITION_BASES,
     };
   });
 

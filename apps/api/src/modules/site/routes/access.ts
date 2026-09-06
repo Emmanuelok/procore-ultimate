@@ -249,11 +249,39 @@ export const accessRoutes: FastifyPluginAsync = async (app) => {
       "fileIds",
       "notes",
     ]);
+    // The verdict follows the marks. A POST derives `valid`/`failed` from the
+    // score against the pass mark, so a PATCH that moves either must move the
+    // verdict too — otherwise a person who failed can be recorded as inducted
+    // in two calls where one is refused. `expired` and `pending` are not
+    // assessment verdicts (the sweep owns expiry), so they are left alone.
+    const mergedScore = body.scorePercent === undefined ? existing.scorePercent : (body.scorePercent ?? null);
+    const mergedPassMark = body.passMark === undefined ? existing.passMark : (body.passMark ?? null);
+    const passed = mergedScore === null || mergedPassMark === null ? true : mergedScore >= mergedPassMark;
+    const verdictMoved =
+      (existing.status === "valid" || existing.status === "failed") && passed !== (existing.status === "valid");
+    if (verdictMoved) set["status"] = passed ? "valid" : "failed";
+
     const [row] = await app.db
       .update(siteInductions)
       .set(set)
       .where(and(eq(siteInductions.id, id), eq(siteInductions.companyId, companyId)))
       .returning();
+    // An induction that has just become a failure cannot leave a live pass
+    // standing on it, exactly as a revocation cannot.
+    const suspended =
+      verdictMoved && !passed
+        ? await app.db
+            .update(siteAccessPasses)
+            .set({ status: "suspended", updatedAt: nowISO() })
+            .where(
+              and(
+                eq(siteAccessPasses.companyId, companyId),
+                eq(siteAccessPasses.inductionId, id),
+                eq(siteAccessPasses.status, "active"),
+              ),
+            )
+            .returning({ id: siteAccessPasses.id })
+        : [];
     await ledger(app.db, {
       companyId,
       projectId,
@@ -261,9 +289,9 @@ export const accessRoutes: FastifyPluginAsync = async (app) => {
       action: "update",
       objectType: "site_induction",
       objectId: id,
-      payload: set,
+      payload: { ...set, ...(suspended.length > 0 ? { passesSuspended: suspended.map((p) => p.id) } : {}) },
     });
-    return row;
+    return { ...row, passesSuspended: suspended.length };
   });
 
   app.post(`${base}/inductions/:id/revoke`, { preHandler: standardGate }, async (req) => {

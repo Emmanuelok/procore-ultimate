@@ -21,6 +21,8 @@ let built: Awaited<ReturnType<typeof buildTestApp>>;
 let app: FastifyInstance;
 let owner: TestActor;
 let projectId: string;
+/** A project that has never held a plan at all. */
+let virginProjectId: string;
 let typeId: string;
 let planId: string;
 
@@ -37,13 +39,23 @@ beforeAll(async () => {
   }
   owner = await registerActor(app, { companyName: "Week Boundary Co" });
   projectId = newId("prj");
-  await app.db.insert(projects).values({
-    id: projectId,
-    companyId: owner.companyId,
-    name: "Sunday shift project",
-    stage: "construction",
-    currency: "USD",
-  });
+  virginProjectId = newId("prj");
+  await app.db.insert(projects).values([
+    {
+      id: projectId,
+      companyId: owner.companyId,
+      name: "Sunday shift project",
+      stage: "construction",
+      currency: "USD",
+    },
+    {
+      id: virginProjectId,
+      companyId: owner.companyId,
+      name: "Never planned",
+      stage: "construction",
+      currency: "USD",
+    },
+  ]);
 
   const type = await app.inject({
     method: "POST",
@@ -143,7 +155,50 @@ describe("week boundaries", () => {
     expect(weeks.every((w) => new Date(`${w}T00:00:00Z`).getUTCDay() === 0)).toBe(true);
   });
 
-  it("falls back to Monday when no plan is active", async () => {
+  /**
+   * Regression: THE BOUNDARY BELONGS TO THE PROJECT, NOT TO WHICHEVER PLAN IS
+   * ACTIVE RIGHT NOW.
+   *
+   * Resolving it from the active `current` plan alone left two holes a user
+   * walks straight into. Supply is stated from the Plan tab with no
+   * activation required, so a Sunday-start plan still in draft got Monday
+   * supply rows; and archiving the live plan flipped the boundary under rows
+   * already stored, stranding every one of them.
+   */
+  it("refuses to move a plan's week boundary once demand is bucketed on it", async () => {
+    const res = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}/resource-plans/${planId}`,
+      headers: owner.headers,
+      payload: { weekStartsOn: 1 },
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toContain("histogram no longer draws");
+  });
+
+  it("allows a no-op restatement of the same boundary", async () => {
+    const res = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}/resource-plans/${planId}`,
+      headers: owner.headers,
+      payload: { weekStartsOn: 0, name: "Sunday-start plan" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().weekStartsOn).toBe(0);
+  });
+
+  it("refuses a second plan that would introduce a second boundary", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/resource-plans`,
+      headers: owner.headers,
+      payload: { name: "Monday rebel", weekStartsOn: 1 },
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toContain("already buckets its weeks");
+  });
+
+  it("keeps the project's boundary when no plan is active", async () => {
     await app.db
       .update(resourcePlans)
       .set({ status: "archived" })
@@ -160,6 +215,36 @@ describe("week boundaries", () => {
       },
     });
     expect(res.statusCode).toBe(200);
-    expect(res.json().weekStart).toBe("2026-12-07"); // the Monday
+    // Sunday, not the Monday a "no active plan → default" fallback would give:
+    // the rows already stored on this project all begin on a Sunday.
+    expect(res.json().weekStart).toBe("2026-12-06");
+  });
+
+  it("falls back to Monday only on a project that has never had a plan", async () => {
+    const res = await app.inject({
+      method: "PUT",
+      url: `/api/v1/projects/${virginProjectId}/resource-availability`,
+      headers: owner.headers,
+      payload: {
+        resourceTypeId: typeId,
+        weekStart: "2026-12-09", // a Wednesday
+        availableHours: 100,
+        source: "roster",
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().weekStart).toBe("2026-12-07"); // the ISO-8601 Monday
+  });
+
+  it("lets a project with no rows yet choose its own boundary", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${virginProjectId}/resource-plans`,
+      headers: owner.headers,
+      payload: { name: "Saturday shift", weekStartsOn: 6 },
+    });
+    // one supply row exists on this project now, so the boundary is settled
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toContain("already buckets its weeks");
   });
 });

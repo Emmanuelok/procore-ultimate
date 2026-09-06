@@ -46,6 +46,24 @@ export const risks = pgTable(
     scheduleTaskId: text("schedule_task_id"),
     /** Distribution JSON for the linked task's duration under this risk */
     durationImpact: jsonb("duration_impact").$type<Record<string, unknown>>(),
+    /* register depth (#447-450): a risk statement is cause → event → effect,
+       so the register can be read as a chain rather than a headline */
+    /** the condition already present that could give rise to the event */
+    cause: text("cause"),
+    /** the consequence for the objective if the event occurs */
+    effect: text("effect"),
+    /** RiskResponseStrategy — avoid | reduce | transfer | share | accept | exploit */
+    responseStrategy: text("response_strategy"),
+    /** the date from which the risk could first materialise (risk proximity) */
+    proximityDate: text("proximity_date"),
+    /** early-warning indicators: observable signs the risk is maturing */
+    triggers: jsonb("triggers").$type<string[]>().default([]).notNull(),
+    /**
+     * Set when this risk exists only BECAUSE of another risk's response —
+     * a secondary risk. Transferring flood exposure to an insurer creates
+     * counterparty risk; the register must show where it came from.
+     */
+    secondaryOfRiskId: text("secondary_of_risk_id"),
     /** mitigation actions: [{ description, ownerId?, dueDate?, cost?, done }] */
     mitigations: jsonb("mitigations").$type<unknown[]>().default([]).notNull(),
     mitigationCost: doublePrecision("mitigation_cost"),
@@ -56,6 +74,8 @@ export const risks = pgTable(
   (t) => [
     uniqueIndex("risks_uq").on(t.projectId, t.number),
     index("risks_project_idx").on(t.projectId),
+    index("risks_status_idx").on(t.companyId, t.projectId, t.status),
+    index("risks_secondary_idx").on(t.secondaryOfRiskId),
   ],
 );
 

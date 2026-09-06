@@ -7442,7 +7442,73 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         validated.push({ input, line, kind, verdict });
       }
 
+      /*
+       * THE ITEM ROLL-UP IS APPLIED ONCE PER ITEM, NOT ONCE PER LINE.
+       *
+       * Two lines naming the same material on one delivery note is ordinary —
+       * two pallets, two batch numbers, two heat numbers. Reading the item and
+       * writing `item.quantityDelivered + line.quantityReceived` once per line
+       * loses one of them the moment the read cannot see the other line's
+       * write, which in production is every time: a read issued on `app.db`
+       * inside a transaction runs on a DIFFERENT pooled connection and sees
+       * only committed rows. The deltas are summed here and the row is written
+       * once, from a row read and locked inside the transaction.
+       */
+      const itemDeltas = new Map<
+        string,
+        { received: number; accepted: number; rejected: number }
+      >();
+      for (const { input, line } of validated) {
+        if (!line.materialItemId) continue;
+        const held = itemDeltas.get(line.materialItemId) ?? {
+          received: 0,
+          accepted: 0,
+          rejected: 0,
+        };
+        held.received = round2(held.received + input.quantityReceived);
+        held.accepted = round2(held.accepted + input.quantityAccepted);
+        held.rejected = round2(held.rejected + input.quantityRejected);
+        itemDeltas.set(line.materialItemId, held);
+      }
+
       await app.db.transaction(async (tx) => {
+        const itemsById = new Map<
+          string,
+          typeof materialItems.$inferSelect
+        >();
+        for (const itemId of itemDeltas.keys()) {
+          const [locked] = await tx
+            .select()
+            .from(materialItems)
+            .where(eq(materialItems.id, itemId))
+            .for("update")
+            .limit(1);
+          if (!locked) throw notFound(`Material item ${itemId} not found`);
+          itemsById.set(itemId, locked);
+        }
+        for (const [itemId, item] of itemsById) {
+          const delta = itemDeltas.get(itemId);
+          if (!delta) continue;
+          const deliveredAfter = round2(
+            item.quantityDelivered + delta.received,
+          );
+          await tx
+            .update(materialItems)
+            .set({
+              quantityDelivered: deliveredAfter,
+              quantityAccepted: round2(item.quantityAccepted + delta.accepted),
+              quantityRejected: round2(item.quantityRejected + delta.rejected),
+              status:
+                item.quantityRequired > 0 &&
+                deliveredAfter >= item.quantityRequired
+                  ? "delivered"
+                  : "partially_delivered",
+              totalsCalculatedAt: now,
+              updatedAt: now,
+            })
+            .where(eq(materialItems.id, itemId));
+        }
+
         for (const { input, line, kind, verdict } of validated) {
           if (kind !== "none") discrepancyKinds.add(kind);
           await tx
@@ -7476,48 +7542,18 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           });
 
           if (!line.materialItemId) continue;
-          const item = await fetchMaterialItem(
-            line.materialItemId,
-            companyId,
-            projectId,
-          );
-          await tx
-            .update(materialItems)
-            .set({
-              quantityDelivered: round2(
-                item.quantityDelivered + input.quantityReceived,
-              ),
-              quantityAccepted: round2(
-                item.quantityAccepted + input.quantityAccepted,
-              ),
-              quantityRejected: round2(
-                item.quantityRejected + input.quantityRejected,
-              ),
-              status:
-                item.quantityRequired > 0 &&
-                round2(item.quantityDelivered + input.quantityReceived) >=
-                  item.quantityRequired
-                  ? "delivered"
-                  : "partially_delivered",
-              totalsCalculatedAt: now,
-              updatedAt: now,
-            })
-            .where(eq(materialItems.id, item.id));
+          const item = itemsById.get(line.materialItemId);
+          if (!item) continue;
           if (
             body.createStockMovements &&
             item.isTracked === 1 &&
             input.quantityAccepted > 0
           ) {
-            const refreshed = await fetchMaterialItem(
-              line.materialItemId,
-              companyId,
-              projectId,
-            );
             const result = await insertStockMovement({
               tx,
               companyId,
               projectId,
-              item: refreshed,
+              item,
               movementType: "receipt",
               quantity: input.quantityAccepted,
               actorId: req.user!.id,
@@ -9388,6 +9424,312 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     },
   );
 
+
+  /* ================================================================ */
+  /* TELEMATICS INTELLIGENCE — the acting half                          */
+  /* ================================================================ */
+
+  /**
+   * The route above REPORTS geofence breaches, unaccounted fuel and active
+   * fault codes. A report nobody opens is not a control, so the same three
+   * engines run here on a schedule and leave a Signal — and, for a fault the
+   * manufacturer itself grades critical, take the machine out of service.
+   *
+   * Three deliberate limits:
+   *
+   *  · IDEMPOTENT. Keyed on (detector, equipmentId, window start), so a
+   *    daily run over a rolling window raises one Signal per machine per
+   *    window rather than one per run. Accusing the same machine seven times
+   *    for one week's fuel is how a register becomes noise.
+   *  · NO FABRICATED WORK ORDER. A maintenance RECORD in this schema is work
+   *    that was done — it carries a non-null `result`. Creating a draft one
+   *    from a fault code would put an outcome on a job nobody has started, so
+   *    the fault produces a Signal and a status, and the fitter raises the
+   *    record when the work happens (the record route returns the machine to
+   *    service).
+   *  · STATUS IS ONLY EVER TAKEN, NEVER GIVEN BACK. The sweep may move a
+   *    working machine to `breakdown`; it never moves anything back to
+   *    `available`, and it never touches a machine that is already off-hired,
+   *    disposed, quarantined or in the workshop.
+   */
+  const TELEMATICS_INTELLIGENCE_DAYS = 7;
+  /** Statuses the sweep is allowed to take a machine OUT of. */
+  const STOPPABLE_STATUSES = ["available", "in_use", "idle"] as const;
+
+  async function sweepTelematicsIntelligence(
+    companyId: string,
+    onlyProjectId: string | null,
+  ): Promise<{
+    from: string;
+    to: string;
+    machinesAssessed: number;
+    signalsRaised: number;
+    takenOutOfService: string[];
+    reasons: string[];
+  }> {
+    const to = todayISO();
+    const from = addDaysISO(to, -(TELEMATICS_INTELLIGENCE_DAYS - 1));
+    const reasons: string[] = [];
+
+    const assignmentClauses = [
+      eq(equipmentAssignments.companyId, companyId),
+      inArray(equipmentAssignments.status, [...IN_SERVICE_ASSIGNMENT_STATUSES]),
+    ];
+    if (onlyProjectId)
+      assignmentClauses.push(eq(equipmentAssignments.projectId, onlyProjectId));
+    const assigned = await app.db
+      .select({
+        equipmentId: equipmentAssignments.equipmentId,
+        projectId: equipmentAssignments.projectId,
+      })
+      .from(equipmentAssignments)
+      .where(and(...assignmentClauses));
+
+    const projectOf = new Map<string, string>();
+    for (const row of assigned) {
+      if (!projectOf.has(row.equipmentId))
+        projectOf.set(row.equipmentId, row.projectId);
+    }
+    const machineIds = [...projectOf.keys()];
+    if (machineIds.length === 0) {
+      return {
+        from,
+        to,
+        machinesAssessed: 0,
+        signalsRaised: 0,
+        takenOutOfService: [],
+        reasons: [
+          "no plant is on any job in this company over the window, so there is no feed to read",
+        ],
+      };
+    }
+
+    const siteRows = await app.db
+      .select({
+        id: projects.id,
+        latitude: projects.latitude,
+        longitude: projects.longitude,
+      })
+      .from(projects)
+      .where(
+        and(
+          eq(projects.companyId, companyId),
+          inArray(projects.id, [...new Set(projectOf.values())]),
+        ),
+      );
+    const siteOf = new Map(
+      siteRows.map((p) => [
+        p.id,
+        p.latitude != null && p.longitude != null
+          ? { latitude: p.latitude, longitude: p.longitude }
+          : null,
+      ]),
+    );
+    if ([...siteOf.values()].some((s) => s === null)) {
+      reasons.push(
+        "one or more projects record no coordinates, so their plant cannot be tested against a " +
+          "site boundary — off-site use is undetectable there until a location is set",
+      );
+    }
+
+    const fleet = await app.db
+      .select()
+      .from(equipment)
+      .where(
+        and(eq(equipment.companyId, companyId), inArray(equipment.id, machineIds)),
+      );
+    const readings = await app.db
+      .select()
+      .from(equipmentTelematicsReadings)
+      .where(
+        and(
+          eq(equipmentTelematicsReadings.companyId, companyId),
+          inArray(equipmentTelematicsReadings.equipmentId, machineIds),
+          gte(equipmentTelematicsReadings.recordedAt, `${from}T00:00:00.000Z`),
+          lte(equipmentTelematicsReadings.recordedAt, `${to}T23:59:59.999Z`),
+        ),
+      );
+    const fuelFills = await app.db
+      .select()
+      .from(equipmentReadings)
+      .where(
+        and(
+          eq(equipmentReadings.companyId, companyId),
+          inArray(equipmentReadings.equipmentId, machineIds),
+          eq(equipmentReadings.readingType, "fuel_fill"),
+          gte(equipmentReadings.readAt, `${from}T00:00:00.000Z`),
+          lte(equipmentReadings.readAt, `${to}T23:59:59.999Z`),
+        ),
+      );
+
+    const keys = machineIds.map((id) => `${id}|${from}`);
+    const seenOffSite = await alreadySignalled(companyId, "equipment_off_site_use", keys);
+    const seenFuel = await alreadySignalled(companyId, "equipment_fuel_unaccounted", keys);
+    const seenFault = await alreadySignalled(companyId, "equipment_fault_active", keys);
+
+    let signalsRaised = 0;
+    const takenOutOfService: string[] = [];
+    const now = new Date().toISOString();
+
+    for (const machine of fleet) {
+      const projectId = projectOf.get(machine.id) ?? null;
+      const site = projectId ? (siteOf.get(projectId) ?? null) : null;
+      const own = readings.filter((r) => r.equipmentId === machine.id);
+      const key = `${machine.id}|${from}`;
+
+      const geofence = checkGeofence({
+        site,
+        readings: own
+          .filter((r) => r.latitude !== null && r.longitude !== null)
+          .map((r) => ({
+            latitude: r.latitude as number,
+            longitude: r.longitude as number,
+            recordedAt: r.recordedAt,
+            engineRunning: r.engineRunning,
+          })),
+      });
+      if (geofence.breaches.length > 0) {
+        const id = await raiseSignalOnce({
+          companyId,
+          projectId,
+          detector: "equipment_off_site_use",
+          key,
+          severity: "high",
+          title: `Plant worked off site — ${machine.reference} ${machine.name}`,
+          explanation:
+            `${machine.reference} ${machine.name} reported ${geofence.breaches.length} reading(s) ` +
+            `with the engine RUNNING more than the site radius from the project it is hired to, ` +
+            `up to ${geofence.maxDistanceMetres} m away, between ${from} and ${to}` +
+            `${geofence.spanHours !== null ? ` — the breaching readings span ${geofence.spanHours} hours` : ""}. ` +
+            "Hire is being charged to this job for hours the machine spent somewhere else: either " +
+            "the plant sheet is wrong, the machine was lent out, or it is being used privately. " +
+            (geofence.reasons.length > 0 ? geofence.reasons.join(" ") : ""),
+          refs: {
+            equipmentId: machine.id,
+            from,
+            to,
+            breaches: geofence.breaches.length,
+            maxDistanceMetres: geofence.maxDistanceMetres,
+            spanHours: geofence.spanHours,
+          },
+          seen: seenOffSite,
+        });
+        if (id) signalsRaised += 1;
+      }
+
+      const fuel = reconcileFuel({
+        telematicsFuelUsedLitres: own.map((r) => r.fuelUsedLitres),
+        fills: fuelFills
+          .filter((f) => f.equipmentId === machine.id && (f.value ?? 0) > 0)
+          .map((f) => ({ litres: f.value as number, at: f.readAt })),
+      });
+      if (fuel.unexplained) {
+        const id = await raiseSignalOnce({
+          companyId,
+          projectId,
+          detector: "equipment_fuel_unaccounted",
+          key,
+          severity: "high",
+          title: `Fuel unaccounted for — ${machine.reference} ${machine.name}`,
+          explanation: `${from} → ${to}. ${fuel.reasons.join(" ")}`,
+          refs: {
+            equipmentId: machine.id,
+            from,
+            to,
+            filledLitres: fuel.filledLitres,
+            burnLitres: fuel.burnLitres,
+            differenceLitres: fuel.differenceLitres,
+            ratio: fuel.ratio,
+          },
+          seen: seenFuel,
+        });
+        if (id) signalsRaised += 1;
+      }
+
+      const faults = assessFaults(
+        own.flatMap((r) => (r.faultCodes as TelematicsFault[] | null) ?? []),
+      );
+      if (faults.actionable.length > 0) {
+        const stopped =
+          faults.stopWork &&
+          (STOPPABLE_STATUSES as readonly string[]).includes(machine.status);
+        const id = await raiseSignalOnce({
+          companyId,
+          projectId,
+          detector: "equipment_fault_active",
+          key,
+          severity: faults.stopWork ? "critical" : "medium",
+          title:
+            `${faults.stopWork ? "Critical" : "Active"} fault reported by ` +
+            `${machine.reference} ${machine.name}`,
+          explanation:
+            `${faults.reason ?? "The machine reports active fault codes."} ` +
+            (stopped
+              ? `${machine.reference} has been moved to "breakdown" by this sweep and is off the ` +
+                "available fleet until somebody looks at it. Raising the maintenance record with " +
+                "returnToService set is what puts it back to work — the platform will not do that " +
+                "on a fault code clearing itself."
+              : faults.stopWork
+                ? `${machine.reference} was left at "${machine.status}": the sweep does not take a ` +
+                  "machine that is already off-hired, quarantined, disposed or in the workshop and " +
+                  "restate its status."
+                : "Book the work before the fault becomes the breakdown."),
+          refs: {
+            equipmentId: machine.id,
+            from,
+            to,
+            worst: faults.worst,
+            stopWork: faults.stopWork,
+            codes: faults.actionable.map((f) => f.code),
+            statusChangedTo: stopped ? "breakdown" : null,
+          },
+          seen: seenFault,
+        });
+        if (id) signalsRaised += 1;
+        if (id && stopped) {
+          await app.db
+            .update(equipment)
+            .set({ status: "breakdown", updatedAt: now })
+            .where(eq(equipment.id, machine.id));
+          await appendLedger(app.db, {
+            companyId,
+            actorId: null,
+            action: "state_change",
+            objectType: "equipment",
+            objectId: machine.id,
+            projectId,
+            payload: {
+              from: machine.status,
+              to: "breakdown",
+              derived: true,
+              reason: "critical fault code on the telematics feed",
+              codes: faults.actionable.map((f) => f.code),
+              signalId: id,
+            },
+            storePayload: true,
+          });
+          takenOutOfService.push(machine.reference);
+        }
+      }
+    }
+
+    return {
+      from,
+      to,
+      machinesAssessed: fleet.length,
+      signalsRaised,
+      takenOutOfService,
+      reasons,
+    };
+  }
+
+  /** Run the telematics detectors on demand — operators and tests. */
+  app.post(
+    "/projects/:projectId/equipment-telematics/intelligence/run",
+    { preHandler: standardGate },
+    async (req) => sweepTelematicsIntelligence(req.companyId!, req.projectId!),
+  );
+
   /* ================================================================ */
   /* SCHEDULED JOBS (plan §6.1)                                        */
   /* ================================================================ */
@@ -9403,6 +9745,20 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       forEachCompany(db, async (companyId) => {
         await sweepEquipment(companyId, null);
         return { companyId };
+      }),
+  });
+
+  app.scheduler.register({
+    name: "equipment.telematics-intelligence",
+    description:
+      "Plant worked outside the site boundary, fuel booked in that the machine never burned, and " +
+      "active fault codes — with a critical fault taking the machine off the available fleet",
+    everyMs: 6 * 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db }) =>
+      forEachCompany(db, async (companyId) => {
+        const out = await sweepTelematicsIntelligence(companyId, null);
+        return { companyId, signalsRaised: out.signalsRaised };
       }),
   });
 

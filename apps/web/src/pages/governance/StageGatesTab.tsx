@@ -33,6 +33,7 @@ import {
   WarnBanner,
   type GateCriterion,
   type GateReview,
+  type LessonsReadiness,
   type ListResponse,
   type OpenCondition,
   type StageGateDetail,
@@ -179,6 +180,7 @@ export default function StageGatesTab({ projectId }: { projectId: string }) {
   const [gCriteria, setGCriteria] = useState<{ text: string; evidenceRequired: boolean }[]>([
     { text: "", evidenceRequired: false },
   ]);
+  const [gLessons, setGLessons] = useState(false);
 
   function openCreate() {
     const taken = new Set((gates ?? []).map((g) => g.gateNumber));
@@ -189,6 +191,7 @@ export default function StageGatesTab({ projectId }: { projectId: string }) {
     setGDescription("");
     setGPlanned("");
     setGCriteria([{ text: "", evidenceRequired: false }]);
+    setGLessons(false);
     setCreateOpen(true);
   }
 
@@ -209,6 +212,7 @@ export default function StageGatesTab({ projectId }: { projectId: string }) {
         name: gName.trim(),
         description: gDescription.trim() || null,
         plannedDate: gPlanned || null,
+        lessonsRequired: gLessons,
         criteria,
       });
       setCreateOpen(false);
@@ -233,8 +237,24 @@ export default function StageGatesTab({ projectId }: { projectId: string }) {
   >({});
   const [rConditions, setRConditions] = useState<{ text: string; dueDate: string }[]>([]);
 
+  /**
+   * The lessons closure gate is checked server-side; the review modal reads
+   * it first so the reviewer sees WHY a proceed will be refused before
+   * filling the form in, rather than losing the work to a 409.
+   */
+  const [lessons, setLessons] = useState<LessonsReadiness | null>(null);
+  const [lessonsError, setLessonsError] = useState<string | null>(null);
+
   function openReview(gate: StageGateDetail) {
     setReviewError(null);
+    setLessons(null);
+    setLessonsError(null);
+    void api
+      .get<LessonsReadiness>(`${base}/stage-gates/${gate.id}/lessons-readiness`)
+      .then(setLessons)
+      .catch(() =>
+        setLessonsError("Lessons readiness could not be read; the server still enforces it."),
+      );
     setRDate(todayIso());
     setRRag("amber");
     setRDecision("proceed");
@@ -374,6 +394,11 @@ export default function StageGatesTab({ projectId }: { projectId: string }) {
                         </div>
                       </div>
                       <div className="flex items-center gap-2">
+                        {gate.lessonsRequired ? (
+                          <Badge tone="violet" title="Proceed is blocked while lessons are unvalidated">
+                            Lessons gate
+                          </Badge>
+                        ) : null}
                         <Badge tone={gateStatusTone(gate.status)}>{humanize(gate.status)}</Badge>
                         <Button size="sm" variant="secondary" onClick={() => openReview(gate)}>
                           Hold review
@@ -551,6 +576,20 @@ export default function StageGatesTab({ projectId }: { projectId: string }) {
               className="min-h-14"
             />
           </Field>
+          <label className="flex items-start gap-2 rounded-md bg-ink-50 px-3 py-2 text-xs text-ink-700">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={gLessons}
+              onChange={(e) => setGLessons(e.target.checked)}
+            />
+            <span>
+              <span className="font-medium text-ink-800">Lessons closure gate</span> — refuse a
+              proceed decision while lessons captured on this project are still awaiting
+              validation. A stage boundary is the last moment the organisation can still learn
+              from the stage that is ending.
+            </span>
+          </label>
           <div>
             <div className="mb-1 flex items-center justify-between">
               <span className="text-xs font-medium text-ink-600">Review criteria</span>
@@ -654,6 +693,48 @@ export default function StageGatesTab({ projectId }: { projectId: string }) {
                 </Select>
               </Field>
             </div>
+
+            {/* lessons closure gate (#415) — shown before the form is filled in */}
+            {lessonsError ? (
+              <div className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                {lessonsError}
+              </div>
+            ) : lessons && lessons.required ? (
+              <div
+                className={`rounded-md px-3 py-2 text-xs ${
+                  lessons.ready
+                    ? "bg-emerald-50 text-emerald-800"
+                    : "bg-red-50 text-red-800"
+                }`}
+              >
+                <div className="font-medium">
+                  Lessons closure gate — {lessons.ready ? "satisfied" : "not satisfied"}
+                </div>
+                <div className="mt-0.5">{lessons.reasons.join(" ")}</div>
+                {lessons.outstanding.length > 0 ? (
+                  <ul className="mt-1 list-disc space-y-0.5 pl-5">
+                    {lessons.outstanding.map((l) => (
+                      <li key={l.id}>
+                        <span className="font-mono">{l.number}</span> {l.title} —{" "}
+                        {humanize(l.status)}
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+                {!lessons.ready ? (
+                  <div className="mt-1">
+                    A <span className="font-medium">stop</span> or{" "}
+                    <span className="font-medium">hold</span> decision is not blocked by this.
+                  </div>
+                ) : null}
+              </div>
+            ) : lessons && lessons.capturedCount > 0 ? (
+              <div className="rounded-md bg-ink-50 px-3 py-2 text-xs text-ink-600">
+                {lessons.capturedCount} lesson{lessons.capturedCount === 1 ? "" : "s"} captured on
+                this project, {lessons.outstanding.length} still awaiting validation. This gate
+                does not require closure, so they are shown for information.
+              </div>
+            ) : null}
 
             <div>
               <span className="mb-1 block text-xs font-medium text-ink-600">

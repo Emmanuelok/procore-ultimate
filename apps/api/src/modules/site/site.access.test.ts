@@ -140,6 +140,38 @@ describe("inductions", () => {
     expect(moved.json().validUntil).toBe("2026-02-01");
   });
 
+  it("moves the verdict with the marks, and suspends the pass standing on an induction that becomes a failure", async () => {
+    const created = await post(`/projects/${projectId}/site/inductions`, {
+      personName: "Nia Frost",
+      scorePercent: 88,
+      passMark: 80,
+      validUntil: "2027-05-04",
+    });
+    expect(created.statusCode).toBe(201);
+    expect(created.json().status).toBe("valid");
+    const pass = await post(`/projects/${projectId}/site/passes`, {
+      inductionId: created.json().id,
+      personName: "Nia Frost",
+      badgeCode: "NF-9001",
+    });
+    expect(pass.statusCode).toBe(201);
+    expect(pass.json().status).toBe("active");
+
+    // Correcting the mark downwards must not leave the record saying "valid":
+    // a POST with these numbers is recorded as failed, so a PATCH to them is.
+    const corrected = await patch(`/projects/${projectId}/site/inductions/${created.json().id}`, { scorePercent: 41 });
+    expect(corrected.statusCode).toBe(200);
+    expect(corrected.json().status).toBe("failed");
+    expect(corrected.json().passesSuspended).toBe(1);
+    const afterFail = await get(`/projects/${projectId}/site/passes?pageSize=200`);
+    expect(afterFail.json().items.find((p: { id: string }) => p.id === pass.json().id).status).toBe("suspended");
+
+    // And back again when the mark was mis-keyed the first time.
+    const restored = await patch(`/projects/${projectId}/site/inductions/${created.json().id}`, { scorePercent: 91 });
+    expect(restored.json().status).toBe("valid");
+    expect(restored.json().passesSuspended).toBe(0);
+  });
+
   it("lists and filters", async () => {
     const res = await get(`/projects/${projectId}/site/inductions?status=valid`);
     expect(res.statusCode).toBe(200);

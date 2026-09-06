@@ -69,7 +69,7 @@ import {
   type SupplyRisk,
 } from "./equipmentShared";
 
-type View = "deliveries" | "match" | "stock" | "supply";
+type View = "deliveries" | "slots" | "match" | "stock" | "supply";
 
 export default function MaterialsTab({
   deliveries,
@@ -110,6 +110,9 @@ export default function MaterialsTab({
   const deliveryRows = useMemo(() => deliveries.data?.items ?? [], [deliveries.data]);
   const discrepant = deliveryRows.filter((row) => row.hasDiscrepancy);
   const discrepantWithoutNcr = discrepant.filter((row) => row.ncrId === null);
+  const bookedSlotCount = deliveryRows.filter(
+    (row) => row.scheduledFor !== null && !LANDED_STATUSES.has(row.status),
+  ).length;
 
   return (
     <div className="space-y-4">
@@ -127,6 +130,7 @@ export default function MaterialsTab({
             aria-label="Materials view"
             options={[
               { value: "deliveries", label: `Deliveries (${deliveryRows.length})` },
+              { value: "slots", label: `Slots (${bookedSlotCount})` },
               {
                 value: "match",
                 label: `Invoice match (${invoiceMatch.data?.unmatchedCount ?? 0} unmatched)`,
@@ -140,6 +144,15 @@ export default function MaterialsTab({
           />
         </CardBody>
       </Card>
+
+      {view === "slots" ? (
+        <SlotsView
+          deliveries={deliveries}
+          selectedDeliveryId={selectedDeliveryId}
+          onSelectDelivery={onSelectDelivery}
+          detail={deliveryDetail}
+        />
+      ) : null}
 
       {view === "deliveries" ? (
         <DeliveriesView
@@ -1163,6 +1176,330 @@ function deliveryTone(status: string): Tone {
     default:
       return "neutral";
   }
+}
+
+/* ========================================================================== */
+/* Slot calendar — the gate's day, not the buyer's register                    */
+/* ========================================================================== */
+
+/**
+ * A delivery is a booking before it is a receipt. The register above answers
+ * "what arrived and was it right"; this answers the question the gateman and
+ * the crane supervisor actually have at 06:00 — WHAT IS COMING TODAY, in what
+ * order, on what vehicle, and does anything collide.
+ *
+ * Two collisions are worth a site's attention and are computed here rather
+ * than left to the reader:
+ *
+ *  · CRANE. Most sites have one. Two crane-required loads booked into the
+ *    same hour is one lorry standing, and standing time is a real invoice.
+ *  · GATE. More than two loads inside the same half hour is a queue on the
+ *    public road, which on most consents is a planning breach before it is an
+ *    inconvenience.
+ *
+ * A delivery with no slot booked is not shown as an empty row in the day: it
+ * is listed separately, because "the gate has no notice of this load" is a
+ * different fact from "it is booked for later".
+ */
+const LANDED_STATUSES = new Set([
+  "received",
+  "partially_received",
+  "rejected",
+  "returned",
+  "cancelled",
+]);
+
+/** Minutes late (positive) or early (negative) against the booked slot. */
+function slotDrift(row: DeliveryRow): number | null {
+  if (!row.scheduledFor || !row.arrivedAt) return null;
+  const booked = new Date(row.scheduledFor).getTime();
+  const actual = new Date(row.arrivedAt).getTime();
+  if (Number.isNaN(booked) || Number.isNaN(actual)) return null;
+  return Math.round((actual - booked) / 60_000);
+}
+
+function slotTime(iso: string): string {
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) return iso;
+  return parsed.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
+
+interface SlotDay {
+  /** local calendar day, YYYY-MM-DD */
+  day: string;
+  rows: DeliveryRow[];
+  craneClashes: string[];
+  gateQueues: string[];
+}
+
+function localDay(iso: string): string {
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) return iso.slice(0, 10);
+  const pad2 = (n: number) => String(n).padStart(2, "0");
+  return `${parsed.getFullYear()}-${pad2(parsed.getMonth() + 1)}-${pad2(parsed.getDate())}`;
+}
+
+/** Bookings that land in the same window, with the window's first time. */
+interface SlotGroup {
+  rows: DeliveryRow[];
+  firstAt: string;
+}
+
+function push(into: Map<string, SlotGroup>, key: string, row: DeliveryRow, at: string): void {
+  const held = into.get(key);
+  if (held) held.rows.push(row);
+  else into.set(key, { rows: [row], firstAt: at });
+}
+
+function buildSlotDays(rows: DeliveryRow[]): SlotDay[] {
+  const byDay = new Map<string, DeliveryRow[]>();
+  for (const row of rows) {
+    if (!row.scheduledFor) continue;
+    const day = localDay(row.scheduledFor);
+    const held = byDay.get(day);
+    if (held) held.push(row);
+    else byDay.set(day, [row]);
+  }
+  const days: SlotDay[] = [];
+  for (const [day, dayRows] of byDay) {
+    const sorted = [...dayRows].sort((a, b) =>
+      (a.scheduledFor ?? "").localeCompare(b.scheduledFor ?? ""),
+    );
+    const craneByHour = new Map<string, SlotGroup>();
+    const gateByHalfHour = new Map<string, SlotGroup>();
+    for (const row of sorted) {
+      const booked = row.scheduledFor;
+      if (!booked) continue;
+      if (LANDED_STATUSES.has(row.status)) continue;
+      const at = new Date(booked);
+      if (Number.isNaN(at.getTime())) continue;
+      const hour = `${at.getHours()}`;
+      const half = `${at.getHours()}:${at.getMinutes() < 30 ? "0" : "30"}`;
+      if (row.craneRequired) push(craneByHour, hour, row, booked);
+      push(gateByHalfHour, half, row, booked);
+    }
+    const craneClashes: string[] = [];
+    for (const [, group] of craneByHour) {
+      if (group.rows.length > 1) {
+        craneClashes.push(
+          `${group.rows.map((r) => r.reference).join(", ")} all need the crane between ` +
+            `${slotTime(group.firstAt)} and the end of that hour`,
+        );
+      }
+    }
+    const gateQueues: string[] = [];
+    for (const [, group] of gateByHalfHour) {
+      if (group.rows.length > 2) {
+        gateQueues.push(
+          `${group.rows.length} loads booked into the half hour from ` +
+            `${slotTime(group.firstAt)} (${group.rows.map((r) => r.reference).join(", ")})`,
+        );
+      }
+    }
+    days.push({ day, rows: sorted, craneClashes, gateQueues });
+  }
+  return days.sort((a, b) => a.day.localeCompare(b.day));
+}
+
+function SlotsView({
+  deliveries,
+  selectedDeliveryId,
+  onSelectDelivery,
+  detail,
+}: {
+  deliveries: Loadable<ListResponse<DeliveryRow>>;
+  selectedDeliveryId: string | null;
+  onSelectDelivery: (deliveryId: string | null) => void;
+  detail: Loadable<DeliveryDetail>;
+}) {
+  const rows = useMemo(() => deliveries.data?.items ?? [], [deliveries.data]);
+  const days = useMemo(() => buildSlotDays(rows), [rows]);
+  const unbooked = useMemo(
+    () => rows.filter((row) => !row.scheduledFor && !LANDED_STATUSES.has(row.status)),
+    [rows],
+  );
+  const todayKey = localDay(new Date().toISOString());
+  const [showPast, setShowPast] = useState(false);
+  const past = days.filter((d) => d.day < todayKey);
+  const upcoming = days.filter((d) => d.day >= todayKey);
+  const shown = showPast ? days : upcoming;
+  const clashCount = upcoming.reduce(
+    (n, d) => n + d.craneClashes.length + d.gateQueues.length,
+    0,
+  );
+
+  if (deliveries.error) return <LoadError message={deliveries.error} onRetry={deliveries.reload} />;
+  if (deliveries.loading && rows.length === 0) return <SkeletonTable rows={8} columns={6} />;
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardBody className="flex flex-wrap items-center gap-2">
+          <Badge tone="neutral" size="sm">
+            {upcoming.reduce((n, d) => n + d.rows.length, 0)} booked from today
+          </Badge>
+          <Badge tone={clashCount > 0 ? "warning" : "success"} size="sm" dot>
+            {clashCount} collision{clashCount === 1 ? "" : "s"} on the plan
+          </Badge>
+          <Badge tone={unbooked.length > 0 ? "warning" : "neutral"} size="sm">
+            {unbooked.length} with no slot booked
+          </Badge>
+          {past.length > 0 ? (
+            <Button size="xs" variant="secondary" onClick={() => setShowPast((v) => !v)}>
+              {showPast ? "Hide past days" : `Show ${past.length} past day${past.length === 1 ? "" : "s"}`}
+            </Button>
+          ) : null}
+        </CardBody>
+      </Card>
+
+      {unbooked.length > 0 ? (
+        <Alert
+          tone="warning"
+          title={`${unbooked.length} deliver${unbooked.length === 1 ? "y is" : "ies are"} expected with no slot booked`}
+        >
+          The gate has no notice of {unbooked.length === 1 ? "this load" : "these loads"}, so nobody
+          is holding a window, a bay or a crane for {unbooked.length === 1 ? "it" : "them"}:{" "}
+          {unbooked
+            .slice(0, 8)
+            .map((row) => row.reference)
+            .join(", ")}
+          {unbooked.length > 8 ? ` and ${unbooked.length - 8} more` : ""}. Waiting time booked
+          against an unplanned arrival is a haulier's claim nobody can dispute.
+        </Alert>
+      ) : null}
+
+      {shown.length === 0 ? (
+        <EmptyState
+          icon={IconMaterial}
+          title="No delivery is booked into a slot"
+          hint="A slot is what turns a delivery into a plan: a time at the gate, a bay to offload into and, where the load needs it, the crane. Book one on the delivery record and this becomes the gateman's day."
+        />
+      ) : (
+        shown.map((day) => (
+          <Card key={day.day}>
+            <CardBody className="space-y-3">
+              <SectionHeading
+                title={
+                  <span className="flex flex-wrap items-baseline gap-2">
+                    <span>
+                      {new Date(`${day.day}T12:00:00`).toLocaleDateString(undefined, {
+                        weekday: "long",
+                        day: "2-digit",
+                        month: "short",
+                        year: "numeric",
+                      })}
+                    </span>
+                    {day.day === todayKey ? (
+                      <Badge tone="info" size="xs">
+                        today
+                      </Badge>
+                    ) : null}
+                  </span>
+                }
+                hint={`${day.rows.length} booking${day.rows.length === 1 ? "" : "s"}`}
+                className="mb-0"
+              />
+
+              {day.craneClashes.map((text) => (
+                <Alert key={text} tone="warning" title="The crane is booked twice in one hour">
+                  {text}. One of them will stand, and standing time is charged.
+                </Alert>
+              ))}
+              {day.gateQueues.map((text) => (
+                <Alert key={text} tone="warning" title="A queue is being planned at the gate">
+                  {text}. More than two loads inside a half hour is a queue on the public road,
+                  which on most consents is a planning breach before it is an inconvenience.
+                </Alert>
+              ))}
+
+              <Table>
+                <THead>
+                  <Tr>
+                    <Th className="w-20">Slot</Th>
+                    <Th>Delivery</Th>
+                    <Th>Vehicle</Th>
+                    <Th>Gate</Th>
+                    <Th>Offload</Th>
+                    <Th className="w-28">Status</Th>
+                    <Th className="w-32 text-right">Against the slot</Th>
+                  </Tr>
+                </THead>
+                <TBody>
+                  {day.rows.map((row) => {
+                    const drift = slotDrift(row);
+                    return (
+                      <Tr
+                        key={row.id}
+                        onClick={() => onSelectDelivery(row.id)}
+                        className="cursor-pointer"
+                      >
+                        <Td className="font-mono tabular-nums">
+                          {row.scheduledFor ? slotTime(row.scheduledFor) : EM_DASH}
+                        </Td>
+                        <Td>
+                          <div className="font-mono text-xs">{row.reference}</div>
+                          <div className="text-xs text-content-subtle">
+                            {row.lineCount} line{row.lineCount === 1 ? "" : "s"}
+                            {row.purchaseOrderRef ? ` · PO ${row.purchaseOrderRef}` : ""}
+                          </div>
+                        </Td>
+                        <Td>
+                          <div className="font-mono text-xs">
+                            {row.vehicleRegistration ?? EM_DASH}
+                          </div>
+                          <div className="text-xs text-content-subtle">
+                            {row.carrierName ?? row.driverName ?? "carrier not recorded"}
+                          </div>
+                        </Td>
+                        <Td className="font-mono text-xs">{row.gateEntryRef ?? EM_DASH}</Td>
+                        <Td className="text-xs">
+                          <span className="flex flex-wrap items-center gap-1">
+                            {row.offloadLocationText ?? EM_DASH}
+                            {row.craneRequired ? (
+                              <Badge tone="warning" size="xs" variant="outline">
+                                crane
+                              </Badge>
+                            ) : null}
+                          </span>
+                        </Td>
+                        <Td>
+                          <Badge tone={deliveryTone(row.status)} size="xs" dot>
+                            {labelize(row.status)}
+                          </Badge>
+                        </Td>
+                        <Td className="text-right text-xs tabular-nums">
+                          {drift === null ? (
+                            <Tooltip content="Nothing has arrived against this booking yet, so there is no lateness to state — an unarrived load is not an on-time load.">
+                              <span className="text-content-subtle">{NOT_AVAILABLE}</span>
+                            </Tooltip>
+                          ) : Math.abs(drift) <= 15 ? (
+                            <span className="text-content-subtle">on the slot</span>
+                          ) : (
+                            <span className={drift > 0 ? "text-danger-600" : "text-content-subtle"}>
+                              {drift > 0 ? `${drift} min late` : `${-drift} min early`}
+                            </span>
+                          )}
+                          {row.waitingMinutes !== null ? (
+                            <div className="text-content-subtle">
+                              waited {row.waitingMinutes} min
+                            </div>
+                          ) : null}
+                        </Td>
+                      </Tr>
+                    );
+                  })}
+                </TBody>
+              </Table>
+            </CardBody>
+          </Card>
+        ))
+      )}
+
+      {selectedDeliveryId ? (
+        <DeliveryPanel detail={detail} onClose={() => onSelectDelivery(null)} />
+      ) : null}
+    </div>
+  );
 }
 
 /* ========================================================================== */
