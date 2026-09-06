@@ -21,6 +21,7 @@ import { registerSsoHttpClient, type SsoHttpClient, type SsoHttpResponse } from 
 import { decryptSecret, deriveSsoKey } from "./secrets.js";
 import { issuerMatches, pkceChallengeFor, verifyIdToken } from "./oidc.js";
 import { safeReturnTo } from "./policy.js";
+import { base32Decode, totpForStep, totpStep, type TotpParams } from "../mfa/totp.js";
 
 /* ================================================================== */
 /* A fake OpenID Provider, built from the published specs              */
@@ -1550,6 +1551,93 @@ describe("the tenant MFA policy applies to SSO (regression)", () => {
       expect(body.mfaRequired).toBe(true);
       expect(body.accessToken).toBeUndefined();
       expect(body.reasons.join(" ")).toContain("did not assert one of the accepted");
+    } finally {
+      await requireMfa(false);
+    }
+  });
+
+  /**
+   * THE OTHER HALF OF THE SAME FIX.
+   *
+   * Returning a challenge instead of tokens is only correct if the challenge
+   * can be spent. It reaches the SPA as the ticket payload, /auth/sso/complete
+   * carries it into the sign-in page's navigation state, and the sign-in page
+   * drives exactly the two calls below. Before this test existed the token was
+   * minted and dropped: the user landed on an email/password form that a
+   * JIT-provisioned SSO account has no usable password for, and starting SSO
+   * again just minted another challenge — an SSO tenant that turned the MFA
+   * requirement on locked out every one of its users, with a loop for a way
+   * out. This drives the whole path end to end.
+   */
+  it("hands over a challenge that finishes the sign-in at POST /auth/mfa/challenge", async () => {
+    const email = `carol-mfa-${Date.now()}@acme.test`;
+    const registered = await app.inject({
+      method: "POST",
+      url: "/api/v1/auth/register",
+      payload: { email, password: "password-123", name: "Carol Contractor" },
+    });
+    expect(registered.statusCode).toBe(201);
+    const carolId = (registered.json() as { user: { id: string } }).user.id;
+    await app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: carolId,
+      role: "member",
+    });
+
+    const provider = await createProvider(owner, { displayName: "MFA policy — redeemed" });
+    await enableProvider(provider.id);
+    await requireMfa(true);
+    try {
+      const { res } = await signIn(provider.slug, {
+        claims: { sub: `mfa-redeem-${carolId}`, email, email_verified: true },
+      });
+      expect(res.statusCode).toBe(200);
+      const envelope = res.json() as {
+        mfaRequired: boolean;
+        challengeToken: string;
+        challengeId: string;
+        scope: string;
+        methods: string[];
+        expiresAt: string;
+        accessToken?: string;
+      };
+      expect(envelope.mfaRequired).toBe(true);
+      expect(envelope.accessToken).toBeUndefined();
+      expect(envelope.scope).toBe("enrol");
+      // Everything the sign-in page's challenge step needs is in the envelope
+      // — this is what SsoCompletePage forwards, so a missing field here is a
+      // page that cannot render.
+      expect(typeof envelope.challengeId).toBe("string");
+      expect(typeof envelope.expiresAt).toBe("string");
+      expect(envelope.methods).toContain("totp");
+
+      const seeded = await app.inject({
+        method: "POST",
+        url: "/api/v1/auth/mfa/challenge/enrol",
+        payload: { challengeToken: envelope.challengeToken },
+      });
+      expect(seeded.statusCode).toBe(201);
+      const secret = (seeded.json() as { secret: string }).secret;
+
+      const params: TotpParams = {
+        secret: base32Decode(secret),
+        algorithm: "SHA1",
+        digits: 6,
+        periodSeconds: 30,
+      };
+      const finished = await app.inject({
+        method: "POST",
+        url: "/api/v1/auth/mfa/challenge",
+        payload: {
+          challengeToken: envelope.challengeToken,
+          code: totpForStep(params, totpStep(Date.now(), 30)),
+        },
+      });
+      expect(finished.statusCode).toBe(200);
+      const session = finished.json() as { accessToken?: string; refreshToken?: string };
+      expect(typeof session.accessToken).toBe("string");
+      expect(typeof session.refreshToken).toBe("string");
     } finally {
       await requireMfa(false);
     }

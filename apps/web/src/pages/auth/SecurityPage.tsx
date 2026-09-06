@@ -400,6 +400,57 @@ function numberOrNull(text: string): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+/**
+ * THE BOUNDS THE API ACTUALLY ENFORCES (security-routes.ts `policySchema`),
+ * repeated here so a refusal is a message next to the field rather than a 400
+ * discovered after pressing Save.
+ *
+ * The reason this exists at all: `numberOrNull` returns null for anything that
+ * is not a number, and null is a LEGITIMATE value meaning "leave it to the
+ * platform". So typing "3o" into Lockout attempts, or "thirty" into Retention,
+ * used to be saved as "platform default" with a green "Policy saved" — the
+ * opposite of what the administrator asked for, silently, on a security
+ * policy. The API cannot catch it because what it receives is indistinguishable
+ * from a deliberate reset.
+ */
+const NUMERIC_POLICY_FIELDS: Array<{
+  key: keyof PolicyForm;
+  label: string;
+  min: number;
+  max: number;
+}> = [
+  { key: "sessionIdleTimeoutMinutes", label: "Idle timeout (minutes)", min: 5, max: 43_200 },
+  { key: "sessionAbsoluteTimeoutHours", label: "Absolute lifetime (hours)", min: 1, max: 2160 },
+  { key: "passwordMinLength", label: "Minimum password length", min: 12, max: 128 },
+  { key: "passwordHistoryDepth", label: "Refuse the last N passwords", min: 0, max: 24 },
+  { key: "passwordMaxAgeDays", label: "Maximum password age (days)", min: 1, max: 3650 },
+  { key: "lockoutMaxAttempts", label: "Failures before lockout", min: 3, max: 50 },
+  { key: "lockoutWindowMinutes", label: "Counting window (minutes)", min: 1, max: 1440 },
+  { key: "lockoutDurationMinutes", label: "Lockout duration (minutes)", min: 1, max: 1440 },
+  { key: "securityEventRetentionDays", label: "Sign-in audit retention (days)", min: 30, max: 3650 },
+  { key: "emailDispatchRetentionDays", label: "Message log retention (days)", min: 30, max: 3650 },
+];
+
+/** Everything wrong with the numbers on the form, in the user's words. */
+function policyNumberProblems(form: PolicyForm): string[] {
+  const problems: string[] = [];
+  for (const field of NUMERIC_POLICY_FIELDS) {
+    const raw = String(form[field.key]).trim();
+    if (raw === "") continue;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || !Number.isInteger(n)) {
+      problems.push(
+        `${field.label}: “${raw}” is not a whole number. Leave it blank to use the platform default.`,
+      );
+      continue;
+    }
+    if (n < field.min || n > field.max) {
+      problems.push(`${field.label}: must be between ${field.min} and ${field.max}.`);
+    }
+  }
+  return problems;
+}
+
 function PolicyTab({
   policy,
   onSaved,
@@ -410,6 +461,7 @@ function PolicyTab({
   const action = useAuthAction();
   const [form, setForm] = useState<PolicyForm | null>(null);
   const [saved, setSaved] = useState(false);
+  const [problems, setProblems] = useState<string[]>([]);
 
   useEffect(() => {
     if (policy.data) setForm(formFrom(policy.data.stored));
@@ -422,6 +474,14 @@ function PolicyTab({
 
   async function save() {
     if (!form) return;
+    // Nothing is sent while a field is unreadable: sending it would store the
+    // platform default under a green tick.
+    const found = policyNumberProblems(form);
+    setProblems(found);
+    if (found.length > 0) {
+      setSaved(false);
+      return;
+    }
     const res = await action.run("policy", () =>
       api.put<PolicyResponse>("/api/v1/company/security-policy", {
         sessionIdleTimeoutMinutes: numberOrNull(form.sessionIdleTimeoutMinutes),
@@ -453,12 +513,22 @@ function PolicyTab({
 
   const set = <K extends keyof PolicyForm>(key: K, value: PolicyForm[K]) => {
     setSaved(false);
+    setProblems([]);
     setForm((f) => (f ? { ...f, [key]: value } : f));
   };
 
   return (
     <div className="space-y-4">
       <FailureAlert failure={action.failure} onDismiss={action.clear} />
+      {problems.length > 0 ? (
+        <Alert tone="danger" size="sm" title="Nothing was saved">
+          <ul className="list-disc space-y-0.5 pl-4">
+            {problems.map((problem) => (
+              <li key={problem}>{problem}</li>
+            ))}
+          </ul>
+        </Alert>
+      ) : null}
       {saved ? (
         <Alert tone="success" size="sm" title="Policy saved">
           It applies to the next sign-in and the next password change. Existing sessions keep the

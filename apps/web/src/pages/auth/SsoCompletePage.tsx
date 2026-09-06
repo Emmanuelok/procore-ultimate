@@ -30,8 +30,46 @@ interface TicketPayload {
   /** the tenant demands a second factor and the IdP did not provide one */
   mfaRequired?: boolean;
   challengeToken?: string;
+  challengeId?: string;
   scope?: "verify" | "enrol";
+  expiresAt?: string;
+  methods?: Array<"totp" | "recovery_code">;
+  enrolmentRequired?: boolean;
+  policy?: { required: boolean; companies: Array<{ companyId: string; name: string }> };
   reasons?: string[];
+}
+
+/**
+ * The challenge envelope, in the shape the sign-in page's challenge step
+ * already implements. Built here rather than passed through untyped so the
+ * two pages cannot drift: if the API adds a field, this stops compiling.
+ */
+interface CarriedChallenge {
+  mfaRequired: true;
+  challengeToken: string;
+  challengeId: string;
+  scope: "verify" | "enrol";
+  expiresAt: string;
+  methods: Array<"totp" | "recovery_code">;
+  enrolmentRequired: boolean;
+  policy: { required: boolean; companies: Array<{ companyId: string; name: string }> };
+  reasons: string[];
+}
+
+function carriedChallenge(payload: TicketPayload): CarriedChallenge | null {
+  if (!payload.mfaRequired || !payload.challengeToken) return null;
+  const scope = payload.scope ?? "verify";
+  return {
+    mfaRequired: true,
+    challengeToken: payload.challengeToken,
+    challengeId: payload.challengeId ?? "",
+    scope,
+    expiresAt: payload.expiresAt ?? new Date(Date.now() + 10 * 60_000).toISOString(),
+    methods: payload.methods ?? (scope === "enrol" ? ["totp"] : ["totp", "recovery_code"]),
+    enrolmentRequired: payload.enrolmentRequired ?? scope === "enrol",
+    policy: payload.policy ?? { required: true, companies: [] },
+    reasons: payload.reasons ?? [],
+  };
 }
 
 export default function SsoCompletePage() {
@@ -147,7 +185,25 @@ export default function SsoCompletePage() {
               ))}
             </ul>
           ) : null}
-          <Button fullWidth onClick={() => navigate("/login", { replace: true })}>
+          <Button
+            fullWidth
+            onClick={() => {
+              // CARRY THE CHALLENGE. The token minted by the callback is the
+              // only way this sign-in can finish: a JIT-provisioned SSO
+              // account has an unusable password, and a tenant that also
+              // turned password sign-in off refuses every password user too,
+              // so dropping it here and landing on an email/password form was
+              // a lockout with an infinite loop behind it (starting SSO again
+              // just mints another challenge). The sign-in page reads this on
+              // mount and drives the enrol/verify panel it already has.
+              const challenge = carriedChallenge(payload);
+              const target = returnTo && returnTo.startsWith("/") ? returnTo : null;
+              navigate(target ? `/login?returnTo=${encodeURIComponent(target)}` : "/login", {
+                replace: true,
+                state: challenge ? { ssoChallenge: challenge } : null,
+              });
+            }}
+          >
             Continue on the sign-in page
           </Button>
         </div>

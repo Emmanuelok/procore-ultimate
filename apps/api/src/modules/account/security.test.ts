@@ -13,7 +13,8 @@ import {
 import type { BuiltApp } from "../../app.js";
 import { buildTestApp } from "../../test/helpers.js";
 import { attemptDelivery, sweepSecurityWebhooks, type Fetcher } from "./webhooks.js";
-import { guardCompanyIpAccess } from "./login.js";
+import { guardCompanyIpAccess, resetIpDecisionThrottle } from "./login.js";
+import { loadSession, touchSession } from "./sessions.js";
 
 /**
  * How long a suite may take to boot its own embedded Postgres.
@@ -553,6 +554,53 @@ describe("session lifetime from policy (#23)", () => {
     expect(events).toHaveLength(1);
   });
 
+  /**
+   * THE FUNCTION THE PLUGIN CALLS.
+   *
+   * `requireLiveSession` is attached to the account module's routes and
+   * nothing else, so until the one-line plugin edit lands (WIRING note 2) a
+   * user who never opens /account/* is never idled out and their "last seen"
+   * never moves. The behaviour was extracted into `touchSession` so the gate
+   * in plugins/auth.ts can call it; these assertions pin the extraction, so
+   * the wiring cannot silently change what it does.
+   */
+  it("touchSession bumps last-seen and enforces the timeout on its own", async () => {
+    const actor = await signUp(app);
+    const login = await app.inject({
+      method: "POST",
+      url: "/api/v1/auth/mfa/login",
+      payload: { email: actor.email, password: PASSWORD },
+    });
+    const { sessionId } = login.json() as { sessionId: string };
+    const req = { ip: "203.0.113.5", headers: {}, url: "/api/v1/projects" } as unknown as Parameters<
+      typeof touchSession
+    >[1];
+
+    // Stale, no timeout set: the row is touched and nothing is refused.
+    const staleAt = new Date(Date.now() - 10 * 60_000).toISOString();
+    await app.db.update(authSessions).set({ lastSeenAt: staleAt }).where(eq(authSessions.id, sessionId));
+    const before = await loadSession(app.db, sessionId);
+    await expect(touchSession(app, req, before!)).resolves.toBeUndefined();
+    const touched = await loadSession(app.db, sessionId);
+    expect(Date.parse(touched!.lastSeenAt)).toBeGreaterThan(Date.parse(staleAt));
+
+    // Now the tenant asks for a timeout and the session is older than it.
+    await app.inject({
+      method: "PUT",
+      url: "/api/v1/company/security-policy",
+      headers: actor.headers,
+      payload: { sessionIdleTimeoutMinutes: 15 },
+    });
+    await app.db
+      .update(authSessions)
+      .set({ lastSeenAt: new Date(Date.now() - 40 * 60_000).toISOString() })
+      .where(eq(authSessions.id, sessionId));
+    const idle = await loadSession(app.db, sessionId);
+    await expect(touchSession(app, req, idle!)).rejects.toMatchObject({ statusCode: 401 });
+    const [row] = await app.db.select().from(authSessions).where(eq(authSessions.id, sessionId));
+    expect(row!.revokedAt).toBeTruthy();
+  });
+
   it("leaves an idle session alone when no tenant asks for a timeout", async () => {
     const actor = await signUp(app);
     const login = await app.inject({
@@ -726,6 +774,90 @@ describe("IP allowlisting at sign-in (#24)", () => {
           ),
         );
       expect(none).toHaveLength(0);
+    });
+
+    /**
+     * ONE PAGE LOAD MUST NOT WRITE FIFTEEN AUDIT ROWS.
+     *
+     * The guard runs on EVERY company-scoped request. In `monitor` mode — the
+     * mode an administrator is told to introduce an allowlist with, and
+     * therefore the mode in which the whole affected population is outside the
+     * list — an unthrottled write put one trail row AND one SIEM delivery on
+     * every request: a single SPA page load buried the trail it exists to
+     * serve. An identical decision is now recorded once per window, and the
+     * row that IS written says how many repeats it stands for.
+     */
+    it("records a monitored address once per window, not once per request", async () => {
+      resetIpDecisionThrottle();
+      const monitored = await signUp(app);
+      await app.db.insert(companySecurityPolicies).values({
+        id: `secpol-thr-m-${Date.now()}`,
+        companyId: monitored.companyId,
+        ipAllowlistMode: "monitor",
+        ipAllowlist: ["198.51.100.0/24"],
+      });
+      for (let i = 0; i < 6; i += 1) {
+        await expect(
+          guardCompanyIpAccess(app, reqFrom("203.0.113.9"), monitored.companyId, monitored.userId),
+        ).resolves.toBeUndefined();
+      }
+      const rows = await app.db
+        .select()
+        .from(authSecurityEvents)
+        .where(
+          and(
+            eq(authSecurityEvents.companyId, monitored.companyId),
+            eq(authSecurityEvents.kind, "login_blocked_ip"),
+          ),
+        );
+      expect(rows).toHaveLength(1);
+
+      // Forgetting the window is the only thing that lets a second row
+      // through — which proves it was the throttle, not the policy.
+      resetIpDecisionThrottle();
+      await guardCompanyIpAccess(app, reqFrom("203.0.113.9"), monitored.companyId, monitored.userId);
+      const after = await app.db
+        .select()
+        .from(authSecurityEvents)
+        .where(
+          and(
+            eq(authSecurityEvents.companyId, monitored.companyId),
+            eq(authSecurityEvents.kind, "login_blocked_ip"),
+          ),
+        );
+      expect(after).toHaveLength(2);
+      // Nothing is lost silently: the second row counts the five it stands for.
+      const metadata = after
+        .map((r) => r.metadata as { repeatsSuppressed?: number } | null)
+        .filter((m) => (m?.repeatsSuppressed ?? 0) > 0);
+      expect(metadata.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("keeps refusing every request even when it stops repeating the row", async () => {
+      resetIpDecisionThrottle();
+      const strict = await signUp(app);
+      await app.db.insert(companySecurityPolicies).values({
+        id: `secpol-thr-e-${Date.now()}`,
+        companyId: strict.companyId,
+        ipAllowlistMode: "enforce",
+        ipAllowlist: ["198.51.100.0/24"],
+      });
+      for (let i = 0; i < 4; i += 1) {
+        await expect(
+          guardCompanyIpAccess(app, reqFrom("203.0.113.9"), strict.companyId, strict.userId),
+        ).rejects.toMatchObject({ statusCode: 403 });
+      }
+      const rows = await app.db
+        .select()
+        .from(authSecurityEvents)
+        .where(
+          and(
+            eq(authSecurityEvents.companyId, strict.companyId),
+            eq(authSecurityEvents.kind, "login_blocked_ip"),
+          ),
+        );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.outcome).toBe("blocked");
     });
 
     it("lets a break-glass user through, so a mistyped CIDR is always fixable", async () => {

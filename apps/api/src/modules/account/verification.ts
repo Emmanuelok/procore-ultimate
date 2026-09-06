@@ -207,6 +207,14 @@ export async function startEmailVerification(
   };
 }
 
+/** Postgres 23505 — the unique violation `users_email_uq` raises. */
+function isUniqueViolation(err: unknown): boolean {
+  for (let cur: unknown = err; cur && typeof cur === "object"; cur = (cur as { cause?: unknown }).cause) {
+    if ((cur as { code?: unknown }).code === "23505") return true;
+  }
+  return String((err as Error | null)?.message ?? "").includes("users_email_uq");
+}
+
 export interface VerificationConsumed {
   userId: string;
   email: string;
@@ -274,36 +282,69 @@ export async function consumeVerificationToken(
    */
   let emailChanged = false;
   if (row.purpose === "email_change") {
-    const [taken] = await app.db
-      .select({ id: users.id })
-      .from(users)
-      .where(eq(users.email, row.email))
-      .limit(1);
-    if (taken && taken.id !== row.userId) {
+    /*
+     * THE CHECK AND THE WRITE ARE ONE ACT.
+     *
+     * A read followed by an update is exactly the race the paragraph above
+     * describes: two links for the same new address, opened at the same
+     * moment, both see it free and the loser hits `users_email_uq` as an
+     * unhandled 500 — a database constraint surfacing as a server error in
+     * the one branch written to explain itself. So the pair runs inside a
+     * transaction AND the unique violation is caught, because a transaction
+     * at READ COMMITTED does not by itself serialise a check against another
+     * transaction's uncommitted insert. Belt and braces, deliberately: the
+     * cost is one catch and the alternative is a 500 on a user's own account.
+     */
+    let taken = false;
+    let previousEmail: string | null = null;
+    try {
+      const outcome: { taken: boolean; before: string | null; changed: boolean } =
+        await app.db.transaction(async (tx) => {
+          const [holder] = await tx
+            .select({ id: users.id })
+            .from(users)
+            .where(eq(users.email, row.email))
+            .limit(1);
+          // Someone else holds it: nothing to do but say so.
+          if (holder && holder.id !== row.userId) {
+            return { taken: true, before: null, changed: false };
+          }
+          // The caller already holds it — a link opened twice, or an address
+          // that was applied by another route. Not an error, not a change.
+          if (holder) return { taken: false, before: null, changed: false };
+          const [before] = await tx
+            .select({ email: users.email })
+            .from(users)
+            .where(eq(users.id, row.userId))
+            .limit(1);
+          await tx
+            .update(users)
+            .set({ email: row.email, updatedAt: new Date(nowMs).toISOString() })
+            .where(eq(users.id, row.userId));
+          return { taken: false, before: before?.email ?? null, changed: true };
+        });
+      taken = outcome.taken;
+      previousEmail = outcome.before;
+      emailChanged = outcome.changed;
+    } catch (err) {
+      if (!isUniqueViolation(err)) throw err;
+      taken = true;
+    }
+    if (taken) {
       throw badRequest(
         "Another account claimed that address while this link was waiting to be opened. " +
           "The address on this account is unchanged; request the change again with a different address.",
       );
     }
-    if (!taken) {
-      const [before] = await app.db
-        .select({ email: users.email })
-        .from(users)
-        .where(eq(users.id, row.userId))
-        .limit(1);
-      await app.db
-        .update(users)
-        .set({ email: row.email, updatedAt: new Date(nowMs).toISOString() })
-        .where(eq(users.id, row.userId));
-      emailChanged = true;
+    if (emailChanged) {
       await recordAuthEvent(app.db, {
         kind: "email_changed",
         userId: row.userId,
         email: row.email,
         ip: ctx.ip,
         userAgent: ctx.userAgent,
-        reason: `Address changed from ${before?.email ?? "(unknown)"} to ${row.email}`,
-        metadata: { previousEmail: before?.email ?? null },
+        reason: `Address changed from ${previousEmail ?? "(unknown)"} to ${row.email}`,
+        metadata: { previousEmail },
       });
       // Every other device keeps working — the credential did not change — but
       // the account holder is told, in the trail they can read, that the

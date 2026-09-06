@@ -16,8 +16,8 @@
  *   challenge  the second factor — or, where policy demands one and the account
  *              has none, enrolling it without losing the sign-in
  */
-import { useState, type FormEvent } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useEffect, useState, type FormEvent } from "react";
+import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { Alert, Badge, Button, Divider, Field, Input } from "../../ui";
 import { IconArrowLeft, IconLock, IconMail } from "../../ui/icons";
 import { api, tokenStore } from "../../lib/api";
@@ -74,6 +74,7 @@ type Step = "identify" | "password" | "challenge" | "recovery-codes";
 export default function LoginPage() {
   const { reload } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const [searchParams] = useSearchParams();
   const action = useAuthAction();
 
@@ -98,8 +99,39 @@ export default function LoginPage() {
    * — which re-enters the password step and does it all over.
    */
   const [enrolFailure, setEnrolFailure] = useState<string | null>(null);
+  /**
+   * Where the challenge on screen came from. A challenge minted by SSO has no
+   * password step behind it, so "start again" means starting the sign-in over
+   * rather than dropping back to a password form the tenant may not even allow.
+   */
+  const [challengeOrigin, setChallengeOrigin] = useState<"password" | "sso">("password");
 
   const returnTo = searchParams.get("returnTo") ?? undefined;
+
+  /**
+   * A CHALLENGE HANDED OVER BY SINGLE SIGN-ON.
+   *
+   * When a tenant requires a second factor and the IdP did not assert one, the
+   * SSO callback returns a challenge envelope INSTEAD of tokens (sso/index.ts
+   * `mfaGate`) and /auth/sso/complete carries it here in navigation state.
+   * Without this the token was minted and dropped on the floor: the user landed
+   * on an email/password form that a JIT-provisioned SSO account has no
+   * password for, and restarting SSO only minted another one — an SSO tenant
+   * that turned on the MFA requirement locked out every one of its users.
+   *
+   * The state is cleared immediately: a challenge is single-use, so a refresh
+   * or a Back must not re-enter a spent one.
+   */
+  useEffect(() => {
+    const carried = (location.state as { ssoChallenge?: ChallengeResponse } | null)?.ssoChallenge;
+    if (!carried?.challengeToken) return;
+    setChallenge(carried);
+    setChallengeOrigin("sso");
+    setStep("challenge");
+    navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
+    if (carried.scope === "enrol") void provisionSeed(carried);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function land() {
     await reload();
@@ -160,6 +192,7 @@ export default function LoginPage() {
 
     if ("mfaRequired" in result && result.mfaRequired) {
       setChallenge(result);
+      setChallengeOrigin("password");
       setStep("challenge");
       if (result.scope === "enrol") await provisionSeed(result);
       return;
@@ -250,13 +283,17 @@ export default function LoginPage() {
 
   if (step === "challenge" && challenge) {
     const enrolling = challenge.scope === "enrol";
+    const fromSso = challengeOrigin === "sso";
+    const accepted = fromSso
+      ? "Your identity provider signed you in."
+      : "Your password was accepted.";
     return (
       <AuthShell
         title={enrolling ? "Set up your second factor" : "Two-factor verification"}
         subtitle={
           enrolling
-            ? "Your password was accepted. Your organisation requires a second factor and this account has none, so enrol one now — you will finish signing in in the same step."
-            : "Your password was accepted. There is no session yet: it exists only once the second factor is proved."
+            ? `${accepted} Your organisation requires a second factor and this account has none, so enrol one now — you will finish signing in in the same step.`
+            : `${accepted} There is no session yet: it exists only once the second factor is proved.`
         }
         width={enrolling ? "md" : "sm"}
         footer={
@@ -264,8 +301,12 @@ export default function LoginPage() {
             type="button"
             className="inline-flex items-center gap-1 text-meta text-content-muted hover:text-content"
             onClick={() => {
-              setStep("password");
+              // A challenge handed over by SSO has no password step behind it
+              // — and for a provisioned SSO account there is no password at
+              // all — so "start again" restarts the sign-in from the address.
+              setStep(fromSso ? "identify" : "password");
               setChallenge(null);
+              setChallengeOrigin("password");
               setEnrolment(null);
               setEnrolFailure(null);
               setCode("");
