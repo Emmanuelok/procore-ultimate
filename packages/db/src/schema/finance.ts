@@ -285,3 +285,177 @@ export const covenantWaivers = pgTable(
     index("covenant_waivers_facility_idx").on(t.facilityId),
   ],
 );
+
+/* ================================================================== */
+/* Designated (special) account discipline — DFI advance accounts      */
+/* ================================================================== */
+
+/**
+ * A designated / special account (#735, #745): the advance a financier
+ * places at the borrower's disposal, replenished on evidence of eligible
+ * expenditure. Its whole purpose is that the balance is reconcilable at any
+ * moment against what has been documented, so the account carries its own
+ * ledger rather than borrowing the facility's.
+ */
+export const designatedAccounts = pgTable(
+  "designated_accounts",
+  {
+    id: text("id").primaryKey(),
+    facilityId: text("facility_id").notNull(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    name: text("name").notNull(),
+    bankName: text("bank_name"),
+    /** last four digits / IBAN tail only — never the full number */
+    accountRef: text("account_ref"),
+    currency: text("currency").default("GBP").notNull(),
+    /** the advance ceiling the financier has authorised */
+    authorisedCeiling: doublePrecision("authorised_ceiling").notNull(),
+    openingBalance: doublePrecision("opening_balance").default(0).notNull(),
+    openedOn: text("opened_on"), // ISO date
+    status: text("status").default("active").notNull(), // DesignatedAccountStatus
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("designated_accounts_facility_idx").on(t.facilityId),
+    index("designated_accounts_project_idx").on(t.projectId),
+  ],
+);
+
+/** One movement on a designated account. Amounts are stored positive; the
+ *  kind decides the sign, so a data-entry slip cannot silently flip a
+ *  withdrawal into a deposit. */
+export const designatedAccountEntries = pgTable(
+  "designated_account_entries",
+  {
+    id: text("id").primaryKey(),
+    accountId: text("account_id").notNull(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    entryDate: text("entry_date").notNull(), // ISO date
+    kind: text("kind").notNull(), // DesignatedAccountEntryKind
+    amount: doublePrecision("amount").notNull(), // always >= 0
+    description: text("description").notNull(),
+    reference: text("reference"),
+    /** the disbursement that funded an advance/replenishment, when there was one */
+    disbursementId: text("disbursement_id"),
+    evidenceId: text("evidence_id"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    index("designated_account_entries_account_idx").on(t.accountId, t.entryDate),
+    index("designated_account_entries_project_idx").on(t.projectId),
+  ],
+);
+
+/**
+ * A period reconciliation of the account: what the bank says against what
+ * the ledger says. An unexplained difference is a signal, not a rounding
+ * note — this is the control the whole advance mechanism rests on.
+ */
+export const designatedAccountReconciliations = pgTable(
+  "designated_account_reconciliations",
+  {
+    id: text("id").primaryKey(),
+    accountId: text("account_id").notNull(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    periodEnd: text("period_end").notNull(), // ISO date
+    /** balance per the bank statement at periodEnd */
+    statementBalance: doublePrecision("statement_balance").notNull(),
+    /** balance per this account's own ledger at periodEnd */
+    computedBalance: doublePrecision("computed_balance").notNull(),
+    difference: doublePrecision("difference").notNull(),
+    /** ReconciliationOutcome — reconciled | unreconciled */
+    outcome: text("outcome").notNull(),
+    explanation: text("explanation"),
+    evidenceIds: jsonb("evidence_ids").$type<string[]>().default([]).notNull(),
+    /** the assurance reconciliations row this mirrors, when one was written */
+    assuranceReconciliationId: text("assurance_reconciliation_id"),
+    reconciledBy: text("reconciled_by").notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    uniqueIndex("designated_account_recs_uq").on(t.accountId, t.periodEnd),
+    index("designated_account_recs_account_idx").on(t.accountId),
+  ],
+);
+
+/* ================================================================== */
+/* PPP / availability payment mechanism                                */
+/* ================================================================== */
+
+/**
+ * The payment mechanism of an availability-based concession: a unitary
+ * charge earned in full only when the asset is available AND performing,
+ * reduced by deductions when it is not. The weights and the cap are the
+ * negotiated terms, so they live on the model rather than in code.
+ */
+export const availabilityPaymentModels = pgTable(
+  "availability_payment_models",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    facilityId: text("facility_id"),
+    name: text("name").notNull(),
+    currency: text("currency").default("GBP").notNull(),
+    /** the full charge for one period at full availability and performance */
+    unitaryCharge: doublePrecision("unitary_charge").notNull(),
+    periodMonths: integer("period_months").default(1).notNull(),
+    /** share of the charge at risk on availability (%) */
+    availabilityWeightPercent: doublePrecision("availability_weight_percent")
+      .default(70)
+      .notNull(),
+    /** share of the charge at risk on performance (%) */
+    performanceWeightPercent: doublePrecision("performance_weight_percent").default(30).notNull(),
+    /** value of one performance failure point, as a % of the charge */
+    performancePointValuePercent: doublePrecision("performance_point_value_percent")
+      .default(0.1)
+      .notNull(),
+    /** maximum deduction in one period, as a % of the charge; null = uncapped */
+    deductionCapPercent: doublePrecision("deduction_cap_percent"),
+    /** failure points in a period that trigger a persistent-breach warning */
+    persistentBreachPoints: doublePrecision("persistent_breach_points"),
+    notes: text("notes"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [index("availability_payment_models_project_idx").on(t.projectId)],
+);
+
+/** One payment period under an availability mechanism. */
+export const availabilityPeriods = pgTable(
+  "availability_periods",
+  {
+    id: text("id").primaryKey(),
+    modelId: text("model_id").notNull(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    periodStart: text("period_start").notNull(), // ISO date
+    periodEnd: text("period_end").notNull(), // ISO date
+    /** hours in the period the asset was contractually required to be available */
+    requiredHours: doublePrecision("required_hours").notNull(),
+    /** [{ area, hours, weight, note }] — unavailability, weighted by area */
+    unavailabilityEvents: jsonb("unavailability_events").$type<unknown[]>().default([]).notNull(),
+    /** performance failure points accrued in the period */
+    performancePoints: doublePrecision("performance_points").default(0).notNull(),
+    status: text("status").default("draft").notNull(), // AvailabilityPeriodStatus
+    /** engine output frozen at certification */
+    computed: jsonb("computed").$type<Record<string, unknown>>(),
+    certifiedBy: text("certified_by"),
+    certifiedAt: timestamp("certified_at", { withTimezone: true, mode: "string" }),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("availability_periods_uq").on(t.modelId, t.periodStart),
+    index("availability_periods_model_idx").on(t.modelId),
+    index("availability_periods_project_idx").on(t.projectId),
+  ],
+);

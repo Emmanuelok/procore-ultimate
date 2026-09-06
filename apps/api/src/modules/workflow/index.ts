@@ -603,6 +603,7 @@ export const workflowModule: FastifyPluginAsync = async (app) => {
       version: 1,
       steps: body.steps as unknown[],
       isActive: body.isActive === false ? 0 : 1,
+      isMandatory: body.isMandatory === true ? 1 : 0,
       createdBy: actorId,
     };
     await app.db.insert(workflowTemplates).values(row);
@@ -615,7 +616,7 @@ export const workflowModule: FastifyPluginAsync = async (app) => {
       payload: { name: body.name, recordType: body.recordType, projectId, mandatory: body.isMandatory === true },
       projectId,
     });
-    return { ...row, isMandatory: body.isMandatory === true };
+    return row;
   }
 
   function templateWhere(templateId: string, companyId: string, projectId: string | null) {
@@ -655,6 +656,7 @@ export const workflowModule: FastifyPluginAsync = async (app) => {
     if (body.recordType !== undefined) set["recordType"] = body.recordType;
     if (body.steps !== undefined) set["steps"] = body.steps as unknown[];
     if (body.isActive !== undefined) set["isActive"] = body.isActive ? 1 : 0;
+    if (body.isMandatory !== undefined) set["isMandatory"] = body.isMandatory ? 1 : 0;
     await app.db.update(workflowTemplates).set(set).where(eq(workflowTemplates.id, templateId));
     await appendLedger(app.db, {
       companyId,
@@ -1166,6 +1168,12 @@ export const workflowModule: FastifyPluginAsync = async (app) => {
         .limit(1);
       started = rows[0] ?? null;
     }
+    /*
+     * `required` is the MANDATORY flag, not "a template exists". An optional
+     * design-review template for RFIs must not stop every RFI in the tenant
+     * from leaving draft, which is what `templates.length > 0` did.
+     */
+    const mandatory = templates.filter((t) => t.isMandatory === 1);
     return {
       recordType: q.recordType,
       templates: templates.map((t) => ({
@@ -1173,8 +1181,10 @@ export const workflowModule: FastifyPluginAsync = async (app) => {
         name: t.name,
         version: t.version,
         projectId: t.projectId,
+        isMandatory: t.isMandatory === 1,
       })),
-      required: templates.length > 0,
+      required: mandatory.length > 0,
+      requiredBy: mandatory.map((t) => ({ id: t.id, name: t.name })),
       instance: started ? { id: started.id, status: started.status } : null,
       satisfied: started ? started.status === "approved" : false,
     };

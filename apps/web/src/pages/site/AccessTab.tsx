@@ -6,7 +6,7 @@
  * is. A muster shows three named lists — present, unaccounted, unexpected —
  * because a headcount that is only a number tells nobody where to look.
  */
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { toast } from "sonner";
 import { Badge, Button, Card, CardBody, Drawer, EmptyState, Field, Input, Select, Textarea } from "../../ui";
 import { DataTable, type DataColumns } from "../../ui/data";
@@ -222,6 +222,8 @@ function InductionsPanel({ base, lookups, onChanged }: { base: string; lookups: 
   const list = useResource<ListResponse<InductionRow>>(`${base}/inductions?pageSize=200`);
   const action = useAction();
   const [open, setOpen] = useState(false);
+  /** the record being corrected — null when the drawer is a new induction */
+  const [editing, setEditing] = useState<InductionRow | null>(null);
 
   const columns = useMemo<DataColumns<InductionRow>>(
     () => [
@@ -275,7 +277,14 @@ function InductionsPanel({ base, lookups, onChanged }: { base: string; lookups: 
           title="Inductions"
           hint="The record that a named person was told this site's rules, by whom, and for how long that lasts. A pass may not be issued against an induction that is not in force."
           actions={
-            <Button size="sm" icon={IconPlus} onClick={() => setOpen(true)}>
+            <Button
+              size="sm"
+              icon={IconPlus}
+              onClick={() => {
+                setEditing(null);
+                setOpen(true);
+              }}
+            >
               Record an induction
             </Button>
           }
@@ -293,16 +302,34 @@ function InductionsPanel({ base, lookups, onChanged }: { base: string; lookups: 
           searchPlaceholder="Search by name…"
           rowActions={(row) =>
             row.status === "revoked" ? null : (
-              <Button size="xs" variant="ghost" onClick={() => void revoke(row)}>
-                Revoke
-              </Button>
+              <span className="flex gap-1">
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  onClick={() => {
+                    setEditing(row);
+                    setOpen(true);
+                  }}
+                >
+                  Edit
+                </Button>
+                <Button size="xs" variant="ghost" onClick={() => void revoke(row)}>
+                  Revoke
+                </Button>
+              </span>
             )
           }
           empty={{
             title: "No inductions recorded",
             description: "Nobody on this site has an induction on the platform. Record them here so every pass has something behind it.",
             action: (
-              <Button size="sm" onClick={() => setOpen(true)}>
+              <Button
+                size="sm"
+                onClick={() => {
+                  setEditing(null);
+                  setOpen(true);
+                }}
+              >
                 Record the first induction
               </Button>
             ),
@@ -311,10 +338,15 @@ function InductionsPanel({ base, lookups, onChanged }: { base: string; lookups: 
         <InductionForm
           base={base}
           lookups={lookups}
+          record={editing}
           open={open}
-          onClose={() => setOpen(false)}
-          onCreated={() => {
+          onClose={() => {
             setOpen(false);
+            setEditing(null);
+          }}
+          onSaved={() => {
+            setOpen(false);
+            setEditing(null);
             list.reload();
             onChanged();
           }}

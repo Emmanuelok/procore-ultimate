@@ -37,7 +37,6 @@ import {
 import OptimismPanel from "./OptimismPanel";
 import SensitivityPanel from "./SensitivityPanel";
 import LogicModelPanel from "./LogicModelPanel";
-import LogicModelPanel from "./LogicModelPanel";
 
 const FIVE_CASES: { key: string; label: string; hint: string }[] = [
   { key: "strategic", label: "Strategic case", hint: "The case for change and strategic fit." },
@@ -622,9 +621,6 @@ export default function BusinessCasesTab({ projectId }: { projectId: string }) {
               <OptimismPanel base={base} bc={detail} onChanged={() => void loadDetail()} />
 
               {detail.options.length > 0 ? <SensitivityPanel options={detail.options} /> : null}
-
-              {/* ------------------------ logic model (#418) ------------------------- */}
-              <LogicModelPanel base={base} bc={detail} onChanged={() => void loadDetail()} />
 
               {/* -------------------------- logic model (#418) -------------------------- */}
               <LogicModelPanel base={base} bc={detail} onChanged={() => void loadDetail()} />

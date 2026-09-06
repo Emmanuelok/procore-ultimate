@@ -32,6 +32,13 @@ export const workflowTemplates = pgTable(
     version: integer("version").default(1).notNull(),
     steps: jsonb("steps").$type<unknown[]>().notNull(),
     isActive: integer("is_active").default(1).notNull(),
+    /**
+     * #788 — a mandatory template must be started (and satisfied) before the
+     * record may leave review. Without this column the flag was accepted by
+     * the API, echoed back once and discarded, and "is a workflow required
+     * here" answered yes for the mere existence of any active template.
+     */
+    isMandatory: integer("is_mandatory").default(0).notNull(),
     createdBy: text("created_by").notNull(),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
