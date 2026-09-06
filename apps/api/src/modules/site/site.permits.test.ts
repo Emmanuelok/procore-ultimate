@@ -372,9 +372,10 @@ describe("permit expiry sweep", () => {
     await app.scheduler.runNow("site.permit-expiry");
     const rows = await app.db.select().from(sitePermits).where(eq(sitePermits.id, id));
     expect(rows[0]?.status).toBe("expired");
-    // and it stops counting as an open permit on the workspace
-    const summary = await get(`${base()}/summary`);
-    expect(summary.json().permits.byType["hot_work"] ?? 0).toBe(0);
+    expect(rows[0]?.expiredAt).toBeTruthy();
+    // and it stops being listed as an open permit
+    const open = await get(`${base()}/permits?open=true`);
+    expect(open.json().items.some((p: { id: string }) => p.id === id)).toBe(false);
   });
 
   it("runs the sweep only for the project the caller's grant covers", async () => {

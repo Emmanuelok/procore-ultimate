@@ -302,7 +302,11 @@ describe("timetable lifecycle", () => {
 describe("standing dispute board", () => {
   it("records members with independence disclosures, warns about gaps and logs visits", async () => {
     const pid = await makeProject("DAAB Project");
-    const dispute = await createDispute(pid, { kind: "daab", jurisdiction: "fidic_daab" });
+    const dispute = await createDispute(pid, {
+      kind: "daab",
+      jurisdiction: "fidic_daab",
+      triggerDate: todayISO(),
+    });
 
     const undisclosed = await app.inject({
       method: "POST",
@@ -697,7 +701,7 @@ describe("hearing bundle upgrades", () => {
       url: `/api/v1/projects/${pid}/dispute-bundles/${bundle.json().id}/items`,
       headers: owner.headers,
       payload: {
-        items: [{ tab: "A1", title: "Foreign document", kind: "file", fileId: foreignFile }],
+        items: [{ title: "Foreign document", fileId: foreignFile }],
       },
     });
     expect(items.statusCode).toBe(400);
@@ -723,15 +727,17 @@ describe("hearing bundle upgrades", () => {
       headers: owner.headers,
       payload: {
         items: [
-          { tab: "A1", title: "Programme", kind: "file", fileId: f1 },
-          { tab: "A2", title: "Counsel advice", kind: "file", fileId: f2 },
+          { title: "Programme", fileId: f1 },
+          { title: "Counsel advice", fileId: f2 },
         ],
       },
     });
     expect(items.statusCode).toBe(200);
-    const itemId = (items.json().items as { id: string; tab: string }[]).find(
-      (i) => i.tab === "A2",
-    )!.id;
+    // Tabs are assigned at GENERATION, not on the draft, so the item is
+    // identified by what it is rather than by where it will end up.
+    const draftItems = items.json().items as { id: string; title: string; tab: string | null }[];
+    expect(draftItems.every((i) => i.tab === null)).toBe(true);
+    const itemId = draftItems.find((i) => i.title === "Counsel advice")!.id;
 
     const privileged = await app.inject({
       method: "PUT",

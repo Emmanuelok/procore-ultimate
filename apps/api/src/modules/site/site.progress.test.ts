@@ -70,6 +70,7 @@ beforeAll(async () => {
     boqId: newId("boq"),
     number: 1,
     valuationDate: "2025-03-31",
+    createdBy: owner.userId,
   });
 });
 
