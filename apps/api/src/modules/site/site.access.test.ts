@@ -557,6 +557,49 @@ describe("the gate feed against the labour register", () => {
     expect(tooLong.json().message).toContain("quarter at a time");
   });
 
+  it("counts a night shift on the site's own day boundary when it is given one", async () => {
+    // 22:00–06:00 UTC: two calendar days in UTC, one working day on a site at
+    // UTC+2, where the shift starts at midnight local.
+    const reads = await post(`/projects/${projectId}/site/gate-events`, {
+      events: [
+        { badgeCode: "B-1001", direction: "in", occurredAt: "2026-05-11T22:00:00.000Z", externalRef: "att-3" },
+        { badgeCode: "B-1001", direction: "out", occurredAt: "2026-05-12T06:00:00.000Z", externalRef: "att-4" },
+      ],
+    });
+    expect(reads.json().accepted).toBe(2);
+    await app.db.insert(siteAccessRecords).values({
+      id: newId("sar"),
+      companyId: owner.companyId,
+      projectId,
+      workerId,
+      accessDate: "2026-05-12",
+      firstIn: "00:00",
+      lastOut: "08:00",
+      hoursOnSite: 8,
+      source: "manual",
+    });
+
+    // On UTC days the shift is split, and the eight claimed hours look overclaimed.
+    const utc = await get(`/projects/${projectId}/site/attendance-reconciliation?from=2026-05-11&to=2026-05-12`);
+    const utcLine = (utc.json().lines as Array<{ date: string; result: string; observedHours: number | null }>).find(
+      (l) => l.date === "2026-05-12",
+    );
+    expect(utcLine?.result).toBe("over_claimed");
+    expect(utcLine?.observedHours).toBe(6);
+    expect((utc.json().reasons as string[]).join(" ")).toContain("UTC midnight boundaries");
+
+    // Told what a day is on this site, the two streams agree.
+    const local = await get(
+      `/projects/${projectId}/site/attendance-reconciliation?from=2026-05-11&to=2026-05-12&utcOffsetMinutes=120`,
+    );
+    const localLine = (local.json().lines as Array<{ date: string; result: string; observedHours: number | null }>).find(
+      (l) => l.date === "2026-05-12",
+    );
+    expect(localLine?.result).toBe("agreed");
+    expect(localLine?.observedHours).toBe(8);
+    expect(local.json().utcOffsetMinutes).toBe(120);
+  });
+
   it("is closed to another company", async () => {
     const res = await get(`/projects/${projectId}/site/attendance-reconciliation?from=${day}&to=${quiet}`, stranger.headers);
     expect(res.statusCode).toBe(403);

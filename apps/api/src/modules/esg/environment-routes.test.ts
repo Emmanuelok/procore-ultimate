@@ -965,6 +965,49 @@ describe("design option carbon comparison (#502-504)", () => {
   });
 });
 
+describe("disclosure waste figures", () => {
+  /*
+   * Regression: the disclosure builder filtered destination "recycling"
+   * (the enum says "recycled") and a non-existent `isHazardous` flag, so
+   * ESRS E5 reported zero recycled and zero hazardous tonnage on a project
+   * that recorded both. A fabricated zero is worse than an omission.
+   */
+  it("reports recycled and hazardous tonnage from the waste register", async () => {
+    const pid = await makeProject("Disclosure waste");
+    const legs: Record<string, unknown>[] = [
+      { stream: "hazardous", destination: "landfill", tonnes: 4 },
+      { stream: "metal", destination: "recycled", tonnes: 10 },
+      { stream: "inert", destination: "landfill", tonnes: 6 },
+    ];
+    for (const w of legs) {
+      const res = await app.inject({
+        method: "POST",
+        url: `/api/v1/projects/${pid}/waste-records`,
+        headers: owner.headers,
+        payload: { recordDate: todayISO(), ...w },
+      });
+      expect(res.statusCode).toBe(201);
+    }
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/esg-disclosures`,
+      headers: owner.headers,
+      payload: {
+        framework: "esrs_e5_circular",
+        periodStart: addDaysISO(todayISO(), -30),
+        periodEnd: todayISO(),
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    const points = (res.json() as { datapoints: { id: string; value: number | null }[] })
+      .datapoints;
+    const recycled = points.find((d) => d.id.includes("recycl"));
+    const hazardous = points.find((d) => d.id.includes("hazard"));
+    expect(recycled?.value).toBe(10);
+    expect(hazardous?.value).toBe(4);
+  });
+});
+
 describe("transport carbon", () => {
   it("books a leg into the project footprint", async () => {
     const pid = await makeProject("Transport");
@@ -993,6 +1036,29 @@ describe("transport carbon", () => {
       headers: owner.headers,
     });
     expect((summary.json() as { totalTco2e: number }).totalTco2e).toBe(body.tco2e);
+
+    /*
+     * Regression: the register selected a `tonneKm` column the table did not
+     * have, so the only read of the transport log threw for any caller who
+     * got past the tenant gate. The activity quantity is now stored with the
+     * leg — the factor and the quantity behind a reported emission are what
+     * an assurer asks for.
+     */
+    const list = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/carbon-transport-legs`,
+      headers: owner.headers,
+    });
+    expect(list.statusCode).toBe(200);
+    const listed = list.json() as {
+      items: { tonneKm: number; tco2e: number }[];
+      totals: { legs: number; tonneKm: number; tco2e: number };
+    };
+    expect(listed.items).toHaveLength(1);
+    expect(listed.items[0]!.tonneKm).toBe(28_800);
+    expect(listed.totals.legs).toBe(1);
+    expect(listed.totals.tonneKm).toBe(28_800);
+    expect(listed.totals.tco2e).toBe(body.tco2e);
   });
 
   it("refuses an unknown mode rather than estimating from nothing", async () => {

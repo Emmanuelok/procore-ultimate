@@ -29,6 +29,7 @@ import { clampDepth, MAX_HISTORY_DEPTH } from "./password-history.js";
 import {
   emptyPolicy,
   invalidAllowlistEntries,
+  invalidateCompanyPolicy,
   loadCompanyPolicy,
   policyRules,
   resolvePolicies,
@@ -256,6 +257,10 @@ export function registerSecurityRoutes(app: FastifyInstance): void {
     } else {
       await app.db.insert(companySecurityPolicies).values({ id: newId("secpol"), ...values });
     }
+    // The allowlist is read on every company-scoped request through a
+    // ten-second cache; the replica that made the change must not be the one
+    // still enforcing the old rule.
+    invalidateCompanyPolicy(companyId);
 
     // The MFA requirement has two homes for historical reasons (see
     // modules/mfa/service.ts `userCompanyPolicies`). Keep them in step from
@@ -438,8 +443,13 @@ export function registerSecurityRoutes(app: FastifyInstance): void {
       .where(auditWhere(companyId, q))
       .orderBy(desc(authSecurityEvents.at))
       .limit(format.limit);
+    // AN EXPORT IS AN ACCESS, NOT A CHANGE. This used to be recorded as
+    // `security_policy_changed`, which put a false statement into the one log
+    // that must not carry one: the row is filterable as a policy change on the
+    // page above it and is pushed to every tenant SIEM, so a detection rule on
+    // "a security policy changed" fired on every export.
     await recordAuthEvent(app.db, {
-      kind: "security_policy_changed",
+      kind: "security_events_exported",
       outcome: "success",
       companyId,
       userId: req.user!.id,
@@ -1098,7 +1108,10 @@ export function registerSecurityRoutes(app: FastifyInstance): void {
    */
   app.post("/company/security/retention/run", { preHandler: companyAdmin }, async (req) => {
     const companyId = req.companyId!;
-    const outcome = await applyRetention(app.db, companyId);
+    // `actorId` puts the administrator's name on the `retention_applied` row
+    // applyRetention writes to the trail, so a manual run is distinguishable
+    // from the nightly sweep on the page that shows both.
+    const outcome = await applyRetention(app.db, companyId, { actorId: req.user!.id });
     await appendLedger(app.db, {
       companyId,
       actorId: req.user!.id,

@@ -6376,6 +6376,16 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     unitCost: money.nullable().optional(),
     currency: z.string().length(3).default("USD"),
     leadTimeDays: z.number().int().min(0).max(3650).nullable().optional(),
+    /*
+     * WHEN IT IS NEEDED, AND WHAT NEEDS IT. Both columns have existed since
+     * the table was written and no route ever wrote them, so the supply
+     * engine — order-by date, shortage forecast, the activities a late
+     * delivery holds up — could never fire on anything a user created. A
+     * field the API stores but no route accepts is a capability the product
+     * claims and does not have.
+     */
+    requiredOnSiteDate: isoDateSchema.nullable().optional(),
+    scheduleActivityId: idRef.nullable().optional(),
     quantityRequired: z.number().finite().min(0).default(0),
     quantityOrdered: z.number().finite().min(0).default(0),
     reorderLevel: z.number().finite().min(0).nullable().optional(),
@@ -6523,6 +6533,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         unitCost: body.unitCost ?? null,
         currency: body.currency,
         leadTimeDays: body.leadTimeDays ?? null,
+        requiredOnSiteDate: body.requiredOnSiteDate ?? null,
+        scheduleActivityId: body.scheduleActivityId ?? null,
         quantityRequired: body.quantityRequired,
         quantityOrdered: body.quantityOrdered,
         reorderLevel: body.reorderLevel ?? null,

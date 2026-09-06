@@ -1011,7 +1011,7 @@ function GateEventForm({ base, open, onClose, onCreated }: { base: string; open:
 }
 
 /* ------------------------------------------------------------------ */
-/* Musters                                                             */
+/* Attendance versus the gate feed                                     */
 /* ------------------------------------------------------------------ */
 
 /**
@@ -1029,7 +1029,9 @@ function AttendancePanel({ base }: { base: string }) {
   const [to, setTo] = useState(today);
   const [tolerance, setTolerance] = useState("0.5");
   const [result, setResult] = useState("");
-  const query = `from=${from}&to=${to}&toleranceHours=${tolerance || "0.5"}${result ? `&result=${result}` : ""}`;
+  /** what "a day" means on this site — a night shift crosses UTC midnight */
+  const [offset, setOffset] = useState("0");
+  const query = `from=${from}&to=${to}&toleranceHours=${tolerance || "0.5"}&utcOffsetMinutes=${offset || "0"}${result ? `&result=${result}` : ""}`;
   const report = useResource<AttendanceReport>(`${base}/attendance-reconciliation?${query}`);
   const r = report.data;
 
@@ -1096,6 +1098,24 @@ function AttendancePanel({ base }: { base: string }) {
               </Field>
               <Field label="Tolerance (h)">
                 <Input type="number" min={0} max={24} step="0.25" value={tolerance} onChange={(e) => setTolerance(e.target.value)} className="w-24" />
+              </Field>
+              <Field label="Day boundary">
+                <Select value={offset} onChange={(e) => setOffset(e.target.value)}>
+                  {[
+                    { value: "-480", label: "UTC−8" },
+                    { value: "-300", label: "UTC−5" },
+                    { value: "0", label: "UTC" },
+                    { value: "60", label: "UTC+1" },
+                    { value: "120", label: "UTC+2" },
+                    { value: "240", label: "UTC+4" },
+                    { value: "480", label: "UTC+8" },
+                    { value: "600", label: "UTC+10" },
+                  ].map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </Select>
               </Field>
               <Field label="Verdict">
                 <Select value={result} onChange={(e) => setResult(e.target.value)}>
@@ -1176,6 +1196,10 @@ function AttendancePanel({ base }: { base: string }) {
     </Card>
   );
 }
+
+/* ------------------------------------------------------------------ */
+/* Musters                                                             */
+/* ------------------------------------------------------------------ */
 
 function MustersPanel({ base, onChanged }: { base: string; onChanged: () => void }) {
   const list = useResource<ListResponse<MusterRow>>(`${base}/musters?pageSize=100`);

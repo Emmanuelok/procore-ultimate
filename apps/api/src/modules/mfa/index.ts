@@ -21,6 +21,7 @@ import {
   noteLoginFailure,
 } from "../account/login.js";
 import { recordLegacyAuthEvent } from "../account/events.js";
+import { invalidateCompanyPolicy } from "../account/policy.js";
 import { dispatchEmail } from "../account/mailer.js";
 import { buildAppUrl, renderMfaEnrolled } from "../../lib/email.js";
 import { isPasswordLoginAllowedForUser } from "../sso/index.js";
@@ -1063,6 +1064,9 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
         .update(companySecurityPolicies)
         .set({ mfaRequired: body.required, updatedAt: nowIso, updatedBy: user.id })
         .where(eq(companySecurityPolicies.companyId, companyId));
+      // requireCompany reads this row through a ten-second cache (policy.ts);
+      // the writer invalidates so its own replica is never the stale one.
+      invalidateCompanyPolicy(companyId);
 
       await appendLedger(app.db, {
         companyId,

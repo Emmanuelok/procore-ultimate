@@ -556,6 +556,62 @@ export async function loadCompanyPolicy(db: Db, companyId: string): Promise<Stor
   return row ? rowToPolicy(row) : emptyPolicy(companyId);
 }
 
+/* ------------------------------------------------------------------ */
+/* A SHORT-LIVED CACHE, because this row is now read on every request   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * `requireCompany` consults the tenant's IP allowlist on EVERY company-scoped
+ * request (plugins/auth.ts), which turned one indexed SELECT into one SELECT
+ * per request platform-wide — paid even by the overwhelming majority of
+ * tenants whose `ipAllowlistMode` is `off` and for whom the answer is always
+ * the same.
+ *
+ * So the row is memoised for ten seconds per company, in process, and every
+ * writer invalidates its own company. The consequences are stated rather than
+ * discovered:
+ *
+ *  - A policy change is visible IMMEDIATELY on the replica that made it
+ *    (the two writers — PUT /company/security-policy and PUT /auth/mfa/policy
+ *    — call `invalidateCompanyPolicy`), and within ten seconds everywhere
+ *    else. Ten seconds of an old allowlist is the cost; a per-request query on
+ *    the hot path was the alternative.
+ *  - Nothing security-DECIDING outside the request path uses it: sign-in,
+ *    password assessment and the retention sweep all call `loadCompanyPolicy`
+ *    directly, so a policy change is never stale where it is expensive to be
+ *    wrong.
+ *  - The map is bounded: past `MAX_CACHED_POLICIES` entries the expired ones
+ *    are dropped, and failing that the whole map is, because an unbounded map
+ *    keyed by tenant is a memory leak with a slow fuse.
+ */
+const POLICY_CACHE_TTL_MS = 10_000;
+const MAX_CACHED_POLICIES = 5_000;
+const policyCache = new Map<string, { atMs: number; policy: StoredSecurityPolicy }>();
+
+/** Drop one company's cached policy (or all of them). Call after every write. */
+export function invalidateCompanyPolicy(companyId?: string): void {
+  if (companyId === undefined) policyCache.clear();
+  else policyCache.delete(companyId);
+}
+
+export async function loadCompanyPolicyCached(
+  db: Db,
+  companyId: string,
+  nowMs: number = Date.now(),
+): Promise<StoredSecurityPolicy> {
+  const hit = policyCache.get(companyId);
+  if (hit && nowMs - hit.atMs < POLICY_CACHE_TTL_MS) return hit.policy;
+  const policy = await loadCompanyPolicy(db, companyId);
+  if (policyCache.size >= MAX_CACHED_POLICIES) {
+    for (const [key, entry] of policyCache) {
+      if (nowMs - entry.atMs >= POLICY_CACHE_TTL_MS) policyCache.delete(key);
+    }
+    if (policyCache.size >= MAX_CACHED_POLICIES) policyCache.clear();
+  }
+  policyCache.set(companyId, { atMs: nowMs, policy });
+  return policy;
+}
+
 /** Every tenant this user belongs to, with its stored policy. */
 export async function loadUserPolicies(db: Db, userId: string): Promise<StoredSecurityPolicy[]> {
   const memberships = await db

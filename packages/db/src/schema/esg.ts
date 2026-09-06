@@ -367,6 +367,14 @@ export const carbonTransportLegs = pgTable(
     payloadTonnes: doublePrecision("payload_tonnes").notNull(),
     /** trips over the same leg; the footprint scales with it */
     trips: integer("trips").default(1).notNull(),
+    /**
+     * The activity quantity the footprint was computed on
+     * (payload × distance × trips). Stored, not re-derived: the factor and
+     * the quantity behind a reported figure are what an assurer asks for,
+     * and recomputing them later from columns that may have been corrected
+     * would silently restate the emission.
+     */
+    tonneKm: doublePrecision("tonne_km").notNull(),
     /** kgCO2e per tonne-km actually applied */
     factorKgCo2ePerTonneKm: doublePrecision("factor_kg_co2e_per_tonne_km").notNull(),
     factorSource: text("factor_source").notNull(),

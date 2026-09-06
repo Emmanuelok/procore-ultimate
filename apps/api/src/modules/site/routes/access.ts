@@ -37,7 +37,7 @@ import {
 import { badRequest, conflict, notFound } from "../../../lib/errors.js";
 import { newId } from "../../../lib/ids.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.js";
-import { reconcileAttendance, type AttendanceClaim } from "../engines/attendance.js";
+import { reconcileAttendance, shiftToLocalDays, type AttendanceClaim } from "../engines/attendance.js";
 import { dailyPresence } from "../engines/occupancy.js";
 import {
   ingestGateEvents,
@@ -47,6 +47,7 @@ import {
   reconcileMusterRecord,
 } from "../service.js";
 import {
+  addDaysISO,
   allocateReference,
   assertVendor,
   assertWorker,
@@ -673,6 +674,8 @@ export const accessRoutes: FastifyPluginAsync = async (app) => {
         from: isoDateSchema,
         to: isoDateSchema,
         toleranceHours: z.coerce.number().min(0).max(24).optional(),
+        /** the site's offset from UTC, so both streams agree what "a day" is */
+        utcOffsetMinutes: z.coerce.number().int().min(-840).max(840).default(0),
         result: z.string().max(30).optional(),
       })
       .parse(req.query);
@@ -683,7 +686,16 @@ export const accessRoutes: FastifyPluginAsync = async (app) => {
     }
 
     const [events, attendance] = await Promise.all([
-      loadGateEvents(app.db, companyId, projectId, `${q.from}T00:00:00.000Z`, `${q.to}T23:59:59.999Z`, FEED_READ_CAP),
+      // A day either side, so a shift onto the site's own day boundary does not
+      // lose the reads that belong to the first and last local days.
+      loadGateEvents(
+        app.db,
+        companyId,
+        projectId,
+        `${addDaysISO(q.from, -1)}T00:00:00.000Z`,
+        `${addDaysISO(q.to, 1)}T23:59:59.999Z`,
+        FEED_READ_CAP,
+      ),
       app.db
         .select({
           workerId: siteAccessRecords.workerId,
@@ -717,31 +729,36 @@ export const accessRoutes: FastifyPluginAsync = async (app) => {
       hours: row.hours,
       source: row.source,
     }));
-    const observations = dailyPresence(events, { from: q.from, to: q.to });
+    const observations = dailyPresence(shiftToLocalDays(events, q.utcOffsetMinutes), { from: q.from, to: q.to });
     const report = reconcileAttendance(claims, observations, {
       from: q.from,
       to: q.to,
       ...(q.toleranceHours === undefined ? {} : { toleranceHours: q.toleranceHours }),
     });
     const lines = q.result ? report.lines.filter((line) => line.result === q.result) : report.lines;
-    // Both streams are read with a hard cap. A window that hits it produces a
-    // partial fold, and a partial fold that says nothing about being partial
-    // is the sort of figure this module refuses to print.
-    const capped: string[] = [];
+    // What the reader has to know to read the figures: which day boundary they
+    // are on, and whether either stream hit its cap — a partial fold that says
+    // nothing about being partial is the sort of figure this module refuses.
+    const notes: string[] = [
+      q.utcOffsetMinutes === 0
+        ? "Days are counted on UTC midnight boundaries. Where the working day crosses UTC midnight, pass `utcOffsetMinutes` so the gate feed and the labour register agree on what a day is."
+        : `Days are counted on the site's own boundary (UTC${q.utcOffsetMinutes >= 0 ? "+" : ""}${Math.round(q.utcOffsetMinutes / 60)} h), so a shift that crosses UTC midnight still lands on one day.`,
+    ];
     if (events.length >= FEED_READ_CAP) {
-      capped.push(
+      notes.push(
         `The gate feed returned the maximum of ${FEED_READ_CAP} reads for this window, so the comparison is folded from a partial stream. Narrow the window.`,
       );
     }
     if (claims.length >= FEED_READ_CAP) {
-      capped.push(
+      notes.push(
         `The labour register returned the maximum of ${FEED_READ_CAP} attendance records for this window; later days are not compared. Narrow the window.`,
       );
     }
     return {
       ...report,
-      reasons: [...capped, ...report.reasons],
-      truncated: capped.length > 0,
+      reasons: [...notes, ...report.reasons],
+      utcOffsetMinutes: q.utcOffsetMinutes,
+      truncated: events.length >= FEED_READ_CAP || claims.length >= FEED_READ_CAP,
       lines,
       total: lines.length,
       attendanceRecords: claims.length,

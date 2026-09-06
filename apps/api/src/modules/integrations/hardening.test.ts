@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import {
   developerSandboxes,
   integrationExportProfiles,
@@ -797,6 +797,12 @@ describe("ERP connector framework", () => {
       url: url(`/projects/${projectId}/integrations/erp/export?feed=payments&format=json`),
       headers: owner.headers,
     });
+    /*
+     * Newest FIRST, by seq. A bare select has no ordering guarantee, so
+     * "the last row of the result" is not "the most recent entry" — it read
+     * whichever row the planner happened to return last, which is how this
+     * assertion started reporting another export's figures.
+     */
     const entries = await app.db
       .select()
       .from(ledgerEntries)
@@ -806,9 +812,10 @@ describe("ERP connector framework", () => {
           eq(ledgerEntries.objectType, "integration_export_profile"),
           eq(ledgerEntries.action, "access"),
         ),
-      );
+      )
+      .orderBy(desc(ledgerEntries.seq));
     expect(entries.length).toBeGreaterThan(0);
-    const payload = entries[entries.length - 1]!.payload as Record<string, unknown>;
+    const payload = entries[0]!.payload as Record<string, unknown>;
     expect(payload).toMatchObject({ format: "json" });
     expect(payload).toHaveProperty("rowCount");
     expect(payload).toHaveProperty("currencies");
@@ -898,8 +905,9 @@ describe("ERP connector framework", () => {
           eq(ledgerEntries.companyId, owner.companyId),
           eq(ledgerEntries.objectType, "integration_export_profile"),
         ),
-      );
-    const payload = entries[entries.length - 1]!.payload as Record<string, unknown>;
+      )
+      .orderBy(desc(ledgerEntries.seq));
+    const payload = entries[0]!.payload as Record<string, unknown>;
     expect(payload["invoicesScanned"]).toBe(1);
     expect(payload["invoiceLimit"]).toBe(1);
     expect(payload["truncated"]).toBe(true);

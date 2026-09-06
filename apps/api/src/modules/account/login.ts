@@ -17,7 +17,7 @@ import {
 import {
   effectivePolicyForEmail,
   evaluateIpAccess,
-  loadCompanyPolicy,
+  loadCompanyPolicyCached,
   loadUserPolicies,
   PLATFORM_DEFAULT_POLICY,
   type ResolvedSecurityPolicy,
@@ -372,6 +372,65 @@ export async function guardLoginIpAllowlist(
   );
 }
 
+/* ------------------------------------------------------------------ */
+/* Throttling the per-request allowlist trail                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * WHY THIS EXISTS.
+ *
+ * `guardCompanyIpAccess` runs on every company-scoped request, so an address
+ * outside the allowlist used to write one `login_blocked_ip` row — and one
+ * SIEM delivery — PER REQUEST. In `monitor` mode, the mode an administrator is
+ * told to introduce an allowlist with, the whole affected population is by
+ * definition outside the list, so a single SPA page load wrote five to fifteen
+ * rows per user and the trail the tenant is meant to read was buried by the
+ * monitoring of it. In `enforce` mode a retrying SPA does the same in bursts.
+ *
+ * So an identical decision — same tenant, same user, same address, same
+ * verdict — is recorded at most once per window, and the row that IS written
+ * carries the number of repeats it stands for. A refusal gets a much shorter
+ * window than a monitored allow, because a refusal is a decision an auditor
+ * counts and a monitored allow is telemetry.
+ *
+ * In process, deliberately: the throttle is an economy, not a control, and a
+ * second replica writing its own first row per window is exactly right.
+ */
+const MONITOR_NOTE_WINDOW_MS = 15 * 60_000;
+const REFUSAL_NOTE_WINDOW_MS = 60_000;
+const MAX_NOTE_KEYS = 20_000;
+const ipNoteState = new Map<string, { lastMs: number; suppressed: number }>();
+
+/** Test seam: forget every throttled decision. */
+export function resetIpDecisionThrottle(): void {
+  ipNoteState.clear();
+}
+
+function shouldNoteIpDecision(
+  companyId: string,
+  userId: string,
+  ip: string | null,
+  allowed: boolean,
+  nowMs: number = Date.now(),
+): { record: boolean; suppressed: number; windowMs: number } {
+  const windowMs = allowed ? MONITOR_NOTE_WINDOW_MS : REFUSAL_NOTE_WINDOW_MS;
+  const key = `${companyId}|${userId}|${ip ?? "-"}|${allowed ? "allow" : "refuse"}`;
+  const state = ipNoteState.get(key);
+  if (state && nowMs - state.lastMs < windowMs) {
+    state.suppressed += 1;
+    return { record: false, suppressed: state.suppressed, windowMs };
+  }
+  if (ipNoteState.size >= MAX_NOTE_KEYS) {
+    for (const [k, v] of ipNoteState) {
+      if (nowMs - v.lastMs >= MONITOR_NOTE_WINDOW_MS) ipNoteState.delete(k);
+    }
+    if (ipNoteState.size >= MAX_NOTE_KEYS) ipNoteState.clear();
+  }
+  const suppressed = state?.suppressed ?? 0;
+  ipNoteState.set(key, { lastMs: nowMs, suppressed: 0 });
+  return { record: true, suppressed, windowMs };
+}
+
 /** The resolved policy for an address, used by the login routes before the
  *  password is compared so that lockout thresholds are the tenant's own. */
 export async function loginPolicyFor(
@@ -420,7 +479,10 @@ export async function guardCompanyIpAccess(
 ): Promise<void> {
   let policy: StoredSecurityPolicy;
   try {
-    policy = await loadCompanyPolicy(app.db, companyId);
+    // Cached for ten seconds per company (policy.ts): this runs on every
+    // company-scoped request, and the overwhelming majority of tenants have
+    // `ipAllowlistMode: "off"`, for which the answer never changes.
+    policy = await loadCompanyPolicyCached(app.db, companyId);
   } catch (err) {
     app.log.error({ err, companyId }, "could not read the tenant security policy; allowing");
     return;
@@ -429,23 +491,31 @@ export async function guardCompanyIpAccess(
   const ctx = requestContext(req);
   const verdict = evaluateIpAccess(policy, ctx.ip, userId);
   if (!verdict.outside) return;
-  await recordAuthEvent(app.db, {
-    kind: "login_blocked_ip",
-    outcome: verdict.allowed ? "pending" : "blocked",
-    companyId,
-    userId,
-    ip: ctx.ip,
-    userAgent: ctx.userAgent,
-    reason: verdict.breakGlass
-      ? "Address outside the allowlist; admitted under the break-glass exemption."
-      : verdict.reason,
-    metadata: {
-      mode: verdict.mode,
-      breakGlass: verdict.breakGlass,
-      scope: "company_request",
-      path: req.url,
-    },
-  });
+  const note = shouldNoteIpDecision(companyId, userId, ctx.ip, verdict.allowed);
+  if (note.record) {
+    await recordAuthEvent(app.db, {
+      kind: "login_blocked_ip",
+      outcome: verdict.allowed ? "pending" : "blocked",
+      companyId,
+      userId,
+      ip: ctx.ip,
+      userAgent: ctx.userAgent,
+      reason: verdict.breakGlass
+        ? "Address outside the allowlist; admitted under the break-glass exemption."
+        : verdict.reason,
+      metadata: {
+        mode: verdict.mode,
+        breakGlass: verdict.breakGlass,
+        scope: "company_request",
+        path: req.url,
+        // How many identical decisions for this tenant, user and address were
+        // NOT written since the last row. Never silently dropped: the count is
+        // the honest form of "we stopped repeating ourselves".
+        repeatsSuppressed: note.suppressed,
+        windowMinutes: Math.round(note.windowMs / 60_000),
+      },
+    });
+  }
   if (verdict.allowed) return;
   throw new AppError(
     403,

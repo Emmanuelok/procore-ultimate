@@ -105,6 +105,7 @@ export interface AttendanceReport {
   unattributedPresence: Array<{ date: string; personKey: string; personName: string; hours: number }>;
   attendanceRecords: number;
   gateEvents: number;
+  utcOffsetMinutes: number;
   truncated: boolean;
   reasons: string[];
 }

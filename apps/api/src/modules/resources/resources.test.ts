@@ -2023,6 +2023,28 @@ describe("week boundaries", () => {
     expect(res.json().message).toContain("already buckets its weeks");
   });
 
+  /**
+   * Regression: a new plan INHERITS the project's boundary. The "New plan"
+   * form never sends `weekStartsOn`, so defaulting to Monday here quietly
+   * produced a Monday plan on a Sunday project — and its histogram would
+   * enumerate Mondays while every stored demand and supply row sat on a
+   * Sunday, matching nothing.
+   */
+  it("gives a new plan the project's boundary when none is stated", async () => {
+    const res = await post(`/api/v1/projects/${weekProject}/resource-plans`, {
+      name: "What-if: two extra gangs",
+      planKind: "scenario",
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().weekStartsOn).toBe(0);
+
+    // and a project that has never had one still starts on the ISO Monday
+    const fresh = await makeProject(owner.companyId, "Fresh start");
+    const first = await post(`/api/v1/projects/${fresh}/resource-plans`, { name: "First plan" });
+    expect(first.statusCode).toBe(201);
+    expect(first.json().weekStartsOn).toBe(1);
+  });
+
   it("keeps the project's boundary when no plan is active", async () => {
     await app.db
       .update(resourcePlans)

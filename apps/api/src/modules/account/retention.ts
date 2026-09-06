@@ -1,6 +1,7 @@
 import { and, eq, inArray, isNotNull, lte, ne, or } from "drizzle-orm";
 import { authSecurityEvents, emailDispatches } from "@constructos/db";
 import type { Db } from "../../lib/db.js";
+import { recordAuthEvent } from "./events.js";
 import { loadCompanyPolicy } from "./policy.js";
 
 /**
@@ -50,6 +51,12 @@ export interface RetentionOutcome {
   companyId: string;
   /** true when nothing ran because the tenant is on legal hold */
   skipped: boolean;
+  /**
+   * WHY nothing ran, as a value rather than prose. `legal_hold` is a decision
+   * worth recording; `no_policy` is the state of most tenants on most days and
+   * writing a trail row for it daily would bury the log it is meant to serve.
+   */
+  skipReason: "legal_hold" | "no_policy" | null;
   reason: string | null;
   securityEventsPseudonymised: number;
   emailDispatchesDeleted: number;
@@ -59,6 +66,15 @@ export interface RetentionOptions {
   nowMs?: number;
   /** ceiling per sweep, so one enormous tenant cannot monopolise a tick */
   limit?: number;
+  /** who asked. `null` (the default) is the daily sweep, i.e. the system. */
+  actorId?: string | null;
+  /**
+   * Write the `retention_applied` row. On by default: a sweep that destroys
+   * records without appearing in the log the tenant watches is invisible from
+   * the one surface built to notice it — and it pseudonymises rows in that
+   * very table, so the destruction hides itself by construction.
+   */
+  record?: boolean;
 }
 
 /**
@@ -76,20 +92,26 @@ export async function applyRetention(
   const policy = await loadCompanyPolicy(db, companyId);
 
   if (policy.legalHold) {
-    return {
+    const held: RetentionOutcome = {
       companyId,
       skipped: true,
+      skipReason: "legal_hold",
       reason:
         policy.legalHoldReason ??
         "This organisation is under a legal hold; no authentication record was removed.",
       securityEventsPseudonymised: 0,
       emailDispatchesDeleted: 0,
     };
+    // A hold that stopped a sweep IS the event: "nothing happened, and this is
+    // why" is what an auditor asks for when the numbers stop moving.
+    await note(db, held, options);
+    return held;
   }
   if (policy.securityEventRetentionDays === null && policy.emailDispatchRetentionDays === null) {
     return {
       companyId,
       skipped: true,
+      skipReason: "no_policy",
       reason: "This organisation has set no retention period, so nothing is removed.",
       securityEventsPseudonymised: 0,
       emailDispatchesDeleted: 0,
@@ -155,11 +177,47 @@ export async function applyRetention(
     }
   }
 
-  return {
+  const outcome: RetentionOutcome = {
     companyId,
     skipped: false,
+    skipReason: null,
     reason: null,
     securityEventsPseudonymised: pseudonymised,
     emailDispatchesDeleted: deleted,
   };
+  await note(db, outcome, options);
+  return outcome;
+}
+
+/**
+ * Put the sweep in the trail the tenant reads and the SIEM consumes.
+ *
+ * The ledger already records it, but the ledger is not what a SIEM subscribes
+ * to and not what /company/security-events shows. `retention_applied` was
+ * declared for exactly this and nothing emitted it, so the two surfaces a
+ * customer actually watches never learned that their sign-in audit had been
+ * pseudonymised or their message log deleted.
+ *
+ * Never fails the sweep: `recordAuthEvent` swallows its own errors by design.
+ */
+async function note(
+  db: Db,
+  outcome: RetentionOutcome,
+  options: RetentionOptions,
+): Promise<void> {
+  if (options.record === false) return;
+  await recordAuthEvent(db, {
+    kind: "retention_applied",
+    outcome: outcome.skipped ? "blocked" : "success",
+    companyId: outcome.companyId,
+    userId: options.actorId ?? null,
+    reason: outcome.skipped
+      ? (outcome.reason ?? "Retention did not run.")
+      : `Retention applied: ${outcome.securityEventsPseudonymised} trail rows pseudonymised, ` +
+        `${outcome.emailDispatchesDeleted} message records deleted`,
+    metadata: {
+      ...outcome,
+      trigger: options.actorId ? "manual" : "scheduled",
+    },
+  });
 }

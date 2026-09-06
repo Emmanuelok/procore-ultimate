@@ -1,5 +1,5 @@
 {
-  "id": "de41d96d-0c83-47cf-b0f6-fa3b71f56948",
+  "id": "d11936d6-ba44-4d2e-8793-d445c906e6b8",
   "prevId": "340cf323-a4ed-4b81-8d6c-8f3e94b698e3",
   "version": "7",
   "dialect": "postgresql",
@@ -34429,6 +34429,12 @@
           "primaryKey": false,
           "notNull": true,
           "default": 1
+        },
+        "tonne_km": {
+          "name": "tonne_km",
+          "type": "double precision",
+          "primaryKey": false,
+          "notNull": true
         },
         "factor_kg_co2e_per_tonne_km": {
           "name": "factor_kg_co2e_per_tonne_km",

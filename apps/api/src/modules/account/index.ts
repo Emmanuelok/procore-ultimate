@@ -27,6 +27,7 @@ import {
   unauthorized,
 } from "../../lib/errors.js";
 import { isExpired } from "../../lib/time.js";
+import { forEachCompany } from "../../lib/scheduler.js";
 import { emailTransportFor } from "./mailer.js";
 import { addSecurityEventHook, recordAuthEvent, recordLegacyAuthEvent } from "./events.js";
 import {
@@ -1439,24 +1440,32 @@ export const accountModule: FastifyPluginAsync = async (app) => {
       "Apply each tenant's authentication-record retention policy: pseudonymise the trail, delete the message log, skip anyone on legal hold",
     everyMs: 24 * 3600_000,
     run: async ({ db, now }) => {
-      const rows = await db.select({ id: companies.id }).from(companies);
       let pseudonymised = 0;
       let deleted = 0;
       let held = 0;
-      for (const row of rows) {
-        try {
-          const outcome = await applyRetention(db, row.id, { nowMs: now.getTime() });
-          if (outcome.skipped) {
-            held += 1;
-            continue;
-          }
-          pseudonymised += outcome.securityEventsPseudonymised;
-          deleted += outcome.emailDispatchesDeleted;
-        } catch {
-          /* one tenant's retention must not stop the rest */
+      // forEachCompany (lib/scheduler.ts) is the platform's sweep primitive:
+      // it walks the tenants, isolates one tenant's failure from the rest and
+      // reports which ones failed. Rolling our own here read every company row
+      // into memory and swallowed the errors.
+      const walk = await forEachCompany(db, async (companyId) => {
+        const outcome = await applyRetention(db, companyId, {
+          nowMs: now.getTime(),
+          actorId: null,
+        });
+        if (outcome.skipped) {
+          held += 1;
+          return;
         }
-      }
-      return { pseudonymised, deleted, skipped: held };
+        pseudonymised += outcome.securityEventsPseudonymised;
+        deleted += outcome.emailDispatchesDeleted;
+      });
+      return {
+        pseudonymised,
+        deleted,
+        skipped: held,
+        companies: walk.companies,
+        failed: walk.failed.length,
+      };
     },
   });
 
@@ -1483,15 +1492,10 @@ export const accountModule: FastifyPluginAsync = async (app) => {
 
   /** Run `fn` for every company, summing what each returns. */
   async function forEachCompanySweep(fn: (companyId: string) => Promise<number>): Promise<number> {
-    const rows = await app.db.select({ id: companies.id }).from(companies);
     let total = 0;
-    for (const row of rows) {
-      try {
-        total += await fn(row.id);
-      } catch {
-        /* one tenant's sweep must not stop the rest */
-      }
-    }
+    await forEachCompany(app.db, async (companyId) => {
+      total += await fn(companyId);
+    });
     return total;
   }
 };

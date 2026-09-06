@@ -1722,11 +1722,14 @@ export function registerEnvironmentRoutes(app: FastifyInstance): void {
         landfillTonnes: round2(
           waste.filter((w) => w.destination === "landfill").reduce((s, w) => s + w.tonnes, 0),
         ),
+        // WASTE_DESTINATIONS says "recycled"; "recycling" matched nothing, so
+        // the disclosure reported a recycled tonnage of zero on every project
+        // that recycles. Hazard is a property of the STREAM, not a flag.
         recycledTonnes: round2(
-          waste.filter((w) => w.destination === "recycling").reduce((s, w) => s + w.tonnes, 0),
+          waste.filter((w) => w.destination === "recycled").reduce((s, w) => s + w.tonnes, 0),
         ),
         hazardousTonnes: round2(
-          waste.filter((w) => w.isHazardous === 1).reduce((s, w) => s + w.tonnes, 0),
+          waste.filter((w) => w.stream === "hazardous").reduce((s, w) => s + w.tonnes, 0),
         ),
         recordCount: waste.length,
       },

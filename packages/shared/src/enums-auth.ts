@@ -53,6 +53,15 @@ export const EXTRA_AUTH_EVENT_KINDS = [
   "email_changed",
   /** §0.2 #45 — the account holder exported their own authentication record */
   "account_export",
+  /**
+   * An administrator exported the tenant's sign-in audit.
+   *
+   * It has its own kind because it is an ACCESS, not a change: recording it as
+   * `security_policy_changed` (which it briefly was) made every export look
+   * like a policy change to the tenant's own audit page and to every SIEM rule
+   * counting them.
+   */
+  "security_events_exported",
   /** §0.2 #46/#47 — a retention sweep pseudonymised or deleted records */
   "retention_applied",
 ] as const;

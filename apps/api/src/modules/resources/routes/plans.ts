@@ -94,6 +94,14 @@ export const planRoutes: FastifyPluginAsync = async (app) => {
     if (body.weekStartsOn !== undefined) {
       await assertWeekBoundary(companyId, projectId, body.weekStartsOn, null);
     }
+    /* A new plan INHERITS the project's week boundary. Defaulting to Monday
+       here was the same bug wearing different clothes: on a Sunday-start
+       project the "New plan" form (which never sends weekStartsOn) would
+       quietly produce a Monday plan, and the histogram would then enumerate
+       Mondays while every demand and supply row already stored sat on a
+       Sunday — not one key matching, every cell empty. */
+    const weekStartsOn =
+      body.weekStartsOn ?? (await projectWeekStartsOn(app.db, companyId, projectId));
 
     const number = await nextRecordNumber(app.db, projectId, "resource_plan");
     const id = newId("rpl");
@@ -111,7 +119,7 @@ export const planRoutes: FastifyPluginAsync = async (app) => {
       scheduleId: schedule?.id ?? null,
       periodStart: body.periodStart ?? null,
       periodEnd: body.periodEnd ?? null,
-      weekStartsOn: body.weekStartsOn ?? 1,
+      weekStartsOn,
       source: "manual",
       version: 1,
       supersedesPlanId: body.supersedesPlanId ?? null,
@@ -678,16 +686,77 @@ export const planRoutes: FastifyPluginAsync = async (app) => {
             `${MAX_HISTOGRAM_WEEKS} weeks so a typo cannot write five years of rows.`,
         );
       }
-      const written: string[] = [];
-      for (const weekStart of weeks) {
-        const row = await upsertAvailability(
-          companyId,
-          projectId,
-          { ...body, weekStart },
-          actorOf(req),
-        );
-        written.push(row.id);
-      }
+      /* One statement per week, but ONE transaction and two round trips —
+         not a select-then-write per week. A term fill is a single act: half
+         of it landing because the process died mid-loop would leave a
+         histogram whose supply stops in the middle of a term with nothing
+         saying why. */
+      const actorId = actorOf(req);
+      const at = nowIso();
+      const written = await app.db.transaction(async (tx) => {
+        const existing = await tx
+          .select({ id: resourceAvailability.id, weekStart: resourceAvailability.weekStart })
+          .from(resourceAvailability)
+          .where(
+            and(
+              eq(resourceAvailability.projectId, projectId),
+              eq(resourceAvailability.resourceTypeId, body.resourceTypeId),
+              inArray(resourceAvailability.weekStart, weeks),
+            ),
+          );
+        const heldByWeek = new Map(existing.map((r) => [r.weekStart, r.id]));
+        const ids: string[] = [];
+        const inserts: Array<typeof resourceAvailability.$inferInsert> = [];
+        for (const weekStart of weeks) {
+          const held = heldByWeek.get(weekStart);
+          if (held) {
+            ids.push(held);
+            continue;
+          }
+          const id = newId("rav");
+          ids.push(id);
+          inserts.push({
+            id,
+            companyId,
+            projectId,
+            resourceTypeId: body.resourceTypeId,
+            weekStart,
+            availableHours: body.availableHours,
+            availableHeadcount: body.availableHeadcount ?? null,
+            source: body.source ?? "manual",
+            vendorId: body.vendorId ?? null,
+            commitmentId: null,
+            note: body.note ?? null,
+            detail: {},
+            createdBy: actorId,
+          });
+        }
+        if (existing.length > 0) {
+          /* A second statement REPLACES the first: two half-remembered
+             figures for one week would silently double the supply. */
+          await tx
+            .update(resourceAvailability)
+            .set({
+              availableHours: body.availableHours,
+              availableHeadcount: body.availableHeadcount ?? null,
+              source: body.source ?? "manual",
+              vendorId: body.vendorId ?? null,
+              commitmentId: null,
+              note: body.note ?? null,
+              updatedAt: at,
+            })
+            .where(
+              inArray(
+                resourceAvailability.id,
+                existing.map((r) => r.id),
+              ),
+            );
+        }
+        for (let i = 0; i < inserts.length; i += 200) {
+          await tx.insert(resourceAvailability).values(inserts.slice(i, i + 200));
+        }
+        return ids;
+      });
       await ledgerResources(app.db, req, "update", "resource_availability", body.resourceTypeId, {
         action: "bulk",
         from: body.from,

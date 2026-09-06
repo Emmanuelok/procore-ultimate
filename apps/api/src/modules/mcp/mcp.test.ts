@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { companyMemberships, ledgerEntries, projectMemberships, projects, rfis } from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
 import { newId } from "../../lib/ids.js";
@@ -441,6 +441,8 @@ describe("audit", () => {
         ),
       );
     await rpc(owner.headers, [call(1, "tools/list"), call(2, "tools/call", { name: "list_projects" })]);
+    // Newest first, by seq: a bare select has no ordering guarantee, so the
+    // last row of the result is not necessarily the entry just written.
     const after = await app.db
       .select()
       .from(ledgerEntries)
@@ -449,9 +451,10 @@ describe("audit", () => {
           eq(ledgerEntries.companyId, owner.companyId),
           eq(ledgerEntries.objectType, "mcp_session"),
         ),
-      );
+      )
+      .orderBy(desc(ledgerEntries.seq));
     expect(after.length).toBe(before.length + 1);
-    const payload = after[after.length - 1]!.payload as Record<string, unknown>;
+    const payload = after[0]!.payload as Record<string, unknown>;
     expect(payload["methods"]).toEqual(expect.arrayContaining(["tools/list", "tools/call"]));
     expect(payload["tools"]).toEqual(["list_projects"]);
     expect(payload["calls"]).toBe(2);

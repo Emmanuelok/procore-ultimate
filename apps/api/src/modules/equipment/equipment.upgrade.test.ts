@@ -531,8 +531,9 @@ describe("regressions", () => {
       availableHours: 10,
       workingHours: 8,
       idleHours: 2,
+      idleReason: "awaiting_materials",
     });
-    expect(day.statusCode).toBe(201);
+    expect(day.statusCode, day.body).toBe(201);
     expect(day.json().cost.hireCost).toBe(400);
     expect(day.json().cost.basis.hire).toContain("internal charge-out rate");
   });
@@ -760,7 +761,7 @@ describe("telematics day hours", () => {
     expect(row.telematicsHours).toBe(17);
     expect(row.varianceHours).toBe(0);
     expect(row.daysUnsupported).toBe(0);
-    expect(res.json().method).toContain("before it began");
+    expect(res.json().method).toContain("BEFORE it began");
   });
 
   it("does not turn a day the feed never reached into zero hours", async () => {
@@ -1435,6 +1436,7 @@ describe("certificate and maintenance verification respect the caller's scope", 
         availableHours: 10,
         workingHours: 0,
         standbyHours: 10,
+        idleReason: "no_work_available",
       });
       expect(res.statusCode, res.body).toBe(201);
     }

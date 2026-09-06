@@ -27,6 +27,31 @@
  * Pure: loading the two streams and rendering the verdicts is the caller's job.
  */
 
+/**
+ * Move a gate feed onto the site's own day boundary.
+ *
+ * `dailyPresence` splits sessions at UTC midnight, and an attendance record
+ * carries a plain calendar date the site wrote in its own time. On a site at
+ * UTC+8 a 07:00 shift starts at 23:00 the PREVIOUS UTC day, so comparing the
+ * two streams unshifted would report a missing gate read on one day and an
+ * unexplained presence on the next — an accusation manufactured by arithmetic.
+ *
+ * Shifting every read by the site's offset before folding moves the boundary
+ * without changing any duration: the instants are no longer real instants
+ * afterwards, so the shifted stream is used ONLY to bucket days and hours.
+ */
+export function shiftToLocalDays<T extends { occurredAt: string }>(
+  events: readonly T[],
+  offsetMinutes: number,
+): T[] {
+  if (offsetMinutes === 0) return [...events];
+  return events.map((event) => {
+    const at = Date.parse(event.occurredAt);
+    if (Number.isNaN(at)) return event;
+    return { ...event, occurredAt: new Date(at + offsetMinutes * 60_000).toISOString() };
+  });
+}
+
 export interface AttendanceClaim {
   workerId: string;
   workerName: string | null;

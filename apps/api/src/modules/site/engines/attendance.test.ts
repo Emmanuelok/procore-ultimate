@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { reconcileAttendance, type AttendanceClaim, type AttendanceObservation } from "./attendance.js";
+import {
+  reconcileAttendance,
+  shiftToLocalDays,
+  type AttendanceClaim,
+  type AttendanceObservation,
+} from "./attendance.js";
 
 const window = { from: "2026-05-04", to: "2026-05-05" };
 
@@ -135,5 +140,28 @@ describe("reconcileAttendance", () => {
     );
     expect(r.lines).toHaveLength(0);
     expect(r.daysInWindow).toBe(2);
+  });
+});
+
+describe("shiftToLocalDays", () => {
+  it("moves the day boundary without changing any duration", () => {
+    const events = [
+      { id: "a", occurredAt: "2026-05-04T23:00:00.000Z" },
+      { id: "b", occurredAt: "2026-05-05T08:00:00.000Z" },
+    ];
+    const shifted = shiftToLocalDays(events, 8 * 60);
+    // A shift that started at 07:00 local (UTC+8) now lands on one local day...
+    expect(shifted[0]?.occurredAt).toBe("2026-05-05T07:00:00.000Z");
+    expect(shifted[1]?.occurredAt).toBe("2026-05-05T16:00:00.000Z");
+    // ...and the nine hours between the two reads are untouched.
+    expect(Date.parse(shifted[1]!.occurredAt) - Date.parse(shifted[0]!.occurredAt)).toBe(
+      Date.parse(events[1]!.occurredAt) - Date.parse(events[0]!.occurredAt),
+    );
+  });
+
+  it("is a no-op at zero and leaves an unparseable timestamp alone", () => {
+    const events = [{ id: "a", occurredAt: "2026-05-04T23:00:00.000Z" }, { id: "b", occurredAt: "not a date" }];
+    expect(shiftToLocalDays(events, 0)).toEqual(events);
+    expect(shiftToLocalDays(events, 60)[1]?.occurredAt).toBe("not a date");
   });
 });

@@ -2093,6 +2093,7 @@ export function MaterialItemModal({
   const [quantityRequired, setQuantityRequired] = useState("0");
   const [reorderLevel, setReorderLevel] = useState("");
   const [leadTimeDays, setLeadTimeDays] = useState("");
+  const [requiredOnSiteDate, setRequiredOnSiteDate] = useState("");
   const [status, setStatus] = useState("planned");
   const [isHazardous, setIsHazardous] = useState(false);
   const [isTracked, setIsTracked] = useState(true);
@@ -2115,6 +2116,7 @@ export function MaterialItemModal({
         quantityRequired: Number(quantityRequired || 0),
         reorderLevel: num(reorderLevel),
         leadTimeDays: num(leadTimeDays),
+        requiredOnSiteDate: requiredOnSiteDate || null,
         storageRequirements: storageRequirements.trim() || null,
         isHazardous,
         isTracked,
@@ -2220,6 +2222,17 @@ export function MaterialItemModal({
           />
         </Field>
       </div>
+      <Field
+        label="Required on site"
+        optional
+        hint="The other half of the order-by date. With a need date and a lead time the supply view says when this had to be ordered — and tells you the day that date passes, which is the last day the slip is still recoverable."
+      >
+        <Input
+          type="date"
+          value={requiredOnSiteDate}
+          onChange={(e) => setRequiredOnSiteDate(e.target.value)}
+        />
+      </Field>
       <Field label="Storage requirements" optional>
         <Textarea
           rows={2}

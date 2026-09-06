@@ -1966,6 +1966,7 @@ CREATE TABLE "carbon_transport_legs" (
 	"distance_km" double precision NOT NULL,
 	"payload_tonnes" double precision NOT NULL,
 	"trips" integer DEFAULT 1 NOT NULL,
+	"tonne_km" double precision NOT NULL,
 	"factor_kg_co2e_per_tonne_km" double precision NOT NULL,
 	"factor_source" text NOT NULL,
 	"tco2e" double precision NOT NULL,
