@@ -277,3 +277,41 @@ export const BUNDLE_ITEM_PRIVILEGE = [
   "commercially_confidential",
 ] as const;
 export type BundleItemPrivilege = (typeof BUNDLE_ITEM_PRIVILEGE)[number];
+
+/* ------------------------------------------------------------------ */
+/* Designated (special) accounts and availability payments (Domain O)   */
+/* ------------------------------------------------------------------ */
+
+/** Lifecycle of a designated/special account held under a facility. */
+export const DESIGNATED_ACCOUNT_STATUSES = ["active", "suspended", "closed"] as const;
+export type DesignatedAccountStatus = (typeof DESIGNATED_ACCOUNT_STATUSES)[number];
+
+/**
+ * Movements on a designated account. The kind decides the sign, so an
+ * amount is always recorded positive and a data-entry slip cannot turn a
+ * withdrawal into a deposit.
+ */
+export const DESIGNATED_ACCOUNT_ENTRY_KINDS = [
+  "advance",
+  "replenishment",
+  "eligible_expenditure",
+  "ineligible_expenditure",
+  "bank_charge",
+  "interest_earned",
+  "refund_to_lender",
+  "transfer_out",
+] as const;
+export type DesignatedAccountEntryKind = (typeof DESIGNATED_ACCOUNT_ENTRY_KINDS)[number];
+
+/** Outcome of a period reconciliation of the account against the bank. */
+export const RECONCILIATION_OUTCOMES = ["reconciled", "unreconciled"] as const;
+export type ReconciliationOutcome = (typeof RECONCILIATION_OUTCOMES)[number];
+
+/** Lifecycle of an availability payment period (PPP unitary charge). */
+export const AVAILABILITY_PERIOD_STATUSES = [
+  "draft",
+  "certified",
+  "disputed",
+  "paid",
+] as const;
+export type AvailabilityPeriodStatus = (typeof AVAILABILITY_PERIOD_STATUSES)[number];

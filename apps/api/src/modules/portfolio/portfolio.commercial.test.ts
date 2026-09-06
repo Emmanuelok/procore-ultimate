@@ -68,6 +68,13 @@ function dateOffset(days: number): string {
   return d.toISOString().slice(0, 10);
 }
 
+/* Booting an embedded PGlite and applying the full migration set takes well
+   over the repo-wide 30s hook budget whenever anything else is running on the
+   machine, and the failure looks like a worker abort rather than a failed
+   assertion. The hook is given its own budget so this suite means what it
+   says under load. */
+const BOOT_TIMEOUT_MS = 180_000;
+
 beforeAll(async () => {
   built = await buildTestApp();
   app = built.app;
@@ -130,7 +137,7 @@ beforeAll(async () => {
     { id: vendorAlpha, companyId: owner.companyId, name: "Alpha Civils Ltd", country: "GB" },
     { id: vendorBeta, companyId: owner.companyId, name: "Beta Build Ltd", country: "GB" },
   ]);
-});
+}, BOOT_TIMEOUT_MS);
 
 afterAll(async () => {
   await built.close();

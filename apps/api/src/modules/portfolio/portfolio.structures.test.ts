@@ -67,6 +67,13 @@ async function makeProject(name: string, currency = "GBP") {
   return id;
 }
 
+/* Booting an embedded PGlite and applying the full migration set takes well
+   over the repo-wide 30s hook budget whenever anything else is running on the
+   machine, and the failure looks like a worker abort rather than a failed
+   assertion. The hook is given its own budget so this suite means what it
+   says under load. */
+const BOOT_TIMEOUT_MS = 180_000;
+
 beforeAll(async () => {
   built = await buildTestApp();
   app = built.app;
@@ -110,7 +117,7 @@ beforeAll(async () => {
     authorization: viewer.headers["authorization"]!,
     "x-company-id": owner.companyId,
   };
-});
+}, BOOT_TIMEOUT_MS);
 
 afterAll(async () => {
   await built.close();
