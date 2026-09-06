@@ -30,9 +30,11 @@ import {
   DisbursedBar,
   fmtMoney,
   instrumentTone,
+  type CurrencyBucket,
   type FacilityRow,
   type FinanceSummary,
   type ListResponse,
+  type MaybeTotal,
 } from "./financeShared";
 
 function Stat({
@@ -73,8 +75,21 @@ function Stat({
 function CovenantStatusChip({ status }: { status: FinanceSummary["covenantStatus"] }) {
   if (status === null) return <Badge tone="gray">No covenants</Badge>;
   if (status === "breached") return <Badge tone="red">✗ Covenant breach</Badge>;
+  if (status === "waived") return <Badge tone="amber">Breach waived by lender</Badge>;
   if (status === "unknown") return <Badge tone="amber">Readings missing</Badge>;
   return <Badge tone="green">✓ Covenants compliant</Badge>;
+}
+
+/** Amount held in one currency bucket; null (rendered "—") when absent. */
+function amountIn(buckets: CurrencyBucket[] | undefined, currency: string): number | null {
+  const hit = (buckets ?? []).find((b) => b.currency === currency);
+  return hit ? hit.amount : null;
+}
+
+/** The explanation attached to a total the API refused to compute. */
+function reasonOf(total: MaybeTotal | undefined): string | null {
+  if (!total || total.value !== null) return null;
+  return total.reasons.join(" ");
 }
 
 interface CategoryDraft {
@@ -191,7 +206,8 @@ export default function FinancePage() {
     );
   }
 
-  const currency = facilities?.[0]?.currency ?? "GBP";
+  const currencies = summary?.currencies ?? [];
+  const singleCurrency = currencies.length === 1 ? currencies[0]! : null;
 
   return (
     <div>
@@ -201,35 +217,100 @@ export default function FinancePage() {
         actions={<Button onClick={openCreate}>New facility</Button>}
       />
 
-      {/* summary strip */}
+      {/* summary strip — money is bucketed by currency and never summed across
+          them; with more than one currency the headline figures are replaced by
+          a per-currency table rather than a wrong total. */}
       {summary ? (
-        <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-          <Stat label="Committed" value={fmtMoney(summary.committed, currency)} />
-          <Stat label="Disbursed" value={fmtMoney(summary.disbursed, currency)} />
-          <Stat
-            label="Undisbursed"
-            value={fmtMoney(summary.undisbursed, currency)}
-            tone="brand"
-            emphasized
-          />
-          <Stat
-            label="Pending requests"
-            value={summary.pendingRequests}
-            tone={summary.pendingRequests > 0 ? "amber" : undefined}
-          />
-          <Stat
-            label="Open conditions"
-            value={summary.openConditions}
-            tone={summary.openConditions > 0 ? "amber" : "green"}
-          />
-          <Card>
-            <CardBody className="flex h-full flex-col justify-center px-4 py-3">
-              <CovenantStatusChip status={summary.covenantStatus} />
-              <div className="mt-1.5 text-xs font-medium uppercase tracking-wide text-ink-400">
-                Covenant status
-              </div>
-            </CardBody>
-          </Card>
+        <div className="mb-4 space-y-3">
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+            {singleCurrency ? (
+              <>
+                <Stat
+                  label="Committed"
+                  value={fmtMoney(amountIn(summary.committedByCurrency, singleCurrency), singleCurrency)}
+                />
+                <Stat
+                  label="Disbursed"
+                  value={fmtMoney(amountIn(summary.disbursedByCurrency, singleCurrency), singleCurrency)}
+                />
+                <Stat
+                  label="Undisbursed"
+                  value={fmtMoney(
+                    amountIn(summary.undisbursedByCurrency, singleCurrency),
+                    singleCurrency,
+                  )}
+                  tone="brand"
+                  emphasized
+                />
+              </>
+            ) : (
+              <Card className="col-span-2 sm:col-span-3">
+                <CardBody className="px-4 py-3">
+                  <div className="text-xs font-medium uppercase tracking-wide text-ink-400">
+                    Funding by currency
+                  </div>
+                  {currencies.length === 0 ? (
+                    <p className="mt-1 text-sm text-ink-500">
+                      — no facilities registered, so there is nothing to total.
+                    </p>
+                  ) : (
+                    <table className="mt-1.5 w-full text-xs tabular-nums">
+                      <thead>
+                        <tr className="text-ink-400">
+                          <th className="text-left font-medium">Currency</th>
+                          <th className="text-right font-medium">Committed</th>
+                          <th className="text-right font-medium">Disbursed</th>
+                          <th className="text-right font-medium">Undisbursed</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {currencies.map((cur) => (
+                          <tr key={cur} className="border-t border-ink-100">
+                            <td className="py-1 font-semibold text-ink-800">{cur}</td>
+                            <td className="py-1 text-right text-ink-700">
+                              {fmtMoney(amountIn(summary.committedByCurrency, cur), cur)}
+                            </td>
+                            <td className="py-1 text-right text-ink-700">
+                              {fmtMoney(amountIn(summary.disbursedByCurrency, cur), cur)}
+                            </td>
+                            <td className="py-1 text-right font-semibold text-brand-700">
+                              {fmtMoney(amountIn(summary.undisbursedByCurrency, cur), cur)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                  {reasonOf(summary.committedTotal) ? (
+                    <p className="mt-1.5 text-xs text-ink-500">{reasonOf(summary.committedTotal)}</p>
+                  ) : null}
+                </CardBody>
+              </Card>
+            )}
+            <Stat
+              label="Pending requests"
+              value={summary.pendingRequests}
+              tone={summary.pendingRequests > 0 ? "amber" : undefined}
+            />
+            <Stat
+              label="Awaiting certification"
+              value={summary.awaitingCertification}
+              tone={summary.awaitingCertification > 0 ? "amber" : undefined}
+            />
+            <Stat
+              label="Open conditions"
+              value={summary.openConditions}
+              tone={summary.openConditions > 0 ? "amber" : "green"}
+            />
+            <Card>
+              <CardBody className="flex h-full flex-col justify-center px-4 py-3">
+                <CovenantStatusChip status={summary.covenantStatus} />
+                <div className="mt-1.5 text-xs font-medium uppercase tracking-wide text-ink-400">
+                  Covenant status
+                </div>
+              </CardBody>
+            </Card>
+          </div>
         </div>
       ) : null}
 

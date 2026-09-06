@@ -3,10 +3,15 @@ import { registerParcelRoutes } from "./parcels.js";
 import { registerPapRoutes } from "./paps.js";
 import { registerGrievanceRoutes } from "./grievances.js";
 import { registerEngagementRoutes } from "./engagement.js";
+import { registerSafeguardRoutes } from "./safeguards.js";
+import { registerLandJobs } from "./detectors.js";
+import { ACQUISITION_BASES } from "@constructos/shared";
 import {
   ENGAGEMENT_KINDS,
   GRIEVANCE_CATEGORIES,
   GRIEVANCE_SLA,
+  PAP_TRANSITIONS,
+  PARCEL_ACQUIRABLE_FROM,
   PARCEL_TRANSITIONS,
   STAKEHOLDER_CATEGORIES,
   STAKEHOLDER_QUADRANTS,
@@ -57,6 +62,9 @@ export const landModule: FastifyPluginAsync = async (app) => {
     grievanceCategories: GRIEVANCE_CATEGORIES,
     vulnerabilityFlags: VULNERABILITY_FLAGS,
     parcelTransitions: PARCEL_TRANSITIONS,
+    parcelAcquirableFrom: PARCEL_ACQUIRABLE_FROM,
+    papTransitions: PAP_TRANSITIONS,
+    acquisitionBases: ACQUISITION_BASES,
     stakeholderCategories: STAKEHOLDER_CATEGORIES,
     stakeholderQuadrants: STAKEHOLDER_QUADRANTS,
     engagementKinds: ENGAGEMENT_KINDS,
@@ -66,4 +74,16 @@ export const landModule: FastifyPluginAsync = async (app) => {
   await registerPapRoutes(app);
   await registerGrievanceRoutes(app);
   await registerEngagementRoutes(app);
+  await registerSafeguardRoutes(app);
+
+  /*
+   * Every land finding — grievance SLA breach and automatic escalation,
+   * grievance hotspots, IFC PS5 conformance, replacement-cost shortfall,
+   * unnotified chance finds and the consent-to-programme dependency — is
+   * raised by this scheduled job as the SYSTEM actor. It replaced a set of
+   * lazy sweeps that ran on page reads with no lock and no unique key, so
+   * the workspace's own parallel loads duplicated findings and made whoever
+   * opened the page the ledger actor for them.
+   */
+  registerLandJobs(app);
 };

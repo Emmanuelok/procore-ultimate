@@ -42,10 +42,14 @@ let app: FastifyInstance;
 
 const url = (p: string) => `/api/v1${p}`;
 
+// 120s, not the global 30s: this hook boots an embedded PGlite and applies the whole
+// migration set, which on a loaded build machine takes longer than the default hook
+// timeout — a worker that times out here reports every test in the file as skipped,
+// which looks exactly like a green run that tested nothing.
 beforeAll(async () => {
   built = await buildTestApp();
   app = built.app;
-});
+}, 120_000);
 
 afterAll(async () => {
   await built.close();
@@ -1613,7 +1617,12 @@ describe("REGRESSION: reads no longer load payload snapshots", () => {
       .where(eq(chainWatermarks.companyId, actor.companyId));
     expect(marks).toHaveLength(1);
     expect(marks[0]!.deepVerifiedSeq).toBeGreaterThan(0);
-  });
+    // 120s: this one grows a chain, seals it, classifies it and then runs the
+    // deep-verify job over every stored snapshot. It is the most expensive
+    // test in the file and it exceeds the 30s default whenever the build
+    // machine is busy — and a timeout here reports as a failure of the code
+    // rather than of the clock.
+  }, 120_000);
 });
 
 describe("OpenTimestamps upgrade", () => {

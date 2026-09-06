@@ -14,9 +14,21 @@
  *    reasons }`, never a zero.
  */
 import type { FastifyInstance } from "fastify";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import { z } from "zod";
-import { locations, scheduleTasks, signals, vendors, workers } from "@constructos/db";
+import {
+  companyMemberships,
+  dailyLogs,
+  entities,
+  locations,
+  paymentApplications,
+  scheduleTasks,
+  signals,
+  users,
+  valuations,
+  vendors,
+  workers,
+} from "@constructos/db";
 import type { NotificationKind, SignalSeverity, SiteDetector } from "@constructos/shared";
 import type { Db } from "../../lib/db.js";
 import { badRequest, notFound } from "../../lib/errors.js";
@@ -333,6 +345,109 @@ export async function assertTask(db: Db, projectId: string, taskId: string) {
   const task = rows[0];
   if (!task) throw badRequest(`Schedule task ${taskId} not found in this project.`);
   return task;
+}
+
+/**
+ * Resolve the party a progress claim is attributed to.
+ *
+ * The different-actor rule is only a control if the OTHER actor exists: a
+ * free-text claimant id makes "somebody else claimed this" unfalsifiable, so
+ * every claimant is resolved against the register its kind names before an
+ * Assertion is written in their name.
+ */
+export type ClaimantKind = "user" | "entity" | "vendor";
+
+export interface ResolvedClaimant {
+  kind: ClaimantKind;
+  id: string;
+  name: string;
+}
+
+export async function assertClaimant(
+  db: Db,
+  companyId: string,
+  kind: ClaimantKind,
+  claimantId: string,
+): Promise<ResolvedClaimant> {
+  if (kind === "user") {
+    const row = (
+      await db
+        .select({ id: users.id, name: users.name })
+        .from(companyMemberships)
+        .innerJoin(users, eq(users.id, companyMemberships.userId))
+        .where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.userId, claimantId)))
+        .limit(1)
+    )[0];
+    if (!row) {
+      throw badRequest(
+        `Claimant ${claimantId} is not a user of this company. A progress claim is attributed to a real party — pick the person who made it, or record the claim against their vendor or entity instead.`,
+      );
+    }
+    return { kind, id: row.id, name: row.name };
+  }
+  if (kind === "vendor") {
+    const row = (
+      await db
+        .select({ id: vendors.id, name: vendors.name })
+        .from(vendors)
+        .where(and(eq(vendors.id, claimantId), eq(vendors.companyId, companyId)))
+        .limit(1)
+    )[0];
+    if (!row) throw badRequest(`Claimant vendor ${claimantId} is not in this company's directory.`);
+    return { kind, id: row.id, name: row.name };
+  }
+  const row = (
+    await db
+      .select({ id: entities.id, name: entities.name })
+      .from(entities)
+      .where(and(eq(entities.id, claimantId), eq(entities.companyId, companyId), isNull(entities.deletedAt)))
+      .limit(1)
+  )[0];
+  if (!row) throw badRequest(`Claimant entity ${claimantId} is not in this company's entity register.`);
+  return { kind, id: row.id, name: row.name };
+}
+
+/**
+ * The record a claim came from. An id stored on an Assertion as its source
+ * must point at something: a valuation, an application, a daily log or a
+ * schedule task in THIS project. A `manual` claim has no record, so an id
+ * given with it is refused rather than kept as decoration.
+ */
+export async function assertClaimSource(
+  db: Db,
+  companyId: string,
+  projectId: string,
+  sourceType: string,
+  sourceId: string,
+): Promise<void> {
+  const found = async (
+    table: typeof valuations | typeof paymentApplications | typeof dailyLogs,
+    label: string,
+  ) => {
+    const rows = await db
+      .select({ id: table.id })
+      .from(table)
+      .where(and(eq(table.id, sourceId), eq(table.companyId, companyId), eq(table.projectId, projectId)))
+      .limit(1);
+    if (!rows[0]) throw badRequest(`${label} ${sourceId} was not found in this project, so it cannot be the source of the claim.`);
+  };
+  switch (sourceType) {
+    case "valuation":
+      return found(valuations, "Valuation");
+    case "progress_claim":
+    case "application":
+      return found(paymentApplications, "Payment application");
+    case "daily_log":
+      return found(dailyLogs, "Daily log");
+    case "schedule_update": {
+      await assertTask(db, projectId, sourceId);
+      return;
+    }
+    default:
+      throw badRequest(
+        `A ${sourceType.replace(/_/g, " ")} claim has no record to point at, so a claim source id cannot be stored against it. Choose the source type that names the record, or leave the id off.`,
+      );
+  }
 }
 
 export function notFoundIfMissing<T>(row: T | undefined, what: string): T {

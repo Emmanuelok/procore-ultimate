@@ -366,6 +366,36 @@ describe("transmittals (#442)", () => {
     expect(complete?.obligationId).toBeNull();
   });
 
+  it("records a read receipt against a transmittal recipient and counts it in the position", async () => {
+    // The drawer offers "Read" on every recipient, including the CC who was
+    // never asked to acknowledge: a read receipt is evidence of delivery, and
+    // it is a DIFFERENT fact from an acknowledgement.
+    const before = await get(
+      `/projects/${projectId}/correspondence/transmittals/${transmittalId}/acknowledgement`,
+    );
+    const cc = before
+      .json()
+      .recipients.find((r: { kind: string }) => r.kind === "cc") as { id: string };
+    expect(cc).toBeTruthy();
+
+    const first = await post(`/projects/${projectId}/correspondence/recipients/${cc.id}/read`);
+    expect(first.statusCode).toBe(200);
+    expect(first.json().readCount).toBe(1);
+    expect(first.json().firstReadAt).toBeTruthy();
+    expect(first.json().deliveryStatus).toBe("delivered");
+    // reading it again keeps the FIRST read and increments the count
+    const second = await post(`/projects/${projectId}/correspondence/recipients/${cc.id}/read`);
+    expect(second.json().readCount).toBe(2);
+    expect(second.json().firstReadAt).toBe(first.json().firstReadAt);
+
+    const after = await get(
+      `/projects/${projectId}/correspondence/transmittals/${transmittalId}/acknowledgement`,
+    );
+    expect(after.json().position.read).toBe(before.json().position.read + 1);
+    // a read receipt is not an acknowledgement, so the rate must not move
+    expect(after.json().position.acknowledged).toBe(before.json().position.acknowledged);
+  });
+
   it("adds a recipient after issue and counts them straight away", async () => {
     const before = (
       await app.db.select().from(transmittals).where(eq(transmittals.id, transmittalId))

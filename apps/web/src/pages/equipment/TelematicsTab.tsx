@@ -36,6 +36,7 @@ import { DataTable, type DataColumns } from "../../ui/data";
 import { ChartCard, GroupedBarChart } from "../../ui/charts";
 import type { Tone } from "../../ui/tokens";
 import { IconZap } from "../../ui/icons";
+import { api } from "../../lib/api";
 import {
   CurrencyRail,
   EM_DASH,
@@ -46,9 +47,11 @@ import {
   ReasonList,
   SectionHeading,
   VARIANCE_CLASS_LABEL,
+  RefusalNotice,
   bucketsOf,
   hours,
   money,
+  useAction,
   type DayVariance,
   type EquipmentReconciliation,
   type Loadable,
@@ -59,12 +62,14 @@ import {
 const WINDOWS = [7, 14, 30, 60];
 
 export default function TelematicsTab({
+  projectId,
   report,
   intelligence,
   days,
   onDays,
   onOpenMachine,
 }: {
+  projectId: string | undefined;
   report: Loadable<TelematicsReport>;
   intelligence: Loadable<TelematicsIntelligence>;
   days: number;
@@ -72,6 +77,8 @@ export default function TelematicsTab({
   onOpenMachine: (equipmentId: string) => void;
 }) {
   const [expanded, setExpanded] = useState<string | null>(null);
+  const action = useAction();
+  const [recorded, setRecorded] = useState<AssuranceRunResult | null>(null);
   const data = report.data;
   const rows = useMemo(() => data?.rows ?? [], [data]);
 
@@ -324,6 +331,26 @@ export default function TelematicsTab({
           <p className="text-2xs text-content-muted">{data.method}</p>
         </CardBody>
       </Card>
+
+      <AssurancePanel
+        projectId={projectId}
+        from={from}
+        to={to}
+        busy={action.busy === "record"}
+        refusal={action.refusal}
+        clearRefusal={action.clear}
+        result={recorded}
+        onRun={async () => {
+          if (!projectId) return;
+          const out = await action.run("record", () =>
+            api.post<AssuranceRunResult>(
+              `/api/v1/projects/${projectId}/equipment-telematics/reconciliation/run`,
+              { from, to },
+            ),
+          );
+          if (out) setRecorded(out);
+        }}
+      />
 
       <CurrencyRail
         buckets={valueBuckets}
@@ -815,4 +842,157 @@ function dayTone(classification: DayVariance["classification"]): Tone | undefine
     default:
       return "neutral";
   }
+}
+
+
+/* ========================================================================== */
+/* Recording the comparison as an assurance fact                               */
+/* ========================================================================== */
+
+export interface AssuranceRunResult {
+  from: string;
+  to: string;
+  recorded: number;
+  replaced: number;
+  rows?: Array<{
+    equipmentId: string;
+    reference: string;
+    assertionId: string;
+    evidenceId: string | null;
+    reconciliationId: string;
+    result: string;
+    selfCertified: boolean;
+  }>;
+  skipped?: Array<{ equipmentId: string; reference: string; reason: string }>;
+  reasons?: string[];
+  method?: string;
+}
+
+const RESULT_TONE: Record<string, Tone> = {
+  supported: "success",
+  partially_supported: "warning",
+  unsupported: "danger",
+  contradicted: "danger",
+  insufficient_evidence: "neutral",
+};
+
+const RESULT_LABEL: Record<string, string> = {
+  supported: "Supported",
+  partially_supported: "Partly supported",
+  unsupported: "Unsupported",
+  contradicted: "Contradicted",
+  insufficient_evidence: "Insufficient evidence",
+};
+
+/**
+ * The read above is a comparison; this writes it down as the platform's three
+ * primitives, which is what makes it readable on the owner's assurance page
+ * next to every other claim that has been tested. The button says who the
+ * claimant is and what happens when that is you, because a pack assembled by
+ * the person who claimed the hours is not an independent test of the claim
+ * and must never present as one.
+ */
+function AssurancePanel({
+  projectId,
+  from,
+  to,
+  busy,
+  refusal,
+  clearRefusal,
+  result,
+  onRun,
+}: {
+  projectId: string | undefined;
+  from: string;
+  to: string;
+  busy: boolean;
+  refusal: ReturnType<typeof useAction>["refusal"];
+  clearRefusal: () => void;
+  result: AssuranceRunResult | null;
+  onRun: () => void;
+}) {
+  return (
+    <Card>
+      <CardBody className="space-y-3">
+        <SectionHeading
+          title="Record this window as assurance evidence"
+          hint="The plant sheet is the ASSERTION; the machine's own counter is the EVIDENCE that tests it. Re-running a window replaces the record rather than stacking a second copy of the same finding."
+          className="mb-0"
+          actions={
+            <Button
+              size="sm"
+              variant="secondary"
+              loading={busy}
+              disabled={!projectId || !from || !to}
+              onClick={onRun}
+            >
+              Record {from} to {to}
+            </Button>
+          }
+        />
+        {refusal ? <RefusalNotice refusal={refusal} onDismiss={clearRefusal} /> : null}
+        {result ? (
+          result.recorded === 0 ? (
+            <Alert tone="neutral" title="Nothing was recorded">
+              <ReasonList
+                reasons={
+                  result.reasons?.length
+                    ? result.reasons
+                    : ["no machine in this window carried hours to test"]
+                }
+              />
+            </Alert>
+          ) : (
+            <div className="space-y-2">
+              <p className="text-meta text-content-muted">
+                {result.recorded} machine{result.recorded === 1 ? "" : "s"} recorded
+                {result.replaced > 0
+                  ? ` · ${result.replaced} replaced an earlier record for the same window`
+                  : ""}
+                .
+              </p>
+              <ul className="divide-y divide-border-subtle rounded-md border border-border-subtle">
+                {(result.rows ?? []).map((row) => (
+                  <li
+                    key={row.reconciliationId}
+                    className="flex flex-wrap items-center gap-2 px-3 py-2"
+                  >
+                    <span className="font-mono text-meta">{row.reference}</span>
+                    <Badge tone={RESULT_TONE[row.result] ?? "neutral"} size="xs">
+                      {RESULT_LABEL[row.result] ?? row.result}
+                    </Badge>
+                    {row.selfCertified ? (
+                      <Tooltip content="You are one of the people who recorded these hours, so this pack is not independent of the claim it tests. The comparison stands; it is not offered as verified.">
+                        <span>
+                          <Badge tone="warning" size="xs" dot>
+                            Self-certified
+                          </Badge>
+                        </span>
+                      </Tooltip>
+                    ) : null}
+                    {row.evidenceId ? null : (
+                      <span className="text-2xs text-content-subtle">
+                        no evidence row — the feed never reached this window
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+              {result.skipped?.length ? (
+                <ReasonList
+                  reasons={result.skipped.map((s) => `${s.reference}: ${s.reason}`)}
+                />
+              ) : null}
+            </div>
+          )
+        ) : (
+          <p className="text-2xs text-content-muted">
+            Nothing has been recorded for this window yet. Recording it does not change any
+            figure on this page — it files the comparison, its confidence and its independence
+            so somebody outside the project can read it.
+          </p>
+        )}
+      </CardBody>
+    </Card>
+  );
 }

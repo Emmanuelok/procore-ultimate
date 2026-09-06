@@ -190,7 +190,16 @@ export const engagements = pgTable(
     recordedBy: text("recorded_by").notNull(),
     createdAt: createdAt(),
   },
-  (t) => [index("engagements_project_idx").on(t.projectId, t.engagementDate)],
+  (t) => [
+    index("engagements_project_idx").on(t.projectId, t.engagementDate),
+    index("engagements_kind_idx").on(t.projectId, t.kind),
+    /**
+     * GIN over the JSONB member array so `stakeholder_ids @> '["stk_x"]'`
+     * is an index lookup. Without it, every "what have we discussed with
+     * this stakeholder?" question was a full project scan filtered in JS.
+     */
+    index("engagements_stakeholders_idx").using("gin", t.stakeholderIds),
+  ],
 );
 
 /* ------------------------------------------------------------------ */

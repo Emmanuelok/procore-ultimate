@@ -26,8 +26,9 @@ export interface CategoryUtilisation {
   limit: number;
   disbursed: number;
   remaining: number;
-  pipeline?: number;
-  available?: number;
+  pipeline: number;
+  available: number;
+  /** present on the company summary rows, absent on the facility detail */
   currency?: string;
 }
 
@@ -55,6 +56,10 @@ export interface FacilityRow {
   updatedAt: string;
   /** aggregates (#739-741) */
   disbursed: number;
+  /** submitted + approved + disbursed — what the headroom gate counts */
+  pipeline: number;
+  /** committed less the pipeline: what may still be requested */
+  available: number;
   undisbursed: number;
   openConditions: number;
   pendingRequests: number;
@@ -106,7 +111,9 @@ export interface DisbursementRow {
   certifiedAt: string | null;
   certifiedBy: string | null;
   certificationNote: string | null;
-  eligibility: EligibilityEntry[] | null;
+  certificationEvidenceIds: string[];
+  /** per-evidence eligibility classification (#736-737) */
+  evidenceEligibility: EligibilityEntry[];
   createdBy: string;
   createdAt: string;
   updatedAt: string;
@@ -179,84 +186,98 @@ export interface ForecastRow {
   createdAt: string;
 }
 
-export interface ForecastPeriod {
+/** One period of the forecast-vs-actual comparison (compareForecast). */
+export interface ForecastPoint {
   periodStart: string;
   periodEnd: string;
   planned: number;
   actual: number;
-  variance: number;
-  variancePercent: number | null;
   cumulativePlanned: number;
   cumulativeActual: number;
-  milestoneTaskId: string | null;
-  milestoneComplete: boolean | null;
+  variance: number;
+  variancePercent: number | null;
+  milestoneOutstanding: boolean;
 }
 
 export interface ForecastResponse {
   facilityId: string;
   currency: string;
-  periods: ForecastPeriod[];
-  totals: { planned: number; actual: number; variance: number };
-  lagging: boolean;
-  reasons: string[];
+  forecasts: ForecastRow[];
+  milestones: Array<{ id: string; name: string; actualFinish: string | null }>;
+  points: ForecastPoint[];
+  totalPlanned: number;
+  totalActual: number;
+  lagAmount: number;
+  lagPercent: number | null;
+  behindPlan: boolean;
+  milestoneBreaches: string[];
+  basis: string;
 }
 
 export interface RecoveryRow {
   id: string;
   facilityId: string;
   disbursementId: string | null;
+  evidenceId: string | null;
   amount: number;
   currency: string;
+  /** IneligibilityReason */
   reason: string;
-  category: string | null;
+  detail: string | null;
   status: string;
   resolvedAt: string | null;
-  note: string | null;
+  resolvedBy: string | null;
+  resolutionNote: string | null;
+  createdBy: string;
   createdAt: string;
+  updatedAt: string;
 }
 
+export interface CovenantStanding {
+  covenantId: string;
+  name: string;
+  compliant: boolean | null;
+  readingDate: string | null;
+  headroom: number | null;
+  waivedBy: { id: string; reference: string | null; effectiveTo: string | null } | null;
+}
+
+/** Whether money may move at all today (#747): availability period + covenants. */
 export interface DrawStop {
-  drawable: boolean;
+  facilityId: string;
+  stopped: boolean;
   reasons: string[];
-  availabilityEndDate: string | null;
-  expired: boolean;
-  covenants: Array<{
-    covenantId: string;
-    name: string;
-    compliant: boolean | null;
-    waivedBy: string | null;
-    waivedUntil: string | null;
-    readingDate: string | null;
-    value: number | null;
-  }>;
+  breachedCovenantIds: string[];
+  pastAvailability: boolean;
+  covenants: CovenantStanding[];
 }
 
-export interface CostOfFinanceRow {
+export interface AccrualPeriod {
   periodStart: string;
   periodEnd: string;
-  openingBalance: number;
-  drawn: number;
-  closingBalance: number;
-  undrawnBalance: number;
+  days: number;
+  openingDrawn: number;
+  drawnInPeriod: number;
+  closingDrawn: number;
+  averageDrawn: number;
+  averageUndrawn: number;
   interest: number;
   commitmentFee: number;
-  total: number;
-  capitalised: boolean;
+  capitalised: number;
+  cumulativeInterest: number;
+  cumulativeFees: number;
 }
 
 export interface CostOfFinance {
   facilityId: string;
   currency: string;
-  basis: {
-    baseRatePercent: number | null;
-    marginPercent: number | null;
-    commitmentFeePercent: number | null;
-    dayCount: string;
-    capitaliseDuringConstruction: boolean;
-  };
-  rows: CostOfFinanceRow[];
-  totals: { interest: number; commitmentFee: number; total: number };
-  reasons: string[];
+  periods: AccrualPeriod[];
+  totalInterest: number;
+  totalCommitmentFees: number;
+  totalCostOfFinance: number;
+  basis: string;
+  /** set when the facility has no rates configured — empty, not zero */
+  unavailableReason: string | null;
 }
 
 export interface EligibilityEntry {

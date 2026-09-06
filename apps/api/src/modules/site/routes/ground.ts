@@ -13,7 +13,7 @@
  *   pattern in their absence becomes visible
  */
 import type { FastifyPluginAsync } from "fastify";
-import { and, count, desc, eq } from "drizzle-orm";
+import { and, count, desc, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   siteGeotechInvestigations,
@@ -645,15 +645,30 @@ export const groundRoutes: FastifyPluginAsync = async (app) => {
       q.severity ? eq(siteUtilityStrikes.severity, q.severity) : undefined,
       q.status ? eq(siteUtilityStrikes.status, q.status) : undefined,
     );
-    const [rows, [total]] = await Promise.all([
+    // The three controls are counted over the WHOLE filtered register, not the
+    // page in front of you: the workspace prints this under "across every
+    // strike on this site", and a figure that quietly meant "the first 200"
+    // would understate the register the moment it grew.
+    const [rows, [total], [controlRow]] = await Promise.all([
       app.db.select().from(siteUtilityStrikes).where(where).orderBy(desc(siteUtilityStrikes.occurredAt)).limit(q.pageSize).offset(pageOffset(q)),
       app.db.select({ n: count() }).from(siteUtilityStrikes).where(where),
+      app.db
+        .select({
+          n: count(),
+          withPermit: sql<number>`count(*) filter (where ${siteUtilityStrikes.permitInPlace} = 1)`,
+          withScan: sql<number>`count(*) filter (where ${siteUtilityStrikes.scanCompleted} = 1)`,
+          withMarks: sql<number>`count(*) filter (where ${siteUtilityStrikes.marksPresent} = 1)`,
+        })
+        .from(siteUtilityStrikes)
+        .where(where),
     ]);
     const controls = {
-      total: rows.length,
-      withPermit: rows.filter((r) => r.permitInPlace === 1).length,
-      withScan: rows.filter((r) => r.scanCompleted === 1).length,
-      withMarks: rows.filter((r) => r.marksPresent === 1).length,
+      total: Number(controlRow?.n ?? 0),
+      withPermit: Number(controlRow?.withPermit ?? 0),
+      withScan: Number(controlRow?.withScan ?? 0),
+      withMarks: Number(controlRow?.withMarks ?? 0),
+      /** the controls cover every strike matching this filter, not just the page */
+      scope: "register" as const,
     };
     return { ...paginate(rows, total?.n ?? 0, q), controls };
   });

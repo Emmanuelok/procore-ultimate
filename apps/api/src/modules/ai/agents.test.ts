@@ -1229,17 +1229,27 @@ describe("schedules", () => {
   // proposals were queued for one target. The claim is now a conditional
   // UPDATE taken before anything else, so exactly one caller proceeds.
   it("exactly one of two callers claims a due schedule", async () => {
-    const [row] = await built.app.db
+    // Due-ness is read from the ROW IN THE DATABASE, not from the object the
+    // caller happens to be holding — that is the whole point of a conditional
+    // claim — so the previous test's run (which moved nextRunAt forward) has
+    // to be undone here rather than masked with a local override.
+    await built.app.db
+      .update(agentSchedules)
+      .set({ nextRunAt: null, lastRunAt: null, lastStatus: "done" })
+      .where(eq(agentSchedules.id, scheduleId));
+    const [due] = await built.app.db
       .select()
       .from(agentSchedules)
       .where(eq(agentSchedules.id, scheduleId));
-    const due = { ...row!, nextRunAt: null };
     const now = new Date();
-    const first = await claimSchedule(built.app.db, due, now);
-    const second = await claimSchedule(built.app.db, due, now);
+    const first = await claimSchedule(built.app.db, due!, now);
+    const second = await claimSchedule(built.app.db, due!, now);
     expect(first).not.toBeNull();
     expect(second).toBeNull();
     expect(first!.lastStatus).toBe("running");
+    // The claim moved the schedule forward, which is what makes the second
+    // caller's WHERE fail.
+    expect(first!.nextRunAt).not.toBeNull();
   });
 
   it("a schedule another caller is running is refused, and no second model call happens", async () => {

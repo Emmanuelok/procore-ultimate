@@ -129,6 +129,27 @@ const SUPPLIER_FIELDS: readonly EditFieldSpec[] = [
   },
 ];
 
+const COMPETITION_FIELDS: readonly EditFieldSpec[] = [
+  { key: "title", label: "Title", type: "text", wide: true },
+  {
+    key: "estimatedValue",
+    label: "Estimated value",
+    type: "number",
+    min: 0,
+    step: 0.01,
+    nullable: true,
+    hint: "An indication for the buyer, not a limit on what may be bid.",
+  },
+  {
+    key: "responsesDueAt",
+    label: "Responses due",
+    type: "date",
+    nullable: true,
+    hint: "Moving this after issue is a change to the competition and lands on the ledger.",
+  },
+  { key: "scope", label: "Scope", type: "textarea", nullable: true, wide: true },
+];
+
 export default function FrameworksTab({ onChanged }: { onChanged: () => void }) {
   const isAdmin = useIsCompanyAdmin();
   const list = useResource<Paginated<Framework>>("/api/v1/portfolio/frameworks?page=1&pageSize=100");
@@ -329,6 +350,11 @@ function FrameworkDrawer({
   const [editingFramework, setEditingFramework] = useState(false);
   const [editingLot, setEditingLot] = useState<FrameworkLot | null>(null);
   const [editingSupplier, setEditingSupplier] = useState<FrameworkSupplier | null>(null);
+  const [checkValue, setCheckValue] = useState("");
+  const [checkCurrency, setCheckCurrency] = useState("");
+  const [checkLot, setCheckLot] = useState("");
+  const [checkResult, setCheckResult] = useState<{ permitted: boolean; reasons: string[] } | null>(null);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
 
   useEffect(() => {
     setLotForm({});
@@ -337,11 +363,19 @@ function FrameworkDrawer({
     setEditingLot(null);
     setEditingSupplier(null);
     setNewCompetition(false);
+    setCheckValue("");
+    setCheckLot("");
+    setCheckResult(null);
+    setConfirmingDelete(false);
     action.clear();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [frameworkId]);
 
   const fw = detail.data;
+
+  useEffect(() => {
+    if (fw) setCheckCurrency((c) => c || fw.currency);
+  }, [fw]);
 
   async function addLot(e: FormEvent) {
     e.preventDefault();
@@ -415,6 +449,30 @@ function FrameworkDrawer({
       setEditingSupplier(null);
       detail.reload();
       onChanged();
+    }
+  }
+
+  async function checkDirectAward(e: FormEvent) {
+    e.preventDefault();
+    if (!frameworkId) return;
+    const value = Number(checkValue);
+    const res = await action.run("check", () =>
+      portfolioApi.directAwardCheck(frameworkId, {
+        value: Number.isFinite(value) ? value : 0,
+        currency: checkCurrency,
+        lotId: checkLot || undefined,
+      }),
+    );
+    if (res) setCheckResult(res);
+  }
+
+  async function removeFramework() {
+    if (!frameworkId) return;
+    const res = await action.run("delete", () => portfolioApi.deleteFramework(frameworkId));
+    if (res !== null) {
+      toast.success("Framework deleted");
+      onChanged();
+      onClose();
     }
   }
 
@@ -772,8 +830,63 @@ function FrameworkDrawer({
             )}
           </div>
 
+          <form onSubmit={checkDirectAward} className="space-y-2 rounded-md border border-border p-3">
+            <div className="text-2xs font-semibold uppercase tracking-wide text-content-subtle">
+              Would a direct award be permissible?
+            </div>
+            <p className="text-2xs text-content-subtle">
+              Asked before an order is drafted rather than discovered at issue. The same rule runs again when the order
+              is actually issued, against the value as it then stands.
+            </p>
+            <div className="grid gap-2 sm:grid-cols-4">
+              <Field label={`Value (${fw.currency})`} required>
+                <Input
+                  type="number"
+                  size="sm"
+                  min={0}
+                  step="0.01"
+                  value={checkValue}
+                  onChange={(e) => setCheckValue(e.target.value)}
+                  required
+                />
+              </Field>
+              <Field label="Currency" required>
+                <Input
+                  size="sm"
+                  maxLength={3}
+                  value={checkCurrency}
+                  onChange={(e) => setCheckCurrency(e.target.value)}
+                  required
+                />
+              </Field>
+              <Field label="Lot">
+                <Select size="sm" value={checkLot} onChange={(e) => setCheckLot(e.target.value)}>
+                  <option value="">No lot</option>
+                  {fw.lots.map((l) => (
+                    <option key={l.id} value={l.id}>
+                      Lot {l.lotNumber} — {l.title}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              <div className="flex items-end">
+                <Button size="sm" type="submit" loading={action.busy === "check"}>
+                  Check
+                </Button>
+              </div>
+            </div>
+            {checkResult ? (
+              <Alert tone={checkResult.permitted ? "success" : "warning"} size="sm">
+                <span className="font-semibold">
+                  {checkResult.permitted ? "Permitted" : "Not permissible"}
+                </span>
+                {checkResult.reasons.length > 0 ? ` — ${checkResult.reasons.join(" ")}` : null}
+              </Alert>
+            ) : null}
+          </form>
+
           {isAdmin ? (
-            <div className="flex flex-wrap gap-2 border-t border-border pt-3">
+            <div className="flex flex-wrap items-center gap-2 border-t border-border pt-3">
               {["live", "suspended", "expired", "terminated"]
                 .filter((s) => s !== fw.status)
                 .map((s) => (
@@ -781,6 +894,29 @@ function FrameworkDrawer({
                     Mark {s}
                   </Button>
                 ))}
+              <span className="flex-1" />
+              {confirmingDelete ? (
+                <>
+                  <span className="text-2xs text-content-subtle">
+                    Deletion is refused once anything has been called off it.
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="danger"
+                    onClick={() => void removeFramework()}
+                    loading={action.busy === "delete"}
+                  >
+                    Delete it
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => setConfirmingDelete(false)}>
+                    Keep
+                  </Button>
+                </>
+              ) : (
+                <Button size="sm" variant="ghost" onClick={() => setConfirmingDelete(true)}>
+                  Delete
+                </Button>
+              )}
             </div>
           ) : null}
 
@@ -836,8 +972,10 @@ function CompetitionDrawer({
   const [responseNote, setResponseNote] = useState("");
   const [responseScores, setResponseScores] = useState<Record<string, string>>({});
   const [responseWithdrawn, setResponseWithdrawn] = useState(false);
+  const [editingCompetition, setEditingCompetition] = useState(false);
 
   useEffect(() => {
+    setEditingCompetition(false);
     setAwardNote("");
     setAwardSupplier("");
     setAwardValue("");
@@ -907,6 +1045,17 @@ function CompetitionDrawer({
     }
   }
 
+  async function saveCompetition(patch: Record<string, unknown>) {
+    if (!competitionId) return;
+    const res = await action.run("edit", () => portfolioApi.patchCompetition(competitionId, patch));
+    if (res) {
+      toast.success("Competition updated");
+      setEditingCompetition(false);
+      detail.reload();
+      onChanged();
+    }
+  }
+
   async function award(e: FormEvent) {
     e.preventDefault();
     if (!competitionId) return;
@@ -947,6 +1096,25 @@ function CompetitionDrawer({
             <Alert tone="danger" size="sm">
               {action.error}
             </Alert>
+          ) : null}
+          {isAdmin && c.status !== "awarded" && c.status !== "cancelled" ? (
+            <div className="flex justify-end">
+              <EditButton
+                editing={editingCompetition}
+                onToggle={() => setEditingCompetition((e) => !e)}
+              />
+            </div>
+          ) : null}
+          {editingCompetition ? (
+            <EditForm
+              key={c.id}
+              fields={COMPETITION_FIELDS}
+              initial={c as unknown as Record<string, unknown>}
+              busy={action.busy === "edit"}
+              onSubmit={saveCompetition}
+              onCancel={() => setEditingCompetition(false)}
+              note="Reference, framework and currency are fixed: they are what was competed. Once the competition is awarded or cancelled nothing here is editable at all — the terms are the record."
+            />
           ) : null}
           <dl className="divide-y divide-border">
             <Row label="Estimated value">

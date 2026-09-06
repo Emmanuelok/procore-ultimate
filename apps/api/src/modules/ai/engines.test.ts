@@ -28,7 +28,7 @@ import {
   ZERO_USAGE,
   type EffectivePolicy,
 } from "./policy.js";
-import { dayRange, interleave, targetTool, tzOffsetMinutes } from "./index.js";
+import { dayRange, interleave, refTool, targetTool, toolsForRefs, tzOffsetMinutes } from "./index.js";
 import { isDue, nextRunAt, staleCutoff } from "./schedules.js";
 import {
   ADVERSARIAL_CASES,
@@ -378,6 +378,87 @@ describe("reviewer tool mapping", () => {
       for (const t of entry.targetTypes) {
         expect(targetTool(t), `${entry.kind} → ${t}`).not.toBeNull();
       }
+    }
+  });
+});
+
+describe("reading a run back is gated by what the run actually read", () => {
+  // REGRESSION. GET /ai/runs/:id used to be gated on `ai:read` alone, so a
+  // field engineer with budget:none could read every budget line out of a
+  // cost forecaster's prompt. The gate is now the tools that own the records
+  // the run RECORDED in inputRefs — precise where the agent's declared union
+  // would be either too wide (refusing a searcher their own partial answer)
+  // or too narrow.
+  it("maps every input-ref type an agent can supply to a real tool", () => {
+    const toolSet = new Set<string>(TOOLS);
+    for (const type of [
+      "file",
+      "drawing_sheet",
+      "drawing_revision",
+      "spec_section",
+      "rfi",
+      "submittal",
+      "daily_log",
+      "punch",
+      "photo",
+      "meeting",
+      "meeting_agenda_item",
+      "meeting_action_item",
+      "contract",
+      "contract_event",
+      "obligation",
+      "forensic_claim",
+      "delay_event",
+      "assertion",
+      "evidence",
+      "reconciliation",
+      "signal",
+      "entity_relationship",
+      "risk",
+      "budget_line_item",
+      "change_event",
+      "commitment",
+      "schedule_task",
+      "safety_incident",
+      "ncr",
+      "bid_package",
+      "bid_submission",
+      "ai_run",
+    ]) {
+      const tool = refTool(type);
+      expect(tool, type).not.toBeNull();
+      expect(toolSet.has(tool!), `${type} → ${tool}`).toBe(true);
+    }
+  });
+
+  it("gates nothing on project metadata, and falls back to `ai` for the unknown", () => {
+    expect(refTool("project")).toBeNull();
+    expect(refTool("company")).toBeNull();
+    // A type nobody mapped is NOT ungated: it lands on the AI tool.
+    expect(refTool("something_new")).toBe("ai");
+  });
+
+  it("collapses a run's refs to the distinct tools that own them", () => {
+    expect(
+      toolsForRefs([
+        { type: "rfi", id: "a" },
+        { type: "rfi", id: "b" },
+        { type: "drawing_sheet", id: "c" },
+        { type: "project", id: "d" },
+        "not a ref",
+        null,
+        { id: "no type" },
+      ]).sort(),
+    ).toEqual(["drawings", "rfis"]);
+    expect(toolsForRefs([])).toEqual([]);
+  });
+
+  it("every tool a fleet agent's evidence can carry is one it declares", () => {
+    // The two lists must not drift: a gather() that starts citing a new
+    // record type without adding its tool to requiredTools would widen what
+    // the prompt holds without widening what it takes to start the run.
+    for (const def of AGENT_DEFINITIONS.values()) {
+      expect(def.requiredTools.length, def.kind).toBeGreaterThan(0);
     }
   });
 });

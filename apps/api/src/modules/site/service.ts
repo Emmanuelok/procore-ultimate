@@ -49,7 +49,7 @@ import type { Db } from "../../lib/db.js";
 import { newId } from "../../lib/ids.js";
 import { buildRegister, type GateEventInput, type OccupancySummary } from "./engines/occupancy.js";
 import { reconcileMuster, type CheckinEntry, type RegisterEntry } from "./engines/muster.js";
-import { expiredPermits, loneWorkerDue, overdueEntries } from "./engines/permits.js";
+import { EXPIRABLE_PERMIT_STATUSES, expiredPermits, loneWorkerDue, overdueEntries } from "./engines/permits.js";
 import { analyseWeather, type Threshold, type WeatherReading } from "./engines/weather.js";
 import { fetchArchive, type FetchLike } from "./engines/provider.js";
 import {
@@ -503,8 +503,18 @@ async function projectWatchers(db: Db, companyId: string, projectId: string): Pr
   return rows.map((r) => r.userId);
 }
 
-/** Permits whose validity window closed while they were still open. */
-export async function sweepPermitExpiry(db: Db, companyId: string, now: Date) {
+/**
+ * Permits whose validity window closed while they were still open.
+ *
+ * `scope` narrows a sweep to one project. The scheduler runs it company-wide
+ * with the system actor; a project route passes its own projectId so a grant
+ * on one project never writes to another.
+ */
+export interface SweepScope {
+  projectId?: string | null;
+}
+
+export async function sweepPermitExpiry(db: Db, companyId: string, now: Date, scope: SweepScope = {}) {
   const nowIso = now.toISOString();
   const open = await db
     .select({
@@ -519,7 +529,13 @@ export async function sweepPermitExpiry(db: Db, companyId: string, now: Date) {
       createdBy: sitePermits.createdBy,
     })
     .from(sitePermits)
-    .where(and(eq(sitePermits.companyId, companyId), inArray(sitePermits.status, ["approved", "active", "suspended"])))
+    .where(
+      and(
+        eq(sitePermits.companyId, companyId),
+        scope.projectId ? eq(sitePermits.projectId, scope.projectId) : undefined,
+        inArray(sitePermits.status, [...EXPIRABLE_PERMIT_STATUSES]),
+      ),
+    )
     .limit(5000);
 
   const due = expiredPermits(open, nowIso);
@@ -532,7 +548,13 @@ export async function sweepPermitExpiry(db: Db, companyId: string, now: Date) {
     await db
       .update(sitePermits)
       .set({ status: "expired", expiredAt: nowIso, updatedAt: nowIso })
-      .where(and(eq(sitePermits.id, permit.id), eq(sitePermits.companyId, companyId), inArray(sitePermits.status, ["approved", "active", "suspended"])));
+      .where(
+        and(
+          eq(sitePermits.id, permit.id),
+          eq(sitePermits.companyId, companyId),
+          inArray(sitePermits.status, [...EXPIRABLE_PERMIT_STATUSES]),
+        ),
+      );
     await ledger(db, {
       companyId,
       projectId: permit.projectId,
@@ -573,12 +595,18 @@ export async function sweepPermitExpiry(db: Db, companyId: string, now: Date) {
 }
 
 /** People still recorded inside a confined space past their expected exit. */
-export async function sweepPermitEntries(db: Db, companyId: string, now: Date) {
+export async function sweepPermitEntries(db: Db, companyId: string, now: Date, scope: SweepScope = {}) {
   const nowIso = now.toISOString();
   const rows = await db
     .select()
     .from(sitePermitEntries)
-    .where(and(eq(sitePermitEntries.companyId, companyId), eq(sitePermitEntries.status, "inside")))
+    .where(
+      and(
+        eq(sitePermitEntries.companyId, companyId),
+        scope.projectId ? eq(sitePermitEntries.projectId, scope.projectId) : undefined,
+        eq(sitePermitEntries.status, "inside"),
+      ),
+    )
     .limit(5000);
   const due = overdueEntries(
     rows.map((r) => ({
@@ -648,12 +676,18 @@ export async function sweepPermitEntries(db: Db, companyId: string, now: Date) {
 }
 
 /** Lone workers who have missed a check-in. */
-export async function sweepLoneWorkers(db: Db, companyId: string, now: Date) {
+export async function sweepLoneWorkers(db: Db, companyId: string, now: Date, scope: SweepScope = {}) {
   const nowIso = now.toISOString();
   const rows = await db
     .select()
     .from(siteLoneWorkerSessions)
-    .where(and(eq(siteLoneWorkerSessions.companyId, companyId), inArray(siteLoneWorkerSessions.status, ["active", "overdue"])))
+    .where(
+      and(
+        eq(siteLoneWorkerSessions.companyId, companyId),
+        scope.projectId ? eq(siteLoneWorkerSessions.projectId, scope.projectId) : undefined,
+        inArray(siteLoneWorkerSessions.status, ["active", "overdue"]),
+      ),
+    )
     .limit(5000);
   const verdicts = loneWorkerDue(
     rows.map((r) => ({
@@ -761,7 +795,7 @@ export async function sweepLoneWorkers(db: Db, companyId: string, now: Date) {
 
 /** Expire passes and inductions whose validity has run out, and flag any live
  *  pass standing on an induction that no longer is. */
-export async function sweepAccessCredentials(db: Db, companyId: string, now: Date) {
+export async function sweepAccessCredentials(db: Db, companyId: string, now: Date, scope: SweepScope = {}) {
   const today = now.toISOString().slice(0, 10);
   const nowIso = now.toISOString();
   // `validUntil` is INCLUSIVE — a pass valid until the 4th is good all of the
@@ -775,6 +809,7 @@ export async function sweepAccessCredentials(db: Db, companyId: string, now: Dat
     .where(
       and(
         eq(siteInductions.companyId, companyId),
+        scope.projectId ? eq(siteInductions.projectId, scope.projectId) : undefined,
         eq(siteInductions.status, "valid"),
         sql`${siteInductions.validUntil} is not null`,
         lt(siteInductions.validUntil, today),
@@ -800,6 +835,7 @@ export async function sweepAccessCredentials(db: Db, companyId: string, now: Dat
     .where(
       and(
         eq(siteAccessPasses.companyId, companyId),
+        scope.projectId ? eq(siteAccessPasses.projectId, scope.projectId) : undefined,
         eq(siteAccessPasses.status, "active"),
         sql`${siteAccessPasses.validUntil} is not null`,
         lt(siteAccessPasses.validUntil, today),
@@ -832,7 +868,13 @@ export async function sweepAccessCredentials(db: Db, companyId: string, now: Dat
     })
     .from(siteAccessPasses)
     .leftJoin(siteInductions, eq(siteAccessPasses.inductionId, siteInductions.id))
-    .where(and(eq(siteAccessPasses.companyId, companyId), eq(siteAccessPasses.status, "active")))
+    .where(
+      and(
+        eq(siteAccessPasses.companyId, companyId),
+        scope.projectId ? eq(siteAccessPasses.projectId, scope.projectId) : undefined,
+        eq(siteAccessPasses.status, "active"),
+      ),
+    )
     .limit(5000);
 
   const raised = await alreadySignalled(db, companyId, ["site_pass_without_induction"]);
@@ -877,7 +919,7 @@ export async function sweepAccessCredentials(db: Db, companyId: string, now: Dat
 }
 
 /** Exclusion zones whose active window has closed. */
-export async function sweepExclusionZones(db: Db, companyId: string, now: Date) {
+export async function sweepExclusionZones(db: Db, companyId: string, now: Date, scope: SweepScope = {}) {
   const nowIso = now.toISOString();
   const lifted = await db
     .update(siteExclusionZones)
@@ -885,6 +927,7 @@ export async function sweepExclusionZones(db: Db, companyId: string, now: Date) 
     .where(
       and(
         eq(siteExclusionZones.companyId, companyId),
+        scope.projectId ? eq(siteExclusionZones.projectId, scope.projectId) : undefined,
         eq(siteExclusionZones.status, "active"),
         sql`${siteExclusionZones.activeTo} is not null`,
         lte(siteExclusionZones.activeTo, nowIso),
@@ -906,7 +949,7 @@ export async function sweepExclusionZones(db: Db, companyId: string, now: Date) 
 }
 
 /** Anyone the register still holds on site after a full working day and more. */
-export async function sweepOverstays(db: Db, companyId: string, now: Date) {
+export async function sweepOverstays(db: Db, companyId: string, now: Date, scope: SweepScope = {}) {
   const nowIso = now.toISOString();
   const projectRows = await db
     .selectDistinct({ projectId: siteGateEvents.projectId })
@@ -914,6 +957,7 @@ export async function sweepOverstays(db: Db, companyId: string, now: Date) {
     .where(
       and(
         eq(siteGateEvents.companyId, companyId),
+        scope.projectId ? eq(siteGateEvents.projectId, scope.projectId) : undefined,
         gte(siteGateEvents.occurredAt, new Date(now.getTime() - REGISTER_WINDOW_DAYS * 86_400_000).toISOString()),
       ),
     );
@@ -1188,6 +1232,7 @@ export interface ProgressRecordInput {
   claimSourceId?: string | null;
   claimantId: string;
   claimantKind: string;
+  claimantName?: string | null;
   claimedAt?: string | null;
   scanId?: string | null;
   droneFlightId?: string | null;
@@ -1224,23 +1269,9 @@ export async function recordProgressObservation(
   const at = nowISO();
 
   const assertionId = newId("asr");
-  await db.insert(assertions).values({
-    id: assertionId,
-    companyId,
-    projectId,
-    kind: "progress_percent",
-    claimantId: input.claimantId,
-    claimantKind: input.claimantKind,
-    value: input.claimedPercent,
-    unit: "percent",
-    basis: `${input.claimSourceType.replace(/_/g, " ")} claim of ${input.claimedPercent}% for ${input.zoneName}`,
-    sourceType: input.claimSourceType,
-    sourceId: input.claimSourceId ?? null,
-    assertedAt: input.claimedAt ?? input.observedAt,
-    createdBy: observer.userId,
-  });
-
   const evidenceId = newId("evd");
+  const reconciliationId = newId("rec");
+  const id = newId("spo");
   const contentHash = hashPayload({
     zone: input.zoneName,
     observedPercent: input.observedPercent,
@@ -1251,86 +1282,111 @@ export async function recordProgressObservation(
     droneFlightId: input.droneFlightId ?? null,
     fileIds: [...input.fileIds].sort(),
   });
-  await db.insert(evidence).values({
-    id: evidenceId,
-    companyId,
-    projectId,
-    kind: input.method === "scan" || input.method === "drone" ? "reality_capture" : input.method === "photo" ? "photograph" : input.method === "survey" ? "survey" : "inspection",
-    source: `site observation (${input.method})`,
-    contentHash,
-    fileId: input.fileIds[0] ?? null,
-    capturedAt: input.observedAt,
-    independenceScore: assessment.independenceScore,
-    provenance: {
-      observedBy: observer.userId,
-      observerVendorId: observer.vendorId ?? null,
-      claimantId: input.claimantId,
-      method: input.method,
-      basis: assessment.independenceBasis,
-      scanId: input.scanId ?? null,
-      droneFlightId: input.droneFlightId ?? null,
-    },
-    metadata: {
-      zoneName: input.zoneName,
-      observedPercent: input.observedPercent,
-      fileIds: input.fileIds,
-    },
-    submittedBy: observer.userId,
-  });
 
-  const reconciliationId = newId("rec");
-  await db.insert(reconciliations).values({
-    id: reconciliationId,
-    companyId,
-    projectId,
-    assertionId,
-    evidenceIds: [evidenceId],
-    method: `progress_${input.method}`,
-    result: assessment.result,
-    variance: Math.round((input.claimedPercent - input.observedPercent) * 100) / 100,
-    variancePercent: assessment.variancePercent,
-    confidence: assessment.confidence,
-    notes: assessment.reasons.join(" "),
-    createdBy: observer.userId,
-  });
-
-  const id = newId("spo");
-  const [saved] = await db
-    .insert(siteProgressObservations)
-    .values({
-      id,
+  // The triple is ONE fact in three rows. An Assertion nobody tested, or an
+  // Evidence row with no Reconciliation pointing at it, is precisely the shape
+  // the assurance layer reads as an untested claim — so the four inserts land
+  // together or not at all, and the ledger is appended only once they have.
+  const saved = await db.transaction(async (tx) => {
+    await tx.insert(assertions).values({
+      id: assertionId,
       companyId,
       projectId,
-      number,
-      reference,
-      zoneName: input.zoneName,
-      locationId: input.locationId ?? null,
-      scheduleTaskId: input.scheduleTaskId ?? null,
-      workPackageRef: input.workPackageRef ?? null,
-      claimedPercent: input.claimedPercent,
-      observedPercent: input.observedPercent,
-      variancePercent: assessment.variancePercent,
-      method: input.method,
-      observedAt: input.observedAt,
-      observedBy: observer.userId,
-      claimSourceType: input.claimSourceType,
-      claimSourceId: input.claimSourceId ?? null,
+      kind: "progress_percent",
       claimantId: input.claimantId,
       claimantKind: input.claimantKind,
-      claimedAt: input.claimedAt ?? null,
-      scanId: input.scanId ?? null,
-      droneFlightId: input.droneFlightId ?? null,
-      fileIds: input.fileIds,
-      assertionId,
-      evidenceId,
-      reconciliationId,
-      result: assessment.result,
-      confidence: assessment.confidence,
-      independenceScore: assessment.independenceScore,
-      notes: input.notes ?? null,
+      value: input.claimedPercent,
+      unit: "percent",
+      basis: `${input.claimSourceType.replace(/_/g, " ")} claim of ${input.claimedPercent}% for ${input.zoneName}${input.claimantName ? ` by ${input.claimantName}` : ""}`,
+      sourceType: input.claimSourceType,
+      sourceId: input.claimSourceId ?? null,
+      assertedAt: input.claimedAt ?? input.observedAt,
       createdBy: observer.userId,
-    })
-    .returning();
+    });
+
+    await tx.insert(evidence).values({
+      id: evidenceId,
+      companyId,
+      projectId,
+      kind: input.method === "scan" || input.method === "drone" ? "reality_capture" : input.method === "photo" ? "photograph" : input.method === "survey" ? "survey" : "inspection",
+      source: `site observation (${input.method})`,
+      contentHash,
+      fileId: input.fileIds[0] ?? null,
+      capturedAt: input.observedAt,
+      independenceScore: assessment.independenceScore,
+      provenance: {
+        observedBy: observer.userId,
+        observerVendorId: observer.vendorId ?? null,
+        claimantId: input.claimantId,
+        claimantKind: input.claimantKind,
+        claimantName: input.claimantName ?? null,
+        method: input.method,
+        basis: assessment.independenceBasis,
+        scanId: input.scanId ?? null,
+        droneFlightId: input.droneFlightId ?? null,
+      },
+      metadata: {
+        zoneName: input.zoneName,
+        observedPercent: input.observedPercent,
+        fileIds: input.fileIds,
+      },
+      submittedBy: observer.userId,
+    });
+
+    await tx.insert(reconciliations).values({
+      id: reconciliationId,
+      companyId,
+      projectId,
+      assertionId,
+      evidenceIds: [evidenceId],
+      method: `progress_${input.method}`,
+      result: assessment.result,
+      variance: Math.round((input.claimedPercent - input.observedPercent) * 100) / 100,
+      variancePercent: assessment.variancePercent,
+      confidence: assessment.confidence,
+      notes: assessment.reasons.join(" "),
+      createdBy: observer.userId,
+    });
+
+    const [row] = await tx
+      .insert(siteProgressObservations)
+      .values({
+        id,
+        companyId,
+        projectId,
+        number,
+        reference,
+        zoneName: input.zoneName,
+        locationId: input.locationId ?? null,
+        scheduleTaskId: input.scheduleTaskId ?? null,
+        workPackageRef: input.workPackageRef ?? null,
+        claimedPercent: input.claimedPercent,
+        observedPercent: input.observedPercent,
+        variancePercent: assessment.variancePercent,
+        method: input.method,
+        observedAt: input.observedAt,
+        observedBy: observer.userId,
+        claimSourceType: input.claimSourceType,
+        claimSourceId: input.claimSourceId ?? null,
+        claimantId: input.claimantId,
+        claimantKind: input.claimantKind,
+        claimantName: input.claimantName ?? null,
+        claimedAt: input.claimedAt ?? null,
+        scanId: input.scanId ?? null,
+        droneFlightId: input.droneFlightId ?? null,
+        fileIds: input.fileIds,
+        assertionId,
+        evidenceId,
+        reconciliationId,
+        result: assessment.result,
+        confidence: assessment.confidence,
+        independenceScore: assessment.independenceScore,
+        notes: input.notes ?? null,
+        createdBy: observer.userId,
+      })
+      .returning();
+    return row!;
+  });
 
   for (const [objectType, objectId] of [
     ["assertion", assertionId],
@@ -1356,7 +1412,7 @@ export async function recordProgressObservation(
     });
   }
 
-  return { record: saved!, assertionId, evidenceId, reconciliationId };
+  return { record: saved, assertionId, evidenceId, reconciliationId };
 }
 
 /* ================================================================== */
@@ -1389,6 +1445,31 @@ export interface SiteSummary {
   signals: { open: number };
 }
 
+/** Rows of `{ k, n }` folded into a map, dropping nulls. */
+function countMap(rows: readonly { k: string | null; n: number | string }[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const row of rows) {
+    if (row.k === null) continue;
+    out[row.k] = (out[row.k] ?? 0) + Number(row.n);
+  }
+  return out;
+}
+
+const sumOf = (map: Record<string, number>): number => Object.values(map).reduce((a, b) => a + b, 0);
+const pick = (map: Record<string, number>, ...keys: string[]): number =>
+  keys.reduce((total, key) => total + (map[key] ?? 0), 0);
+
+/**
+ * The workspace header and the intelligence layer's input.
+ *
+ * Every figure is a GROUPED COUNT in the database — `count(*) … group by
+ * status` — not a table read folded in JavaScript: this endpoint is polled
+ * per project by WP-INTEL as well as rendered on every page load, and a
+ * mature site would otherwise move hundreds of thousands of rows to produce
+ * twenty numbers (and silently truncate them at the row cap). The one fold
+ * that still reads rows is the on-site register, which genuinely needs the
+ * gate feed in order.
+ */
 export async function siteSummary(
   db: Db,
   companyId: string,
@@ -1397,129 +1478,120 @@ export async function siteSummary(
 ): Promise<SiteSummary> {
   const today = asOf.slice(0, 10);
   const soon = new Date(Date.parse(`${today}T00:00:00.000Z`) + 30 * 86_400_000).toISOString().slice(0, 10);
-  const LIMIT = 20_000;
+  const scope = <T extends { companyId: typeof sitePermits.companyId; projectId: typeof sitePermits.projectId }>(t: T) =>
+    and(eq(t.companyId, companyId), eq(t.projectId, projectId));
 
   const [
     register,
-    passRows,
-    inductionRows,
+    passStats,
+    inductionStats,
     permitRows,
     entryRows,
     loneRows,
     zoneRows,
-    weatherRows,
-    analysisRows,
-    flightRows,
-    scanRows,
+    weatherStats,
+    analysisStats,
+    lastAnalysis,
+    flightStats,
+    scanStats,
     deviationRows,
-    tourRows,
-    strikeRows,
-    investigationRows,
-    findingRows,
-    envRows,
+    tourStats,
+    strikeStats,
+    investigationStats,
+    findingStats,
+    envStats,
     progressRows,
-    settingOutRows,
+    settingOutStats,
     openSignals,
   ] = await Promise.all([
     loadRegister(db, companyId, projectId, asOf),
     db
       .select({
-        status: siteAccessPasses.status,
-        validUntil: siteAccessPasses.validUntil,
-        inductionId: siteAccessPasses.inductionId,
-        inductionStatus: siteInductions.status,
+        active: sql<number>`count(*) filter (where ${siteAccessPasses.status} = 'active')`,
+        expiring: sql<number>`count(*) filter (where ${siteAccessPasses.status} = 'active' and ${siteAccessPasses.validUntil} is not null and ${siteAccessPasses.validUntil} <= ${soon})`,
+        withoutInduction: sql<number>`count(*) filter (where ${siteAccessPasses.status} = 'active' and (${siteInductions.status} is null or ${siteInductions.status} <> 'valid'))`,
       })
       .from(siteAccessPasses)
       .leftJoin(siteInductions, eq(siteAccessPasses.inductionId, siteInductions.id))
-      .where(and(eq(siteAccessPasses.companyId, companyId), eq(siteAccessPasses.projectId, projectId)))
-      .limit(LIMIT),
+      .where(scope(siteAccessPasses)),
     db
-      .select({ status: siteInductions.status })
+      .select({ valid: sql<number>`count(*) filter (where ${siteInductions.status} = 'valid')` })
       .from(siteInductions)
-      .where(and(eq(siteInductions.companyId, companyId), eq(siteInductions.projectId, projectId)))
-      .limit(LIMIT),
+      .where(scope(siteInductions)),
     db
-      .select({ status: sitePermits.status, permitType: sitePermits.permitType })
+      .select({ status: sitePermits.status, permitType: sitePermits.permitType, n: count() })
       .from(sitePermits)
-      .where(and(eq(sitePermits.companyId, companyId), eq(sitePermits.projectId, projectId)))
-      .limit(LIMIT),
+      .where(scope(sitePermits))
+      .groupBy(sitePermits.status, sitePermits.permitType),
     db
-      .select({ status: sitePermitEntries.status })
+      .select({ k: sitePermitEntries.status, n: count() })
       .from(sitePermitEntries)
-      .where(and(eq(sitePermitEntries.companyId, companyId), eq(sitePermitEntries.projectId, projectId)))
-      .limit(LIMIT),
+      .where(scope(sitePermitEntries))
+      .groupBy(sitePermitEntries.status),
     db
-      .select({ status: siteLoneWorkerSessions.status })
+      .select({ k: siteLoneWorkerSessions.status, n: count() })
       .from(siteLoneWorkerSessions)
-      .where(and(eq(siteLoneWorkerSessions.companyId, companyId), eq(siteLoneWorkerSessions.projectId, projectId)))
-      .limit(LIMIT),
+      .where(scope(siteLoneWorkerSessions))
+      .groupBy(siteLoneWorkerSessions.status),
     db
-      .select({ status: siteExclusionZones.status })
+      .select({ k: siteExclusionZones.status, n: count() })
       .from(siteExclusionZones)
-      .where(and(eq(siteExclusionZones.companyId, companyId), eq(siteExclusionZones.projectId, projectId)))
-      .limit(LIMIT),
+      .where(scope(siteExclusionZones))
+      .groupBy(siteExclusionZones.status),
     db
-      .select({ observedOn: siteWeatherObservations.observedOn })
+      .select({ n: count(), lastObservedOn: sql<string | null>`max(${siteWeatherObservations.observedOn})` })
       .from(siteWeatherObservations)
-      .where(and(eq(siteWeatherObservations.companyId, companyId), eq(siteWeatherObservations.projectId, projectId)))
-      .orderBy(desc(siteWeatherObservations.observedOn))
-      .limit(LIMIT),
+      .where(scope(siteWeatherObservations)),
+    db.select({ n: count() }).from(siteWeatherAnalyses).where(scope(siteWeatherAnalyses)),
     db
       .select({ exceptionalDays: siteWeatherAnalyses.exceptionalDays })
       .from(siteWeatherAnalyses)
-      .where(and(eq(siteWeatherAnalyses.companyId, companyId), eq(siteWeatherAnalyses.projectId, projectId)))
+      .where(scope(siteWeatherAnalyses))
       .orderBy(desc(siteWeatherAnalyses.generatedAt))
-      .limit(500),
+      .limit(1),
+    db.select({ n: count() }).from(siteDroneFlights).where(scope(siteDroneFlights)),
+    db.select({ n: count() }).from(siteScans).where(scope(siteScans)),
     db
-      .select({ status: siteDroneFlights.status })
-      .from(siteDroneFlights)
-      .where(and(eq(siteDroneFlights.companyId, companyId), eq(siteDroneFlights.projectId, projectId)))
-      .limit(LIMIT),
-    db
-      .select({ status: siteScans.status })
-      .from(siteScans)
-      .where(and(eq(siteScans.companyId, companyId), eq(siteScans.projectId, projectId)))
-      .limit(LIMIT),
-    db
-      .select({ verdict: siteScanDeviations.verdict })
+      .select({ k: siteScanDeviations.verdict, n: count() })
       .from(siteScanDeviations)
-      .where(and(eq(siteScanDeviations.companyId, companyId), eq(siteScanDeviations.projectId, projectId)))
-      .limit(LIMIT),
+      .where(scope(siteScanDeviations))
+      .groupBy(siteScanDeviations.verdict),
     db
-      .select({ status: sitePhotoTours.status })
+      .select({ published: sql<number>`count(*) filter (where ${sitePhotoTours.status} = 'published')` })
       .from(sitePhotoTours)
-      .where(and(eq(sitePhotoTours.companyId, companyId), eq(sitePhotoTours.projectId, projectId)))
-      .limit(LIMIT),
+      .where(scope(sitePhotoTours)),
     db
-      .select({ severity: siteUtilityStrikes.severity, status: siteUtilityStrikes.status })
+      .select({
+        n: count(),
+        nearMisses: sql<number>`count(*) filter (where ${siteUtilityStrikes.severity} = 'near_miss')`,
+      })
       .from(siteUtilityStrikes)
-      .where(and(eq(siteUtilityStrikes.companyId, companyId), eq(siteUtilityStrikes.projectId, projectId)))
-      .limit(LIMIT),
+      .where(scope(siteUtilityStrikes)),
+    db.select({ n: count() }).from(siteGeotechInvestigations).where(scope(siteGeotechInvestigations)),
     db
-      .select({ status: siteGeotechInvestigations.status })
-      .from(siteGeotechInvestigations)
-      .where(and(eq(siteGeotechInvestigations.companyId, companyId), eq(siteGeotechInvestigations.projectId, projectId)))
-      .limit(LIMIT),
-    db
-      .select({ status: siteGroundFindings.status })
+      .select({ open: sql<number>`count(*) filter (where ${siteGroundFindings.status} = 'open')` })
       .from(siteGroundFindings)
-      .where(and(eq(siteGroundFindings.companyId, companyId), eq(siteGroundFindings.projectId, projectId)))
-      .limit(LIMIT),
+      .where(scope(siteGroundFindings)),
     db
-      .select({ status: siteEnvironmentalEvents.status, exceeded: siteEnvironmentalEvents.exceededThreshold })
+      .select({
+        open: sql<number>`count(*) filter (where ${siteEnvironmentalEvents.status} <> 'closed')`,
+        exceedances: sql<number>`count(*) filter (where ${siteEnvironmentalEvents.exceededThreshold} = 1)`,
+      })
       .from(siteEnvironmentalEvents)
-      .where(and(eq(siteEnvironmentalEvents.companyId, companyId), eq(siteEnvironmentalEvents.projectId, projectId)))
-      .limit(LIMIT),
+      .where(scope(siteEnvironmentalEvents)),
     db
-      .select({ result: siteProgressObservations.result, variancePercent: siteProgressObservations.variancePercent })
+      .select({
+        k: siteProgressObservations.result,
+        n: count(),
+        worst: sql<number | null>`max(${siteProgressObservations.variancePercent})`,
+      })
       .from(siteProgressObservations)
-      .where(and(eq(siteProgressObservations.companyId, companyId), eq(siteProgressObservations.projectId, projectId)))
-      .limit(LIMIT),
+      .where(scope(siteProgressObservations))
+      .groupBy(siteProgressObservations.result),
     db
-      .select({ status: siteSettingOutRecords.status })
+      .select({ awaitingCheck: sql<number>`count(*) filter (where ${siteSettingOutRecords.status} = 'set_out')` })
       .from(siteSettingOutRecords)
-      .where(and(eq(siteSettingOutRecords.companyId, companyId), eq(siteSettingOutRecords.projectId, projectId)))
-      .limit(LIMIT),
+      .where(scope(siteSettingOutRecords)),
     db
       .select({ n: count() })
       .from(signals)
@@ -1538,21 +1610,30 @@ export async function siteSummary(
   let permitsActive = 0;
   let permitsExpired = 0;
   for (const p of permitRows) {
+    const n = Number(p.n);
     if ((OPEN_PERMIT_STATUSES as readonly string[]).includes(p.status)) {
-      permitsOpen += 1;
-      byType[p.permitType] = (byType[p.permitType] ?? 0) + 1;
+      permitsOpen += n;
+      byType[p.permitType] = (byType[p.permitType] ?? 0) + n;
     }
-    if (p.status === "active") permitsActive += 1;
-    if (p.status === "expired") permitsExpired += 1;
+    if (p.status === "active") permitsActive += n;
+    if (p.status === "expired") permitsExpired += n;
   }
 
-  const overclaims = progressRows.filter(
-    (r) => r.result === "unsupported" || r.result === "contradicted" || r.result === "partially_supported",
-  );
-  const worstVariance = overclaims.reduce<number | null>(
-    (m, r) => (m === null || r.variancePercent > m ? r.variancePercent : m),
-    null,
-  );
+  const entries = countMap(entryRows);
+  const lone = countMap(loneRows);
+  const zones = countMap(zoneRows);
+  const deviations = countMap(deviationRows);
+
+  const OVERCLAIM_RESULTS = ["unsupported", "contradicted", "partially_supported"] as const;
+  const progressByResult = countMap(progressRows);
+  const observations = sumOf(progressByResult);
+  const overclaims = pick(progressByResult, ...OVERCLAIM_RESULTS);
+  let worstVariance: number | null = null;
+  for (const row of progressRows) {
+    if (row.k === null || !(OVERCLAIM_RESULTS as readonly string[]).includes(row.k)) continue;
+    const worst = row.worst === null || row.worst === undefined ? null : Number(row.worst);
+    if (worst !== null && (worstVariance === null || worst > worstVariance)) worstVariance = worst;
+  }
 
   return {
     asOf,
@@ -1566,56 +1647,53 @@ export async function siteSummary(
       reasons: register.reasons,
     },
     access: {
-      activePasses: passRows.filter((p) => p.status === "active").length,
-      validInductions: inductionRows.filter((i) => i.status === "valid").length,
-      expiringPasses: passRows.filter((p) => p.status === "active" && p.validUntil !== null && p.validUntil <= soon).length,
-      passesWithoutValidInduction: passRows.filter((p) => p.status === "active" && p.inductionStatus !== "valid").length,
+      activePasses: Number(passStats[0]?.active ?? 0),
+      validInductions: Number(inductionStats[0]?.valid ?? 0),
+      expiringPasses: Number(passStats[0]?.expiring ?? 0),
+      passesWithoutValidInduction: Number(passStats[0]?.withoutInduction ?? 0),
     },
     permits: { open: permitsOpen, active: permitsActive, expired: permitsExpired, byType },
-    entries: {
-      inside: entryRows.filter((e) => e.status === "inside").length,
-      overdue: entryRows.filter((e) => e.status === "overdue").length,
-    },
+    entries: { inside: entries["inside"] ?? 0, overdue: entries["overdue"] ?? 0 },
     loneWorkers: {
-      active: loneRows.filter((l) => l.status === "active").length,
-      overdue: loneRows.filter((l) => l.status === "overdue").length,
-      escalated: loneRows.filter((l) => l.status === "escalated").length,
+      active: lone["active"] ?? 0,
+      overdue: lone["overdue"] ?? 0,
+      escalated: lone["escalated"] ?? 0,
     },
-    zones: { active: zoneRows.filter((z) => z.status === "active").length },
+    zones: { active: zones["active"] ?? 0 },
     weather: {
-      observations: weatherRows.length,
-      lastObservedOn: weatherRows[0]?.observedOn ?? null,
-      analyses: analysisRows.length,
-      lastExceptionalDays: analysisRows[0]?.exceptionalDays ?? null,
+      observations: Number(weatherStats[0]?.n ?? 0),
+      lastObservedOn: weatherStats[0]?.lastObservedOn ?? null,
+      analyses: Number(analysisStats[0]?.n ?? 0),
+      lastExceptionalDays: lastAnalysis[0]?.exceptionalDays ?? null,
     },
     capture: {
-      flights: flightRows.length,
-      scans: scanRows.length,
-      deviationsOutOfTolerance: deviationRows.filter((d) => d.verdict === "out_of_tolerance").length,
-      toursPublished: tourRows.filter((t) => t.status === "published").length,
+      flights: Number(flightStats[0]?.n ?? 0),
+      scans: Number(scanStats[0]?.n ?? 0),
+      deviationsOutOfTolerance: deviations["out_of_tolerance"] ?? 0,
+      toursPublished: Number(tourStats[0]?.published ?? 0),
     },
     ground: {
-      investigations: investigationRows.length,
-      openFindings: findingRows.filter((f) => f.status === "open").length,
-      strikes: strikeRows.length,
-      nearMisses: strikeRows.filter((s) => s.severity === "near_miss").length,
+      investigations: Number(investigationStats[0]?.n ?? 0),
+      openFindings: Number(findingStats[0]?.open ?? 0),
+      strikes: Number(strikeStats[0]?.n ?? 0),
+      nearMisses: Number(strikeStats[0]?.nearMisses ?? 0),
     },
     environmental: {
-      open: envRows.filter((e) => e.status !== "closed").length,
-      exceedances: envRows.filter((e) => e.exceeded === 1).length,
+      open: Number(envStats[0]?.open ?? 0),
+      exceedances: Number(envStats[0]?.exceedances ?? 0),
     },
     progress: {
-      observations: progressRows.length,
-      overclaims: overclaims.length,
+      observations,
+      overclaims,
       worstVariance:
         worstVariance === null
-          ? figure(null, "percentage points", { observations: progressRows.length }, [
+          ? figure(null, "percentage points", { observations }, [
               "No progress observation has found an overclaim.",
             ])
-          : figure(round1(worstVariance), "percentage points", { observations: progressRows.length }),
+          : figure(round1(worstVariance), "percentage points", { observations }),
     },
-    settingOut: { awaitingCheck: settingOutRows.filter((s) => s.status === "set_out").length },
-    signals: { open: openSignals[0]?.n ?? 0 },
+    settingOut: { awaitingCheck: Number(settingOutStats[0]?.awaitingCheck ?? 0) },
+    signals: { open: Number(openSignals[0]?.n ?? 0) },
   };
 }
 

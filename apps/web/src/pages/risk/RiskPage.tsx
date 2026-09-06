@@ -36,6 +36,7 @@ import { DrawdownCurve, SCurve, Tornado, type TornadoRow } from "./SimulationCha
 import AppetiteTab from "./AppetiteTab";
 import ReferenceClassTab from "./ReferenceClassTab";
 import ContingencyGovernance from "./ContingencyGovernance";
+import SimulationJobs from "./SimulationJobs";
 import {
   bandChipClass,
   bandTone,
@@ -379,6 +380,10 @@ function SimulationTab({
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
   const [view, setView] = useState<SimView | null>(null);
+  /** queue the run instead of waiting for it — the honest option for a big
+   *  model, and the only one that does not hold a request open for minutes */
+  const [background, setBackground] = useState(false);
+  const [queueNonce, setQueueNonce] = useState(0);
 
   const [history, setHistory] = useState<SimListItem[] | null>(null);
   const [histError, setHistError] = useState<string | null>(null);
@@ -413,6 +418,14 @@ function SimulationTab({
       const body: Record<string, unknown> = { iterations: Number(iterations) || undefined };
       if (seed.trim() !== "") body["seed"] = Number(seed);
       if (kind === "qsra" && scheduleId) body["scheduleId"] = scheduleId;
+      if (background) {
+        body["async"] = true;
+        await api.post<{ job: { id: string } }>(`${base}/risk/simulations/${kind}`, body);
+        // The jobs panel takes it from here: it polls, shows convergence and
+        // opens the result when the run lands.
+        setQueueNonce((n) => n + 1);
+        return;
+      }
       const res = await api.post<SimView & Record<string, unknown>>(
         `${base}/risk/simulations/${kind}`,
         body,
@@ -543,13 +556,32 @@ function SimulationTab({
                 </Select>
               </Field>
             ) : null}
+            <label className="mb-2 flex items-center gap-2 text-xs text-ink-700">
+              <input
+                type="checkbox"
+                className="h-4 w-4 accent-brand-600"
+                checked={background}
+                onChange={(e) => setBackground(e.target.checked)}
+              />
+              Run in the background
+            </label>
             <Button onClick={() => void onRun()} disabled={running}>
-              {running ? "Simulating…" : "Run simulation"}
+              {running ? "Simulating…" : background ? "Queue simulation" : "Run simulation"}
             </Button>
           </div>
           <ErrorAlert message={runError} />
+          <p className="mt-1 text-xs text-ink-400">
+            A queued run executes in batches off the request path and records its convergence, so a
+            20,000-iteration model does not hold a request open or block other users.
+          </p>
         </CardBody>
       </Card>
+
+      <SimulationJobs
+        key={queueNonce}
+        base={base}
+        onOpenSimulation={(simulationId) => void onView(simulationId)}
+      />
 
       {/* results */}
       {view ? (

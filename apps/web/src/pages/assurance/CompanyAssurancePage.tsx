@@ -8,6 +8,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import {
   ENTITY_KINDS,
   ENTITY_RELATIONSHIP_KINDS,
+  SCREENING_DISPOSITIONS,
   SIGNAL_DISPOSITIONS,
   SIGNAL_SEVERITIES,
 } from "@constructos/shared";
@@ -27,6 +28,7 @@ import {
   Spinner,
   Table,
   Td,
+  Textarea,
   Th,
 } from "../../ui";
 import { formatDateTime, humanize } from "../format";
@@ -45,6 +47,7 @@ import {
 import CasesTab from "./CasesTab";
 import DetectorsTab from "./DetectorsTab";
 import IntegrityTab from "./IntegrityTab";
+import RegistersTab from "./RegistersTab";
 
 const COMPANY_TABS = [
   { key: "signals", label: "Signals" },
@@ -52,6 +55,7 @@ const COMPANY_TABS = [
   { key: "integrity", label: "Integrity scores" },
   { key: "cases", label: "Cases" },
   { key: "entities", label: "Entity register" },
+  { key: "registers", label: "Conflicts & authority" },
 ];
 
 interface SignalStats {
@@ -164,6 +168,18 @@ export default function CompanyAssurancePage() {
   const [scan, setScan] = useState<ScanResult | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
 
+  // Entity lifecycle: edit, soft-remove (with a mandatory reason) and restore.
+  const [includeDeleted, setIncludeDeleted] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
+  const [editForm, setEditForm] = useState<EntityForm>(emptyEntity);
+  const [editBusy, setEditBusy] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+  const [removeOpen, setRemoveOpen] = useState(false);
+  const [removeReason, setRemoveReason] = useState("");
+  const [removeBusy, setRemoveBusy] = useState(false);
+  const [removeError, setRemoveError] = useState<string | null>(null);
+  const [screenDispBusy, setScreenDispBusy] = useState<string | null>(null);
+
   const loadSignals = useCallback(async () => {
     setError(null);
     try {
@@ -185,13 +201,15 @@ export default function CompanyAssurancePage() {
   const loadEntities = useCallback(async () => {
     setEntityError(null);
     try {
-      const res = await api.get<ListResponse<EntityRow>>("/api/v1/entities?pageSize=200");
+      const res = await api.get<ListResponse<EntityRow>>(
+        `/api/v1/entities?pageSize=200${includeDeleted ? "&includeDeleted=true" : ""}`,
+      );
       setEntities(res.items);
     } catch (err) {
       setEntities([]);
       setEntityError(err instanceof Error ? err.message : "Failed to load entities");
     }
-  }, []);
+  }, [includeDeleted]);
 
   useEffect(() => {
     void loadSignals();
@@ -277,6 +295,107 @@ export default function CompanyAssurancePage() {
     }
   }
 
+  /**
+   * Record a reviewer's judgement on one screening hit.
+   *
+   * A match against a sanctions or PEP list is a question, not a finding —
+   * names collide. Without this control every hit stayed `pending` forever and
+   * the entity's screening status could never be cleared or escalated by a
+   * human, which is the only thing that turns a fuzzy name match into a fact.
+   */
+  async function setScreeningDisposition(resultId: string, disposition: string) {
+    if (!selectedEntity) return;
+    setScreenDispBusy(resultId);
+    setScreenError(null);
+    try {
+      await api.patch(`/api/v1/screening-results/${resultId}`, { disposition });
+      const scr = await api.get<{ items: ScreeningRow[] }>(
+        `/api/v1/entities/${selectedEntity.id}/screening`,
+      );
+      setScreening(scr.items);
+    } catch (err) {
+      setScreenError(
+        err instanceof Error ? err.message : "Failed to record the screening disposition",
+      );
+    } finally {
+      setScreenDispBusy(null);
+    }
+  }
+
+  function openEdit() {
+    if (!selectedEntity) return;
+    setEditForm({
+      kind: selectedEntity.kind,
+      name: selectedEntity.name,
+      jurisdiction: selectedEntity.jurisdiction ?? "",
+      identifiers: { ...(selectedEntity.identifiers ?? {}) },
+    });
+    setEditError(null);
+    setEditOpen(true);
+  }
+
+  async function onEditEntity(e: FormEvent) {
+    e.preventDefault();
+    if (!selectedEntity) return;
+    setEditBusy(true);
+    setEditError(null);
+    try {
+      const identifiers: Record<string, string> = {};
+      for (const k of IDENTIFIER_KEYS) {
+        const v = (editForm.identifiers[k] ?? "").trim();
+        if (v) identifiers[k] = v;
+      }
+      const updated = await api.patch<EntityRow>(`/api/v1/entities/${selectedEntity.id}`, {
+        kind: editForm.kind,
+        name: editForm.name.trim(),
+        jurisdiction: editForm.jurisdiction.trim() || null,
+        identifiers,
+      });
+      setEditOpen(false);
+      await loadEntities();
+      await selectEntity(updated);
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : "Failed to update the entity");
+    } finally {
+      setEditBusy(false);
+    }
+  }
+
+  async function onRemoveEntity(e: FormEvent) {
+    e.preventDefault();
+    if (!selectedEntity || !removeReason.trim()) return;
+    setRemoveBusy(true);
+    setRemoveError(null);
+    try {
+      await api.del(
+        `/api/v1/entities/${selectedEntity.id}?reason=${encodeURIComponent(removeReason.trim())}`,
+      );
+      setRemoveOpen(false);
+      setRemoveReason("");
+      setSelectedEntity(null);
+      await loadEntities();
+    } catch (err) {
+      setRemoveError(err instanceof Error ? err.message : "Failed to remove the entity");
+    } finally {
+      setRemoveBusy(false);
+    }
+  }
+
+  async function onRestoreEntity() {
+    if (!selectedEntity) return;
+    setPanelError(null);
+    try {
+      const restored = await api.post<EntityRow>(
+        `/api/v1/entities/${selectedEntity.id}/restore`,
+        {},
+      );
+      await loadEntities();
+      await selectEntity(restored);
+    } catch (err) {
+      setPanelError(err instanceof Error ? err.message : "Failed to restore the entity");
+    }
+  }
+
   async function onCreateRelationship(e: FormEvent) {
     e.preventDefault();
     if (!selectedEntity || !relTo) return;
@@ -338,6 +457,7 @@ export default function CompanyAssurancePage() {
       {tab === "detectors" ? <DetectorsTab /> : null}
       {tab === "integrity" ? <IntegrityTab /> : null}
       {tab === "cases" ? <CasesTab /> : null}
+      {tab === "registers" ? <RegistersTab /> : null}
 
       <div hidden={tab !== "entities"}>
       <ErrorAlert message={scanError} />
@@ -480,7 +600,17 @@ export default function CompanyAssurancePage() {
             Counterparties, their identifiers, and the relationship graph between them.
           </p>
         </div>
-        <Button onClick={() => setCreateOpen(true)}>New entity</Button>
+        <div className="flex items-center gap-3">
+          <label className="flex items-center gap-1.5 text-xs text-ink-600">
+            <input
+              type="checkbox"
+              checked={includeDeleted}
+              onChange={(e) => setIncludeDeleted(e.target.checked)}
+            />
+            Show removed
+          </label>
+          <Button onClick={() => setCreateOpen(true)}>New entity</Button>
+        </div>
       </div>
 
       <ErrorAlert message={entityError} />
@@ -515,7 +645,14 @@ export default function CompanyAssurancePage() {
                     }`}
                     onClick={() => void selectEntity(e)}
                   >
-                    <Td className="font-medium text-ink-900">{e.name}</Td>
+                    <Td className="font-medium text-ink-900">
+                      {e.name}
+                      {e.deletedAt ? (
+                        <Badge tone="gray" className="ml-2">
+                          removed
+                        </Badge>
+                      ) : null}
+                    </Td>
                     <Td>
                       <Badge tone="blue">{humanize(e.kind)}</Badge>
                     </Td>
@@ -553,10 +690,41 @@ export default function CompanyAssurancePage() {
                       {selectedEntity.jurisdiction ? ` · ${selectedEntity.jurisdiction}` : ""}
                     </div>
                   </div>
-                  <Button size="sm" variant="secondary" onClick={() => setRelOpen(true)}>
-                    Add relationship
-                  </Button>
+                  <div className="flex flex-wrap justify-end gap-2">
+                    <Button size="sm" variant="secondary" onClick={() => setRelOpen(true)}>
+                      Add relationship
+                    </Button>
+                    <Button size="sm" variant="secondary" onClick={openEdit}>
+                      Edit
+                    </Button>
+                    {selectedEntity.deletedAt ? (
+                      <Button size="sm" variant="secondary" onClick={() => void onRestoreEntity()}>
+                        Restore
+                      </Button>
+                    ) : (
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        onClick={() => {
+                          setRemoveReason("");
+                          setRemoveError(null);
+                          setRemoveOpen(true);
+                        }}
+                      >
+                        Remove
+                      </Button>
+                    )}
+                  </div>
                 </div>
+
+                {selectedEntity.deletedAt ? (
+                  <div className="mb-3 rounded-md bg-ink-50 px-3 py-2 text-xs text-ink-600 ring-1 ring-ink-200">
+                    Removed {formatDateTime(selectedEntity.deletedAt)}
+                    {selectedEntity.deleteReason ? ` — "${selectedEntity.deleteReason}"` : ""}. The
+                    row and every relationship it had are retained: a scan-inferred edge is the
+                    evidence, so removal hides it from the register without destroying it.
+                  </div>
+                ) : null}
 
                 {Object.keys(selectedEntity.identifiers ?? {}).length > 0 ? (
                   <dl className="mb-3 grid grid-cols-2 gap-x-4 gap-y-1 rounded-md bg-ink-50 p-3 text-xs">
@@ -626,7 +794,23 @@ export default function CompanyAssurancePage() {
                           <span className="text-ink-700">
                             {r.matchedName ? `${r.matchedName} (${pct(r.matchScore)})` : "no match"}
                           </span>
-                          <span className="ml-auto text-ink-400">{humanize(r.disposition)}</span>
+                          <div className="ml-auto w-36">
+                            {/* A fuzzy name match is a question. Someone has to answer it. */}
+                            <Select
+                              aria-label="Screening disposition"
+                              value={r.disposition}
+                              disabled={screenDispBusy === r.id}
+                              onChange={(e) =>
+                                void setScreeningDisposition(r.id, e.target.value)
+                              }
+                            >
+                              {SCREENING_DISPOSITIONS.map((d) => (
+                                <option key={d} value={d}>
+                                  {humanize(d)}
+                                </option>
+                              ))}
+                            </Select>
+                          </div>
                         </div>
                         <div
                           className="mt-0.5 truncate text-[11px] text-ink-400"
@@ -768,6 +952,106 @@ export default function CompanyAssurancePage() {
             </Button>
             <Button type="submit" disabled={busy}>
               {busy ? "Creating…" : "Create entity"}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+
+      {/* Edit entity modal */}
+      <Modal
+        open={editOpen}
+        title={`Edit ${selectedEntity?.name ?? "entity"}`}
+        onClose={() => setEditOpen(false)}
+      >
+        <ErrorAlert message={editError} />
+        <form onSubmit={onEditEntity} className="space-y-4">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <Field label="Kind">
+              <Select
+                value={editForm.kind}
+                onChange={(e) => setEditForm((f) => ({ ...f, kind: e.target.value }))}
+              >
+                {ENTITY_KINDS.map((k) => (
+                  <option key={k} value={k}>
+                    {humanize(k)}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <div className="sm:col-span-2">
+              <Field label="Name">
+                <Input
+                  required
+                  value={editForm.name}
+                  onChange={(e) => setEditForm((f) => ({ ...f, name: e.target.value }))}
+                />
+              </Field>
+            </div>
+          </div>
+          <Field label="Jurisdiction">
+            <Input
+              value={editForm.jurisdiction}
+              onChange={(e) => setEditForm((f) => ({ ...f, jurisdiction: e.target.value }))}
+            />
+          </Field>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            {IDENTIFIER_KEYS.map((k) => (
+              <Field key={k} label={humanize(k)}>
+                <Input
+                  value={editForm.identifiers[k] ?? ""}
+                  onChange={(e) =>
+                    setEditForm((f) => ({
+                      ...f,
+                      identifiers: { ...f.identifiers, [k]: e.target.value },
+                    }))
+                  }
+                />
+              </Field>
+            ))}
+          </div>
+          <p className="text-xs text-ink-400">
+            The previous values are kept: every edit stores the row BEFORE and after it in the
+            ledger, so an overwritten bank account is always recoverable.
+          </p>
+          <div className="flex justify-end gap-2">
+            <Button variant="secondary" onClick={() => setEditOpen(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={editBusy}>
+              {editBusy ? "Saving…" : "Save changes"}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+
+      {/* Remove entity modal — a reason is mandatory */}
+      <Modal
+        open={removeOpen}
+        title={`Remove ${selectedEntity?.name ?? "entity"} from the register`}
+        onClose={() => setRemoveOpen(false)}
+      >
+        <ErrorAlert message={removeError} />
+        <form onSubmit={onRemoveEntity} className="space-y-4">
+          <p className="text-sm text-ink-600">
+            This is a soft removal. The entity, its identifiers and every relationship — including
+            the ones the collusion scan inferred — are retained and remain visible under “Show
+            removed”, because those relationships are frequently the evidence.
+          </p>
+          <Field label="Reason" hint="Recorded against the removal in the ledger.">
+            <Textarea
+              required
+              rows={3}
+              value={removeReason}
+              onChange={(e) => setRemoveReason(e.target.value)}
+              placeholder="Duplicate record superseded by ENT-… / counterparty never engaged"
+            />
+          </Field>
+          <div className="flex justify-end gap-2">
+            <Button variant="secondary" onClick={() => setRemoveOpen(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={removeBusy || !removeReason.trim()}>
+              {removeBusy ? "Removing…" : "Remove"}
             </Button>
           </div>
         </form>

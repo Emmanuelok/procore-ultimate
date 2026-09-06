@@ -1,5 +1,5 @@
 {
-  "id": "2805c535-ee96-44ae-8e14-cd71fbfa0088",
+  "id": "1adc806e-454e-4981-b6bd-f786b1eab60f",
   "prevId": "340cf323-a4ed-4b81-8d6c-8f3e94b698e3",
   "version": "7",
   "dialect": "postgresql",
@@ -29937,6 +29937,42 @@
           "isUnique": false,
           "concurrently": false,
           "method": "btree",
+          "with": {}
+        },
+        "engagements_kind_idx": {
+          "name": "engagements_kind_idx",
+          "columns": [
+            {
+              "expression": "project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "kind",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "engagements_stakeholders_idx": {
+          "name": "engagements_stakeholders_idx",
+          "columns": [
+            {
+              "expression": "stakeholder_ids",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "gin",
           "with": {}
         }
       },
@@ -111631,6 +111667,12 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'user'"
+        },
+        "claimant_name": {
+          "name": "claimant_name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
         },
         "claimed_at": {
           "name": "claimed_at",

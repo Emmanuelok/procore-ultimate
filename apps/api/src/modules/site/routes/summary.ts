@@ -60,21 +60,25 @@ export const summaryRoutes: FastifyPluginAsync = async (app) => {
   });
 
   /**
-   * Run every site sweep for this company now. The scheduler runs the same
-   * services on its own cadence; this is the operator's button and what the
-   * tests drive.
+   * Run every site sweep for THIS PROJECT now. The scheduler runs the same
+   * services company-wide with the system actor; this is the operator's
+   * button and what the tests drive — and it is scoped to the project the
+   * caller's `site_ops` admin grant actually covers, so an admin on one
+   * project never expires permits or escalates lone workers on another.
    */
   app.post(`${base}/sweeps/run`, { preHandler: adminGate }, async (req) => {
+    const { projectId } = req.params as { projectId: string };
     const companyId = req.companyId!;
     const now = new Date();
+    const scope = { projectId };
     const [permits, entries, loneWorkers, credentials, zones, overstays] = await Promise.all([
-      sweepPermitExpiry(app.db, companyId, now),
-      sweepPermitEntries(app.db, companyId, now),
-      sweepLoneWorkers(app.db, companyId, now),
-      sweepAccessCredentials(app.db, companyId, now),
-      sweepExclusionZones(app.db, companyId, now),
-      sweepOverstays(app.db, companyId, now),
+      sweepPermitExpiry(app.db, companyId, now, scope),
+      sweepPermitEntries(app.db, companyId, now, scope),
+      sweepLoneWorkers(app.db, companyId, now, scope),
+      sweepAccessCredentials(app.db, companyId, now, scope),
+      sweepExclusionZones(app.db, companyId, now, scope),
+      sweepOverstays(app.db, companyId, now, scope),
     ]);
-    return { ranAt: now.toISOString(), permits, entries, loneWorkers, credentials, zones, overstays };
+    return { ranAt: now.toISOString(), scope: { projectId }, permits, entries, loneWorkers, credentials, zones, overstays };
   });
 };

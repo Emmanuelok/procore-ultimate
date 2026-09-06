@@ -8,6 +8,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, eq } from "drizzle-orm";
 import {
+  assertions,
   budgetLineItems,
   budgets,
   companyMemberships,
@@ -15,9 +16,11 @@ import {
   equipmentCertificates,
   equipmentMaintenanceSchedules,
   equipmentTelematicsReadings,
+  evidence,
   materialItems,
   projectMemberships,
   projects,
+  reconciliations,
   signals,
   vendors,
 } from "@constructos/db";
@@ -1058,6 +1061,504 @@ describe("rental against owned", () => {
     const res = await get(
       `/companies/current/equipment-ownership-comparison?projectId=${projectB}`,
       readerHeaders,
+    );
+    expect(res.statusCode).toBe(403);
+  });
+});
+
+
+/* ================================================================== */
+/* Adding lines to an open delivery                                    */
+/* ================================================================== */
+
+/**
+ * A delivery note is often typed before the wagon is unloaded and the pallet
+ * nobody expected is added at the gate. The route that adds those lines had
+ * no test, and it is the route that decides whether "what arrived" can still
+ * be changed after the receipt is closed.
+ */
+describe("delivery lines", () => {
+  let deliveryId = "";
+  let itemId = "";
+
+  it("appends a line to an open delivery, in position order", async () => {
+    const item = await post(`/projects/${projectA}/materials`, {
+      name: "Late-added rebar",
+      unit: "t",
+      quantityRequired: 50,
+      isTracked: true,
+    });
+    expect(item.statusCode, item.body).toBe(201);
+    itemId = item.json().id as string;
+
+    const delivery = await post(`/projects/${projectA}/material-deliveries`, {
+      supplierVendorId: vendorId,
+      deliveryNoteNumber: "DN-LINES-1",
+      lines: [{ description: "First line", quantityExpected: 5, unit: "t" }],
+    });
+    expect(delivery.statusCode, delivery.body).toBe(201);
+    deliveryId = delivery.json().id as string;
+
+    const added = await post(
+      `/projects/${projectA}/material-deliveries/${deliveryId}/lines`,
+      {
+        lines: [
+          {
+            materialItemId: itemId,
+            description: "Pallet nobody expected",
+            quantityExpected: 3,
+            unit: "t",
+            heatNumber: "H-99213",
+          },
+        ],
+      },
+    );
+    expect(added.statusCode, added.body).toBe(201);
+    const lines = added.json().lines as Array<{
+      description: string;
+      position: number;
+      heatNumber: string | null;
+    }>;
+    expect(lines).toHaveLength(2);
+    const appended = lines.find((l) => l.description === "Pallet nobody expected")!;
+    expect(appended.position).toBe(1);
+    // Traceability travels with the line, not with the delivery.
+    expect(appended.heatNumber).toBe("H-99213");
+  });
+
+  it("refuses a line naming a material that is not on this project", async () => {
+    const elsewhere = await post(`/projects/${projectB}/materials`, {
+      name: "Somebody else's block",
+      unit: "no",
+      quantityRequired: 10,
+    });
+    expect(elsewhere.statusCode).toBe(201);
+    const res = await post(
+      `/projects/${projectA}/material-deliveries/${deliveryId}/lines`,
+      { lines: [{ materialItemId: elsewhere.json().id, description: "Wrong project" }] },
+    );
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("refuses lines once the receipt is closed", async () => {
+    const lines = (
+      await get(`/projects/${projectA}/material-deliveries/${deliveryId}`)
+    ).json().lines as Array<{ id: string }>;
+    const received = await post(
+      `/projects/${projectA}/material-deliveries/${deliveryId}/receive`,
+      {
+        createStockMovements: false,
+        lines: lines.map((l) => ({
+          lineId: l.id,
+          quantityReceived: 1,
+          quantityAccepted: 1,
+          quantityRejected: 0,
+        })),
+      },
+    );
+    expect(received.statusCode, received.body).toBe(200);
+
+    const late = await post(
+      `/projects/${projectA}/material-deliveries/${deliveryId}/lines`,
+      { lines: [{ description: "Remembered afterwards", quantityExpected: 1 }] },
+    );
+    expect(late.statusCode).toBe(400);
+    expect(late.json().message).toContain("What arrived is what arrived");
+  });
+
+  it("refuses a stranger from another company", async () => {
+    const res = await post(
+      `/projects/${projectA}/material-deliveries/${deliveryId}/lines`,
+      { lines: [{ description: "Not yours" }] },
+      stranger.headers,
+    );
+    expect(res.statusCode).toBe(403);
+  });
+});
+
+/* ================================================================== */
+/* Telematics intelligence over the route                              */
+/* ================================================================== */
+
+/**
+ * The geofence, fuel and fault engines are unit-tested in telematics.test.ts;
+ * this is the route that assembles them, and its contract is that a missing
+ * input is REPORTED rather than guessed — a project with no coordinates has
+ * no fence and therefore no off-site verdict.
+ */
+describe("telematics intelligence route", () => {
+  it("states plainly that it cannot fence a project with no coordinates", async () => {
+    const machineId = await makeMachine({ name: "Unfenced roller" });
+    await mobilise(projectA, machineId);
+    const res = await get(`/projects/${projectA}/equipment-telematics/intelligence?days=7`);
+    expect(res.statusCode, res.body).toBe(200);
+    const body = res.json() as {
+      site: unknown;
+      reasons: string[];
+      machines: Array<{ equipmentId: string; geofence: { breaches: unknown[]; reasons: string[] } }>;
+    };
+    expect(body.site).toBeNull();
+    expect(body.reasons.join(" ")).toContain("records no location");
+    const mine = body.machines.find((m) => m.equipmentId === machineId);
+    expect(mine).toBeDefined();
+    // No fence means no verdict — never a verdict of "inside".
+    expect(mine!.geofence.breaches).toHaveLength(0);
+    expect(mine!.geofence.reasons.join(" ")).toContain("no fence");
+  });
+
+  it("finds a machine running outside the fence once the project has a location", async () => {
+    const fenced = await makeProject("Fenced site");
+    await app.db
+      .update(projects)
+      .set({ latitude: 51.5007, longitude: -0.1246 })
+      .where(eq(projects.id, fenced));
+
+    const machineId = await makeMachine({
+      name: "Wandering excavator",
+      telematicsProvider: "custom",
+      telematicsDeviceId: "DEV-WANDER-1",
+    });
+    await mobilise(fenced, machineId);
+
+    // Two readings: on site, then ninety kilometres away with the engine on.
+    for (const [i, point] of [
+      { latitude: 51.5007, longitude: -0.1246 },
+      { latitude: 52.2053, longitude: 0.1218 },
+    ].entries()) {
+      await app.db.insert(equipmentTelematicsReadings).values({
+        id: newId("etr"),
+        companyId: owner.companyId,
+        projectId: fenced,
+        equipmentId: machineId,
+        providerKey: "custom",
+        deviceId: "DEV-WANDER-1",
+        recordedAt: `${daysAgo(1)}T0${8 + i}:00:00.000Z`,
+        latitude: point.latitude,
+        longitude: point.longitude,
+        engineRunning: 1,
+        engineHours: 100 + i,
+      });
+    }
+
+    const res = await get(
+      `/projects/${fenced}/equipment-telematics/intelligence?days=3&radiusMetres=2000`,
+    );
+    expect(res.statusCode, res.body).toBe(200);
+    const machines = res.json().machines as Array<{
+      equipmentId: string;
+      readings: number;
+      geofence: {
+        breaches: Array<{ recordedAt: string; distanceMetres: number }>;
+        maxDistanceMetres: number | null;
+        reasons: string[];
+      };
+    }>;
+    const mine = machines.find((m) => m.equipmentId === machineId);
+    expect(mine).toBeDefined();
+    expect(mine!.readings).toBe(2);
+    expect(mine!.geofence.breaches).toHaveLength(1);
+    expect(mine!.geofence.maxDistanceMetres).toBeGreaterThan(2000);
+    // One reading is where, not how long — and the route says so.
+    expect(mine!.geofence.reasons.join(" ")).toContain("one reading only");
+  });
+
+  it("is refused to a company the project does not belong to", async () => {
+    const res = await get(
+      `/projects/${projectA}/equipment-telematics/intelligence`,
+      stranger.headers,
+    );
+    expect(res.statusCode).toBe(403);
+  });
+});
+
+
+/* ================================================================== */
+/* Scope narrowing on the child routes                                 */
+/* ================================================================== */
+
+/**
+ * `companyToolGate` admits a plant admin who holds `equipment` on ONE job;
+ * the register is then narrowed to the plant that job can see. A narrowing
+ * you can step around by naming the certificate instead of the excavator is
+ * not a narrowing, so the two verify routes that take a child id resolve the
+ * machine and answer 404 for plant outside the caller's scope.
+ */
+describe("certificate and maintenance verification respect the caller's scope", () => {
+  let scopedHeaders: Record<string, string> = {};
+  let outOfScopeMachine = "";
+  let outOfScopeCertificate = "";
+  let outOfScopeRecord = "";
+
+  beforeAll(async () => {
+    const scoped = await registerActor(app);
+    await app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: scoped.userId,
+      role: "member",
+    });
+    // Full control of every tool — but only on project A.
+    await app.db.insert(projectMemberships).values({
+      id: newId("pm"),
+      companyId: owner.companyId,
+      projectId: projectA,
+      userId: scoped.userId,
+      templateKey: "project_admin",
+    });
+    scopedHeaders = {
+      authorization: scoped.headers["authorization"]!,
+      "x-company-id": owner.companyId,
+    };
+
+    outOfScopeMachine = await makeMachine({ name: "Project B crane" });
+    await mobilise(projectB, outOfScopeMachine);
+
+    const cert = await post(
+      `/companies/current/equipment/${outOfScopeMachine}/certificates`,
+      {
+        certificateType: "thorough_examination",
+        issuedByName: "LOLER Inspections Ltd",
+        certificateNumber: "TE-B-1",
+        validFrom: daysAgo(10),
+        validTo: daysAhead(180),
+      },
+    );
+    expect(cert.statusCode, cert.body).toBe(201);
+    outOfScopeCertificate = cert.json().id as string;
+
+    const record = await post(
+      `/companies/current/equipment/${outOfScopeMachine}/maintenance-records`,
+      {
+        maintenanceType: "servicing",
+        performedAt: `${daysAgo(2)}T09:00:00.000Z`,
+        result: "completed",
+        description: "500-hour service",
+      },
+    );
+    expect(record.statusCode, record.body).toBe(201);
+    outOfScopeRecord = record.json().id as string;
+  });
+
+  it("admits the scoped plant admin to the register", async () => {
+    const res = await get("/companies/current/equipment", scopedHeaders);
+    expect(res.statusCode, res.body).toBe(200);
+    const ids = (res.json().items as Array<{ id: string }>).map((i) => i.id);
+    expect(ids).not.toContain(outOfScopeMachine);
+  });
+
+  it("404s a certificate verification on plant outside that scope", async () => {
+    const res = await post(
+      `/companies/current/equipment-certificates/${outOfScopeCertificate}/verify`,
+      { verificationMethod: "issuer_confirmation" },
+      scopedHeaders,
+    );
+    expect(res.statusCode, res.body).toBe(404);
+  });
+
+  it("404s a maintenance verification on plant outside that scope", async () => {
+    const res = await post(
+      `/companies/current/equipment-maintenance-records/${outOfScopeRecord}/verify`,
+      { note: "looks fine to me" },
+      scopedHeaders,
+    );
+    expect(res.statusCode, res.body).toBe(404);
+  });
+
+  it("still lets an independent company admin verify them", async () => {
+    const cert = await post(
+      `/companies/current/equipment-certificates/${outOfScopeCertificate}/verify`,
+      { verificationMethod: "issuer_confirmation" },
+      verifier.headers,
+    );
+    expect(cert.statusCode, cert.body).toBe(200);
+    const record = await post(
+      `/companies/current/equipment-maintenance-records/${outOfScopeRecord}/verify`,
+      { note: "service sheet and parts invoice seen" },
+      verifier.headers,
+    );
+    expect(record.statusCode, record.body).toBe(200);
+  });
+});
+
+
+/* ================================================================== */
+/* The reconciliation as an assurance fact                             */
+/* ================================================================== */
+
+/**
+ * The read computes the comparison; the RUN route records it as the
+ * platform's three primitives. What is being tested here is the discipline,
+ * not the arithmetic: the plant sheet is the Assertion, the machine's own
+ * counter is the Evidence, and a pack assembled by one of the people who
+ * claimed the hours is marked self-certified and downgraded rather than
+ * presented as verified.
+ */
+describe("telematics reconciliation recorded as assertion, evidence and reconciliation", () => {
+  let projectC = "";
+  let machineId = "";
+
+  beforeAll(async () => {
+    projectC = await makeProject("Assurance plant");
+    machineId = await makeMachine({
+      name: "Assurance excavator",
+      telematicsProvider: "generic_aemp",
+      telematicsDeviceId: "DEV-ASSURE-1",
+      hireRateAmount: 40,
+      hireRateUnit: "hour",
+      operatorRateAmount: 30,
+      currency: "GBP",
+    });
+    await mobilise(projectC, machineId);
+
+    // The machine reports 6 engine hours a day for four days; the plant
+    // sheet claims 9. Carry-in reading first, so day one is measurable.
+    const counters: Array<[string, number]> = [
+      [daysAgo(5), 2000],
+      [daysAgo(4), 2006],
+      [daysAgo(3), 2012],
+      [daysAgo(2), 2018],
+      [daysAgo(1), 2024],
+    ];
+    for (const [date, engineHours] of counters) {
+      await app.db.insert(equipmentTelematicsReadings).values({
+        id: newId("etr"),
+        companyId: owner.companyId,
+        projectId: projectC,
+        equipmentId: machineId,
+        providerKey: "generic_aemp",
+        deviceId: "DEV-ASSURE-1",
+        recordedAt: `${date}T18:00:00.000Z`,
+        engineHours,
+      });
+    }
+    for (const date of [daysAgo(4), daysAgo(3), daysAgo(2), daysAgo(1)]) {
+      const res = await post(`/projects/${projectC}/equipment-utilisation`, {
+        equipmentId: machineId,
+        utilisationDate: date,
+        availableHours: 10,
+        workingHours: 9,
+      });
+      expect(res.statusCode, res.body).toBe(201);
+    }
+  });
+
+  it("records the triple when an independent party assembles it", async () => {
+    const res = await post(
+      `/projects/${projectC}/equipment-telematics/reconciliation/run`,
+      { from: daysAgo(4), to: daysAgo(1) },
+      // The plant sheets were filled in by `owner`; `verifier` is somebody
+      // else, so the pack is independent of the claim.
+      verifier.headers,
+    );
+    expect(res.statusCode, res.body).toBe(200);
+    const body = res.json() as {
+      recorded: number;
+      replaced: number;
+      rows: Array<{
+        equipmentId: string;
+        assertionId: string;
+        evidenceId: string | null;
+        result: string;
+        selfCertified: boolean;
+      }>;
+    };
+    expect(body.recorded).toBe(1);
+    expect(body.replaced).toBe(0);
+    const row = body.rows.find((r) => r.equipmentId === machineId)!;
+    expect(row.selfCertified).toBe(false);
+    expect(row.result).toBe("unsupported");
+    expect(row.evidenceId).toBeTruthy();
+
+    const [assertion] = await app.db
+      .select()
+      .from(assertions)
+      .where(eq(assertions.id, row.assertionId));
+    expect(assertion?.kind).toBe("duration");
+    expect(assertion?.unit).toBe("hours");
+    expect(assertion?.value).toBe(36);
+    // The claim is attributed to whoever filled in the plant sheet, NOT to
+    // whoever ran the reconciliation.
+    expect(assertion?.claimantId).toBe(owner.userId);
+    expect(assertion?.sourceType).toBe("equipment_utilisation_window");
+
+    const [evd] = await app.db
+      .select()
+      .from(evidence)
+      .where(eq(evidence.id, row.evidenceId!));
+    expect(evd?.kind).toBe("telematics");
+    expect(evd?.independenceScore).toBeGreaterThan(0.5);
+    expect(evd?.independenceScore).toBeLessThan(1);
+
+    const recs = await app.db
+      .select()
+      .from(reconciliations)
+      .where(eq(reconciliations.assertionId, row.assertionId));
+    expect(recs).toHaveLength(1);
+    expect(recs[0]?.method).toBe("equipment_hours_vs_telematics");
+    expect(recs[0]?.result).toBe("unsupported");
+    expect(recs[0]?.selfCertified).toBe(false);
+    expect(recs[0]?.variance).toBe(12);
+    expect(recs[0]?.notes ?? "").toContain("GBP");
+  });
+
+  it("replaces the triple on a re-run rather than stacking a second copy", async () => {
+    const again = await post(
+      `/projects/${projectC}/equipment-telematics/reconciliation/run`,
+      { from: daysAgo(4), to: daysAgo(1) },
+      verifier.headers,
+    );
+    expect(again.statusCode, again.body).toBe(200);
+    expect(again.json().replaced).toBe(1);
+    const assertionId = (again.json().rows as Array<{ assertionId: string }>)[0]!.assertionId;
+    const recs = await app.db
+      .select()
+      .from(reconciliations)
+      .where(eq(reconciliations.assertionId, assertionId));
+    expect(recs).toHaveLength(1);
+  });
+
+  it("marks a pack assembled by one of the claimants self-certified and downgrades it", async () => {
+    // `owner` filled in every plant sheet in this window.
+    const res = await post(
+      `/projects/${projectC}/equipment-telematics/reconciliation/run`,
+      { from: daysAgo(4), to: daysAgo(1) },
+    );
+    expect(res.statusCode, res.body).toBe(200);
+    const row = (
+      res.json().rows as Array<{
+        assertionId: string;
+        result: string;
+        selfCertified: boolean;
+      }>
+    )[0]!;
+    expect(row.selfCertified).toBe(true);
+    // The comparison still happened — it is simply not offered as verified.
+    expect(row.result).toBe("partially_supported");
+    const [rec] = await app.db
+      .select()
+      .from(reconciliations)
+      .where(eq(reconciliations.assertionId, row.assertionId));
+    expect(rec?.selfCertified).toBe(true);
+    expect(rec?.notes ?? "").toContain("not independent");
+  });
+
+  it("records nothing, and says so, for a window with no plant and no hours", async () => {
+    const empty = await makeProject("No plant at all");
+    const res = await post(
+      `/projects/${empty}/equipment-telematics/reconciliation/run`,
+      {},
+      verifier.headers,
+    );
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json().recorded).toBe(0);
+    expect(res.json().reasons.join(" ")).toContain("nothing to reconcile");
+  });
+
+  it("refuses the run to another company", async () => {
+    const res = await post(
+      `/projects/${projectC}/equipment-telematics/reconciliation/run`,
+      {},
+      stranger.headers,
     );
     expect(res.statusCode).toBe(403);
   });

@@ -486,6 +486,7 @@ export default function EquipmentPage() {
         />
       ) : tab === "telematics" ? (
         <TelematicsTab
+          projectId={projectId}
           report={telematics}
           intelligence={intelligence}
           days={telematicsDays}

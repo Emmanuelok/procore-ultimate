@@ -188,9 +188,13 @@ export function buildRateLookup(
   const priority = opts?.sourcePriority ?? null;
   const rank = (source: string): number => {
     if (!priority) return 0;
+    // `sourcePriority` is stated LEAST-preferred first, so the index IS the
+    // rank: manual < market < central_bank. Inverting it (as an earlier
+    // version did) made a hand-keyed figure outrank a central-bank fixing,
+    // which is the opposite of what every caller documents wanting.
     const i = priority.indexOf(source);
     // an unranked source sits BELOW every ranked one
-    return i === -1 ? -1 : priority.length - i;
+    return i === -1 ? -1 : i;
   };
   const map = new Map<string, RateQuote>();
   for (const r of rows) {
@@ -226,6 +230,7 @@ export function buildRateLookup(
  * exclude it outright; this ordering only breaks ties between the rest.
  */
 export const MARKET_SOURCE_PRIORITY: readonly string[] = ["manual", "market", "central_bank"];
+// (stated least-preferred first — see `rank` in buildRateLookup)
 
 /** Sources that must never stand in for a market quote (#599). */
 export const NON_MARKET_SOURCES: readonly string[] = ["contractual"];

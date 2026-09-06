@@ -1081,3 +1081,122 @@ describe("command view and health inputs", () => {
     expect(job.state).toBe("succeeded");
   });
 });
+
+/* ================================================================== */
+/* Regressions — the register must not double-count, and a venture has */
+/* exactly one "our share"                                             */
+/* ================================================================== */
+
+describe("open-book and venture regressions", () => {
+  let regVerificationId: string;
+  let regItemId: string;
+
+  beforeAll(async () => {
+    const created = await post(`/projects/${projectB}/portfolio/verifications`, {
+      title: "Re-verdict regression",
+      currency: "GBP",
+      claimedAmount: 1_000,
+      auditRightsClause: "Clause 52.2",
+    });
+    regVerificationId = created.json().id as string;
+    const added = await post(
+      `/projects/${projectB}/portfolio/verifications/${regVerificationId}/items`,
+      {
+        component: "people",
+        description: "Supervision, week 12",
+        claimedAmount: 1_000,
+        evidenceRef: "Timesheets W12",
+      },
+    );
+    expect(added.statusCode).toBe(201);
+    regItemId = added.json().items[0].id as string;
+    expect(regItemId).toBeTruthy();
+  });
+
+  it("supersedes the prior disallowance when a verdict is re-taken instead of stacking a second one", async () => {
+    const partial = await post(
+      `/projects/${projectB}/portfolio/verifications/${regVerificationId}/items/${regItemId}/verdict`,
+      {
+        verdict: "partially_disallowed",
+        verifiedAmount: 400,
+        disallowance: { category: "not_defined_cost", groundClause: "Clause 11.2(25)" },
+      },
+      admin2Headers,
+    );
+    expect(partial.statusCode).toBe(200);
+    expect(partial.json().totals.disallowed).toBe(600);
+
+    let register = await get(`/projects/${projectB}/portfolio/disallowed-costs`);
+    expect(register.json().summary.byCurrency[0].outstanding).toBe(600);
+    expect(register.json().summary.unresolved).toBe(1);
+
+    // the module's own PATCH refusal tells the user to reset to pending and
+    // try again, so the register has to survive exactly that
+    const reset = await post(
+      `/projects/${projectB}/portfolio/verifications/${regVerificationId}/items/${regItemId}/verdict`,
+      { verdict: "pending" },
+      admin2Headers,
+    );
+    expect(reset.statusCode).toBe(200);
+    register = await get(`/projects/${projectB}/portfolio/disallowed-costs`);
+    // reverting the verdict withdrew the finding rather than leaving an
+    // amount disallowed against a cost that is no longer disallowed
+    expect(register.json().summary.byCurrency[0].outstanding).toBe(0);
+    expect(register.json().summary.byCurrency[0].withdrawn).toBe(600);
+    expect(register.json().summary.unresolved).toBe(0);
+
+    const full = await post(
+      `/projects/${projectB}/portfolio/verifications/${regVerificationId}/items/${regItemId}/verdict`,
+      {
+        verdict: "disallowed",
+        disallowance: { category: "insufficient_records", groundClause: "Clause 52.2" },
+      },
+      admin2Headers,
+    );
+    expect(full.statusCode).toBe(200);
+
+    register = await get(`/projects/${projectB}/portfolio/disallowed-costs`);
+    // 1,000 claimed: the register shows 1,000 outstanding, not 1,600
+    expect(register.json().summary.byCurrency[0].outstanding).toBe(1_000);
+    expect(register.json().summary.unresolved).toBe(1);
+    expect(register.json().items.filter((d: { status: string }) => d.status === "withdrawn")).toHaveLength(1);
+  });
+
+  it("refuses to re-take a verdict once the money has already moved", async () => {
+    const register = await get(`/projects/${projectB}/portfolio/disallowed-costs`);
+    const standing = register
+      .json()
+      .items.find((d: { status: string }) => d.status === "raised") as { id: string };
+    const deducted = await post(
+      `/projects/${projectB}/portfolio/disallowed-costs/${standing.id}/resolve`,
+      {
+        outcome: "deducted",
+        note: "Deducted from application 4",
+        deductedAmount: 1_000,
+        deductionRefType: "invoice",
+        deductionRefId: "inv_reg_1",
+      },
+    );
+    expect(deducted.statusCode).toBe(200);
+
+    const again = await post(
+      `/projects/${projectB}/portfolio/verifications/${regVerificationId}/items/${regItemId}/verdict`,
+      { verdict: "verified", verifiedAmount: 1_000 },
+      admin2Headers,
+    );
+    expect(again.statusCode).toBe(409);
+    expect(again.json().message).toMatch(/already been deducted/i);
+  });
+
+  it("refuses to flag a second partner as our own share through the patch route", async () => {
+    const flipped = await patch(
+      `/projects/${projectA}/portfolio/ventures/${jvId}/partners/${partnerThem}`,
+      { isSelf: true },
+    );
+    expect(flipped.statusCode).toBe(409);
+    expect(flipped.json().message).toMatch(/one "our share"/i);
+
+    const position = await get(`/projects/${projectA}/portfolio/ventures/${jvId}/position`);
+    expect(position.json().ourSharePercent).toBe(60);
+  });
+});

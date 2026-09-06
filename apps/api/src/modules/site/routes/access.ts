@@ -223,6 +223,15 @@ export const accessRoutes: FastifyPluginAsync = async (app) => {
     }
     if (body.workerId) await assertWorker(app.db, projectId, body.workerId);
     if (body.vendorId) await assertVendor(app.db, companyId, body.vendorId);
+    // The invariant is tested against the MERGED record, not the patch: two
+    // calls must not reach a state one call is refused for.
+    const mergedFrom = body.validFrom === undefined ? existing.validFrom : body.validFrom;
+    const mergedUntil = body.validUntil === undefined ? existing.validUntil : body.validUntil;
+    if (mergedFrom && mergedUntil && mergedUntil < mergedFrom) {
+      throw badRequest(
+        `That edit would leave the induction valid from ${mergedFrom} until ${mergedUntil} — it cannot expire before it becomes valid.`,
+      );
+    }
     const set = patchSet(body as Record<string, unknown>, [
       "workerId",
       "personName",
@@ -343,6 +352,10 @@ export const accessRoutes: FastifyPluginAsync = async (app) => {
       }
     }
 
+    if (body.validFrom && body.validUntil && body.validUntil < body.validFrom) {
+      throw badRequest("A site pass cannot expire before it becomes valid.");
+    }
+
     const clash = (
       await app.db
         .select({ id: siteAccessPasses.id, status: siteAccessPasses.status })
@@ -397,10 +410,10 @@ export const accessRoutes: FastifyPluginAsync = async (app) => {
     const { projectId, id } = req.params as { projectId: string; id: string };
     const body = patchSchemaOf(passBody.omit({ badgeCode: true })).parse(req.body);
     const companyId = req.companyId!;
-    notFoundIfMissing(
+    const existing = notFoundIfMissing(
       (
         await app.db
-          .select({ id: siteAccessPasses.id })
+          .select()
           .from(siteAccessPasses)
           .where(and(eq(siteAccessPasses.id, id), eq(siteAccessPasses.companyId, companyId), eq(siteAccessPasses.projectId, projectId)))
           .limit(1)
@@ -408,6 +421,34 @@ export const accessRoutes: FastifyPluginAsync = async (app) => {
       "Pass",
     );
     if (body.vendorId) await assertVendor(app.db, companyId, body.vendorId);
+    const mergedFrom = body.validFrom === undefined ? existing.validFrom : body.validFrom;
+    const mergedUntil = body.validUntil === undefined ? existing.validUntil : body.validUntil;
+    if (mergedFrom && mergedUntil && mergedUntil < mergedFrom) {
+      throw badRequest(
+        `That edit would leave the pass valid from ${mergedFrom} until ${mergedUntil} — it cannot expire before it becomes valid.`,
+      );
+    }
+    if (body.inductionId) {
+      const induction = (
+        await app.db
+          .select({ id: siteInductions.id, status: siteInductions.status })
+          .from(siteInductions)
+          .where(
+            and(
+              eq(siteInductions.id, body.inductionId),
+              eq(siteInductions.companyId, companyId),
+              eq(siteInductions.projectId, projectId),
+            ),
+          )
+          .limit(1)
+      )[0];
+      if (!induction) throw badRequest(`Induction ${body.inductionId} not found in this project.`);
+      if (induction.status !== "valid" && existing.status === "active") {
+        throw badRequest(
+          `Induction ${induction.id} is ${induction.status}, not valid. An active pass may not be moved onto an induction that is not in force.`,
+        );
+      }
+    }
     const set = patchSet(body as Record<string, unknown>, [
       "inductionId",
       "workerId",

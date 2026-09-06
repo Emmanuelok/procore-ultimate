@@ -26,6 +26,8 @@ import {
 } from "./policy.js";
 import { computeEvidenceScore, effectiveConfidence } from "./evidence.js";
 import { validateCitations } from "./service.js";
+import { AGENT_TARGET_TYPES } from "@constructos/shared";
+import { refTool, targetTool } from "./tools.js";
 
 /* ================================================================== */
 /* Adversarial harness (#1024)                                         */
@@ -198,6 +200,59 @@ export const ADVERSARIAL_CASES: AdversarialCase[] = [
     run: () => {
       const policy = policyFor({ enabled: false });
       return { held: policy.enabled === false, observed: `enabled=${policy.enabled}` };
+    },
+  },
+  {
+    id: "role_limit_enforced",
+    family: "authorisation",
+    description:
+      "A tenant restricted an agent kind to owner/admin and a plain member asks for a run.",
+    expectation:
+      "The stored allowedRoles list is CONSULTED, not merely displayed: the member is refused.",
+    run: () => {
+      const policy = policyFor({ allowedRoles: ["owner", "admin"] });
+      const memberAllowed = policy.allowedRoles.includes("member");
+      const ownerAllowed = policy.allowedRoles.includes("owner");
+      return {
+        held: !memberAllowed && ownerAllowed,
+        observed: `allowedRoles=[${policy.allowedRoles.join(", ")}] admits member=${memberAllowed}`,
+      };
+    },
+  },
+  {
+    id: "advisory_target_is_gated",
+    family: "authorisation",
+    description:
+      "A proposal quotes another module's records (budget lines, competing bids, an injured worker's account) but changes nothing on approval.",
+    expectation:
+      "Every target type the fleet can produce maps to the tool that owns the data its body quotes; none is left at the bare `ai` gate.",
+    run: () => {
+      const ungated = AGENT_TARGET_TYPES.filter((t) => targetTool(t) === null);
+      return {
+        held: ungated.length === 0,
+        observed:
+          ungated.length === 0
+            ? `all ${AGENT_TARGET_TYPES.length} target types map to an owning tool`
+            : `ungated: ${ungated.join(", ")}`,
+      };
+    },
+  },
+  {
+    id: "prompt_readback_is_gated",
+    family: "authorisation",
+    description:
+      "An agent's gathered rows land verbatim in ai_runs.prompt, and anyone with ai:read on the project can open the run.",
+    expectation:
+      "Every record type an agent can supply resolves to the tool that owns it, so reading the prompt back needs that tool too.",
+    run: () => {
+      const types = ["budget_line_item", "safety_incident", "bid_submission", "spec_section"];
+      const mapped = types.map((t) => refTool(t));
+      const held =
+        mapped[0] === "budget" &&
+        mapped[1] === "safety" &&
+        mapped[2] === "bidding" &&
+        mapped[3] === "specifications";
+      return { held, observed: types.map((t, i) => `${t}→${mapped[i]}`).join(", ") };
     },
   },
   {

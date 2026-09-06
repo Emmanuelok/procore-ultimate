@@ -43,6 +43,7 @@ import {
   type AgentDescriptor,
   type AgentReport,
   type AgentSchedule,
+  type ModelInventory,
   type UsageResponse,
 } from "./agentsShared";
 
@@ -66,6 +67,7 @@ export default function OperationsTab({
     <div className="space-y-4">
       <SchedulesPanel agents={agents} projects={projects} isAdmin={isAdmin} onChanged={onChanged} />
       <UsagePanel />
+      <ModelInventoryPanel />
       <ReportsPanel isAdmin={isAdmin} />
     </div>
   );
@@ -418,6 +420,89 @@ function UsagePanel() {
         ) : (
           <Spinner />
         )}
+      </CardBody>
+    </Card>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Model inventory and transparency (#775, X #1027)                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * GET /ai/models is the transparency statement an auditor asks for: which
+ * model each agent runs on, the prompt version it is running, what categories
+ * of tenant data leave the platform for it, and what is retained. It existed
+ * with no way to read it in the product, which is the same as not publishing
+ * it.
+ */
+function ModelInventoryPanel() {
+  const [data, setData] = useState<ModelInventory | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState(false);
+
+  useEffect(() => {
+    api
+      .get<ModelInventory>("/api/v1/ai/models")
+      .then(setData)
+      .catch((err: unknown) => setError(errorMessage(err, "Failed to load the model inventory")));
+  }, []);
+
+  const rows = data?.agents ?? [];
+  const shown = expanded ? rows : rows.slice(0, 8);
+
+  return (
+    <Card>
+      <CardBody className="space-y-2">
+        <div className="text-sm font-semibold text-ink-900">Models, prompts and what leaves the tenant</div>
+        <ErrorAlert message={error} />
+        {!data && !error ? <Spinner /> : null}
+        {data ? (
+          <>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+              <Stat label="Provider" value={data.provider} />
+              <Stat label="Default model" value={data.defaultModel ?? "—"} />
+              <Stat label="AI enabled" value={data.enabled ? "yes" : "no — no API key configured"} />
+            </div>
+            <p className="text-xs text-ink-500">{data.retentionStatement}</p>
+            <p className="text-xs text-ink-500">{data.humanInTheLoop}</p>
+            <Table>
+              <thead>
+                <tr>
+                  <Th>Agent</Th>
+                  <Th>Model</Th>
+                  <Th>Prompt version</Th>
+                  <Th>Data categories sent</Th>
+                  <Th>Permission required</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {shown.map((a) => (
+                  <tr key={a.kind}>
+                    <Td className="text-xs">{a.name}</Td>
+                    <Td className="text-xs">{a.model ?? "—"}</Td>
+                    <Td className="font-mono text-[11px]">
+                      {a.promptVersion ? a.promptVersion.slice(0, 12) : "— served by its own route"}
+                    </Td>
+                    <Td className="text-xs">
+                      {a.dataCategories.length === 0 ? "—" : a.dataCategories.map(humanize).join(", ")}
+                    </Td>
+                    <Td className="text-xs">
+                      {a.requiredTools.length === 0
+                        ? "—"
+                        : `${a.requiredTools.map(humanize).join(", ")} (read)`}
+                    </Td>
+                  </tr>
+                ))}
+              </tbody>
+            </Table>
+            {rows.length > 8 ? (
+              <Button size="sm" variant="ghost" onClick={() => setExpanded((v) => !v)}>
+                {expanded ? "Show fewer" : `Show all ${rows.length} agents`}
+              </Button>
+            ) : null}
+          </>
+        ) : null}
       </CardBody>
     </Card>
   );

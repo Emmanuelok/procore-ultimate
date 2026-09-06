@@ -211,7 +211,14 @@ export interface SimulationQueueOptions {
  * `requeueStale` moves back to `queued` on boot rather than stranding it.
  */
 export class SimulationQueue {
-  private draining = false;
+  /**
+   * The cycle currently running, if any. A concurrent `drain()` CHAINS onto
+   * it rather than returning 0 immediately: "run the queue now" has to mean
+   * the queue is empty when it resolves, or the manual endpoint reports
+   * success while a job is still half-run and the caller reads back a
+   * `running` row it was told had finished.
+   */
+  private inFlight: Promise<number> | null = null;
   private closed = false;
 
   constructor(private readonly opts: SimulationQueueOptions) {}
@@ -230,35 +237,48 @@ export class SimulationQueue {
     this.closed = true;
   }
 
-  /** Run every queued job, oldest first. Safe to call concurrently. */
+  /**
+   * Run every queued job, oldest first. Safe to call concurrently: cycles are
+   * serialised, and a caller's promise resolves only once ITS cycle has
+   * drained the queue.
+   */
   async drain(): Promise<number> {
-    if (this.draining) return 0;
-    this.draining = true;
-    let ran = 0;
+    const previous = this.inFlight;
+    const cycle = (async () => {
+      if (previous) await previous.catch(() => 0);
+      return this.drainOnce();
+    })();
+    this.inFlight = cycle;
     try {
-      for (;;) {
-        if (this.closed) break;
-        const next = (
-          await this.opts.db
-            .select()
-            .from(simulationJobs)
-            .where(eq(simulationJobs.status, "queued"))
-            .orderBy(asc(simulationJobs.createdAt), asc(simulationJobs.id))
-            .limit(1)
-        )[0];
-        if (!next) break;
-        // Claim it: only one worker may move queued → running.
-        const claimed = await this.opts.db
-          .update(simulationJobs)
-          .set({ status: "running", startedAt: new Date().toISOString() })
-          .where(and(eq(simulationJobs.id, next.id), eq(simulationJobs.status, "queued")))
-          .returning({ id: simulationJobs.id });
-        if (claimed.length === 0) continue;
-        await this.runJob({ ...next, status: "running" });
-        ran += 1;
-      }
+      return await cycle;
     } finally {
-      this.draining = false;
+      if (this.inFlight === cycle) this.inFlight = null;
+    }
+  }
+
+  /** One pass over the queue. Never runs concurrently — `drain` serialises. */
+  private async drainOnce(): Promise<number> {
+    let ran = 0;
+    for (;;) {
+      if (this.closed) break;
+      const next = (
+        await this.opts.db
+          .select()
+          .from(simulationJobs)
+          .where(eq(simulationJobs.status, "queued"))
+          .orderBy(asc(simulationJobs.createdAt), asc(simulationJobs.id))
+          .limit(1)
+      )[0];
+      if (!next) break;
+      // Claim it: only one worker may move queued → running.
+      const claimed = await this.opts.db
+        .update(simulationJobs)
+        .set({ status: "running", startedAt: new Date().toISOString() })
+        .where(and(eq(simulationJobs.id, next.id), eq(simulationJobs.status, "queued")))
+        .returning({ id: simulationJobs.id });
+      if (claimed.length === 0) continue;
+      await this.runJob({ ...next, status: "running" });
+      ran += 1;
     }
     return ran;
   }
@@ -277,15 +297,35 @@ export class SimulationQueue {
       .where(eq(simulationJobs.id, jobId))
       .limit(1);
     const job = rows[0];
-    if (!job || job.status !== "queued") return false;
+    if (!job) return false;
+    // A background cycle may have claimed this job between the enqueue and
+    // here. Waiting for that cycle is the difference between the caller
+    // reading a finished row and reading a `running` one and reporting the
+    // simulation as failed.
+    if (job.status !== "queued") {
+      await this.settle();
+      return false;
+    }
     const claimed = await this.opts.db
       .update(simulationJobs)
       .set({ status: "running", startedAt: new Date().toISOString() })
       .where(and(eq(simulationJobs.id, jobId), eq(simulationJobs.status, "queued")))
       .returning({ id: simulationJobs.id });
-    if (claimed.length === 0) return false;
+    if (claimed.length === 0) {
+      await this.settle();
+      return false;
+    }
     await this.runJob({ ...job, status: "running" });
     return true;
+  }
+
+  /** Wait for any cycle already in flight; returns immediately when idle. */
+  async settle(): Promise<void> {
+    while (this.inFlight) {
+      const current = this.inFlight;
+      await current.catch(() => 0);
+      if (this.inFlight === current) break;
+    }
   }
 
   /** Move jobs left `running` by a crashed process back into the queue. */

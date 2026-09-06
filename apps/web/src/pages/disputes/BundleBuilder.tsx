@@ -20,7 +20,8 @@ import {
   Td,
   Th,
 } from "../../ui";
-import { formatDate, formatDateTime } from "../format";
+import { BUNDLE_ITEM_PRIVILEGE } from "@constructos/shared";
+import { formatDate, formatDateTime, humanize } from "../format";
 import {
   bundleSourceLabel,
   isTerminal,
@@ -166,6 +167,42 @@ export default function BundleBuilder({
   function removeItem(i: number) {
     if (!bundle) return;
     void putItems(bundle.items.filter((_, idx) => idx !== i));
+  }
+
+  /**
+   * Mark an item privileged (#340-342). A privileged item stays on the
+   * register — the tribunal is entitled to know it exists — but is withheld
+   * from the production and listed in the privilege log instead.
+   */
+  async function setPrivilege(item: BundleItem, privilege: string) {
+    if (!bundle) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const reason =
+        privilege === "none"
+          ? null
+          : (window.prompt(
+              `Reason for withholding "${item.title}" (shown in the privilege log):`,
+              item.privilegeReason ?? "",
+            ) ?? "");
+      await api.put(`${base}/dispute-bundles/${bundle.id}/privilege`, {
+        entries: [
+          {
+            itemId: item.id,
+            privilege,
+            ...(reason ? { reason } : {}),
+          },
+        ],
+      });
+      await onChanged();
+    } catch (err) {
+      setError(
+        err instanceof ApiClientError ? err.message : "Failed to update the privilege marking.",
+      );
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function sortChronological() {
@@ -517,6 +554,25 @@ export default function BundleBuilder({
                   <span className="whitespace-nowrap text-xs text-ink-400">
                     {it.date ? formatDate(it.date) : "undated"}
                   </span>
+                  {/* Privilege (#340-342): a privileged item stays on the
+                      register and out of the production, with a reason. */}
+                  <select
+                    aria-label={`Privilege for item ${i + 1}`}
+                    value={it.privilege ?? "none"}
+                    disabled={busy}
+                    onChange={(e) => void setPrivilege(it, e.target.value)}
+                    className={`shrink-0 rounded border px-1.5 py-1 text-xs ${
+                      (it.privilege ?? "none") === "none"
+                        ? "border-ink-200 text-ink-500"
+                        : "border-amber-300 bg-amber-50 font-medium text-amber-800"
+                    }`}
+                  >
+                    {BUNDLE_ITEM_PRIVILEGE.map((p) => (
+                      <option key={p} value={p}>
+                        {p === "none" ? "produce" : humanize(p)}
+                      </option>
+                    ))}
+                  </select>
                   <span className="flex shrink-0 items-center gap-1">
                     <button
                       type="button"
@@ -585,6 +641,27 @@ export default function BundleBuilder({
                     </Button>
                   </div>
                 </div>
+              ) : null}
+
+              {bundle.manifest?.privilegeLog && bundle.manifest.privilegeLog.length > 0 ? (
+                <div className="mb-3 rounded-md bg-amber-50 px-3 py-2 ring-1 ring-amber-200">
+                  <div className="text-xs font-semibold text-amber-900">
+                    Privilege log — {bundle.manifest.privilegeLog.length} item
+                    {bundle.manifest.privilegeLog.length === 1 ? "" : "s"} withheld
+                  </div>
+                  <ul className="mt-1 space-y-0.5 text-xs text-amber-800">
+                    {bundle.manifest.privilegeLog.map((p) => (
+                      <li key={p.id}>
+                        <span className="font-medium">{p.title}</span> — {humanize(p.privilege)}
+                        {p.reason ? `: ${p.reason}` : ""}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+
+              {bundle.manifest?.statement ? (
+                <p className="mb-3 text-xs leading-5 text-ink-500">{bundle.manifest.statement}</p>
               ) : null}
 
               <div className="flex flex-wrap gap-2">

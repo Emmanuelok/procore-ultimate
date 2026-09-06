@@ -29,10 +29,11 @@ import { badRequest, conflict, notFound } from "../../../lib/errors.js";
 import { newId } from "../../../lib/ids.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.js";
 import { zonesContaining, type ZoneShape } from "../engines/geometry.js";
-import { canTransition, loneWorkerDue, overdueEntries, type PermitState } from "../engines/permits.js";
+import { canTransition, loneWorkerDue, overdueEntries, SCAN_REQUIRED_TYPES, type PermitState } from "../engines/permits.js";
 import { sweepLoneWorkers, sweepPermitEntries, sweepPermitExpiry } from "../service.js";
 import {
   addMinutesISO,
+  alreadySignalled,
   allocateReference,
   assertLocation,
   assertVendor,
@@ -50,6 +51,7 @@ import {
   nowISO,
   patchSchemaOf,
   patchSet,
+  raiseSignal,
   ringSchema,
 } from "../shared.js";
 
@@ -326,6 +328,15 @@ export const permitRoutes: FastifyPluginAsync = async (app) => {
     }
     if (body.locationId) await assertLocation(app.db, projectId, body.locationId);
     if (body.vendorId) await assertVendor(app.db, companyId, body.vendorId);
+    // Tested against the MERGED record: a two-call sequence must not reach a
+    // validity window the one-call path refuses.
+    const mergedFrom = body.validFrom === undefined ? row.validFrom : body.validFrom;
+    const mergedTo = body.validTo === undefined ? row.validTo : body.validTo;
+    if (mergedFrom && mergedTo && Date.parse(mergedTo) <= Date.parse(mergedFrom)) {
+      throw badRequest(
+        `That edit would leave the permit valid from ${mergedFrom} to ${mergedTo} — a permit's validity must end after it begins.`,
+      );
+    }
     const set = patchSet(body as Record<string, unknown>, [
       "permitType",
       "title",
@@ -452,6 +463,32 @@ export const permitRoutes: FastifyPluginAsync = async (app) => {
         objectId: id,
         payload: { action, from: row.status, to: set["status"], reason: body.reason ?? null },
       });
+      // An excavation authorised with no utility survey behind it: activation
+      // will be refused, but the approval itself is the thing worth seeing —
+      // somebody signed off digging with nothing to say what is buried there.
+      if (action === "approve" && SCAN_REQUIRED_TYPES.has(row.permitType) && !row.utilityScanId) {
+        const key = `permit-no-survey:${id}`;
+        const already = await alreadySignalled(app.db, companyId, ["site_excavation_without_scan"], projectId);
+        if (!already.has(key)) {
+          await raiseSignal(app.db, companyId, projectId, req.user!.id, {
+            detector: "site_excavation_without_scan",
+            severity: "high",
+            confidence: 1,
+            title: `Permit ${row.reference} approved with no utility survey`,
+            explanation: `${row.reference} (${row.permitType.replace(/_/g, " ")}, "${row.title}") was approved without a utility survey recorded against it. It cannot be activated until one is linked, and no ground may be broken under it in the meantime.`,
+            key,
+            subjectType: "site_permit",
+            subjectId: id,
+            evidence: {
+              permitId: id,
+              reference: row.reference,
+              permitType: row.permitType,
+              approvedBy: req.user!.id,
+              locationDescription: row.locationDescription,
+            },
+          });
+        }
+      }
       if (action === "approve" || action === "reject") {
         await notifyUsers(app.db, {
           companyId,
@@ -1024,13 +1061,17 @@ export const permitRoutes: FastifyPluginAsync = async (app) => {
   /* ---------------------------------------------------------------- */
 
   app.post(`${base}/permits/sweep`, { preHandler: adminGate }, async (req) => {
+    const { projectId } = req.params as { projectId: string };
     const companyId = req.companyId!;
     const now = new Date();
+    // Scoped to this project: the grant that opened this route covers this
+    // project, so the writes it causes stay inside it.
+    const scope = { projectId };
     const [expiry, entries, lone] = await Promise.all([
-      sweepPermitExpiry(app.db, companyId, now),
-      sweepPermitEntries(app.db, companyId, now),
-      sweepLoneWorkers(app.db, companyId, now),
+      sweepPermitExpiry(app.db, companyId, now, scope),
+      sweepPermitEntries(app.db, companyId, now, scope),
+      sweepLoneWorkers(app.db, companyId, now, scope),
     ]);
-    return { ranAt: now.toISOString(), permits: expiry, entries, loneWorkers: lone };
+    return { ranAt: now.toISOString(), scope: { projectId }, permits: expiry, entries, loneWorkers: lone };
   });
 };

@@ -1881,8 +1881,13 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
       // One streaming pass serves both the receipt's prefix checks and the
       // whole-chain classification: the receipt's own entryCount is added as a
       // checkpoint alongside every seal's.
-      chain = await classifyCompany(req.companyId!, [sealFields.entryCount]);
-      const scan = chain.scan;
+      // The scan is the walk, not the verdict: keep it local. `chain` is
+      // spread into the signal payload below, and a Merkle frontier plus a
+      // checkpoint Map has no business in a stored snapshot.
+      const { scan, ...classified } = await classifyCompany(req.companyId!, [
+        sealFields.entryCount,
+      ]);
+      chain = classified;
       const checkpoint = scan.checkpoints.get(sealFields.entryCount) ?? null;
       const entriesPresent = scan.entryCount >= sealFields.entryCount;
       const recomputedRoot = entriesPresent ? (checkpoint?.root ?? null) : null;

@@ -24,6 +24,10 @@
  *                valuations and completed activities, with the company's own
  *                estimating bias stated as a percentage. Proposals only: an
  *                entry enters the library when a named person accepts it.
+ *   · Clauses & routes — the contract half of the same idea (#987-988): which
+ *                clause the company actually argues about, under which form,
+ *                for how much and with what recovery; and what each
+ *                procurement route cost it in change and in disputes.
  *   · Suppliers — the same idea pointed at vendors (#987-989): a supplier's
  *                record on one job is an anecdote, across eleven it is
  *                knowledge. Assembled from certificates, owned actions and
@@ -39,6 +43,7 @@ import { useSearchParams } from "react-router-dom";
 import { useAuth } from "../../lib/auth";
 import { EmptyState, ErrorAlert, Field, PageHeader, Select, Spinner } from "../../ui";
 import CaptureTab from "./CaptureTab";
+import ContractsTab from "./ContractsTab";
 import LibrariesTab from "./LibrariesTab";
 import OnboardingTab from "./OnboardingTab";
 import HealthTab from "./HealthTab";
@@ -58,6 +63,7 @@ const TABS = [
   { key: "onboarding", label: "Onboarding pack" },
   { key: "libraries", label: "Libraries" },
   { key: "suppliers", label: "Suppliers" },
+  { key: "contracts", label: "Clauses & routes" },
   { key: "search", label: "Search" },
 ];
 
@@ -210,6 +216,8 @@ export default function LearningPage() {
       {tab === "libraries" ? <LibrariesTab canAdmin={canAdmin} /> : null}
 
       {tab === "suppliers" ? <SuppliersTab /> : null}
+
+      {tab === "contracts" ? <ContractsTab /> : null}
 
       {tab === "search" ? <SearchTab projects={projects} canSupersede={canAdmin} /> : null}
     </div>

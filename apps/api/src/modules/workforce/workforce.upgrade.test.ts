@@ -15,6 +15,7 @@ import {
   signals,
   vendors,
   workerGrievances,
+  workerVoiceChannels,
   workers,
 } from "@constructos/db";
 import { LABOUR_COMPLIANCE_DETECTORS } from "@constructos/shared";
@@ -359,6 +360,77 @@ describe("worker voice", () => {
   it("refuses the grievance register to another company", async () => {
     const res = await get(`/projects/${projectId}/worker-grievances`, stranger.headers);
     expect(res.statusCode).toBe(403);
+  });
+
+  /*
+   * A card is a physical object: it gets lost, photographed, or handed to
+   * the gang-master. Revoking it must close the channel the token opens
+   * WITHOUT telling whoever holds it that this particular token is the dead
+   * one — a channel that distinguishes "revoked" from "never existed" lets
+   * an employer enumerate which cards are live.
+   */
+  it("revokes an issued card so the token stops opening the channel", async () => {
+    const issued = await post(`/projects/${projectId}/worker-voice/channels`, {
+      name: "Gate 5 card (to be withdrawn)",
+      languages: ["en"],
+      responseSlaHours: 24,
+    });
+    expect(issued.statusCode).toBe(201);
+    const doomed = issued.json() as { id: string; token: string };
+
+    const works = await app.inject({
+      method: "POST",
+      url: "/api/v1/worker-voice/reports",
+      headers: { "x-intake-token": doomed.token },
+      payload: { category: "other", summary: "The card works before it is withdrawn" },
+    });
+    expect(works.statusCode, works.body).toBe(201);
+
+    const revoked = await post(
+      `/projects/${projectId}/worker-voice/channels/${doomed.id}/revoke`,
+      {},
+    );
+    expect(revoked.statusCode, revoked.body).toBe(200);
+
+    const after = await app.db
+      .select()
+      .from(workerVoiceChannels)
+      .where(eq(workerVoiceChannels.id, doomed.id));
+    expect(after[0]?.isActive).toBe(0);
+    expect(after[0]?.revokedAt).toBeTruthy();
+
+    const refused = await app.inject({
+      method: "POST",
+      url: "/api/v1/worker-voice/reports",
+      headers: { "x-intake-token": doomed.token },
+      payload: { category: "other", summary: "and not after" },
+    });
+    expect(refused.statusCode).toBe(400);
+    // Identical wording to an unknown token: no enumeration oracle.
+    expect(refused.json().message).toContain("not valid on any open channel");
+
+    // Reports already taken through that card are NOT deleted with it.
+    const kept = await app.db
+      .select()
+      .from(workerGrievances)
+      .where(eq(workerGrievances.channelId, doomed.id));
+    expect(kept.length).toBe(1);
+
+    // Revoking is ledgered, and a stranger cannot revoke anybody's channel.
+    const bystander = await post(
+      `/projects/${projectId}/worker-voice/channels/${doomed.id}/revoke`,
+      {},
+      stranger.headers,
+    );
+    expect(bystander.statusCode).toBe(403);
+  });
+
+  it("404s a revoke for a channel that belongs to no project of ours", async () => {
+    const res = await post(
+      `/projects/${projectId}/worker-voice/channels/${newId("wvc")}/revoke`,
+      {},
+    );
+    expect(res.statusCode).toBe(404);
   });
 });
 

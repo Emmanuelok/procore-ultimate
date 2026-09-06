@@ -22,7 +22,7 @@
  */
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { api } from "../../lib/api";
-import { Badge, Card, CardBody } from "../../ui";
+import { Badge, Card, CardBody, formatCurrency } from "../../ui";
 
 /* ---------------------------------- Types ---------------------------------- */
 
@@ -1101,4 +1101,100 @@ export function libraryStatusTone(status: string): "gray" | "blue" | "green" | "
   if (status === "rejected") return "red";
   if (status === "superseded") return "gray";
   return "blue";
+}
+
+/* ---------- Contract clause & procurement route analytics (#987-988) ------- */
+
+/** Money is never one number: every amount arrives keyed by its currency. */
+export type MoneyByCurrency = Record<string, number>;
+
+export interface ClauseRow {
+  key: string;
+  contractFamily: string;
+  clause: string;
+  projects: number;
+  disputes: number;
+  disputesResolved: number;
+  disputeOutcomes: Record<string, number>;
+  disputeRootCauses: Record<string, number>;
+  amountClaimed: MoneyByCurrency;
+  amountAwarded: MoneyByCurrency;
+  /** awarded ÷ claimed where both were recorded; null when unknowable */
+  recoveryRatio: number | null;
+  recoveryObservations: number;
+  variations: number;
+  variationValue: MoneyByCurrency;
+  variationTimeImpactDays: number | null;
+  forensicClaims: number;
+  obligations: number;
+  obligationsBreached: number;
+  breachRate: number | null;
+  weight: number;
+  basis: string;
+  reasons: string[];
+}
+
+export interface ClausePerformanceResponse {
+  asOf: string;
+  items: ClauseRow[];
+  total: number;
+  unattributed: {
+    disputes: number;
+    variations: number;
+    forensicClaims: number;
+    obligations: number;
+  };
+  scope: "company" | "restricted";
+  truncated?: boolean;
+  sources?: string[];
+  reasons: string[];
+}
+
+export interface RouteRow {
+  route: string;
+  projects: number;
+  projectIds: string[];
+  contractSum: MoneyByCurrency;
+  agreedVariationValue: MoneyByCurrency;
+  outturnVariancePercent: number | null;
+  outturnObservations: number;
+  variationsPerProject: number | null;
+  variations: number;
+  disputeRate: number | null;
+  disputedProjects: number;
+  disputes: number;
+  reliable: boolean;
+  basis: string;
+  reasons: string[];
+}
+
+export interface ProcurementRouteResponse {
+  asOf: string;
+  items: RouteRow[];
+  total: number;
+  minProjects: number;
+  scope: "company" | "restricted";
+  sources?: string[];
+  reasons: string[];
+}
+
+/**
+ * Money bucketed by currency, rendered as the several figures it is. Summing
+ * across currencies would produce one confident wrong number, so the component
+ * lists them instead — and says "—" when there is nothing at all.
+ */
+export function moneyBuckets(bucket: MoneyByCurrency | undefined): string {
+  if (!bucket) return "—";
+  const entries = Object.entries(bucket).filter(([, v]) => Number.isFinite(v));
+  if (entries.length === 0) return "—";
+  return entries
+    .sort((a, b) => b[1] - a[1])
+    .map(([ccy, value]) => formatCurrency(value, { currency: ccy, compact: true }))
+    .join("  ·  ");
+}
+
+/** A ratio 0..1 as a percentage, or "—" when it was not knowable. */
+export function ratioPercent(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
+  return `${(value * 100).toFixed(0)}%`;
 }

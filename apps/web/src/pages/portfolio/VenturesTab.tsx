@@ -476,6 +476,20 @@ function VentureDrawer({
     }
   }
 
+  async function waiveTx(txId: string) {
+    if (!jvId) return;
+    const reason = window.prompt("Why is this contribution being waived? The reason goes on the ledger.");
+    if (!reason) return;
+    const res = await action.run(`waive-${txId}`, () =>
+      api.waiveTransaction(jvId, txId, { reason, outcome: "waived" }),
+    );
+    if (res) {
+      toast.success("Waived — the obligation it carried is discharged with its reason");
+      detail.reload();
+      onChanged();
+    }
+  }
+
   async function previewVote() {
     if (!jvId) return;
     const res = await action.run("preview", () =>
@@ -737,12 +751,21 @@ function VentureDrawer({
                       >
                         Settle
                       </Button>
+                      <Button
+                        size="xs"
+                        variant="ghost"
+                        onClick={() => void waiveTx(t.id)}
+                        loading={action.busy === `waive-${t.id}`}
+                      >
+                        Waive
+                      </Button>
                     </span>
                   </div>
                 ))}
               <p className="text-2xs text-content-subtle">
                 Calling a contribution raises an obligation with its deadline; the person who recorded a transaction
-                cannot confirm it was settled.
+                cannot confirm it was settled. A call the partners agree to drop is waived with its reason — the
+                obligation is discharged, not deleted.
               </p>
             </div>
             <form onSubmit={addTransaction} className="mt-2 grid gap-2 rounded-md border border-border p-2 sm:grid-cols-5">

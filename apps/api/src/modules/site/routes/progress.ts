@@ -37,6 +37,8 @@ import {
 import { recordProgressObservation } from "../service.js";
 import {
   alreadySignalled,
+  assertClaimSource,
+  assertClaimant,
   assertLocation,
   assertTask,
   buildGates,
@@ -111,6 +113,14 @@ export const progressRoutes: FastifyPluginAsync = async (app) => {
 
     if (body.locationId) await assertLocation(app.db, projectId, body.locationId);
     if (body.scheduleTaskId) await assertTask(app.db, projectId, body.scheduleTaskId);
+    // The different-actor rule is only a control if the other actor EXISTS:
+    // resolve the claimant against the register their kind names before an
+    // Assertion is written in their name, and resolve the record the claim
+    // came from so the source id on that Assertion points at something.
+    const claimant = await assertClaimant(app.db, companyId, body.claimantKind, body.claimantId);
+    if (body.claimSourceId) {
+      await assertClaimSource(app.db, companyId, projectId, body.claimSourceType, body.claimSourceId);
+    }
     for (const vendorId of [body.claimantVendorId, body.observerVendorId]) {
       if (!vendorId) continue;
       const vendor = (
@@ -161,6 +171,7 @@ export const progressRoutes: FastifyPluginAsync = async (app) => {
         claimSourceId: body.claimSourceId ?? null,
         claimantId: body.claimantId,
         claimantKind: body.claimantKind,
+        claimantName: claimant.name,
         claimedAt: body.claimedAt ?? null,
         scanId: body.scanId ?? null,
         droneFlightId: body.droneFlightId ?? null,
@@ -205,6 +216,7 @@ export const progressRoutes: FastifyPluginAsync = async (app) => {
     return reply.code(201).send({
       ...saved.record,
       signalId,
+      claimant,
       assessment: {
         result: assessment.result,
         variancePercent: assessment.variancePercent,

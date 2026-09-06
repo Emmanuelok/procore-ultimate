@@ -188,16 +188,22 @@ function MetricsPanel({
 
 /* -------------------------------- the drawer -------------------------------- */
 
+/*
+ * No `canAdmin` here on purpose. Sign-off and delete are gated server-side on
+ * `learning` at ADMIN level, which a project member can hold through their
+ * permission template — a company-role guess was stricter than the real rule
+ * and locked out users the server would have accepted. The controls are
+ * offered and the server's refusal is surfaced verbatim, exactly as Publish
+ * already did.
+ */
 function ReviewDrawer({
   projectId,
   reviewId,
-  canAdmin,
   onClose,
   onChanged,
 }: {
   projectId: string;
   reviewId: string;
-  canAdmin: boolean;
   onClose: () => void;
   onChanged: () => void;
 }) {
@@ -779,13 +785,7 @@ function ReviewDrawer({
 
 /* --------------------------------- the panel -------------------------------- */
 
-export default function ReviewsPanel({
-  projectId,
-  canAdmin,
-}: {
-  projectId: string;
-  canAdmin: boolean;
-}) {
+export default function ReviewsPanel({ projectId }: { projectId: string }) {
   const [rows, setRows] = useState<Review[] | null>(null);
   const [total, setTotal] = useState(0);
   const [status, setStatus] = useState("");
@@ -967,7 +967,6 @@ export default function ReviewsPanel({
         <ReviewDrawer
           projectId={projectId}
           reviewId={openId}
-          canAdmin={canAdmin}
           onClose={() => setOpenId(null)}
           onChanged={() => void load()}
         />

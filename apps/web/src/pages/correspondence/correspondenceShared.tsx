@@ -14,7 +14,8 @@
  */
 import { useCallback, useState, type ReactNode } from "react";
 import { api, ApiClientError, fetchBlobUrl } from "../../lib/api";
-import { Alert, Badge, Skeleton, cx } from "../../ui";
+import { Alert, Badge, Button, Input, Skeleton, cx } from "../../ui";
+import { IconPlus } from "../../ui/icons";
 import type { Tone } from "../../ui/tokens";
 import { useResource, type Loadable, type Paginated } from "../../layouts/project/lib";
 
@@ -40,6 +41,8 @@ export interface CorrespondenceType {
   defaultDirection: string;
   requiresResponse: number;
   responseDays: number | null;
+  /** "calendar" or "working" — most contracts count a notice period in working days */
+  responseDaysBasis: string;
   isContractual: number;
   createsObligation: number;
   approvalSteps: Array<{ name: string; role?: string | null; userId?: string | null }>;
@@ -911,6 +914,154 @@ export function FigureValue({ figure, unit }: { figure: Figure | null | undefine
   );
 }
 
+/* ============================ Activity drafts ============================= */
+
+/**
+ * The editable shape of one required activity. The action plan builder and the
+ * TEMPLATE builder both edit exactly this, so the two screens cannot drift
+ * apart on what a plan is allowed to ask for (#448–#452).
+ */
+export interface ActivityDraft {
+  title: string;
+  evidenceRequired: boolean;
+  evidenceRequirement: string;
+  isQualityCheckpoint: boolean;
+  dueOffsetDays: string;
+  signoffLabels: string;
+}
+
+export const emptyActivity = (): ActivityDraft => ({
+  title: "",
+  evidenceRequired: false,
+  evidenceRequirement: "",
+  isQualityCheckpoint: false,
+  dueOffsetDays: "",
+  signoffLabels: "",
+});
+
+/** Drafts → the wire shape of the API's `templateActivitySchema`. */
+export function activityDraftPayload(rows: readonly ActivityDraft[]): Array<Record<string, unknown>> {
+  return rows
+    .filter((a) => a.title.trim() !== "")
+    .map((a) => ({
+      title: a.title.trim(),
+      evidenceRequired: a.evidenceRequired,
+      evidenceRequirement: a.evidenceRequirement.trim() || null,
+      isQualityCheckpoint: a.isQualityCheckpoint,
+      dueOffsetDays: a.dueOffsetDays === "" ? null : Number(a.dueOffsetDays),
+      signoffParties: a.signoffLabels
+        .split(",")
+        .map((l) => l.trim())
+        .filter((l) => l !== "")
+        .map((label) => ({ partyType: "user", label })),
+    }));
+}
+
+/** A saved template's activities → drafts, so an edit starts from the truth. */
+export function activityDraftsFrom(rows: readonly TemplateActivity[] | undefined): ActivityDraft[] {
+  return (rows ?? []).map((a) => ({
+    title: a.title,
+    evidenceRequired: a.evidenceRequired === 1,
+    evidenceRequirement: a.evidenceRequirement ?? "",
+    isQualityCheckpoint: a.isQualityCheckpoint === 1,
+    dueOffsetDays: a.dueOffsetDays === null ? "" : String(a.dueOffsetDays),
+    signoffLabels: a.signoffParties.map((p) => p.label).join(", "),
+  }));
+}
+
+/**
+ * The activity editor. Sign-off labels are optional on purpose: an activity
+ * that names nobody closes through "Mark complete" instead of a signature, and
+ * the hint says so rather than leaving the author to discover it.
+ */
+export function ActivityDraftEditor({
+  activities,
+  onChange,
+  label = "Required activities",
+  empty = "A plan with no activities cannot be activated — it would enforce nothing.",
+}: {
+  activities: ActivityDraft[];
+  onChange: (next: ActivityDraft[]) => void;
+  label?: string;
+  empty?: string;
+}) {
+  const update = (index: number, patch: Partial<ActivityDraft>) =>
+    onChange(activities.map((r, i) => (i === index ? { ...r, ...patch } : r)));
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <span className="text-meta font-semibold text-content">{label}</span>
+        <Button
+          size="sm"
+          variant="ghost"
+          icon={IconPlus}
+          onClick={() => onChange([...activities, emptyActivity()])}
+        >
+          Add
+        </Button>
+      </div>
+      {activities.length === 0 ? <p className="text-2xs text-content-subtle">{empty}</p> : null}
+      {activities.map((activity, index) => (
+        <div key={index} className="space-y-2 rounded-md border border-border p-2">
+          <Input
+            size="sm"
+            placeholder="What must be done"
+            value={activity.title}
+            onChange={(e) => update(index, { title: e.target.value })}
+          />
+          <div className="grid gap-2 sm:grid-cols-2">
+            <Input
+              size="sm"
+              placeholder="Signatories, comma separated"
+              value={activity.signoffLabels}
+              onChange={(e) => update(index, { signoffLabels: e.target.value })}
+            />
+            <Input
+              size="sm"
+              type="number"
+              min={0}
+              placeholder="Due, days after start"
+              value={activity.dueOffsetDays}
+              onChange={(e) => update(index, { dueOffsetDays: e.target.value })}
+            />
+          </div>
+          <Input
+            size="sm"
+            placeholder="Evidence requirement (leave blank if none)"
+            value={activity.evidenceRequirement}
+            onChange={(e) =>
+              update(index, {
+                evidenceRequirement: e.target.value,
+                evidenceRequired: e.target.value.trim() !== "",
+              })
+            }
+          />
+          <label className="flex items-center gap-2 text-2xs text-content-muted">
+            <input
+              type="checkbox"
+              checked={activity.isQualityCheckpoint}
+              onChange={(e) => update(index, { isQualityCheckpoint: e.target.checked })}
+            />
+            Quality checkpoint — holds every activity after it until it is signed off
+            <button
+              type="button"
+              className="ml-auto text-danger-text hover:underline"
+              onClick={() => onChange(activities.filter((_, i) => i !== index))}
+            >
+              Remove
+            </button>
+          </label>
+          {activity.signoffLabels.trim() === "" ? (
+            <p className="text-2xs text-content-subtle">
+              Nobody named to sign: this activity closes with “Mark complete” once its evidence is in.
+            </p>
+          ) : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /* ================================= Hooks ================================== */
 
 export function useAction(): {
@@ -1033,6 +1184,8 @@ export const corrApi = {
   /* transmittals */
   createTransmittal: (projectId: string, body: Record<string, unknown>) =>
     api.post<TransmittalDetail>(`${p(projectId)}/transmittals`, body),
+  patchTransmittal: (projectId: string, id: string, body: Record<string, unknown>) =>
+    api.patch<Transmittal>(`${p(projectId)}/transmittals/${id}`, body),
   addTransmittalItems: (projectId: string, id: string, items: unknown[]) =>
     api.post<{ items: TransmittalItem[]; itemCount: number }>(`${p(projectId)}/transmittals/${id}/items`, {
       items,

@@ -636,9 +636,15 @@ export async function insuranceHoldDecision(
  *    reads like one, because in both cases the notice is a condition
  *    precedent to liability and lateness is usually fatal.
  *  - A certificate that expires while the works continue is a **Signal**,
- *    raised by an idempotent lazy sweep on list/detail reads (#780). Never a
- *    cron: the read is the trigger, and the `evidenceRefs.key` is what stops
- *    the same lapse being raised twice.
+ *    raised by an idempotent sweep (#780). The sweep used to run on list and
+ *    detail READS, which was wrong twice over: a project nobody opened was
+ *    never warned (the expiry date does not wait for a browser tab) and the
+ *    ledger attributed the resulting signals and status flips to whoever
+ *    happened to open the list, including read-only users and assurance
+ *    grantees who hold no write permission at all. It now runs under the
+ *    platform scheduler with a null (system) actor, plus an explicit
+ *    `POST .../sweep` for operators and tests; reads are pure. The
+ *    `evidenceRefs.key` is what stops the same lapse being raised twice.
  *  - A certificate is **Evidence** about a policy **Assertion** (ADR 0004),
  *    so the actor who submits the evidence may not be the actor who verifies
  *    it; only an integrity reviewer may knowingly self-verify, and that

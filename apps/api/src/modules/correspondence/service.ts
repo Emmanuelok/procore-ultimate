@@ -747,7 +747,7 @@ export const SUMMARY_ROW_CAP = 20_000;
 export const SUMMARY_ACTIVITY_CAP = 50_000;
 export const SUMMARY_TEMPLATE_CAP = 5_000;
 
-function capped<T>(rows: T[], cap: number, what: string, reasons: string[]): T[] {
+export function capped<T>(rows: T[], cap: number, what: string, reasons: string[]): T[] {
   if (rows.length <= cap) return rows;
   reasons.push(
     `This project holds more than ${cap.toLocaleString("en-GB")} ${what}. Every figure below counts only the ${cap.toLocaleString("en-GB")} rows read, so treat them as a floor rather than the whole register.`,

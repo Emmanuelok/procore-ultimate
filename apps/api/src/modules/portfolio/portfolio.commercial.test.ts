@@ -920,3 +920,111 @@ describe("call-off orders (#1053, #1056)", () => {
     expect(order.json().message).toMatch(/only a live framework/i);
   });
 });
+
+/* ================================================================== */
+/* Regressions — the rules that must bite at the moment of issue       */
+/* ================================================================== */
+
+describe("call-off regressions", () => {
+  it("refuses to issue a draft direct award whose value was edited past the threshold", async () => {
+    const created = await post(`/projects/${projectA}/portfolio/call-offs`, {
+      title: "Small direct award, later inflated",
+      route: "direct_award",
+      frameworkId,
+      lotId: lot1,
+      supplierName: "Alpha Civils Ltd",
+      currency: "GBP",
+      orderValue: 10_000,
+      justification: "Well within the framework's direct-award threshold",
+    });
+    expect(created.statusCode).toBe(201);
+    const id = created.json().id as string;
+
+    // a draft's value IS editable — that is what a draft is for
+    const edited = await patch(`/projects/${projectA}/portfolio/call-offs/${id}`, {
+      orderValue: 500_000,
+    });
+    expect(edited.statusCode).toBe(200);
+    expect(edited.json().orderValue).toBe(500_000);
+
+    // but the direct-award rule is tested against the value being ISSUED, not
+    // against the value the order happened to carry when it was drafted
+    const issue = await post(`/projects/${projectA}/portfolio/call-offs/${id}/issue`);
+    expect(issue.statusCode).toBe(409);
+    expect(issue.json().message).toMatch(/direct award is not permissible/i);
+
+    const stillDraft = await get(`/projects/${projectA}/portfolio/call-offs/${id}`);
+    expect(stillDraft.json().status).toBe("draft");
+
+    // brought back under the threshold, it issues
+    await patch(`/projects/${projectA}/portfolio/call-offs/${id}`, { orderValue: 20_000 });
+    const ok = await post(`/projects/${projectA}/portfolio/call-offs/${id}/issue`);
+    expect(ok.statusCode).toBe(200);
+    expect(ok.json().status).toBe("issued");
+  });
+
+  it("refuses to issue a direct award moved onto a lot that only takes mini-competitions", async () => {
+    const created = await post(`/projects/${projectA}/portfolio/call-offs`, {
+      title: "Lot-hopping direct award",
+      route: "direct_award",
+      frameworkId,
+      lotId: lot1,
+      supplierName: "Alpha Civils Ltd",
+      currency: "GBP",
+      orderValue: 5_000,
+      justification: "Lot 1 permits a direct award at this value",
+    });
+    expect(created.statusCode).toBe(201);
+    const id = created.json().id as string;
+
+    // move it onto the mini-competition-only lot behind the check's back
+    await app.db
+      .update(callOffOrders)
+      .set({ lotId: lot2 })
+      .where(eq(callOffOrders.id, id));
+
+    const issue = await post(`/projects/${projectA}/portfolio/call-offs/${id}/issue`);
+    expect(issue.statusCode).toBe(409);
+    expect(issue.json().message).toMatch(/mini-competition/i);
+  });
+
+  it("refuses a lot that is not a lot of the framework the order names, on every route", async () => {
+    const foreignLot = await post(`/projects/${projectB}/portfolio/call-offs`, {
+      title: "Lot laundering",
+      route: "term_contract",
+      termContractId,
+      frameworkId,
+      lotId: "flo_not_of_this_framework",
+      supplierName: "Alpha Civils Ltd",
+      currency: "GBP",
+      orderValue: 5_000,
+    });
+    expect(foreignLot.statusCode).toBe(400);
+    expect(foreignLot.json().message).toMatch(/does not name a lot of this framework/i);
+
+    const orphanLot = await post(`/projects/${projectB}/portfolio/call-offs`, {
+      title: "Lot with no framework",
+      route: "term_contract",
+      termContractId,
+      lotId: lot1,
+      supplierName: "Alpha Civils Ltd",
+      currency: "GBP",
+      orderValue: 5_000,
+    });
+    expect(orphanLot.statusCode).toBe(400);
+    expect(orphanLot.json().message).toMatch(/name the framework/i);
+  });
+
+  it("narrows the call-offs shown on a framework to the projects the caller may see", async () => {
+    const asOwner = await get(`/portfolio/frameworks/${frameworkId}`);
+    expect(asOwner.statusCode).toBe(200);
+    expect(asOwner.json().callOffs.length).toBeGreaterThan(0);
+
+    const asMember = await get(`/portfolio/frameworks/${frameworkId}`, memberHeaders);
+    expect(asMember.statusCode).toBe(200);
+    expect(asMember.json().callOffs).toHaveLength(0);
+    // the utilisation still counts them: a ceiling is a property of the framework
+    expect(asMember.json().utilisation.ordered).toBe(asOwner.json().utilisation.ordered);
+    expect(asMember.json().reasons.some((r: string) => /not a member of/i.test(r))).toBe(true);
+  });
+});

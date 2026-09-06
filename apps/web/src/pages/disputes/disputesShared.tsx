@@ -41,6 +41,19 @@ export interface DisputeRow {
   timetable: TimetableStep[];
   outcome: string | null;
   decidedAt: string | null;
+  /* regime + outcome database (#322-333, #356-357) */
+  jurisdiction: string | null;
+  triggerDate: string | null;
+  amountClaimed: number | null;
+  amountAwarded: number | null;
+  costsAwarded: number | null;
+  rootCause: string | null;
+  governingClause: string | null;
+  contractFamily: string | null;
+  resolvedAt: string | null;
+  enforcementStatus: string | null;
+  complianceDeadline: string | null;
+  nodDeadline: string | null;
   createdBy: string;
   createdAt: string;
   updatedAt: string;
@@ -76,6 +89,12 @@ export interface BundleItem {
   recordId: string | null;
   fileId: string | null;
   sha256: string | null;
+  /** BundleItemPrivilege — anything other than "none" is withheld (#340-342) */
+  privilege?: string;
+  privilegeReason?: string | null;
+  /** page span in the produced bundle, assigned at generation */
+  startPage?: number | null;
+  endPage?: number | null;
 }
 
 export interface ManifestIndexEntry {
@@ -91,6 +110,17 @@ export interface BundleManifest {
   itemCount: number;
   merkleRoot: string;
   index: ManifestIndexEntry[];
+  /** items withheld on privilege — listed, never produced (#340-342) */
+  privilegeLog?: Array<{
+    id: string;
+    title: string;
+    date: string | null;
+    privilege: string;
+    reason: string | null;
+  }>;
+  /** total pages including the cover and the hyperlinked index */
+  pages?: number;
+  statement?: string;
 }
 
 export interface BundleRow {

@@ -1,20 +1,21 @@
 import type { FastifyInstance } from "fastify";
 import { and, asc, count, desc, eq, inArray, ne } from "drizzle-orm";
 import { z } from "zod";
-import { affectedPersons, landParcels, signals } from "@constructos/db";
-import { PARCEL_STATUSES, TENURE_TYPES } from "@constructos/shared";
+import { affectedPersons, landParcels } from "@constructos/db";
+import { ACQUISITION_BASES, PARCEL_STATUSES, TENURE_TYPES } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, conflict, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
-import { isoDateSchema } from "../field/dates.js";
+import { isoDateSchema, todayISO } from "../field/dates.js";
 import {
-  PARCEL_BLOCKING_STATUSES,
+  CASH_ACQUISITION_BASES,
+  PARCEL_ACQUIRABLE_FROM,
   PARCEL_COMPENSABLE_FROM,
   PARCEL_TRANSITIONS,
 } from "./reference.js";
+import { loadConsentView, SIGNAL_HORIZON_DAYS } from "./consent-service.js";
 import {
-  daysUntil,
   resolveTasks,
   round2,
   validateEntity,
@@ -54,6 +55,14 @@ const parcelStatusSchema = z.object({
   note: z.string().max(10000).nullable().optional(),
 });
 
+const acquireSchema = z.object({
+  acquisitionBasis: z.enum(ACQUISITION_BASES),
+  acquiredAt: isoDateSchema.optional(),
+  /** title transfer, lease, donation deed, court order, allocation letter */
+  evidenceIds: z.array(z.string().min(1)).min(1).max(100),
+  note: z.string().max(10000).nullable().optional(),
+});
+
 const compensateSchema = z.object({
   amount: z.number().positive(),
   paidAt: isoDateSchema,
@@ -66,9 +75,6 @@ const compensateSchema = z.object({
 const scheduleRiskQuery = z.object({
   days: z.coerce.number().int().min(1).max(3650).default(90),
 });
-
-/** Blocked tasks starting inside this horizon raise an integrity signal. */
-const SIGNAL_HORIZON_DAYS = 30;
 
 /**
  * Land parcel register, acquisition flow, evidenced compensation and the
@@ -251,6 +257,29 @@ export async function registerParcelRoutes(app: FastifyInstance): Promise<void> 
       if (body.blockingTaskIds !== undefined) {
         await validateTasksInProject(app.db, req.projectId!, body.blockingTaskIds);
       }
+      /*
+       * Once compensation has been PAID, the amount and the currency are
+       * facts about a transaction that happened, not editable attributes.
+       * A general PATCH could previously move a parcel compensated at
+       * 10,000 USD to 50,000 USD, and the only trace was an "update" row
+       * saying `compensationAmount changed` — no before, no after, no
+       * evidence. A supplementary payment is a supplementary /compensate
+       * with its own evidence; a mistake is a correction with a reason.
+       */
+      if (parcel.compensationPaidAt) {
+        const frozen = (["compensationAmount", "currency", "valuationAmount"] as const).filter(
+          (k) => body[k] !== undefined && body[k] !== parcel[k],
+        );
+        if (frozen.length > 0) {
+          throw conflict(
+            `Parcel ${parcel.reference} was compensated on ${parcel.compensationPaidAt}: ` +
+              `${frozen.join(", ")} cannot be edited afterwards. Record a supplementary payment ` +
+              `through POST /parcels/${parcelId}/compensate with its own evidence.`,
+          );
+        }
+      }
+      const before: Record<string, unknown> = {};
+      const after: Record<string, unknown> = {};
       const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
       for (const key of [
         "reference",
@@ -267,7 +296,11 @@ export async function registerParcelRoutes(app: FastifyInstance): Promise<void> 
         "longitude",
         "blockingTaskIds",
       ] as const) {
-        if (body[key] !== undefined) set[key] = body[key];
+        if (body[key] !== undefined) {
+          set[key] = body[key];
+          before[key] = parcel[key];
+          after[key] = body[key];
+        }
       }
       await app.db.update(landParcels).set(set).where(eq(landParcels.id, parcelId));
       await appendLedger(app.db, {
@@ -276,7 +309,10 @@ export async function registerParcelRoutes(app: FastifyInstance): Promise<void> 
         action: "update",
         objectType: "land_parcel",
         objectId: parcelId,
-        payload: { changed: Object.keys(body) },
+        // the values, not the key names: a compensation figure that moved
+        // has to be readable from the ledger without the record beside it
+        payload: { before, after },
+        storePayload: true,
       });
       return fetchParcel(parcelId, req.companyId!, req.projectId!);
     },
@@ -302,6 +338,12 @@ export async function registerParcelRoutes(app: FastifyInstance): Promise<void> 
             "(POST /parcels/:parcelId/compensate)",
         );
       }
+      if (body.status === "acquired") {
+        throw badRequest(
+          "A parcel is marked acquired only through the evidenced acquisition route " +
+            "(POST /parcels/:parcelId/acquire), which records the basis on which title passed",
+        );
+      }
       const allowed =
         PARCEL_TRANSITIONS[parcel.status as keyof typeof PARCEL_TRANSITIONS] ?? ([] as string[]);
       if (!allowed.includes(body.status)) {
@@ -324,6 +366,82 @@ export async function registerParcelRoutes(app: FastifyInstance): Promise<void> 
           from: parcel.status,
           to: body.status,
           reference: parcel.reference,
+          note: body.note ?? null,
+        },
+        storePayload: true,
+      });
+      return fetchParcel(parcelId, req.companyId!, req.projectId!);
+    },
+  );
+
+  /**
+   * Title actually passing (#551-552).
+   *
+   * Before this route the ONLY way into `acquired` without a cash payment
+   * was `agreed → disputed → acquired`. On a road scheme dominated by
+   * state-owned land, communal donations or land the employer already held,
+   * that forced thirty fictitious disputes into the register — and the RAP
+   * dashboard, the acquisition pipeline and the dispute statistics all read
+   * them as real. Acquisition is instead its own evidenced act, naming the
+   * BASIS on which title passed, from `agreed`, `compensated` or `disputed`
+   * (a court order or compulsory-purchase determination settles a dispute
+   * straight into acquisition).
+   *
+   * Evidence is mandatory: a title transfer, lease, donation deed, court
+   * order or government allocation letter. A `purchase` or `expropriation`
+   * basis additionally requires that compensation has actually been paid —
+   * possession before payment is the IFC PS5 para 20 breach, and it must not
+   * be reachable by choosing a menu item.
+   */
+  app.post(
+    "/projects/:projectId/parcels/:parcelId/acquire",
+    { preHandler: standardGate },
+    async (req) => {
+      const { parcelId } = req.params as { parcelId: string };
+      const body = acquireSchema.parse(req.body);
+      const parcel = await fetchParcel(parcelId, req.companyId!, req.projectId!);
+      if (parcel.status === "acquired") throw badRequest("Parcel is already acquired");
+      if (!PARCEL_ACQUIRABLE_FROM.includes(parcel.status as (typeof PARCEL_ACQUIRABLE_FROM)[number])) {
+        throw badRequest(
+          `A ${parcel.status} parcel cannot be acquired ` +
+            `(allowed: ${PARCEL_ACQUIRABLE_FROM.join(", ")})`,
+        );
+      }
+      if (CASH_ACQUISITION_BASES.includes(body.acquisitionBasis) && !parcel.compensationPaidAt) {
+        throw badRequest(
+          `Acquisition on a "${body.acquisitionBasis}" basis requires compensation to have been ` +
+            `paid first: IFC PS5 para 20 requires payment before possession is taken. Record ` +
+            `the payment through /compensate, or state the non-cash basis on which title passed.`,
+        );
+      }
+      await validateEvidence(app.db, req.companyId!, req.projectId!, body.evidenceIds);
+      const acquiredAt = body.acquiredAt ?? todayISO();
+      const merged = [...new Set([...parcel.evidenceIds, ...body.evidenceIds])];
+      await app.db
+        .update(landParcels)
+        .set({
+          status: "acquired",
+          acquisitionBasis: body.acquisitionBasis,
+          acquiredAt,
+          evidenceIds: merged,
+          updatedAt: new Date().toISOString(),
+        })
+        .where(eq(landParcels.id, parcelId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "land_parcel",
+        objectId: parcelId,
+        payload: {
+          from: parcel.status,
+          to: "acquired",
+          reference: parcel.reference,
+          acquisitionBasis: body.acquisitionBasis,
+          acquiredAt,
+          tenureType: parcel.tenureType,
+          compensationPaidAt: parcel.compensationPaidAt,
+          evidenceIds: body.evidenceIds,
           note: body.note ?? null,
         },
         storePayload: true,
@@ -391,136 +509,75 @@ export async function registerParcelRoutes(app: FastifyInstance): Promise<void> 
   /* ---------------------------------------------------------------- */
 
   /**
-   * The question a programme director actually asks: which works are about
-   * to start on land we do not yet hold? Every parcel that is not `acquired`
-   * and that blocks a task starting inside the horizon is reported, ordered
-   * by urgency. Anything starting inside 30 days also raises an integrity
-   * signal — once per (parcel, task), so repeated reads never duplicate it.
+   * Which works are about to start on land the project does not hold — and,
+   * now, under a consent it has not been granted: parcels and permits are
+   * one dependency set, because a task blocked by both is not two separate
+   * risks to a programme director.
+   *
+   * This read is PURE. It used to raise signals and append ledger rows as a
+   * side effect of being looked at, with no lock and no unique key, so the
+   * two requests the land workspace fires in parallel both inserted the same
+   * finding. Raising is now the scheduled detector's job (system actor,
+   * advisory-locked, fingerprinted, auto-closing when the dependency
+   * clears); the view reports what is true, and quantifies it: days-at-risk
+   * per dependency from the project's own median resolution times, and the
+   * slip that survives the task's float.
    */
   app.get("/projects/:projectId/land/schedule-risk", { preHandler: readGate }, async (req) => {
     const q = scheduleRiskQuery.parse(req.query);
-    const parcels = await app.db
-      .select()
-      .from(landParcels)
-      .where(
-        and(
-          eq(landParcels.companyId, req.companyId!),
-          eq(landParcels.projectId, req.projectId!),
-          inArray(landParcels.status, [...PARCEL_BLOCKING_STATUSES]),
-        ),
-      )
-      .orderBy(asc(landParcels.reference));
-    const allTaskIds = [...new Set(parcels.flatMap((p) => p.blockingTaskIds))];
-    const tasks = await resolveTasks(app.db, req.projectId!, allTaskIds);
-
-    interface RiskRow {
-      parcelId: string;
-      reference: string;
-      status: string;
-      tenureType: string;
-      ownerName: string | null;
-      taskId: string;
-      taskName: string;
-      taskStart: string;
-      daysUntilStart: number;
-    }
-    const items: RiskRow[] = [];
-    for (const parcel of parcels) {
-      for (const taskId of parcel.blockingTaskIds) {
-        const task = tasks.get(taskId);
-        if (!task?.startDate) continue; // unscheduled task — no date to be at risk against
-        const days = daysUntil(task.startDate);
-        if (days > q.days) continue;
-        items.push({
-          parcelId: parcel.id,
-          reference: parcel.reference,
-          status: parcel.status,
-          tenureType: parcel.tenureType,
-          ownerName: parcel.ownerName,
-          taskId,
-          taskName: task.name,
-          taskStart: task.startDate,
-          daysUntilStart: days,
-        });
-      }
-    }
-    items.sort((a, b) => a.daysUntilStart - b.daysUntilStart || a.reference.localeCompare(b.reference));
-
-    // Idempotent signal raise, keyed on (parcel, task) carried in evidenceRefs.
-    const imminent = items.filter((r) => r.daysUntilStart <= SIGNAL_HORIZON_DAYS);
-    if (imminent.length > 0) {
-      const existing = await app.db
-        .select({ evidenceRefs: signals.evidenceRefs })
-        .from(signals)
-        .where(
-          and(
-            eq(signals.companyId, req.companyId!),
-            eq(signals.projectId, req.projectId!),
-            eq(signals.detector, "land_blocks_programme"),
-          ),
-        );
-      const seen = new Set(
-        existing.map((row) => {
-          const refs = row.evidenceRefs as { parcelId?: string; taskId?: string } | null;
-          return `${refs?.parcelId ?? ""}::${refs?.taskId ?? ""}`;
-        }),
-      );
-      for (const risk of imminent) {
-        const key = `${risk.parcelId}::${risk.taskId}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        const id = newId("sig");
-        const when =
-          risk.daysUntilStart < 0
-            ? `started ${Math.abs(risk.daysUntilStart)} day(s) ago`
-            : `starts in ${risk.daysUntilStart} day(s)`;
-        await app.db.insert(signals).values({
-          id,
-          companyId: req.companyId!,
-          projectId: req.projectId!,
-          detector: "land_blocks_programme",
-          severity: "high",
-          confidence: 1,
-          title: `Land not acquired blocks "${risk.taskName}" — parcel ${risk.reference}`,
-          explanation:
-            `Parcel ${risk.reference} (${risk.tenureType} tenure${risk.ownerName ? `, ${risk.ownerName}` : ""}) ` +
-            `is ${risk.status} and has not been acquired, yet it blocks schedule task ` +
-            `"${risk.taskName}", which ${when} (planned start ${risk.taskStart}). ` +
-            `Mobilising onto land the project does not hold exposes it to trespass, ` +
-            `injunction and lender-standard non-compliance, and is one of the most common ` +
-            `root causes of prolongation claims on internationally financed infrastructure.`,
-          evidenceRefs: {
-            parcelId: risk.parcelId,
-            taskId: risk.taskId,
-            reference: risk.reference,
-            taskStart: risk.taskStart,
-            parcelStatus: risk.status,
-          },
-        });
-        await appendLedger(app.db, {
-          companyId: req.companyId!,
-          actorId: req.user!.id,
-          action: "create",
-          objectType: "signal",
-          objectId: id,
-          payload: {
-            detector: "land_blocks_programme",
-            parcelId: risk.parcelId,
-            taskId: risk.taskId,
-          },
-        });
-      }
-    }
-
-    const blockedParcels = new Set(items.map((r) => r.parcelId));
-    return {
+    const { view } = await loadConsentView(app.db, req.companyId!, req.projectId!, {
       horizonDays: q.days,
-      /** headline: how many works packages are standing on un-acquired land */
-      blockedTasks: items.length,
-      blockedParcels: blockedParcels.size,
-      imminent: imminent.length,
-      alreadyStarted: items.filter((r) => r.daysUntilStart < 0).length,
+      withObservations: true,
+    });
+
+    // Flat (dependency × task) rows, which is what the register renders.
+    const items = view.tasks.flatMap((task) =>
+      task.dependencies.map((dep) => ({
+        kind: dep.kind,
+        dependencyId: dep.id,
+        // kept for backwards compatibility with the parcel-only view
+        parcelId: dep.kind === "parcel" ? dep.id : null,
+        permitId: dep.kind === "permit" ? dep.id : null,
+        reference: dep.reference,
+        label: dep.label,
+        status: dep.status,
+        taskId: task.taskId,
+        taskName: task.taskName,
+        taskStart: task.plannedStart ?? task.actualStart,
+        daysUntilStart: task.daysUntilStart,
+        isCritical: task.isCritical,
+        totalFloat: task.totalFloat,
+        daysAtRisk: dep.daysAtRisk,
+        expectedResolutionDate: dep.expectedResolutionDate,
+        estimateSource: dep.estimateSource,
+        estimateSampleSize: dep.estimateSampleSize,
+        slipContribution: task.slipContribution,
+        startedUnconsented: task.startedUnconsented,
+        basis: task.basis,
+        detail: dep.detail,
+      })),
+    );
+    items.sort(
+      (a, b) =>
+        (a.daysUntilStart ?? Number.MAX_SAFE_INTEGER) -
+          (b.daysUntilStart ?? Number.MAX_SAFE_INTEGER) ||
+        b.daysAtRisk - a.daysAtRisk ||
+        a.reference.localeCompare(b.reference),
+    );
+
+    return {
+      horizonDays: view.horizonDays,
       signalHorizonDays: SIGNAL_HORIZON_DAYS,
+      /** headline: how many works packages stand on unresolved consent */
+      blockedTasks: view.summary.blockedTasks,
+      blockedParcels: view.summary.blockingParcels,
+      blockingPermits: view.summary.blockingPermits,
+      alreadyStarted: view.summary.startedUnconsented,
+      imminent: items.filter(
+        (i) => i.daysUntilStart !== null && i.daysUntilStart <= SIGNAL_HORIZON_DAYS,
+      ).length,
+      summary: view.summary,
+      tasks: view.tasks,
       items,
     };
   });

@@ -40,6 +40,10 @@ let memberHeaders: Record<string, string>;
 let reviewerHeaders: Record<string, string>;
 let surveyorHeaders: Record<string, string>;
 
+// 120s, not the global 30s: this hook boots an embedded PGlite and applies the whole
+// migration set, which on a loaded build machine takes longer than the default hook
+// timeout — a worker that times out here reports every test in the file as skipped,
+// which looks exactly like a green run that tested nothing.
 beforeAll(async () => {
   built = await buildTestApp();
   app = built.app;
@@ -93,7 +97,7 @@ beforeAll(async () => {
     role: "auditor",
     grantedBy: owner.userId,
   });
-});
+}, 120_000);
 
 afterAll(async () => {
   await built.close();
@@ -1152,5 +1156,446 @@ describe("tenant isolation", () => {
   it("cannot forge a company header to reach a company it is not a member of", async () => {
     const res = await get("/signals", headersFor(stranger, owner.companyId));
     expect(res.statusCode).toBe(403);
+  });
+});
+
+/* ================================================================== */
+/* REGRESSION (verifier): the BULK auto route obeys the separation     */
+/* rule the manual route enforces                                      */
+/* ================================================================== */
+
+describe("REGRESSION: /reconciliations/auto cannot verify a claim against its author's own evidence", () => {
+  let projectC: string;
+
+  beforeAll(async () => {
+    projectC = newId("prj");
+    await app.db
+      .insert(projects)
+      .values({ id: projectC, companyId: owner.companyId, name: "Project C" });
+  });
+
+  it("records no result, flags the row, raises a signal and keeps it out of the owner variance", async () => {
+    const as = await mkAssertion(projectC, owner.headers, {
+      kind: "progress_percent",
+      value: 90,
+      unit: "%",
+    });
+    expect(as.statusCode).toBe(201);
+    // THE ATTACK: the claimant supplies every piece of evidence themselves and
+    // presses the bulk button, which used to skip separationCheck entirely.
+    // Both rows sit inside the ±5% band, so the engine would have said
+    // "supported" — and the dashboard would have printed it as verified.
+    await mkEvidence(projectC, owner.headers, {
+      kind: "reality_capture",
+      metadata: { observedPercent: 89 },
+    });
+    await mkEvidence(projectC, owner.headers, {
+      kind: "reality_capture",
+      metadata: { observedPercent: 91 },
+    });
+
+    const res = await post(`/projects/${projectC}/reconciliations/auto`, owner.headers, {});
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      created: number;
+      selfCertified: number;
+      results: Record<string, number>;
+      signalsCreated: number;
+    };
+    expect(body.created).toBe(1);
+    expect(body.selfCertified).toBe(1);
+    expect(body.results["supported"] ?? 0).toBe(0);
+    expect(body.results["insufficient_evidence"]).toBe(1);
+    expect(body.signalsCreated).toBeGreaterThan(0);
+
+    const list = await get(`/projects/${projectC}/reconciliations?pageSize=10`, owner.headers);
+    const row = (
+      list.json().items as Array<{
+        selfCertified: boolean;
+        result: string;
+        variancePercent: number | null;
+        confidence: number | null;
+        notes: string;
+      }>
+    )[0]!;
+    expect(row.selfCertified).toBe(true);
+    expect(row.result).toBe("insufficient_evidence");
+    expect(row.variancePercent).toBeNull();
+    expect(row.confidence).toBe(0);
+    expect(row.notes).toMatch(/NOT INDEPENDENTLY TESTED/);
+
+    const sig = await get(
+      `/projects/${projectC}/signals?detector=self_certified_claim`,
+      owner.headers,
+    );
+    expect((sig.json().items as unknown[]).length).toBe(1);
+
+    // The owner-side tile must not quote it as a verified variance.
+    const summary = await get(`/projects/${projectC}/assurance/summary`, owner.headers);
+    const cvv = summary.json().claimedVsVerified as { value: number | null; reasons?: string[] };
+    expect(cvv.value).toBeNull();
+    expect((cvv.reasons ?? []).join(" ")).toMatch(/evidenced only by the claimant/);
+  });
+
+  it("still produces a real verdict once an independent row exists", async () => {
+    const as = await mkAssertion(projectC, owner.headers, {
+      kind: "headcount",
+      value: 50,
+      unit: "people",
+    });
+    expect(as.statusCode).toBe(201);
+    await mkEvidence(projectC, surveyorHeaders, {
+      kind: "access_control_log",
+      metadata: { distinctWorkers: 49 },
+    });
+    const res = await post(`/projects/${projectC}/reconciliations/auto`, owner.headers, {
+      kind: "headcount",
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { created: number; selfCertified: number };
+    expect(body.created).toBe(1);
+    expect(body.selfCertified).toBe(0);
+    const list = await get(
+      `/projects/${projectC}/reconciliations?pageSize=10`,
+      owner.headers,
+    );
+    const rows = list.json().items as Array<{
+      assertionId: string;
+      selfCertified: boolean;
+      result: string;
+    }>;
+    const independent = rows.find((r) => r.assertionId === (as.json().id as string));
+    expect(independent).toBeTruthy();
+    expect(independent!.selfCertified).toBe(false);
+    expect(independent!.result).toBe("supported");
+  });
+});
+
+/* ================================================================== */
+/* REGRESSION (verifier): a case may not be used to read or escalate   */
+/* another project's findings                                          */
+/* ================================================================== */
+
+describe("REGRESSION: integrity case items are scoped to the caller's assurance reach", () => {
+  let caseId: string;
+  let signalInB: string;
+
+  beforeAll(async () => {
+    // A finding on project B, which reviewerA has no grant over.
+    const raised = await post(`/projects/${projectB}/detectors/run`, owner.headers, {
+      detectors: ["duplicate_assertions"],
+    });
+    expect(raised.statusCode).toBe(200);
+    const rows = await app.db
+      .select({ id: signals.id })
+      .from(signals)
+      .where(and(eq(signals.companyId, owner.companyId), eq(signals.projectId, projectB)));
+    expect(rows.length).toBeGreaterThan(0);
+    signalInB = rows[0]!.id;
+
+    const created = await post("/integrity-cases", reviewerHeaders, {
+      title: "Scoped reviewer case",
+      projectId: projectA,
+    });
+    expect(created.statusCode).toBe(201);
+    caseId = created.json().id as string;
+  });
+
+  it("refuses to attach a signal from a project the reviewer has no reach over", async () => {
+    const res = await post(`/integrity-cases/${caseId}/items`, reviewerHeaders, {
+      itemType: "signal",
+      itemId: signalInB,
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().message).toMatch(/No assurance visibility/);
+    // The refusal left no dangling item and did not escalate the signal.
+    const after = await app.db
+      .select({ disposition: signals.disposition })
+      .from(signals)
+      .where(eq(signals.id, signalInB));
+    expect(after[0]!.disposition).not.toBe("escalated");
+  });
+
+  it("refuses the same attachment at case-creation time", async () => {
+    const res = await post("/integrity-cases", reviewerHeaders, {
+      title: "Case opened around another project's finding",
+      projectId: projectA,
+      signalIds: [signalInB],
+    });
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("withholds out-of-reach signals from a case another actor attached", async () => {
+    // The owner has full reach and legitimately groups both projects.
+    const cross = await post("/integrity-cases", owner.headers, {
+      title: "Cross-project case",
+      projectId: projectA,
+      signalIds: [signalInB],
+    });
+    expect(cross.statusCode).toBe(201);
+    const crossId = cross.json().id as string;
+
+    const asOwner = await get(`/integrity-cases/${crossId}`, owner.headers);
+    expect(asOwner.statusCode).toBe(200);
+    expect((asOwner.json().signals as unknown[]).length).toBe(1);
+    expect(asOwner.json().withheldSignals).toBe(0);
+
+    const asReviewer = await get(`/integrity-cases/${crossId}`, reviewerHeaders);
+    expect(asReviewer.statusCode).toBe(200);
+    expect(asReviewer.json().signals).toHaveLength(0);
+    expect(asReviewer.json().withheldSignals).toBe(1);
+  });
+});
+
+/* ================================================================== */
+/* REGRESSION (verifier): an AUTO-closed finding reopens when its       */
+/* condition returns; a reviewer's judgement is never overridden        */
+/* ================================================================== */
+
+describe("REGRESSION: auto-closed signals reopen when the condition recurs", () => {
+  let reviewerB: TestActor;
+  let reviewerBHeaders: Record<string, string>;
+
+  beforeAll(async () => {
+    // Dispositioning a signal is a reviewer's act, not an owner's — the route
+    // admits integrity_reviewer only — so the "a reviewer's judgement stands"
+    // half of this needs a reviewer whose grant covers project B.
+    reviewerB = await registerActor(app);
+    await app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: reviewerB.userId,
+      role: "member",
+    });
+    await app.db.insert(assuranceGrants).values({
+      id: newId("ag"),
+      companyId: owner.companyId,
+      projectId: projectB,
+      userId: reviewerB.userId,
+      role: "integrity_reviewer",
+      grantedBy: owner.userId,
+    });
+    reviewerBHeaders = headersFor(reviewerB, owner.companyId);
+  });
+
+  async function duplicateAssertionSignal() {
+    const rows = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.projectId, projectB),
+          eq(signals.detector, "duplicate_assertions"),
+        ),
+      );
+    expect(rows).toHaveLength(1);
+    return rows[0]!;
+  }
+
+  it("reopens a machine-closed finding and counts the recurrence", async () => {
+    const before = await duplicateAssertionSignal();
+    // Simulate the earlier run having auto-closed it: the condition had gone
+    // away, no human touched it.
+    const closedAt = new Date().toISOString();
+    await app.db
+      .update(signals)
+      .set({ disposition: "closed", closedAt, autoClosedAt: closedAt, reviewerId: null })
+      .where(eq(signals.id, before.id));
+
+    const run = await post(`/projects/${projectB}/detectors/run`, owner.headers, {
+      detectors: ["duplicate_assertions"],
+    });
+    expect(run.statusCode).toBe(200);
+    expect(run.json().reopened).toBe(1);
+    expect(run.json().created).toBe(0);
+
+    const after = await duplicateAssertionSignal();
+    expect(after.id).toBe(before.id);
+    expect(after.disposition).toBe("new");
+    expect(after.closedAt).toBeNull();
+    expect(after.autoClosedAt).toBeNull();
+    expect(after.occurrences).toBe((before.occurrences ?? 1) + 1);
+
+    // It is back in the queue a reviewer actually reads.
+    const queue = await get(`/projects/${projectB}/signals?disposition=new`, owner.headers);
+    expect(
+      (queue.json().items as Array<{ id: string }>).some((s) => s.id === after.id),
+    ).toBe(true);
+
+    const entries = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(
+        and(
+          eq(ledgerEntries.companyId, owner.companyId),
+          eq(ledgerEntries.objectType, "signal"),
+          eq(ledgerEntries.objectId, after.id),
+          eq(ledgerEntries.action, "state_change"),
+        ),
+      );
+    expect(entries.length).toBeGreaterThan(0);
+  });
+
+  it("does NOT revive a finding a reviewer dismissed", async () => {
+    const sig = await duplicateAssertionSignal();
+    const dismissed = await patch(`/signals/${sig.id}/disposition`, reviewerBHeaders, {
+      disposition: "false_positive",
+      notes: "Two genuinely distinct claims that happen to match.",
+    });
+    expect(dismissed.statusCode).toBe(200);
+
+    const run = await post(`/projects/${projectB}/detectors/run`, owner.headers, {
+      detectors: ["duplicate_assertions"],
+    });
+    expect(run.statusCode).toBe(200);
+    expect(run.json().reopened).toBe(0);
+    expect(run.json().created).toBe(0);
+
+    const after = await duplicateAssertionSignal();
+    expect(after.disposition).toBe("false_positive");
+  });
+});
+
+/* ================================================================== */
+/* REGRESSION (verifier): scheduling and read-only roles                */
+/* ================================================================== */
+
+describe("REGRESSION: the detector programme is scheduled on BOTH scopes", () => {
+  it("runs project-scope detectors from the scheduler, attributed to the system", async () => {
+    const before = await app.db
+      .select({ id: signals.id })
+      .from(signals)
+      .where(eq(signals.companyId, owner.companyId));
+    const status = await app.scheduler.runNow("assurance.project-detector-sweep");
+    expect(status.lastError).toBeNull();
+    const result = status.lastResult as {
+      projects?: number;
+      failed?: Array<{ companyId: string; error: string }>;
+    };
+    expect(result.failed ?? []).toHaveLength(0);
+    expect(result.projects ?? 0).toBeGreaterThan(0);
+    const after = await app.db
+      .select({ id: signals.id })
+      .from(signals)
+      .where(eq(signals.companyId, owner.companyId));
+    // Idempotent: a sweep over already-detected conditions must not duplicate.
+    expect(after.length).toBeGreaterThanOrEqual(before.length);
+
+    const runs = await get("/detector-runs?pageSize=25", owner.headers);
+    const items = runs.json().items as Array<{ scope: string; trigger: string; actorId: string | null }>;
+    const scheduled = items.find((r) => r.scope === "project" && r.trigger === "scheduled");
+    expect(scheduled).toBeTruthy();
+    expect(scheduled!.actorId).toBeNull();
+  });
+
+  it("refuses a detector run to the read-only regulator role", async () => {
+    const regulator = await registerActor(app);
+    await app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: regulator.userId,
+      role: "member",
+    });
+    await app.db.insert(assuranceGrants).values({
+      id: newId("ag"),
+      companyId: owner.companyId,
+      projectId: projectA,
+      userId: regulator.userId,
+      role: "regulator",
+      grantedBy: owner.userId,
+    });
+    const headers = headersFor(regulator, owner.companyId);
+    // A regulator reads; it must not be able to write signals, detector_runs
+    // or integrity_scores rows carrying its own actorId.
+    expect((await post(`/projects/${projectA}/detectors/run`, headers, {})).statusCode).toBe(403);
+    expect((await post("/detectors/run", headers, {})).statusCode).toBe(403);
+    expect((await post("/integrity/recompute", headers, {})).statusCode).toBe(403);
+    // …but the read surface its grant confers still works.
+    const read = await get(`/signals?projectId=${projectA}`, headers);
+    expect(read.statusCode).toBe(200);
+  });
+});
+
+/* ================================================================== */
+/* REGRESSION (verifier): the registers the detectors read are usable   */
+/* from a browser client                                                */
+/* ================================================================== */
+
+describe("REGRESSION: register maintenance works over the wire the UI actually uses", () => {
+  it("accepts the mandatory delete reason as a query parameter", async () => {
+    const created = await post("/entities", owner.headers, {
+      kind: "company",
+      name: "Removable Ltd",
+      identifiers: { bank_account: "GB00REMOVE0001" },
+    });
+    expect(created.statusCode).toBe(201);
+    const entityId = created.json().id as string;
+
+    // The web client's `api.del` sends no body, so a body-only reason made the
+    // mandatory justification impossible to supply from the UI.
+    const noReason = await del(`/entities/${entityId}`, owner.headers);
+    expect(noReason.statusCode).toBe(400);
+
+    const res = await del(
+      `/entities/${entityId}?reason=${encodeURIComponent("duplicate of ENT-1")}`,
+      owner.headers,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.json().soft).toBe(true);
+
+    const hidden = await get("/entities?pageSize=200", owner.headers);
+    expect(
+      (hidden.json().items as Array<{ id: string }>).some((e) => e.id === entityId),
+    ).toBe(false);
+    const shown = await get("/entities?pageSize=200&includeDeleted=true", owner.headers);
+    const row = (shown.json().items as Array<{ id: string; deleteReason: string | null }>).find(
+      (e) => e.id === entityId,
+    );
+    expect(row).toBeTruthy();
+    expect(row!.deleteReason).toBe("duplicate of ENT-1");
+
+    const restored = await post(`/entities/${entityId}/restore`, owner.headers, {});
+    expect(restored.statusCode).toBe(200);
+    expect(restored.json().deletedAt).toBeNull();
+  });
+
+  it("serves the conflict and authority registers the two detectors depend on", async () => {
+    const entity = await post("/entities", owner.headers, {
+      kind: "company",
+      name: "Declared Interest Ltd",
+      identifiers: {},
+    });
+    expect(entity.statusCode).toBe(201);
+
+    const declared = await post("/conflict-declarations", owner.headers, {
+      entityId: entity.json().id,
+      nature: "Director",
+    });
+    expect(declared.statusCode).toBe(201);
+    const declarations = await get("/conflict-declarations?pageSize=50", owner.headers);
+    expect(
+      (declarations.json().items as Array<{ id: string }>).some(
+        (d) => d.id === declared.json().id,
+      ),
+    ).toBe(true);
+
+    const ended = await del(`/conflict-declarations/${declared.json().id}`, owner.headers);
+    expect(ended.statusCode).toBe(200);
+    expect(ended.json().endedAt).toBeTruthy();
+
+    const limit = await post("/authority-limits", owner.headers, {
+      userId: member.userId,
+      maxAmount: 25_000,
+      currency: "USD",
+      objectType: "invoice",
+    });
+    expect(limit.statusCode).toBe(201);
+    const limits = await get("/authority-limits?pageSize=50", owner.headers);
+    expect(
+      (limits.json().items as Array<{ id: string }>).some((l) => l.id === limit.json().id),
+    ).toBe(true);
+    expect((await get("/authority-limits", memberHeaders)).statusCode).toBe(403);
+    expect((await del(`/authority-limits/${limit.json().id}`, owner.headers)).statusCode).toBe(200);
   });
 });

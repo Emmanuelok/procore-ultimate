@@ -15,6 +15,28 @@ export interface ListResponse<T> {
   pageSize: number;
 }
 
+export interface SensitivityCell {
+  variable: "capex" | "benefits" | "costs" | "discountRate";
+  changePercent: number;
+  npv: number;
+  bcr: number | null;
+}
+
+export interface SwitchingValue {
+  variable: "capex" | "benefits" | "costs" | "discountRate";
+  /** null when nothing within ±1000% flips the NPV — stated, never invented */
+  changePercent: number | null;
+  switchesAt: number | null;
+  note: string;
+}
+
+export interface SensitivityAnalysis {
+  grid: SensitivityCell[];
+  switching: SwitchingValue[];
+  tornado: { variable: string; low: number; high: number; swing: number }[];
+  basis: string;
+}
+
 export interface OptionComputed {
   capexAdjusted: number;
   pvBenefits: number;
@@ -22,6 +44,64 @@ export interface OptionComputed {
   npv: number;
   bcr: number | null;
   paybackYear: number | null;
+  /** economic IRR; null when the net series never changes sign (#400) */
+  eirr: number | null;
+  sensitivity: SensitivityAnalysis;
+}
+
+/** The inside (published table) view of the optimism-bias uplift (#402-403). */
+export interface UpliftPosition {
+  category: string;
+  upperPercent: number;
+  lowerPercent: number;
+  position: number;
+  upliftPercent: number;
+  basis: string;
+}
+
+/** The outside (empirical reference class) view (#403-404). */
+export interface ReferenceClassForecast {
+  basis: "cost" | "duration";
+  category: string;
+  sampleSize: number;
+  ratios: number[];
+  p50UpliftPercent: number | null;
+  p80UpliftPercent: number | null;
+  p90UpliftPercent: number | null;
+  meanUpliftPercent: number | null;
+  thin: boolean;
+  basisNote: string;
+  unavailableReason: string | null;
+}
+
+export interface ReferenceClassPosition {
+  category: string;
+  position: number;
+  upperPercent: number;
+  lowerPercent: number;
+  mitigations: string[];
+  appliedPercent: number;
+  view: "inside" | "outside";
+  outsideConfidence: string;
+  inside: UpliftPosition;
+  outside: ReferenceClassForecast;
+  setAt: string;
+  setBy: string;
+}
+
+export interface UpliftChallenge {
+  id: string;
+  businessCaseId: string;
+  category: string;
+  tablePercent: number;
+  proposedPercent: number;
+  justification: string;
+  status: string;
+  decidedBy: string | null;
+  decidedAt: string | null;
+  decisionNote: string | null;
+  createdBy: string;
+  createdAt: string;
 }
 
 export interface BcOption {
@@ -49,6 +129,11 @@ export interface BusinessCaseRow {
   appraisal: AppraisalConfig;
   options: BcOption[];
   preferredOptionId: string | null;
+  referenceClass: ReferenceClassPosition | null;
+  logicModel: {
+    nodes: Array<{ id: string; level: string; label: string; note?: string | null; benefitId?: string | null }>;
+    edges: Array<{ from: string; to: string }>;
+  } | null;
   approvedBy: string | null;
   approvedAt: string | null;
   createdBy: string;
@@ -62,10 +147,30 @@ export interface GateCriterion {
   evidenceRequired: boolean;
 }
 
+/** The frozen pack a gate decision was made on (#411). */
+export interface GateEvidencePack {
+  root: string;
+  builtAt: string;
+  itemCount: number;
+  items: Array<{
+    criterionId: string;
+    criterionText: string;
+    kind: "evidence" | "file";
+    id: string;
+    sha256: string;
+    title: string;
+  }>;
+  unevidencedCriteria: { criterionId: string; text: string }[];
+  statement: string;
+}
+
 export interface GateFinding {
   criterionId: string;
   met: boolean;
   note?: string;
+  /** artefacts the reviewer cited — required where evidenceRequired (#410) */
+  evidenceIds?: string[];
+  fileIds?: string[];
 }
 
 export interface GateCondition {
@@ -88,6 +193,9 @@ export interface GateReview {
   narrative: string | null;
   findings: GateFinding[];
   conditions: GateCondition[];
+  /** Merkle root of the evidence pack frozen at review time (#411) */
+  evidencePackRoot: string | null;
+  evidencePack: GateEvidencePack | null;
   reviewedBy: string;
   createdAt: string;
 }

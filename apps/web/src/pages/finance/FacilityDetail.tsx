@@ -4,10 +4,18 @@
  * the lender conditionality gate (#732-734), statement of expenditure
  * download (#735, #769), category utilisation (#739), undisbursed balance
  * and closing-date monitoring (#740-741), and covenant compliance with the
- * readings chart (#742-743).
+ * readings chart (#742-743), plus the lender-discipline layer: the
+ * draw-stop verdict (#747), eligibility classification and independent
+ * certification of each application (#736-738), the drawdown forecast
+ * (#745-746), ineligible-expenditure recoveries (#744) and the cost of
+ * finance (#748-751).
  */
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { COVENANT_OPERATORS, FACILITY_CONDITION_KINDS } from "@constructos/shared";
+import {
+  COVENANT_FORMULAS,
+  COVENANT_OPERATORS,
+  FACILITY_CONDITION_KINDS,
+} from "@constructos/shared";
 import { api, ApiClientError, fetchBlobUrl } from "../../lib/api";
 import {
   Badge,
@@ -29,6 +37,15 @@ import {
 import { formatDate, formatDateTime, humanize } from "../format";
 import CovenantChart from "./CovenantChart";
 import EvidencePicker from "./EvidencePicker";
+import { CashflowsPanel, WaiveCovenantForm } from "./CovenantOps";
+import {
+  CertifyForm,
+  CostOfFinancePanel,
+  DrawStopBanner,
+  EligibilityForm,
+  ForecastPanel,
+  RecoveriesPanel,
+} from "./LenderDiscipline";
 import {
   ClosingCountdown,
   conditionTone,
@@ -45,12 +62,36 @@ import {
   type CovenantReadingRow,
   type CovenantRow,
   type DisbursementRow,
+  type DrawStop,
   type FacilityDetailData,
   type OpenConditionLite,
 } from "./financeShared";
 
 function todayIso(): string {
   return new Date().toISOString().slice(0, 10);
+}
+
+/**
+ * One line naming how many attached items are classified and how many are
+ * not. "Unassessed" is stated rather than counted as eligible — that is the
+ * whole point of the classification (#736-737).
+ */
+function eligibilitySummary(d: DisbursementRow): string {
+  const entries = d.evidenceEligibility ?? [];
+  const byId = new Map(entries.map((e) => [e.evidenceId, e.eligibility]));
+  let eligible = 0;
+  let ineligible = 0;
+  let unassessed = 0;
+  for (const id of d.evidenceIds) {
+    const value = byId.get(id) ?? "unassessed";
+    if (value === "eligible") eligible += 1;
+    else if (value === "ineligible") ineligible += 1;
+    else unassessed += 1;
+  }
+  const parts = [`${eligible} eligible`];
+  if (ineligible > 0) parts.push(`${ineligible} INELIGIBLE`);
+  if (unassessed > 0) parts.push(`${unassessed} unassessed`);
+  return `${d.evidenceIds.length} item${d.evidenceIds.length === 1 ? "" : "s"} — ${parts.join(", ")}`;
 }
 
 export default function FacilityDetail({
@@ -67,6 +108,7 @@ export default function FacilityDetail({
 }) {
   const base = `/api/v1/projects/${projectId}`;
   const [detail, setDetail] = useState<FacilityDetailData | null>(null);
+  const [drawStop, setDrawStop] = useState<DrawStop | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -76,6 +118,12 @@ export default function FacilityDetail({
       setDetail(d);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load the facility");
+    }
+    // the draw-stop verdict fails alone: a facility still renders without it
+    try {
+      setDrawStop(await api.get<DrawStop>(`${base}/facilities/${facilityId}/draw-stop`));
+    } catch {
+      setDrawStop(null);
     }
   }, [base, facilityId]);
 
@@ -332,6 +380,11 @@ export default function FacilityDetail({
     }
   }
 
+  /* ------------- eligibility (#736-737) and certification (#738) -------------- */
+
+  const [eligibilityFor, setEligibilityFor] = useState<DisbursementRow | null>(null);
+  const [certifyFor, setCertifyFor] = useState<DisbursementRow | null>(null);
+
   /* ---------------------------- covenants (#742-743) --------------------------- */
 
   const [covOpen, setCovOpen] = useState(false);
@@ -342,6 +395,7 @@ export default function FacilityDetail({
   const [vOperator, setVOperator] = useState<string>("gte");
   const [vThreshold, setVThreshold] = useState("");
   const [vUnit, setVUnit] = useState("");
+  const [vFormula, setVFormula] = useState<string>("custom");
 
   function openCovModal() {
     setCovError(null);
@@ -350,6 +404,7 @@ export default function FacilityDetail({
     setVOperator("gte");
     setVThreshold("");
     setVUnit("");
+    setVFormula("custom");
     setCovOpen(true);
   }
 
@@ -365,6 +420,7 @@ export default function FacilityDetail({
       };
       if (vDescription.trim()) payload["description"] = vDescription.trim();
       if (vUnit.trim()) payload["unit"] = vUnit.trim();
+      payload["formula"] = vFormula;
       await api.post(`${base}/facilities/${facilityId}/covenants`, payload);
       setCovOpen(false);
       await reload();
@@ -560,6 +616,9 @@ export default function FacilityDetail({
 
       <ErrorAlert message={error} />
 
+      {/* ------------------------- draw-stop verdict (#747) ------------------------- */}
+      <DrawStopBanner drawStop={drawStop} />
+
       {/* ---------------------- conditions checklist (#730-731) --------------------- */}
       <div className="mb-5 grid grid-cols-1 gap-4 lg:grid-cols-2">
         {conditionSection(
@@ -672,6 +731,11 @@ export default function FacilityDetail({
                         Rejected: {d.rejectionReason}
                       </span>
                     ) : null}
+                    {d.evidenceIds.length > 0 ? (
+                      <span className="mt-0.5 block text-[11px] text-ink-500">
+                        {eligibilitySummary(d)}
+                      </span>
+                    ) : null}
                   </Td>
                   <Td>
                     <Badge tone={disbursementTone(d.status)}>{humanize(d.status)}</Badge>
@@ -679,6 +743,11 @@ export default function FacilityDetail({
                   <Td className="whitespace-nowrap text-[11px] leading-4 text-ink-500">
                     {d.submittedAt ? <div>sub {formatDateTime(d.submittedAt)}</div> : null}
                     {d.approvedAt ? <div>app {formatDateTime(d.approvedAt)}</div> : null}
+                    {d.certifiedAt ? (
+                      <div className="font-medium text-violet-700">
+                        cert {formatDateTime(d.certifiedAt)}
+                      </div>
+                    ) : null}
                     {d.disbursedAt ? (
                       <div className="font-medium text-emerald-700">
                         paid {formatDateTime(d.disbursedAt)}
@@ -690,6 +759,16 @@ export default function FacilityDetail({
                   </Td>
                   <Td className="text-right">
                     <div className="flex justify-end gap-1.5">
+                      {d.status === "draft" || d.status === "rejected" ? (
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          title="Classify each attached item as eligible or ineligible (#736-737)"
+                          onClick={() => setEligibilityFor(d)}
+                        >
+                          Eligibility
+                        </Button>
+                      ) : null}
                       {d.status === "draft" ? (
                         <Button
                           size="sm"
@@ -710,10 +789,25 @@ export default function FacilityDetail({
                           Approve
                         </Button>
                       ) : null}
+                      {d.status === "approved" && !d.certifiedAt ? (
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          title="Independent engineer / LTA certification (#738)"
+                          onClick={() => setCertifyFor(d)}
+                        >
+                          Certify
+                        </Button>
+                      ) : null}
                       {d.status === "approved" ? (
                         <Button
                           size="sm"
-                          disabled={busyId === d.id}
+                          disabled={busyId === d.id || drawStop?.stopped === true}
+                          title={
+                            drawStop?.stopped
+                              ? "A draw-stop is in force — see the banner above"
+                              : "Pays the request; the payer may not be the requester, submitter or approver"
+                          }
                           onClick={() => void runAction(d, "disburse")}
                         >
                           Disburse
@@ -754,26 +848,34 @@ export default function FacilityDetail({
             </h3>
             <div className="space-y-3">
               {detail.categories.map((c) => {
-                const frac = c.limit > 0 ? Math.min(1, Math.max(0, c.disbursed / c.limit)) : 0;
-                const exhausted = c.remaining <= 0;
+                const paidFrac = c.limit > 0 ? Math.min(1, Math.max(0, c.disbursed / c.limit)) : 0;
+                const pipelineOnly = Math.max(0, c.pipeline - c.disbursed);
+                const pipelineFrac =
+                  c.limit > 0 ? Math.min(1 - paidFrac, Math.max(0, pipelineOnly / c.limit)) : 0;
+                const exhausted = c.available <= 0;
                 return (
                   <div key={c.id}>
                     <div className="mb-1 flex flex-wrap items-baseline justify-between gap-2 text-xs">
                       <span className="font-medium text-ink-800">{c.name}</span>
                       <span className="tabular-nums text-ink-500">
-                        {fmtMoney(c.disbursed, currency)} of {fmtMoney(c.limit, currency)} ·{" "}
+                        {fmtMoney(c.disbursed, currency)} paid + {fmtMoney(pipelineOnly, currency)} in
+                        flight of {fmtMoney(c.limit, currency)} ·{" "}
                         <span className={exhausted ? "font-semibold text-red-700" : "text-ink-600"}>
-                          {fmtMoney(c.remaining, currency)} remaining
+                          {fmtMoney(c.available, currency)} available to request
                         </span>
                       </span>
                     </div>
                     <div
-                      className="h-2.5 w-full overflow-hidden rounded-full bg-ink-100"
-                      title={`${c.name}: ${Math.round(frac * 100)}% of the ${fmtMoney(c.limit, currency)} allocation disbursed`}
+                      className="flex h-2.5 w-full overflow-hidden rounded-full bg-ink-100"
+                      title={`${c.name}: ${fmtMoney(c.disbursed, currency)} disbursed and ${fmtMoney(pipelineOnly, currency)} submitted or approved against a ${fmtMoney(c.limit, currency)} allocation. The submit gate counts both.`}
                     >
                       <div
-                        className={`h-full rounded-full ${exhausted ? "bg-red-600" : "bg-brand-600"}`}
-                        style={{ width: `${frac * 100}%` }}
+                        className={`h-full ${exhausted ? "bg-red-600" : "bg-brand-600"}`}
+                        style={{ width: `${paidFrac * 100}%` }}
+                      />
+                      <div
+                        className="h-full bg-brand-300"
+                        style={{ width: `${pipelineFrac * 100}%` }}
                       />
                     </div>
                   </div>
@@ -784,7 +886,13 @@ export default function FacilityDetail({
         </Card>
       ) : null}
 
+      {/* ------------------ lender discipline (#744-751) ---------------------------- */}
+      <ForecastPanel base={base} facilityId={facilityId} currency={currency} />
+      <RecoveriesPanel base={base} facilityId={facilityId} currency={currency} />
+      <CostOfFinancePanel base={base} facilityId={facilityId} />
+
       {/* ---------------------------- covenants (#742-743) --------------------------- */}
+      <CashflowsPanel base={base} facilityId={facilityId} onChanged={() => void reload()} />
       <div className="mb-2 flex items-center justify-between">
         <h3 className="text-sm font-semibold text-ink-900">Covenants</h3>
         <Button variant="secondary" size="sm" onClick={openCovModal}>
@@ -948,12 +1056,16 @@ export default function FacilityDetail({
                 onChange={(e) => setRAmount(e.target.value)}
               />
             </Field>
-            <Field label="Category" hint="Optional — draws against the category's allocation limit.">
+            <Field
+              label="Category"
+              hint="Optional — 'available' is the limit less everything already submitted, approved or paid, which is exactly what the submit gate enforces."
+            >
               <Select value={rCategoryId} onChange={(e) => setRCategoryId(e.target.value)}>
                 <option value="">Uncategorised</option>
                 {detail.categories.map((c) => (
                   <option key={c.id} value={c.id}>
-                    {c.name} — {fmtNum(c.remaining)} remaining
+                    {c.name} — {fmtNum(c.available)} available
+                    {c.available === c.remaining ? "" : ` (${fmtNum(c.remaining)} unpaid of limit)`}
                   </option>
                 ))}
               </Select>
@@ -1045,6 +1157,18 @@ export default function FacilityDetail({
               <Input value={vUnit} onChange={(e) => setVUnit(e.target.value)} />
             </Field>
           </div>
+          <Field
+            label="Formula"
+            hint="A named ratio is computed from the period cashflow inputs; custom keeps manual readings (#743)."
+          >
+            <Select value={vFormula} onChange={(e) => setVFormula(e.target.value)}>
+              {COVENANT_FORMULAS.map((f) => (
+                <option key={f} value={f}>
+                  {humanize(f)}
+                </option>
+              ))}
+            </Select>
+          </Field>
           <Field label="Description">
             <Textarea
               value={vDescription}
@@ -1062,6 +1186,50 @@ export default function FacilityDetail({
             </Button>
           </div>
         </form>
+      </Modal>
+
+      <Modal
+        open={eligibilityFor !== null}
+        title={
+          eligibilityFor
+            ? `Eligibility classification — ${drLabel(eligibilityFor.number)}`
+            : "Eligibility classification"
+        }
+        onClose={() => setEligibilityFor(null)}
+        wide
+      >
+        {eligibilityFor ? (
+          <EligibilityForm
+            base={base}
+            disbursementId={eligibilityFor.id}
+            evidenceIds={eligibilityFor.evidenceIds}
+            existing={eligibilityFor.evidenceEligibility ?? []}
+            currency={currency}
+            onCancel={() => setEligibilityFor(null)}
+            onSaved={() => {
+              setEligibilityFor(null);
+              void reload();
+            }}
+          />
+        ) : null}
+      </Modal>
+
+      <Modal
+        open={certifyFor !== null}
+        title={certifyFor ? `Certify ${drLabel(certifyFor.number)}` : "Certify application"}
+        onClose={() => setCertifyFor(null)}
+      >
+        {certifyFor ? (
+          <CertifyForm
+            base={base}
+            disbursementId={certifyFor.id}
+            onCancel={() => setCertifyFor(null)}
+            onDone={() => {
+              setCertifyFor(null);
+              void reload();
+            }}
+          />
+        ) : null}
       </Modal>
     </div>
   );
@@ -1102,6 +1270,7 @@ function CovenantCard({
   const [rNote, setRNote] = useState("");
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const [waiveOpen, setWaiveOpen] = useState(false);
 
   async function onAddReading(e: FormEvent) {
     e.preventDefault();
@@ -1140,6 +1309,9 @@ function CovenantCard({
               ) : (
                 <Badge tone="green">✓ compliant</Badge>
               )}
+              {covenant.formula && covenant.formula !== "custom" ? (
+                <Badge tone="violet">{humanize(covenant.formula)} — computed</Badge>
+              ) : null}
             </div>
             <p className="mt-0.5 text-xs text-ink-500">
               Required {opGlyph(covenant.operator)}{" "}
@@ -1213,8 +1385,31 @@ function CovenantCard({
           <Button type="submit" size="sm" disabled={busy} className="mb-0.5">
             {busy ? "Recording…" : "Record reading"}
           </Button>
+          {breach ? (
+            <Button
+              variant="secondary"
+              size="sm"
+              className="mb-0.5"
+              onClick={() => setWaiveOpen(true)}
+              title="Admin — records the lender's waiver, which lifts the draw-stop"
+            >
+              Record waiver
+            </Button>
+          ) : null}
         </form>
         {formError ? <p className="mt-1.5 text-xs text-red-600">{formError}</p> : null}
+
+        <Modal open={waiveOpen} title={`Waive — ${covenant.name}`} onClose={() => setWaiveOpen(false)}>
+          <WaiveCovenantForm
+            base={base}
+            covenantId={covenant.id}
+            onCancel={() => setWaiveOpen(false)}
+            onDone={() => {
+              setWaiveOpen(false);
+              onChanged();
+            }}
+          />
+        </Modal>
       </CardBody>
     </Card>
   );

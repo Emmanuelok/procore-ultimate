@@ -11,11 +11,15 @@ import { TabBar } from "./governanceShared";
 import BusinessCasesTab from "./BusinessCasesTab";
 import StageGatesTab from "./StageGatesTab";
 import BenefitsTab from "./BenefitsTab";
+import RealisationTab from "./RealisationTab";
+import AssuranceActionsTab from "./AssuranceActionsTab";
 
 const TABS = [
   { key: "business-case", label: "Business case" },
   { key: "stage-gates", label: "Stage gates" },
   { key: "benefits", label: "Benefits" },
+  { key: "realisation", label: "Realisation" },
+  { key: "assurance-actions", label: "Assurance actions" },
 ];
 
 export default function GovernancePage() {
@@ -42,6 +46,8 @@ export default function GovernancePage() {
       {tab === "business-case" ? <BusinessCasesTab projectId={projectId} /> : null}
       {tab === "stage-gates" ? <StageGatesTab projectId={projectId} /> : null}
       {tab === "benefits" ? <BenefitsTab projectId={projectId} /> : null}
+      {tab === "realisation" ? <RealisationTab projectId={projectId} /> : null}
+      {tab === "assurance-actions" ? <AssuranceActionsTab projectId={projectId} /> : null}
     </div>
   );
 }

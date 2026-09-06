@@ -675,8 +675,10 @@ function SourceDrawer({
 }) {
   const action = useAction();
   const [editing, setEditing] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
   useEffect(() => {
     setEditing(false);
+    setConfirmingDelete(false);
     action.clear();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [source?.id]);
@@ -690,6 +692,16 @@ function SourceDrawer({
       toast.success("Facility updated");
       setEditing(false);
       onChanged();
+    }
+  }
+
+  async function remove() {
+    if (!source) return;
+    const res = await action.run("delete", () => portfolioApi.deleteSource(source.id));
+    if (res !== null) {
+      toast.success("Facility deleted");
+      onChanged();
+      onClose();
     }
   }
 
@@ -774,7 +786,7 @@ function SourceDrawer({
         ) : null}
         <ReasonList reasons={p.reasons} />
         {isAdmin ? (
-          <div className="flex flex-wrap gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             {["committed", "available", "withdrawn", "closed"]
               .filter((s) => s !== source.status)
               .map((s) => (
@@ -782,6 +794,24 @@ function SourceDrawer({
                   Mark {s}
                 </Button>
               ))}
+            <span className="flex-1" />
+            {confirmingDelete ? (
+              <>
+                <span className="text-2xs text-content-subtle">
+                  Refused once anything is allocated against it — withdraw it instead.
+                </span>
+                <Button size="sm" variant="danger" onClick={() => void remove()} loading={action.busy === "delete"}>
+                  Delete it
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => setConfirmingDelete(false)}>
+                  Keep
+                </Button>
+              </>
+            ) : (
+              <Button size="sm" variant="ghost" onClick={() => setConfirmingDelete(true)}>
+                Delete
+              </Button>
+            )}
           </div>
         ) : null}
       </div>

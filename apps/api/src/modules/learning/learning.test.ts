@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, eq } from "drizzle-orm";
 import {
+  bidOpportunities,
   boqItems,
   boqs,
   companyMemberships,
@@ -1471,6 +1472,283 @@ describe("supplier performance scorecard", () => {
     expect(body).toHaveLength(0);
   });
 });
+
+/* ================================================================== */
+/* Contract clause & procurement route analytics (#987-988)            */
+/* ================================================================== */
+
+describe("clause and procurement route performance", () => {
+  let routeProjectA: string;
+  let routeProjectB: string;
+
+  beforeAll(async () => {
+    routeProjectA = newId("prj");
+    routeProjectB = newId("prj");
+    await app.db.insert(projects).values([
+      {
+        id: routeProjectA,
+        companyId: owner.companyId,
+        name: "Clause analytics A",
+        currency: "GBP",
+      },
+      {
+        id: routeProjectB,
+        companyId: owner.companyId,
+        name: "Clause analytics B",
+        currency: "GBP",
+      },
+    ]);
+    await app.db.insert(contracts).values([
+      {
+        id: newId("con"),
+        companyId: owner.companyId,
+        projectId: routeProjectA,
+        name: "A main works",
+        form: "fidic_red_2017",
+        status: "executed",
+        currency: "GBP",
+        contractSum: 1_000_000,
+        createdBy: owner.userId,
+      },
+      {
+        id: newId("con"),
+        companyId: owner.companyId,
+        projectId: routeProjectB,
+        name: "B main works",
+        form: "fidic_red_2017",
+        status: "executed",
+        currency: "GBP",
+        contractSum: 2_000_000,
+        createdBy: owner.userId,
+      },
+    ]);
+    await app.db.insert(bidOpportunities).values([
+      {
+        id: newId("opp"),
+        companyId: owner.companyId,
+        projectId: routeProjectA,
+        number: 8001,
+        reference: "OPP-8001",
+        title: "Clause analytics A pursuit",
+        procurementRoute: "design_and_build",
+        currency: "GBP",
+        createdBy: owner.userId,
+      },
+      {
+        id: newId("opp"),
+        companyId: owner.companyId,
+        projectId: routeProjectB,
+        number: 8002,
+        reference: "OPP-8002",
+        title: "Clause analytics B pursuit",
+        procurementRoute: "design_and_build",
+        currency: "GBP",
+        createdBy: owner.userId,
+      },
+    ]);
+    await app.db.insert(disputes).values([
+      {
+        id: newId("dsp"),
+        companyId: owner.companyId,
+        projectId: routeProjectA,
+        number: 8001,
+        title: "Clause 20.1 time bar",
+        kind: "adjudication",
+        status: "decided",
+        governingClause: "Sub-Clause 20.1",
+        contractFamily: "FIDIC",
+        outcome: "partly_successful",
+        rootCause: "late_notice",
+        amountClaimed: 100_000,
+        amountAwarded: 40_000,
+        currency: "GBP",
+        resolvedAt: "2026-04-01",
+        createdBy: owner.userId,
+      },
+      {
+        id: newId("dsp"),
+        companyId: owner.companyId,
+        projectId: routeProjectB,
+        number: 8002,
+        title: "Clause 20.1 again",
+        kind: "adjudication",
+        status: "decided",
+        governingClause: "clause 20.1",
+        contractFamily: "FIDIC",
+        outcome: "partly_successful",
+        rootCause: "late_notice",
+        amountClaimed: 100_000,
+        amountAwarded: 60_000,
+        currency: "GBP",
+        resolvedAt: "2026-05-01",
+        createdBy: owner.userId,
+      },
+    ]);
+    await app.db.insert(variations).values([
+      {
+        id: newId("var"),
+        companyId: owner.companyId,
+        projectId: routeProjectA,
+        number: 8001,
+        title: "Instructed change under 13.3",
+        status: "agreed",
+        clauseRef: "13.3",
+        currency: "GBP",
+        agreedValue: 100_000,
+        timeImpactDays: 10,
+        createdBy: owner.userId,
+      },
+      {
+        id: newId("var"),
+        companyId: owner.companyId,
+        projectId: routeProjectB,
+        number: 8002,
+        title: "Instructed change under 13.3",
+        status: "agreed",
+        clauseRef: "Clause 13.3",
+        currency: "GBP",
+        agreedValue: 400_000,
+        timeImpactDays: 20,
+        createdBy: owner.userId,
+      },
+    ]);
+    await app.db.insert(obligations).values([
+      {
+        id: newId("obl"),
+        companyId: owner.companyId,
+        projectId: routeProjectA,
+        sourceClause: "20.1",
+        trigger: "Notice of claim within 28 days",
+        status: "breached",
+        createdBy: owner.userId,
+      },
+      {
+        id: newId("obl"),
+        companyId: owner.companyId,
+        projectId: routeProjectB,
+        sourceClause: "Sub-Clause 20.1",
+        trigger: "Notice of claim within 28 days",
+        status: "discharged",
+        createdBy: owner.userId,
+      },
+    ]);
+  }, 120_000);
+
+  it("collapses the ways a clause is written and measures recovery across projects", async () => {
+    const res = await get("/learning/clause-performance?contractFamily=FIDIC&clause=Clause%2020.1");
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      items: Array<{
+        clause: string;
+        contractFamily: string;
+        disputes: number;
+        projects: number;
+        amountClaimed: Record<string, number>;
+        amountAwarded: Record<string, number>;
+        recoveryRatio: number | null;
+        obligations: number;
+        obligationsBreached: number;
+        breachRate: number | null;
+      }>;
+      sources: string[];
+    };
+    expect(body.items).toHaveLength(1);
+    const row = body.items[0]!;
+    expect(row.clause).toBe("20.1");
+    expect(row.contractFamily).toBe("fidic");
+    expect(row.disputes).toBe(2);
+    expect(row.projects).toBe(2);
+    expect(row.amountClaimed["GBP"]).toBe(200_000);
+    expect(row.amountAwarded["GBP"]).toBe(100_000);
+    expect(row.recoveryRatio).toBe(0.5);
+    // the obligations materialised from the same clause, both spellings
+    expect(row.obligations).toBe(2);
+    expect(row.obligationsBreached).toBe(1);
+    expect(row.breachRate).toBe(0.5);
+    expect(body.sources.length).toBeGreaterThan(0);
+  });
+
+  it("reports records that carry no clause reference rather than silently dropping them", async () => {
+    const res = await get("/learning/clause-performance");
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      unattributed: { disputes: number; variations: number; obligations: number };
+      reasons: string[];
+    };
+    // the fixtures at the top of this file carry no clause at all
+    expect(body.unattributed.disputes).toBeGreaterThan(0);
+    expect(body.reasons.join(" ")).toMatch(/carry no clause reference|Frequency is not fault/);
+  });
+
+  it("filters by minimum dispute count", async () => {
+    const res = await get("/learning/clause-performance?minDisputes=2");
+    const items = (res.json() as { items: Array<{ clause: string; disputes: number }> }).items;
+    expect(items.every((i) => i.disputes >= 2)).toBe(true);
+    expect(items.some((i) => i.clause === "20.1")).toBe(true);
+  });
+
+  it("computes the outturn variance per project and never sums across currencies", async () => {
+    const res = await get("/learning/procurement-routes");
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      items: Array<{
+        route: string;
+        projects: number;
+        contractSum: Record<string, number>;
+        outturnVariancePercent: number | null;
+        outturnObservations: number;
+        disputeRate: number | null;
+        reliable: boolean;
+        reasons: string[];
+      }>;
+    };
+    const dnb = body.items.find((r) => r.route === "design_and_build")!;
+    expect(dnb).toBeDefined();
+    expect(dnb.projects).toBe(2);
+    expect(dnb.contractSum["GBP"]).toBe(3_000_000);
+    // A: 100k/1m = 10%, B: 400k/2m = 20% → mean 15%
+    expect(dnb.outturnVariancePercent).toBe(15);
+    expect(dnb.outturnObservations).toBe(2);
+    expect(dnb.disputeRate).toBe(1);
+    expect(dnb.reliable).toBe(false);
+    expect(dnb.reasons.join(" ")).toMatch(/below the/);
+  });
+
+  it("keeps projects with no recorded route visible instead of inventing one", async () => {
+    const res = await get("/learning/procurement-routes");
+    const body = res.json() as { items: Array<{ route: string; reasons: string[] }> };
+    const unrecorded = body.items.find((r) => r.route === "unrecorded");
+    expect(unrecorded).toBeDefined();
+    expect(unrecorded!.reasons.join(" ")).toMatch(/No procurement route is recorded/);
+  });
+
+  it("refuses both reports to a guest who holds learning nowhere", async () => {
+    const nobody = await registerActor(app);
+    await app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: nobody.userId,
+      role: "guest",
+    });
+    const headers = {
+      authorization: nobody.headers["authorization"]!,
+      "x-company-id": owner.companyId,
+    };
+    expect((await get("/learning/clause-performance", headers)).statusCode).toBe(403);
+    expect((await get("/learning/procurement-routes", headers)).statusCode).toBe(403);
+  });
+
+  it("shows another tenant nothing of this company's clause history", async () => {
+    const clause = await get("/learning/clause-performance", outsider.headers);
+    const routes = await get("/learning/procurement-routes", outsider.headers);
+    const clauseItems =
+      clause.statusCode === 200 ? (clause.json().items as unknown[]) : [];
+    const routeItems = routes.statusCode === 200 ? (routes.json().items as unknown[]) : [];
+    expect(clauseItems).toHaveLength(0);
+    expect(routeItems).toHaveLength(0);
+  });
+});
+
 
 /* ================================================================== */
 /* Audit bug regressions                                               */

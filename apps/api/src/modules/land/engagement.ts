@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import { and, asc, count, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import { engagements, stakeholders } from "@constructos/db";
 import { CONSENT_STATUSES } from "@constructos/shared";
@@ -15,6 +15,9 @@ import {
   quadrantFor,
 } from "./reference.js";
 import { validateFiles } from "./shared.js";
+
+/** How many engagements a stakeholder drawer previews before the register. */
+const STAKEHOLDER_ENGAGEMENT_PREVIEW = 50;
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -74,6 +77,19 @@ const engagementListQuery = pageQuerySchema.extend({
 export async function registerEngagementRoutes(app: FastifyInstance): Promise<void> {
   const readGate = [app.authenticate, app.requireCompany, app.requireTool("land", "read")];
   const standardGate = [app.authenticate, app.requireCompany, app.requireTool("land", "standard")];
+
+  /**
+   * `stakeholder_ids` is a JSONB array; `@>` asks Postgres whether it
+   * CONTAINS the id, which the GIN index on the column answers directly.
+   * Every use below used to pull rows into memory and test with
+   * `Array.includes` — the register list capped that scan at 1000 rows, so on
+   * a long-running scheme an older engagement silently vanished from a
+   * stakeholder's consultation history and `total` under-reported it. A
+   * consultation record that quietly loses entries is not a record.
+   */
+  const mentions = (stakeholderId: string) =>
+    sql`${engagements.stakeholderIds} @> ${JSON.stringify([stakeholderId])}::jsonb`;
+
 
   async function fetchStakeholder(id: string, companyId: string, projectId: string) {
     const rows = await app.db
@@ -257,19 +273,34 @@ export async function registerEngagementRoutes(app: FastifyInstance): Promise<vo
     async (req) => {
       const { stakeholderId } = req.params as { stakeholderId: string };
       const s = await fetchStakeholder(stakeholderId, req.companyId!, req.projectId!);
-      const all = await app.db
+      const [countRow] = await app.db
+        .select({ n: count() })
+        .from(engagements)
+        .where(
+          and(
+            eq(engagements.companyId, req.companyId!),
+            eq(engagements.projectId, req.projectId!),
+            mentions(stakeholderId),
+          ),
+        );
+      const recent = await app.db
         .select()
         .from(engagements)
         .where(
           and(
             eq(engagements.companyId, req.companyId!),
             eq(engagements.projectId, req.projectId!),
+            mentions(stakeholderId),
           ),
         )
-        .orderBy(desc(engagements.engagementDate));
+        .orderBy(desc(engagements.engagementDate))
+        .limit(STAKEHOLDER_ENGAGEMENT_PREVIEW);
       return {
         ...decorateStakeholder(s),
-        engagements: all.filter((e) => e.stakeholderIds.includes(stakeholderId)),
+        engagements: recent,
+        engagementCount: Number(countRow?.n ?? 0),
+        // the drawer shows the most recent; the register is the full history
+        engagementsTruncated: Number(countRow?.n ?? 0) > recent.length,
       };
     },
   );
@@ -314,16 +345,17 @@ export async function registerEngagementRoutes(app: FastifyInstance): Promise<vo
     async (req, reply) => {
       const { stakeholderId } = req.params as { stakeholderId: string };
       const s = await fetchStakeholder(stakeholderId, req.companyId!, req.projectId!);
-      const all = await app.db
-        .select({ id: engagements.id, stakeholderIds: engagements.stakeholderIds })
+      const [usedRow] = await app.db
+        .select({ n: count() })
         .from(engagements)
         .where(
           and(
             eq(engagements.companyId, req.companyId!),
             eq(engagements.projectId, req.projectId!),
+            mentions(stakeholderId),
           ),
         );
-      if (all.some((e) => e.stakeholderIds.includes(stakeholderId))) {
+      if (Number(usedRow?.n ?? 0) > 0) {
         throw conflict(
           "A stakeholder recorded on an engagement cannot be deleted — the consultation " +
             "record must keep pointing at a real party",
@@ -397,21 +429,18 @@ export async function registerEngagementRoutes(app: FastifyInstance): Promise<vo
     ];
     if (q.kind) clauses.push(eq(engagements.kind, q.kind));
     if (q.consentStatus) clauses.push(eq(engagements.consentStatus, q.consentStatus));
+    // filtered IN SQL, so pagination and the total are both honest
+    if (q.stakeholderId) clauses.push(mentions(q.stakeholderId));
     const where = and(...clauses);
     const [totalRow] = await app.db.select({ n: count() }).from(engagements).where(where);
-    let rows = await app.db
+    const rows = await app.db
       .select()
       .from(engagements)
       .where(where)
       .orderBy(desc(engagements.engagementDate), desc(engagements.createdAt))
-      .limit(q.stakeholderId ? 1000 : q.pageSize)
-      .offset(q.stakeholderId ? 0 : pageOffset(q));
-    let total = Number(totalRow?.n ?? 0);
-    if (q.stakeholderId) {
-      const filtered = rows.filter((e) => e.stakeholderIds.includes(q.stakeholderId!));
-      total = filtered.length;
-      rows = filtered.slice(pageOffset(q), pageOffset(q) + q.pageSize);
-    }
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    const total = Number(totalRow?.n ?? 0);
     const stakeholderIds = [...new Set(rows.flatMap((e) => e.stakeholderIds))];
     const named = stakeholderIds.length
       ? await app.db

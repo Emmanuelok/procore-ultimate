@@ -1545,3 +1545,405 @@ describe("governance report visibility", () => {
     expect(ok.statusCode).toBe(200);
   });
 });
+
+/* ================================================================== */
+/* An agent action's before/after image is record content, not metadata */
+/* ================================================================== */
+
+describe("agent action visibility", () => {
+  it("the list carries no before/after image; the detail is gated by the owning tool", async () => {
+    // photos:none for the narrow member — the same denial the photo-intel
+    // route now refuses. Reading the tag write back must be refused too,
+    // otherwise the image is the leak the route was closed against.
+    await built.app.db
+      .update(projectMemberships)
+      .set({
+        overrides: {
+          ai: "standard",
+          assurance: "read",
+          budget: "none",
+          bidding: "none",
+          safety: "none",
+          photos: "none",
+        },
+      })
+      .where(
+        and(
+          eq(projectMemberships.projectId, projectId),
+          eq(projectMemberships.userId, narrow.userId),
+        ),
+      );
+
+    setResponse({
+      tags: ["formwork"],
+      progressSummary: "Formwork struck.",
+      safetySignals: [],
+      confidence: 0.6,
+    });
+    const ran = await built.app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/ai/photo-intel`,
+      headers: owner.headers,
+      payload: { photoId: ids.photo },
+    });
+    expect(ran.statusCode).toBe(200);
+    const actionId = (ran.json() as { actionId: string }).actionId;
+
+    const list = await built.app.inject({
+      method: "GET",
+      url: "/api/v1/agents/actions?pageSize=100",
+      headers: owner.headers,
+    });
+    expect(list.statusCode).toBe(200);
+    const listed = (list.json() as { items: Array<Record<string, unknown>> }).items.find(
+      (r) => r["id"] === actionId,
+    );
+    expect(listed).toBeTruthy();
+    expect(listed).not.toHaveProperty("beforeImage");
+    expect(listed).not.toHaveProperty("afterImage");
+    expect(listed!["hasBeforeImage"]).toBe(true);
+
+    const detail = await built.app.inject({
+      method: "GET",
+      url: `/api/v1/agents/actions/${actionId}`,
+      headers: owner.headers,
+    });
+    expect(detail.statusCode).toBe(200);
+    expect(
+      (detail.json() as { action: { beforeImage: { aiTags: string[] } } }).action.beforeImage
+        .aiTags,
+    ).toEqual(["existing-tag"]);
+
+    const denied = await built.app.inject({
+      method: "GET",
+      url: `/api/v1/agents/actions/${actionId}`,
+      headers: narrowHeaders,
+    });
+    expect(denied.statusCode).toBe(403);
+
+    // …and the same member cannot reverse it either.
+    const rollback = await built.app.inject({
+      method: "POST",
+      url: `/api/v1/agents/actions/${actionId}/rollback`,
+      headers: narrowHeaders,
+      payload: { reason: "not mine to undo" },
+    });
+    expect(rollback.statusCode).toBe(403);
+
+    // Restore the photo so later assertions see the seeded values.
+    const undo = await built.app.inject({
+      method: "POST",
+      url: `/api/v1/agents/actions/${actionId}/rollback`,
+      headers: owner.headers,
+      payload: { reason: "test cleanup" },
+    });
+    expect(undo.statusCode).toBe(200);
+  });
+
+  it("a company-wide action is an owner/admin surface, in the list and in the detail", async () => {
+    const companyActionId = newId("aac");
+    await built.app.db.insert(agentActions).values({
+      id: companyActionId,
+      companyId: owner.companyId,
+      projectId: null,
+      agentKind: "integrity_monitor",
+      runId: null,
+      reviewId: null,
+      actionType: "append_signal_explanation",
+      targetType: "signal_explanation",
+      targetId: null,
+      beforeImage: { explanation: "every project's reconciliations" },
+      afterImage: { explanation: "the memo the company-wide run produced" },
+      status: "applied",
+      reversible: 1,
+      authorisation: "human",
+      summary: "Company-wide integrity memo",
+    });
+
+    const mine = await built.app.inject({
+      method: "GET",
+      url: "/api/v1/agents/actions?pageSize=100",
+      headers: narrowHeaders,
+    });
+    expect(mine.statusCode).toBe(200);
+    expect(
+      (mine.json() as { items: Array<{ id: string }> }).items.map((r) => r.id),
+    ).not.toContain(companyActionId);
+
+    const denied = await built.app.inject({
+      method: "GET",
+      url: `/api/v1/agents/actions/${companyActionId}`,
+      headers: narrowHeaders,
+    });
+    expect(denied.statusCode).toBe(403);
+
+    const ok = await built.app.inject({
+      method: "GET",
+      url: `/api/v1/agents/actions/${companyActionId}`,
+      headers: owner.headers,
+    });
+    expect(ok.statusCode).toBe(200);
+  });
+});
+
+/* ================================================================== */
+/* Company-scoped runs and proposals are not listed to the tenant      */
+/* ================================================================== */
+
+describe("company-scoped rows are listed only to those who may open them", () => {
+  it("a company-wide run someone else asked for is neither listed nor readable", async () => {
+    const runId = newId("air");
+    await built.app.db.insert(aiRuns).values({
+      id: runId,
+      companyId: owner.companyId,
+      projectId: null,
+      agentKind: "integrity_monitor",
+      model: "claude-opus-5",
+      requestedBy: owner.userId,
+      inputRefs: [],
+      prompt: "signals and reconciliations gathered from EVERY project",
+      output: "{}",
+      citations: [],
+      status: "succeeded",
+    });
+
+    const theirs = await built.app.inject({
+      method: "GET",
+      url: "/api/v1/ai/runs?pageSize=200",
+      headers: narrowHeaders,
+    });
+    expect(theirs.statusCode).toBe(200);
+    expect(
+      (theirs.json() as { items: Array<{ id: string }> }).items.map((r) => r.id),
+    ).not.toContain(runId);
+
+    const detail = await built.app.inject({
+      method: "GET",
+      url: `/api/v1/ai/runs/${runId}`,
+      headers: narrowHeaders,
+    });
+    expect(detail.statusCode).toBe(403);
+
+    const ownerList = await built.app.inject({
+      method: "GET",
+      url: "/api/v1/ai/runs?pageSize=200",
+      headers: owner.headers,
+    });
+    expect(
+      (ownerList.json() as { items: Array<{ id: string }> }).items.map((r) => r.id),
+    ).toContain(runId);
+  });
+
+  it("a company-wide proposal is not listed to a plain member", async () => {
+    const runId = newId("air");
+    await built.app.db.insert(aiRuns).values({
+      id: runId,
+      companyId: owner.companyId,
+      projectId: null,
+      agentKind: "integrity_monitor",
+      model: "claude-opus-5",
+      requestedBy: owner.userId,
+      inputRefs: [],
+      status: "succeeded",
+    });
+    const reviewId = newId("arq");
+    await built.app.db.insert(aiReviewQueue).values({
+      id: reviewId,
+      companyId: owner.companyId,
+      projectId: null,
+      runId,
+      targetType: "integrity_memo",
+      targetId: null,
+      proposal: { hypothesis: "Vendor invoices reconcile to nothing" },
+      summary: "Integrity memo across the tenant",
+      confidence: 0.4,
+      status: "pending",
+    });
+
+    const list = await built.app.inject({
+      method: "GET",
+      url: "/api/v1/ai/review?pageSize=200",
+      headers: narrowHeaders,
+    });
+    expect(list.statusCode).toBe(200);
+    expect(
+      (list.json() as { items: Array<{ id: string }> }).items.map((r) => r.id),
+    ).not.toContain(reviewId);
+
+    const detail = await built.app.inject({
+      method: "GET",
+      url: `/api/v1/ai/review/${reviewId}`,
+      headers: narrowHeaders,
+    });
+    expect(detail.statusCode).toBe(403);
+
+    const ownerList = await built.app.inject({
+      method: "GET",
+      url: "/api/v1/ai/review?pageSize=200",
+      headers: owner.headers,
+    });
+    expect(
+      (ownerList.json() as { items: Array<{ id: string }> }).items.map((r) => r.id),
+    ).toContain(reviewId);
+  });
+});
+
+/* ================================================================== */
+/* The legacy single-shot routes are gated by the tools they read too  */
+/* ================================================================== */
+
+/** Replace the narrow member's project overrides for one test. */
+async function setNarrowOverrides(overrides: Record<string, string>): Promise<void> {
+  await built.app.db
+    .update(projectMemberships)
+    .set({ overrides })
+    .where(
+      and(
+        eq(projectMemberships.projectId, projectId),
+        eq(projectMemberships.userId, narrow.userId),
+      ),
+    );
+}
+
+describe("legacy agent routes are gated by the tool that owns what they read", () => {
+  it("sheet naming needs drawings, and the daily-log drafter needs daily logs", async () => {
+    await setNarrowOverrides({ ai: "standard", drawings: "none", daily_logs: "none" });
+    const before = callCount;
+
+    const sheet = await built.app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/ai/sheet-name`,
+      headers: narrowHeaders,
+      payload: { revisionId: "drv_whatever" },
+    });
+    expect(sheet.statusCode).toBe(403);
+
+    const log = await built.app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/ai/daily-log-draft`,
+      headers: narrowHeaders,
+      payload: { date: "2026-07-10" },
+    });
+    expect(log.statusCode).toBe(403);
+    expect(callCount).toBe(before);
+  });
+
+  it("grounded search does not scan a source the caller cannot read, and says so", async () => {
+    await setNarrowOverrides({ ai: "standard", drawings: "none", documents: "none" });
+    setResponse({
+      answer: "The revised layout on S-201 rev C governs.",
+      citations: [CITE("rfi", ids.rfi)],
+      confidence: 0.6,
+    });
+    const res = await built.app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/ai/search`,
+      headers: narrowHeaders,
+      payload: { query: "piling" },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { coverage: string[]; skipped: string[] };
+    expect(body.coverage).toContain("rfi");
+    expect(body.coverage).not.toContain("drawing_sheet");
+    expect(body.coverage).not.toContain("file");
+    expect(body.skipped.join(" ")).toContain("read access to drawings");
+    expect(body.skipped.join(" ")).toContain("read access to documents");
+    // The drawing OCR that the caller may not read never reached the model.
+    expect(promptText()).not.toContain("PILING LAYOUT: pile caps");
+    expect(promptText()).toContain(`type=rfi id=${ids.rfi}`);
+  });
+
+  it("search is refused outright when the caller holds none of its four sources", async () => {
+    await setNarrowOverrides({
+      ai: "standard",
+      drawings: "none",
+      documents: "none",
+      rfis: "none",
+      submittals: "none",
+    });
+    const before = callCount;
+    const res = await built.app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/ai/search`,
+      headers: narrowHeaders,
+      payload: { query: "piling" },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(callCount).toBe(before);
+  });
+
+  it("RFI evaluation runs without the pinned drawing OCR and reports the omission", async () => {
+    const openRfi = newId("rfi");
+    await built.app.db.insert(rfis).values({
+      id: openRfi,
+      companyId: owner.companyId,
+      projectId,
+      number: 89,
+      subject: "Pile cap depth confirmation",
+      question: "Confirm the pile cap depth at grid C4.",
+      status: "open",
+      createdBy: owner.userId,
+    });
+    await setNarrowOverrides({ ai: "standard", rfis: "read", drawings: "none" });
+    setResponse({
+      suggestedResponse: "The pile cap is 900mm deep.",
+      costImpact: "no",
+      scheduleImpact: "no",
+      reasoning: "Stated in the RFI question context.",
+      citations: [CITE("rfi", openRfi)],
+      confidence: 0.55,
+    });
+    const res = await built.app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/ai/rfi-evaluate`,
+      headers: narrowHeaders,
+      payload: { rfiId: openRfi },
+    });
+    expect(res.statusCode).toBe(201);
+    expect((res.json() as { omittedSources: string[] }).omittedSources.join(" ")).toContain(
+      "drawings",
+    );
+    expect(promptText()).toContain("does not have drawing access");
+
+    // …and the run they just made IS readable back to them: the gate is what
+    // the run actually read (one RFI), not the agent's union of sources.
+    const runId = (res.json() as { runId: string }).runId;
+    const detail = await built.app.inject({
+      method: "GET",
+      url: `/api/v1/ai/runs/${runId}`,
+      headers: narrowHeaders,
+    });
+    expect(detail.statusCode).toBe(200);
+  });
+
+  it("submittal review omits the clause text and the attachments the caller cannot read", async () => {
+    await setNarrowOverrides({
+      ai: "standard",
+      submittals: "read",
+      specifications: "none",
+      documents: "none",
+    });
+    setResponse({
+      recommendation: "revise_and_resubmit",
+      findings: [],
+      deviations: [],
+      missingItems: [],
+      reasoning: "The review could not be performed on content.",
+      citations: [],
+      confidence: 0.3,
+    });
+    const res = await built.app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/ai/submittal-review`,
+      headers: narrowHeaders,
+      payload: { submittalId: ids.submittal },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as { contentReviewed: boolean; omittedSources: string[] };
+    expect(body.contentReviewed).toBe(false);
+    expect(body.omittedSources.join(" ")).toContain("specification");
+    const prompt = promptText();
+    expect(prompt).not.toContain("2.1 PILE CAPS");
+    expect(prompt).toContain("does not have specification access");
+  });
+});

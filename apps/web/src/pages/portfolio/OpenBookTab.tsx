@@ -32,12 +32,16 @@ import {
 } from "../../ui";
 import { IconAudit, IconPlus } from "../../ui/icons";
 import {
+  AUDIT_RIGHTS_STATUSES,
   AUDIT_SUBJECT_TYPES,
   Basis,
   DASH,
   DEFINED_COST_COMPONENTS,
   DEFINED_COST_VERDICTS,
   DISALLOWED_CATEGORIES,
+  DISALLOWED_RESOLUTIONS,
+  EditButton,
+  EditForm,
   LoadError,
   ReasonList,
   Row,
@@ -55,9 +59,58 @@ import {
   type DefinedCostItem,
   type DisallowedCost,
   type DisallowedListResponse,
+  type EditFieldSpec,
   type Paginated,
   type Verification,
 } from "./portfolioShared";
+
+const VERIFICATION_FIELDS: readonly EditFieldSpec[] = [
+  { key: "title", label: "Title", type: "text", wide: true },
+  { key: "claimedAmount", label: "Claimed for the period", type: "number", min: 0, step: 0.01 },
+  { key: "plannedAt", label: "Planned", type: "date", nullable: true },
+  { key: "periodStart", label: "Period start", type: "date", nullable: true },
+  { key: "periodEnd", label: "Period end", type: "date", nullable: true },
+  { key: "auditRightsClause", label: "Audit rights clause", type: "text", nullable: true },
+  { key: "verifierName", label: "Verifier", type: "text", nullable: true },
+  {
+    key: "methodology",
+    label: "Methodology",
+    type: "textarea",
+    nullable: true,
+    wide: true,
+    hint: "What was examined and how the sample was drawn.",
+  },
+];
+
+const AUDIT_FIELDS: readonly EditFieldSpec[] = [
+  { key: "subjectName", label: "Subject", type: "text" },
+  {
+    key: "subjectType",
+    label: "Subject type",
+    type: "select",
+    options: AUDIT_SUBJECT_TYPES,
+  },
+  { key: "contractReference", label: "Contract reference", type: "text", nullable: true },
+  { key: "clause", label: "Clause", type: "text", nullable: true },
+  { key: "auditorName", label: "Auditor", type: "text", nullable: true },
+  { key: "noticeDate", label: "Notice date", type: "date" },
+  {
+    key: "noticeDays",
+    label: "Notice days",
+    type: "number",
+    min: 0,
+    nullable: true,
+    hint: "What the clause requires.",
+  },
+  {
+    key: "scheduledDate",
+    label: "Scheduled date",
+    type: "date",
+    nullable: true,
+    hint: "Moving this does not move the obligation already raised against the old date.",
+  },
+  { key: "scope", label: "Scope", type: "textarea", wide: true },
+];
 
 export default function OpenBookTab({ projectId, onChanged }: { projectId: string; onChanged: () => void }) {
   const verifications = useResource<Paginated<Verification>>(
@@ -70,7 +123,9 @@ export default function OpenBookTab({ projectId, onChanged }: { projectId: strin
     `/api/v1/projects/${projectId}/portfolio/audit-rights?page=1&pageSize=100`,
   );
   const [openVerification, setOpenVerification] = useState<string | null>(null);
-  const [creating, setCreating] = useState<null | "verification" | "audit">(null);
+  const [openDisallowed, setOpenDisallowed] = useState<DisallowedCost | null>(null);
+  const [openAudit, setOpenAudit] = useState<AuditRights | null>(null);
+  const [creating, setCreating] = useState<null | "verification" | "audit" | "disallowed">(null);
 
   function reloadAll() {
     verifications.reload();
@@ -291,6 +346,11 @@ export default function OpenBookTab({ projectId, onChanged }: { projectId: strin
         <CardHeader
           title="Disallowed cost register"
           subtitle="A disallowance without a ground is an opinion and will not survive adjudication. The count of those is on this page deliberately."
+          actions={
+            <Button size="sm" variant="ghost" icon={IconPlus} onClick={() => setCreating("disallowed")}>
+              Raise a disallowance
+            </Button>
+          }
         />
         <CardBody flush>
           {summary ? (
@@ -326,13 +386,15 @@ export default function OpenBookTab({ projectId, onChanged }: { projectId: strin
               stickyHeader
               flush
               exportFileName="disallowed-costs"
+              onRowClick={({ row }) => setOpenDisallowed(row)}
               rowTone={(row) =>
                 row.status === "disputed" ? "danger" : row.groundClause ? undefined : "warning"
               }
               empty={{
                 title: "Nothing disallowed",
                 description:
-                  "Disallowances are usually raised from a verification verdict, so that the item, the ground and the amount stay tied together.",
+                  "Disallowances are usually raised from a verification verdict, so that the item, the ground and the amount stay tied together. One raised here stands on its own and still needs its ground.",
+                action: <Button onClick={() => setCreating("disallowed")}>Raise a disallowance</Button>,
               }}
               aria-label="Disallowed costs"
             />
@@ -372,6 +434,7 @@ export default function OpenBookTab({ projectId, onChanged }: { projectId: strin
               stickyHeader
               flush
               toolbar={false}
+              onRowClick={({ row }) => setOpenAudit(row)}
               rowTone={(row) => (row.status === "obstructed" ? "danger" : undefined)}
               empty={{
                 title: "No audit exercised",
@@ -389,6 +452,24 @@ export default function OpenBookTab({ projectId, onChanged }: { projectId: strin
         verificationId={openVerification}
         onClose={() => setOpenVerification(null)}
         onChanged={reloadAll}
+      />
+      <DisallowedDrawer
+        projectId={projectId}
+        row={openDisallowed}
+        onClose={() => setOpenDisallowed(null)}
+        onChanged={() => {
+          setOpenDisallowed(null);
+          reloadAll();
+        }}
+      />
+      <AuditDrawer
+        projectId={projectId}
+        row={openAudit}
+        onClose={() => setOpenAudit(null)}
+        onChanged={() => {
+          setOpenAudit(null);
+          reloadAll();
+        }}
       />
       <CreateDrawer
         projectId={projectId}
@@ -425,11 +506,13 @@ function VerificationDrawer({
   const [itemForm, setItemForm] = useState<Record<string, string>>({ component: "people" });
   const [verdictFor, setVerdictFor] = useState<DefinedCostItem | null>(null);
   const [findings, setFindings] = useState("");
+  const [editing, setEditing] = useState(false);
 
   useEffect(() => {
     setItemForm({ component: "people" });
     setVerdictFor(null);
     setFindings("");
+    setEditing(false);
     action.clear();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [verificationId]);
@@ -541,6 +624,17 @@ function VerificationDrawer({
     }
   }
 
+  async function saveEdit(patch: Record<string, unknown>) {
+    if (!verificationId) return;
+    const res = await action.run("edit", () => api.patchVerification(verificationId, patch));
+    if (res) {
+      toast.success("Verification updated");
+      setEditing(false);
+      detail.reload();
+      onChanged();
+    }
+  }
+
   return (
     <Drawer
       open={verificationId !== null}
@@ -559,6 +653,22 @@ function VerificationDrawer({
             <Alert tone="danger" size="sm">
               {action.error}
             </Alert>
+          ) : null}
+          {v.status !== "closed" ? (
+            <div className="flex justify-end">
+              <EditButton editing={editing} onToggle={() => setEditing((e) => !e)} />
+            </div>
+          ) : null}
+          {editing ? (
+            <EditForm
+              key={v.id}
+              fields={VERIFICATION_FIELDS}
+              initial={v as unknown as Record<string, unknown>}
+              busy={action.busy === "edit"}
+              onSubmit={saveEdit}
+              onCancel={() => setEditing(false)}
+              note="The currency is fixed at creation: a verification measured in one currency cannot be restated in another without re-testing every item."
+            />
           ) : null}
           <dl className="divide-y divide-border">
             <Row label="Claimed for the period">{money(v.claimedAmount, v.currency)}</Row>
@@ -785,6 +895,7 @@ function VerdictDrawer({
   const api = projectApi(projectId);
   const action = useAction();
   const [verdict, setVerdict] = useState("verified");
+  const [confirmingRemove, setConfirmingRemove] = useState(false);
   const [verifiedAmount, setVerifiedAmount] = useState("");
   const [note, setNote] = useState("");
   const [category, setCategory] = useState("not_defined_cost");
@@ -797,11 +908,22 @@ function VerdictDrawer({
     setNote(item?.verifierNote ?? "");
     setClause("");
     setResponseDueAt("");
+    setConfirmingRemove(false);
     action.clear();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [item?.id]);
 
   const raisesDisallowance = verdict === "disallowed" || verdict === "partially_disallowed";
+
+  async function removeItem() {
+    if (!verificationId || !item) return;
+    const res = await action.run("remove", () => api.deleteItem(verificationId, item.id));
+    if (res !== null) {
+      toast.success("Item removed and the header totals recomputed");
+      onChanged();
+      onClose();
+    }
+  }
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -891,6 +1013,35 @@ function VerdictDrawer({
           <Field label="Verifier's note">
             <Textarea rows={3} value={note} onChange={(e) => setNote(e.target.value)} />
           </Field>
+          <div className="rounded-md border border-border p-3">
+            <div className="mb-1 text-2xs font-semibold uppercase tracking-wide text-content-subtle">
+              Remove this item
+            </div>
+            <p className="mb-2 text-2xs text-content-subtle">
+              An item claimed in error is removed, not verified at zero. An item a disallowance already rests on cannot
+              be removed until that finding is withdrawn.
+            </p>
+            {confirmingRemove ? (
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  variant="danger"
+                  type="button"
+                  onClick={() => void removeItem()}
+                  loading={action.busy === "remove"}
+                >
+                  Remove it
+                </Button>
+                <Button size="sm" variant="ghost" type="button" onClick={() => setConfirmingRemove(false)}>
+                  Keep it
+                </Button>
+              </div>
+            ) : (
+              <Button size="sm" variant="ghost" type="button" onClick={() => setConfirmingRemove(true)}>
+                Remove
+              </Button>
+            )}
+          </div>
           {raisesDisallowance ? (
             <div className="space-y-3 rounded-md border border-border p-3">
               <div className="text-2xs font-semibold uppercase tracking-wide text-content-subtle">
@@ -922,6 +1073,427 @@ function VerdictDrawer({
   );
 }
 
+/* ============================ Disallowed cost ============================= */
+
+/**
+ * The register entry's own workspace: the contractor's response (which is what
+ * discharges the obligation raised when the disallowance was made) and the
+ * resolution, including the deduction — the point at which money actually
+ * moves, and the reason the person who raised it may not be the one who
+ * executes it (#1066).
+ */
+function DisallowedDrawer({
+  projectId,
+  row,
+  onClose,
+  onChanged,
+}: {
+  projectId: string;
+  row: DisallowedCost | null;
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  const api = projectApi(projectId);
+  const action = useAction();
+  const [response, setResponse] = useState("");
+  const [disputed, setDisputed] = useState(false);
+  const [outcome, setOutcome] = useState("deducted");
+  const [note, setNote] = useState("");
+  const [deductedAmount, setDeductedAmount] = useState("");
+  const [refType, setRefType] = useState("invoice");
+  const [refId, setRefId] = useState("");
+
+  useEffect(() => {
+    setResponse("");
+    setDisputed(false);
+    setOutcome("deducted");
+    setNote("");
+    setDeductedAmount(row ? String(row.amount) : "");
+    setRefType("invoice");
+    setRefId("");
+    action.clear();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [row?.id]);
+
+  const settled = row ? ["accepted", "withdrawn", "deducted"].includes(row.status) : false;
+
+  async function respond(e: FormEvent) {
+    e.preventDefault();
+    if (!row) return;
+    const res = await action.run("respond", () =>
+      api.respondDisallowed(row.id, { response, disputed }),
+    );
+    if (res) {
+      toast.success(
+        disputed
+          ? "Response recorded as disputed; the obligation to answer is discharged either way"
+          : "Response recorded; the obligation to answer is discharged",
+      );
+      onChanged();
+    }
+  }
+
+  async function resolve(e: FormEvent) {
+    e.preventDefault();
+    if (!row) return;
+    const body: Record<string, unknown> = { outcome, note };
+    if (outcome === "deducted") {
+      const n = Number(deductedAmount);
+      if (Number.isFinite(n)) body["deductedAmount"] = n;
+      body["deductionRefType"] = refType || undefined;
+      body["deductionRefId"] = refId || undefined;
+    }
+    const res = await action.run("resolve", () => api.resolveDisallowed(row.id, body));
+    if (res) {
+      toast.success(`Disallowance ${outcome}`);
+      onChanged();
+    }
+  }
+
+  return (
+    <Drawer
+      open={row !== null}
+      onClose={onClose}
+      size="md"
+      title={row ? `DC-${String(row.number).padStart(3, "0")}` : "Disallowed cost"}
+      description={row ? `${titleCase(row.category)} · ${titleCase(row.status)}` : undefined}
+    >
+      {row ? (
+        <div className="space-y-4">
+          {action.error ? (
+            <Alert tone="danger" size="sm">
+              {action.error}
+            </Alert>
+          ) : null}
+          {row.groundClause ? null : (
+            <Alert tone="warning" size="sm">
+              This disallowance cites no contract clause. A disallowance without a ground is an opinion and will not
+              survive adjudication.
+            </Alert>
+          )}
+          <dl className="divide-y divide-border">
+            <Row label="Description">{row.description}</Row>
+            <Row label="Ground">{titleCase(row.category)}</Row>
+            <Row label="Clause">{row.groundClause ?? DASH}</Row>
+            <Row label="Amount">{money(row.amount, row.currency)}</Row>
+            <Row label="Deducted">
+              {row.deductedAmount > 0 ? money(row.deductedAmount, row.currency) : DASH}
+            </Row>
+            <Row label="Raised">{isoDate(row.raisedAt)}</Row>
+            <Row label="Response due" hint="Watched as an obligation once a date is set">
+              {isoDate(row.responseDueAt)}
+            </Row>
+            <Row label="Responded">{isoDate(row.respondedAt)}</Row>
+            <Row label="Deduction reference">
+              {row.deductionRefType ? `${titleCase(row.deductionRefType)} ${row.deductionRefId ?? ""}`.trim() : DASH}
+            </Row>
+            <Row label="Resolution note">{row.resolutionNote ?? DASH}</Row>
+          </dl>
+
+          {row.contractorResponse ? (
+            <div className="rounded-md border border-border p-3">
+              <div className="mb-1 text-2xs font-semibold uppercase tracking-wide text-content-subtle">
+                Contractor's response
+              </div>
+              <p className="whitespace-pre-wrap text-meta text-content">{row.contractorResponse}</p>
+            </div>
+          ) : null}
+
+          {settled ? (
+            <Alert tone="info" size="sm">
+              This entry is {row.status}; it is part of the record and is not edited further. A finding that turns out
+              to be wrong is withdrawn, not deleted.
+            </Alert>
+          ) : (
+            <>
+              <form onSubmit={respond} className="space-y-2 rounded-md border border-border p-3">
+                <div className="text-2xs font-semibold uppercase tracking-wide text-content-subtle">
+                  Record the contractor's response
+                </div>
+                <p className="text-2xs text-content-subtle">
+                  The response performs the obligation whether or not it agrees; a dispute is an answer, silence is not.
+                </p>
+                <Field label="Response" required>
+                  <Textarea rows={3} value={response} onChange={(e) => setResponse(e.target.value)} required />
+                </Field>
+                <label className="flex items-center gap-2 text-meta text-content">
+                  <input type="checkbox" checked={disputed} onChange={(e) => setDisputed(e.target.checked)} />
+                  The contractor disputes the disallowance
+                </label>
+                <Button size="sm" type="submit" disabled={!response.trim()} loading={action.busy === "respond"}>
+                  Record the response
+                </Button>
+              </form>
+
+              <form onSubmit={resolve} className="space-y-2 rounded-md border border-border p-3">
+                <div className="text-2xs font-semibold uppercase tracking-wide text-content-subtle">
+                  Resolve
+                </div>
+                <Alert tone="info" size="sm">
+                  The person who raised a disallowance cannot also execute the deduction: the finding and the money
+                  movement need different hands.
+                </Alert>
+                <Field label="Outcome" required>
+                  <Select value={outcome} onChange={(e) => setOutcome(e.target.value)}>
+                    {DISALLOWED_RESOLUTIONS.map((o) => (
+                      <option key={o} value={o}>
+                        {titleCase(o)}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+                {outcome === "deducted" ? (
+                  <div className="grid gap-2 sm:grid-cols-3">
+                    <Field label={`Deducted (${row.currency})`} required>
+                      <Input
+                        type="number"
+                        size="sm"
+                        min={0}
+                        max={row.amount}
+                        step="0.01"
+                        value={deductedAmount}
+                        onChange={(e) => setDeductedAmount(e.target.value)}
+                        required
+                      />
+                    </Field>
+                    <Field label="Deducted from" hint="Where the money actually moved">
+                      <Input size="sm" value={refType} onChange={(e) => setRefType(e.target.value)} />
+                    </Field>
+                    <Field label="Reference id" required>
+                      <Input size="sm" value={refId} onChange={(e) => setRefId(e.target.value)} required />
+                    </Field>
+                  </div>
+                ) : null}
+                <Field label="Note" required>
+                  <Textarea rows={2} value={note} onChange={(e) => setNote(e.target.value)} required />
+                </Field>
+                <Button size="sm" type="submit" disabled={!note.trim()} loading={action.busy === "resolve"}>
+                  Resolve
+                </Button>
+              </form>
+            </>
+          )}
+        </div>
+      ) : null}
+    </Drawer>
+  );
+}
+
+/* ============================== Audit rights ============================== */
+
+/**
+ * The execution log for one audit right (#1064). Everything after the notice —
+ * access granted, records refused, obstruction, outcome — happens here, and
+ * `obstructed` is the state the sweep and the health inputs both read.
+ */
+function AuditDrawer({
+  projectId,
+  row,
+  onClose,
+  onChanged,
+}: {
+  projectId: string;
+  row: AuditRights | null;
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  const api = projectApi(projectId);
+  const action = useAction();
+  const [editing, setEditing] = useState(false);
+  const [status, setStatus] = useState("in_progress");
+  const [obstructionNote, setObstructionNote] = useState("");
+  const [outcome, setOutcome] = useState("");
+
+  useEffect(() => {
+    setEditing(false);
+    setStatus(row?.status === "notified" ? "in_progress" : (row?.status ?? "in_progress"));
+    setObstructionNote(row?.obstructionNote ?? "");
+    setOutcome(row?.outcome ?? "");
+    action.clear();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [row?.id]);
+
+  async function saveEdit(patch: Record<string, unknown>) {
+    if (!row) return;
+    const res = await action.run("edit", () => api.patchAudit(row.id, patch));
+    if (res) {
+      toast.success("Audit record updated");
+      setEditing(false);
+      onChanged();
+    }
+  }
+
+  async function submitStatus(e: FormEvent) {
+    e.preventDefault();
+    if (!row) return;
+    const body: Record<string, unknown> = { status };
+    if (status === "obstructed") body["obstructionNote"] = obstructionNote;
+    if (status === "completed") body["outcome"] = outcome;
+    const res = await action.run("status", () => api.setAuditStatus(row.id, body));
+    if (res) {
+      toast.success(`Audit marked ${status.replace(/_/g, " ")}`);
+      onChanged();
+    }
+  }
+
+  const records = row?.recordsRequested ?? [];
+
+  return (
+    <Drawer
+      open={row !== null}
+      onClose={onClose}
+      size="lg"
+      title={row ? `${row.reference} — ${row.subjectName}` : "Audit right"}
+      description={row ? `${titleCase(row.subjectType)} · ${titleCase(row.status)}` : undefined}
+    >
+      {row ? (
+        <div className="space-y-4">
+          {action.error ? (
+            <Alert tone="danger" size="sm">
+              {action.error}
+            </Alert>
+          ) : null}
+          {row.status === "obstructed" ? (
+            <Alert tone="danger" size="sm">
+              Access was obstructed. Refusal to produce records under an audit clause is itself a breach, and this
+              record is the evidence of it.
+            </Alert>
+          ) : null}
+          {row.status !== "closed" ? (
+            <div className="flex justify-end">
+              <EditButton editing={editing} onToggle={() => setEditing((e) => !e)} />
+            </div>
+          ) : null}
+          {editing ? (
+            <EditForm
+              key={row.id}
+              fields={AUDIT_FIELDS}
+              initial={row as unknown as Record<string, unknown>}
+              busy={action.busy === "edit"}
+              onSubmit={saveEdit}
+              onCancel={() => setEditing(false)}
+              note="The reference is fixed: it is how this exercise is cited elsewhere."
+            />
+          ) : null}
+          <dl className="divide-y divide-border">
+            <Row label="Contract reference">{row.contractReference ?? DASH}</Row>
+            <Row label="Clause">{row.clause ?? DASH}</Row>
+            <Row label="Auditor">{row.auditorName ?? DASH}</Row>
+            <Row label="Notice given">{isoDate(row.noticeDate)}</Row>
+            <Row label="Notice days required">{row.noticeDays === null ? DASH : num(row.noticeDays)}</Row>
+            <Row label="Scheduled">{isoDate(row.scheduledDate)}</Row>
+            <Row label="Access granted">{isoDate(row.accessGrantedAt)}</Row>
+            <Row label="Completed">{isoDate(row.completedAt)}</Row>
+            <Row label="Scope">{row.scope}</Row>
+            <Row label="Obstruction note">{row.obstructionNote ?? DASH}</Row>
+            <Row label="Outcome">{row.outcome ?? DASH}</Row>
+          </dl>
+
+          <div>
+            <div className="mb-1 text-2xs font-semibold uppercase tracking-wide text-content-subtle">
+              Records requested ({num(records.length)})
+            </div>
+            {records.length === 0 ? (
+              <p className="text-meta text-content-subtle">
+                No records were listed on the notice. What was asked for is what the obstruction is measured against, so
+                an empty list makes a refusal hard to prove.
+              </p>
+            ) : (
+              <div className="overflow-x-auto">
+                <Table>
+                  <thead>
+                    <tr>
+                      <Th>Record</Th>
+                      <Th>Requested</Th>
+                      <Th>Produced</Th>
+                      <Th>Note</Th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {records.map((r, i) => (
+                      <tr key={r.id ?? `${i}`}>
+                        <Td>{r.description}</Td>
+                        <Td>{isoDate(r.requestedAt ?? null)}</Td>
+                        <Td>
+                          {r.refused ? (
+                            <Badge tone="danger" size="xs">
+                              Refused
+                            </Badge>
+                          ) : r.providedAt ? (
+                            isoDate(r.providedAt)
+                          ) : (
+                            <span className="text-warning-text">outstanding</span>
+                          )}
+                        </Td>
+                        <Td>{r.note ?? DASH}</Td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </Table>
+              </div>
+            )}
+          </div>
+
+          {row.status === "closed" ? (
+            <Alert tone="info" size="sm">
+              This audit record is closed and cannot be reopened.
+            </Alert>
+          ) : (
+            <form onSubmit={submitStatus} className="space-y-2 rounded-md border border-border p-3">
+              <div className="text-2xs font-semibold uppercase tracking-wide text-content-subtle">
+                Move the audit on
+              </div>
+              <Field label="Status" required>
+                <Select value={status} onChange={(e) => setStatus(e.target.value)}>
+                  {AUDIT_RIGHTS_STATUSES.map((sname) => (
+                    <option key={sname} value={sname}>
+                      {titleCase(sname)}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              {status === "obstructed" ? (
+                <Field
+                  label="What was refused, and by whom"
+                  required
+                  hint="An obstruction with no note is not evidence of anything."
+                >
+                  <Textarea
+                    rows={3}
+                    value={obstructionNote}
+                    onChange={(e) => setObstructionNote(e.target.value)}
+                    required
+                  />
+                </Field>
+              ) : null}
+              {status === "completed" ? (
+                <Field label="Outcome" required hint="What the audit found. A completed audit with no outcome is not a finding.">
+                  <Textarea rows={3} value={outcome} onChange={(e) => setOutcome(e.target.value)} required />
+                </Field>
+              ) : null}
+              <p className="text-2xs text-content-subtle">
+                Granting access or completing satisfies the counterparty's obligation; recording an obstruction breaches
+                it.
+              </p>
+              <Button
+                size="sm"
+                type="submit"
+                loading={action.busy === "status"}
+                disabled={
+                  (status === "obstructed" && !obstructionNote.trim()) ||
+                  (status === "completed" && !outcome.trim())
+                }
+              >
+                Record
+              </Button>
+            </form>
+          )}
+        </div>
+      ) : null}
+    </Drawer>
+  );
+}
+
 /* =============================== Create =================================== */
 
 function CreateDrawer({
@@ -932,7 +1504,7 @@ function CreateDrawer({
   onCreated,
 }: {
   projectId: string;
-  kind: null | "verification" | "audit";
+  kind: null | "verification" | "audit" | "disallowed";
   verifications: Verification[];
   onClose: () => void;
   onCreated: () => void;
@@ -984,6 +1556,26 @@ function CreateDrawer({
       }
       return;
     }
+    if (kind === "disallowed") {
+      const res = await action.run("create", () =>
+        api.createDisallowed({
+          description: form["description"] ?? "",
+          category: form["category"] ?? "not_defined_cost",
+          groundClause: form["groundClause"] || undefined,
+          currency: form["currency"] ?? "",
+          amount: numeric("amount") ?? 0,
+          verificationId: form["verificationId"] || undefined,
+          responseDueAt: form["responseDueAt"] || undefined,
+        }),
+      );
+      if (res) {
+        toast.success(
+          res.warning ?? "Disallowance raised on the register with its ground",
+        );
+        onCreated();
+      }
+      return;
+    }
     if (kind === "audit") {
       const res = await action.run("create", () =>
         api.createAudit({
@@ -1012,11 +1604,19 @@ function CreateDrawer({
       open={kind !== null}
       onClose={onClose}
       size="md"
-      title={kind === "verification" ? "Plan an open-book verification" : "Give notice under the audit clause"}
+      title={
+        kind === "verification"
+          ? "Plan an open-book verification"
+          : kind === "disallowed"
+            ? "Raise a disallowance"
+            : "Give notice under the audit clause"
+      }
       description={
         kind === "verification"
           ? "Record the sampling plan: without a population value the observed rate cannot be projected beyond the items tested, and the platform will say so rather than guess."
-          : "A scheduled date makes the counterparty's duty to give access an obligation the sweep can breach."
+          : kind === "disallowed"
+            ? "A disallowance raised outside a verification still needs its ground and its clause; a response date makes the contractor's duty to answer an obligation the sweep watches."
+            : "A scheduled date makes the counterparty's duty to give access an obligation the sweep can breach."
       }
       footer={
         <div className="flex justify-end gap-2">
@@ -1118,6 +1718,75 @@ function CreateDrawer({
                 />
               </Field>
             </div>
+          </>
+        ) : null}
+
+        {kind === "disallowed" ? (
+          <>
+            <Field label="Description" required>
+              <Input
+                value={form["description"] ?? ""}
+                onChange={(e) => set("description", e.target.value)}
+                required
+              />
+            </Field>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field label="Ground" required>
+                <Select
+                  value={form["category"] ?? "not_defined_cost"}
+                  onChange={(e) => set("category", e.target.value)}
+                >
+                  {DISALLOWED_CATEGORIES.map((c) => (
+                    <option key={c} value={c}>
+                      {titleCase(c)}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              <Field
+                label="Contract clause"
+                hint="Without one the register counts this as an opinion, and says so."
+              >
+                <Input value={form["groundClause"] ?? ""} onChange={(e) => set("groundClause", e.target.value)} />
+              </Field>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-3">
+              <Field label="Currency" required>
+                <Input
+                  value={form["currency"] ?? ""}
+                  onChange={(e) => set("currency", e.target.value)}
+                  maxLength={3}
+                  required
+                />
+              </Field>
+              <Field label="Amount" required>
+                <Input
+                  type="number"
+                  value={form["amount"] ?? ""}
+                  onChange={(e) => set("amount", e.target.value)}
+                  min={0}
+                  step="0.01"
+                  required
+                />
+              </Field>
+              <Field label="Response due by" hint="Becomes an obligation">
+                <Input
+                  type="date"
+                  value={form["responseDueAt"] ?? ""}
+                  onChange={(e) => set("responseDueAt", e.target.value)}
+                />
+              </Field>
+            </div>
+            <Field label="Arising from" hint="Tie it to the verification that found it where there is one">
+              <Select value={form["verificationId"] ?? ""} onChange={(e) => set("verificationId", e.target.value)}>
+                <option value="">Standalone</option>
+                {verifications.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {v.reference} — {v.title}
+                  </option>
+                ))}
+              </Select>
+            </Field>
           </>
         ) : null}
 

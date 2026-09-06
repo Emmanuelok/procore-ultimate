@@ -619,14 +619,33 @@ function TransmittalDrawer({
   );
   const action = useAction();
   const [voidReason, setVoidReason] = useState("");
+  const [itemTitle, setItemTitle] = useState("");
+  const [itemType, setItemType] = useState("file");
+  const [itemRevision, setItemRevision] = useState("");
+  const [recipientName, setRecipientName] = useState("");
+  const [recipientEmail, setRecipientEmail] = useState("");
+  const [recipientKind, setRecipientKind] = useState("to");
+  const [recipientAck, setRecipientAck] = useState(true);
+  const [ackDue, setAckDue] = useState("");
 
   useEffect(() => {
     setVoidReason("");
+    setItemTitle("");
+    setItemType("file");
+    setItemRevision("");
+    setRecipientName("");
+    setRecipientEmail("");
+    setRecipientKind("to");
+    setRecipientAck(true);
     action.clear();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [transmittalId]);
 
   const record = detail.data;
+
+  useEffect(() => {
+    setAckDue(record?.ackDueDate ?? "");
+  }, [record?.ackDueDate]);
 
   async function run(key: string, fn: () => Promise<unknown>, message: string) {
     const result = await action.run(key, fn);
@@ -702,6 +721,36 @@ function TransmittalDrawer({
                 <ReasonList reasons={record.position.reasons} className="mt-1" />
               </>
             )}
+            {record.status !== "closed" && record.status !== "void" ? (
+              <div className="mt-2 flex flex-wrap items-end gap-2">
+                <Field
+                  label="Acknowledgement due"
+                  hint="Moving it moves the assurance obligation with it, so there is only ever one date."
+                >
+                  <Input
+                    size="sm"
+                    type="date"
+                    value={ackDue}
+                    onChange={(e) => setAckDue(e.target.value)}
+                  />
+                </Field>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={ackDue === "" || ackDue === (record.ackDueDate ?? "")}
+                  loading={action.busy === "ackDue"}
+                  onClick={() =>
+                    run(
+                      "ackDue",
+                      () => corrApi.patchTransmittal(projectId, record.id, { ackDueDate: ackDue }),
+                      `Acknowledgement now due ${ackDue}.`,
+                    )
+                  }
+                >
+                  Move the date
+                </Button>
+              </div>
+            ) : null}
           </section>
 
           <section>
@@ -744,6 +793,59 @@ function TransmittalDrawer({
                 ))}
               </ul>
             )}
+            {record.status === "draft" ? (
+              <div className="mt-2 grid gap-2 rounded-md border border-border p-2 sm:grid-cols-4">
+                <Input
+                  size="sm"
+                  className="sm:col-span-2"
+                  placeholder="What is being sent"
+                  value={itemTitle}
+                  onChange={(e) => setItemTitle(e.target.value)}
+                />
+                <Select size="sm" value={itemType} onChange={(e) => setItemType(e.target.value)}>
+                  {TRANSMITTAL_ITEM_TYPES.map((t) => (
+                    <option key={t} value={t}>
+                      {titleCase(t)}
+                    </option>
+                  ))}
+                </Select>
+                <div className="flex gap-2">
+                  <Input
+                    size="sm"
+                    placeholder="Rev"
+                    value={itemRevision}
+                    onChange={(e) => setItemRevision(e.target.value)}
+                  />
+                  <Button
+                    size="sm"
+                    disabled={itemTitle.trim() === ""}
+                    loading={action.busy === "add-item"}
+                    onClick={async () => {
+                      await run(
+                        "add-item",
+                        () =>
+                          corrApi.addTransmittalItems(projectId, record.id, [
+                            {
+                              itemType,
+                              title: itemTitle.trim(),
+                              revision: itemRevision.trim() || null,
+                            },
+                          ]),
+                        "Item added.",
+                      );
+                      setItemTitle("");
+                      setItemRevision("");
+                    }}
+                  >
+                    Add
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <p className="mt-1 text-2xs text-content-subtle">
+                Issued: the contents are frozen. Issue a revised transmittal instead.
+              </p>
+            )}
           </section>
 
           <section>
@@ -760,9 +862,10 @@ function TransmittalDrawer({
                     <div className="truncate text-2xs text-content-subtle">
                       {r.email ?? "no address on file"} · {titleCase(r.deliveryStatus)}
                       {r.firstReadAt ? ` · first read ${dateTime(r.firstReadAt)}` : ""}
+                      {r.readCount > 0 ? ` · read ${r.readCount}×` : ""}
                     </div>
                   </div>
-                  <div className="shrink-0">
+                  <div className="flex shrink-0 items-center gap-1">
                     {r.acknowledgedAt ? (
                       <Badge tone="success" size="xs" dot title={dateTime(r.acknowledgedAt)}>
                         Acknowledged
@@ -785,10 +888,101 @@ function TransmittalDrawer({
                     ) : (
                       <span className="text-2xs text-content-subtle">not asked</span>
                     )}
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      title="Record that this recipient opened it"
+                      loading={action.busy === `read-${r.id}`}
+                      onClick={() =>
+                        run(
+                          `read-${r.id}`,
+                          () => corrApi.markRead(projectId, r.id),
+                          `Read receipt recorded for ${r.name}.`,
+                        )
+                      }
+                    >
+                      Read
+                    </Button>
+                    {r.acknowledgedAt === null ? (
+                      <button
+                        type="button"
+                        className="text-2xs text-danger-text hover:underline"
+                        onClick={() =>
+                          run(
+                            `drop-${r.id}`,
+                            () => corrApi.removeRecipient(projectId, r.id),
+                            `${r.name} removed from the distribution.`,
+                          )
+                        }
+                      >
+                        Remove
+                      </button>
+                    ) : null}
                   </div>
                 </li>
               ))}
             </ul>
+            {record.status === "closed" || record.status === "void" ? (
+              <p className="mt-1 text-2xs text-content-subtle">
+                {titleCase(record.status)}: the distribution list can no longer be changed.
+              </p>
+            ) : (
+              <div className="mt-2 grid gap-2 rounded-md border border-border p-2 sm:grid-cols-4">
+                <Input
+                  size="sm"
+                  placeholder="Name"
+                  value={recipientName}
+                  onChange={(e) => setRecipientName(e.target.value)}
+                />
+                <Input
+                  size="sm"
+                  placeholder="Email"
+                  value={recipientEmail}
+                  onChange={(e) => setRecipientEmail(e.target.value)}
+                />
+                <Select size="sm" value={recipientKind} onChange={(e) => setRecipientKind(e.target.value)}>
+                  {RECIPIENT_KINDS.map((k) => (
+                    <option key={k} value={k}>
+                      {k.toUpperCase()}
+                    </option>
+                  ))}
+                </Select>
+                <Button
+                  size="sm"
+                  disabled={recipientName.trim() === ""}
+                  loading={action.busy === "add-recipient"}
+                  onClick={async () => {
+                    await run(
+                      "add-recipient",
+                      () =>
+                        corrApi.addTransmittalRecipient(projectId, record.id, {
+                          kind: recipientKind,
+                          partyType: "external",
+                          name: recipientName.trim(),
+                          email: recipientEmail.trim() || null,
+                          acknowledgementRequired: recipientAck,
+                        }),
+                      `${recipientName.trim()} added to the distribution.`,
+                    );
+                    setRecipientName("");
+                    setRecipientEmail("");
+                  }}
+                >
+                  Add
+                </Button>
+                <label className="flex items-center gap-2 text-2xs text-content-muted sm:col-span-4">
+                  <input
+                    type="checkbox"
+                    checked={recipientAck}
+                    onChange={(e) => setRecipientAck(e.target.checked)}
+                  />
+                  Must acknowledge receipt
+                  {record.status !== "draft"
+                    ? " — added after issue, so they are marked sent straight away and the counters resync"
+                    : ""}
+                </label>
+              </div>
+            )}
           </section>
 
           <section>

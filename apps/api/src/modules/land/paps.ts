@@ -2,7 +2,12 @@ import type { FastifyInstance } from "fastify";
 import { and, asc, count, eq, ne, sql } from "drizzle-orm";
 import { z } from "zod";
 import { affectedPersons, landParcels, projects } from "@constructos/db";
-import { DISPLACEMENT_TYPES, PAP_STATUSES, PARCEL_STATUSES } from "@constructos/shared";
+import {
+  DISPLACEMENT_TYPES,
+  PAP_STATUSES,
+  PARCEL_STATUSES,
+  type PapStatus,
+} from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, conflict, notFound } from "../../lib/errors.js";
@@ -10,6 +15,7 @@ import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { isoDateSchema, todayISO } from "../field/dates.js";
 import {
   LIVELIHOOD_REQUIRED_DISPLACEMENT,
+  PAP_TRANSITIONS,
   PARCEL_READY_STATUS,
   PHYSICAL_DISPLACEMENT,
   VULNERABILITY_FLAGS,
@@ -354,7 +360,13 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
         ...pap,
         vulnerable: pap.vulnerabilities.length > 0,
         livelihoodRequired: LIVELIHOOD_REQUIRED_DISPLACEMENT.includes(pap.displacementType),
+        physicalDisplacement: PHYSICAL_DISPLACEMENT.includes(pap.displacementType),
         parcel: parcel ?? null,
+        // the UI drives its buttons from this rather than offering every
+        // status and letting the server refuse (or, worse, accept)
+        allowedTransitions: (PAP_TRANSITIONS[pap.status as PapStatus] ?? []).filter(
+          (next) => next !== "compensated" && next !== "grievance_open",
+        ),
       };
     },
   );
@@ -375,6 +387,8 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
       if (body.parcelId) {
         await assertParcelInProject(req.companyId!, req.projectId!, body.parcelId);
       }
+      const before: Record<string, unknown> = {};
+      const after: Record<string, unknown> = {};
       const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
       for (const key of [
         "reference",
@@ -388,7 +402,11 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
         "livelihoodProgramme",
         "livelihoodRestoredAt",
       ] as const) {
-        if (body[key] !== undefined) set[key] = body[key];
+        if (body[key] !== undefined) {
+          set[key] = body[key];
+          before[key] = pap[key];
+          after[key] = body[key];
+        }
       }
       await app.db.update(affectedPersons).set(set).where(eq(affectedPersons.id, papId));
       await appendLedger(app.db, {
@@ -397,7 +415,10 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
         action: "update",
         objectType: "affected_person",
         objectId: papId,
-        payload: { changed: Object.keys(body) },
+        // values, not key names: a vulnerability flag or a displacement type
+        // that quietly changed decides which entitlements were owed
+        payload: { before, after },
+        storePayload: true,
       });
       return fetchPap(papId, req.companyId!, req.projectId!);
     },
@@ -521,6 +542,49 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
             "(POST /affected-persons/:papId/compensate)",
         );
       }
+      if (body.status === "grievance_open") {
+        throw badRequest(
+          "grievance_open is set by the grievance register when a grievance naming this " +
+            "household is opened, and cleared on verified closure — it is not a status anyone " +
+            "types in",
+        );
+      }
+      const allowed = PAP_TRANSITIONS[pap.status as PapStatus] ?? [];
+      if (!allowed.includes(body.status)) {
+        throw badRequest(
+          `A ${pap.status} household cannot move to ${body.status} ` +
+            `(allowed: ${allowed.join(", ") || "none"})`,
+        );
+      }
+      /*
+       * `resettled` and `livelihood_restored` are claims about the household,
+       * not workflow steps. Under IFC PS5 para 20 a household is not moved
+       * before it is paid, and para 29 measures restoration against the
+       * pre-displacement baseline — so each has a precondition the register
+       * can actually check.
+       */
+      if (body.status === "resettled") {
+        if (!PHYSICAL_DISPLACEMENT.includes(pap.displacementType)) {
+          throw badRequest(
+            `Household ${pap.reference} is recorded as ${pap.displacementType} displacement, ` +
+              `so there is no physical move to record. Mark it resettled only where the ` +
+              `household is physically displaced.`,
+          );
+        }
+        if (!pap.compensationPaidAt) {
+          throw badRequest(
+            `Household ${pap.reference} has no compensation payment on file. IFC PS5 para 20 ` +
+              `requires compensation to be paid before the household is displaced; record the ` +
+              `evidenced payment first.`,
+          );
+        }
+      }
+      if (body.status === "livelihood_restored" && !pap.compensationPaidAt) {
+        throw badRequest(
+          `Household ${pap.reference} has no compensation payment on file, so there is no ` +
+            `displacement date to measure restoration from (IFC PS5 para 29)`,
+        );
+      }
       const set: Record<string, unknown> = {
         status: body.status,
         updatedAt: new Date().toISOString(),
@@ -540,6 +604,8 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
           from: pap.status,
           to: body.status,
           reference: pap.reference,
+          displacementType: pap.displacementType,
+          compensationPaidAt: pap.compensationPaidAt,
           note: body.note ?? null,
         },
         storePayload: true,

@@ -60,6 +60,11 @@ import {
   IMPORT_SPECS,
   type ImportRowError,
 } from "../projects/import.js";
+import {
+  loadVendorsByName,
+  referencedVendorNames,
+  unresolvedVendorNames,
+} from "./importrefs.js";
 // Phase 8 — an invitation now produces a record and a message instead of a
 // temporary password and silence. Everything about tokens, dispatch and
 // acceptance lives in modules/account; this module keeps the route.
@@ -250,18 +255,42 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
    * see. `vendorReferences` counts them; `repointVendor` moves them.
    */
   const VENDOR_REFERENCE_TABLES = [
-    { label: "contacts", table: contacts, key: "vendorId", column: contacts.vendorId, companyColumn: contacts.companyId },
-    { label: "commitments", table: commitments, key: "vendorId", column: commitments.vendorId, companyColumn: commitments.companyId },
-    { label: "invoices", table: invoices, key: "vendorId", column: invoices.vendorId, companyColumn: invoices.companyId },
-    { label: "submittals", table: submittals, key: "vendorId", column: submittals.vendorId, companyColumn: submittals.companyId },
-    { label: "punch items", table: punchItems, key: "vendorId", column: punchItems.vendorId, companyColumn: punchItems.companyId },
-    { label: "bid invitations", table: bidInvitations, key: "vendorId", column: bidInvitations.vendorId, companyColumn: bidInvitations.companyId },
-    { label: "bid submissions", table: bidSubmissions, key: "vendorId", column: bidSubmissions.vendorId, companyColumn: bidSubmissions.companyId },
-    { label: "insurance certificates", table: insuranceCertificates, key: "vendorId", column: insuranceCertificates.vendorId, companyColumn: insuranceCertificates.companyId },
-    { label: "workers", table: workers, key: "vendorId", column: workers.vendorId, companyColumn: workers.companyId },
-    { label: "safety incidents", table: safetyIncidents, key: "vendorId", column: safetyIncidents.vendorId, companyColumn: safetyIncidents.companyId },
-    { label: "NCRs", table: nonConformanceReports, key: "raisedAgainstVendorId", column: nonConformanceReports.raisedAgainstVendorId, companyColumn: nonConformanceReports.companyId },
+    { label: "contacts", table: contacts, key: "vendorId", column: contacts.vendorId, companyColumn: contacts.companyId, idColumn: contacts.id },
+    { label: "commitments", table: commitments, key: "vendorId", column: commitments.vendorId, companyColumn: commitments.companyId, idColumn: commitments.id },
+    { label: "invoices", table: invoices, key: "vendorId", column: invoices.vendorId, companyColumn: invoices.companyId, idColumn: invoices.id },
+    { label: "submittals", table: submittals, key: "vendorId", column: submittals.vendorId, companyColumn: submittals.companyId, idColumn: submittals.id },
+    { label: "punch items", table: punchItems, key: "vendorId", column: punchItems.vendorId, companyColumn: punchItems.companyId, idColumn: punchItems.id },
+    { label: "bid invitations", table: bidInvitations, key: "vendorId", column: bidInvitations.vendorId, companyColumn: bidInvitations.companyId, idColumn: bidInvitations.id },
+    { label: "bid submissions", table: bidSubmissions, key: "vendorId", column: bidSubmissions.vendorId, companyColumn: bidSubmissions.companyId, idColumn: bidSubmissions.id },
+    { label: "insurance certificates", table: insuranceCertificates, key: "vendorId", column: insuranceCertificates.vendorId, companyColumn: insuranceCertificates.companyId, idColumn: insuranceCertificates.id },
+    { label: "workers", table: workers, key: "vendorId", column: workers.vendorId, companyColumn: workers.companyId, idColumn: workers.id },
+    { label: "safety incidents", table: safetyIncidents, key: "vendorId", column: safetyIncidents.vendorId, companyColumn: safetyIncidents.companyId, idColumn: safetyIncidents.id },
+    { label: "NCRs", table: nonConformanceReports, key: "raisedAgainstVendorId", column: nonConformanceReports.raisedAgainstVendorId, companyColumn: nonConformanceReports.companyId, idColumn: nonConformanceReports.id },
   ] as const;
+
+  /**
+   * A merge movement, as journalled.
+   *
+   * `ids` is the load-bearing field: it names the rows THIS merge moved. An
+   * undo that re-points every row currently owned by the target vendor takes
+   * the target's own pre-existing records with it — the merge journal has to
+   * carry identity, not just a count.
+   */
+  type MergeMovement = {
+    table: string;
+    column: string;
+    rows: number;
+    ids: string[] | null;
+  };
+
+  /**
+   * Above this many re-pointed rows the journal stops recording ids and the
+   * merge becomes irreversible: an unbounded id list in a jsonb column is its
+   * own problem, and guessing which rows to move back is the bug this exists
+   * to prevent. The merge still happens; only the undo is refused, and the
+   * register says so.
+   */
+  const MERGE_UNDO_MAX_ROWS = 5000;
 
   async function vendorReferences(companyId: string, vendorId: string) {
     const counts: Record<string, number> = {};
@@ -309,6 +338,14 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
    * blank vendor name in every register that joined to it. Deletion now marks
    * the row and reports what still points at it; the vendor keeps its history
    * and can be restored.
+   *
+   * It deliberately does NOT detach the vendor's contacts. Nulling
+   * `contacts.vendorId` used to be part of this transaction, and it was the
+   * one thing a "restorable" delete destroyed for good: the restore cleared
+   * `deletedAt` and nothing anywhere remembered which of the tenant's
+   * contacts had belonged to the vendor. The association is kept, and the
+   * read path marks the vendor instead — GET /contacts hydrates `vendorName`
+   * with `vendorDeleted: true`.
    */
   app.delete("/vendors/:vendorId", { preHandler: adminOnly }, async (req) => {
     const { vendorId } = req.params as { vendorId: string };
@@ -316,16 +353,10 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
     await assertNoLegalHold(req.companyId!, "vendor", vendorId);
     const references = await vendorReferences(req.companyId!, vendorId);
     const now = new Date().toISOString();
-    await app.db.transaction(async (tx) => {
-      await tx
-        .update(contacts)
-        .set({ vendorId: null, updatedAt: now })
-        .where(and(eq(contacts.vendorId, vendorId), eq(contacts.companyId, req.companyId!)));
-      await tx
-        .update(vendors)
-        .set({ deletedAt: now, deletedBy: req.user!.id, status: "inactive", updatedAt: now })
-        .where(and(eq(vendors.id, vendorId), eq(vendors.companyId, req.companyId!)));
-    });
+    await app.db
+      .update(vendors)
+      .set({ deletedAt: now, deletedBy: req.user!.id, status: "inactive", updatedAt: now })
+      .where(and(eq(vendors.id, vendorId), eq(vendors.companyId, req.companyId!)));
     await appendLedger(app.db, {
       companyId: req.companyId!,
       actorId: req.user!.id,
@@ -576,7 +607,7 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
      * mattered, and vendor performance was split across both.
      */
     const now = new Date().toISOString();
-    const movements: Array<{ table: string; column: string; rows: number }> = [];
+    const movements: MergeMovement[] = [];
     const mergeId = newId("vmrg");
     /*
      * The re-pointing, the journal row and BOTH ledger entries are one
@@ -590,14 +621,31 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
      */
     await app.db.transaction(async (tx) => {
       for (const entry of VENDOR_REFERENCE_TABLES) {
+        /*
+         * `.returning` the PRIMARY KEY, not the vendorId column: the undo has
+         * to move back exactly these rows, and after the merge every row of
+         * the target vendor answers to the same vendorId.
+         */
         const moved = await tx
           .update(entry.table)
           .set({ [entry.key]: target.id } as never)
           .where(and(eq(entry.companyColumn, req.companyId!), eq(entry.column, source.id)))
-          .returning({ id: entry.column });
+          .returning({ rowId: entry.idColumn });
         if (moved.length > 0) {
-          movements.push({ table: entry.label, column: entry.key, rows: moved.length });
+          movements.push({
+            table: entry.label,
+            column: entry.key,
+            rows: moved.length,
+            ids: moved.map((r) => r.rowId),
+          });
         }
+      }
+      // All or nothing: a journal where some tables carry ids and others do
+      // not would undo half a merge. Over the cap the whole merge is recorded
+      // as irreversible.
+      const totalMoved = movements.reduce((n, m) => n + m.rows, 0);
+      if (totalMoved > MERGE_UNDO_MAX_ROWS) {
+        for (const m of movements) m.ids = null;
       }
       await tx
         .update(vendors)
@@ -636,10 +684,13 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
   /**
    * Undo a merge.
    *
-   * Bounded to what the journal records: the same tables, moving back the
-   * same number of rows. Rows that were re-pointed to the target by some
-   * OTHER means since the merge cannot be told apart, so the undo refuses
-   * once the window has passed rather than guessing.
+   * Bounded to the ROWS THE MERGE MOVED, by primary key, from the journal.
+   * Selecting by `vendorId = target` instead would sweep up every record the
+   * surviving vendor owned before the merge and hand the whole commercial
+   * history of a live vendor to the one being restored — a one-click,
+   * transactional, unrecoverable loss. A journal with no ids (a merge above
+   * `MERGE_UNDO_MAX_ROWS`, or one written before ids were recorded) is
+   * refused rather than guessed at.
    */
   app.post("/vendor-merges/:mergeId/undo", { preHandler: adminOnly }, async (req) => {
     const { mergeId } = req.params as { mergeId: string };
@@ -657,22 +708,37 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
         "A merge can only be undone within 24 hours; after that the re-pointed records cannot be told apart from later edits.",
       );
     }
+    const journal = merge.movements as MergeMovement[];
+    const unidentified = journal.filter((m) => m.rows > 0 && !Array.isArray(m.ids));
+    if (unidentified.length > 0) {
+      throw conflict(
+        `This merge cannot be undone: the journal records how many rows moved (${unidentified
+          .map((m) => `${m.rows} ${m.table}`)
+          .join(", ")}) but not which ones, and moving every record the surviving vendor now owns would take its own history with it.`,
+      );
+    }
     const now = new Date().toISOString();
-    const restored: Array<{ table: string; rows: number }> = [];
+    const restored: Array<{ table: string; rows: number; expected: number }> = [];
     await app.db.transaction(async (tx) => {
       for (const entry of VENDOR_REFERENCE_TABLES) {
-        const record = (merge.movements as Array<{ table: string; rows: number }>).find(
-          (m) => m.table === entry.label,
-        );
-        if (!record || record.rows === 0) continue;
+        const record = journal.find((m) => m.table === entry.label);
+        const ids = record?.ids ?? [];
+        if (!record || record.rows === 0 || ids.length === 0) continue;
         const moved = await tx
           .update(entry.table)
           .set({ [entry.key]: merge.sourceVendorId } as never)
           .where(
-            and(eq(entry.companyColumn, req.companyId!), eq(entry.column, merge.targetVendorId)),
+            and(
+              eq(entry.companyColumn, req.companyId!),
+              eq(entry.column, merge.targetVendorId),
+              inArray(entry.idColumn, ids),
+            ),
           )
-          .returning({ id: entry.column });
-        restored.push({ table: entry.label, rows: moved.length });
+          .returning({ rowId: entry.idColumn });
+        // `expected` next to `rows`: a row re-pointed away from the target
+        // since the merge is deliberately left alone, and the difference is
+        // reported rather than hidden.
+        restored.push({ table: entry.label, rows: moved.length, expected: record.rows });
       }
       await tx
         .update(vendors)
@@ -723,13 +789,28 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
           .where(and(eq(vendors.companyId, req.companyId!), inArray(vendors.id, ids)))
       : [];
     const nameById = new Map(names.map((v) => [v.id, v.name]));
+    const nowMs = Date.now();
     return paginate(
-      items.map((m) => ({
-        ...m,
-        sourceName: nameById.get(m.sourceVendorId) ?? m.sourceVendorId,
-        targetName: nameById.get(m.targetVendorId) ?? m.targetVendorId,
-        undoDeadline: new Date(Date.parse(m.createdAt) + MERGE_UNDO_WINDOW_MS).toISOString(),
-      })),
+      items.map((m) => {
+        const journal = m.movements as MergeMovement[];
+        const identified = journal.every((mv) => mv.rows === 0 || Array.isArray(mv.ids));
+        const deadline = Date.parse(m.createdAt) + MERGE_UNDO_WINDOW_MS;
+        const undoBlockedReason = m.undoneAt
+          ? "already undone"
+          : !identified
+            ? "the journal records counts but not row identities, so an undo would move the surviving vendor's own records"
+            : nowMs > deadline
+              ? "outside the 24-hour undo window"
+              : null;
+        return {
+          ...m,
+          sourceName: nameById.get(m.sourceVendorId) ?? m.sourceVendorId,
+          targetName: nameById.get(m.targetVendorId) ?? m.targetVendorId,
+          undoDeadline: new Date(deadline).toISOString(),
+          undoable: undoBlockedReason === null,
+          undoBlockedReason,
+        };
+      }),
       Number(totalRow?.n ?? 0),
       q,
     );
@@ -739,11 +820,12 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
 
   async function assertVendorInCompany(companyId: string, vendorId: string) {
     const [vendor] = await app.db
-      .select({ id: vendors.id })
+      .select({ id: vendors.id, deletedAt: vendors.deletedAt })
       .from(vendors)
       .where(and(eq(vendors.id, vendorId), eq(vendors.companyId, companyId)))
       .limit(1);
     if (!vendor) throw badRequest("vendorId does not exist in this company");
+    if (vendor.deletedAt) throw badRequest("That vendor is in the recycle bin; restore it first");
   }
 
   app.get("/contacts", { preHandler: read }, async (req) => {
@@ -769,7 +851,32 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
       .limit(q.pageSize)
       .offset(pageOffset(q));
     const [row] = await app.db.select({ n: count() }).from(contacts).where(where);
-    return paginate(items, Number(row?.n ?? 0), q);
+    /*
+     * Hydrate the employer, INCLUDING deleted vendors. A vendor in the
+     * recycle bin keeps its contacts (see DELETE /vendors/:id); the honest
+     * rendering is "Northern Groundworks (deleted)", not a blank employer or
+     * a silently detached contact.
+     */
+    const vendorIds = [...new Set(items.map((c) => c.vendorId).filter((v): v is string => !!v))];
+    const vendorRows = vendorIds.length
+      ? await app.db
+          .select({ id: vendors.id, name: vendors.name, deletedAt: vendors.deletedAt })
+          .from(vendors)
+          .where(and(eq(vendors.companyId, req.companyId!), inArray(vendors.id, vendorIds)))
+      : [];
+    const vendorById = new Map(vendorRows.map((v) => [v.id, v]));
+    return paginate(
+      items.map((c) => {
+        const v = c.vendorId ? vendorById.get(c.vendorId) : undefined;
+        return {
+          ...c,
+          vendorName: v?.name ?? null,
+          vendorDeleted: v ? Boolean(v.deletedAt) : false,
+        };
+      }),
+      Number(row?.n ?? 0),
+      q,
+    );
   });
 
   app.post("/contacts", { preHandler: write }, async (req, reply) => {
@@ -1681,12 +1788,19 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
 
     let created = 0;
     let updated = 0;
+    let unresolvedVendors: string[] = [];
     if (job.dataset === "vendors") {
-      const existing = await app.db
-        .select({ id: vendors.id, name: vendors.name })
-        .from(vendors)
-        .where(and(eq(vendors.companyId, req.companyId!), isNull(vendors.deletedAt)));
-      const byName = new Map(existing.map((v) => [v.name.trim().toLowerCase(), v.id]));
+      /*
+       * Bounded by the names the file mentions (PLAN §6.4). This used to load
+       * every vendor of the tenant into a Map to answer "does this name
+       * already exist?".
+       */
+      const fileNames = [
+        ...new Set(
+          writable.map((r) => (r["name"] ?? "").trim().toLowerCase()).filter(Boolean),
+        ),
+      ];
+      const byName = await loadVendorsByName(app.db, req.companyId!, fileNames);
       await app.db.transaction(async (tx) => {
         for (const row of writable) {
           const name = (row["name"] ?? "").trim();
@@ -1720,18 +1834,40 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
         }
       });
     } else {
-      const vendorRows = await app.db
-        .select({ id: vendors.id, name: vendors.name })
-        .from(vendors)
-        .where(and(eq(vendors.companyId, req.companyId!), isNull(vendors.deletedAt)));
-      const vendorByName = new Map(vendorRows.map((v) => [v.name.trim().toLowerCase(), v.id]));
-      const existing = await app.db
-        .select({ id: contacts.id, email: contacts.email })
-        .from(contacts)
-        .where(and(eq(contacts.companyId, req.companyId!), isNull(contacts.deletedAt)));
-      const byEmail = new Map(
-        existing.filter((c) => c.email).map((c) => [c.email!.trim().toLowerCase(), c.id]),
+      const vendorByName = await loadVendorsByName(
+        app.db,
+        req.companyId!,
+        referencedVendorNames(writable),
       );
+      /*
+       * An employer named in the file that matches no vendor is reported, not
+       * silently dropped. The preview flags it per row; the commit repeats
+       * the distinct names so the outcome survives the review step.
+       */
+      unresolvedVendors = unresolvedVendorNames(writable, vendorByName);
+      // Bounded by the emails the file mentions rather than every contact of
+      // the tenant (PLAN §6.4).
+      const fileEmails = [
+        ...new Set(writable.map((r) => (r["email"] ?? "").trim().toLowerCase()).filter(Boolean)),
+      ];
+      const byEmail = new Map<string, string>();
+      const CHUNK = 500;
+      for (let i = 0; i < fileEmails.length; i += CHUNK) {
+        const chunk = fileEmails.slice(i, i + CHUNK);
+        const existing = await app.db
+          .select({ id: contacts.id, email: contacts.email })
+          .from(contacts)
+          .where(
+            and(
+              eq(contacts.companyId, req.companyId!),
+              isNull(contacts.deletedAt),
+              inArray(sql<string>`lower(${contacts.email})`, chunk),
+            ),
+          );
+        for (const c of existing) {
+          if (c.email) byEmail.set(c.email.trim().toLowerCase(), c.id);
+        }
+      }
       await app.db.transaction(async (tx) => {
         for (const row of writable) {
           const name = (row["name"] ?? "").trim();
@@ -1771,7 +1907,7 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
       action: "create",
       objectType: "import_job",
       objectId: jobId,
-      payload: { dataset: job.dataset, created, updated },
+      payload: { dataset: job.dataset, created, updated, unresolvedVendors },
       storePayload: true,
     });
     return {
@@ -1780,6 +1916,7 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
       created,
       updated,
       skipped: preview.rowCount - writable.length,
+      unresolvedVendors,
     };
   });
 };

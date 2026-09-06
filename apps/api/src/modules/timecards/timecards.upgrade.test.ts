@@ -968,6 +968,220 @@ describe("health inputs and jobs", () => {
   });
 });
 
+/* ================================================================== */
+/* The week's route surface, end to end                                */
+/* ================================================================== */
+
+/**
+ * Collect → submit → approve → lock → export is the path every hour a
+ * subcontractor is paid for actually travels, and four of its five steps had
+ * no test at all. They are the steps after which a correction stops being an
+ * edit, so a regression here is money out of the door.
+ */
+describe("batch lifecycle: collect, submit, approve, lock, export", () => {
+  let batchId = "";
+  let cardIds: string[] = [];
+
+  it("collects the crew's week and is idempotent about it", async () => {
+    const a = await makeCard(workerIds[0]!, day(100), 8);
+    const b = await makeCard(workerIds[1]!, day(101), 8);
+    cardIds = [a.id, b.id];
+
+    const batch = await post(`/projects/${projectId}/timecard-batches`, {
+      crewId,
+      periodStart: day(98),
+      periodEnd: day(104),
+    });
+    expect(batch.statusCode, batch.body).toBe(201);
+    batchId = batch.json().id as string;
+    expect(batch.json().rollup.timecardCount).toBe(0);
+
+    const collected = await post(
+      `/projects/${projectId}/timecard-batches/${batchId}/collect`,
+      {},
+    );
+    expect(collected.statusCode, collected.body).toBe(200);
+    expect(collected.json().collected.collected).toHaveLength(2);
+    expect(collected.json().rollup.totalHours).toBe(16);
+
+    // A second collect finds nothing new — cards already in the batch are not
+    // re-collected and not reported as skipped conflicts.
+    const again = await post(
+      `/projects/${projectId}/timecard-batches/${batchId}/collect`,
+      {},
+    );
+    expect(again.statusCode).toBe(200);
+    expect(again.json().collected.collected).toHaveLength(0);
+    expect(again.json().rollup.timecardCount).toBe(2);
+  });
+
+  it("will not collect a card that already belongs to another batch", async () => {
+    const other = await post(`/projects/${projectId}/timecard-batches`, {
+      crewId,
+      periodStart: day(98),
+      periodEnd: day(104),
+    });
+    expect(other.statusCode).toBe(201);
+    const res = await post(
+      `/projects/${projectId}/timecard-batches/${other.json().id}/collect`,
+      { timecardIds: cardIds },
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.json().collected.collected).toHaveLength(0);
+    expect(res.json().collected.skipped).toHaveLength(2);
+    expect(res.json().collected.skipped[0].reason).toContain("already in another batch");
+  });
+
+  it("submits the week and moves every card with it", async () => {
+    const res = await post(`/projects/${projectId}/timecard-batches/${batchId}/submit`, {
+      comment: "Week ending — groundworks gang",
+    });
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json().status).toBe("submitted");
+    const rows = await app.db
+      .select()
+      .from(timecards)
+      .where(eq(timecards.batchId, batchId));
+    expect(rows.every((r) => r.status === "submitted")).toBe(true);
+  });
+
+  it("refuses the lock while the week is still only submitted", async () => {
+    const res = await post(`/projects/${projectId}/timecard-batches/${batchId}/lock`, {});
+    expect(res.statusCode).toBe(409);
+  });
+
+  it("approves the week through an approver who raised none of its cards", async () => {
+    const res = await post(
+      `/projects/${projectId}/timecard-batches/${batchId}/approve`,
+      { decision: "approved", comment: "Checked against the gate log" },
+      approver.headers,
+    );
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json().status).toBe("approved");
+    expect(res.json().level).toBe(1);
+    expect(res.json().approvalProgress).toContain("approved 1 of 1");
+    const rows = await app.db
+      .select()
+      .from(timecards)
+      .where(eq(timecards.batchId, batchId));
+    expect(rows.every((r) => r.status === "approved")).toBe(true);
+  });
+
+  it("locks the week, freezing every approved card in it", async () => {
+    const res = await post(`/projects/${projectId}/timecard-batches/${batchId}/lock`, {});
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json().status).toBe("locked");
+    const rows = await app.db
+      .select()
+      .from(timecards)
+      .where(eq(timecards.batchId, batchId));
+    expect(rows.every((r) => r.status === "locked")).toBe(true);
+    expect(rows.every((r) => r.lockedAt !== null)).toBe(true);
+
+    // A locked card is not editable, and the refusal says so rather than
+    // silently accepting the edit.
+    const edit = await patch(`/projects/${projectId}/timecards/${cardIds[0]}`, {
+      workedHours: 9,
+    });
+    expect(edit.statusCode).toBe(409);
+  });
+
+  it("exports the locked week to payroll and stamps the external reference", async () => {
+    const res = await post(`/projects/${projectId}/timecard-batches/${batchId}/export`, {
+      payrollBatchRef: "SAGE-2026-W14",
+    });
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json().status).toBe("exported");
+    const rows = await app.db
+      .select()
+      .from(timecards)
+      .where(eq(timecards.batchId, batchId));
+    expect(rows.every((r) => r.payrollBatchRef === "SAGE-2026-W14")).toBe(true);
+  });
+
+  it("refuses a second export of the same week", async () => {
+    const res = await post(`/projects/${projectId}/timecard-batches/${batchId}/export`, {
+      payrollBatchRef: "SAGE-2026-W14-again",
+    });
+    expect(res.statusCode).toBe(409);
+  });
+
+  it("keeps collect, lock and export away from another company", async () => {
+    const stranger = await registerActor(app);
+    for (const path of ["collect", "lock", "export"]) {
+      const res = await post(
+        `/projects/${projectId}/timecard-batches/${batchId}/${path}`,
+        { payrollBatchRef: "X" },
+        stranger.headers,
+      );
+      expect(res.statusCode, `${path}: ${res.body}`).toBe(403);
+    }
+  });
+});
+
+describe("locking a single card", () => {
+  it("locks an approved card and refuses to lock one that is not approved", async () => {
+    const card = await makeCard(workerIds[2]!, day(110), 8);
+    const tooEarly = await post(`/projects/${projectId}/timecards/${card.id}/lock`, {});
+    expect(tooEarly.statusCode).toBe(409);
+
+    const submitted = await post(`/projects/${projectId}/timecards/${card.id}/submit`, {});
+    expect(submitted.statusCode, submitted.body).toBe(200);
+    const approved = await post(
+      `/projects/${projectId}/timecards/${card.id}/approve`,
+      { decision: "approved" },
+      approver.headers,
+    );
+    expect(approved.statusCode, approved.body).toBe(200);
+
+    const locked = await post(`/projects/${projectId}/timecards/${card.id}/lock`, {
+      note: "Paid on the March run",
+    });
+    expect(locked.statusCode, locked.body).toBe(200);
+    expect(locked.json().status).toBe("locked");
+    const rows = await app.db.select().from(timecards).where(eq(timecards.id, card.id));
+    expect(rows[0]?.lockedAt).toBeTruthy();
+    expect((rows[0]?.detail as { lockNote?: string } | null)?.lockNote).toBe(
+      "Paid on the March run",
+    );
+
+    // After the lock the sanctioned correction is a dated adjustment, not an
+    // edit — and the edit is refused rather than quietly applied.
+    const edit = await patch(`/projects/${projectId}/timecards/${card.id}`, {
+      workedHours: 10,
+    });
+    expect(edit.statusCode).toBe(409);
+    const revise = await post(`/projects/${projectId}/timecards/${card.id}/revise`, {
+      workedHours: 10,
+      reason: "Two hours were left off the card",
+    });
+    expect(revise.statusCode, revise.body).toBe(201);
+  });
+});
+
+describe("productivity detector run", () => {
+  it("raises nothing when no week is measurable, and says why", async () => {
+    const res = await post(`/projects/${projectId}/labour-productivity/run`, {
+      from: day(200),
+      to: day(213),
+    });
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json().raised).toBe(0);
+    expect(res.json().deviation).toBeNull();
+    expect(res.json().note).toContain("no measurable week");
+  });
+
+  it("is refused to another company", async () => {
+    const stranger = await registerActor(app);
+    const res = await post(
+      `/projects/${projectId}/labour-productivity/run`,
+      {},
+      stranger.headers,
+    );
+    expect(res.statusCode).toBe(403);
+  });
+});
+
 describe("tenant isolation", () => {
   it("refuses another company's project entirely", async () => {
     const stranger = await registerActor(app);

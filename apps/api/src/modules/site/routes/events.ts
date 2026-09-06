@@ -161,67 +161,72 @@ export const environmentalRoutes: FastifyPluginAsync = async (app) => {
       }
     }
 
-    // Mirror into the platform-wide occurrence log so forensics and assurance
-    // see this in the same chronology as every other event.
+    // The site record and its mirror in the platform-wide occurrence log are
+    // one fact in two tables: written together, or not at all. A mirror with
+    // no site record behind it would leave forensics an occurrence nothing
+    // explains, and a re-post would mint a second one.
     const assuranceEventId = newId("evt");
-    await app.db.insert(platformEvents).values({
-      id: assuranceEventId,
-      companyId,
-      projectId,
-      type: `site_${body.category}`,
-      occurredAt: body.occurredAt,
-      location: body.locationId ?? body.sensorRef ?? null,
-      detectedOrReported: body.detectedVia === "sensor" ? "detected" : "reported",
-      payload: {
-        reference,
-        category: body.category,
-        magnitude: body.magnitude ?? null,
-        magnitudeUnit: body.magnitudeUnit ?? null,
-        thresholdValue: body.thresholdValue ?? null,
-        exceeded,
-        workStopped: body.workStopped,
-        stoppageMinutes: body.stoppageMinutes ?? null,
-      },
-      createdBy: req.user!.id,
-    });
-
-    const [row] = await app.db
-      .insert(siteEnvironmentalEvents)
-      .values({
-        id,
+    const row = await app.db.transaction(async (tx) => {
+      await tx.insert(platformEvents).values({
+        id: assuranceEventId,
         companyId,
         projectId,
-        number,
-        reference,
-        category: body.category,
-        detectedVia: body.detectedVia,
+        type: `site_${body.category}`,
         occurredAt: body.occurredAt,
-        durationMinutes: body.durationMinutes ?? null,
-        magnitude: body.magnitude ?? null,
-        magnitudeUnit: body.magnitudeUnit ?? null,
-        thresholdValue: body.thresholdValue ?? null,
-        thresholdUnit: body.thresholdUnit ?? null,
-        exceededThreshold: exceeded ? 1 : 0,
-        severity: body.severity,
-        status: "open",
-        locationId: body.locationId ?? null,
-        zoneId: body.zoneId ?? null,
-        lat: body.lat ?? null,
-        lon: body.lon ?? null,
-        sensorRef: body.sensorRef ?? null,
-        impact: body.impact ?? null,
-        workStopped: body.workStopped ? 1 : 0,
-        stoppageMinutes: body.stoppageMinutes ?? null,
-        actionsTaken: body.actionsTaken ?? null,
-        weatherObservationId: body.weatherObservationId ?? null,
-        assuranceEventId,
-        signalId,
-        fileIds: body.fileIds,
-        notes: body.notes ?? null,
-        reportedByName: body.reportedByName ?? null,
+        location: body.locationId ?? body.sensorRef ?? null,
+        detectedOrReported: body.detectedVia === "sensor" ? "detected" : "reported",
+        payload: {
+          reference,
+          category: body.category,
+          magnitude: body.magnitude ?? null,
+          magnitudeUnit: body.magnitudeUnit ?? null,
+          thresholdValue: body.thresholdValue ?? null,
+          exceeded,
+          workStopped: body.workStopped,
+          stoppageMinutes: body.stoppageMinutes ?? null,
+        },
         createdBy: req.user!.id,
-      })
-      .returning();
+      });
+
+      const [saved] = await tx
+        .insert(siteEnvironmentalEvents)
+        .values({
+          id,
+          companyId,
+          projectId,
+          number,
+          reference,
+          category: body.category,
+          detectedVia: body.detectedVia,
+          occurredAt: body.occurredAt,
+          durationMinutes: body.durationMinutes ?? null,
+          magnitude: body.magnitude ?? null,
+          magnitudeUnit: body.magnitudeUnit ?? null,
+          thresholdValue: body.thresholdValue ?? null,
+          thresholdUnit: body.thresholdUnit ?? null,
+          exceededThreshold: exceeded ? 1 : 0,
+          severity: body.severity,
+          status: "open",
+          locationId: body.locationId ?? null,
+          zoneId: body.zoneId ?? null,
+          lat: body.lat ?? null,
+          lon: body.lon ?? null,
+          sensorRef: body.sensorRef ?? null,
+          impact: body.impact ?? null,
+          workStopped: body.workStopped ? 1 : 0,
+          stoppageMinutes: body.stoppageMinutes ?? null,
+          actionsTaken: body.actionsTaken ?? null,
+          weatherObservationId: body.weatherObservationId ?? null,
+          assuranceEventId,
+          signalId,
+          fileIds: body.fileIds,
+          notes: body.notes ?? null,
+          reportedByName: body.reportedByName ?? null,
+          createdBy: req.user!.id,
+        })
+        .returning();
+      return saved!;
+    });
 
     await ledger(app.db, {
       companyId,

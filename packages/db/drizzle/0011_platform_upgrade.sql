@@ -6971,6 +6971,7 @@ CREATE TABLE "site_progress_observations" (
 	"claim_source_id" text,
 	"claimant_id" text NOT NULL,
 	"claimant_kind" text DEFAULT 'user' NOT NULL,
+	"claimant_name" text,
 	"claimed_at" timestamp with time zone,
 	"scan_id" text,
 	"drone_flight_id" text,
@@ -9001,6 +9002,8 @@ CREATE INDEX "delay_events_schedule_idx" ON "delay_events" USING btree ("schedul
 CREATE INDEX "delay_events_start_idx" ON "delay_events" USING btree ("project_id","start_date");--> statement-breakpoint
 CREATE INDEX "delay_events_notice_idx" ON "delay_events" USING btree ("status","notice_due_date");--> statement-breakpoint
 CREATE INDEX "forensic_claims_status_idx" ON "forensic_claims" USING btree ("company_id","status");--> statement-breakpoint
+CREATE INDEX "engagements_kind_idx" ON "engagements" USING btree ("project_id","kind");--> statement-breakpoint
+CREATE INDEX "engagements_stakeholders_idx" ON "engagements" USING gin ("stakeholder_ids");--> statement-breakpoint
 CREATE UNIQUE INDEX "payroll_entries_uq" ON "payroll_entries" USING btree ("worker_id","period_start","period_end","source_ref");--> statement-breakpoint
 CREATE INDEX "carbon_entries_boq_item_idx" ON "carbon_entries" USING btree ("project_id","boq_item_id");--> statement-breakpoint
 CREATE INDEX "local_content_readings_company_idx" ON "local_content_readings" USING btree ("company_id");--> statement-breakpoint

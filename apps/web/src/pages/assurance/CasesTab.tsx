@@ -30,6 +30,7 @@ import {
 import { formatDateTime, humanize } from "../format";
 import {
   downloadAuthenticated,
+  PackAccessLog,
   severityTone,
   StatCard,
   truncateMiddle,
@@ -107,6 +108,7 @@ export default function CasesTab() {
   const [form, setForm] = useState({ title: "", summary: "", severity: "medium" });
   const [createError, setCreateError] = useState<string | null>(null);
 
+  const [openAccess, setOpenAccess] = useState<string | null>(null);
   const [referTarget, setReferTarget] = useState("");
   const [packResult, setPackResult] = useState<{ root: string; statement: string } | null>(null);
 
@@ -378,28 +380,44 @@ export default function CasesTab() {
                 {detail.packs.length > 0 ? (
                   <ul className="mt-3 space-y-1 text-xs">
                     {detail.packs.map((p) => (
-                      <li key={p.id} className="flex items-center justify-between gap-2">
-                        <span>
-                          {p.title} · {p.itemCount} item{p.itemCount === 1 ? "" : "s"} ·{" "}
-                          {formatDateTime(p.generatedAt)}
-                          {p.sealSequence !== null ? ` · seal #${p.sealSequence}` : " · unsealed"}
-                        </span>
-                        <button
-                          type="button"
-                          className="text-brand-700 underline"
-                          onClick={() => {
-                            void downloadAuthenticated(
-                              `/api/v1/evidence-packs/${p.id}/download`,
-                              `constructos-evidence-pack-${p.id}.json`,
-                            ).catch((err: unknown) =>
-                              setDetailError(
-                                err instanceof Error ? err.message : "Download failed",
-                              ),
-                            );
-                          }}
-                        >
-                          JSON
-                        </button>
+                      <li key={p.id}>
+                        <div className="flex items-center justify-between gap-2">
+                          <span>
+                            {p.title} · {p.itemCount} item{p.itemCount === 1 ? "" : "s"} ·{" "}
+                            {formatDateTime(p.generatedAt)}
+                            {p.sealSequence !== null ? ` · seal #${p.sealSequence}` : " · unsealed"}
+                          </span>
+                          <span className="flex shrink-0 gap-2">
+                            <button
+                              type="button"
+                              className="text-brand-700 underline"
+                              onClick={() => {
+                                void downloadAuthenticated(
+                                  `/api/v1/evidence-packs/${p.id}/download`,
+                                  `constructos-evidence-pack-${p.id}.json`,
+                                ).catch((err: unknown) =>
+                                  setDetailError(
+                                    err instanceof Error ? err.message : "Download failed",
+                                  ),
+                                );
+                              }}
+                            >
+                              JSON
+                            </button>
+                            <button
+                              type="button"
+                              className="text-ink-600 underline"
+                              onClick={() => setOpenAccess((cur) => (cur === p.id ? null : p.id))}
+                            >
+                              {openAccess === p.id ? "Hide custody" : "Custody"}
+                            </button>
+                          </span>
+                        </div>
+                        {openAccess === p.id ? (
+                          <div className="mt-1 rounded border border-ink-100 bg-ink-50/60 px-2 py-1.5">
+                            <PackAccessLog packId={p.id} />
+                          </div>
+                        ) : null}
                       </li>
                     ))}
                   </ul>

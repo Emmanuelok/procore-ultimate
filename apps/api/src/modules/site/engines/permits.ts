@@ -249,14 +249,23 @@ export function loneWorkerDue(sessions: readonly LoneWorkerClock[], now: string)
   return out.sort((a, b) => b.lateMinutes - a.lateMinutes);
 }
 
-/** Permits whose validity window has closed while they were still open. */
+/**
+ * Permits whose validity window has closed while they were still open.
+ *
+ * "Open" includes REQUESTED: a permit raised on Monday for Tuesday's work and
+ * never approved is not live work, but it is not an open item either once its
+ * window has passed, and leaving it in `requested` for ever kept it counting
+ * in the workspace's open-permit figure. It expires with the rest.
+ */
+export const EXPIRABLE_PERMIT_STATUSES = ["requested", "approved", "active", "suspended"] as const;
+
 export function expiredPermits<T extends { id: string; status: string; validTo: string | null }>(
   permits: readonly T[],
   now: string,
 ): T[] {
   const nowMs = Date.parse(now);
   return permits.filter((p) => {
-    if (p.status !== "active" && p.status !== "approved" && p.status !== "suspended") return false;
+    if (!(EXPIRABLE_PERMIT_STATUSES as readonly string[]).includes(p.status)) return false;
     if (!p.validTo) return false;
     const to = Date.parse(p.validTo);
     return Number.isFinite(to) && to < nowMs;

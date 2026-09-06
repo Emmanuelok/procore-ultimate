@@ -195,8 +195,16 @@ export interface AgentAction {
   actionType: string;
   targetType: string;
   targetId: string | null;
-  beforeImage: Record<string, unknown> | null;
-  afterImage: Record<string, unknown> | null;
+  /**
+   * Present only on GET /agents/actions/:id. The list projection carries
+   * `hasBeforeImage`/`hasAfterImage` instead: the images are the operational
+   * record content the agent moved and are gated by the tool that owns the
+   * target, not by `ai:read`.
+   */
+  beforeImage?: Record<string, unknown> | null;
+  afterImage?: Record<string, unknown> | null;
+  hasBeforeImage?: boolean;
+  hasAfterImage?: boolean;
   status: string;
   reversible: number;
   irreversibleReason: string | null;
@@ -259,13 +267,41 @@ export interface UsageResponse {
   >;
 }
 
-export interface ModelsResponse {
+/**
+ * GET /ai/models — the transparency statement (#775, X #1027). Its rows come
+ * from the AGENT INVENTORY, not from the /agents descriptor, so they carry
+ * the inventory's fields plus the model and the tenant's policy; they do NOT
+ * carry the run counters. Typing it as an AgentDescriptor claimed fields the
+ * route never sends.
+ */
+export interface ModelInventoryAgent {
+  kind: string;
+  name: string;
+  description: string;
+  category: AgentDescriptor["category"];
+  scope: AgentDescriptor["scope"];
+  inputs: string[];
+  outputs: string[];
+  dataCategories: string[];
+  requiredTools: string[];
+  targetTypes: string[];
+  consequential: boolean;
+  schedulable: boolean;
+  runnable: boolean;
+  requireCitations: boolean;
+  route: string;
+  promptVersion: string | null;
+  model: string | null;
+  policy: AgentPolicy | null;
+}
+
+export interface ModelInventory {
   provider: string;
   enabled: boolean;
-  defaultModel: string;
+  defaultModel: string | null;
   retentionStatement: string;
   humanInTheLoop: string;
-  agents: Array<AgentDescriptor & { model: string; policy: AgentPolicy | null }>;
+  agents: ModelInventoryAgent[];
 }
 
 export interface AgentRunResult {

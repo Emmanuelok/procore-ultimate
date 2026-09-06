@@ -838,3 +838,160 @@ describe("tenant isolation", () => {
     expect(res.statusCode).toBe(401);
   });
 });
+
+/* ================================================================== */
+/* Regressions — visibility, settled years, and the year an allocation */
+/* is measured in                                                      */
+/* ================================================================== */
+
+describe("regressions — company-gated detail routes and settled authority", () => {
+  let regSourceId: string;
+  let regFrom: string;
+  let regTo: string;
+
+  beforeAll(async () => {
+    const source = await post("/portfolio/funding-sources", {
+      name: "Regression facility",
+      kind: "internal_capital",
+      currency: "GBP",
+      amount: 10_000_000,
+      portfolioId: portfolioA,
+    });
+    regSourceId = source.json().id as string;
+    await post(`/portfolio/funding-sources/${regSourceId}/status`, { status: "available" });
+
+    const from = await post("/portfolio/appropriations", {
+      name: "Regression year A",
+      fiscalYear: "2028/29",
+      fundingSourceId: regSourceId,
+      currency: "GBP",
+      appropriatedAmount: 4_000_000,
+      carryForwardPolicy: "lapse",
+    });
+    regFrom = from.json().id as string;
+    const to = await post("/portfolio/appropriations", {
+      name: "Regression year B",
+      fiscalYear: "2029/30",
+      fundingSourceId: regSourceId,
+      currency: "GBP",
+      appropriatedAmount: 1_000_000,
+      carryForwardPolicy: "lapse",
+    });
+    regTo = to.json().id as string;
+    await post(`/portfolio/appropriations/${regFrom}/approve`, {}, admin2Headers);
+    await post(`/portfolio/appropriations/${regTo}/approve`, {}, admin2Headers);
+    const alloc = await post("/portfolio/allocations", {
+      projectId: projectA,
+      appropriationId: regFrom,
+      fundingSourceId: regSourceId,
+      fiscalYear: "2028/29",
+      currency: "GBP",
+      amount: 250_000,
+    });
+    expect(alloc.statusCode).toBe(201);
+  });
+
+  it("does not hand a company member the allocations of projects they are not on", async () => {
+    /* §6.3: the same rule GET /portfolio/allocations already enforces. The
+       facility POSITION still counts every allocation — headroom is a
+       property of the facility, not of who is looking — but the rows are
+       project data and the response says when the list was narrowed. */
+    const asMember = await get(`/portfolio/funding-sources/${regSourceId}`, memberHeaders);
+    expect(asMember.statusCode).toBe(200);
+    expect(asMember.json().allocations).toHaveLength(0);
+    expect(asMember.json().position.allocated).toBe(250_000);
+    expect(
+      asMember.json().reasons.some((r: string) => /not a member of/i.test(r)),
+    ).toBe(true);
+
+    const asOwner = await get(`/portfolio/funding-sources/${regSourceId}`);
+    expect(asOwner.json().allocations).toHaveLength(1);
+    expect(asOwner.json().reasons).toHaveLength(0);
+  });
+
+  it("does not hand a company member the allocations against an appropriation either", async () => {
+    const asMember = await get(`/portfolio/appropriations/${regFrom}`, memberHeaders);
+    expect(asMember.statusCode).toBe(200);
+    expect(asMember.json().allocations).toHaveLength(0);
+    expect(asMember.json().position.allocated).toBe(250_000);
+    expect(
+      asMember.json().reasons.some((r: string) => /not a member of/i.test(r)),
+    ).toBe(true);
+
+    const asOwner = await get(`/portfolio/appropriations/${regFrom}`);
+    expect(asOwner.json().allocations).toHaveLength(1);
+  });
+
+  it("counts the signals it shows: the page and the total agree for a restricted caller", async () => {
+    const asMember = await get("/portfolio/signals?pageSize=100", memberHeaders);
+    expect(asMember.statusCode).toBe(200);
+    const body = asMember.json();
+    expect(body.items.length).toBe(body.total);
+    expect(body.items.every((s: { projectId: string | null }) => s.projectId === null)).toBe(true);
+  });
+
+  it("refuses to vire authority into or out of a year that has been settled", async () => {
+    const proposed = await post("/portfolio/virements", {
+      fromAppropriationId: regFrom,
+      toAppropriationId: regTo,
+      amount: 100_000,
+      reason: "Rephasing between years",
+    });
+    expect(proposed.statusCode).toBe(201);
+    const virementId = proposed.json().id as string;
+
+    // the target year is closed AFTER the virement was proposed
+    const closed = await post(`/portfolio/appropriations/${regTo}/close`, {}, admin2Headers);
+    expect(closed.statusCode).toBe(200);
+    expect(closed.json().appropriation.status).toBe("lapsed");
+
+    const decided = await post(
+      `/portfolio/virements/${virementId}/decide`,
+      { outcome: "approved", decisionNote: "Approved after the year was settled" },
+      admin2Headers,
+    );
+    expect(decided.statusCode).toBe(409);
+    expect(decided.json().message).toMatch(/only approved or committed authority can be vired/i);
+
+    // and the source appropriation was not touched
+    const after = await get(`/portfolio/appropriations/${regFrom}`);
+    expect(after.json().virementNet).toBe(0);
+  });
+
+  it("treats a change of fiscal year as a change of money, and refuses a year the authority is not in", async () => {
+    const created = await post("/portfolio/allocations", {
+      projectId: projectB,
+      appropriationId: regFrom,
+      fiscalYear: "2028/29",
+      currency: "GBP",
+      amount: 100_000,
+    });
+    expect(created.statusCode).toBe(201);
+    const id = created.json().id as string;
+    const approved = await post(`/portfolio/allocations/${id}/approve`, {}, admin2Headers);
+    expect(approved.statusCode).toBe(200);
+
+    /* fiscalYear is the key affordability() matches demand on, so moving it
+       moves the allocation from one envelope's ceiling to another's. It may
+       not ride the approval given against the old year. */
+    const moved = await patch(`/portfolio/allocations/${id}`, { fiscalYear: "2029/30" });
+    expect(moved.statusCode).toBe(400);
+    expect(moved.json().message).toMatch(/is measured in the year of the authority behind it/i);
+
+    const detached = await post("/portfolio/allocations", {
+      projectId: projectB,
+      fundingSourceId: regSourceId,
+      fiscalYear: "2028/29",
+      currency: "GBP",
+      amount: 50_000,
+    });
+    const detachedId = detached.json().id as string;
+    await post(`/portfolio/allocations/${detachedId}/approve`, {}, admin2Headers);
+    const reyeared = await patch(`/portfolio/allocations/${detachedId}`, {
+      fiscalYear: "2030/31",
+    });
+    expect(reyeared.statusCode).toBe(200);
+    expect(reyeared.json().status).toBe("planned");
+    expect(reyeared.json().approvedBy).toBeNull();
+  });
+});

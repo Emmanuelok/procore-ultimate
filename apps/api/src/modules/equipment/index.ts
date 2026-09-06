@@ -16,6 +16,7 @@ import {
 import { z } from "zod";
 import {
   apiTokens,
+  assertions,
   assuranceGrants,
   budgetLineItems,
   carbonFactors,
@@ -36,6 +37,8 @@ import {
   materialItems,
   materialStockMovements,
   nonConformanceReports,
+  evidence,
+  reconciliations,
   obligations,
   projects,
   signals,
@@ -68,6 +71,7 @@ import {
   type HireRateUnit,
   type MaintenanceIntervalKind,
   type MeterType,
+  type ReconciliationResult,
   type SignalSeverity,
   type StockMovementType,
 } from "@constructos/shared";
@@ -265,6 +269,14 @@ const SWEEP_MIN_INTERVAL_MS = 5 * 60_000;
  *  • Delivery receipt validates every line before writing any of them and
  *    books them in ONE transaction; stock movements take a row lock; company
  *    catalogue items hold no stock at all.
+ *  • THE PLANT-HOURS CHECK IS AN ASSURANCE FACT, not only a signal.
+ *    `POST /projects/:id/equipment-telematics/reconciliation/run` records the
+ *    Assertion (hours claimed on the plant sheet, attributed to whoever filled
+ *    it in), the Evidence (the machine's own counter, independence 0.9 — a
+ *    counter can be reset and the device mapping is a human decision) and the
+ *    Reconciliation between them, marked `selfCertified` and downgraded when
+ *    the pack is assembled by one of the claimants. Re-running a window
+ *    replaces the triple instead of stacking a second copy of one finding.
  */
 export const equipmentModule: FastifyPluginAsync = async (app) => {
   const readGate = [
@@ -321,6 +333,33 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       );
     }
   };
+
+  /**
+   * The same narrowing for a route that names a CHILD of a machine rather
+   * than the machine — a certificate to verify, a maintenance record to
+   * countersign. `machineScopeGate` cannot see those ids, and a scope you can
+   * step around by naming the certificate instead of the excavator it belongs
+   * to is not a scope. 404 for the same reason: existence is information.
+   */
+  async function assertMachineVisible(
+    req: FastifyRequest,
+    equipmentId: string,
+  ): Promise<void> {
+    const scope = companyScopeOf(req);
+    if (scope.all) return;
+    const [row] = await app.db
+      .select({ projectId: equipment.projectId })
+      .from(equipment)
+      .where(
+        and(eq(equipment.id, equipmentId), eq(equipment.companyId, req.companyId!)),
+      )
+      .limit(1);
+    if (row && row.projectId && !scope.projectIds.includes(row.projectId)) {
+      throw notFound(
+        `Equipment ${equipmentId} was not found in this company's register.`,
+      );
+    }
+  }
 
   const companyRead = [
     app.authenticate,
@@ -3758,6 +3797,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         .parse(req.body);
       const companyId = req.companyId!;
       const cert = await fetchCertificate(certificateId, companyId);
+      await assertMachineVisible(req, cert.equipmentId);
       if (cert.status === "revoked" || cert.status === "superseded") {
         throw badRequest(`a ${cert.status} certificate cannot be verified`);
       }
@@ -4560,6 +4600,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         .parse(req.body ?? {});
       const companyId = req.companyId!;
       const record = await fetchMaintenanceRecord(recordId, companyId);
+      await assertMachineVisible(req, record.equipmentId);
       if (record.verifiedBy)
         throw conflict("this maintenance record has already been verified");
       const override = await assertIndependent(
@@ -5561,60 +5602,201 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
    * `.varianceHours` is what those columns exist for: the reconciliation
    * must be readable from the utilisation row itself, not only from here.
    */
+  const telematicsReconcileQuery = z.object({
+    from: isoDateSchema.optional(),
+    to: isoDateSchema.optional(),
+    days: z.coerce.number().int().min(1).max(180).optional(),
+    equipmentId: idRef.optional(),
+    /*
+     * The site's offset from UTC in minutes (+480 for UTC+8). A night shift
+     * east of UTC straddles two UTC days, so neither of them matches the
+     * plant sheet the foreman filled in; the caller says which clock the days
+     * are cut on and the default stays UTC.
+     */
+    tzOffsetMinutes: z.coerce.number().int().min(-840).max(840).optional(),
+  });
+
+  /**
+   * Load and compute the plant-hours reconciliation for a window. Shared by
+   * the read (which writes the comparison back onto the utilisation rows and
+   * raises the standing signal) and by the RUN route (which additionally
+   * records the Assertion / Evidence / Reconciliation triple). One code path,
+   * so the register and the assurance record can never disagree.
+   */
+  async function loadTelematicsReconciliation(
+    companyId: string,
+    projectId: string,
+    q: z.infer<typeof telematicsReconcileQuery>,
+  ) {
+    const to = q.to ?? todayISO();
+    const from = q.from ?? addDaysISO(to, -((q.days ?? 14) - 1));
+    const tz = q.tzOffsetMinutes ?? 0;
+
+    const utilClauses = [
+      eq(equipmentUtilisation.companyId, companyId),
+      eq(equipmentUtilisation.projectId, projectId),
+      gte(equipmentUtilisation.utilisationDate, from),
+      lte(equipmentUtilisation.utilisationDate, to),
+    ];
+    if (q.equipmentId)
+      utilClauses.push(eq(equipmentUtilisation.equipmentId, q.equipmentId));
+    const utilRows = await app.db
+      .select()
+      .from(equipmentUtilisation)
+      .where(and(...utilClauses));
+
+    const assigned = await app.db
+      .select({ equipmentId: equipmentAssignments.equipmentId })
+      .from(equipmentAssignments)
+      .where(
+        and(
+          eq(equipmentAssignments.companyId, companyId),
+          eq(equipmentAssignments.projectId, projectId),
+        ),
+      );
+    const machineIds = [
+      ...new Set([
+        ...utilRows.map((r) => r.equipmentId),
+        ...assigned.map((a) => a.equipmentId),
+      ]),
+    ].filter((id) => !q.equipmentId || id === q.equipmentId);
+    if (machineIds.length === 0) {
+      return { from, to, tz, empty: true as const };
+    }
+    const fleet = await app.db
+      .select()
+      .from(equipment)
+      .where(
+        and(
+          eq(equipment.companyId, companyId),
+          inArray(equipment.id, machineIds),
+        ),
+      );
+    const teleRows = await app.db
+      .select()
+      .from(equipmentTelematicsReadings)
+      .where(
+        and(
+          eq(equipmentTelematicsReadings.companyId, companyId),
+          inArray(equipmentTelematicsReadings.equipmentId, machineIds),
+          /*
+           * The window starts CARRY_IN_LOOKBACK_DAYS early on purpose. A
+           * day's engine hours are the last reading of that day minus the
+           * last reading before it began — normally the previous day's
+           * final reading — so the first day of the window needs a reading
+           * from before the window to be measurable at all.
+           */
+          gte(
+            equipmentTelematicsReadings.recordedAt,
+            `${addDaysISO(from, -CARRY_IN_LOOKBACK_DAYS)}T00:00:00.000Z`,
+          ),
+          lte(equipmentTelematicsReadings.recordedAt, `${to}T23:59:59.999Z`),
+        ),
+      );
+
+    /*
+     * Every reading per machine, INCLUDING the carry-in lookback, plus the
+     * days inside the window that the feed itself reported on. Grouping by
+     * calendar day and taking last-minus-first inside each group lost every
+     * hour run between the last reading of one day and the first of the
+     * next, and returned null for any device reporting once a day — which
+     * the 1h + 15% tolerance then turned into "hours the machine does not
+     * corroborate" against an honest plant sheet.
+     */
+    const teleByMachine = new Map<
+      string,
+      { recordedAt: string; engineHours: number | null }[]
+    >();
+    const teleDaysByMachine = new Map<string, Set<string>>();
+    const windowStartMs = Date.parse(`${from}T00:00:00.000Z`) - tz * 60_000;
+    for (const row of teleRows) {
+      if (!row.equipmentId) continue;
+      const list = teleByMachine.get(row.equipmentId) ?? [];
+      list.push({ recordedAt: row.recordedAt, engineHours: row.engineHours });
+      teleByMachine.set(row.equipmentId, list);
+      if (Date.parse(row.recordedAt) < windowStartMs) continue;
+      const days = teleDaysByMachine.get(row.equipmentId) ?? new Set<string>();
+      days.add(localDateOf(row.recordedAt, tz));
+      teleDaysByMachine.set(row.equipmentId, days);
+    }
+    /* manual hours per machine per day — shifts on the same day are summed,
+       because the telematics counter does not know about shifts */
+    const manualByMachineDay = new Map<
+      string,
+      { hours: number; rowIds: string[] }
+    >();
+    for (const row of utilRows) {
+      const key = `${row.equipmentId}|${row.utilisationDate}`;
+      const held = manualByMachineDay.get(key) ?? { hours: 0, rowIds: [] };
+      held.hours = round2(held.hours + row.workingHours);
+      held.rowIds.push(row.id);
+      manualByMachineDay.set(key, held);
+    }
+
+    const inputs: EquipmentReconcileInput[] = fleet.map((machine) => {
+      const dates = new Set<string>();
+      for (const key of manualByMachineDay.keys()) {
+        const [id, date] = key.split("|");
+        if (id === machine.id && date && date >= from && date <= to) dates.add(date);
+      }
+      for (const date of teleDaysByMachine.get(machine.id) ?? []) {
+        if (date >= from && date <= to) dates.add(date);
+      }
+      const series = engineHoursSeries({
+        dates: [...dates],
+        readings: teleByMachine.get(machine.id) ?? [],
+        tzOffsetMinutes: tz,
+      });
+      const days: TelematicsDayInput[] = series.map(({ date, delta }) => {
+        const manual = manualByMachineDay.get(`${machine.id}|${date}`);
+        return {
+          date,
+          manualWorkingHours: manual ? manual.hours : null,
+          telematicsEngineHours: delta.hours,
+          telematicsReasons: delta.reasons,
+        };
+      });
+      return {
+        equipmentId: machine.id,
+        reference: machine.reference,
+        name: machine.name,
+        currency: machine.currency,
+        hireRateAmount: machine.hireRateAmount,
+        hireRateUnit: machine.hireRateUnit as HireRateUnit | null,
+        internalRateAmount: machine.internalRateAmount,
+        operatorRateAmount: machine.operatorRateAmount,
+        days,
+      };
+    });
+
+    const summary = reconcileTelematics(inputs, {
+      periodStart: from,
+      periodEnd: to,
+    });
+
+    return {
+      from,
+      to,
+      tz,
+      empty: false as const,
+      summary,
+      utilRows,
+      manualByMachineDay,
+      teleByMachine,
+      teleRowsById: teleRows,
+    };
+  }
+
   app.get(
     "/projects/:projectId/equipment-telematics/reconciliation",
     { preHandler: readGate },
     async (req) => {
-      const q = z
-        .object({
-          from: isoDateSchema.optional(),
-          to: isoDateSchema.optional(),
-          days: z.coerce.number().int().min(1).max(180).optional(),
-          equipmentId: idRef.optional(),
-          /*
-           * The site's offset from UTC in minutes (+480 for UTC+8). A night
-           * shift east of UTC straddles two UTC days, so neither of them
-           * matches the plant sheet the foreman filled in; the caller says
-           * which clock the days are cut on and the default stays UTC.
-           */
-          tzOffsetMinutes: z.coerce.number().int().min(-840).max(840).optional(),
-        })
-        .parse(req.query);
+      const q = telematicsReconcileQuery.parse(req.query);
       const companyId = req.companyId!;
       const projectId = req.projectId!;
-      const to = q.to ?? todayISO();
-      const from = q.from ?? addDaysISO(to, -((q.days ?? 14) - 1));
-      const tz = q.tzOffsetMinutes ?? 0;
-
-      const utilClauses = [
-        eq(equipmentUtilisation.companyId, companyId),
-        eq(equipmentUtilisation.projectId, projectId),
-        gte(equipmentUtilisation.utilisationDate, from),
-        lte(equipmentUtilisation.utilisationDate, to),
-      ];
-      if (q.equipmentId)
-        utilClauses.push(eq(equipmentUtilisation.equipmentId, q.equipmentId));
-      const utilRows = await app.db
-        .select()
-        .from(equipmentUtilisation)
-        .where(and(...utilClauses));
-
-      const assigned = await app.db
-        .select({ equipmentId: equipmentAssignments.equipmentId })
-        .from(equipmentAssignments)
-        .where(
-          and(
-            eq(equipmentAssignments.companyId, companyId),
-            eq(equipmentAssignments.projectId, projectId),
-          ),
-        );
-      const machineIds = [
-        ...new Set([
-          ...utilRows.map((r) => r.equipmentId),
-          ...assigned.map((a) => a.equipmentId),
-        ]),
-      ].filter((id) => !q.equipmentId || id === q.equipmentId);
-      if (machineIds.length === 0) {
+      const loaded = await loadTelematicsReconciliation(companyId, projectId, q);
+      const { from, to, tz } = loaded;
+      if (loaded.empty) {
         return {
           from,
           to,
@@ -5634,116 +5816,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
             "there is nothing to reconcile",
         };
       }
-      const fleet = await app.db
-        .select()
-        .from(equipment)
-        .where(
-          and(
-            eq(equipment.companyId, companyId),
-            inArray(equipment.id, machineIds),
-          ),
-        );
-      const teleRows = await app.db
-        .select()
-        .from(equipmentTelematicsReadings)
-        .where(
-          and(
-            eq(equipmentTelematicsReadings.companyId, companyId),
-            inArray(equipmentTelematicsReadings.equipmentId, machineIds),
-            /*
-             * The window starts CARRY_IN_LOOKBACK_DAYS early on purpose. A
-             * day's engine hours are the last reading of that day minus the
-             * last reading before it began — normally the previous day's
-             * final reading — so the first day of the window needs a reading
-             * from before the window to be measurable at all.
-             */
-            gte(
-              equipmentTelematicsReadings.recordedAt,
-              `${addDaysISO(from, -CARRY_IN_LOOKBACK_DAYS)}T00:00:00.000Z`,
-            ),
-            lte(equipmentTelematicsReadings.recordedAt, `${to}T23:59:59.999Z`),
-          ),
-        );
-
-      /*
-       * Every reading per machine, INCLUDING the carry-in lookback, plus the
-       * days inside the window that the feed itself reported on. Grouping by
-       * calendar day and taking last-minus-first inside each group lost every
-       * hour run between the last reading of one day and the first of the
-       * next, and returned null for any device reporting once a day — which
-       * the 1h + 15% tolerance then turned into "hours the machine does not
-       * corroborate" against an honest plant sheet.
-       */
-      const teleByMachine = new Map<
-        string,
-        { recordedAt: string; engineHours: number | null }[]
-      >();
-      const teleDaysByMachine = new Map<string, Set<string>>();
-      const windowStartMs = Date.parse(`${from}T00:00:00.000Z`) - tz * 60_000;
-      for (const row of teleRows) {
-        if (!row.equipmentId) continue;
-        const list = teleByMachine.get(row.equipmentId) ?? [];
-        list.push({ recordedAt: row.recordedAt, engineHours: row.engineHours });
-        teleByMachine.set(row.equipmentId, list);
-        if (Date.parse(row.recordedAt) < windowStartMs) continue;
-        const days = teleDaysByMachine.get(row.equipmentId) ?? new Set<string>();
-        days.add(localDateOf(row.recordedAt, tz));
-        teleDaysByMachine.set(row.equipmentId, days);
-      }
-      /* manual hours per machine per day — shifts on the same day are summed,
-         because the telematics counter does not know about shifts */
-      const manualByMachineDay = new Map<
-        string,
-        { hours: number; rowIds: string[] }
-      >();
-      for (const row of utilRows) {
-        const key = `${row.equipmentId}|${row.utilisationDate}`;
-        const held = manualByMachineDay.get(key) ?? { hours: 0, rowIds: [] };
-        held.hours = round2(held.hours + row.workingHours);
-        held.rowIds.push(row.id);
-        manualByMachineDay.set(key, held);
-      }
-
-      const inputs: EquipmentReconcileInput[] = fleet.map((machine) => {
-        const dates = new Set<string>();
-        for (const key of manualByMachineDay.keys()) {
-          const [id, date] = key.split("|");
-          if (id === machine.id && date && date >= from && date <= to) dates.add(date);
-        }
-        for (const date of teleDaysByMachine.get(machine.id) ?? []) {
-          if (date >= from && date <= to) dates.add(date);
-        }
-        const series = engineHoursSeries({
-          dates: [...dates],
-          readings: teleByMachine.get(machine.id) ?? [],
-          tzOffsetMinutes: tz,
-        });
-        const days: TelematicsDayInput[] = series.map(({ date, delta }) => {
-          const manual = manualByMachineDay.get(`${machine.id}|${date}`);
-          return {
-            date,
-            manualWorkingHours: manual ? manual.hours : null,
-            telematicsEngineHours: delta.hours,
-            telematicsReasons: delta.reasons,
-          };
-        });
-        return {
-          equipmentId: machine.id,
-          reference: machine.reference,
-          name: machine.name,
-          currency: machine.currency,
-          hireRateAmount: machine.hireRateAmount,
-          hireRateUnit: machine.hireRateUnit as HireRateUnit | null,
-          internalRateAmount: machine.internalRateAmount,
-          operatorRateAmount: machine.operatorRateAmount,
-          days,
-        };
-      });
-
-      const summary = reconcileTelematics(inputs, {
-        periodStart: from,
-        periodEnd: to,
-      });
+      const { summary, utilRows, manualByMachineDay } = loaded;
 
       /* write the comparison back onto the utilisation rows */
       const now = new Date().toISOString();
@@ -5840,6 +5913,312 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           Object.keys(summary.valueAtRiskByCurrency).length > 1
             ? "value at risk is reported per currency and never added"
             : null,
+      };
+    },
+  );
+
+  /**
+   * RECORD THE RECONCILIATION AS AN ASSURANCE FACT (plan §0, §1).
+   *
+   * The read above computes the comparison and raises the standing signal.
+   * This route additionally writes the platform's three primitives, so the
+   * plant-hours check reads on the owner's assurance page next to every other
+   * claim that has been tested:
+   *
+   *   • ASSERTION — the working hours CLAIMED for the machine in the window,
+   *     attributed to the people who filled in the plant sheets, not to
+   *     whoever ran this route. `duration` in hours, with the utilisation
+   *     rows named as its source.
+   *   • EVIDENCE — the telematics feed for the same window. Independence is
+   *     high but not 1: a counter is a device somebody can reset, and the
+   *     mapping from device to machine is a human decision. Where the feed
+   *     is silent there is no evidence row and the reconciliation says
+   *     `insufficient_evidence` rather than "unsupported" — absence of a
+   *     reading is absence of a reading, never proof of a false claim.
+   *   • RECONCILIATION — the variance, the confidence and the disposition,
+   *     marked `selfCertified` when whoever recorded the hours is also the
+   *     one producing the evidence pack, which is exactly the arrangement
+   *     ADR 0004 forbids from presenting as verified.
+   *
+   * Idempotent per (machine, window): re-running replaces the triple rather
+   * than stacking a second copy of the same finding on the register.
+   */
+  app.post(
+    "/projects/:projectId/equipment-telematics/reconciliation/run",
+    { preHandler: standardGate },
+    async (req) => {
+      const q = telematicsReconcileQuery.parse(req.body ?? {});
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      const actorId = req.user!.id;
+      const loaded = await loadTelematicsReconciliation(companyId, projectId, q);
+      const { from, to } = loaded;
+      if (loaded.empty) {
+        return {
+          from,
+          to,
+          recorded: 0,
+          replaced: 0,
+          skipped: [],
+          reasons: [
+            "no plant is assigned to this project and no utilisation has been recorded — there " +
+              "is nothing to reconcile, which is not the same as everything reconciling",
+          ],
+        };
+      }
+      const { summary, utilRows } = loaded;
+
+      /** who filled in the plant sheets for this machine in this window */
+      const claimantsOf = (equipmentId: string): string[] => [
+        ...new Set(
+          utilRows
+            .filter((r) => r.equipmentId === equipmentId)
+            .map((r) => r.createdBy)
+            .filter((v): v is string => Boolean(v)),
+        ),
+      ];
+
+      const recorded: Array<{
+        equipmentId: string;
+        reference: string;
+        assertionId: string;
+        evidenceId: string | null;
+        reconciliationId: string;
+        result: string;
+        selfCertified: boolean;
+      }> = [];
+      const skipped: Array<{ equipmentId: string; reference: string; reason: string }> = [];
+      let replaced = 0;
+      const nowIso3 = new Date().toISOString();
+
+      for (const row of summary.rows) {
+        if (row.daysCompared === 0 && row.manualHours === 0) {
+          skipped.push({
+            equipmentId: row.equipmentId,
+            reference: row.reference,
+            reason:
+              "no hours were claimed for this machine in the window, so there is no assertion to " +
+              "test",
+          });
+          continue;
+        }
+        const claimants = claimantsOf(row.equipmentId);
+        const sourceId = `${row.equipmentId}|${from}|${to}`;
+
+        /* the reconciliation VERDICT, stated in the platform's vocabulary */
+        const result: ReconciliationResult =
+          row.daysCompared === 0
+            ? "insufficient_evidence"
+            : row.persistent
+              ? "unsupported"
+              : row.daysUnsupported > 0
+                ? "partially_supported"
+                : "supported";
+        /*
+         * Confidence is the share of the window the two streams could
+         * actually be compared on. A verdict drawn from one comparable day
+         * out of fourteen is a weak verdict and says so.
+         */
+        const comparableSpan =
+          row.daysCompared + row.daysWithoutTelematics + row.daysWithoutManual;
+        const confidence =
+          comparableSpan === 0 ? 0 : round2(row.daysCompared / comparableSpan);
+
+        const [existing] = await app.db
+          .select({ id: assertions.id })
+          .from(assertions)
+          .where(
+            and(
+              eq(assertions.companyId, companyId),
+              eq(assertions.projectId, projectId),
+              eq(assertions.sourceType, "equipment_utilisation_window"),
+              eq(assertions.sourceId, sourceId),
+            ),
+          )
+          .limit(1);
+
+        const assertionId = existing?.id ?? newId("asr");
+        const assertionValues = {
+          id: assertionId,
+          companyId,
+          projectId,
+          kind: "duration",
+          claimantId: claimants[0] ?? actorId,
+          claimantKind: "user",
+          value: row.manualHours,
+          unit: "hours",
+          basis:
+            `${row.manualHours} working hour(s) claimed for ${row.reference} ${row.name} on the ` +
+            `plant sheets covering ${from} to ${to}` +
+            (claimants.length > 1 ? ` (${claimants.length} authors)` : ""),
+          sourceType: "equipment_utilisation_window",
+          sourceId,
+          assertedAt: nowIso3,
+          createdBy: actorId,
+        };
+        if (existing) {
+          replaced += 1;
+          await app.db
+            .update(assertions)
+            .set({
+              value: assertionValues.value,
+              basis: assertionValues.basis,
+              claimantId: assertionValues.claimantId,
+              assertedAt: assertionValues.assertedAt,
+            })
+            .where(eq(assertions.id, assertionId));
+          await app.db
+            .delete(reconciliations)
+            .where(
+              and(
+                eq(reconciliations.companyId, companyId),
+                eq(reconciliations.assertionId, assertionId),
+              ),
+            );
+        } else {
+          await app.db.insert(assertions).values(assertionValues);
+        }
+
+        /*
+         * EVIDENCE ONLY WHERE THERE IS EVIDENCE. A window the feed never
+         * reached gets no evidence row: an empty evidence pack presented as
+         * an evidence pack is worse than none, because it reads as tested.
+         */
+        let evidenceId: string | null = null;
+        if (row.daysCompared > 0) {
+          evidenceId = newId("evd");
+          await app.db.insert(evidence).values({
+            id: evidenceId,
+            companyId,
+            projectId,
+            kind: "telematics",
+            source: `telematics feed for ${row.reference} (${from} to ${to})`,
+            contentHash: hashPayload({
+              equipmentId: row.equipmentId,
+              from,
+              to,
+              telematicsHours: row.telematicsHours,
+              days: row.days.map((d) => ({
+                date: d.date,
+                telematicsEngineHours: d.telematicsEngineHours,
+              })),
+            }),
+            capturedAt: nowIso3,
+            /*
+             * High, not total. The counter is produced by the machine and
+             * nobody on the project authors it — but a counter can be reset
+             * and the device-to-machine mapping is a human decision, so this
+             * is not a perfect witness.
+             */
+            independenceScore: 0.9,
+            provenance: {
+              stream: "equipment_telematics_readings",
+              equipmentId: row.equipmentId,
+              periodStart: from,
+              periodEnd: to,
+              daysCompared: row.daysCompared,
+              claimants,
+              recordedBy: actorId,
+            },
+            metadata: {
+              telematicsHours: row.telematicsHours,
+              manualHours: row.manualHours,
+              varianceHours: row.varianceHours,
+              daysUnsupported: row.daysUnsupported,
+              valueAtRisk: row.valueAtRisk,
+              currency: row.currency,
+            },
+            submittedBy: actorId,
+          });
+        }
+
+        /*
+         * SELF-CERTIFIED when the person recording the pack is also one of
+         * the people who claimed the hours. The row is still written — the
+         * comparison happened — but it is marked, and the result is
+         * downgraded so it can never present as an independently tested
+         * claim on the owner's page.
+         */
+        const selfCertified = claimants.includes(actorId);
+        const reconciliationId = newId("rec");
+        await app.db.insert(reconciliations).values({
+          id: reconciliationId,
+          companyId,
+          projectId,
+          assertionId,
+          evidenceIds: evidenceId ? [evidenceId] : [],
+          method: "equipment_hours_vs_telematics",
+          result:
+            selfCertified && result !== "insufficient_evidence"
+              ? "partially_supported"
+              : result,
+          variance: row.varianceHours,
+          variancePercent:
+            row.telematicsHours > 0 && row.varianceHours !== null
+              ? round2((row.varianceHours / row.telematicsHours) * 100)
+              : null,
+          confidence: selfCertified ? round2(confidence * 0.5) : confidence,
+          selfCertified,
+          notes: [
+            `${row.manualHours} claimed hour(s) against ${row.telematicsHours} engine hour(s) ` +
+              `over ${row.daysCompared} comparable day(s) of ${comparableSpan}.`,
+            row.valueAtRisk !== null
+              ? `${row.currency} ${row.valueAtRisk} of plant and operator time rests on the ` +
+                "unsupported hours."
+              : `The money cannot be stated: ${row.reasons.join("; ") || "no hourly rate is recorded"}.`,
+            selfCertified
+              ? "RECORDED BY ONE OF THE CLAIMANTS. The comparison stands but the pack is not " +
+                "independent of the claim, so the result is not offered as verified."
+              : "",
+          ]
+            .filter(Boolean)
+            .join(" "),
+          createdBy: actorId,
+        });
+
+        recorded.push({
+          equipmentId: row.equipmentId,
+          reference: row.reference,
+          assertionId,
+          evidenceId,
+          reconciliationId,
+          result:
+            selfCertified && result !== "insufficient_evidence"
+              ? "partially_supported"
+              : result,
+          selfCertified,
+        });
+      }
+
+      await appendLedger(app.db, {
+        companyId,
+        actorId,
+        action: "create",
+        objectType: "equipment_telematics_reconciliation",
+        objectId: `${projectId}|${from}|${to}`,
+        projectId,
+        payload: {
+          periodStart: from,
+          periodEnd: to,
+          recorded: recorded.length,
+          replaced,
+          skipped: skipped.length,
+          valueAtRiskByCurrency: summary.valueAtRiskByCurrency,
+        },
+      });
+
+      return {
+        from,
+        to,
+        recorded: recorded.length,
+        replaced,
+        rows: recorded,
+        skipped,
+        valueAtRiskByCurrency: summary.valueAtRiskByCurrency,
+        method:
+          "the plant sheet is the ASSERTION and the telematics feed is the EVIDENCE that tests " +
+          "it, authored by different parties through different pathways. Re-running the same " +
+          "window replaces the triple rather than stacking a second copy of the same finding.",
       };
     },
   );

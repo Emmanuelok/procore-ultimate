@@ -74,6 +74,19 @@ export default function PrioritisationTab() {
     ranking.reload();
   }
 
+  async function setModelStatus(status: string) {
+    if (!activeId) return;
+    const res = await action.run(`status-${status}`, () => portfolioApi.setModelStatus(activeId, status));
+    if (res) {
+      toast.success(
+        status === "archived"
+          ? "Model archived — an archived model takes no new scores and cannot be reopened"
+          : `Model marked ${status}`,
+      );
+      reloadAll();
+    }
+  }
+
   const rankColumns = useMemo<DataColumns<McdaRanked>>(
     () => [
       {
@@ -187,6 +200,26 @@ export default function PrioritisationTab() {
             {isAdmin && model && model.status !== "archived" ? (
               <Button size="sm" variant="ghost" onClick={() => setEditingModel(true)}>
                 Edit model
+              </Button>
+            ) : null}
+            {isAdmin && model && model.status === "draft" ? (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => void setModelStatus("active")}
+                loading={action.busy === "status-active"}
+              >
+                Activate
+              </Button>
+            ) : null}
+            {isAdmin && model && model.status !== "archived" ? (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => void setModelStatus("archived")}
+                loading={action.busy === "status-archived"}
+              >
+                Archive
               </Button>
             ) : null}
             {isAdmin ? (
@@ -645,6 +678,17 @@ function ScoreDrawer({
     setRationale(existing?.rationale ?? {});
   }, [projectId, model.scores]);
 
+  const alreadyScored = Boolean(projectId && model.scores?.some((sc) => sc.projectId === projectId));
+
+  async function clearScores() {
+    if (!projectId) return;
+    const res = await action.run("clear", () => portfolioApi.deleteScores(model.id, projectId));
+    if (res !== null) {
+      toast.success("Scores removed; the project falls out of the ranking rather than scoring zero");
+      onSaved();
+    }
+  }
+
   async function submit(e: FormEvent) {
     e.preventDefault();
     const scores: Record<string, number> = {};
@@ -727,6 +771,23 @@ function ScoreDrawer({
           </div>
         ))}
         <Row label="Model version">v{model.version}</Row>
+        {alreadyScored ? (
+          <div className="rounded-md border border-border p-2">
+            <p className="mb-2 text-2xs text-content-subtle">
+              Removing this project's scores takes it out of the ranking entirely. It is not the same as scoring it
+              zero, and the ranking says which projects are unscored rather than ranking them last.
+            </p>
+            <Button
+              size="sm"
+              variant="ghost"
+              type="button"
+              onClick={() => void clearScores()}
+              loading={action.busy === "clear"}
+            >
+              Remove this project's scores
+            </Button>
+          </div>
+        ) : null}
       </form>
     </Drawer>
   );

@@ -27,6 +27,7 @@ import {
 } from "../../ui";
 import { IconApproval, IconPlus } from "../../ui/icons";
 import {
+  ActivityDraftEditor,
   DASH,
   DueBadge,
   LoadError,
@@ -34,10 +35,12 @@ import {
   PLAN_STATUSES,
   ReasonList,
   Row,
+  activityDraftPayload,
   activityTone,
   corrApi,
   count,
   dateTime,
+  emptyActivity,
   isoDate,
   pct,
   planTone,
@@ -49,6 +52,7 @@ import {
   type ActionPlan,
   type ActionPlanDetail,
   type ActionPlanTemplate,
+  type ActivityDraft,
   type Paginated,
 } from "./correspondenceShared";
 
@@ -240,24 +244,6 @@ export default function ActionPlansTab({
 
 /* ================================= Create ================================= */
 
-interface ActivityDraft {
-  title: string;
-  evidenceRequired: boolean;
-  evidenceRequirement: string;
-  isQualityCheckpoint: boolean;
-  dueOffsetDays: string;
-  signoffLabels: string;
-}
-
-const emptyActivity = (): ActivityDraft => ({
-  title: "",
-  evidenceRequired: false,
-  evidenceRequirement: "",
-  isQualityCheckpoint: false,
-  dueOffsetDays: "",
-  signoffLabels: "",
-});
-
 function PlanCreateDrawer({
   projectId,
   open,
@@ -302,20 +288,7 @@ function PlanCreateDrawer({
     const payload: Record<string, unknown> = {
       anchor,
       startDate,
-      activities: activities
-        .filter((a) => a.title.trim() !== "")
-        .map((a) => ({
-          title: a.title.trim(),
-          evidenceRequired: a.evidenceRequired,
-          evidenceRequirement: a.evidenceRequirement.trim() || null,
-          isQualityCheckpoint: a.isQualityCheckpoint,
-          dueOffsetDays: a.dueOffsetDays === "" ? null : Number(a.dueOffsetDays),
-          signoffParties: a.signoffLabels
-            .split(",")
-            .map((l) => l.trim())
-            .filter((l) => l !== "")
-            .map((label) => ({ partyType: "user", label })),
-        })),
+      activities: activityDraftPayload(activities),
     };
     if (templateId) payload["templateId"] = templateId;
     if (title.trim()) payload["title"] = title.trim();
@@ -397,93 +370,7 @@ function PlanCreateDrawer({
         </Field>
 
         {templateId ? null : (
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <span className="text-meta font-semibold text-content">Required activities</span>
-              <Button
-                size="sm"
-                variant="ghost"
-                icon={IconPlus}
-                onClick={() => setActivities((a) => [...a, emptyActivity()])}
-              >
-                Add
-              </Button>
-            </div>
-            {activities.length === 0 ? (
-              <p className="text-2xs text-content-subtle">
-                A plan with no activities cannot be activated — it would enforce nothing.
-              </p>
-            ) : null}
-            {activities.map((activity, index) => (
-              <div key={index} className="space-y-2 rounded-md border border-border p-2">
-                <Input
-                  size="sm"
-                  placeholder="What must be done"
-                  value={activity.title}
-                  onChange={(e) =>
-                    setActivities((rows) => rows.map((r, i) => (i === index ? { ...r, title: e.target.value } : r)))
-                  }
-                />
-                <div className="grid gap-2 sm:grid-cols-2">
-                  <Input
-                    size="sm"
-                    placeholder="Signatories, comma separated"
-                    value={activity.signoffLabels}
-                    onChange={(e) =>
-                      setActivities((rows) =>
-                        rows.map((r, i) => (i === index ? { ...r, signoffLabels: e.target.value } : r)),
-                      )
-                    }
-                  />
-                  <Input
-                    size="sm"
-                    type="number"
-                    min={0}
-                    placeholder="Due, days after start"
-                    value={activity.dueOffsetDays}
-                    onChange={(e) =>
-                      setActivities((rows) =>
-                        rows.map((r, i) => (i === index ? { ...r, dueOffsetDays: e.target.value } : r)),
-                      )
-                    }
-                  />
-                </div>
-                <Input
-                  size="sm"
-                  placeholder="Evidence requirement (leave blank if none)"
-                  value={activity.evidenceRequirement}
-                  onChange={(e) =>
-                    setActivities((rows) =>
-                      rows.map((r, i) =>
-                        i === index
-                          ? { ...r, evidenceRequirement: e.target.value, evidenceRequired: e.target.value.trim() !== "" }
-                          : r,
-                      ),
-                    )
-                  }
-                />
-                <label className="flex items-center gap-2 text-2xs text-content-muted">
-                  <input
-                    type="checkbox"
-                    checked={activity.isQualityCheckpoint}
-                    onChange={(e) =>
-                      setActivities((rows) =>
-                        rows.map((r, i) => (i === index ? { ...r, isQualityCheckpoint: e.target.checked } : r)),
-                      )
-                    }
-                  />
-                  Quality checkpoint — holds every activity after it until it is signed off
-                  <button
-                    type="button"
-                    className="ml-auto text-danger-text hover:underline"
-                    onClick={() => setActivities((rows) => rows.filter((_, i) => i !== index))}
-                  >
-                    Remove
-                  </button>
-                </label>
-              </div>
-            ))}
-          </div>
+          <ActivityDraftEditor activities={activities} onChange={setActivities} />
         )}
       </form>
     </Drawer>
@@ -860,6 +747,69 @@ function PlanDrawer({
               ) : null}
             </section>
           ) : null}
+
+          <section>
+            <h3 className="mb-1 text-meta font-semibold text-content">
+              Completion report{plan.report.complete ? " · complete" : ""}
+            </h3>
+            {plan.report.rows.length === 0 ? (
+              <p className="text-meta text-content-subtle">
+                Nothing to report on: this plan has no activities.
+              </p>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-2xs">
+                  <thead>
+                    <tr className="border-b border-border text-left text-content-subtle">
+                      <th className="py-1 pr-2 font-medium">#</th>
+                      <th className="py-1 pr-2 font-medium">Activity</th>
+                      <th className="py-1 pr-2 font-medium">Status</th>
+                      <th className="py-1 pr-2 text-right font-medium">Evidence</th>
+                      <th className="py-1 pr-2 text-right font-medium">Signatures</th>
+                      <th className="py-1 font-medium">Due</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {plan.report.rows.map((r) => (
+                      <tr key={r.seq} className="border-b border-border/60 align-top">
+                        <td className="py-1 pr-2 tabular-nums text-content-subtle">{r.seq}</td>
+                        <td className="py-1 pr-2 text-content">
+                          {r.title}
+                          {r.isQualityCheckpoint ? (
+                            <Badge tone="accent" size="xs" className="ml-1">
+                              hold point
+                            </Badge>
+                          ) : null}
+                        </td>
+                        <td className="py-1 pr-2">
+                          <Badge tone={activityTone(r.status)} size="xs">
+                            {titleCase(r.status)}
+                          </Badge>
+                        </td>
+                        <td className="py-1 pr-2 text-right tabular-nums text-content-muted">
+                          {r.evidenceRequired ? `${r.evidenceCount} of ≥1` : DASH}
+                        </td>
+                        <td className="py-1 pr-2 text-right tabular-nums text-content-muted">
+                          {r.signoffRequiredCount === 0
+                            ? "none asked"
+                            : `${r.signoffCount}/${r.signoffRequiredCount}`}
+                        </td>
+                        <td className="py-1 text-content-muted">
+                          {r.dueDate === null ? (
+                            DASH
+                          ) : (
+                            <span className={r.overdue ? "text-danger-text" : undefined}>
+                              {isoDate(r.dueDate)}
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
 
           <section>
             <h3 className="mb-1 text-meta font-semibold text-content">What stands in the way</h3>

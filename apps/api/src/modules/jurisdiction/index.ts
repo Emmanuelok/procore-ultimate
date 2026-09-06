@@ -1,18 +1,24 @@
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, gte, inArray, isNotNull, lt, lte } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, inArray, isNotNull, lt, lte, notInArray } from "drizzle-orm";
 import { z } from "zod";
 import {
+  companyMemberships,
   contracts,
   currencyConfigs,
+  files,
   fxRates,
   localContentReadings,
   localContentTargets,
   obligations,
   permits,
   scheduleTasks,
-  signals,
 } from "@constructos/db";
-import { FX_RATE_SOURCES, PERMIT_KINDS, PERMIT_STATUSES } from "@constructos/shared";
+import {
+  FX_RATE_SOURCES,
+  PERMIT_KINDS,
+  PERMIT_STATUSES,
+  type PermitStatus,
+} from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
@@ -20,9 +26,12 @@ import { badRequest, conflict, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { addDaysISO, isoDateSchema, todayISO } from "../field/dates.js";
 import {
+  MARKET_SOURCE_PRIORITY,
+  NON_MARKET_SOURCES,
   buildRateLookup,
   convert,
   normalizeCurrency,
+  resolveRate,
   round2,
   splitPayment,
   validatePortions,
@@ -30,6 +39,9 @@ import {
   type RateLookup,
   type RateQuote,
 } from "./fx.js";
+import { PERMIT_REAPPLY_FROM, PERMIT_TRANSITIONS } from "./reference.js";
+import { registerJurisdictionJobs, runJurisdictionDetectors } from "./detectors.js";
+import { registerGroupRoutes } from "./group.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -237,6 +249,11 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
     app.requireTool("jurisdiction", "standard"),
   ];
   const companyGate = [app.authenticate, app.requireCompany];
+  const companyWriteGate = [
+    app.authenticate,
+    app.requireCompany,
+    app.requireCompanyRole(["owner", "admin", "member"]),
+  ];
 
   /* ---------------------------------------------------------------- */
   /* Fetch helpers                                                     */
@@ -341,11 +358,26 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
    * "as at" the as-of date, never a future one. Restricting to the handful
    * of currencies actually in play keeps this a small, indexed read.
    */
+  /**
+   * Build the rate lookup used by conversion, splitting and the exposure
+   * statement.
+   *
+   * `marketOnly` is the load-bearing option. A currency configuration records
+   * the CONTRACTUAL base-date rates, and teams routinely key those same rates
+   * into the FX register with `source: "contractual"` — which is exactly what
+   * the register invites. Without an exclusion the "market" side of every
+   * variance then resolves to the contractual rate, the variance is 0, and
+   * the exposure statement reports no position while the real spot rate has
+   * moved. A market valuation therefore never sees a contractual quote, and
+   * when two sources quote the same date a central-bank fixing outranks a
+   * broker mark, which outranks a hand-keyed figure.
+   */
   async function loadLookup(
     companyId: string,
     codes: string[],
     asOf: string,
     source?: string,
+    opts?: { marketOnly?: boolean },
   ): Promise<RateLookup> {
     const unique = [...new Set(codes.map(normalizeCurrency))];
     if (unique.length === 0) return buildRateLookup([]);
@@ -356,6 +388,7 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
       inArray(fxRates.toCurrency, unique),
     ];
     if (source) filters.push(eq(fxRates.source, source));
+    if (opts?.marketOnly) filters.push(notInArray(fxRates.source, [...NON_MARKET_SOURCES]));
     const rows = await app.db
       .select()
       .from(fxRates)
@@ -368,227 +401,75 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
       rateDate: r.rateDate,
       source: r.source,
     }));
-    return buildRateLookup(quotes);
+    return buildRateLookup(
+      quotes,
+      opts?.marketOnly ? { sourcePriority: MARKET_SOURCE_PRIORITY } : undefined,
+    );
   }
 
-  /* ---------------------------------------------------------------- */
-  /* Permit sweeps (lazy, idempotent)                                  */
-  /* ---------------------------------------------------------------- */
-
-  /**
-   * Permit ids that already carry a signal from `detector`, so a sweep with
-   * no state flip of its own (the blocks-programme detector) still fires
-   * exactly once per permit.
-   */
-  async function alreadySignalled(
+  /** Every file id must belong to this company, and to this project or none. */
+  async function validatePermitFiles(
     companyId: string,
     projectId: string,
-    detector: string,
-  ): Promise<Set<string>> {
-    const rows = await app.db
-      .select({ refs: signals.evidenceRefs })
-      .from(signals)
-      .where(
-        and(
-          eq(signals.companyId, companyId),
-          eq(signals.projectId, projectId),
-          eq(signals.detector, detector),
-        ),
-      );
-    const ids = new Set<string>();
-    for (const row of rows) {
-      const refs = row.refs as { permitId?: string } | null;
-      if (refs?.permitId) ids.add(refs.permitId);
-    }
-    return ids;
-  }
-
-  /**
-   * Three lazy sweeps, run on permit list reads (the same pattern as the
-   * payments deemed-liability and finance overdue-condition sweeps). Each is
-   * idempotent: (a) and (b) are guarded on a state flip that removes the row
-   * from the next sweep, (c) on the presence of its own signal.
-   *
-   *  (a) A permit still awaiting determination past its statutory due date
-   *      breaches its obligation and raises a MEDIUM signal — the authority
-   *      is late, which is a claim event before it is an escalation.
-   *  (b) A granted permit whose expiry has passed flips to `expired` and
-   *      raises a HIGH signal — work proceeding under a lapsed consent is
-   *      an enforcement exposure.
-   *  (c) An ungranted permit whose blocked tasks start within 30 days
-   *      raises a HIGH signal — the consent-to-programme dependency (#591).
-   */
-  async function sweepPermits(
-    companyId: string,
-    projectId: string,
-    actorId: string,
+    ids: readonly string[],
   ): Promise<void> {
-    const today = todayISO();
-
-    /* (a) determination overdue */
-    const awaiting = await app.db
-      .select()
-      .from(permits)
-      .where(
-        and(
-          eq(permits.companyId, companyId),
-          eq(permits.projectId, projectId),
-          inArray(permits.status, [...AWAITING_STATUSES]),
-          isNotNull(permits.dueAt),
-          lt(permits.dueAt, today),
-          isNotNull(permits.obligationId),
-        ),
-      );
-    for (const permit of awaiting) {
-      if (!permit.obligationId) continue;
-      const [obl] = await app.db
-        .select({ id: obligations.id, status: obligations.status })
-        .from(obligations)
-        .where(eq(obligations.id, permit.obligationId))
-        .limit(1);
-      if (!obl || obl.status !== "open") continue; // already swept
-      await app.db
-        .update(obligations)
-        .set({ status: "breached" })
-        .where(and(eq(obligations.id, obl.id), eq(obligations.status, "open")));
-      await app.db.insert(signals).values({
-        id: newId("sig"),
-        companyId,
-        projectId,
-        detector: "permit_determination_overdue",
-        severity: "medium",
-        confidence: 1,
-        title: `Permit determination overdue — ${permit.authority}: ${permit.title}`,
-        explanation:
-          `Permit #${permit.number} (${permit.kind}) was submitted to ${permit.authority} on ` +
-          `${permit.appliedAt} with an expected determination period of ${permit.expectedDays} days, ` +
-          `expiring ${permit.dueAt}. No determination has been recorded. Authority delay beyond the ` +
-          `statutory period is normally an employer-risk event: record the chase correspondence now, ` +
-          `because the entitlement argument later rests on it.`,
-        evidenceRefs: { permitId: permit.id, dueAt: permit.dueAt },
-      });
-      await appendLedger(app.db, {
-        companyId,
-        actorId,
-        action: "state_change",
-        objectType: "permit",
-        objectId: permit.id,
-        payload: { determination: "overdue", dueAt: permit.dueAt, obligationId: obl.id },
-      });
-    }
-
-    /* (b) granted but expired */
-    const lapsed = await app.db
-      .select()
-      .from(permits)
-      .where(
-        and(
-          eq(permits.companyId, companyId),
-          eq(permits.projectId, projectId),
-          eq(permits.status, "granted"),
-          isNotNull(permits.expiresAt),
-          lt(permits.expiresAt, today),
-        ),
-      );
-    for (const permit of lapsed) {
-      await app.db
-        .update(permits)
-        .set({ status: "expired", updatedAt: new Date().toISOString() })
-        .where(and(eq(permits.id, permit.id), eq(permits.status, "granted")));
-      await app.db.insert(signals).values({
-        id: newId("sig"),
-        companyId,
-        projectId,
-        detector: "permit_expired",
-        severity: "high",
-        confidence: 1,
-        title: `Permit expired — ${permit.authority}: ${permit.title}`,
-        explanation:
-          `Permit #${permit.number} (${permit.kind}), granted ${permit.grantedAt} by ` +
-          `${permit.authority}, expired on ${permit.expiresAt}. Any activity still relying on this ` +
-          `consent is proceeding without authority and is exposed to a stop notice, prosecution or ` +
-          `insurance avoidance. Renew or suspend the dependent work.`,
-        evidenceRefs: { permitId: permit.id, expiresAt: permit.expiresAt },
-      });
-      await appendLedger(app.db, {
-        companyId,
-        actorId,
-        action: "state_change",
-        objectType: "permit",
-        objectId: permit.id,
-        payload: { from: "granted", to: "expired", expiresAt: permit.expiresAt },
-      });
-    }
-
-    /* (c) ungranted permits blocking imminent work (#591) */
-    const horizon = addDaysISO(today, 30);
-    const ungranted = await app.db
-      .select()
-      .from(permits)
-      .where(
-        and(
-          eq(permits.companyId, companyId),
-          eq(permits.projectId, projectId),
-          inArray(permits.status, ["not_started", "applied", "in_review", "refused", "expired"]),
-        ),
-      );
-    const blocking = ungranted.filter((p) => (p.blockingTaskIds ?? []).length > 0);
-    if (blocking.length > 0) {
-      const seen = await alreadySignalled(companyId, projectId, "permit_blocks_programme");
-      const candidates = blocking.filter((p) => !seen.has(p.id));
-      if (candidates.length > 0) {
-        const taskIds = [...new Set(candidates.flatMap((p) => p.blockingTaskIds ?? []))];
-        const tasks = await app.db
-          .select()
-          .from(scheduleTasks)
-          .where(
-            and(inArray(scheduleTasks.id, taskIds), eq(scheduleTasks.projectId, projectId)),
-          );
-        const taskById = new Map(tasks.map((t) => [t.id, t]));
-        for (const permit of candidates) {
-          const imminent = (permit.blockingTaskIds ?? [])
-            .map((id) => taskById.get(id))
-            .filter((t): t is (typeof tasks)[number] => Boolean(t))
-            .map((t) => ({ task: t, start: t.startDate ?? t.constraintDate }))
-            .filter((x): x is { task: (typeof tasks)[number]; start: string } =>
-              Boolean(x.start && x.start <= horizon),
-            )
-            .sort((a, b) => a.start.localeCompare(b.start));
-          const soonest = imminent[0];
-          if (!soonest) continue;
-          const days = daysUntil(soonest.start);
-          await app.db.insert(signals).values({
-            id: newId("sig"),
-            companyId,
-            projectId,
-            detector: "permit_blocks_programme",
-            severity: "high",
-            confidence: 0.9,
-            title: `Consent not in place for work starting in ${days} day${days === 1 ? "" : "s"} — ${permit.title}`,
-            explanation:
-              `Permit #${permit.number} (${permit.kind}, ${permit.authority}) is ${permit.status} and ` +
-              `blocks ${imminent.length} schedule task${imminent.length === 1 ? "" : "s"}, the earliest ` +
-              `being "${soonest.task.name}" starting ${soonest.start}. A consent-to-programme dependency ` +
-              `inside 30 days with no grant on file is a delay already in motion: either the start moves ` +
-              `or the work proceeds unlawfully.`,
-            evidenceRefs: {
-              permitId: permit.id,
-              taskIds: imminent.map((x) => x.task.id),
-              earliestStart: soonest.start,
-            },
-          });
-          await appendLedger(app.db, {
-            companyId,
-            actorId,
-            action: "state_change",
-            objectType: "permit",
-            objectId: permit.id,
-            payload: { blocksProgramme: true, earliestStart: soonest.start, status: permit.status },
-          });
-        }
-      }
+    if (ids.length === 0) return;
+    const unique = [...new Set(ids)];
+    const rows = await app.db
+      .select({ id: files.id, projectId: files.projectId })
+      .from(files)
+      .where(and(inArray(files.id, unique), eq(files.companyId, companyId)));
+    const usable = rows.filter((r) => r.projectId === null || r.projectId === projectId);
+    if (usable.length !== unique.length) {
+      throw badRequest("fileIds must reference files in this company and project");
     }
   }
+
+  /** A permit owner must actually be a member of this tenant. */
+  async function validateOwner(companyId: string, ownerId: string): Promise<void> {
+    const rows = await app.db
+      .select({ id: companyMemberships.id })
+      .from(companyMemberships)
+      .where(
+        and(
+          eq(companyMemberships.companyId, companyId),
+          eq(companyMemberships.userId, ownerId),
+        ),
+      )
+      .limit(1);
+    if (!rows[0]) throw badRequest("ownerId is not a member of this company");
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Detectors                                                         */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * The permit / ICV / local-content detectors used to run lazily on the
+   * permit list read: read the existing signals, compute, insert. With no
+   * lock and no unique key, the two requests the permits workspace fires in
+   * parallel (list + schedule-risk) both saw "no signal yet" and both
+   * inserted one, plus two `state_change` ledger rows — and whoever happened
+   * to open the page, including a read-only assurance grant, became the
+   * ledger actor for a finding they did not make.
+   *
+   * They now run as a scheduled job (system actor, advisory-locked,
+   * fingerprinted, self-reconciling) and reads are pure. `POST
+   * .../jurisdiction/detectors/run` triggers a cycle for operators and tests.
+   */
+  registerJurisdictionJobs(app);
+
+  /* Group structure, consolidation, ICV and computed local content. */
+  registerGroupRoutes(app);
+
+  app.post(
+    "/projects/:projectId/jurisdiction/detectors/run",
+    { preHandler: standardGate },
+    async (req) => {
+      const result = await runJurisdictionDetectors(app.db, req.companyId!, req.projectId!);
+      return { projectId: req.projectId!, ...result };
+    },
+  );
 
   /* ---------------------------------------------------------------- */
   /* Currency configurations (#593-595)                                */
@@ -722,7 +603,15 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
   /* FX rate register (#597) — company-scoped reference data           */
   /* ---------------------------------------------------------------- */
 
-  app.post("/fx-rates", { preHandler: companyGate }, async (req, reply) => {
+  /**
+   * Writing the register is NOT a read-level act. Rates here are immutable
+   * company-wide reference data, and the latest quote per pair silently
+   * becomes the rate every project's converter, split and exposure statement
+   * uses — so a guest (COMPANY_ROLES includes "guest") must not be able to
+   * move the number every certificate is valued at. Reads stay on the plain
+   * company gate.
+   */
+  app.post("/fx-rates", { preHandler: companyWriteGate }, async (req, reply) => {
     const body = fxRateCreateSchema.parse(req.body);
     if (body.fromCurrency === body.toCurrency) {
       throw badRequest("fromCurrency and toCurrency must differ");
@@ -873,10 +762,14 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
       const config = await fetchConfig(configId, req.companyId!, req.projectId!);
       const asOf = body.asOf ?? todayISO();
       const portions = parsePortions(config);
+      // the MARKET side of the variance must never resolve to the very
+      // contractual rate it is being compared against (#599)
       const lookup = await loadLookup(
         req.companyId!,
         [config.baseCurrency, ...portions.map((p) => p.currency)],
         asOf,
+        undefined,
+        { marketOnly: true },
       );
       const result = splitPayment(body.amount, config.baseCurrency, portions, lookup);
       return {
@@ -928,22 +821,69 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
     const items = [];
     for (const config of configs) {
       const contract = config.contractId ? contractById.get(config.contractId) : undefined;
-      const contractSum = contract?.contractSum ?? null;
+      const rawSum = contract?.contractSum ?? null;
+      const contractCurrency = contract ? normalizeCurrency(contract.currency) : null;
+      const baseCurrency = normalizeCurrency(config.baseCurrency);
       const portions = parsePortions(config);
       const notes: string[] = [];
       if (!config.contractId) {
         notes.push("No contract linked — the configuration cannot be valued against a sum.");
-      } else if (contractSum === null) {
+      } else if (rawSum === null) {
         notes.push(
           `Contract "${contract?.name ?? config.contractId}" has no contract sum recorded — ` +
             `the exposure cannot be quantified.`,
         );
       }
+
+      /*
+       * The contract sum is denominated in the CONTRACT's currency, which is
+       * not necessarily the configuration's base currency. Splitting a
+       * EUR 12,000,000 sum as though it were USD does not produce a wrong
+       * rounding — it produces an exposure statement that is wrong by the
+       * whole EUR/USD rate, with nothing in the response saying so. Convert
+       * at the configuration's BASE DATE (that is the date the contractual
+       * portions were struck at), and when no rate exists leave the item
+       * unpriced with the reason rather than pretending the numbers match.
+       */
+      let contractSum: number | null = rawSum;
+      let conversionRate: number | null = null;
+      let conversionRateDate: string | null = null;
+      if (rawSum !== null && contractCurrency && contractCurrency !== baseCurrency) {
+        const baseDateLookup = await loadLookup(
+          req.companyId!,
+          [contractCurrency, baseCurrency],
+          config.baseDate,
+        );
+        const resolved = resolveRate(contractCurrency, baseCurrency, baseDateLookup, baseCurrency);
+        if (resolved && resolved.rate > 0) {
+          conversionRate = resolved.rate;
+          conversionRateDate = resolved.rateDate;
+          contractSum = round2(rawSum * resolved.rate);
+          notes.push(
+            `Contract sum is denominated in ${contractCurrency} but the configuration is based ` +
+              `in ${baseCurrency}: ${round2(rawSum)} ${contractCurrency} × ${resolved.rate} = ` +
+              `${contractSum} ${baseCurrency}, at the ${conversionRateDate ?? config.baseDate} rate ` +
+              `in force on the configuration's base date.`,
+          );
+        } else {
+          contractSum = null;
+          notes.push(
+            `Contract sum is denominated in ${contractCurrency} but the configuration is based ` +
+              `in ${baseCurrency}, and no ${contractCurrency}/${baseCurrency} rate is on file on ` +
+              `or before the base date ${config.baseDate}. The exposure is left unpriced rather ` +
+              `than valuing ${round2(rawSum)} ${contractCurrency} as though it were ${baseCurrency}.`,
+          );
+        }
+      }
+
       if (contractSum === null) {
         items.push({
           configId: config.id,
           contractId: config.contractId,
           contractName: contract?.name ?? null,
+          contractCurrency,
+          conversionRate,
+          conversionRateDate,
           baseCurrency: config.baseCurrency,
           baseDate: config.baseDate,
           contractSum: null,
@@ -961,6 +901,8 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
         req.companyId!,
         [config.baseCurrency, ...portions.map((p) => p.currency)],
         asOf,
+        undefined,
+        { marketOnly: true },
       );
       const split = splitPayment(contractSum, config.baseCurrency, portions, lookup);
       if (split.note) notes.push(split.note);
@@ -970,6 +912,9 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
         configId: config.id,
         contractId: config.contractId,
         contractName: contract?.name ?? null,
+        contractCurrency,
+        conversionRate,
+        conversionRateDate,
         baseCurrency: config.baseCurrency,
         baseDate: config.baseDate,
         contractSum: round2(contractSum),
@@ -1030,6 +975,8 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
     const body = permitCreateSchema.parse(req.body);
     const blockingTaskIds = body.blockingTaskIds ?? [];
     await validateTasks(req.projectId!, blockingTaskIds);
+    await validatePermitFiles(req.companyId!, req.projectId!, body.fileIds ?? []);
+    if (body.ownerId) await validateOwner(req.companyId!, body.ownerId);
     const conditions: PermitCondition[] = (body.conditions ?? []).map((c) => ({
       id: newId("pcn"),
       text: c.text,
@@ -1042,64 +989,78 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
     // the statutory determination clock only starts once an application is in
     const dueAt =
       body.appliedAt && body.expectedDays ? addDaysISO(body.appliedAt, body.expectedDays) : null;
-    let obligationId: string | null = null;
-    if (dueAt) {
-      obligationId = newId("obl");
-      await app.db.insert(obligations).values({
-        id: obligationId,
+    const id = newId("prm");
+    /*
+     * Obligation, number, record and ledger are one act. The obligation used
+     * to be inserted first, outside any transaction: a unique-number race or
+     * a DB error between the two left an orphan open obligation with a
+     * deadline the assurance sweep would later breach against a permit that
+     * does not exist.
+     */
+    const { number, obligationId } = await app.db.transaction(async (tx) => {
+      let obligationId: string | null = null;
+      if (dueAt) {
+        obligationId = newId("obl");
+        await tx.insert(obligations).values({
+          id: obligationId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          sourceClause: `${body.authority} — ${body.title} determination`,
+          trigger: `Application submitted ${body.appliedAt}; ${body.expectedDays}-day determination period`,
+          deadline: `${dueAt}T23:59:59Z`,
+          warnDaysBefore: 7,
+          evidenceRequirement:
+            "Written determination (grant, refusal or requisition) from the authority",
+          status: "open",
+          createdBy: req.user!.id,
+        });
+      }
+      const number = await nextRecordNumber(tx, req.projectId!, "permit");
+      await tx.insert(permits).values({
+        id,
         companyId: req.companyId!,
         projectId: req.projectId!,
-        sourceClause: `${body.authority} — ${body.title} determination`,
-        trigger: `Application submitted ${body.appliedAt}; ${body.expectedDays}-day determination period`,
-        deadline: `${dueAt}T23:59:59Z`,
-        warnDaysBefore: 7,
-        evidenceRequirement: "Written determination (grant, refusal or requisition) from the authority",
-        status: "open",
-        createdBy: req.user!.id,
-      });
-    }
-    const number = await nextRecordNumber(app.db, req.projectId!, "permit");
-    const id = newId("prm");
-    await app.db.insert(permits).values({
-      id,
-      companyId: req.companyId!,
-      projectId: req.projectId!,
-      number,
-      kind: body.kind,
-      title: body.title,
-      authority: body.authority,
-      jurisdiction: body.jurisdiction ?? null,
-      reference: body.reference ?? null,
-      appliedAt: body.appliedAt ?? null,
-      expectedDays: body.expectedDays ?? null,
-      dueAt,
-      status: body.appliedAt ? "applied" : "not_started",
-      conditions,
-      blockingTaskIds,
-      obligationId,
-      fileIds: body.fileIds ?? [],
-      ownerId: body.ownerId ?? null,
-      createdBy: req.user!.id,
-    });
-    await appendLedger(app.db, {
-      companyId: req.companyId!,
-      actorId: req.user!.id,
-      action: "create",
-      objectType: "permit",
-      objectId: id,
-      payload: {
         number,
         kind: body.kind,
         title: body.title,
         authority: body.authority,
+        jurisdiction: body.jurisdiction ?? null,
+        reference: body.reference ?? null,
         appliedAt: body.appliedAt ?? null,
+        expectedDays: body.expectedDays ?? null,
         dueAt,
-        obligationId,
-        blockingTaskIds,
+        status: body.appliedAt ? "applied" : "not_started",
         conditions,
-      },
-      storePayload: true,
+        blockingTaskIds,
+        obligationId,
+        fileIds: body.fileIds ?? [],
+        ownerId: body.ownerId ?? null,
+        createdBy: req.user!.id,
+      });
+      await appendLedger(tx, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "permit",
+        objectId: id,
+        projectId: req.projectId!,
+        payload: {
+          number,
+          kind: body.kind,
+          title: body.title,
+          authority: body.authority,
+          appliedAt: body.appliedAt ?? null,
+          dueAt,
+          obligationId,
+          blockingTaskIds,
+          conditions,
+        },
+        storePayload: true,
+      });
+      return { number, obligationId };
     });
+    void number;
+    void obligationId;
     const created = await fetchPermit(id, req.companyId!, req.projectId!);
     return reply.status(201).send({ ...created, ...permitDerived(created) });
   });
@@ -1121,7 +1082,6 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/permits", { preHandler: readGate }, async (req) => {
     const q = permitListQuery.parse(req.query);
-    await sweepPermits(req.companyId!, req.projectId!, req.user!.id);
     const filters = [eq(permits.companyId, req.companyId!), eq(permits.projectId, req.projectId!)];
     if (q.kind) filters.push(eq(permits.kind, q.kind));
     if (q.status) filters.push(eq(permits.status, q.status));
@@ -1149,7 +1109,6 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
   /** Consent-to-programme dependency map (#591). */
   app.get("/projects/:projectId/permits/schedule-risk", { preHandler: readGate }, async (req) => {
     const q = scheduleRiskQuery.parse(req.query);
-    await sweepPermits(req.companyId!, req.projectId!, req.user!.id);
     const horizon = addDaysISO(todayISO(), q.days);
     const rows = await app.db
       .select()
@@ -1241,6 +1200,9 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
         daysUntilStart: t.startDate ?? t.constraintDate ? daysUntil((t.startDate ?? t.constraintDate)!) : null,
       })),
       obligation,
+      // parcels return this and the UI drives its buttons from it; permits
+      // used to expose every status as a button and accept every one of them
+      allowedTransitions: PERMIT_TRANSITIONS[permit.status as PermitStatus] ?? [],
     };
   });
 
@@ -1249,6 +1211,8 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
     const body = permitPatchSchema.parse(req.body);
     const permit = await fetchPermit(permitId, req.companyId!, req.projectId!);
     if (body.blockingTaskIds) await validateTasks(req.projectId!, body.blockingTaskIds);
+    if (body.fileIds) await validatePermitFiles(req.companyId!, req.projectId!, body.fileIds);
+    if (body.ownerId) await validateOwner(req.companyId!, body.ownerId);
     const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
     for (const field of [
       "kind",
@@ -1317,6 +1281,26 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
       const { permitId } = req.params as { permitId: string };
       const body = permitStatusSchema.parse(req.body);
       const permit = await fetchPermit(permitId, req.companyId!, req.projectId!);
+      /*
+       * A permit is a statutory process, not a free-form status field. The
+       * route used to apply whatever was sent: `granted → applied` left the
+       * determination obligation satisfied and grantedAt populated, so the
+       * overdue sweep could never fire again; `not_started → expired` recorded
+       * the lapse of a consent that was never granted; `in_review` set no
+       * appliedAt, so no clock ran at all.
+       */
+      const current = permit.status as PermitStatus;
+      const allowed = PERMIT_TRANSITIONS[current] ?? [];
+      if (body.status === current) throw badRequest(`Permit is already ${current}`);
+      if (!allowed.includes(body.status)) {
+        throw badRequest(
+          `A ${current} permit cannot move to ${body.status} ` +
+            `(allowed: ${allowed.join(", ") || "none"})`,
+        );
+      }
+      const isReapplication =
+        PERMIT_REAPPLY_FROM.includes(current) && body.status === "applied";
+
       const patch: Record<string, unknown> = {
         status: body.status,
         updatedAt: new Date().toISOString(),
@@ -1324,7 +1308,40 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
       if (body.reference !== undefined) patch["reference"] = body.reference;
       if (body.expiresAt !== undefined) patch["expiresAt"] = body.expiresAt;
 
-      if (body.status === "granted") {
+      if (isReapplication) {
+        /*
+         * A re-application after a refusal or a lapse is a NEW determination,
+         * so it gets a new clock: the previous grant dates are cleared (they
+         * described a consent that no longer exists) and a fresh obligation
+         * is opened when the applicant states an expected period.
+         */
+        const appliedAt = body.grantedAt ?? todayISO();
+        patch["appliedAt"] = appliedAt;
+        patch["grantedAt"] = null;
+        patch["expiresAt"] = body.expiresAt ?? null;
+        const expectedDays = permit.expectedDays;
+        if (expectedDays) {
+          const dueAt = addDaysISO(appliedAt, expectedDays);
+          patch["dueAt"] = dueAt;
+          const obligationId = newId("obl");
+          await app.db.insert(obligations).values({
+            id: obligationId,
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            sourceClause: `${permit.authority} — ${permit.title} re-determination`,
+            trigger: `Re-application submitted ${appliedAt} after ${current}; ${expectedDays}-day determination period`,
+            deadline: `${dueAt}T23:59:59Z`,
+            warnDaysBefore: 7,
+            evidenceRequirement:
+              "Written determination (grant, refusal or requisition) from the authority",
+            status: "open",
+            createdBy: req.user!.id,
+          });
+          patch["obligationId"] = obligationId;
+        } else {
+          patch["dueAt"] = null;
+        }
+      } else if (body.status === "granted") {
         // a grant without a date is not a grant — default to today rather
         // than leaving the register unable to compute an expiry window
         const grantedAt = body.grantedAt ?? todayISO();
@@ -1349,6 +1366,13 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
         }
       } else if (body.status === "applied" && !permit.appliedAt) {
         patch["appliedAt"] = todayISO();
+      } else if (body.status === "in_review" && !permit.appliedAt) {
+        // "in review" means the authority has it: without an application
+        // date no determination clock ever starts, so the sweep is blind
+        patch["appliedAt"] = todayISO();
+        if (permit.expectedDays) {
+          patch["dueAt"] = addDaysISO(todayISO(), permit.expectedDays);
+        }
       }
 
       await app.db.update(permits).set(patch).where(eq(permits.id, permitId));
@@ -1361,6 +1385,8 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
         payload: {
           from: permit.status,
           to: body.status,
+          reapplication: isReapplication,
+          previousObligationId: isReapplication ? permit.obligationId : undefined,
           grantedAt: patch["grantedAt"] ?? permit.grantedAt,
           expiresAt: body.expiresAt ?? permit.expiresAt,
           reference: body.reference ?? permit.reference,
@@ -1368,7 +1394,11 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
         storePayload: true,
       });
       const updated = await fetchPermit(permitId, req.companyId!, req.projectId!);
-      return { ...updated, ...permitDerived(updated) };
+      return {
+        ...updated,
+        ...permitDerived(updated),
+        allowedTransitions: PERMIT_TRANSITIONS[updated.status as PermitStatus] ?? [],
+      };
     },
   );
 

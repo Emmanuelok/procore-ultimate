@@ -674,15 +674,47 @@ function LetterDrawer({
   const action = useAction();
   const [voidReason, setVoidReason] = useState("");
   const [responseNote, setResponseNote] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [editSubject, setEditSubject] = useState("");
+  const [editBody, setEditBody] = useState("");
+  const [editPriority, setEditPriority] = useState("normal");
+  const [editDue, setEditDue] = useState("");
+  const [recipientName, setRecipientName] = useState("");
+  const [recipientEmail, setRecipientEmail] = useState("");
+  const [recipientKind, setRecipientKind] = useState("to");
+  const [recipientAck, setRecipientAck] = useState(false);
 
   useEffect(() => {
     setVoidReason("");
     setResponseNote("");
+    setEditing(false);
+    setRecipientName("");
+    setRecipientEmail("");
+    setRecipientKind("to");
+    setRecipientAck(false);
     action.clear();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [letterId]);
 
   const letter = detail.data;
+
+  useEffect(() => {
+    if (!letter) return;
+    setEditSubject(letter.subject);
+    setEditBody(letter.body ?? "");
+    setEditPriority(letter.priority);
+    setEditDue(letter.responseDueDate ?? "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [letter?.id, letter?.updatedAt]);
+
+  // The API refuses to issue a letter whose workflow still has an undecided
+  // step, so the button is not offered while one is outstanding — an action
+  // that can only 409 is not an action.
+  const approvalsOutstanding = (letter?.approvals ?? []).some((a) => a.status === "pending");
+  const canIssue =
+    letter !== null &&
+    letter !== undefined &&
+    (letter.status === "draft" || (letter.status === "pending_approval" && !approvalsOutstanding));
 
   async function run(key: string, fn: () => Promise<unknown>, message: string) {
     const result = await action.run(key, fn);
@@ -712,7 +744,7 @@ function LetterDrawer({
           {action.error ? <Alert tone="danger" size="sm">{action.error}</Alert> : null}
 
           <div className="flex flex-wrap gap-2">
-            {letter.status === "draft" || letter.status === "pending_approval" ? (
+            {canIssue ? (
               <Button
                 size="sm"
                 icon={IconSend}
@@ -726,6 +758,11 @@ function LetterDrawer({
                 }
               >
                 Issue
+              </Button>
+            ) : null}
+            {letter.status === "draft" ? (
+              <Button size="sm" variant="secondary" onClick={() => setEditing((v) => !v)}>
+                {editing ? "Stop editing" : "Edit"}
               </Button>
             ) : null}
             {letter.status === "draft" && (letter.type?.approvalSteps.length ?? 0) > 0 ? (
@@ -783,6 +820,82 @@ function LetterDrawer({
               </Button>
             ) : null}
           </div>
+
+          {letter.status === "pending_approval" && approvalsOutstanding ? (
+            <p className="text-2xs text-content-subtle">
+              This letter cannot be issued while its workflow still has an undecided step. Decide the
+              outstanding approval below, or reject it back to draft.
+            </p>
+          ) : null}
+
+          {editing && letter.status === "draft" ? (
+            <section className="space-y-3 rounded-md border border-border p-3">
+              <h3 className="text-meta font-semibold text-content">Edit this draft</h3>
+              <Field label="Subject" required>
+                <Input
+                  size="sm"
+                  value={editSubject}
+                  onChange={(e) => setEditSubject(e.target.value)}
+                  maxLength={300}
+                />
+              </Field>
+              <Field label="Body">
+                <Textarea rows={5} value={editBody} onChange={(e) => setEditBody(e.target.value)} />
+              </Field>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <Field label="Priority">
+                  <Select size="sm" value={editPriority} onChange={(e) => setEditPriority(e.target.value)}>
+                    {PRIORITIES.map((p) => (
+                      <option key={p} value={p}>
+                        {titleCase(p)}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+                <Field
+                  label="Response due"
+                  hint={
+                    letter.responseRequired === 1
+                      ? "The obligation is opened against this date at issue."
+                      : "This type does not expect a response."
+                  }
+                >
+                  <Input
+                    size="sm"
+                    type="date"
+                    value={editDue}
+                    onChange={(e) => setEditDue(e.target.value)}
+                  />
+                </Field>
+              </div>
+              <div className="flex justify-end gap-2">
+                <Button size="sm" variant="ghost" onClick={() => setEditing(false)}>
+                  Cancel
+                </Button>
+                <Button
+                  size="sm"
+                  disabled={editSubject.trim() === ""}
+                  loading={action.busy === "patch"}
+                  onClick={async () => {
+                    await run(
+                      "patch",
+                      () =>
+                        corrApi.patchLetter(projectId, letter.id, {
+                          subject: editSubject.trim(),
+                          body: editBody.trim() || null,
+                          priority: editPriority,
+                          responseDueDate: editDue || null,
+                        }),
+                      `${letter.reference} updated.`,
+                    );
+                    setEditing(false);
+                  }}
+                >
+                  Save draft
+                </Button>
+              </div>
+            </section>
+          ) : null}
 
           {letter.status === "issued" || letter.status === "acknowledged" ? (
             <Field label="Response note" hint="Recorded on the ledger alongside the state change.">
@@ -898,10 +1011,99 @@ function LetterDrawer({
                       ) : (
                         <span className="text-2xs text-content-subtle">no acknowledgement asked</span>
                       )}
+                      <Button
+                        size="xs"
+                        variant="ghost"
+                        title="Record that this recipient opened it"
+                        loading={action.busy === `read-${r.id}`}
+                        onClick={() =>
+                          run(
+                            `read-${r.id}`,
+                            () => corrApi.markRead(projectId, r.id),
+                            `Read receipt recorded for ${r.name}.`,
+                          )
+                        }
+                      >
+                        Read
+                      </Button>
+                      {letter.status === "draft" ? (
+                        <button
+                          type="button"
+                          className="text-2xs text-danger-text hover:underline"
+                          onClick={() =>
+                            run(
+                              `drop-${r.id}`,
+                              () => corrApi.removeRecipient(projectId, r.id),
+                              `${r.name} removed.`,
+                            )
+                          }
+                        >
+                          Remove
+                        </button>
+                      ) : null}
                     </div>
                   </li>
                 ))}
               </ul>
+            )}
+            {letter.status === "draft" ? (
+              <div className="mt-2 grid gap-2 rounded-md border border-border p-2 sm:grid-cols-4">
+                <Input
+                  size="sm"
+                  placeholder="Name"
+                  value={recipientName}
+                  onChange={(e) => setRecipientName(e.target.value)}
+                />
+                <Input
+                  size="sm"
+                  placeholder="Email"
+                  value={recipientEmail}
+                  onChange={(e) => setRecipientEmail(e.target.value)}
+                />
+                <Select size="sm" value={recipientKind} onChange={(e) => setRecipientKind(e.target.value)}>
+                  {RECIPIENT_KINDS.map((k) => (
+                    <option key={k} value={k}>
+                      {k.toUpperCase()}
+                    </option>
+                  ))}
+                </Select>
+                <Button
+                  size="sm"
+                  disabled={recipientName.trim() === ""}
+                  loading={action.busy === "add-recipient"}
+                  onClick={async () => {
+                    await run(
+                      "add-recipient",
+                      () =>
+                        corrApi.addLetterRecipient(projectId, letter.id, {
+                          kind: recipientKind,
+                          partyType: "external",
+                          name: recipientName.trim(),
+                          email: recipientEmail.trim() || null,
+                          acknowledgementRequired: recipientAck,
+                        }),
+                      `${recipientName.trim()} added.`,
+                    );
+                    setRecipientName("");
+                    setRecipientEmail("");
+                  }}
+                >
+                  Add
+                </Button>
+                <label className="flex items-center gap-2 text-2xs text-content-muted sm:col-span-4">
+                  <input
+                    type="checkbox"
+                    checked={recipientAck}
+                    onChange={(e) => setRecipientAck(e.target.checked)}
+                  />
+                  Must acknowledge receipt
+                </label>
+              </div>
+            ) : (
+              <p className="mt-1 text-2xs text-content-subtle">
+                The distribution list was frozen at issue: who was served is the fact a dispute turns
+                on. Void and reissue if it was wrong.
+              </p>
             )}
           </section>
 

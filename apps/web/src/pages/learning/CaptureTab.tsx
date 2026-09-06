@@ -412,7 +412,7 @@ export default function CaptureTab({
       </Card>
 
       {/* ------------------------------- reviews ------------------------------ */}
-      <ReviewsPanel projectId={projectId} canAdmin={canAdmin} />
+      <ReviewsPanel projectId={projectId} />
 
       {/* -------------------------------- modals ------------------------------ */}
       <Modal open={createOpen} title="Capture a lesson" onClose={() => setCreateOpen(false)} wide>

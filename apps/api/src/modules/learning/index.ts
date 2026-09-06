@@ -16,9 +16,13 @@ import {
 } from "drizzle-orm";
 import { z } from "zod";
 import {
+  bidOpportunities,
   boqItems,
   companies,
+  contracts,
+  disputes,
   durationLibraryEntries,
+  forensicClaims,
   insuranceCertificates,
   lessonApplications,
   lessonEdges,
@@ -39,6 +43,7 @@ import {
   users,
   valuationLines,
   valuations,
+  variations,
   vendors,
 } from "@constructos/db";
 import {
@@ -105,6 +110,12 @@ import {
   type RateSample,
 } from "./libraries.js";
 import { knownTargetTypes, resolveTarget, targetEntryFor } from "./targets.js";
+import {
+  clausePerformance,
+  normaliseClause,
+  normaliseFamily,
+  procurementRoutePerformance,
+} from "./clauses.js";
 
 /**
  * The library sweep never loads a table unbounded: it reads at most this many
@@ -2065,6 +2076,316 @@ export const learningModule: FastifyPluginAsync = async (app) => {
         "Every figure names the records it came from and a dimension with no records scores " +
         "null rather than zero. Nothing here is a recommendation: it reports what happened, " +
         "and whether that disqualifies a supplier is a human judgement they may answer.",
+    };
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Contract clause and procurement route analytics (#987-988)        */
+  /*                                                                   */
+  /* The company already knows which clause it keeps arguing about —   */
+  /* one war story at a time. Every dispute, forensic claim, variation */
+  /* and obligation already carries the clause it came from, so the    */
+  /* answer is a read away, and a read is what turns a habit into a    */
+  /* measured statement with an n beside it.                           */
+  /*                                                                   */
+  /* Both are deterministic reads with no side effects: nothing here   */
+  /* writes a ledger entry, a signal or an obligation.                 */
+  /* ---------------------------------------------------------------- */
+
+  /** No report loads a table unbounded; each source is capped and says so. */
+  const CLAUSE_SCAN_LIMIT = 20_000;
+
+  app.get("/learning/clause-performance", { preHandler: companyScopedRead }, async (req) => {
+    const q = z
+      .object({
+        contractFamily: z.string().max(60).optional(),
+        clause: z.string().max(120).optional(),
+        minDisputes: z.coerce.number().int().min(0).max(1000).default(0),
+        limit: z.coerce.number().int().min(1).max(500).default(100),
+      })
+      .parse(req.query ?? {});
+    const companyId = req.companyId!;
+    const scope = companyScopeOf(req, "learning");
+    const asOf = todayISO();
+    const visible = scope.all ? null : scope.projectIds;
+    if (visible !== null && visible.length === 0) {
+      return {
+        asOf,
+        items: [],
+        total: 0,
+        unattributed: { disputes: 0, variations: 0, forensicClaims: 0, obligations: 0 },
+        scope: "restricted" as const,
+        truncated: false,
+        reasons: [
+          "You hold learning on no project, so no clause history can be assembled. That is not " +
+            "the same as there being no disputes.",
+        ],
+      };
+    }
+    const disputeRows = await app.db
+      .select({
+        projectId: disputes.projectId,
+        clause: disputes.governingClause,
+        contractFamily: disputes.contractFamily,
+        status: disputes.status,
+        outcome: disputes.outcome,
+        rootCause: disputes.rootCause,
+        amountClaimed: disputes.amountClaimed,
+        amountAwarded: disputes.amountAwarded,
+        currency: disputes.currency,
+        resolvedAt: disputes.resolvedAt,
+      })
+      .from(disputes)
+      .where(
+        and(
+          eq(disputes.companyId, companyId),
+          visible === null ? undefined : inArray(disputes.projectId, visible),
+        ),
+      )
+      .limit(CLAUSE_SCAN_LIMIT);
+
+    const variationRows = await app.db
+      .select({
+        projectId: variations.projectId,
+        clause: variations.clauseRef,
+        status: variations.status,
+        currency: variations.currency,
+        agreedValue: variations.agreedValue,
+        costEstimate: variations.costEstimate,
+        timeImpactDays: variations.timeImpactDays,
+      })
+      .from(variations)
+      .where(
+        and(
+          eq(variations.companyId, companyId),
+          visible === null ? undefined : inArray(variations.projectId, visible),
+        ),
+      )
+      .limit(CLAUSE_SCAN_LIMIT);
+
+    const claimRows = await app.db
+      .select({
+        projectId: forensicClaims.projectId,
+        clause: forensicClaims.clauseRef,
+        status: forensicClaims.status,
+        currency: forensicClaims.currency,
+        amountClaimed: forensicClaims.amountClaimed,
+        amountAssessed: forensicClaims.amountAssessed,
+        daysClaimed: forensicClaims.daysClaimed,
+        daysAssessed: forensicClaims.daysAssessed,
+      })
+      .from(forensicClaims)
+      .where(
+        and(
+          eq(forensicClaims.companyId, companyId),
+          visible === null ? undefined : inArray(forensicClaims.projectId, visible),
+        ),
+      )
+      .limit(CLAUSE_SCAN_LIMIT);
+
+    const obligationRows = await app.db
+      .select({
+        projectId: obligations.projectId,
+        clause: obligations.sourceClause,
+        status: obligations.status,
+      })
+      .from(obligations)
+      .where(
+        and(
+          eq(obligations.companyId, companyId),
+          visible === null ? undefined : inArray(obligations.projectId, visible),
+        ),
+      )
+      .limit(CLAUSE_SCAN_LIMIT);
+
+    const report = clausePerformance({
+      asOf,
+      disputes: disputeRows,
+      variations: variationRows,
+      forensicClaims: claimRows,
+      obligations: obligationRows,
+    });
+
+    const wanted = q.contractFamily ? normaliseFamily(q.contractFamily) : null;
+    const wantedClause = q.clause ? normaliseClause(q.clause) : null;
+    const filtered = report.items.filter(
+      (row) =>
+        (wanted === null || row.contractFamily === wanted) &&
+        (wantedClause === null || row.clause === wantedClause) &&
+        row.disputes >= q.minDisputes,
+    );
+    const truncated =
+      disputeRows.length === CLAUSE_SCAN_LIMIT ||
+      variationRows.length === CLAUSE_SCAN_LIMIT ||
+      claimRows.length === CLAUSE_SCAN_LIMIT ||
+      obligationRows.length === CLAUSE_SCAN_LIMIT;
+
+    return {
+      asOf,
+      items: filtered.slice(0, q.limit),
+      total: filtered.length,
+      unattributed: report.unattributed,
+      scope: visible === null ? ("company" as const) : ("restricted" as const),
+      truncated,
+      sources: [
+        "disputes (governing clause, contract family, claimed vs awarded, outcome, root cause)",
+        "forensic claims (clause reference, claimed vs assessed)",
+        "variations (clause reference, agreed value, time impact)",
+        "obligations materialised from contract clauses (breached vs discharged)",
+      ],
+      reasons: truncated
+        ? [
+            ...report.reasons,
+            `At least one source hit the ${CLAUSE_SCAN_LIMIT.toLocaleString("en-GB")}-row scan ` +
+              "limit, so this report is built from a sample rather than the whole register.",
+          ]
+        : report.reasons,
+    };
+  });
+
+  app.get("/learning/procurement-routes", { preHandler: companyScopedRead }, async (req) => {
+    const companyId = req.companyId!;
+    const scope = companyScopeOf(req, "learning");
+    const asOf = todayISO();
+    const visible = scope.all ? null : scope.projectIds;
+    if (visible !== null && visible.length === 0) {
+      return {
+        asOf,
+        items: [],
+        total: 0,
+        minProjects: 0,
+        scope: "restricted" as const,
+        reasons: [
+          "You hold learning on no project, so no procurement route can be measured.",
+        ],
+      };
+    }
+
+    const projectRows = await app.db
+      .select({ id: projects.id, name: projects.name })
+      .from(projects)
+      .where(
+        and(
+          eq(projects.companyId, companyId),
+          isNull(projects.deletedAt),
+          visible === null ? undefined : inArray(projects.id, visible),
+        ),
+      )
+      .limit(CLAUSE_SCAN_LIMIT);
+    if (projectRows.length === 0) {
+      return {
+        asOf,
+        items: [],
+        total: 0,
+        minProjects: 0,
+        scope: visible === null ? ("company" as const) : ("restricted" as const),
+        reasons: ["No live project is visible to you, so no route can be measured."],
+      };
+    }
+    const projectIds = projectRows.map((p) => p.id);
+
+    /* The route is a fact about how the job was won, and the only place the
+       platform records it is the opportunity the project came from. A project
+       created directly carries none, and inventing one would put a number
+       under something nobody captured — so it is reported as "unrecorded". */
+    const opportunityRows = await app.db
+      .select({
+        projectId: bidOpportunities.projectId,
+        procurementRoute: bidOpportunities.procurementRoute,
+        updatedAt: bidOpportunities.updatedAt,
+      })
+      .from(bidOpportunities)
+      .where(
+        and(
+          eq(bidOpportunities.companyId, companyId),
+          inArray(bidOpportunities.projectId, projectIds),
+        ),
+      )
+      .orderBy(asc(bidOpportunities.updatedAt));
+    const routeByProject = new Map<string, string | null>();
+    for (const o of opportunityRows) {
+      if (o.projectId) routeByProject.set(o.projectId, o.procurementRoute);
+    }
+
+    /* The project's contract terms. Where a project holds several contracts the
+       largest sum is taken as the main one, and the report says so. */
+    const contractRows = await app.db
+      .select({
+        projectId: contracts.projectId,
+        form: contracts.form,
+        contractSum: contracts.contractSum,
+        currency: contracts.currency,
+      })
+      .from(contracts)
+      .where(
+        and(eq(contracts.companyId, companyId), inArray(contracts.projectId, projectIds)),
+      );
+    const contractByProject = new Map<string, (typeof contractRows)[number]>();
+    for (const c of contractRows) {
+      const current = contractByProject.get(c.projectId);
+      if (!current || (c.contractSum ?? 0) > (current.contractSum ?? 0)) {
+        contractByProject.set(c.projectId, c);
+      }
+    }
+
+    const disputeRows = await app.db
+      .select({
+        projectId: disputes.projectId,
+        clause: disputes.governingClause,
+        contractFamily: disputes.contractFamily,
+        status: disputes.status,
+        outcome: disputes.outcome,
+        rootCause: disputes.rootCause,
+        amountClaimed: disputes.amountClaimed,
+        amountAwarded: disputes.amountAwarded,
+        currency: disputes.currency,
+        resolvedAt: disputes.resolvedAt,
+      })
+      .from(disputes)
+      .where(and(eq(disputes.companyId, companyId), inArray(disputes.projectId, projectIds)))
+      .limit(CLAUSE_SCAN_LIMIT);
+
+    const variationRows = await app.db
+      .select({
+        projectId: variations.projectId,
+        clause: variations.clauseRef,
+        status: variations.status,
+        currency: variations.currency,
+        agreedValue: variations.agreedValue,
+        costEstimate: variations.costEstimate,
+        timeImpactDays: variations.timeImpactDays,
+      })
+      .from(variations)
+      .where(and(eq(variations.companyId, companyId), inArray(variations.projectId, projectIds)))
+      .limit(CLAUSE_SCAN_LIMIT);
+
+    const report = procurementRoutePerformance({
+      asOf,
+      projects: projectRows.map((p) => {
+        const contract = contractByProject.get(p.id);
+        return {
+          projectId: p.id,
+          name: p.name,
+          procurementRoute: routeByProject.get(p.id) ?? null,
+          contractFamily: contract?.form ?? null,
+          contractSum: contract?.contractSum ?? null,
+          contractCurrency: contract?.currency ?? null,
+        };
+      }),
+      disputes: disputeRows,
+      variations: variationRows,
+    });
+
+    return {
+      ...report,
+      total: report.items.length,
+      scope: visible === null ? ("company" as const) : ("restricted" as const),
+      sources: [
+        "the procurement route recorded on the opportunity each project was won through",
+        "the project's largest contract (sum, currency and form)",
+        "agreed variations, per project, in the contract's own currency",
+        "disputes raised on the project",
+      ],
     };
   });
 

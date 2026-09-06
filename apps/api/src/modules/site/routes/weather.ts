@@ -25,6 +25,7 @@ import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.j
 import { classifyDay, daysInclusive, type Threshold } from "../engines/weather.js";
 import { captureWeather, runWeatherAnalysis, toWeatherReading } from "../service.js";
 import {
+  alreadySignalled,
   buildGates,
   idSchema,
   isoDateSchema,
@@ -33,6 +34,8 @@ import {
   notFoundIfMissing,
   patchSchemaOf,
   patchSet,
+  raiseSignal,
+  round1,
 } from "../shared.js";
 
 const observationBody = z.object({
@@ -425,6 +428,45 @@ export const weatherRoutes: FastifyPluginAsync = async (app) => {
       objectId: id,
       payload: { to: "issued", delayEventId: delayEventId ?? null, exceptionalDays: row.exceptionalDays },
     });
-    return row;
+
+    // An ISSUED analysis that found exceptional weather is a claim-ready
+    // finding, so it reaches the attention layer as a signal rather than
+    // sitting in a register nobody polls. Draft analyses raise nothing: a
+    // figure that has not been issued is still being argued about.
+    let signalId: string | null = null;
+    const exceptional = row.exceptionalDays ?? 0;
+    if (exceptional > 0) {
+      const key = `weather-exceptional:${row.id}`;
+      const raised = await alreadySignalled(app.db, companyId, ["site_exceptional_weather"], projectId);
+      if (!raised.has(key)) {
+        const coverage = row.coveragePercent;
+        signalId = await raiseSignal(app.db, companyId, projectId, req.user!.id, {
+          detector: "site_exceptional_weather",
+          severity: exceptional >= 10 ? "high" : exceptional >= 3 ? "medium" : "low",
+          confidence: coverage === null ? 0.5 : Math.max(0.3, Math.min(1, coverage / 100)),
+          title: `${row.reference}: ${round1(exceptional)} day(s) of weather beyond the contract baseline`,
+          explanation: `Between ${row.periodStart} and ${row.periodEnd} the archive records ${row.observedAdverseDays ?? "an unknown number of"} adverse day(s) against a pro-rated baseline of ${row.baselineAdverseDays ?? "an unstated allowance"}, leaving ${round1(exceptional)} exceptional day(s)${row.hoursLost === null ? "" : ` and ${round1(row.hoursLost)} recorded hour(s) lost`}. The archive covers ${coverage === null ? "an unknown share of" : `${round1(coverage)}% of`} the period (${row.daysObserved} of ${row.daysInPeriod} days), so a gap is a gap and never counted as fair weather.`,
+          key,
+          subjectType: "site_weather_analysis",
+          subjectId: row.id,
+          evidence: {
+            analysisId: row.id,
+            reference: row.reference,
+            baselineId: row.baselineId,
+            periodStart: row.periodStart,
+            periodEnd: row.periodEnd,
+            exceptionalDays: row.exceptionalDays,
+            observedAdverseDays: row.observedAdverseDays,
+            baselineAdverseDays: row.baselineAdverseDays,
+            coveragePercent: row.coveragePercent,
+            daysObserved: row.daysObserved,
+            daysInPeriod: row.daysInPeriod,
+            delayEventId: delayEventId ?? null,
+            reasons: row.reasons,
+          },
+        });
+      }
+    }
+    return { ...row, signalId };
   });
 };

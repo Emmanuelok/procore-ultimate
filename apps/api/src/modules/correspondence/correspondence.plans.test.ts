@@ -219,6 +219,39 @@ describe("action plan templates", () => {
     expect(detail.json().activities).toHaveLength(2);
   });
 
+  it("renames a template without emptying it or minting a version", async () => {
+    // The Setup drawer sends `activities` only when the author ticks "replace
+    // the activity list". A rename must therefore leave the list — and the
+    // version plans were built from — exactly where it was.
+    const created = await post("/correspondence/action-plan-templates", {
+      key: "rename-me",
+      name: "Before",
+      activities: [{ title: "Keep me" }, { title: "And me" }],
+    });
+    const id = created.json().id as string;
+    const renamed = await patch(`/correspondence/action-plan-templates/${id}`, {
+      name: "After",
+      category: "handover",
+    });
+    expect(renamed.statusCode).toBe(200);
+    expect(renamed.json().name).toBe("After");
+    expect(renamed.json().version).toBe(1);
+    const detail = await get(`/correspondence/action-plan-templates/${id}`);
+    expect(detail.json().activities).toHaveLength(2);
+    expect(detail.json().activities[0].title).toBe("Keep me");
+
+    // Deactivating hides it from the picker a plan is built from, but the
+    // template — and the plans already built from it — survive.
+    const retired = await patch(`/correspondence/action-plan-templates/${id}`, { isActive: false });
+    expect(retired.json().isActive).toBe(0);
+    const active = await get(`/correspondence/action-plan-templates?projectId=${projectId}`);
+    expect(active.json().items.some((t: { id: string }) => t.id === id)).toBe(false);
+    const all = await get(
+      `/correspondence/action-plan-templates?projectId=${projectId}&includeInactive=true`,
+    );
+    expect(all.json().items.some((t: { id: string }) => t.id === id)).toBe(true);
+  });
+
   it("is invisible to another tenant", async () => {
     const res = await app.inject({
       method: "GET",

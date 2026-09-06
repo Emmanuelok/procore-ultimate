@@ -2855,7 +2855,21 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
   app.delete("/entities/:entityId", { preHandler: companyGate }, async (req) => {
     await requireEntityWriter(req);
     const { entityId } = req.params as { entityId: string };
-    const body = z.object({ reason: z.string().min(1).max(2000) }).parse(req.body ?? {});
+    // The reason may arrive in the body or as `?reason=` — DELETE with a body
+    // is awkward for a browser client (the web `api.del` helper sends none),
+    // and a mandatory justification the UI cannot supply is a rule nobody can
+    // follow. Either way it is mandatory.
+    const q = z.object({ reason: z.string().min(1).max(2000).optional() }).parse(req.query ?? {});
+    const body = z
+      .object({ reason: z.string().min(1).max(2000).optional() })
+      .parse(req.body ?? {});
+    const reason = body.reason ?? q.reason;
+    if (!reason) {
+      throw badRequest(
+        "A reason is required to remove an entity from the register: the removal is recorded " +
+          "against it, and 'why' is the part an investigator needs. Send { reason } or ?reason=.",
+      );
+    }
     const existing = await loadEntity(req, entityId);
     const relationships = await app.db
       .select()
@@ -2875,7 +2889,7 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
     // on delete is how the register gets cleaned before an investigation.
     await app.db
       .update(entities)
-      .set({ deletedAt: nowIso, deletedBy: req.user!.id, deleteReason: body.reason })
+      .set({ deletedAt: nowIso, deletedBy: req.user!.id, deleteReason: reason })
       .where(eq(entities.id, entityId));
     await appendLedger(app.db, {
       companyId: req.companyId!,
@@ -2893,7 +2907,7 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
           source: r.source,
         })),
         soft: true,
-        reason: body.reason,
+        reason,
       },
       storePayload: true,
     });

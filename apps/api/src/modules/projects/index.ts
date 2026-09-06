@@ -95,6 +95,11 @@ import {
   type ImportRowError,
 } from "./import.js";
 import { checkRecord } from "./records.js";
+import {
+  loadVendorsByName,
+  referencedVendorNames,
+  unresolvedVendorFindings,
+} from "../directory/importrefs.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -2976,6 +2981,20 @@ export const projectsModule: FastifyPluginAsync = async (app) => {
       await liveProject(req.companyId!, body.projectId);
     }
     const preview = validateRows(spec, toRecords(parseCsv(body.csv)));
+    /*
+     * The column spec cannot know whether "Acme Ltd." is a vendor this tenant
+     * has. Cross-reference the directory before anybody is asked to approve
+     * the file: a dry run that reports nothing about 60 unmatched employers
+     * is worse than no dry run, because it is believed.
+     */
+    if (dataset === "contacts") {
+      const byName = await loadVendorsByName(
+        app.db,
+        req.companyId!,
+        referencedVendorNames(preview.rows),
+      );
+      preview.errors = [...preview.errors, ...unresolvedVendorFindings(preview.rows, byName)];
+    }
     const id = newId("imp");
     await app.db.insert(importJobs).values({
       id,

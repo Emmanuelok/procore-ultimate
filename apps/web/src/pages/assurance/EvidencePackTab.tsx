@@ -7,7 +7,7 @@
  * download is recorded, because "who has seen this bundle" is part of what
  * makes it evidence.
  */
-import { useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useState } from "react";
 import { EVIDENCE_PACK_PURPOSES } from "@constructos/shared";
 import { api } from "../../lib/api";
 import {
@@ -28,6 +28,7 @@ import {
   CopyButton,
   downloadAuthenticated,
   HashChip,
+  PackAccessLog,
   ScoreMeter,
   type EvidenceRow,
   type ListResponse,
@@ -73,6 +74,7 @@ export default function EvidencePackTab({ projectId }: { projectId: string }) {
   const [busy, setBusy] = useState(false);
   const [packError, setPackError] = useState<string | null>(null);
   const [openProof, setOpenProof] = useState<string | null>(null);
+  const [openAccess, setOpenAccess] = useState<string | null>(null);
   const [stored, setStored] = useState<StoredPack[] | null>(null);
   const [storedError, setStoredError] = useState<string | null>(null);
   const [purpose, setPurpose] = useState("audit");
@@ -298,7 +300,8 @@ export default function EvidencePackTab({ projectId }: { projectId: string }) {
                   </thead>
                   <tbody>
                     {stored.map((p) => (
-                      <tr key={p.id}>
+                      <Fragment key={p.id}>
+                      <tr>
                         <Td className="text-sm">{p.title}</Td>
                         <Td className="text-xs">{humanize(p.purpose)}</Td>
                         <Td className="tabular-nums text-sm">{p.itemCount}</Td>
@@ -316,24 +319,46 @@ export default function EvidencePackTab({ projectId }: { projectId: string }) {
                           {formatDateTime(p.generatedAt)}
                         </Td>
                         <Td className="whitespace-nowrap">
-                          <button
-                            type="button"
-                            className="text-xs text-brand-700 underline"
-                            onClick={() => {
-                              void downloadAuthenticated(
-                                `/api/v1/evidence-packs/${p.id}/download`,
-                                `constructos-evidence-pack-${p.id}.json`,
-                              ).catch((err: unknown) =>
-                                setStoredError(
-                                  err instanceof Error ? err.message : "Download failed",
-                                ),
-                              );
-                            }}
-                          >
-                            Download JSON
-                          </button>
+                          <div className="flex items-center gap-3">
+                            <button
+                              type="button"
+                              className="text-xs text-brand-700 underline"
+                              onClick={() => {
+                                void downloadAuthenticated(
+                                  `/api/v1/evidence-packs/${p.id}/download`,
+                                  `constructos-evidence-pack-${p.id}.json`,
+                                ).catch((err: unknown) =>
+                                  setStoredError(
+                                    err instanceof Error ? err.message : "Download failed",
+                                  ),
+                                );
+                              }}
+                            >
+                              Download JSON
+                            </button>
+                            <button
+                              type="button"
+                              className="text-xs text-ink-600 underline"
+                              onClick={() => setOpenAccess((cur) => (cur === p.id ? null : p.id))}
+                            >
+                              {openAccess === p.id ? "Hide custody" : "Chain of custody"}
+                            </button>
+                          </div>
                         </Td>
                       </tr>
+                      {openAccess === p.id ? (
+                        <tr>
+                          <Td colSpan={7} className="bg-ink-50/60">
+                            <div className="max-w-xl">
+                              <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-ink-400">
+                                Chain of custody
+                              </div>
+                              <PackAccessLog packId={p.id} />
+                            </div>
+                          </Td>
+                        </tr>
+                      ) : null}
+                      </Fragment>
                     ))}
                   </tbody>
                 </Table>

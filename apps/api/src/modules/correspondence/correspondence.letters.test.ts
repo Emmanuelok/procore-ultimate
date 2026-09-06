@@ -404,6 +404,35 @@ describe("letters (#441, #444, #446)", () => {
     expect(notified.length).toBeGreaterThan(0);
   });
 
+  it("opens the obligation against the response date the draft was edited to", async () => {
+    // The drawer lets a draft's response date be moved before issue. The
+    // obligation must be opened against THAT date, not the type's default —
+    // otherwise the register and the assurance layer chase different days.
+    const agreed = addDaysISO(today, 21);
+    const draft = await post(`/projects/${projectId}/correspondence/letters`, {
+      typeId: noticeTypeId,
+      subject: "Response period agreed with the recipient",
+      recipients: [{ partyType: "external", name: "Recipient", email: "resp@x.example" }],
+    });
+    const id = draft.json().id as string;
+    expect(draft.json().responseDueDate).not.toBe(agreed);
+
+    const edited = await patch(`/projects/${projectId}/correspondence/letters/${id}`, {
+      responseDueDate: agreed,
+    });
+    expect(edited.json().responseDueDate).toBe(agreed);
+
+    const issued = await post(`/projects/${projectId}/correspondence/letters/${id}/issue`, {
+      issueDate: today,
+    });
+    expect(issued.statusCode).toBe(200);
+    expect(issued.json().responseDueDate).toBe(agreed);
+    const obligation = (
+      await app.db.select().from(obligations).where(eq(obligations.id, issued.json().obligationId))
+    )[0];
+    expect(obligation?.deadline?.slice(0, 10)).toBe(agreed);
+  });
+
   it("freezes an issued letter against edits", async () => {
     const res = await patch(`/projects/${projectId}/correspondence/letters/${letterId}`, {
       subject: "Rewriting history",

@@ -1840,6 +1840,16 @@ export const DISALLOWED_CATEGORIES = [
   "other",
 ];
 export const AUDIT_SUBJECT_TYPES = ["commitment", "framework", "term_contract", "jv", "project"];
+export const AUDIT_RIGHTS_STATUSES = [
+  "notified",
+  "scheduled",
+  "in_progress",
+  "obstructed",
+  "completed",
+  "closed",
+];
+/** The outcomes a disallowance can be resolved to — `deducted` moves money. */
+export const DISALLOWED_RESOLUTIONS = ["accepted", "withdrawn", "deducted"];
 
 export interface ProjectLite {
   id: string;
