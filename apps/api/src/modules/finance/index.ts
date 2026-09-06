@@ -2,9 +2,15 @@ import type { FastifyPluginAsync } from "fastify";
 import { and, asc, count, desc, eq, inArray, isNotNull, lt } from "drizzle-orm";
 import { z } from "zod";
 import {
+  assertions,
+  availabilityPaymentModels,
+  availabilityPeriods,
   covenantReadings,
   covenantWaivers,
   covenants,
+  designatedAccountEntries,
+  designatedAccountReconciliations,
+  designatedAccounts,
   disbursementForecasts,
   disbursements,
   evidence,
@@ -14,13 +20,17 @@ import {
   ineligibleRecoveries,
   obligations,
   projects,
+  reconciliations,
   scheduleTasks,
   signals,
 } from "@constructos/db";
 import {
+  AVAILABILITY_PERIOD_STATUSES,
   COVENANT_FORMULAS,
   COVENANT_OPERATORS,
   DAY_COUNT_CONVENTIONS,
+  DESIGNATED_ACCOUNT_ENTRY_KINDS,
+  DESIGNATED_ACCOUNT_STATUSES,
   EXPENDITURE_ELIGIBILITY,
   FACILITY_CONDITION_KINDS,
   FACILITY_INSTRUMENTS,
@@ -47,6 +57,11 @@ import {
   formulaSpec,
 } from "./covenants.js";
 import { buildAccrualSchedule, quarterEnds } from "./interest.js";
+import { computeAccountPosition, reconcileAccount, type AccountEntryInput } from "./accounts.js";
+import {
+  computeAvailabilityPayment,
+  type UnavailabilityEvent,
+} from "./availability.js";
 import {
   assessEligibility,
   bucketByCurrency,
@@ -61,6 +76,7 @@ import {
   sweepDisbursementForecast,
   sweepOverdueConditions as sweepConditionsShared,
 } from "./jobs.js";
+import { closeSignalByKey, raiseSignalOnce } from "../governance/signals.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -160,9 +176,23 @@ const forecastCreateSchema = z.object({
   note: z.string().max(5000).nullable().optional(),
 });
 
+const CASHFLOW_INPUT_SET = new Set<string>(FACILITY_CASHFLOW_INPUTS);
+
 const cashflowPutSchema = z.object({
   periodEnd: isoDateSchema,
-  inputs: z.record(z.enum(FACILITY_CASHFLOW_INPUTS), z.number().finite()),
+  /*
+   * A PARTIAL map, not an exhaustive one. `z.record(z.enum(...), ...)` in
+   * zod v4 demands every key of the enum, which would force a treasury team
+   * to send all twelve named inputs to record a DSCR. Keys are validated
+   * against the enum below instead, so an unknown key is still refused.
+   */
+  inputs: z
+    .record(z.string().max(60), z.number().finite())
+    .refine(
+      (map) => Object.keys(map).every((k) => CASHFLOW_INPUT_SET.has(k)),
+      `inputs may only name the recognised cashflow inputs: ${FACILITY_CASHFLOW_INPUTS.join(", ")}`,
+    )
+    .refine((map) => Object.keys(map).length > 0, "at least one input is required"),
   note: z.string().max(5000).nullable().optional(),
 });
 
@@ -194,6 +224,78 @@ const costOfFinanceQuery = z.object({
 });
 
 const rejectSchema = z.object({ reason: z.string().min(1).max(10000) });
+
+/* ---- Designated (special) accounts (#735, #745) ---- */
+
+const accountCreateSchema = z.object({
+  name: z.string().min(1).max(300),
+  bankName: z.string().max(300).nullable().optional(),
+  /** last four digits / IBAN tail only — never the full number */
+  accountRef: z.string().max(60).nullable().optional(),
+  currency: z.string().length(3).optional(),
+  authorisedCeiling: z.number().positive(),
+  openingBalance: z.number().nonnegative().optional(),
+  openedOn: isoDateSchema.nullable().optional(),
+  status: z.enum(DESIGNATED_ACCOUNT_STATUSES).optional(),
+});
+
+const accountEntrySchema = z.object({
+  entryDate: isoDateSchema,
+  kind: z.enum(DESIGNATED_ACCOUNT_ENTRY_KINDS),
+  /** always positive — the kind decides the direction */
+  amount: z.number().positive(),
+  description: z.string().min(1).max(2000),
+  reference: z.string().max(200).nullable().optional(),
+  disbursementId: z.string().min(1).nullable().optional(),
+  evidenceId: z.string().min(1).nullable().optional(),
+});
+
+const accountReconcileSchema = z.object({
+  periodEnd: isoDateSchema,
+  statementBalance: z.number().finite(),
+  /** absolute tolerance for rounding and cross-border charges */
+  tolerance: z.number().nonnegative().max(10000).optional(),
+  explanation: z.string().max(10000).nullable().optional(),
+  evidenceIds: z.array(z.string().min(1)).max(50).optional(),
+});
+
+const accountViewQuery = z.object({ asAt: isoDateSchema.optional() });
+
+/* ---- PPP / availability payment mechanism ---- */
+
+const availabilityModelSchema = z.object({
+  name: z.string().min(1).max(300),
+  facilityId: z.string().min(1).nullable().optional(),
+  currency: z.string().length(3).optional(),
+  unitaryCharge: z.number().positive(),
+  periodMonths: z.number().int().min(1).max(12).default(1),
+  availabilityWeightPercent: z.number().min(0).max(100).default(70),
+  performanceWeightPercent: z.number().min(0).max(100).default(30),
+  performancePointValuePercent: z.number().min(0).max(100).default(0.1),
+  deductionCapPercent: z.number().min(0).max(100).nullable().optional(),
+  persistentBreachPoints: z.number().nonnegative().nullable().optional(),
+  notes: z.string().max(20000).nullable().optional(),
+});
+
+const availabilityPeriodSchema = z.object({
+  periodStart: isoDateSchema,
+  periodEnd: isoDateSchema,
+  requiredHours: z.number().nonnegative(),
+  unavailabilityEvents: z
+    .array(
+      z.object({
+        area: z.string().min(1).max(300),
+        hours: z.number().nonnegative(),
+        /** share of the asset the area represents; an event cannot cost more than the asset */
+        weight: z.number().min(0).max(1),
+        note: z.string().max(2000).nullable().optional(),
+      }),
+    )
+    .max(500)
+    .default([]),
+  performancePoints: z.number().nonnegative().default(0),
+  status: z.enum(AVAILABILITY_PERIOD_STATUSES).optional(),
+});
 
 const covenantCreateSchema = z.object({
   name: z.string().min(1).max(300),
@@ -2628,6 +2730,50 @@ export const financeModule: FastifyPluginAsync = async (app) => {
       reasons.push("No facility carries an availability end date, so closing pressure is unknown.");
     }
 
+    // Designated accounts: an unreconciled advance account is a health input
+    // in its own right, and "no accounts" is stated rather than scored 0.
+    const accounts = await app.db
+      .select()
+      .from(designatedAccounts)
+      .where(
+        and(
+          eq(designatedAccounts.companyId, companyId),
+          eq(designatedAccounts.projectId, projectId),
+          eq(designatedAccounts.status, "active"),
+        ),
+      );
+    let unreconciledAccounts: number | null = null;
+    if (accounts.length === 0) {
+      reasons.push(
+        "No designated account is held on this project, so account reconciliation is not a measure here.",
+      );
+    } else {
+      const recs = await app.db
+        .select({
+          accountId: designatedAccountReconciliations.accountId,
+          outcome: designatedAccountReconciliations.outcome,
+          periodEnd: designatedAccountReconciliations.periodEnd,
+        })
+        .from(designatedAccountReconciliations)
+        .where(
+          inArray(
+            designatedAccountReconciliations.accountId,
+            accounts.map((a) => a.id),
+          ),
+        );
+      const latest = new Map<string, { outcome: string; periodEnd: string }>();
+      for (const r of recs) {
+        const current = latest.get(r.accountId);
+        if (!current || r.periodEnd > current.periodEnd) {
+          latest.set(r.accountId, { outcome: r.outcome, periodEnd: r.periodEnd });
+        }
+      }
+      unreconciledAccounts = accounts.filter((a) => {
+        const last = latest.get(a.id);
+        return !last || last.outcome !== "reconciled";
+      }).length;
+    }
+
     return {
       metrics: {
         facilities: facs.length,
@@ -2642,10 +2788,705 @@ export const financeModule: FastifyPluginAsync = async (app) => {
         daysToClosing: closingDates[0] ? daysUntil(closingDates[0]) : null,
         awaitingCertification: draws.filter((d) => d.status === "approved" && !d.certifiedAt).length,
         openRecoveries: recoveries.filter((r) => r.status === "open").length,
+        designatedAccounts: accounts.length,
+        unreconciledAccounts,
       },
       reasons,
     };
   });
+
+  /* ---------------------------------------------------------------- */
+  /* Designated (special) account reconciliation (#735, #745)           */
+  /* ---------------------------------------------------------------- */
+
+  async function fetchAccount(accountId: string, companyId: string, projectId: string) {
+    const rows = await app.db
+      .select()
+      .from(designatedAccounts)
+      .where(
+        and(
+          eq(designatedAccounts.id, accountId),
+          eq(designatedAccounts.companyId, companyId),
+          eq(designatedAccounts.projectId, projectId),
+        ),
+      )
+      .limit(1);
+    if (!rows[0]) throw notFound("Designated account not found");
+    return rows[0];
+  }
+
+  async function accountEntries(accountId: string): Promise<AccountEntryInput[]> {
+    const rows = await app.db
+      .select({
+        entryDate: designatedAccountEntries.entryDate,
+        kind: designatedAccountEntries.kind,
+        amount: designatedAccountEntries.amount,
+      })
+      .from(designatedAccountEntries)
+      .where(eq(designatedAccountEntries.accountId, accountId))
+      .orderBy(asc(designatedAccountEntries.entryDate), asc(designatedAccountEntries.createdAt));
+    return rows;
+  }
+
+  app.post(
+    "/projects/:projectId/facilities/:facilityId/designated-accounts",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { facilityId } = req.params as { facilityId: string };
+      const body = accountCreateSchema.parse(req.body);
+      const facility = await fetchFacility(facilityId, req.companyId!, req.projectId!);
+      const id = newId("dac");
+      await app.db.insert(designatedAccounts).values({
+        id,
+        facilityId,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        name: body.name,
+        bankName: body.bankName ?? null,
+        accountRef: body.accountRef ?? null,
+        currency: (body.currency ?? facility.currency).toUpperCase(),
+        authorisedCeiling: body.authorisedCeiling,
+        openingBalance: body.openingBalance ?? 0,
+        openedOn: body.openedOn ?? null,
+        createdBy: req.user!.id,
+      });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "designated_account",
+        objectId: id,
+        payload: {
+          facilityId,
+          name: body.name,
+          authorisedCeiling: body.authorisedCeiling,
+          currency: body.currency ?? facility.currency,
+        },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      const row = await fetchAccount(id, req.companyId!, req.projectId!);
+      return reply.status(201).send(row);
+    },
+  );
+
+  app.get(
+    "/projects/:projectId/facilities/:facilityId/designated-accounts",
+    { preHandler: readGate },
+    async (req) => {
+      const { facilityId } = req.params as { facilityId: string };
+      await fetchFacility(facilityId, req.companyId!, req.projectId!);
+      const rows = await app.db
+        .select()
+        .from(designatedAccounts)
+        .where(
+          and(
+            eq(designatedAccounts.facilityId, facilityId),
+            eq(designatedAccounts.companyId, req.companyId!),
+          ),
+        )
+        .orderBy(asc(designatedAccounts.createdAt));
+      const today = todayISO();
+      const items = [];
+      for (const account of rows) {
+        const position = computeAccountPosition(
+          { openingBalance: account.openingBalance, authorisedCeiling: account.authorisedCeiling },
+          await accountEntries(account.id),
+          today,
+        );
+        items.push({ ...account, position });
+      }
+      return { items, total: items.length };
+    },
+  );
+
+  app.get(
+    "/projects/:projectId/designated-accounts/:accountId",
+    { preHandler: readGate },
+    async (req) => {
+      const { accountId } = req.params as { accountId: string };
+      const q = accountViewQuery.parse(req.query);
+      const account = await fetchAccount(accountId, req.companyId!, req.projectId!);
+      const asAt = q.asAt ?? todayISO();
+      const entries = await app.db
+        .select()
+        .from(designatedAccountEntries)
+        .where(eq(designatedAccountEntries.accountId, accountId))
+        .orderBy(asc(designatedAccountEntries.entryDate), asc(designatedAccountEntries.createdAt));
+      const recs = await app.db
+        .select()
+        .from(designatedAccountReconciliations)
+        .where(eq(designatedAccountReconciliations.accountId, accountId))
+        .orderBy(desc(designatedAccountReconciliations.periodEnd));
+      const position = computeAccountPosition(
+        { openingBalance: account.openingBalance, authorisedCeiling: account.authorisedCeiling },
+        entries,
+        asAt,
+      );
+      return { ...account, asAt, entries, reconciliations: recs, position };
+    },
+  );
+
+  app.post(
+    "/projects/:projectId/designated-accounts/:accountId/entries",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { accountId } = req.params as { accountId: string };
+      const body = accountEntrySchema.parse(req.body);
+      const account = await fetchAccount(accountId, req.companyId!, req.projectId!);
+      if (account.status !== "active") {
+        throw badRequest(`A ${account.status} designated account cannot take new entries`);
+      }
+      if (body.disbursementId) {
+        const d = await fetchDisbursement(body.disbursementId, req.companyId!, req.projectId!);
+        if (d.facilityId !== account.facilityId) {
+          throw badRequest("disbursementId belongs to a different facility");
+        }
+      }
+      if (body.evidenceId) {
+        await validateEvidence(req.companyId!, req.projectId!, [body.evidenceId]);
+      }
+      const id = newId("dae");
+      await app.db.insert(designatedAccountEntries).values({
+        id,
+        accountId,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        entryDate: body.entryDate,
+        kind: body.kind,
+        amount: body.amount,
+        description: body.description,
+        reference: body.reference ?? null,
+        disbursementId: body.disbursementId ?? null,
+        evidenceId: body.evidenceId ?? null,
+        createdBy: req.user!.id,
+      });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "designated_account_entry",
+        objectId: id,
+        payload: {
+          accountId,
+          kind: body.kind,
+          amount: body.amount,
+          entryDate: body.entryDate,
+        },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      const position = computeAccountPosition(
+        { openingBalance: account.openingBalance, authorisedCeiling: account.authorisedCeiling },
+        await accountEntries(accountId),
+        todayISO(),
+      );
+      // The ceiling is a lender term, not a system limit: an entry that
+      // breaches it is recorded and raised, never silently refused.
+      if (position.overCeiling) {
+        await raiseAccountSignal(req.companyId!, req.projectId!, account, position.balance);
+      }
+      const [row] = await app.db
+        .select()
+        .from(designatedAccountEntries)
+        .where(eq(designatedAccountEntries.id, id))
+        .limit(1);
+      return reply.status(201).send({ ...row, position });
+    },
+  );
+
+  /** One signal per ACCOUNT while it is over its ceiling, not one per entry. */
+  async function raiseAccountSignal(
+    companyId: string,
+    projectId: string,
+    account: typeof designatedAccounts.$inferSelect,
+    balance: number,
+  ): Promise<void> {
+    await raiseSignalOnce(app.db, {
+      companyId,
+      projectId,
+      detector: "designated_account_over_ceiling",
+      key: account.id,
+      severity: "high",
+      confidence: 1,
+      title: `Designated account "${account.name}" is above its authorised ceiling`,
+      explanation:
+        `The ledger balance of ${account.name} is ${balance} ${account.currency} against an ` +
+        `authorised ceiling of ${account.authorisedCeiling}. An advance account held above its ` +
+        `ceiling is a breach of the financing agreement's account conditions and is usually a ` +
+        `refund event, not a rounding matter.`,
+      subjectType: "designated_account",
+      subjectId: account.id,
+    });
+  }
+
+  /**
+   * Reconcile the account against the bank statement for a period.
+   *
+   * Admin-gated and mirrored into the assurance register: the statement
+   * balance is recorded as an ASSERTION and the comparison as a
+   * RECONCILIATION, so an account nobody can reconcile shows up in the same
+   * place as every other unsupported claim on the platform.
+   */
+  app.post(
+    "/projects/:projectId/designated-accounts/:accountId/reconcile",
+    { preHandler: adminGate },
+    async (req, reply) => {
+      const { accountId } = req.params as { accountId: string };
+      const body = accountReconcileSchema.parse(req.body);
+      const account = await fetchAccount(accountId, req.companyId!, req.projectId!);
+      if (body.evidenceIds && body.evidenceIds.length > 0) {
+        await validateEvidence(req.companyId!, req.projectId!, body.evidenceIds);
+      }
+      const existing = await app.db
+        .select({ id: designatedAccountReconciliations.id })
+        .from(designatedAccountReconciliations)
+        .where(
+          and(
+            eq(designatedAccountReconciliations.accountId, accountId),
+            eq(designatedAccountReconciliations.periodEnd, body.periodEnd),
+          ),
+        )
+        .limit(1);
+      if (existing[0]) {
+        throw conflict(
+          `This account has already been reconciled to ${body.periodEnd}. Reconciliations are a ` +
+            `record of what was checked on a date and are not rewritten.`,
+        );
+      }
+      const position = computeAccountPosition(
+        { openingBalance: account.openingBalance, authorisedCeiling: account.authorisedCeiling },
+        await accountEntries(accountId),
+        body.periodEnd,
+      );
+      const result = reconcileAccount({
+        statementBalance: body.statementBalance,
+        computedBalance: position.balance,
+        tolerance: body.tolerance,
+      });
+
+      const id = newId("dar");
+      const assertionId = newId("ast");
+      const assuranceRecId = newId("rec");
+      const now = new Date().toISOString();
+
+      await app.db.transaction(async (tx) => {
+        await tx.insert(assertions).values({
+          id: assertionId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          kind: "cost",
+          claimantId: req.user!.id,
+          claimantKind: "user",
+          value: body.statementBalance,
+          unit: account.currency,
+          basis:
+            `Bank statement balance of designated account "${account.name}" at ${body.periodEnd}.`,
+          sourceType: "designated_account",
+          sourceId: accountId,
+          assertedAt: now,
+          createdBy: req.user!.id,
+        });
+        await tx.insert(reconciliations).values({
+          id: assuranceRecId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          assertionId,
+          evidenceIds: body.evidenceIds ?? [],
+          method: "designated_account_balance",
+          result: result.outcome === "reconciled" ? "supported" : "contradicted",
+          variance: result.difference,
+          variancePercent:
+            Math.abs(position.balance) < 1e-9
+              ? null
+              : round2((result.difference / position.balance) * 100),
+          confidence: (body.evidenceIds ?? []).length > 0 ? 0.9 : 0.5,
+          notes: result.explanation,
+          selfCertified: (body.evidenceIds ?? []).length === 0,
+          createdBy: req.user!.id,
+        });
+        await tx.insert(designatedAccountReconciliations).values({
+          id,
+          accountId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          periodEnd: body.periodEnd,
+          statementBalance: result.statementBalance,
+          computedBalance: result.computedBalance,
+          difference: result.difference,
+          outcome: result.outcome,
+          explanation: body.explanation ?? result.explanation,
+          evidenceIds: body.evidenceIds ?? [],
+          assuranceReconciliationId: assuranceRecId,
+          reconciledBy: req.user!.id,
+        });
+        await appendLedger(tx as never, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "create",
+          objectType: "designated_account_reconciliation",
+          objectId: id,
+          payload: {
+            accountId,
+            periodEnd: body.periodEnd,
+            statementBalance: result.statementBalance,
+            computedBalance: result.computedBalance,
+            difference: result.difference,
+            outcome: result.outcome,
+          },
+          storePayload: true,
+          projectId: req.projectId!,
+        });
+      });
+
+      if (result.outcome === "unreconciled") {
+        await raiseSignalOnce(app.db, {
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          detector: "designated_account_unreconciled",
+          key: `${accountId}:${body.periodEnd}`,
+          severity: "high",
+          confidence: 1,
+          title: `Designated account "${account.name}" does not reconcile at ${body.periodEnd}`,
+          explanation: result.explanation,
+          subjectType: "designated_account",
+          subjectId: accountId,
+          evidenceRefs: { reconciliationId: id },
+        });
+      } else {
+        // A clean period closes the standing "never reconciled" finding.
+        await closeSignalByKey(
+          app.db,
+          req.companyId!,
+          "designated_account_unreconciled_overdue",
+          accountId,
+          `Reconciled to ${body.periodEnd} with no unexplained difference.`,
+        );
+      }
+
+      const [row] = await app.db
+        .select()
+        .from(designatedAccountReconciliations)
+        .where(eq(designatedAccountReconciliations.id, id))
+        .limit(1);
+      return reply.status(201).send({ ...row, position, result });
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* PPP / availability payment mechanism                              */
+  /* ---------------------------------------------------------------- */
+
+  async function fetchAvailabilityModel(
+    modelId: string,
+    companyId: string,
+    projectId: string,
+  ) {
+    const rows = await app.db
+      .select()
+      .from(availabilityPaymentModels)
+      .where(
+        and(
+          eq(availabilityPaymentModels.id, modelId),
+          eq(availabilityPaymentModels.companyId, companyId),
+          eq(availabilityPaymentModels.projectId, projectId),
+        ),
+      )
+      .limit(1);
+    if (!rows[0]) throw notFound("Availability payment model not found");
+    return rows[0];
+  }
+
+  function modelInput(model: typeof availabilityPaymentModels.$inferSelect) {
+    return {
+      unitaryCharge: model.unitaryCharge,
+      currency: model.currency,
+      availabilityWeightPercent: model.availabilityWeightPercent,
+      performanceWeightPercent: model.performanceWeightPercent,
+      performancePointValuePercent: model.performancePointValuePercent,
+      deductionCapPercent: model.deductionCapPercent,
+      persistentBreachPoints: model.persistentBreachPoints,
+    };
+  }
+
+  app.post(
+    "/projects/:projectId/availability-models",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const body = availabilityModelSchema.parse(req.body);
+      if (body.availabilityWeightPercent + body.performanceWeightPercent > 100) {
+        throw badRequest(
+          "The availability and performance weights cannot together exceed 100% of the charge",
+        );
+      }
+      if (body.facilityId) {
+        await fetchFacility(body.facilityId, req.companyId!, req.projectId!);
+      }
+      const id = newId("apm");
+      await app.db.insert(availabilityPaymentModels).values({
+        id,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        facilityId: body.facilityId ?? null,
+        name: body.name,
+        currency: (body.currency ?? "GBP").toUpperCase(),
+        unitaryCharge: body.unitaryCharge,
+        periodMonths: body.periodMonths,
+        availabilityWeightPercent: body.availabilityWeightPercent,
+        performanceWeightPercent: body.performanceWeightPercent,
+        performancePointValuePercent: body.performancePointValuePercent,
+        deductionCapPercent: body.deductionCapPercent ?? null,
+        persistentBreachPoints: body.persistentBreachPoints ?? null,
+        notes: body.notes ?? null,
+        createdBy: req.user!.id,
+      });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "availability_payment_model",
+        objectId: id,
+        payload: { name: body.name, unitaryCharge: body.unitaryCharge },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      const row = await fetchAvailabilityModel(id, req.companyId!, req.projectId!);
+      return reply.status(201).send(row);
+    },
+  );
+
+  app.get("/projects/:projectId/availability-models", { preHandler: readGate }, async (req) => {
+    const rows = await app.db
+      .select()
+      .from(availabilityPaymentModels)
+      .where(
+        and(
+          eq(availabilityPaymentModels.companyId, req.companyId!),
+          eq(availabilityPaymentModels.projectId, req.projectId!),
+        ),
+      )
+      .orderBy(asc(availabilityPaymentModels.createdAt));
+    return { items: rows, total: rows.length };
+  });
+
+  app.post(
+    "/projects/:projectId/availability-models/:modelId/periods",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { modelId } = req.params as { modelId: string };
+      const body = availabilityPeriodSchema.parse(req.body);
+      const model = await fetchAvailabilityModel(modelId, req.companyId!, req.projectId!);
+      if (body.periodEnd <= body.periodStart) {
+        throw badRequest("periodEnd must fall after periodStart");
+      }
+      const id = newId("avp");
+      const computed = computeAvailabilityPayment(modelInput(model), {
+        requiredHours: body.requiredHours,
+        events: body.unavailabilityEvents as UnavailabilityEvent[],
+        performancePoints: body.performancePoints,
+      });
+      const inserted = await app.db
+        .insert(availabilityPeriods)
+        .values({
+          id,
+          modelId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          periodStart: body.periodStart,
+          periodEnd: body.periodEnd,
+          requiredHours: body.requiredHours,
+          unavailabilityEvents: body.unavailabilityEvents,
+          performancePoints: body.performancePoints,
+          computed: computed as unknown as Record<string, unknown>,
+          createdBy: req.user!.id,
+        })
+        .onConflictDoNothing({
+          target: [availabilityPeriods.modelId, availabilityPeriods.periodStart],
+        })
+        .returning({ id: availabilityPeriods.id });
+      if (inserted.length === 0) {
+        throw conflict(`A period starting ${body.periodStart} already exists on this model`);
+      }
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "availability_period",
+        objectId: id,
+        payload: {
+          modelId,
+          periodStart: body.periodStart,
+          periodEnd: body.periodEnd,
+          netPayment: computed.netPayment,
+          totalDeduction: computed.totalDeduction,
+        },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      const [row] = await app.db
+        .select()
+        .from(availabilityPeriods)
+        .where(eq(availabilityPeriods.id, id))
+        .limit(1);
+      return reply.status(201).send(row);
+    },
+  );
+
+  app.get(
+    "/projects/:projectId/availability-models/:modelId/periods",
+    { preHandler: readGate },
+    async (req) => {
+      const { modelId } = req.params as { modelId: string };
+      const model = await fetchAvailabilityModel(modelId, req.companyId!, req.projectId!);
+      const rows = await app.db
+        .select()
+        .from(availabilityPeriods)
+        .where(eq(availabilityPeriods.modelId, modelId))
+        .orderBy(asc(availabilityPeriods.periodStart));
+      // Recompute uncertified periods against the CURRENT model terms; a
+      // certified period keeps the figures it was certified on.
+      const items = rows.map((p) =>
+        p.status === "draft"
+          ? {
+              ...p,
+              computed: computeAvailabilityPayment(modelInput(model), {
+                requiredHours: p.requiredHours,
+                events: (p.unavailabilityEvents ?? []) as UnavailabilityEvent[],
+                performancePoints: p.performancePoints,
+              }) as unknown as Record<string, unknown>,
+            }
+          : p,
+      );
+      const certified = items.filter((p) => p.status !== "draft");
+      const totals = {
+        currency: model.currency,
+        periods: items.length,
+        certifiedPeriods: certified.length,
+        certifiedGross: round2(
+          certified.reduce(
+            (s, p) => s + Number((p.computed as { grossCharge?: number })?.grossCharge ?? 0),
+            0,
+          ),
+        ),
+        certifiedDeductions: round2(
+          certified.reduce(
+            (s, p) => s + Number((p.computed as { totalDeduction?: number })?.totalDeduction ?? 0),
+            0,
+          ),
+        ),
+        certifiedNet: round2(
+          certified.reduce(
+            (s, p) => s + Number((p.computed as { netPayment?: number })?.netPayment ?? 0),
+            0,
+          ),
+        ),
+      };
+      return {
+        model,
+        items,
+        total: items.length,
+        totals,
+        basis:
+          "Totals cover CERTIFIED periods only — a draft period is an unagreed number and is " +
+          "shown but not added in. Every period is denominated in the model's single currency.",
+      };
+    },
+  );
+
+  /**
+   * Certify a period: freeze the computed figures. Separation of duties —
+   * the certifier may not be the person who recorded the period, because
+   * this is the step that turns a claim into a payable amount.
+   */
+  app.post(
+    "/projects/:projectId/availability-periods/:periodId/certify",
+    { preHandler: adminGate },
+    async (req) => {
+      const { periodId } = req.params as { periodId: string };
+      const rows = await app.db
+        .select()
+        .from(availabilityPeriods)
+        .where(
+          and(
+            eq(availabilityPeriods.id, periodId),
+            eq(availabilityPeriods.companyId, req.companyId!),
+            eq(availabilityPeriods.projectId, req.projectId!),
+          ),
+        )
+        .limit(1);
+      const period = rows[0];
+      if (!period) throw notFound("Availability period not found");
+      if (period.status !== "draft") {
+        throw badRequest(`A ${period.status} period cannot be certified again`);
+      }
+      if (period.createdBy === req.user!.id) {
+        throw forbidden(
+          "Separation of duties: the person who recorded the period cannot also certify it",
+        );
+      }
+      const model = await fetchAvailabilityModel(
+        period.modelId,
+        req.companyId!,
+        req.projectId!,
+      );
+      const computed = computeAvailabilityPayment(modelInput(model), {
+        requiredHours: period.requiredHours,
+        events: (period.unavailabilityEvents ?? []) as UnavailabilityEvent[],
+        performancePoints: period.performancePoints,
+      });
+      const now = new Date().toISOString();
+      await app.db
+        .update(availabilityPeriods)
+        .set({
+          status: "certified",
+          computed: computed as unknown as Record<string, unknown>,
+          certifiedBy: req.user!.id,
+          certifiedAt: now,
+          updatedAt: now,
+        })
+        .where(eq(availabilityPeriods.id, periodId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "availability_period",
+        objectId: periodId,
+        payload: {
+          from: "draft",
+          to: "certified",
+          netPayment: computed.netPayment,
+          totalDeduction: computed.totalDeduction,
+          persistentBreach: computed.persistentBreach,
+        },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      if (computed.persistentBreach) {
+        await raiseSignalOnce(app.db, {
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          detector: "availability_persistent_breach",
+          key: periodId,
+          severity: "high",
+          confidence: 1,
+          title: `Persistent breach threshold reached on "${model.name}"`,
+          explanation:
+            `The period ${period.periodStart} → ${period.periodEnd} accrued ` +
+            `${period.performancePoints} performance failure points against a threshold of ` +
+            `${model.persistentBreachPoints}. Under an availability-based concession this ` +
+            `normally engages a warning notice and, if repeated, step-in or termination rights.`,
+          subjectType: "availability_period",
+          subjectId: periodId,
+        });
+      }
+      const [row] = await app.db
+        .select()
+        .from(availabilityPeriods)
+        .where(eq(availabilityPeriods.id, periodId))
+        .limit(1);
+      return row;
+    },
+  );
 
   /* ---------------------------------------------------------------- */
   /* Company-level portfolio view                                      */

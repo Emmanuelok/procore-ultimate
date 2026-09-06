@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from "fastify";
-import { and, count, desc, eq, isNull } from "drizzle-orm";
+import { and, asc, count, desc, eq, isNull } from "drizzle-orm";
 import { z } from "zod";
 import {
   benchmarkContributions,
@@ -13,6 +13,7 @@ import {
 import { ASSET_CLASSES, PROCUREMENT_ROUTES, SIZE_BANDS } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
+import { forEachCompany } from "../../lib/scheduler.js";
 import { AppError, badRequest, conflict, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import {
@@ -27,11 +28,12 @@ import {
   type BenchmarkMetricDef,
 } from "./metrics.js";
 import {
+  assessCounts,
   assessPool,
+  hasContributed as poolHasContributed,
   MAX_CONTRIBUTOR_SHARE,
   readCell,
   type CellKey,
-  type PoolRow,
   type PoolVerdict,
 } from "./pool.js";
 import { SEED_DISTRIBUTIONS, SEED_METHODOLOGY } from "./seed.js";
@@ -154,6 +156,15 @@ function requireMetric(key: string): BenchmarkMetricDef {
 const normalizeRegion = (region: string): string => region.trim().toUpperCase();
 
 /**
+ * The class register reads one row per (class, contributor). The cap bounds a
+ * cross-tenant read; hitting it is disclosed rather than silently truncating.
+ */
+const REGISTER_GROUP_LIMIT = 2000;
+
+/** Snapshots examined per company per outlier sweep. */
+const OUTLIER_SWEEP_LIMIT = 1000;
+
+/**
  * M11 — Independent benchmarking (spec Vol II Domain V #821-858, Vol III M11).
  *
  * Code-resident metric registry, auditable per-project metric snapshots,
@@ -189,20 +200,8 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
    * Contribute-to-access check (#855). Contributor ids are read in a WHERE
    * clause for enforcement and never returned.
    */
-  async function hasContributed(companyId: string, metric: string): Promise<boolean> {
-    const rows = await app.db
-      .select({ id: benchmarkSamples.id })
-      .from(benchmarkSamples)
-      .where(
-        and(
-          eq(benchmarkSamples.metric, metric),
-          eq(benchmarkSamples.source, "contributed"),
-          eq(benchmarkSamples.contributorCompanyId, companyId),
-        ),
-      )
-      .limit(1);
-    return rows.length > 0;
-  }
+  const hasContributed = (companyId: string, metric: string): Promise<boolean> =>
+    poolHasContributed(app.db, companyId, metric);
 
   /** A sandbox tenant's figures are not real, so they never enter the pool. */
   async function isSandbox(companyId: string): Promise<boolean> {
@@ -223,7 +222,11 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
    * WINS the key may write the seed rows, and the loser proceeds to read the
    * cell the winner wrote.
    */
-  async function ensureSeeded(metric: string, companyId: string, actorId: string): Promise<void> {
+  async function ensureSeeded(
+    metric: string,
+    companyId: string,
+    actorId: string | null,
+  ): Promise<void> {
     const cells = SEED_DISTRIBUTIONS[metric];
     if (!cells || cells.length === 0) return;
     const def = requireMetric(metric);
@@ -273,13 +276,64 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
     key: CellKey,
     viewerCompanyId: string,
     contributedAccess: boolean,
-  ): Promise<{ verdict: PoolVerdict; seedIncluded: boolean }> {
+  ): Promise<{ verdict: PoolVerdict; seedIncluded: boolean; narrowingDropped: string[] }> {
     if (!contributedAccess) {
-      const seed = await readCell(app.db, { ...key, currency: null }, "seed");
-      return { verdict: assessPool(seed, viewerCompanyId, { seed: true }), seedIncluded: seed.length > 0 };
+      // Seed rows carry no size band and no procurement route, so a narrowed
+      // request cannot be answered from them. The narrowing is DROPPED and the
+      // caller is told, rather than a wider class being passed off as the
+      // narrow one it asked for.
+      const dropped = [
+        ...(key.sizeBand ? ["sizeBand"] : []),
+        ...(key.procurementRoute ? ["procurementRoute"] : []),
+      ];
+      const seed = await readCell(
+        app.db,
+        { ...key, currency: null, sizeBand: null, procurementRoute: null },
+        "seed",
+      );
+      return {
+        verdict: assessPool(seed, viewerCompanyId, { seed: true }),
+        seedIncluded: seed.length > 0,
+        narrowingDropped: dropped,
+      };
     }
     const contributed = await readCell(app.db, key, "contributed");
-    return { verdict: assessPool(contributed, viewerCompanyId), seedIncluded: false };
+    return {
+      verdict: assessPool(contributed, viewerCompanyId),
+      seedIncluded: false,
+      narrowingDropped: [],
+    };
+  }
+
+  /**
+   * The published membership criteria (#833-838, #846-849), stated as the
+   * predicate the query actually ran. Every criterion named here is in the
+   * WHERE clause; nothing that was not applied is named.
+   */
+  function membershipNote(
+    assetClass: string,
+    region: string,
+    currency: string | null,
+    applied: { sizeBand: string | null; procurementRoute: string | null },
+  ): string {
+    const parts = [`asset class ${assetClass}`, `region ${region}`];
+    if (currency) parts.push(`currency ${currency}`);
+    if (applied.sizeBand) parts.push(`size band ${applied.sizeBand}`);
+    if (applied.procurementRoute) parts.push(`procurement route ${applied.procurementRoute}`);
+    return `Membership criteria applied to this class: ${parts.join(", ")}.`;
+  }
+
+  /** The membership criteria a describeCell() answer was actually drawn from. */
+  function appliedMembership(
+    q: { sizeBand?: string; procurementRoute?: string },
+    narrowingDropped: string[],
+  ): { sizeBand: string | null; procurementRoute: string | null } {
+    return {
+      sizeBand: narrowingDropped.includes("sizeBand") ? null : (q.sizeBand ?? null),
+      procurementRoute: narrowingDropped.includes("procurementRoute")
+        ? null
+        : (q.procurementRoute ?? null),
+    };
   }
 
   /** Disclosure lines shared by distributions and compare (#831, #832). */
@@ -525,6 +579,35 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
       });
 
       if (priorContribution) {
+        /*
+         * The supersede is CLAIMED, not assumed. Two concurrent contributions
+         * for the same project and cell both read the same prior row; an
+         * unconditional update let both of them insert a live sample and both
+         * point the contributions row at their own, leaving one live sample
+         * with nothing claiming it — exactly the "one live sample per project
+         * per cell" rule the dominance and min-n arithmetic rests on. Only the
+         * request whose UPDATE still sees the prior sample id wins.
+         */
+        const claimed = await app.db
+          .update(benchmarkContributions)
+          .set({ sampleId, supersededSampleId: priorContribution.sampleId })
+          .where(
+            and(
+              eq(benchmarkContributions.id, priorContribution.id),
+              eq(benchmarkContributions.sampleId, priorContribution.sampleId),
+            ),
+          )
+          .returning({ id: benchmarkContributions.id });
+        if (claimed.length === 0) {
+          await app.db
+            .update(benchmarkSamples)
+            .set({ supersededAt: new Date().toISOString() })
+            .where(eq(benchmarkSamples.id, sampleId));
+          throw conflict(
+            "Another contribution for this project and cell was recorded at the same instant; " +
+              "re-read the snapshot and try again.",
+          );
+        }
         await app.db
           .update(benchmarkSamples)
           .set({
@@ -532,10 +615,6 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
             supersededBySampleId: sampleId,
           })
           .where(eq(benchmarkSamples.id, priorContribution.sampleId));
-        await app.db
-          .update(benchmarkContributions)
-          .set({ sampleId, supersededSampleId: priorContribution.sampleId })
-          .where(eq(benchmarkContributions.id, priorContribution.id));
       } else {
         try {
           await app.db.insert(benchmarkContributions).values({
@@ -677,7 +756,7 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
   async function compareSnapshot(
     companyId: string,
     projectId: string,
-    userId: string,
+    userId: string | null,
     q: z.infer<typeof compareQuery>,
   ) {
     const metric = requireMetric(q.metric);
@@ -830,6 +909,127 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
    * evaluations cannot both raise one: the loser sees zero rows returned and
    * reports the winner's signal instead of writing a duplicate.
    */
+  async function evaluateSnapshot(
+    snapshot: typeof projectMetricSnapshots.$inferSelect,
+    actorId: string | null,
+    overrides: Partial<z.infer<typeof compareQuery>> = {},
+  ) {
+    const companyId = snapshot.companyId;
+    const projectId = snapshot.projectId;
+    const c = await compareSnapshot(companyId, projectId, actorId, {
+      ...overrides,
+      metric: snapshot.metric,
+    });
+
+    if (!c.signallable) {
+      return {
+        snapshotId: snapshot.id,
+        signalRaised: false,
+        signalId: snapshot.outlierSignalId,
+        reason: c.adverse
+          ? c.verdict.suppressed
+            ? "The comparison cell does not satisfy the anonymity rules, so its tails are not " +
+              "a defensible basis for a signal."
+            : "The distribution is illustrative seed data, not contributed outcomes."
+          : "The snapshot is not in the adverse tail of its cell.",
+        percentile: c.percentile,
+        distribution: c.distribution,
+        disclosures: c.disclosures,
+      };
+    }
+
+    const signalId = newId("sig");
+    const claimed = await app.db
+      .update(projectMetricSnapshots)
+      .set({ outlierSignalId: signalId })
+      .where(
+        and(
+          eq(projectMetricSnapshots.id, snapshot.id),
+          isNull(projectMetricSnapshots.outlierSignalId),
+        ),
+      )
+      .returning({ id: projectMetricSnapshots.id });
+    if (claimed.length === 0) {
+      const [after] = await app.db
+        .select({ outlierSignalId: projectMetricSnapshots.outlierSignalId })
+        .from(projectMetricSnapshots)
+        .where(eq(projectMetricSnapshots.id, snapshot.id))
+        .limit(1);
+      return {
+        snapshotId: snapshot.id,
+        signalRaised: false,
+        signalId: after?.outlierSignalId ?? null,
+        reason: "A signal has already been raised for this snapshot.",
+        percentile: c.percentile,
+        distribution: c.distribution,
+        disclosures: c.disclosures,
+      };
+    }
+
+    await app.db.insert(signals).values({
+      id: signalId,
+      companyId,
+      projectId,
+      detector: OUTLIER_DETECTOR,
+      severity: "medium",
+      confidence: round2(
+        Math.min(0.95, c.verdict.contributors / (c.verdict.contributors + MIN_SAMPLE_N)),
+      ),
+      title: `${c.metric.name} is beyond the adverse ${
+        c.metric.higherIsBetter ? "p10" : "p90"
+      } of its benchmark cell`,
+      explanation:
+        `The project's latest "${c.metric.key}" snapshot is ${snapshot.value} ${snapshot.unit}, ` +
+        `${c.metric.higherIsBetter ? "below" : "beyond"} the ${
+          c.metric.higherIsBetter ? "10th" : "90th"
+        } percentile (${c.threshold} ${c.metric.unit}) of the contributed ` +
+        `${c.assetClass}/${c.region} distribution (n=${c.verdict.values.length} from ` +
+        `${c.verdict.contributors} distinct contributors, median ${c.median} ${c.metric.unit}; ` +
+        "your own samples excluded). Investigate whether the figure reflects scope, data " +
+        "quality, or genuine adverse performance.",
+      evidenceRefs: {
+        snapshotId: snapshot.id,
+        metric: c.metric.key,
+        assetClass: c.assetClass,
+        region: c.region,
+        currency: c.currency,
+        value: snapshot.value,
+        threshold: c.threshold,
+        side: c.side,
+        n: c.verdict.values.length,
+        contributors: c.verdict.contributors,
+        percentile: c.percentile,
+      },
+    });
+    await appendLedger(app.db, {
+      companyId,
+      actorId,
+      action: "create",
+      objectType: "benchmark_outlier_signal",
+      objectId: signalId,
+      projectId,
+      payload: {
+        snapshotId: snapshot.id,
+        metric: c.metric.key,
+        assetClass: c.assetClass,
+        region: c.region,
+        value: snapshot.value,
+        threshold: c.threshold,
+        n: c.verdict.values.length,
+        contributors: c.verdict.contributors,
+      },
+      storePayload: true,
+    });
+    return {
+      snapshotId: snapshot.id,
+      signalRaised: true,
+      signalId,
+      percentile: c.percentile,
+      distribution: c.distribution,
+      disclosures: c.disclosures,
+    };
+  }
+
   app.post(
     "/projects/:projectId/benchmarks/snapshots/:snapshotId/evaluate",
     { preHandler: projectStandard },
@@ -848,120 +1048,63 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
         .limit(1);
       if (!snapshot) throw notFound("Snapshot not found");
       const body = compareQuery.partial({ metric: true }).parse(req.body ?? {});
-      const c = await compareSnapshot(req.companyId!, req.projectId!, req.user!.id, {
-        ...body,
-        metric: snapshot.metric,
-      });
-
-      if (!c.signallable) {
-        return {
-          snapshotId: snapshot.id,
-          signalRaised: false,
-          signalId: snapshot.outlierSignalId,
-          reason: c.adverse
-            ? c.verdict.suppressed
-              ? "The comparison cell does not satisfy the anonymity rules, so its tails are not " +
-                "a defensible basis for a signal."
-              : "The distribution is illustrative seed data, not contributed outcomes."
-            : "The snapshot is not in the adverse tail of its cell.",
-          percentile: c.percentile,
-          distribution: c.distribution,
-          disclosures: c.disclosures,
-        };
-      }
-
-      const signalId = newId("sig");
-      const claimed = await app.db
-        .update(projectMetricSnapshots)
-        .set({ outlierSignalId: signalId })
-        .where(
-          and(
-            eq(projectMetricSnapshots.id, snapshot.id),
-            isNull(projectMetricSnapshots.outlierSignalId),
-          ),
-        )
-        .returning({ id: projectMetricSnapshots.id });
-      if (claimed.length === 0) {
-        const [after] = await app.db
-          .select({ outlierSignalId: projectMetricSnapshots.outlierSignalId })
-          .from(projectMetricSnapshots)
-          .where(eq(projectMetricSnapshots.id, snapshot.id))
-          .limit(1);
-        return {
-          snapshotId: snapshot.id,
-          signalRaised: false,
-          signalId: after?.outlierSignalId ?? null,
-          reason: "A signal has already been raised for this snapshot.",
-          percentile: c.percentile,
-          distribution: c.distribution,
-          disclosures: c.disclosures,
-        };
-      }
-
-      await app.db.insert(signals).values({
-        id: signalId,
-        companyId: req.companyId!,
-        projectId: req.projectId!,
-        detector: OUTLIER_DETECTOR,
-        severity: "medium",
-        confidence: round2(
-          Math.min(0.95, c.verdict.contributors / (c.verdict.contributors + MIN_SAMPLE_N)),
-        ),
-        title: `${c.metric.name} is beyond the adverse ${
-          c.metric.higherIsBetter ? "p10" : "p90"
-        } of its benchmark cell`,
-        explanation:
-          `The project's latest "${c.metric.key}" snapshot is ${snapshot.value} ${snapshot.unit}, ` +
-          `${c.metric.higherIsBetter ? "below" : "beyond"} the ${
-            c.metric.higherIsBetter ? "10th" : "90th"
-          } percentile (${c.threshold} ${c.metric.unit}) of the contributed ` +
-          `${c.assetClass}/${c.region} distribution (n=${c.verdict.values.length} from ` +
-          `${c.verdict.contributors} distinct contributors, median ${c.median} ${c.metric.unit}; ` +
-          "your own samples excluded). Investigate whether the figure reflects scope, data " +
-          "quality, or genuine adverse performance.",
-        evidenceRefs: {
-          snapshotId: snapshot.id,
-          metric: c.metric.key,
-          assetClass: c.assetClass,
-          region: c.region,
-          currency: c.currency,
-          value: snapshot.value,
-          threshold: c.threshold,
-          side: c.side,
-          n: c.verdict.values.length,
-          contributors: c.verdict.contributors,
-          percentile: c.percentile,
-        },
-      });
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: req.user!.id,
-        action: "create",
-        objectType: "benchmark_outlier_signal",
-        objectId: signalId,
-        projectId: req.projectId!,
-        payload: {
-          snapshotId: snapshot.id,
-          metric: c.metric.key,
-          assetClass: c.assetClass,
-          region: c.region,
-          value: snapshot.value,
-          threshold: c.threshold,
-          n: c.verdict.values.length,
-          contributors: c.verdict.contributors,
-        },
-        storePayload: true,
-      });
-      return {
-        snapshotId: snapshot.id,
-        signalRaised: true,
-        signalId,
-        percentile: c.percentile,
-        distribution: c.distribution,
-        disclosures: c.disclosures,
-      };
+      return evaluateSnapshot(snapshot, req.user!.id, body);
     },
   );
+
+  /**
+   * The sweep that makes the signal real (#843).
+   *
+   * Moving signal-raising off the GET fixed a write-on-read, but left the
+   * signal depending on somebody pressing a button: an adverse outlier that
+   * nobody looked at was never raised at all. Every project's LATEST snapshot
+   * per metric is evaluated here on a schedule, so the compare view, the
+   * health inputs and the attention feed describe a signal the platform
+   * actually raises. Idempotent by construction: the conditional claim on
+   * `outlier_signal_id` means a snapshot can carry at most one signal, and a
+   * snapshot that already carries one is filtered out before it is read.
+   */
+  app.scheduler.register({
+    name: "benchmarks.outlier-evaluation",
+    description:
+      "Evaluate each project's latest benchmark snapshot per metric and raise the adverse-outlier signal when the contributed cell supports one",
+    everyMs: 6 * 60 * 60_000,
+    runOnBoot: false,
+    run: async ({ db }) =>
+      forEachCompany(db, async (companyId) => {
+        const rows = await app.db
+          .select()
+          .from(projectMetricSnapshots)
+          .where(
+            and(
+              eq(projectMetricSnapshots.companyId, companyId),
+              isNull(projectMetricSnapshots.outlierSignalId),
+            ),
+          )
+          .orderBy(desc(projectMetricSnapshots.createdAt), desc(projectMetricSnapshots.id))
+          .limit(OUTLIER_SWEEP_LIMIT);
+        // Only the newest snapshot of a (project, metric) is a live figure;
+        // superseded ones are history and must not raise anything.
+        const latest = new Map<string, (typeof rows)[number]>();
+        for (const row of rows) {
+          const key = `${row.projectId}|${row.metric}`;
+          if (!latest.has(key)) latest.set(key, row);
+        }
+        let raised = 0;
+        let evaluated = 0;
+        for (const snapshot of latest.values()) {
+          evaluated += 1;
+          try {
+            const outcome = await evaluateSnapshot(snapshot, null);
+            if (outcome.signalRaised) raised += 1;
+          } catch {
+            // A snapshot whose metric was retired, or whose cell cannot be
+            // derived, is skipped: the sweep must not fail a whole tenant.
+          }
+        }
+        return { evaluated, raised };
+      }),
+  });
 
   /* ---------------------------------------------------------------- */
   /* Reference-class forecasting (#833-838, #846-849)                  */
@@ -977,16 +1120,25 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
     const metric = z
       .object({ metric: z.string().min(1).max(100).optional() })
       .parse(req.query).metric;
-    const rows = await app.db
+    /*
+     * AGGREGATED IN SQL, NOT IN MEMORY.
+     *
+     * This used to read every contributed sample on the platform with a flat
+     * limit(5000) and no ORDER BY, then group them here — an unbounded
+     * cross-tenant scan (plan §6.4) that past 5000 samples silently dropped an
+     * arbitrary subset, so the contributor count and the "describable" verdict
+     * an operator reads went wrong with nothing disclosing it. One row per
+     * (class, contributor) is all the anonymity rules need, the ordering is
+     * stable, and a register that HAS hit its cap says so.
+     */
+    const grouped = await app.db
       .select({
         metric: benchmarkSamples.metric,
         assetClass: benchmarkSamples.assetClass,
         region: benchmarkSamples.region,
         currency: benchmarkSamples.currency,
         contributorCompanyId: benchmarkSamples.contributorCompanyId,
-        value: benchmarkSamples.value,
-        dataYear: benchmarkSamples.dataYear,
-        methodology: benchmarkSamples.methodology,
+        samples: count(),
       })
       .from(benchmarkSamples)
       .where(
@@ -996,18 +1148,35 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
           metric ? eq(benchmarkSamples.metric, metric) : undefined,
         ),
       )
-      .limit(5000);
-    const byClass = new Map<string, PoolRow[]>();
-    const meta = new Map<string, { metric: string; assetClass: string; region: string; currency: string | null }>();
-    for (const r of rows) {
+      .groupBy(
+        benchmarkSamples.metric,
+        benchmarkSamples.assetClass,
+        benchmarkSamples.region,
+        benchmarkSamples.currency,
+        benchmarkSamples.contributorCompanyId,
+      )
+      .orderBy(
+        asc(benchmarkSamples.metric),
+        asc(benchmarkSamples.assetClass),
+        asc(benchmarkSamples.region),
+        asc(benchmarkSamples.contributorCompanyId),
+      )
+      .limit(REGISTER_GROUP_LIMIT + 1);
+    const truncated = grouped.length > REGISTER_GROUP_LIMIT;
+    const groups = truncated ? grouped.slice(0, REGISTER_GROUP_LIMIT) : grouped;
+
+    const byClass = new Map<
+      string,
+      { contributorCompanyId: string | null; samples: number }[]
+    >();
+    const meta = new Map<
+      string,
+      { metric: string; assetClass: string; region: string; currency: string | null }
+    >();
+    for (const r of groups) {
       const key = `${r.metric}|${r.assetClass}|${r.region}|${r.currency ?? ""}`;
       const list = byClass.get(key) ?? [];
-      list.push({
-        value: r.value,
-        dataYear: r.dataYear,
-        methodology: r.methodology,
-        contributorCompanyId: r.contributorCompanyId,
-      });
+      list.push({ contributorCompanyId: r.contributorCompanyId, samples: Number(r.samples) });
       byClass.set(key, list);
       meta.set(key, {
         metric: r.metric,
@@ -1017,25 +1186,39 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
       });
     }
     const classes = [...byClass.entries()].map(([key, list]) => {
-      const verdict = assessPool(list, req.companyId!);
+      const verdict = assessCounts(list, req.companyId!);
       const m = meta.get(key)!;
       return {
         id: key,
         ...m,
         contributors: verdict.contributors,
-        sampleSize: verdict.values.length,
-        describable: !verdict.suppressed && verdict.values.length > 0,
+        sampleSize: verdict.sampleSize,
+        ownSamplesExcluded: verdict.ownSamples,
+        describable: verdict.describable,
         reasons: verdict.reasons,
       };
     });
     return {
-      classes: classes.sort((a, b) => b.contributors - a.contributors),
+      classes: classes.sort(
+        (a, b) => b.contributors - a.contributors || a.id.localeCompare(b.id),
+      ),
+      truncated,
+      ...(truncated
+        ? {
+            truncationNote:
+              `The register lists the first ${REGISTER_GROUP_LIMIT} (class, contributor) groups ` +
+              "in a stable order; later classes are not shown. Narrow it with ?metric= to see " +
+              "them, rather than reading these counts as the whole pool.",
+          }
+        : {}),
       minSampleN: MIN_SAMPLE_N,
       maxContributorShare: MAX_CONTRIBUTOR_SHARE,
       membership:
-        "A reference class is metric x asset class x region (x currency for money metrics). " +
-        "Size band and procurement route are declared on each sample and published with it; " +
-        "narrow the class with ?sizeBand= and ?procurementRoute= on the forecast route.",
+        "A reference class is metric x asset class x region (x currency for money metrics), " +
+        "optionally narrowed by size band and procurement route. Narrow it with ?sizeBand= and " +
+        "?procurementRoute= on the forecast route: those criteria are then applied to the query " +
+        "AND published with the figure. A criterion that could not be applied — seed samples " +
+        "carry neither — is dropped from the published class rather than asserted.",
     };
   });
 
@@ -1052,11 +1235,19 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
     const currency = cellCurrency(metric, q.currency);
     await ensureSeeded(metric.key, req.companyId!, req.user!.id);
     const contributedAccess = await hasContributed(req.companyId!, metric.key);
-    const { verdict, seedIncluded } = await describeCell(
-      { metric: metric.key, assetClass: q.assetClass, region, currency },
+    const { verdict, seedIncluded, narrowingDropped } = await describeCell(
+      {
+        metric: metric.key,
+        assetClass: q.assetClass,
+        region,
+        currency,
+        sizeBand: q.sizeBand ?? null,
+        procurementRoute: q.procurementRoute ?? null,
+      },
       req.companyId!,
       contributedAccess,
     );
+    const applied = appliedMembership(q, narrowingDropped);
     const values = verdict.suppressed ? [] : verdict.values;
     const sorted = [...values].sort((a, b) => a - b);
     const p50 = values.length > 0 ? round2(percentileOf(sorted, 50)) : null;
@@ -1075,14 +1266,24 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
           "worked example, not a recommendation.",
       );
     }
+    disclosures.push(membershipNote(q.assetClass, region, currency, applied));
+    if (narrowingDropped.length > 0) {
+      disclosures.push(
+        `The requested ${narrowingDropped.join(" and ")} narrowing was NOT applied: seed samples ` +
+          "carry neither, so this figure describes the whole class.",
+      );
+    }
     return {
       metric: metric.key,
       unit: metric.unit,
       assetClass: q.assetClass,
       region,
       currency,
-      sizeBand: q.sizeBand ?? null,
-      procurementRoute: q.procurementRoute ?? null,
+      sizeBand: applied.sizeBand,
+      procurementRoute: applied.procurementRoute,
+      requestedSizeBand: q.sizeBand ?? null,
+      requestedProcurementRoute: q.procurementRoute ?? null,
+      narrowingDropped,
       contributors: verdict.contributors,
       sampleSize: values.length,
       p50Uplift: p50,
@@ -1118,11 +1319,19 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
       const currency = cellCurrency(metric, q.currency);
       await ensureSeeded(metric.key, req.companyId!, req.user!.id);
       const contributedAccess = await hasContributed(req.companyId!, metric.key);
-      const { verdict, seedIncluded } = await describeCell(
-        { metric: metric.key, assetClass: q.assetClass, region, currency },
+      const { verdict, seedIncluded, narrowingDropped } = await describeCell(
+        {
+          metric: metric.key,
+          assetClass: q.assetClass,
+          region,
+          currency,
+          sizeBand: q.sizeBand ?? null,
+          procurementRoute: q.procurementRoute ?? null,
+        },
         req.companyId!,
         contributedAccess,
       );
+      const applied = appliedMembership(q, narrowingDropped);
       const values = verdict.suppressed ? [] : verdict.values;
       if (values.length === 0) {
         throw new AppError(
@@ -1140,17 +1349,37 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
         probability: round2(values.filter((v) => v > threshold).length / values.length),
       }));
       const disclosures = baseDisclosures(verdict, seedIncluded);
+      disclosures.push(membershipNote(q.assetClass, region, currency, applied));
+      if (narrowingDropped.length > 0) {
+        // The stored row is citable. Storing a criterion the query did not
+        // apply would make it a record of a narrower class than the figure
+        // came from — precisely what "published membership criteria" exists to
+        // prevent — so the unapplied narrowing is dropped from the row and the
+        // refusal is disclosed on it.
+        disclosures.push(
+          `The requested ${narrowingDropped.join(" and ")} narrowing was NOT applied and is ` +
+            "therefore not recorded as a membership criterion of this forecast.",
+        );
+      }
       const id = newId("bfc");
+      const referenceClassParts = [
+        metric.key,
+        q.assetClass,
+        region,
+        ...(currency ? [currency] : []),
+        ...(applied.sizeBand ? [applied.sizeBand] : []),
+        ...(applied.procurementRoute ? [applied.procurementRoute] : []),
+      ];
       await app.db.insert(benchmarkForecasts).values({
         id,
         companyId: req.companyId!,
         projectId: req.projectId!,
         metric: metric.key,
-        referenceClass: `${metric.key}|${q.assetClass}|${region}${currency ? `|${currency}` : ""}`,
+        referenceClass: referenceClassParts.join("|"),
         assetClass: q.assetClass,
         region,
-        sizeBand: q.sizeBand ?? null,
-        procurementRoute: q.procurementRoute ?? null,
+        sizeBand: applied.sizeBand,
+        procurementRoute: applied.procurementRoute,
         budget: q.budget ?? null,
         currency,
         contributorCount: verdict.contributors,
@@ -1172,6 +1401,9 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
           metric: metric.key,
           assetClass: q.assetClass,
           region,
+          sizeBand: applied.sizeBand,
+          procurementRoute: applied.procurementRoute,
+          narrowingDropped,
           p50Uplift: p50,
           p80Uplift: p80,
           sampleSize: values.length,
@@ -1185,7 +1417,7 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
         .from(benchmarkForecasts)
         .where(eq(benchmarkForecasts.id, id))
         .limit(1);
-      return reply.status(201).send({ forecast: row, seedIncluded });
+      return reply.status(201).send({ forecast: row, seedIncluded, narrowingDropped });
     },
   );
 

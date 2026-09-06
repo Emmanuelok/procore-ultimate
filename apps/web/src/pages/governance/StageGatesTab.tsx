@@ -661,7 +661,7 @@ export default function StageGatesTab({ projectId }: { projectId: string }) {
               </span>
               <div className="space-y-2">
                 {reviewGate.criteria.map((c) => {
-                  const f = rFindings[c.id] ?? { note: "" };
+                  const f = rFindings[c.id] ?? { note: "", evidence: "" };
                   return (
                     <div key={c.id} className="rounded-md bg-ink-50 px-3 py-2">
                       <div className="flex flex-wrap items-center justify-between gap-2">

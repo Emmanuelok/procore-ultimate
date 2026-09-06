@@ -100,10 +100,10 @@ describe("BoQ carbon import idempotence", () => {
     for (const [i, code] of ["C10.1", "C10.2"].entries()) {
       await app.db.insert(boqItems).values({
         id: newId("bqi"),
-        companyId: owner.companyId,
         boqId,
         code,
         path: `1.${i}`,
+        level: "item",
         sortOrder: i,
         description: `Concrete item ${code}`,
         quantity: 10_000,
@@ -233,7 +233,7 @@ describe("social value delivered total", () => {
       url: `/api/v1/projects/${pid}/social-value`,
       headers: owner.headers,
       payload: {
-        theme: "jobs",
+        theme: "economic_inequality",
         description: "Local apprenticeships",
         targetValue: 100,
         unit: "weeks",
@@ -490,11 +490,14 @@ describe("ESG detectors run from the scheduler, not from reads", () => {
       .where(
         and(
           eq(ledgerEntries.companyId, owner.companyId),
-          eq(ledgerEntries.objectType, "carbon_budget"),
-          eq(ledgerEntries.action, "create"),
+          eq(ledgerEntries.objectType, "signal"),
         ),
       );
-    expect(entries.at(-1)!.actorId).toBeNull();
+    const raised = entries.filter(
+      (e) => (e.payload as { detector?: string } | null)?.detector === "carbon_budget_exceeded",
+    );
+    expect(raised).toHaveLength(1);
+    expect(raised[0]!.actorId).toBeNull();
   });
 
   it("RE-ARMS the exceedance when the target is revised and breached again", async () => {

@@ -4,9 +4,12 @@
  * and raises / auto-resolves the three consent detectors.
  *
  * It lives in the land module because that is where the engine lives, but it
- * is deliberately register-agnostic: the jurisdiction module's permit
- * schedule-risk view calls exactly the same function, so the two workspaces
- * can never disagree about which task is blocked or by how much.
+ * is deliberately register-agnostic: it reads parcels AND permits, so the
+ * unified consent view (`GET /projects/:id/land/consent`) and the land
+ * schedule-risk view answer for both registers at once. The jurisdiction
+ * module keeps its own permit-only schedule-risk read for the permits
+ * workspace; both are now pure, and the FINDINGS come from here alone, so
+ * the two views can never disagree about what has been raised.
  *
  * Detectors raised here:
  *

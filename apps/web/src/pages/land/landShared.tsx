@@ -80,6 +80,9 @@ export interface PapRow {
   vulnerable?: boolean;
   entitlementCount?: number;
   livelihoodRequired?: boolean;
+  physicalDisplacement?: boolean;
+  /** the server's own state machine — the UI drives its buttons from it */
+  allowedTransitions?: string[];
 }
 
 export interface GrievanceSlaRule {

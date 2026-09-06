@@ -204,6 +204,21 @@ export default function GrievancesTab({
     void load();
   }, [load]);
 
+  /* Pickers for the intake form. Each fails alone: a missing location list
+     must not stop a grievance being recorded. */
+  useEffect(() => {
+    void api
+      .get<{ items: { id: string; name: string }[] }>(`${base}/locations?pageSize=200`)
+      .then((res) => setLocations(res.items))
+      .catch(() => setLocations([]));
+    void api
+      .get<{ items: { id: string; reference: string }[] }>(
+        `${base}/affected-persons?pageSize=200`,
+      )
+      .then((res) => setPapOptions(res.items))
+      .catch(() => setPapOptions([]));
+  }, [base]);
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -235,6 +250,19 @@ export default function GrievancesTab({
   const [severity, setSeverity] = useState<string>("medium");
   const [description, setDescription] = useState("");
   const [receivedAt, setReceivedAt] = useState("");
+  /*
+   * The API has always accepted `locationId` and `papId` and the analytics
+   * group by location (#574), but the intake form never sent either — so
+   * every grievance landed "unassigned", the by-location cut was dead, the
+   * hotspot detector had nothing to cluster on, and a grievance could not be
+   * tied to a household from anywhere in the product.
+   */
+  const [rejectReason, setRejectReason] = useState("");
+  const [rejectOutcome, setRejectOutcome] = useState("rejected");
+  const [locationId, setLocationId] = useState("");
+  const [papId, setPapId] = useState("");
+  const [locations, setLocations] = useState<{ id: string; name: string }[]>([]);
+  const [papOptions, setPapOptions] = useState<{ id: string; reference: string }[]>([]);
 
   const anonymousEffective = anonymous || channel === "anonymous";
 
@@ -248,6 +276,8 @@ export default function GrievancesTab({
     setSeverity("medium");
     setDescription("");
     setReceivedAt(new Date().toISOString().slice(0, 10));
+    setLocationId("");
+    setPapId("");
     setIntakeOpen(true);
   }
 
@@ -257,6 +287,8 @@ export default function GrievancesTab({
     if (next) {
       setName("");
       setContact("");
+      // a household id IS identifying data; anonymity has to mean it
+      setPapId("");
     }
   }
 
@@ -265,6 +297,8 @@ export default function GrievancesTab({
     if (next === "anonymous") {
       setName("");
       setContact("");
+      // a household id IS identifying data; anonymity has to mean it
+      setPapId("");
     }
   }
 
@@ -285,6 +319,8 @@ export default function GrievancesTab({
         if (name.trim()) payload["complainantName"] = name.trim();
         if (contact.trim()) payload["complainantContact"] = contact.trim();
       }
+      if (locationId) payload["locationId"] = locationId;
+      if (papId) payload["papId"] = papId;
       await api.post(`${base}/grievances`, payload);
       setIntakeOpen(false);
       await load();
@@ -682,6 +718,43 @@ export default function GrievancesTab({
             </Field>
           </div>
 
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <Field
+              label="Location"
+              hint="Where it happened — three complaints of one kind at one place is a hotspot, not three complaints."
+            >
+              <Select value={locationId} onChange={(e) => setLocationId(e.target.value)}>
+                <option value="">Not tied to a location</option>
+                {locations.map((l) => (
+                  <option key={l.id} value={l.id}>
+                    {l.name}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field
+              label="Affected household"
+              hint="Links the grievance to the census record it is about."
+            >
+              <Select
+                value={papId}
+                onChange={(e) => setPapId(e.target.value)}
+                disabled={anonymousEffective}
+              >
+                <option value="">
+                  {anonymousEffective ? "Withheld — anonymous intake" : "Not tied to a household"}
+                </option>
+                {anonymousEffective
+                  ? null
+                  : papOptions.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.reference}
+                      </option>
+                    ))}
+              </Select>
+            </Field>
+          </div>
+
           <label className="flex items-start gap-2 text-sm text-ink-700">
             <input
               type="checkbox"
@@ -883,24 +956,69 @@ export default function GrievancesTab({
                     >
                       Record resolution
                     </Button>
-                    {selected.status !== "escalated" ? (
-                      <>
-                        <Input
-                          className="w-64"
-                          placeholder="Escalation reason"
-                          value={escalationReason}
-                          onChange={(e) => setEscalationReason(e.target.value)}
-                        />
-                        <Button
-                          variant="secondary"
-                          size="sm"
-                          disabled={busy || escalationReason.trim().length === 0}
-                          onClick={() => void act("escalate", { reason: escalationReason.trim() })}
-                        >
-                          Escalate
-                        </Button>
-                      </>
-                    ) : null}
+                    <>
+                      <Input
+                        className="w-64"
+                        placeholder="Escalation reason"
+                        value={escalationReason}
+                        onChange={(e) => setEscalationReason(e.target.value)}
+                      />
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        disabled={busy || escalationReason.trim().length === 0}
+                        onClick={() => void act("escalate", { reason: escalationReason.trim() })}
+                        title="Climbs the published ladder one tier: site officer → community liaison manager → project director → external route."
+                      >
+                        Escalate
+                      </Button>
+                    </>
+                  </div>
+
+                  {/*
+                   * Rejection is a real outcome of a functioning mechanism.
+                   * Without it, an out-of-scope or vexatious grievance had to be
+                   * "resolved" with a fabricated resolution and then verified —
+                   * which inflated both the SLA compliance rate and the
+                   * satisfaction rate — or left open to breach its SLA.
+                   */}
+                  <div className="rounded-md bg-ink-50 px-3 py-3">
+                    <p className="mb-2 text-xs text-ink-500">
+                      Out of scope, or withdrawn by the complainant? Reject it with a reason. A
+                      rejection is excluded from the SLA compliance rate rather than counted as a
+                      hit or a miss, and the obligation is waived, not satisfied — nothing was
+                      delivered to the complainant.
+                    </p>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Select
+                        className="w-40"
+                        value={rejectOutcome}
+                        onChange={(e) => setRejectOutcome(e.target.value)}
+                      >
+                        <option value="rejected">Rejected</option>
+                        <option value="withdrawn">Withdrawn</option>
+                      </Select>
+                      <Input
+                        className="w-72"
+                        placeholder="Reason given to the complainant"
+                        value={rejectReason}
+                        onChange={(e) => setRejectReason(e.target.value)}
+                      />
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        disabled={busy || rejectReason.trim().length === 0}
+                        onClick={() =>
+                          void act("reject", {
+                            reason: rejectReason.trim(),
+                            outcome: rejectOutcome,
+                            complainantNotified: true,
+                          })
+                        }
+                      >
+                        Close as {rejectOutcome}
+                      </Button>
+                    </div>
                   </div>
                 </>
               ) : null}
@@ -924,6 +1042,14 @@ export default function GrievancesTab({
                     Verify closure
                   </Button>
                 </div>
+              ) : null}
+
+              {selected.status === "rejected" ? (
+                <p className="rounded-md bg-ink-100 px-3 py-2 text-sm text-ink-700">
+                  Closed as rejected. {selected.resolution ?? ""} It is excluded from the SLA
+                  compliance rate on both sides, and its obligation was waived rather than
+                  satisfied.
+                </p>
               ) : null}
 
               {selected.status === "closed_verified" ? (

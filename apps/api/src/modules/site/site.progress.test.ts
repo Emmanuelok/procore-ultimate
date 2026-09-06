@@ -13,6 +13,7 @@ import {
   projects,
   reconciliations,
   signals,
+  valuations,
   vendors,
 } from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
@@ -27,6 +28,7 @@ let viewerHeaders: Record<string, string>;
 let stranger: TestActor;
 let projectId: string;
 let vendorId: string;
+let valuationId: string;
 
 function post(url: string, payload: unknown, headers = owner.headers) {
   return app.inject({ method: "POST", url: `/api/v1${url}`, headers, payload });
@@ -57,6 +59,18 @@ beforeAll(async () => {
 
   vendorId = newId("ven");
   await app.db.insert(vendors).values({ id: vendorId, companyId: owner.companyId, name: "Frame Co", country: "GB" });
+
+  // A real record for the claim to point at: an id stored on an Assertion as
+  // the source of a claim has to resolve to something.
+  valuationId = newId("val");
+  await app.db.insert(valuations).values({
+    id: valuationId,
+    companyId: owner.companyId,
+    projectId,
+    boqId: newId("boq"),
+    number: 1,
+    valuationDate: "2025-03-31",
+  });
 });
 
 afterAll(async () => {
@@ -90,7 +104,7 @@ describe("recording an observation", () => {
       observedPercent: 78,
       method: "photo",
       claimSourceType: "valuation",
-      claimSourceId: "val_123",
+      claimSourceId: valuationId,
       claimantId: claimant.userId,
       claimantVendorId: vendorId,
       fileIds: ["file_a", "file_b"],
@@ -188,6 +202,98 @@ describe("recording an observation", () => {
     expect(contradicted.json().total).toBe(1);
   });
 
+  it("refuses a claimant nobody can resolve, so the different-actor rule is not a string compare", async () => {
+    const res = await post(`${base()}/progress-observations`, {
+      zoneName: "Level 7 slab",
+      claimedPercent: 80,
+      observedPercent: 80,
+      method: "photo",
+      claimantId: "acme-ltd",
+      fileIds: ["file_e"],
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("acme-ltd");
+    expect(res.json().message).toContain("not a user of this company");
+  });
+
+  it("refuses a user from another company as the claimant", async () => {
+    const res = await post(`${base()}/progress-observations`, {
+      zoneName: "Level 7 slab",
+      claimedPercent: 80,
+      observedPercent: 80,
+      claimantId: stranger.userId,
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("accepts a vendor as the claimant and records the resolved name", async () => {
+    const res = await post(`${base()}/progress-observations`, {
+      zoneName: "Level 7 cladding",
+      claimedPercent: 50,
+      observedPercent: 48,
+      method: "survey",
+      claimantKind: "vendor",
+      claimantId: vendorId,
+      claimantVendorId: vendorId,
+      fileIds: ["file_f"],
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().claimantName).toBe("Frame Co");
+    expect(res.json().claimant).toEqual({ kind: "vendor", id: vendorId, name: "Frame Co" });
+    const [assertion] = await app.db.select().from(assertions).where(eq(assertions.id, res.json().assertionId));
+    expect(assertion?.basis).toContain("Frame Co");
+  });
+
+  it("refuses a vendor claimant that is not in the directory", async () => {
+    const res = await post(`${base()}/progress-observations`, {
+      zoneName: "Level 7 cladding",
+      claimedPercent: 50,
+      observedPercent: 48,
+      claimantKind: "vendor",
+      claimantId: "ven_nope",
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("directory");
+  });
+
+  it("refuses a claim source id that points at nothing, and one on a manual claim", async () => {
+    const ghost = await post(`${base()}/progress-observations`, {
+      zoneName: "Level 8",
+      claimedPercent: 10,
+      observedPercent: 10,
+      claimantId: claimant.userId,
+      claimSourceType: "valuation",
+      claimSourceId: "val_ghost",
+    });
+    expect(ghost.statusCode).toBe(400);
+    expect(ghost.json().message).toContain("val_ghost");
+
+    const manual = await post(`${base()}/progress-observations`, {
+      zoneName: "Level 8",
+      claimedPercent: 10,
+      observedPercent: 10,
+      claimantId: claimant.userId,
+      claimSourceType: "manual",
+      claimSourceId: valuationId,
+    });
+    expect(manual.statusCode).toBe(400);
+    expect(manual.json().message).toContain("no record to point at");
+  });
+
+  it("writes the triple atomically — a refused reference leaves no orphan assertion", async () => {
+    const before = await app.db.select().from(assertions).where(eq(assertions.projectId, projectId));
+    const res = await post(`${base()}/progress-observations`, {
+      zoneName: "Level 9",
+      claimedPercent: 10,
+      observedPercent: 10,
+      claimantId: claimant.userId,
+      scheduleTaskId: "tsk_ghost",
+    });
+    expect(res.statusCode).toBe(400);
+    const after = await app.db.select().from(assertions).where(eq(assertions.projectId, projectId));
+    expect(after.length).toBe(before.length);
+  });
+
   it("refuses a schedule task from another project", async () => {
     const res = await post(`${base()}/progress-observations`, {
       zoneName: "Nowhere",
@@ -205,7 +311,7 @@ describe("summary and health inputs", () => {
     const res = await get(`${base()}/summary`);
     expect(res.statusCode).toBe(200);
     const body = res.json();
-    expect(body.progress.observations).toBe(4);
+    expect(body.progress.observations).toBe(5);
     expect(body.progress.overclaims).toBe(2);
     expect(body.progress.worstVariance.value).toBe(60);
     expect(body.register.headcount).toBe(0);

@@ -20,13 +20,20 @@ import GrievancesTab from "./GrievancesTab";
 import ParcelsTab from "./ParcelsTab";
 import PapsTab from "./PapsTab";
 import RapTab from "./RapTab";
+import SafeguardsTab from "./SafeguardsTab";
 import {
   type GrievanceAnalytics,
   type RapProgress,
   type ScheduleRisk,
 } from "./landShared";
 
-type TabKey = "rap" | "parcels" | "households" | "grievances" | "community";
+type TabKey =
+  | "rap"
+  | "parcels"
+  | "households"
+  | "grievances"
+  | "community"
+  | "safeguards";
 
 const TABS: { key: TabKey; label: string; hint: string }[] = [
   { key: "rap", label: "RAP dashboard", hint: "#558, #568, #591" },
@@ -34,6 +41,7 @@ const TABS: { key: TabKey; label: string; hint: string }[] = [
   { key: "households", label: "Affected households", hint: "#555-568" },
   { key: "grievances", label: "Grievances", hint: "#569-574" },
   { key: "community", label: "Stakeholders", hint: "#575-584" },
+  { key: "safeguards", label: "Safeguards", hint: "#550, #561, #568, #575-578" },
 ];
 
 export default function LandPage() {
@@ -177,6 +185,9 @@ export default function LandPage() {
             <GrievancesTab projectId={projectId} onChanged={() => void loadOverview()} />
           ) : null}
           {tab === "community" ? <CommunityTab projectId={projectId} /> : null}
+          {tab === "safeguards" ? (
+            <SafeguardsTab projectId={projectId} onChanged={() => void loadOverview()} />
+          ) : null}
         </>
       )}
     </div>

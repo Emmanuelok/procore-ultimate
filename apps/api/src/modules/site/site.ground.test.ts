@@ -341,7 +341,24 @@ describe("buried utilities and strikes", () => {
 
   it("summarises the three controls across the register", async () => {
     const res = await get(`${base()}/strikes`);
-    expect(res.json().controls).toEqual({ total: 1, withPermit: 0, withScan: 0, withMarks: 1 });
+    expect(res.json().controls).toEqual({ total: 1, withPermit: 0, withScan: 0, withMarks: 1, scope: "register" });
+  });
+
+  it("counts the controls over the whole register, not the page in front of you", async () => {
+    const second = await post(`${base()}/strikes`, {
+      occurredAt: new Date().toISOString(),
+      utilityType: "water",
+      severity: "near_miss",
+      permitInPlace: true,
+      scanCompleted: true,
+      marksPresent: true,
+    });
+    expect(second.statusCode).toBe(201);
+    const page = await get(`${base()}/strikes?pageSize=1`);
+    expect(page.json().items).toHaveLength(1);
+    expect(page.json().total).toBe(2);
+    // one page shown, both strikes counted
+    expect(page.json().controls).toEqual({ total: 2, withPermit: 1, withScan: 1, withMarks: 2, scope: "register" });
   });
 
   it("closes a strike with a root cause", async () => {

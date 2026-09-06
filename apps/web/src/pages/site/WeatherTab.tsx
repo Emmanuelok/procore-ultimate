@@ -8,7 +8,7 @@
  * Coverage is stated on every analysis: a missing day is a gap in the record,
  * never a fair-weather day.
  */
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { toast } from "sonner";
 import { Alert, Badge, Button, Card, CardBody, Drawer, Field, Input, Select, Textarea } from "../../ui";
 import { DataTable, type DataColumns } from "../../ui/data";
@@ -336,6 +336,8 @@ function ObservationForm({ base, open, onClose, onCreated }: { base: string; ope
 function BaselinePanel({ base, onChanged }: { base: string; onChanged: () => void }) {
   const list = useResource<ListResponse<WeatherBaselineRow>>(`${base}/weather/baselines?pageSize=100`);
   const [open, setOpen] = useState(false);
+  /** the baseline being corrected — null when the drawer is a new one */
+  const [editing, setEditing] = useState<WeatherBaselineRow | null>(null);
 
   return (
     <Card>
@@ -344,7 +346,14 @@ function BaselinePanel({ base, onChanged }: { base: string; onChanged: () => voi
           title="Contract baselines"
           hint="What the contract calls adverse, and how many adverse days a normal month holds. Without the monthly figures the platform will count adverse days but refuses to call any of them exceptional."
           actions={
-            <Button size="sm" icon={IconPlus} onClick={() => setOpen(true)}>
+            <Button
+              size="sm"
+              icon={IconPlus}
+              onClick={() => {
+                setEditing(null);
+                setOpen(true);
+              }}
+            >
               Add a baseline
             </Button>
           }
@@ -355,9 +364,21 @@ function BaselinePanel({ base, onChanged }: { base: string; onChanged: () => voi
             <div key={b.id} className="rounded-md border border-border-subtle p-3">
               <div className="flex flex-wrap items-baseline justify-between gap-2">
                 <span className="text-body font-semibold text-content">{b.name}</span>
-                <span className="text-2xs uppercase tracking-wide text-content-subtle">
-                  {labelize(b.source)}
-                  {b.contractRef ? ` · ${b.contractRef}` : ""}
+                <span className="flex items-center gap-2">
+                  <span className="text-2xs uppercase tracking-wide text-content-subtle">
+                    {labelize(b.source)}
+                    {b.contractRef ? ` · ${b.contractRef}` : ""}
+                  </span>
+                  <Button
+                    size="xs"
+                    variant="ghost"
+                    onClick={() => {
+                      setEditing(b);
+                      setOpen(true);
+                    }}
+                  >
+                    Edit
+                  </Button>
                 </span>
               </div>
               <div className="mt-2 flex flex-wrap gap-1.5">
@@ -396,10 +417,15 @@ function BaselinePanel({ base, onChanged }: { base: string; onChanged: () => voi
         </div>
         <BaselineForm
           base={base}
+          record={editing}
           open={open}
-          onClose={() => setOpen(false)}
-          onCreated={() => {
+          onClose={() => {
             setOpen(false);
+            setEditing(null);
+          }}
+          onSaved={() => {
+            setOpen(false);
+            setEditing(null);
             list.reload();
             onChanged();
           }}
@@ -409,13 +435,55 @@ function BaselinePanel({ base, onChanged }: { base: string; onChanged: () => voi
   );
 }
 
-function BaselineForm({ base, open, onClose, onCreated }: { base: string; open: boolean; onClose: () => void; onCreated: () => void }) {
+const DEFAULT_THRESHOLDS = "precipitation_mm gte 10 Rainfall\nwind_gust_kph gte 60 Gust\ntemp_min_c lte -2 Frost";
+const DEFAULT_MONTHLY = "1 3\n2 2.5\n3 2\n11 2.5\n12 3";
+
+const COMPARATOR_SIGN: Record<string, string> = { gte: "gte", gt: "gt", lte: "lte", lt: "lt" };
+
+function BaselineForm({
+  base,
+  record,
+  open,
+  onClose,
+  onSaved,
+}: {
+  base: string;
+  /** the baseline being corrected, or null for a new one */
+  record: WeatherBaselineRow | null;
+  open: boolean;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
   const action = useAction();
   const [name, setName] = useState("");
   const [source, setSource] = useState("contract");
   const [contractRef, setContractRef] = useState("");
-  const [thresholds, setThresholds] = useState("precipitation_mm gte 10 Rainfall\nwind_gust_kph gte 60 Gust\ntemp_min_c lte -2 Frost");
-  const [monthly, setMonthly] = useState("1 3\n2 2.5\n3 2\n11 2.5\n12 3");
+  const [thresholds, setThresholds] = useState(DEFAULT_THRESHOLDS);
+  const [monthly, setMonthly] = useState(DEFAULT_MONTHLY);
+
+  // Prefill from the stored baseline whenever the drawer opens on one, so an
+  // edit starts from the thresholds actually in force.
+  useEffect(() => {
+    if (!open) return;
+    setName(record?.name ?? "");
+    setSource(record?.source ?? "contract");
+    setContractRef(record?.contractRef ?? "");
+    setThresholds(
+      record
+        ? record.thresholds
+            .map((t) => [t.metric, COMPARATOR_SIGN[t.comparator] ?? t.comparator, String(t.value), t.label ?? ""].join(" ").trim())
+            .join("\n")
+        : DEFAULT_THRESHOLDS,
+    );
+    setMonthly(
+      record
+        ? Object.entries(record.monthlyExpectedAdverseDays)
+            .sort((a, b) => Number(a[0]) - Number(b[0]))
+            .map(([m, v]) => `${m} ${v}`)
+            .join("\n")
+        : DEFAULT_MONTHLY,
+    );
+  }, [open, record]);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -435,13 +503,23 @@ function BaselineForm({ base, open, onClose, onCreated }: { base: string; open: 
       if (!month || !value) continue;
       if (Number.isFinite(Number(month)) && Number.isFinite(Number(value))) parsedMonthly[String(Number(month))] = Number(value);
     }
-    const payload: Record<string, unknown> = { name: name.trim(), source, thresholds: parsedThresholds, monthlyExpectedAdverseDays: parsedMonthly };
-    if (contractRef.trim()) payload["contractRef"] = contractRef.trim();
-    const r = await action.run("create", () => api.post<WeatherBaselineRow>(`${base}/weather/baselines`, payload));
+    const payload: Record<string, unknown> = {
+      name: name.trim(),
+      source,
+      thresholds: parsedThresholds,
+      monthlyExpectedAdverseDays: parsedMonthly,
+      contractRef: contractRef.trim() || null,
+    };
+    if (!record && payload["contractRef"] === null) delete payload["contractRef"];
+    const r = record
+      ? await action.run("save", () => api.patch<WeatherBaselineRow>(`${base}/weather/baselines/${record.id}`, payload))
+      : await action.run("save", () => api.post<WeatherBaselineRow>(`${base}/weather/baselines`, payload));
     if (r) {
-      toast.success(`${r.name} saved with ${r.thresholds.length} threshold(s)`);
-      setName("");
-      onCreated();
+      toast.success(
+        record ? `${r.name} updated` : `${r.name} saved with ${r.thresholds.length} threshold(s)`,
+      );
+      if (!record) setName("");
+      onSaved();
     }
   }
 
@@ -449,8 +527,8 @@ function BaselineForm({ base, open, onClose, onCreated }: { base: string; open: 
     <Drawer
       open={open}
       onClose={onClose}
-      title="Add a weather baseline"
-      description="Thresholds: one per line as `metric comparator value label`. Monthly expectations: one per line as `month days`."
+      title={record ? `Correct ${record.name}` : "Add a weather baseline"}
+      description="Thresholds: one per line as `metric comparator value label`. Monthly expectations: one per line as `month days`. An analysis already run keeps the figures it was run on; re-run it to use the corrected baseline."
       size="md"
     >
       <form onSubmit={(e) => void submit(e)} className="space-y-3">
@@ -482,7 +560,7 @@ function BaselineForm({ base, open, onClose, onCreated }: { base: string; open: 
           <Button type="button" variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button type="submit" loading={action.busy === "create"}>
+          <Button type="submit" loading={action.busy === "save"}>
             Save
           </Button>
         </div>
@@ -557,9 +635,14 @@ function AnalysisPanel({ base, onChanged }: { base: string; onChanged: () => voi
   }
 
   async function issue(id: string) {
-    const r = await action.run("issue", () => api.post<WeatherAnalysisRow>(`${base}/weather/analyses/${id}/issue`, {}));
+    const r = await action.run("issue", () =>
+      api.post<WeatherAnalysisRow & { signalId: string | null }>(`${base}/weather/analyses/${id}/issue`, {}),
+    );
     if (r) {
-      toast.success(`${r.reference} issued`);
+      // Issuing an analysis that found exceptional weather raises a signal, so
+      // the finding reaches the attention layer instead of sitting in a
+      // register nobody polls. Say so rather than leaving it invisible.
+      toast.success(r.signalId ? `${r.reference} issued — signal raised for the attention feed` : `${r.reference} issued`);
       list.reload();
       detail.reload();
     }
@@ -686,6 +769,10 @@ function AnalysisPanel({ base, onChanged }: { base: string; onChanged: () => voi
                 <Button loading={action.busy === "issue"} onClick={() => void issue(detail.data!.id)}>
                   Issue this analysis
                 </Button>
+                <p className="mt-1 text-meta text-content-muted">
+                  Issuing fixes the figures and, where the analysis found exceptional days, raises a signal against this
+                  project so the entitlement is not lost in a register.
+                </p>
               </div>
             ) : (
               <Alert tone="info" title={`Issued ${dateTime(detail.data.issuedAt)}`}>

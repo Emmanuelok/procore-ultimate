@@ -497,7 +497,8 @@ export interface StrikeRow {
 }
 
 export interface StrikeList extends ListResponse<StrikeRow> {
-  controls: { total: number; withPermit: number; withScan: number; withMarks: number };
+  /** counted over the whole filtered register, not the page shown */
+  controls: { total: number; withPermit: number; withScan: number; withMarks: number; scope: string };
 }
 
 export interface ProgressRow {
@@ -512,7 +513,10 @@ export interface ProgressRow {
   observedAt: string;
   observedBy: string;
   claimantId: string;
+  claimantKind: string;
+  claimantName: string | null;
   claimSourceType: string;
+  claimSourceId: string | null;
   result: string;
   confidence: number | null;
   independenceScore: number | null;
@@ -834,6 +838,10 @@ export function useAction(): {
 /** Pickers from neighbouring registers. Each fails alone. */
 export function useSiteLookups(projectId: string) {
   const vendors = useResource<ListResponse<{ id: string; name: string }>>("/api/v1/vendors?pageSize=200");
+  /** company users — the pool a progress claim can be attributed to */
+  const people = useResource<ListResponse<{ id: string; name: string; email: string }>>(
+    "/api/v1/company/users?pageSize=200",
+  );
   const locations = useResource<ListResponse<{ id: string; name: string }> | Array<{ id: string; name: string }>>(
     `/api/v1/projects/${projectId}/locations`,
   );
@@ -845,10 +853,12 @@ export function useSiteLookups(projectId: string) {
     vendors: vendors.data?.items ?? [],
     locations: locationItems,
     workers: workers.data?.items ?? [],
+    people: people.data?.items ?? [],
     notes: [
       vendors.error ? `Vendors could not be loaded: ${vendors.error}` : null,
       locations.error ? `Locations could not be loaded: ${locations.error}` : null,
       workers.error ? `The labour register could not be loaded: ${workers.error}` : null,
+      people.error ? `The list of people could not be loaded: ${people.error}` : null,
     ].filter((x): x is string => Boolean(x)),
   };
 }

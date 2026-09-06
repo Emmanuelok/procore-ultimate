@@ -124,10 +124,19 @@ export default function NotificationsPage() {
           hint={unread ? undefined : "Count unavailable"}
           tone={unread && unread.count > 0 ? "info" : "neutral"}
         />
+        {/*
+          A digest cadence DEFERS these; they are written but excluded from
+          the unread count until the digest goes out, so they get their own
+          tile rather than silently inflating "Unread".
+        */}
         <Stat
-          label="Unread kinds"
-          value={unread ? num(Object.keys(unread.byKind).length) : "—"}
-          hint="Distinct kinds waiting on you"
+          label="Held for digest"
+          value={unread ? num(unread.heldForDigest ?? 0) : "—"}
+          hint={
+            unread && (unread.heldForDigest ?? 0) > 0
+              ? "Deferred until your next digest, then counted as unread"
+              : "Nothing deferred"
+          }
         />
         <Stat
           label="Loudest kind"

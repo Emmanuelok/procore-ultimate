@@ -81,6 +81,16 @@ export default function ProgressTab({ projectId, lookups, onChanged }: { project
         width: 130,
         cell: ({ row }) => (row.independenceScore === null ? EM_DASH : num(row.independenceScore, 2)),
       },
+      {
+        id: "claimant",
+        header: "Claimant",
+        accessor: (row) => row.claimantName ?? row.claimantId,
+        type: "text",
+        width: 200,
+        cell: ({ row }) => (
+          <span title={`${labelize(row.claimantKind)} ${row.claimantId}`}>{row.claimantName ?? row.claimantId}</span>
+        ),
+      },
       { id: "claimSourceType", header: "Claim from", accessor: "claimSourceType", type: "status", width: 150, groupable: true, cell: ({ row }) => labelize(row.claimSourceType) },
       { id: "observedAt", header: "Observed", accessor: "observedAt", type: "datetime", width: 170, cell: ({ row }) => dateTime(row.observedAt) },
     ],
@@ -185,8 +195,16 @@ export default function ProgressTab({ projectId, lookups, onChanged }: { project
               <KeyValue
                 items={[
                   { label: "Claimed", value: `${num(detail.data.claimedPercent, 1)}%` },
-                  { label: "Claimant", value: detail.data.claimantId },
-                  { label: "From", value: labelize(detail.data.claimSourceType) },
+                  {
+                    label: "Claimant",
+                    value: `${detail.data.claimantName ?? detail.data.claimantId} (${labelize(detail.data.claimantKind)})`,
+                  },
+                  {
+                    label: "From",
+                    value: detail.data.claimSourceId
+                      ? `${labelize(detail.data.claimSourceType)} · ${detail.data.claimSourceId}`
+                      : labelize(detail.data.claimSourceType),
+                  },
                   { label: "Basis", value: detail.data.assertion?.basis ?? EM_DASH },
                   { label: "Asserted at", value: dateTime(detail.data.assertion?.assertedAt ?? null) },
                 ]}
@@ -252,10 +270,18 @@ function ObservationForm({
   const [method, setMethod] = useState("photo");
   const [claimSourceType, setClaimSourceType] = useState("valuation");
   const [claimSourceId, setClaimSourceId] = useState("");
+  const [claimantKind, setClaimantKind] = useState<"user" | "vendor" | "entity">("user");
   const [claimantId, setClaimantId] = useState("");
   const [claimantVendorId, setClaimantVendorId] = useState("");
   const [observerVendorId, setObserverVendorId] = useState("");
   const [notes, setNotes] = useState("");
+
+  function changeClaimantKind(kind: "user" | "vendor" | "entity") {
+    setClaimantKind(kind);
+    // The id belongs to the register the kind names, so it does not survive
+    // a change of kind.
+    setClaimantId("");
+  }
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -265,6 +291,7 @@ function ObservationForm({
       observedPercent: Number(observedPercent),
       method,
       claimSourceType,
+      claimantKind,
       claimantId: claimantId.trim(),
     };
     if (workPackageRef.trim()) payload["workPackageRef"] = workPackageRef.trim();
@@ -326,14 +353,58 @@ function ObservationForm({
               ))}
             </Select>
           </Field>
-          <Field label="Claim record id">
-            <Input value={claimSourceId} onChange={(e) => setClaimSourceId(e.target.value)} maxLength={64} />
+          <Field
+            label="Claim record id"
+            hint="The valuation, application, daily log or schedule task the claim came from. It is checked against this project; a manual claim carries no record id."
+          >
+            <Input
+              value={claimSourceId}
+              onChange={(e) => setClaimSourceId(e.target.value)}
+              maxLength={64}
+              disabled={claimSourceType === "manual"}
+              placeholder={claimSourceType === "manual" ? "not applicable to a manual claim" : ""}
+            />
           </Field>
           <Field label="Work package">
             <Input value={workPackageRef} onChange={(e) => setWorkPackageRef(e.target.value)} maxLength={200} />
           </Field>
-          <Field label="Claimant (user id)" required hint="Whose claim this is. It may not be you.">
-            <Input value={claimantId} onChange={(e) => setClaimantId(e.target.value)} required maxLength={64} />
+          <Field label="Claimant is a">
+            <Select value={claimantKind} onChange={(e) => changeClaimantKind(e.target.value as "user" | "vendor" | "entity")}>
+              <option value="user">Person on the platform</option>
+              <option value="vendor">Vendor</option>
+              <option value="entity">Entity on the register</option>
+            </Select>
+          </Field>
+          <Field
+            label="Claimant"
+            required
+            hint="Whose claim this is. It may not be you, and it must be a party the platform can resolve — a name typed into a box is not a second actor."
+          >
+            {claimantKind === "user" ? (
+              <Select value={claimantId} onChange={(e) => setClaimantId(e.target.value)} required>
+                {optionList(lookups.people, (p) => `${p.name} — ${p.email}`).map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </Select>
+            ) : claimantKind === "vendor" ? (
+              <Select value={claimantId} onChange={(e) => setClaimantId(e.target.value)} required>
+                {optionList(lookups.vendors, (v) => v.name).map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </Select>
+            ) : (
+              <Input
+                value={claimantId}
+                onChange={(e) => setClaimantId(e.target.value)}
+                required
+                maxLength={64}
+                placeholder="Entity register id"
+              />
+            )}
           </Field>
           <Field label="Claimant's employer">
             <Select value={claimantVendorId} onChange={(e) => setClaimantVendorId(e.target.value)}>

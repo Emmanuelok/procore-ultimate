@@ -25,6 +25,7 @@ import {
 } from "../../ui";
 import { formatDate, humanize } from "../format";
 import FacilityDetail from "./FacilityDetail";
+import AvailabilityTab from "./AvailabilityTab";
 import {
   ClosingCountdown,
   DisbursedBar,
@@ -105,6 +106,7 @@ export default function FinancePage() {
   const [summary, setSummary] = useState<FinanceSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [tab, setTab] = useState<"facilities" | "availability">("facilities");
 
   const load = useCallback(async () => {
     if (!projectId) return;
@@ -213,14 +215,38 @@ export default function FinancePage() {
     <div>
       <PageHeader
         title="Project Finance"
-        subtitle="Funding facilities, lender conditionality, disbursements and covenant compliance"
-        actions={<Button onClick={openCreate}>New facility</Button>}
+        subtitle="Funding facilities, lender conditionality, disbursements, covenant compliance and the availability payment mechanism"
+        actions={tab === "facilities" ? <Button onClick={openCreate}>New facility</Button> : null}
       />
+
+      <div className="mb-4 flex gap-1 border-b border-ink-200">
+        {(
+          [
+            { id: "facilities", label: "Facilities" },
+            { id: "availability", label: "Availability payments" },
+          ] as const
+        ).map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            onClick={() => setTab(t.id)}
+            className={
+              tab === t.id
+                ? "-mb-px border-b-2 border-brand-600 px-3 py-2 text-sm font-medium text-brand-700"
+                : "-mb-px border-b-2 border-transparent px-3 py-2 text-sm font-medium text-ink-500 hover:text-ink-800"
+            }
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "availability" ? <AvailabilityTab projectId={projectId} /> : null}
 
       {/* summary strip — money is bucketed by currency and never summed across
           them; with more than one currency the headline figures are replaced by
           a per-currency table rather than a wrong total. */}
-      {summary ? (
+      {tab === "facilities" && summary ? (
         <div className="mb-4 space-y-3">
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
             {singleCurrency ? (
@@ -314,10 +340,10 @@ export default function FinancePage() {
         </div>
       ) : null}
 
-      <ErrorAlert message={error} />
+      {tab === "facilities" ? <ErrorAlert message={error} /> : null}
 
       {/* facility register (#729) */}
-      {facilities === null ? (
+      {tab !== "facilities" ? null : facilities === null ? (
         <Spinner />
       ) : facilities.length === 0 ? (
         <EmptyState

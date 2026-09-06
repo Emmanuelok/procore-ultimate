@@ -12,7 +12,7 @@
  * carries a dedupe key naming the record and the condition, and every status
  * change is guarded by the status it moves from.
  */
-import { and, asc, count, desc, eq, gte, inArray, lt, lte, or, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, inArray, lt, lte, or, sql, type AnyColumn } from "drizzle-orm";
 import {
   assertions,
   evidence,
@@ -1478,7 +1478,8 @@ export async function siteSummary(
 ): Promise<SiteSummary> {
   const today = asOf.slice(0, 10);
   const soon = new Date(Date.parse(`${today}T00:00:00.000Z`) + 30 * 86_400_000).toISOString().slice(0, 10);
-  const scope = <T extends { companyId: typeof sitePermits.companyId; projectId: typeof sitePermits.projectId }>(t: T) =>
+  /** every one of this module's tables is company- and project-scoped */
+  const scope = (t: { companyId: AnyColumn; projectId: AnyColumn }) =>
     and(eq(t.companyId, companyId), eq(t.projectId, projectId));
 
   const [

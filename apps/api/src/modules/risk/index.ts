@@ -782,8 +782,12 @@ export const riskModule: FastifyPluginAsync = async (app) => {
       };
       const jobId = await enqueueJob(req, "qcra", params, seed, body.iterations);
       if (body.async) {
-        queue.schedule();
+        // Read the row BEFORE kicking the queue: scheduling yields to the
+        // event loop, and a drain that claims the job between the kick and
+        // the read would make the 202 body report a state the caller never
+        // asked about.
         const job = await fetchJob(jobId, req.companyId!, req.projectId!);
+        queue.schedule();
         return reply.status(202).send({ job: jobView(job), riskCount: riskInputs.length });
       }
       await queue.runById(jobId);
@@ -926,8 +930,8 @@ export const riskModule: FastifyPluginAsync = async (app) => {
       };
       const jobId = await enqueueJob(req, "qsra", params, seed, body.iterations);
       if (body.async) {
-        queue.schedule();
         const job = await fetchJob(jobId, req.companyId!, req.projectId!);
+        queue.schedule();
         return reply
           .status(202)
           .send({ job: jobView(job), scheduleId: schedule.id, taskCount: qsraTasks.length });

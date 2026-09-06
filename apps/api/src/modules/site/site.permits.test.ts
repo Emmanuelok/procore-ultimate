@@ -243,6 +243,15 @@ describe("excavation permits require a utility survey", () => {
     await post(`${base()}/permits/${id2}/approve`, {}, approver.headers);
     expect((await post(`${base()}/permits/${id2}/activate`, {})).statusCode).toBe(200);
   });
+
+  it("raises a signal when one is approved with no survey behind it, and none when there is one", async () => {
+    // The first permit above was approved with nothing to say what is buried
+    // there; the second carried a scan. One signal, naming the first.
+    const raised = await siteSignals("site_excavation_without_scan");
+    expect(raised).toHaveLength(1);
+    expect(raised[0]?.title).toContain("approved with no utility survey");
+    expect(raised[0]?.explanation).toContain("Trench for drainage");
+  });
 });
 
 describe("confined-space entries", () => {
@@ -347,6 +356,50 @@ describe("permit expiry sweep", () => {
 
     await app.scheduler.runNow("site.permit-expiry");
     expect(await siteSignals("site_permit_expired_open")).toHaveLength(1);
+  });
+
+  it("expires a permit still sitting in requested past its window, as the job says it does", async () => {
+    const created = await post(`${base()}/permits`, {
+      permitType: "hot_work",
+      title: "Welding that never got approved",
+      validFrom: ago(600),
+      validTo: ahead(2),
+    });
+    const id = created.json().id;
+    await post(`${base()}/permits/${id}/request`, {});
+    await app.db.update(sitePermits).set({ validTo: ago(5) }).where(eq(sitePermits.id, id));
+
+    await app.scheduler.runNow("site.permit-expiry");
+    const rows = await app.db.select().from(sitePermits).where(eq(sitePermits.id, id));
+    expect(rows[0]?.status).toBe("expired");
+    // and it stops counting as an open permit on the workspace
+    const summary = await get(`${base()}/summary`);
+    expect(summary.json().permits.byType["hot_work"] ?? 0).toBe(0);
+  });
+
+  it("runs the sweep only for the project the caller's grant covers", async () => {
+    const other = newId("prj");
+    await app.db.insert(projects).values({ id: other, companyId: owner.companyId, name: "Elsewhere", stage: "course_of_construction" });
+    const elsewhere = await post(`/projects/${other}/site/permits`, {
+      permitType: "excavation",
+      title: "Somebody else's trench",
+      validFrom: ago(600),
+      validTo: ahead(2),
+    });
+    const otherId = elsewhere.json().id;
+    await post(`/projects/${other}/site/permits/${otherId}/request`, {});
+    await app.db.update(sitePermits).set({ validTo: ago(5) }).where(eq(sitePermits.id, otherId));
+
+    const ran = await post(`${base()}/sweeps/run`, {});
+    expect(ran.statusCode).toBe(200);
+    expect(ran.json().scope.projectId).toBe(projectId);
+    const untouched = await app.db.select().from(sitePermits).where(eq(sitePermits.id, otherId));
+    expect(untouched[0]?.status).toBe("requested");
+
+    const ranThere = await post(`/projects/${other}/site/sweeps/run`, {});
+    expect(ranThere.statusCode).toBe(200);
+    const now = await app.db.select().from(sitePermits).where(eq(sitePermits.id, otherId));
+    expect(now[0]?.status).toBe("expired");
   });
 });
 

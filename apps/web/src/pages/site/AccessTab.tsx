@@ -359,15 +359,18 @@ function InductionsPanel({ base, lookups, onChanged }: { base: string; lookups: 
 function InductionForm({
   base,
   lookups,
+  record,
   open,
   onClose,
-  onCreated,
+  onSaved,
 }: {
   base: string;
   lookups: SiteLookups;
+  /** the induction being corrected, or null for a new one */
+  record: InductionRow | null;
   open: boolean;
   onClose: () => void;
-  onCreated: () => void;
+  onSaved: () => void;
 }) {
   const action = useAction();
   const [personName, setPersonName] = useState("");
@@ -375,10 +378,29 @@ function InductionForm({
   const [workerId, setWorkerId] = useState("");
   const [vendorId, setVendorId] = useState("");
   const [inductionType, setInductionType] = useState("general");
+  const [validFrom, setValidFrom] = useState("");
   const [validUntil, setValidUntil] = useState("");
   const [topics, setTopics] = useState("Fire and evacuation\nTraffic management\nPermits to work");
   const [scorePercent, setScorePercent] = useState("");
   const [passMark, setPassMark] = useState("");
+
+  // Prefill from the record being corrected each time the drawer opens on a
+  // different one, so an edit starts from what is actually stored.
+  useEffect(() => {
+    if (!open) return;
+    setPersonName(record?.personName ?? "");
+    setPersonKind(record?.personKind ?? "worker");
+    setWorkerId(record?.workerId ?? "");
+    setVendorId(record?.vendorId ?? "");
+    setInductionType(record?.inductionType ?? "general");
+    setValidFrom(record?.validFrom ?? "");
+    setValidUntil(record?.validUntil ?? "");
+    setTopics(
+      record ? record.topics.join("\n") : "Fire and evacuation\nTraffic management\nPermits to work",
+    );
+    setScorePercent(record?.scorePercent === null || record?.scorePercent === undefined ? "" : String(record.scorePercent));
+    setPassMark(record?.passMark === null || record?.passMark === undefined ? "" : String(record.passMark));
+  }, [open, record]);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -387,22 +409,46 @@ function InductionForm({
       personKind,
       inductionType,
       topics: topics.split("\n").map((t) => t.trim()).filter(Boolean),
+      workerId: workerId || null,
+      vendorId: vendorId || null,
+      validFrom: validFrom || null,
+      validUntil: validUntil || null,
+      scorePercent: scorePercent.trim() ? Number(scorePercent) : null,
+      passMark: passMark.trim() ? Number(passMark) : null,
     };
-    if (workerId) payload["workerId"] = workerId;
-    if (vendorId) payload["vendorId"] = vendorId;
-    if (validUntil) payload["validUntil"] = validUntil;
-    if (scorePercent.trim()) payload["scorePercent"] = Number(scorePercent);
-    if (passMark.trim()) payload["passMark"] = Number(passMark);
-    const r = await action.run("create", () => api.post<InductionRow>(`${base}/inductions`, payload));
+    if (!record) {
+      for (const key of Object.keys(payload)) {
+        if (payload[key] === null) delete payload[key];
+      }
+    }
+    const r = record
+      ? await action.run("save", () => api.patch<InductionRow>(`${base}/inductions/${record.id}`, payload))
+      : await action.run("save", () => api.post<InductionRow>(`${base}/inductions`, payload));
     if (r) {
-      toast.success(r.status === "valid" ? `${r.personName} inducted` : `${r.personName} recorded as ${labelize(r.status)}`);
-      setPersonName("");
-      onCreated();
+      toast.success(
+        record
+          ? `${r.personName}'s induction updated`
+          : r.status === "valid"
+            ? `${r.personName} inducted`
+            : `${r.personName} recorded as ${labelize(r.status)}`,
+      );
+      if (!record) setPersonName("");
+      onSaved();
     }
   }
 
   return (
-    <Drawer open={open} onClose={onClose} title="Record an induction" description="A score below the pass mark is recorded as failed, not as valid." size="md">
+    <Drawer
+      open={open}
+      onClose={onClose}
+      title={record ? `Correct ${record.personName}'s induction` : "Record an induction"}
+      description={
+        record
+          ? "Correcting the record of an induction that was already given. Revoking it is a different act, with its own reason and its own effect on every pass standing on it."
+          : "A score below the pass mark is recorded as failed, not as valid."
+      }
+      size="md"
+    >
       <form onSubmit={(e) => void submit(e)} className="space-y-3">
         {action.refusal ? <RefusalNotice refusal={action.refusal} onDismiss={action.clear} /> : null}
         <ReasonList reasons={lookups.notes} />
@@ -446,7 +492,10 @@ function InductionForm({
               ))}
             </Select>
           </Field>
-          <Field label="Valid until">
+          <Field label="Valid from">
+            <Input type="date" value={validFrom} onChange={(e) => setValidFrom(e.target.value)} />
+          </Field>
+          <Field label="Valid until" hint="An induction cannot expire before it becomes valid; the platform refuses that edit.">
             <Input type="date" value={validUntil} onChange={(e) => setValidUntil(e.target.value)} />
           </Field>
           <Field label="Score %">
@@ -463,8 +512,8 @@ function InductionForm({
           <Button type="button" variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button type="submit" loading={action.busy === "create"}>
-            Record
+          <Button type="submit" loading={action.busy === "save"}>
+            {record ? "Save" : "Record"}
           </Button>
         </div>
       </form>
@@ -481,6 +530,7 @@ function PassesPanel({ base, lookups, onChanged }: { base: string; lookups: Site
   const inductions = useResource<ListResponse<InductionRow>>(`${base}/inductions?status=valid&pageSize=200`);
   const action = useAction();
   const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState<PassRow | null>(null);
 
   const columns = useMemo<DataColumns<PassRow>>(
     () => [
@@ -542,7 +592,14 @@ function PassesPanel({ base, lookups, onChanged }: { base: string; lookups: Site
           title="Site passes"
           hint="One badge, one person: a duplicate badge on a project is refused, because two people on one credential makes the register a fiction."
           actions={
-            <Button size="sm" icon={IconPlus} onClick={() => setOpen(true)}>
+            <Button
+              size="sm"
+              icon={IconPlus}
+              onClick={() => {
+                setEditing(null);
+                setOpen(true);
+              }}
+            >
               Issue a pass
             </Button>
           }
@@ -561,6 +618,18 @@ function PassesPanel({ base, lookups, onChanged }: { base: string; lookups: Site
           rowTone={(row) => (row.inductionId === null && row.status === "active" ? "danger" : undefined)}
           rowActions={(row) => (
             <span className="flex gap-1">
+              {row.status === "revoked" ? null : (
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  onClick={() => {
+                    setEditing(row);
+                    setOpen(true);
+                  }}
+                >
+                  Edit
+                </Button>
+              )}
               {row.status === "active" ? (
                 <Button size="xs" variant="ghost" onClick={() => void transition(row, "suspend")}>
                   Suspend
@@ -582,7 +651,13 @@ function PassesPanel({ base, lookups, onChanged }: { base: string; lookups: Site
             title: "No passes issued",
             description: "Issue a pass against a valid induction so the gate feed can resolve a badge to a person.",
             action: (
-              <Button size="sm" onClick={() => setOpen(true)}>
+              <Button
+                size="sm"
+                onClick={() => {
+                  setEditing(null);
+                  setOpen(true);
+                }}
+              >
                 Issue the first pass
               </Button>
             ),
@@ -592,10 +667,15 @@ function PassesPanel({ base, lookups, onChanged }: { base: string; lookups: Site
           base={base}
           lookups={lookups}
           inductions={inductions.data?.items ?? []}
+          record={editing}
           open={open}
-          onClose={() => setOpen(false)}
-          onCreated={() => {
+          onClose={() => {
             setOpen(false);
+            setEditing(null);
+          }}
+          onSaved={() => {
+            setOpen(false);
+            setEditing(null);
             list.reload();
             onChanged();
           }}
@@ -609,16 +689,19 @@ function PassForm({
   base,
   lookups,
   inductions,
+  record,
   open,
   onClose,
-  onCreated,
+  onSaved,
 }: {
   base: string;
   lookups: SiteLookups;
   inductions: InductionRow[];
+  /** the pass being corrected, or null for a new one */
+  record: PassRow | null;
   open: boolean;
   onClose: () => void;
-  onCreated: () => void;
+  onSaved: () => void;
 }) {
   const action = useAction();
   const [inductionId, setInductionId] = useState("");
@@ -626,25 +709,61 @@ function PassForm({
   const [badgeCode, setBadgeCode] = useState("");
   const [credentialType, setCredentialType] = useState("badge");
   const [vendorId, setVendorId] = useState("");
+  const [validFrom, setValidFrom] = useState("");
   const [validUntil, setValidUntil] = useState("");
+
+  useEffect(() => {
+    if (!open) return;
+    setInductionId(record?.inductionId ?? "");
+    setPersonName(record?.personName ?? "");
+    setBadgeCode(record?.badgeCode ?? "");
+    setCredentialType(record?.credentialType ?? "badge");
+    setVendorId(record?.vendorId ?? "");
+    setValidFrom(record?.validFrom ?? "");
+    setValidUntil(record?.validUntil ?? "");
+  }, [open, record]);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
-    const payload: Record<string, unknown> = { personName: personName.trim(), badgeCode: badgeCode.trim(), credentialType };
-    if (inductionId) payload["inductionId"] = inductionId;
-    if (vendorId) payload["vendorId"] = vendorId;
-    if (validUntil) payload["validUntil"] = validUntil;
-    const r = await action.run("create", () => api.post<PassRow>(`${base}/passes`, payload));
+    const payload: Record<string, unknown> = {
+      personName: personName.trim(),
+      credentialType,
+      inductionId: inductionId || null,
+      vendorId: vendorId || null,
+      validFrom: validFrom || null,
+      validUntil: validUntil || null,
+    };
+    if (!record) {
+      payload["badgeCode"] = badgeCode.trim();
+      for (const key of Object.keys(payload)) {
+        if (payload[key] === null) delete payload[key];
+      }
+    }
+    const r = record
+      ? await action.run("save", () => api.patch<PassRow>(`${base}/passes/${record.id}`, payload))
+      : await action.run("save", () => api.post<PassRow>(`${base}/passes`, payload));
     if (r) {
-      toast.success(`Badge ${r.badgeCode} issued to ${r.personName}`);
-      setBadgeCode("");
-      setPersonName("");
-      onCreated();
+      toast.success(record ? `Badge ${r.badgeCode} updated` : `Badge ${r.badgeCode} issued to ${r.personName}`);
+      if (!record) {
+        setBadgeCode("");
+        setPersonName("");
+      }
+      onSaved();
     }
   }
 
   return (
-    <Drawer open={open} onClose={onClose} title="Issue a site pass" description="A pass issued without a valid induction behind it is flagged by the credentials sweep." size="md">
+    <Drawer
+      open={open}
+      onClose={onClose}
+      title={record ? `Correct badge ${record.badgeCode}` : "Issue a site pass"}
+      description={
+        record
+          ? "The badge code itself is fixed once issued — one badge, one person, for the life of the register. Everything else can be corrected."
+          : "A pass issued without a valid induction behind it is flagged by the credentials sweep."
+      }
+      size="md"
+    >
       <form onSubmit={(e) => void submit(e)} className="space-y-3">
         {action.refusal ? <RefusalNotice refusal={action.refusal} onDismiss={action.clear} /> : null}
         <Field label="Induction" hint="Only inductions currently in force are listed.">
@@ -667,8 +786,14 @@ function PassForm({
           <Field label="Person" required>
             <Input value={personName} onChange={(e) => setPersonName(e.target.value)} required maxLength={200} />
           </Field>
-          <Field label="Badge code" required>
-            <Input value={badgeCode} onChange={(e) => setBadgeCode(e.target.value)} required maxLength={64} />
+          <Field label="Badge code" required={!record} hint={record ? "Fixed for the life of the pass." : undefined}>
+            <Input
+              value={badgeCode}
+              onChange={(e) => setBadgeCode(e.target.value)}
+              required={!record}
+              disabled={Boolean(record)}
+              maxLength={64}
+            />
           </Field>
           <Field label="Credential">
             <Select value={credentialType} onChange={(e) => setCredentialType(e.target.value)}>
@@ -688,7 +813,10 @@ function PassForm({
               ))}
             </Select>
           </Field>
-          <Field label="Valid until">
+          <Field label="Valid from">
+            <Input type="date" value={validFrom} onChange={(e) => setValidFrom(e.target.value)} />
+          </Field>
+          <Field label="Valid until" hint="A pass cannot expire before it becomes valid; the platform refuses that edit.">
             <Input type="date" value={validUntil} onChange={(e) => setValidUntil(e.target.value)} />
           </Field>
         </div>
@@ -696,8 +824,8 @@ function PassForm({
           <Button type="button" variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button type="submit" loading={action.busy === "create"}>
-            Issue
+          <Button type="submit" loading={action.busy === "save"}>
+            {record ? "Save" : "Issue"}
           </Button>
         </div>
       </form>

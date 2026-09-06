@@ -291,6 +291,31 @@ export default function CurrencyTab({ projectId }: { projectId: string }) {
     return Math.abs(sum - 100) <= PORTION_SUM_TOLERANCE;
   }, [fPortions]);
 
+  /**
+   * A named portion with a blank base rate used to submit `baseRate: 0`
+   * (`Number("")` is 0), and the server's `positive()` refusal surfaced as a
+   * generic validation message with no indication of which row was wrong.
+   * The rate is the contractual fact the whole exposure statement rests on,
+   * so the row says what is missing and the submit stays closed.
+   */
+  const portionIssues = useMemo(
+    () =>
+      fPortions.map((p) => {
+        if (p.currency.trim() === "") return null;
+        const rate = Number(p.baseRate);
+        if (p.baseRate.trim() === "") return "Base rate is required";
+        if (!Number.isFinite(rate) || rate <= 0) return "Base rate must be greater than zero";
+        const proportion = Number(p.proportionPercent);
+        if (p.proportionPercent.trim() === "") return "Proportion is required";
+        if (!Number.isFinite(proportion) || proportion < 0) {
+          return "Proportion must not be negative";
+        }
+        return null;
+      }),
+    [fPortions],
+  );
+  const portionsValid = portionIssues.every((issue) => issue === null);
+
   async function onCreate(e: FormEvent) {
     e.preventDefault();
     setFormError(null);
@@ -813,7 +838,10 @@ export default function CurrencyTab({ projectId }: { projectId: string }) {
                     </Field>
                   </div>
                   <div className="flex-1">
-                    <Field label={i === 0 ? `Base rate per 1 ${fBaseCurrency || "base"}` : ""}>
+                    <Field
+                      label={i === 0 ? `Base rate per 1 ${fBaseCurrency || "base"}` : ""}
+                      error={portionIssues[i] ?? null}
+                    >
                       <Input
                         type="number"
                         min="0"
@@ -821,6 +849,7 @@ export default function CurrencyTab({ projectId }: { projectId: string }) {
                         value={p.baseRate}
                         onChange={(e) => patchPortion(i, { baseRate: e.target.value })}
                         placeholder="0.92"
+                        aria-invalid={portionIssues[i] ? true : undefined}
                       />
                     </Field>
                   </div>
@@ -858,7 +887,7 @@ export default function CurrencyTab({ projectId }: { projectId: string }) {
             <Button variant="secondary" onClick={() => setOpen(false)}>
               Cancel
             </Button>
-            <Button type="submit" disabled={busy || !portionSumOk}>
+            <Button type="submit" disabled={busy || !portionSumOk || !portionsValid}>
               {busy ? "Saving…" : "Save configuration"}
             </Button>
           </div>

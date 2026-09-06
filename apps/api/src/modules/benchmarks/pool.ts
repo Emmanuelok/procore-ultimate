@@ -57,6 +57,14 @@ export interface CellKey {
   region: string;
   /** null for unitless metrics; money metrics are keyed by currency */
   currency: string | null;
+  /**
+   * Optional narrowing dimensions (#833-838). `undefined`/`null` means "do not
+   * narrow"; a value means the WHERE clause carries it. A published membership
+   * criterion that the query did not apply would be a lie about where the
+   * number came from, so these live on the key, not beside it.
+   */
+  sizeBand?: string | null;
+  procurementRoute?: string | null;
 }
 
 export interface PoolVerdict {
@@ -171,6 +179,57 @@ export function assessPool(
 }
 
 /**
+ * The same verdict from COUNTS rather than rows.
+ *
+ * The class register asks one question of every class in the platform: how many
+ * contributors, how many samples, is it describable. Reading every sample row
+ * into memory to answer it is an unbounded cross-tenant scan (plan §6.4) — and
+ * it silently truncated past its row cap, so contributor counts and the
+ * "describable" verdict went quietly wrong. The counts come from a GROUP BY
+ * now, and this applies exactly the rules `assessPool` applies to rows.
+ */
+export function assessCounts(
+  counts: readonly { contributorCompanyId: string | null; samples: number }[],
+  viewerCompanyId: string | null,
+): {
+  contributors: number;
+  sampleSize: number;
+  ownSamples: number;
+  describable: boolean;
+  reasons: string[];
+} {
+  const own = counts
+    .filter((c) => viewerCompanyId !== null && c.contributorCompanyId === viewerCompanyId)
+    .reduce((sum, c) => sum + c.samples, 0);
+  const others = counts.filter(
+    (c) => viewerCompanyId === null || c.contributorCompanyId !== viewerCompanyId,
+  );
+  const sampleSize = others.reduce((sum, c) => sum + c.samples, 0);
+  const contributors = new Set(others.map((c) => c.contributorCompanyId ?? "__seed__")).size;
+  const share = sampleSize === 0 ? 0 : Math.max(...others.map((c) => c.samples)) / sampleSize;
+  const reasons: string[] = [];
+  if (contributors < MIN_SAMPLE_N) {
+    reasons.push(
+      `Only ${contributors} distinct contributing compan${contributors === 1 ? "y" : "ies"} in ` +
+        `this cell; ${MIN_SAMPLE_N} are required before a distribution can be described.`,
+    );
+  }
+  if (sampleSize > 0 && share >= MAX_CONTRIBUTOR_SHARE) {
+    reasons.push(
+      `One contributor holds ${Math.round(share * 100)}% of the samples in this cell, so its ` +
+        "percentiles would largely describe that contributor.",
+    );
+  }
+  return {
+    contributors,
+    sampleSize,
+    ownSamples: own,
+    describable: reasons.length === 0 && sampleSize > 0,
+    reasons,
+  };
+}
+
+/**
  * Live samples of one cell for one source. `superseded_at is null` is what
  * makes rule 2 real at read time as well as at write time — a superseded row
  * is kept as the record of what was contributed and never described again.
@@ -194,6 +253,12 @@ export async function readCell(
     // currencies describe the exchange rate, not the construction cost.
     key.currency ? eq(benchmarkSamples.currency, key.currency) : isNull(benchmarkSamples.currency),
   ];
+  // Narrowing dimensions are applied when asked for, and only then — so a
+  // forecast that PUBLISHES "large / design_build" was actually drawn from it.
+  if (key.sizeBand) clauses.push(eq(benchmarkSamples.sizeBand, key.sizeBand));
+  if (key.procurementRoute) {
+    clauses.push(eq(benchmarkSamples.procurementRoute, key.procurementRoute));
+  }
   return db
     .select({
       value: benchmarkSamples.value,
@@ -203,4 +268,36 @@ export async function readCell(
     })
     .from(benchmarkSamples)
     .where(and(...clauses));
+}
+
+/**
+ * Contribute-to-access (#855), as a function every reader of the pool can call.
+ *
+ * It lived only inside the benchmarks plugin, so the analytics forecast — which
+ * reads exactly the same contributed cells — did not apply it, and a tenant
+ * that had never contributed a sample read other tenants' contributed
+ * distribution through GET /projects/:id/analytics/forecast. A door is never
+ * allowed to be wider than the room it opens onto, so the check lives beside
+ * the read it guards.
+ *
+ * Contributor ids are read in a WHERE clause for enforcement only and never
+ * returned.
+ */
+export async function hasContributed(
+  db: Db,
+  companyId: string,
+  metric: string,
+): Promise<boolean> {
+  const rows = await db
+    .select({ id: benchmarkSamples.id })
+    .from(benchmarkSamples)
+    .where(
+      and(
+        eq(benchmarkSamples.metric, metric),
+        eq(benchmarkSamples.source, "contributed"),
+        eq(benchmarkSamples.contributorCompanyId, companyId),
+      ),
+    )
+    .limit(1);
+  return rows.length > 0;
 }

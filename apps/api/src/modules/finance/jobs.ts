@@ -16,6 +16,9 @@
  *  3. `finance.forecast` — compares the planned drawdown profile with what
  *     actually moved and raises a signal when actuals lag the plan or a
  *     milestone-triggered tranche's milestone is incomplete (#745-746).
+ *  4. `finance.designated-accounts` — an advance account nobody has
+ *     reconciled is the single most common finding in a DFI audit, and it
+ *     is invisible on a page nobody opens. The sweep raises it (#735, #745).
  */
 import type { FastifyInstance } from "fastify";
 import { and, asc, eq, inArray, isNotNull, lt } from "drizzle-orm";
@@ -23,6 +26,8 @@ import {
   covenantReadings,
   covenantWaivers,
   covenants,
+  designatedAccountReconciliations,
+  designatedAccounts,
   disbursementForecasts,
   disbursements,
   facilityCashflows,
@@ -404,6 +409,84 @@ export async function covenantStanding(
 }
 
 /* ------------------------------------------------------------------ */
+/* Designated account reconciliation staleness (#735, #745)            */
+/* ------------------------------------------------------------------ */
+
+/** Days an active designated account may go unreconciled before it is raised. */
+export const ACCOUNT_RECONCILIATION_MAX_AGE_DAYS = 45;
+
+/**
+ * Raise (once) every active designated account whose last reconciliation is
+ * older than the threshold, or which has never been reconciled at all. The
+ * finding closes itself when a reconciliation lands, so the register does
+ * not accumulate stale rows.
+ */
+export async function sweepDesignatedAccounts(
+  db: Db,
+  companyId: string,
+  today: string,
+): Promise<void> {
+  const accounts = await db
+    .select()
+    .from(designatedAccounts)
+    .where(and(eq(designatedAccounts.companyId, companyId), eq(designatedAccounts.status, "active")));
+  if (accounts.length === 0) return;
+  const recs = await db
+    .select({
+      accountId: designatedAccountReconciliations.accountId,
+      periodEnd: designatedAccountReconciliations.periodEnd,
+    })
+    .from(designatedAccountReconciliations)
+    .where(
+      inArray(
+        designatedAccountReconciliations.accountId,
+        accounts.map((a) => a.id),
+      ),
+    );
+  const latest = new Map<string, string>();
+  for (const r of recs) {
+    const current = latest.get(r.accountId);
+    if (!current || r.periodEnd > current) latest.set(r.accountId, r.periodEnd);
+  }
+  const cutoff = new Date(`${today}T00:00:00Z`);
+  cutoff.setUTCDate(cutoff.getUTCDate() - ACCOUNT_RECONCILIATION_MAX_AGE_DAYS);
+  const cutoffIso = cutoff.toISOString().slice(0, 10);
+
+  for (const account of accounts) {
+    const last = latest.get(account.id) ?? null;
+    const stale = last === null || last < cutoffIso;
+    if (!stale) {
+      await closeSignalByKey(
+        db,
+        companyId,
+        "designated_account_unreconciled_overdue",
+        account.id,
+        `Reconciled to ${last ?? "an earlier period"}, inside the ${ACCOUNT_RECONCILIATION_MAX_AGE_DAYS}-day window.`,
+      );
+      continue;
+    }
+    await raiseSignalOnce(db, {
+      companyId,
+      projectId: account.projectId,
+      detector: "designated_account_unreconciled_overdue",
+      key: account.id,
+      severity: "medium",
+      confidence: 1,
+      title: `Designated account "${account.name}" has not been reconciled`,
+      explanation:
+        last === null
+          ? `This account has never been reconciled against a bank statement. Until it is, the ` +
+            `advance outstanding on it is unevidenced.`
+          : `The last reconciliation of this account was to ${last}, more than ` +
+            `${ACCOUNT_RECONCILIATION_MAX_AGE_DAYS} days ago. An advance account is only ` +
+            `evidence of anything while it reconciles.`,
+      subjectType: "designated_account",
+      subjectId: account.id,
+    });
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Registration                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -427,6 +510,18 @@ export function registerFinanceJobs(app: FastifyInstance): void {
     everyMs: 12 * 60 * 60_000,
     runOnBoot: true,
     run: async ({ db }) => forEachCompany(db, (companyId) => sweepCovenantTests(db, companyId)),
+  });
+
+  app.scheduler.register({
+    name: "finance.designated-accounts",
+    description:
+      "Raise every active designated account that has never been reconciled, or whose last reconciliation is more than 45 days old",
+    everyMs: 24 * 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db, now }) =>
+      forEachCompany(db, (companyId) =>
+        sweepDesignatedAccounts(db, companyId, now.toISOString().slice(0, 10)),
+      ),
   });
 
   app.scheduler.register({

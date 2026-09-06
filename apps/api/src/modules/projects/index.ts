@@ -37,6 +37,7 @@ import {
   costCodes,
   customFieldDefs,
   customFieldValues,
+  distributionGroupMembers,
   distributionGroups,
   drawingSheets,
   equipment,
@@ -880,6 +881,30 @@ export const projectsModule: FastifyPluginAsync = async (app) => {
           .where(eq(workflowInstances.projectId, projectId))
           .returning({ id: workflowInstances.id }),
       );
+      /*
+       * Distribution groups and their members — same dangling-child shape:
+       * `distribution_group_members` carries only `group_id`.
+       */
+      const doomedGroups = await tx
+        .select({ id: distributionGroups.id })
+        .from(distributionGroups)
+        .where(eq(distributionGroups.projectId, projectId));
+      const doomedGroupIds = doomedGroups.map((g) => g.id);
+      counts["distributionGroupMembers"] =
+        doomedGroupIds.length === 0
+          ? 0
+          : (
+              await tx
+                .delete(distributionGroupMembers)
+                .where(inArray(distributionGroupMembers.groupId, doomedGroupIds))
+                .returning({ id: distributionGroupMembers.id })
+            ).length;
+      await del("distributionGroups", () =>
+        tx
+          .delete(distributionGroups)
+          .where(eq(distributionGroups.projectId, projectId))
+          .returning({ id: distributionGroups.id }),
+      );
       await tx.delete(projects).where(eq(projects.id, projectId));
       /*
        * The ledger append is INSIDE this transaction.
@@ -1112,9 +1137,41 @@ export const projectsModule: FastifyPluginAsync = async (app) => {
           companyId,
           projectId: newProjectId,
           name: row.name,
+          sourceId: row.id,
         }));
-        if (values.length > 0) await tx.insert(distributionGroups).values(values);
+        if (values.length > 0) {
+          await tx
+            .insert(distributionGroups)
+            .values(values.map(({ sourceId: _ignored, ...v }) => v));
+        }
         copied["distributionGroups"] = values.length;
+        /*
+         * The recipients too. Copying group NAMES and reporting
+         * "3 distributionGroups" reads as confirmation, and the first
+         * distribution from the cloned project goes to nobody with nothing
+         * saying so.
+         */
+        const groupIdMap = new Map(values.map((v) => [v.sourceId, v.id]));
+        let members = 0;
+        if (groupIdMap.size > 0) {
+          const memberRows = await tx
+            .select()
+            .from(distributionGroupMembers)
+            .where(inArray(distributionGroupMembers.groupId, [...groupIdMap.keys()]));
+          const memberValues = memberRows.map((row) => ({
+            id: newId("dgm"),
+            groupId: groupIdMap.get(row.groupId)!,
+            userId: row.userId,
+            contactId: row.contactId,
+            email: row.email,
+            memberKey: row.memberKey,
+          }));
+          if (memberValues.length > 0) {
+            await tx.insert(distributionGroupMembers).values(memberValues);
+          }
+          members = memberValues.length;
+        }
+        copied["distributionGroupMembers"] = members;
       }
 
       return copied;
@@ -2057,6 +2114,14 @@ export const projectsModule: FastifyPluginAsync = async (app) => {
     async (req, reply) => {
       const { recordType, recordId } = req.params as RecordParams;
       const body = commentCreateSchema.parse(req.body);
+      /*
+       * Prove the record is IN this project before stamping the URL's
+       * companyId/projectId onto it. Without this a caller with standard
+       * access to project A could comment on a record of project B — an
+       * orphan comment filed under A, and (with the watcher fan-out below)
+       * the comment text delivered to B's watchers.
+       */
+      await assertRecordInProject(req.companyId!, req.projectId!, recordType, recordId);
       const id = newId("cmt");
       const mentionIds = [...new Set(body.mentions ?? [])].filter((m) => m !== req.user!.id);
 
@@ -2141,6 +2206,11 @@ export const projectsModule: FastifyPluginAsync = async (app) => {
         .where(
           and(
             eq(watchers.companyId, req.companyId!),
+            // Project-scoped, like the GET route: `watchers` is addressed by
+            // (recordType, recordId), and a record id colliding across two
+            // projects of one tenant otherwise delivers the comment text to
+            // people who cannot open the project it was written in.
+            eq(watchers.projectId, req.projectId!),
             eq(watchers.recordType, recordType),
             eq(watchers.recordId, recordId),
           ),

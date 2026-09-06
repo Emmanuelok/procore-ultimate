@@ -162,8 +162,15 @@ const optionInputSchema = z.object({
   name: z.string().min(1).max(300),
   isCounterfactual: z.boolean().optional(),
   capex: z.number().min(0).finite(),
-  annualBenefits: z.array(z.number().finite()).max(60),
-  annualCosts: z.array(z.number().finite()).max(60),
+  /**
+   * Annual series default to empty rather than being mandatory: a capital-only
+   * option genuinely has no recurring costs, and a benefits-only option
+   * genuinely has no capex profile. `padToYears` pads either to the horizon,
+   * so an omitted series means "nothing in these years" — which is what an
+   * author omitting it actually means.
+   */
+  annualBenefits: z.array(z.number().finite()).max(60).default([]),
+  annualCosts: z.array(z.number().finite()).max(60).default([]),
 });
 
 const optionsPutSchema = z.object({

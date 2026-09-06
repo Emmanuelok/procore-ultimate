@@ -54,6 +54,38 @@ async function insertEvidence(pid: string, actor: TestActor = owner): Promise<st
   return id;
 }
 
+/**
+ * Findings are raised by the scheduled detector now, not as a side effect of
+ * a read. Tests that assert on a finding trigger a cycle explicitly, which is
+ * exactly what the scheduler does on its interval.
+ */
+async function runDetectors(pid: string): Promise<void> {
+  const res = await app.inject({
+    method: "POST",
+    url: `/api/v1/projects/${pid}/land/detectors/run`,
+    headers: owner.headers,
+  });
+  if (res.statusCode !== 200) {
+    throw new Error(`detector run failed: ${res.statusCode} ${res.body}`);
+  }
+}
+
+/** Title passes through the evidenced acquisition route, naming the basis. */
+async function acquire(
+  pid: string,
+  parcelId: string,
+  acquisitionBasis = "state_allocation",
+): Promise<number> {
+  const evidenceId = await insertEvidence(pid);
+  const res = await app.inject({
+    method: "POST",
+    url: `/api/v1/projects/${pid}/parcels/${parcelId}/acquire`,
+    headers: owner.headers,
+    payload: { acquisitionBasis, evidenceIds: [evidenceId] },
+  });
+  return res.statusCode;
+}
+
 async function insertTask(pid: string, name: string, startDate: string): Promise<string> {
   const id = newId("tsk");
   await app.db.insert(scheduleTasks).values({
@@ -169,8 +201,16 @@ describe("land parcel register", () => {
     const disputed = await setStatus(pid, parcel.id, "disputed");
     expect(disputed.statusCode).toBe(200);
     expect(disputed.json().status).toBe("disputed");
-    // and resolve straight to acquired on a compulsory-purchase determination
-    expect((await setStatus(pid, parcel.id, "acquired")).statusCode).toBe(200);
+    // `acquired` is likewise reachable only through the evidenced route, which
+    // records the BASIS on which title passed — before it existed, a state or
+    // donated parcel could only reach `acquired` by first being marked
+    // `disputed`, manufacturing a dispute for every parcel on a road scheme
+    const bySneak = await setStatus(pid, parcel.id, "acquired");
+    expect(bySneak.statusCode).toBe(400);
+    expect(bySneak.json().message).toContain("/acquire");
+
+    // a compulsory-purchase determination settles the dispute into acquisition
+    expect(await acquire(pid, parcel.id, "court_order")).toBe(200);
   });
 
   it("will not record compensation without payment evidence", async () => {
@@ -212,8 +252,8 @@ describe("land parcel register", () => {
     expect(paid.compensationPaidAt).toBe("2026-03-01");
     expect(paid.evidenceIds).toEqual([evidenceId]);
 
-    // and only then can title pass
-    expect((await setStatus(pid, parcel.id, "acquired")).statusCode).toBe(200);
+    // and only then can title pass — on a stated basis, with its own evidence
+    expect(await acquire(pid, parcel.id, "purchase")).toBe(200);
   });
 
   it("lists parcels with linked PAP counts and filters", async () => {
@@ -277,9 +317,10 @@ describe("land / schedule risk", () => {
     const acquired = (
       await createParcel(pid, { reference: "RISK-3", blockingTaskIds: [imminent] })
     ).json();
-    for (const s of ["surveyed", "under_negotiation", "disputed", "acquired"]) {
+    for (const s of ["surveyed", "under_negotiation", "agreed"]) {
       await setStatus(pid, acquired.id, s);
     }
+    expect(await acquire(pid, acquired.id)).toBe(200);
 
     const res = await app.inject({
       method: "GET",
@@ -290,13 +331,26 @@ describe("land / schedule risk", () => {
     const risk = res.json();
     // the 200-day task is outside the 90-day default horizon
     expect(risk.blockedTasks).toBe(2);
-    expect(risk.blockedParcels).toBe(2);
+    expect(risk.blockedParcels).toBeGreaterThanOrEqual(2);
     expect(risk.imminent).toBe(1);
     expect(risk.items[0].parcelId).toBe(blocking.id);
     expect(risk.items[0].taskName).toBe("Earthworks — Ch 4+200");
     expect(risk.items[0].daysUntilStart).toBe(12);
     expect(risk.items[1].parcelId).toBe(alsoBlocking.id);
+    // the view now quantifies the exposure rather than merely listing it
+    expect(risk.items[0].daysAtRisk).toBeGreaterThanOrEqual(0);
+    expect(risk.items[0].expectedResolutionDate).toBeTruthy();
 
+    // the READ is pure: it raises nothing at all
+    const fromRead = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(eq(signals.projectId, pid), eq(signals.detector, "land_blocks_programme")),
+      );
+    expect(fromRead).toHaveLength(0);
+
+    await runDetectors(pid);
     const raised = await app.db
       .select()
       .from(signals)
@@ -306,18 +360,16 @@ describe("land / schedule risk", () => {
     expect(raised).toHaveLength(1);
     expect(raised[0]!.severity).toBe("high");
     expect(raised[0]!.title).toContain("RISK-1");
+    // the SYSTEM raised it, not whoever opened the page
+    expect(raised[0]!.disposition).toBe("new");
 
-    // repeated reads must not duplicate the signal
+    // repeated reads AND repeated detector cycles must not duplicate it
     await app.inject({
       method: "GET",
       url: `/api/v1/projects/${pid}/land/schedule-risk`,
       headers: owner.headers,
     });
-    await app.inject({
-      method: "GET",
-      url: `/api/v1/projects/${pid}/land/schedule-risk?days=365`,
-      headers: owner.headers,
-    });
+    await runDetectors(pid);
     const again = await app.db
       .select()
       .from(signals)
@@ -556,8 +608,9 @@ describe("project affected persons", () => {
         payload: { amount: 1200, paidAt: "2026-05-01", evidenceIds: [evidenceId] },
       });
     }
-    await setStatus(pid, parcelIds[0]!, "acquired");
-    await setStatus(pid, parcelIds[1]!, "acquired");
+    expect(await acquire(pid, parcelIds[0]!, "purchase")).toBe(200);
+    expect(await acquire(pid, parcelIds[1]!, "purchase")).toBe(200);
+    const rapAcquired = 2;
 
     // 4 households: 2 physical, 1 economic, 1 both; 2 vulnerable
     await createPap(pid, { reference: "RP-1", displacementType: "physical", householdSize: 5 });
@@ -590,13 +643,30 @@ describe("project affected persons", () => {
       headers: owner.headers,
       payload: { paidAt: "2026-05-10", evidenceIds: [evidenceId] },
     });
-    // one of the two livelihood-restoration households is restored
+    // one of the two livelihood-restoration households is restored. It has to
+    // be compensated first: restoration is measured FROM the displacement
+    // date, and PS5 para 20 puts payment before displacement.
     await app.inject({
+      method: "PUT",
+      url: `/api/v1/projects/${pid}/affected-persons/${both.id}/entitlements`,
+      headers: owner.headers,
+      payload: {
+        entitlements: [{ item: "Replacement dwelling", basis: "matrix", amount: 5000 }],
+      },
+    });
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/affected-persons/${both.id}/compensate`,
+      headers: owner.headers,
+      payload: { paidAt: "2026-05-10", evidenceIds: [evidenceId] },
+    });
+    const restored = await app.inject({
       method: "POST",
       url: `/api/v1/projects/${pid}/affected-persons/${both.id}/status`,
       headers: owner.headers,
       payload: { status: "livelihood_restored" },
     });
+    expect(restored.statusCode).toBe(200);
 
     const res = await app.inject({
       method: "GET",
@@ -606,7 +676,7 @@ describe("project affected persons", () => {
     expect(res.statusCode).toBe(200);
     const rap = res.json();
     expect(rap.parcels.total).toBe(4);
-    expect(rap.parcels.byStatus.acquired).toBe(2);
+    expect(rap.parcels.byStatus.acquired).toBe(rapAcquired);
     expect(rap.parcels.byStatus.compensated).toBe(1);
     expect(rap.parcels.byStatus.identified).toBe(1);
     expect(rap.parcels.byStatus.disputed).toBe(0); // zero-filled, not missing
@@ -846,6 +916,14 @@ describe("grievance redress mechanism", () => {
     expect(rows.find((r) => r.id === overdueCritical.id)!.daysOverdue).toBe(23);
     expect(rows.find((r) => r.id === inTime.id)!.overdue).toBe(false);
 
+    // the register read raises nothing — findings are the detector's job
+    const fromRead = await app.db
+      .select()
+      .from(signals)
+      .where(and(eq(signals.projectId, pid), eq(signals.detector, "grievance_sla_breach")));
+    expect(fromRead).toHaveLength(0);
+
+    await runDetectors(pid);
     const breached = await app.db
       .select()
       .from(signals)
@@ -880,6 +958,7 @@ describe("grievance redress mechanism", () => {
       url: `/api/v1/projects/${pid}/grievances/analytics`,
       headers: owner.headers,
     });
+    await runDetectors(pid);
     const again = await app.db
       .select()
       .from(signals)

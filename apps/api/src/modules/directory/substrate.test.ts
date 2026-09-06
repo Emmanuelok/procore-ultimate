@@ -6,13 +6,14 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import {
   assuranceGrants,
   commitments,
   companyMemberships,
   contacts,
   users,
+  vendorMerges,
   vendors,
 } from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
@@ -615,5 +616,279 @@ describe("directory bulk operations", () => {
       headers: owner.headers,
     });
     expect(res.statusCode).toBe(400);
+  });
+
+  /*
+   * A vendor_name the directory does not hold used to become `null` with no
+   * finding anywhere: 60 unattached contacts out of a 500-row file, reviewed
+   * in a dry run that said nothing.
+   */
+  it("flags a vendor_name the directory does not hold, in the dry run and again on commit", async () => {
+    await app.inject({
+      method: "POST",
+      url: "/api/v1/vendors",
+      headers: owner.headers,
+      payload: { name: "Acme Limited" },
+    });
+    const preview = await app.inject({
+      method: "POST",
+      url: "/api/v1/imports/contacts/preview",
+      headers: owner.headers,
+      payload: {
+        csv: [
+          "name,email,vendor_name",
+          "Real Person,real@acme.test,Acme Limited",
+          "Lost Person,lost@acme.test,Acme Ltd.",
+        ].join("\n"),
+      },
+    });
+    expect(preview.statusCode).toBe(201);
+    const findings = preview.json().errors as Array<{
+      row: number;
+      field: string | null;
+      message: string;
+      severity: string;
+    }>;
+    const unmatched = findings.find((f) => f.field === "vendor_name");
+    expect(unmatched).toBeTruthy();
+    expect(unmatched!.severity).toBe("warning");
+    expect(unmatched!.message).toContain("Acme Ltd.");
+    // A warning, not an error: the contact is still worth importing.
+    expect(preview.json().errorCount).toBe(0);
+
+    const commit = await app.inject({
+      method: "POST",
+      url: `/api/v1/directory/imports/${preview.json().id}/commit`,
+      headers: owner.headers,
+    });
+    expect(commit.statusCode).toBe(200);
+    expect(commit.json().created).toBe(2);
+    expect(commit.json().unresolvedVendors).toEqual(["Acme Ltd."]);
+
+    const list = await app.inject({
+      method: "GET",
+      url: "/api/v1/contacts?search=Lost",
+      headers: owner.headers,
+    });
+    expect(list.json().items[0].vendorId).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Fixer pass — the merge undo and the "restorable" delete             */
+/* ------------------------------------------------------------------ */
+
+describe("vendor merge undo", () => {
+  /*
+   * BLOCKER regression. The undo re-pointed EVERY row currently owned by the
+   * target back to the source, because the journal recorded only a count per
+   * table. One click inside the advertised 24-hour window transferred the
+   * surviving vendor's entire commercial history to a vendor it was never
+   * associated with, transactionally, with no second undo.
+   */
+  it("moves back only the rows the merge moved, leaving the target's own records alone", async () => {
+    const a = await app.inject({
+      method: "POST",
+      url: "/api/v1/vendors",
+      headers: owner.headers,
+      payload: { name: "Undo Source Ltd" },
+    });
+    const b = await app.inject({
+      method: "POST",
+      url: "/api/v1/vendors",
+      headers: owner.headers,
+      payload: { name: "Undo Target Ltd" },
+    });
+    const source = a.json().id as string;
+    const target = b.json().id as string;
+
+    // The target already owns two commitments of its own.
+    const own: string[] = [];
+    for (const reference of ["SC-200", "SC-201"]) {
+      const id = newId("cmt");
+      own.push(id);
+      await app.db.insert(commitments).values({
+        id,
+        companyId: owner.companyId,
+        projectId,
+        number: Number(reference.slice(3)),
+        reference,
+        title: `Target work ${reference}`,
+        vendorId: target,
+        createdBy: owner.userId,
+      });
+    }
+    // The source owns one.
+    const moved = newId("cmt");
+    await app.db.insert(commitments).values({
+      id: moved,
+      companyId: owner.companyId,
+      projectId,
+      number: 202,
+      reference: "SC-202",
+      title: "Source work",
+      vendorId: source,
+      createdBy: owner.userId,
+    });
+
+    const merge = await app.inject({
+      method: "POST",
+      url: `/api/v1/vendors/${source}/merge`,
+      headers: owner.headers,
+      payload: { intoVendorId: target },
+    });
+    expect(merge.statusCode).toBe(200);
+    const movements = merge.json().movements as Array<{
+      table: string;
+      rows: number;
+      ids: string[] | null;
+    }>;
+    const commitmentMovement = movements.find((m) => m.table === "commitments")!;
+    expect(commitmentMovement.rows).toBe(1);
+    // The identity of the moved row, not just how many there were.
+    expect(commitmentMovement.ids).toEqual([moved]);
+
+    const undo = await app.inject({
+      method: "POST",
+      url: `/api/v1/vendor-merges/${merge.json().mergeId}/undo`,
+      headers: owner.headers,
+    });
+    expect(undo.statusCode).toBe(200);
+    expect(
+      (undo.json().restored as Array<{ table: string; rows: number }>).find(
+        (r) => r.table === "commitments",
+      )?.rows,
+    ).toBe(1);
+
+    const rows = await app.db
+      .select({ id: commitments.id, vendorId: commitments.vendorId })
+      .from(commitments)
+      .where(inArray(commitments.id, [...own, moved]));
+    const byId = new Map(rows.map((r) => [r.id, r.vendorId]));
+    expect(byId.get(moved)).toBe(source);
+    // The two the target owned all along stay with the target.
+    for (const id of own) expect(byId.get(id)).toBe(target);
+  });
+
+  it("refuses an undo when the journal has no row identities", async () => {
+    const a = await app.inject({
+      method: "POST",
+      url: "/api/v1/vendors",
+      headers: owner.headers,
+      payload: { name: "Legacy Source Ltd" },
+    });
+    const b = await app.inject({
+      method: "POST",
+      url: "/api/v1/vendors",
+      headers: owner.headers,
+      payload: { name: "Legacy Target Ltd" },
+    });
+    const contactId = newId("cnt");
+    await app.db.insert(contacts).values({
+      id: contactId,
+      companyId: owner.companyId,
+      vendorId: a.json().id,
+      name: "Legacy Contact",
+    });
+    const merge = await app.inject({
+      method: "POST",
+      url: `/api/v1/vendors/${a.json().id}/merge`,
+      headers: owner.headers,
+      payload: { intoVendorId: b.json().id },
+    });
+    const mergeId = merge.json().mergeId as string;
+    // Rewrite the journal the way it was written before ids were recorded.
+    await app.db
+      .update(vendorMerges)
+      .set({ movements: [{ table: "contacts", column: "vendorId", rows: 1 }] })
+      .where(eq(vendorMerges.id, mergeId));
+
+    const journal = await app.inject({
+      method: "GET",
+      url: "/api/v1/vendor-merges",
+      headers: owner.headers,
+    });
+    const row = journal
+      .json()
+      .items.find((m: { id: string }) => m.id === mergeId) as {
+      undoable: boolean;
+      undoBlockedReason: string | null;
+    };
+    expect(row.undoable).toBe(false);
+    expect(row.undoBlockedReason).toContain("identities");
+
+    const undo = await app.inject({
+      method: "POST",
+      url: `/api/v1/vendor-merges/${mergeId}/undo`,
+      headers: owner.headers,
+    });
+    expect(undo.statusCode).toBe(409);
+    // Nothing moved: the refusal is the point.
+    const after = await app.db.select().from(contacts).where(eq(contacts.id, contactId));
+    expect(after[0]!.vendorId).toBe(b.json().id);
+  });
+});
+
+describe("soft-deleting a vendor", () => {
+  /*
+   * The delete used to null `contacts.vendorId` inside the same transaction,
+   * and the restore never put it back — the one thing a "restorable" delete
+   * destroyed irreversibly.
+   */
+  it("keeps its contacts, and the restore returns a vendor that still has them", async () => {
+    const vendor = await app.inject({
+      method: "POST",
+      url: "/api/v1/vendors",
+      headers: owner.headers,
+      payload: { name: "Southern Groundworks" },
+    });
+    const vendorId = vendor.json().id as string;
+    const contactId = newId("cnt");
+    await app.db.insert(contacts).values({
+      id: contactId,
+      companyId: owner.companyId,
+      vendorId,
+      name: "Attached Contact",
+    });
+
+    await app.inject({
+      method: "DELETE",
+      url: `/api/v1/vendors/${vendorId}`,
+      headers: owner.headers,
+    });
+    const stillAttached = await app.db.select().from(contacts).where(eq(contacts.id, contactId));
+    expect(stillAttached[0]!.vendorId).toBe(vendorId);
+
+    // The read path says the employer is deleted rather than blanking it.
+    const listed = await app.inject({
+      method: "GET",
+      url: "/api/v1/contacts?search=Attached",
+      headers: owner.headers,
+    });
+    const contactRow = listed.json().items[0];
+    expect(contactRow.vendorName).toBe("Southern Groundworks");
+    expect(contactRow.vendorDeleted).toBe(true);
+
+    // And a new contact cannot be filed against a vendor in the recycle bin.
+    const refused = await app.inject({
+      method: "POST",
+      url: "/api/v1/contacts",
+      headers: owner.headers,
+      payload: { name: "Too Late", vendorId },
+    });
+    expect(refused.statusCode).toBe(400);
+
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/vendors/${vendorId}/restore`,
+      headers: owner.headers,
+    });
+    const afterRestore = await app.inject({
+      method: "GET",
+      url: `/api/v1/contacts?vendorId=${vendorId}`,
+      headers: owner.headers,
+    });
+    expect(afterRestore.json().items.map((c: { id: string }) => c.id)).toContain(contactId);
+    expect(afterRestore.json().items[0].vendorDeleted).toBe(false);
   });
 });

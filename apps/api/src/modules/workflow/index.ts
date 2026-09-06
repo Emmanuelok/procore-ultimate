@@ -45,6 +45,7 @@ import {
   lte,
   ne,
   or,
+  sql,
 } from "drizzle-orm";
 import { z } from "zod";
 import {
@@ -82,6 +83,7 @@ import {
   type StepDef,
 } from "./engine.js";
 import { resolveWorkflowContext, resolvableRecordTypes } from "./context.js";
+import { companyAdminOrDelegation, toolGateOrDelegation } from "../admin/delegation.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -156,10 +158,17 @@ function snapshotSteps(context: Record<string, unknown>): StepDef[] | null {
 
 export const workflowModule: FastifyPluginAsync = async (app) => {
   const companyGate = [app.authenticate, app.requireCompany];
+  /*
+   * #27 — company-level template administration admits a TENANT-WIDE
+   * `workflow_templates` delegation as well as an owner/admin. A
+   * project-scoped delegation opens the project template routes below
+   * instead; a company template applies to every project, so nothing narrower
+   * than tenant-wide may create one (modules/admin/delegation.ts).
+   */
   const adminCompanyGate = [
     app.authenticate,
     app.requireCompany,
-    app.requireCompanyRole(["owner", "admin"]),
+    companyAdminOrDelegation(app, "workflow_templates"),
   ];
   const readGate = [app.authenticate, app.requireCompany, app.requireTool("workflow", "read")];
   const standardGate = [
@@ -167,7 +176,12 @@ export const workflowModule: FastifyPluginAsync = async (app) => {
     app.requireCompany,
     app.requireTool("workflow", "standard"),
   ];
-  const adminGate = [app.authenticate, app.requireCompany, app.requireTool("workflow", "admin")];
+  /** Project template administration: the workflow tool, or a delegation naming this project. */
+  const adminGate = [
+    app.authenticate,
+    app.requireCompany,
+    toolGateOrDelegation(app, "workflow", "admin", "workflow_templates"),
+  ];
 
   /* ---------------------------------------------------------------- */
   /* Authorisation helpers                                             */
@@ -427,6 +441,18 @@ export const workflowModule: FastifyPluginAsync = async (app) => {
     fromIdx: number,
     actorId: string,
     resolve: (step: StepDef) => { ids: string[]; reason?: string },
+    /**
+     * `${position}:${assigneeId}` keys that already have a step row on this
+     * instance and must not be re-created.
+     *
+     * Only the retroactive migration (#90) passes this. A partially decided
+     * parallel group keeps its decided rows — dropping Alice's approval to
+     * rebuild the group would erase an approval that happened — so the
+     * rebuild has to leave her out, or the insert collides with
+     * `workflow_steps_uq (instance_id, position, assignee_id)` and the whole
+     * batch throws.
+     */
+    taken?: ReadonlySet<string>,
   ): Promise<ActivationResult> {
     const context = stripContext(instance.context);
     const now = new Date().toISOString();
@@ -457,27 +483,29 @@ export const workflowModule: FastifyPluginAsync = async (app) => {
         };
       }
 
-      const rows = plan.steps.map((s: PlannedStep) => {
-        const dates = stepDates(today, {
-          dueInDays: s.dueInDays,
-          escalateAfterDays: s.escalateAfterDays,
+      const rows = plan.steps
+        .filter((s: PlannedStep) => !taken?.has(`${g}:${s.assigneeId}`))
+        .map((s: PlannedStep) => {
+          const dates = stepDates(today, {
+            dueInDays: s.dueInDays,
+            escalateAfterDays: s.escalateAfterDays,
+          });
+          return {
+            id: newId("wfs"),
+            instanceId: instance.id,
+            position: g,
+            name: s.name,
+            stepType: s.stepType,
+            assigneeId: s.assigneeId,
+            assignedVia: s.assignedVia,
+            assignedViaKey: s.assignedViaKey,
+            quorum: s.quorum,
+            decision: s.skipped ? "skipped" : "pending",
+            dueDate: s.skipped ? null : dates.dueDate,
+            escalateAt: s.skipped ? null : dates.escalateAt,
+            decidedAt: s.skipped ? now : null,
+          } satisfies typeof workflowStepInstances.$inferInsert;
         });
-        return {
-          id: newId("wfs"),
-          instanceId: instance.id,
-          position: g,
-          name: s.name,
-          stepType: s.stepType,
-          assigneeId: s.assigneeId,
-          assignedVia: s.assignedVia,
-          assignedViaKey: s.assignedViaKey,
-          quorum: s.quorum,
-          decision: s.skipped ? "skipped" : "pending",
-          dueDate: s.skipped ? null : dates.dueDate,
-          escalateAt: s.skipped ? null : dates.escalateAt,
-          decidedAt: s.skipped ? now : null,
-        } satisfies typeof workflowStepInstances.$inferInsert;
-      });
 
       if (rows.length > 0) await tx.insert(workflowStepInstances).values(rows);
       await tx
@@ -871,30 +899,45 @@ export const workflowModule: FastifyPluginAsync = async (app) => {
       const steps = stepsSchema.parse(tpl.steps);
       const groups = buildGroups(steps);
 
-      // Idempotent start: a double click must not open a second approval
-      // chain on one record.
-      const live = await app.db
-        .select()
-        .from(workflowInstances)
-        .where(
-          and(
-            eq(workflowInstances.companyId, req.companyId!),
-            eq(workflowInstances.projectId, req.projectId!),
-            eq(workflowInstances.recordType, body.recordType),
-            eq(workflowInstances.recordId, body.recordId),
-            inArray(workflowInstances.status, ["running", "blocked"]),
-          ),
-        )
-        .limit(1);
-      if (live[0]) {
+      /*
+       * Idempotent start: a double click must not open a second approval
+       * chain on one record.
+       *
+       * A bare read-then-insert is not idempotent — that is the double click
+       * it was written for: both requests observe nothing live and both
+       * insert. Concurrent starts on one record are serialised with a
+       * transaction-scoped advisory lock (the same primitive `appendLedger`
+       * uses for the chain head), and the existence check is repeated INSIDE
+       * that lock below, so the loser of the race returns the winner's
+       * instance instead of creating a second one.
+       */
+      const startLockKey = `workflow:start:${req.companyId!}:${body.recordType}:${body.recordId}`;
+      const liveInstance = async (db: Db) =>
+        (
+          await db
+            .select()
+            .from(workflowInstances)
+            .where(
+              and(
+                eq(workflowInstances.companyId, req.companyId!),
+                eq(workflowInstances.projectId, req.projectId!),
+                eq(workflowInstances.recordType, body.recordType),
+                eq(workflowInstances.recordId, body.recordId),
+                inArray(workflowInstances.status, ["running", "blocked"]),
+              ),
+            )
+            .limit(1)
+        )[0] ?? null;
+      const existing = await liveInstance(app.db);
+      if (existing) {
         const stepRows = await app.db
           .select()
           .from(workflowStepInstances)
-          .where(eq(workflowStepInstances.instanceId, live[0].id))
+          .where(eq(workflowStepInstances.instanceId, existing.id))
           .orderBy(asc(workflowStepInstances.position), asc(workflowStepInstances.createdAt));
         return reply
           .status(200)
-          .send({ ...instanceDto(live[0]), steps: stepRows, alreadyRunning: true });
+          .send({ ...instanceDto(existing), steps: stepRows, alreadyRunning: true });
       }
 
       // Conditions branch on the RECORD, not on what the caller says about it.
@@ -937,13 +980,33 @@ export const workflowModule: FastifyPluginAsync = async (app) => {
         steps,
       );
 
-      const outcome = await app.db.transaction(async (tx) => {
+      const started = await app.db.transaction(async (
+        tx,
+      ): Promise<{ raced: InstanceRow } | { outcome: ActivationResult }> => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${startLockKey}))`);
+        // Re-check under the lock: the other half of the double click may have
+        // committed between the optimistic check above and this transaction.
+        const raced = await liveInstance(tx as Db);
+        if (raced) return { raced };
         await tx.insert(workflowInstances).values(row);
         const inserted = (
           await tx.select().from(workflowInstances).where(eq(workflowInstances.id, instanceId)).limit(1)
         )[0]!;
-        return activateFrom(tx as Db, inserted, groups, 0, req.user!.id, resolveAssignees);
+        return {
+          outcome: await activateFrom(tx as Db, inserted, groups, 0, req.user!.id, resolveAssignees),
+        };
       });
+      if ("raced" in started) {
+        const stepRows = await app.db
+          .select()
+          .from(workflowStepInstances)
+          .where(eq(workflowStepInstances.instanceId, started.raced.id))
+          .orderBy(asc(workflowStepInstances.position), asc(workflowStepInstances.createdAt));
+        return reply
+          .status(200)
+          .send({ ...instanceDto(started.raced), steps: stepRows, alreadyRunning: true });
+      }
+      const outcome = started.outcome;
 
       await appendLedger(app.db, {
         companyId: req.companyId!,
@@ -1557,6 +1620,30 @@ export const workflowModule: FastifyPluginAsync = async (app) => {
     if (step.decision !== "pending") throw conflict("Step has already been decided");
     await assertCompanyMembers(instance.companyId, [body.toUserId], "Reassignee");
     if (body.toUserId === step.assigneeId) throw badRequest("Step is already assigned to that user");
+    /*
+     * "Alice has left, Bob covers it" on a parallel group where Bob is
+     * already an approver used to violate `workflow_steps_uq
+     * (instance_id, position, assignee_id)` and surface as an unhandled 500.
+     * One approver may hold only one step per group; say so.
+     */
+    const [clash] = await app.db
+      .select({ id: workflowStepInstances.id, decision: workflowStepInstances.decision })
+      .from(workflowStepInstances)
+      .where(
+        and(
+          eq(workflowStepInstances.instanceId, instance.id),
+          eq(workflowStepInstances.position, step.position),
+          eq(workflowStepInstances.assigneeId, body.toUserId),
+        ),
+      )
+      .limit(1);
+    if (clash) {
+      throw conflict(
+        clash.decision === "pending"
+          ? "That person is already an approver on this step"
+          : `That person already ${clash.decision} a step in this group`,
+      );
+    }
 
     await app.db
       .update(workflowStepInstances)
@@ -1747,85 +1834,125 @@ export const workflowModule: FastifyPluginAsync = async (app) => {
         .limit(500);
 
       const migrated: Array<{ id: string; from: number; to: number; status: string }> = [];
+      /*
+       * One instance failing must not abort the batch and leave the earlier
+       * ones migrated with nothing said about it. Every skip and every failure
+       * is reported per instance.
+       */
+      const skippedItems: Array<{ id: string; reason: string }> = [];
       for (const instance of running) {
         if (instance.currentPosition >= groups.length) {
           // The new definition is shorter than where this run has reached —
           // migrating it would silently drop approvals that have not happened.
+          skippedItems.push({
+            id: instance.id,
+            reason: `the new version has ${groups.length} group(s) but this instance has reached group ${instance.currentPosition + 1}`,
+          });
           continue;
         }
-        const resolveAssignees = await buildAssigneeResolver(
-          instance.companyId,
-          instance.projectId,
-          steps,
-        );
-        const now = new Date().toISOString();
-        const outcome = await app.db.transaction(async (tx) => {
-          const locked = (
-            await tx
-              .select()
-              .from(workflowInstances)
-              .where(eq(workflowInstances.id, instance.id))
-              .for("update")
-          )[0];
-          if (!locked) return null;
-          // Drop the pending group and rebuild it from the new definition.
-          await tx
-            .delete(workflowStepInstances)
-            .where(
-              and(
-                eq(workflowStepInstances.instanceId, locked.id),
-                eq(workflowStepInstances.position, locked.currentPosition),
-                eq(workflowStepInstances.decision, "pending"),
-              ),
-            );
-          await tx
-            .update(workflowInstances)
-            .set({
-              templateVersion: tpl.version,
-              status: "running",
-              blockedReason: null,
-              context: { ...locked.context, [STEPS_KEY]: steps },
-              updatedAt: now,
-            })
-            .where(eq(workflowInstances.id, locked.id));
-          const refreshed = (
-            await tx.select().from(workflowInstances).where(eq(workflowInstances.id, locked.id)).limit(1)
-          )[0]!;
-          return activateFrom(
-            tx as Db,
-            refreshed,
-            groups,
-            refreshed.currentPosition,
-            req.user!.id,
-            resolveAssignees,
+        try {
+          const resolveAssignees = await buildAssigneeResolver(
+            instance.companyId,
+            instance.projectId,
+            steps,
           );
-        });
-        if (!outcome) continue;
-        await appendLedger(app.db, {
-          companyId: instance.companyId,
-          actorId: req.user!.id,
-          action: "state_change",
-          objectType: "workflow_instance",
-          objectId: instance.id,
-          payload: {
-            event: "template_migrated",
-            fromVersion: instance.templateVersion,
-            toVersion: tpl.version,
-            position: instance.currentPosition,
-          },
-          // Stored, not just hashed: "which version of the approval chain was
-          // this record actually judged against" is a question a dispute asks.
-          storePayload: true,
-          projectId: instance.projectId,
-        });
-        const fresh = await fetchInstance(instance.id, instance.companyId);
-        await announceActivation(fresh, outcome, req.user!.id);
-        migrated.push({
-          id: instance.id,
-          from: instance.templateVersion,
-          to: tpl.version,
-          status: outcome.status,
-        });
+          const now = new Date().toISOString();
+          const outcome = await app.db.transaction(async (tx) => {
+            const locked = (
+              await tx
+                .select()
+                .from(workflowInstances)
+                .where(eq(workflowInstances.id, instance.id))
+                .for("update")
+            )[0];
+            if (!locked) return null;
+            // Drop the pending group and rebuild it from the new definition.
+            await tx
+              .delete(workflowStepInstances)
+              .where(
+                and(
+                  eq(workflowStepInstances.instanceId, locked.id),
+                  eq(workflowStepInstances.position, locked.currentPosition),
+                  eq(workflowStepInstances.decision, "pending"),
+                ),
+              );
+            /*
+             * What survived the delete: rows at this position that were already
+             * DECIDED. A parallel group where one of two approvers has answered
+             * is exactly the case retroactive migration exists for, and
+             * rebuilding the group without excluding the decided approver
+             * violates workflow_steps_uq and throws mid-batch.
+             */
+            const surviving = await tx
+              .select({
+                position: workflowStepInstances.position,
+                assigneeId: workflowStepInstances.assigneeId,
+              })
+              .from(workflowStepInstances)
+              .where(eq(workflowStepInstances.instanceId, locked.id));
+            const taken = new Set(surviving.map((s) => `${s.position}:${s.assigneeId}`));
+            await tx
+              .update(workflowInstances)
+              .set({
+                templateVersion: tpl.version,
+                status: "running",
+                blockedReason: null,
+                context: { ...locked.context, [STEPS_KEY]: steps },
+                updatedAt: now,
+              })
+              .where(eq(workflowInstances.id, locked.id));
+            const refreshed = (
+              await tx.select().from(workflowInstances).where(eq(workflowInstances.id, locked.id)).limit(1)
+            )[0]!;
+            return activateFrom(
+              tx as Db,
+              refreshed,
+              groups,
+              refreshed.currentPosition,
+              req.user!.id,
+              resolveAssignees,
+              taken,
+            );
+          });
+          if (!outcome) {
+            skippedItems.push({ id: instance.id, reason: "instance disappeared during migration" });
+            continue;
+          }
+          await appendLedger(app.db, {
+            companyId: instance.companyId,
+            actorId: req.user!.id,
+            action: "state_change",
+            objectType: "workflow_instance",
+            objectId: instance.id,
+            payload: {
+              event: "template_migrated",
+              fromVersion: instance.templateVersion,
+              toVersion: tpl.version,
+              position: instance.currentPosition,
+            },
+            // Stored, not just hashed: "which version of the approval chain was
+            // this record actually judged against" is a question a dispute asks.
+            storePayload: true,
+            projectId: instance.projectId,
+          });
+          const fresh = await fetchInstance(instance.id, instance.companyId);
+          await announceActivation(fresh, outcome, req.user!.id);
+          migrated.push({
+            id: instance.id,
+            from: instance.templateVersion,
+            to: tpl.version,
+            status: outcome.status,
+          });
+        } catch (err) {
+          app.log.error(
+            { err, instanceId: instance.id, templateId },
+            "workflow template migration failed for one instance",
+          );
+          skippedItems.push({
+            id: instance.id,
+            reason: err instanceof Error ? err.message : "migration failed",
+          });
+        }
       }
 
       return {
@@ -1833,8 +1960,11 @@ export const workflowModule: FastifyPluginAsync = async (app) => {
         version: tpl.version,
         candidates: running.length,
         migrated: migrated.length,
-        skipped: running.length - migrated.length,
+        skipped: skippedItems.length,
         items: migrated,
+        // Named, not merely counted: "12 of 14 migrated" with no way to find
+        // the other two is not a report.
+        skippedItems,
       };
     },
   );

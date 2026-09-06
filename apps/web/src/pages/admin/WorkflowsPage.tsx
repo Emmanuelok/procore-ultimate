@@ -768,11 +768,25 @@ function TemplatesTab({ isAdmin }: { isAdmin: boolean }) {
     )
       return;
     try {
-      const res = await api.post<{ migrated: number }>(
-        `/api/v1/workflow-templates/${tpl.id}/apply-to-running`,
-        {},
+      const res = await api.post<{
+        migrated: number;
+        candidates: number;
+        skippedItems?: Array<{ id: string; reason: string }>;
+      }>(`/api/v1/workflow-templates/${tpl.id}/apply-to-running`, {});
+      toast.success(`${res.migrated} of ${res.candidates} running instance(s) migrated`);
+      /*
+       * Per-instance outcomes, not just a count. The migration used to abort
+       * the whole batch on the first instance it could not rebuild, leaving
+       * earlier ones migrated with nothing said; now each failure is named.
+       */
+      const skipped = res.skippedItems ?? [];
+      setError(
+        skipped.length === 0
+          ? null
+          : `${skipped.length} instance(s) were not migrated: ${skipped
+              .map((s) => `${s.id} (${s.reason})`)
+              .join("; ")}`,
       );
-      toast.success(`${res.migrated} running instance(s) migrated`);
       await load();
     } catch (err) {
       setError(errorMessage(err, "Failed to apply the template to running instances"));
@@ -833,6 +847,7 @@ function TemplatesTab({ isAdmin }: { isAdmin: boolean }) {
                 <Th>Steps</Th>
                 <Th>Version</Th>
                 <Th>Active</Th>
+                <Th>Mandatory</Th>
                 <Th />
               </tr>
             </thead>
@@ -846,6 +861,15 @@ function TemplatesTab({ isAdmin }: { isAdmin: boolean }) {
                   </Td>
                   <Td>v{t.version}</Td>
                   <Td>{t.isActive ? <Badge tone="success">Active</Badge> : <Badge tone="neutral">Inactive</Badge>}</Td>
+                  <Td>
+                    {t.isMandatory === 1 ? (
+                      <Badge tone="warning" title="Records of this type cannot leave review without it">
+                        Required
+                      </Badge>
+                    ) : (
+                      <span className="text-2xs text-content-subtle">Optional</span>
+                    )}
+                  </Td>
                   <Td>
                     {isAdmin ? (
                       <div className="flex gap-1">
@@ -910,6 +934,7 @@ function TemplateDesigner({
   const [name, setName] = useState("");
   const [recordType, setRecordType] = useState("rfi");
   const [steps, setSteps] = useState<DesignerStep[]>([emptyStep()]);
+  const [isMandatory, setIsMandatory] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -919,12 +944,14 @@ function TemplateDesigner({
     if (template) {
       setName(template.name);
       setRecordType(template.recordType);
+      setIsMandatory(template.isMandatory === 1);
       setSteps(
         template.steps.map((s) => ({ ...s, assigneeText: (s.assigneeIds ?? []).join(", ") })),
       );
     } else {
       setName("");
       setRecordType(recordTypes[0] ?? "rfi");
+      setIsMandatory(false);
       setSteps([emptyStep()]);
     }
   }, [open, template, recordTypes]);
@@ -943,6 +970,7 @@ function TemplateDesigner({
       const payload = {
         name,
         recordType,
+        isMandatory,
         steps: steps.map((s) => {
           const ids = (s.assigneeText ?? "")
             .split(/[,\s]+/)
@@ -971,6 +999,7 @@ function TemplateDesigner({
         await api.patch(`/api/v1/workflow-templates/${template.id}`, {
           name: payload.name,
           steps: payload.steps,
+          isMandatory: payload.isMandatory,
         });
         toast.success("Template saved — version bumped");
       } else {
@@ -1015,6 +1044,30 @@ function TemplateDesigner({
             </datalist>
           </Field>
         </div>
+
+        {/*
+          #788 — mandatory is a stored property of the template, and the only
+          thing GET /workflow-required answers "required: true" for. An
+          optional template must not block every record of its type.
+        */}
+        <label className="flex items-start gap-2 rounded border border-border-subtle p-3 text-xs">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            checked={isMandatory}
+            onChange={(e) => setIsMandatory(e.target.checked)}
+          />
+          <span>
+            <span className="font-medium text-content-strong">
+              Mandatory for this record type
+            </span>
+            <span className="block text-2xs text-content-muted">
+              The owning module asks <code>GET /projects/:id/workflow-required</code> before a
+              record leaves review. Leave this off for an optional chain — an optional template
+              that answered "required" would block every record of the type.
+            </span>
+          </span>
+        </label>
 
         <div className="space-y-3">
           {steps.map((step, i) => (

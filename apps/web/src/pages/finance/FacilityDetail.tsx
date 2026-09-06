@@ -38,6 +38,7 @@ import { formatDate, formatDateTime, humanize } from "../format";
 import CovenantChart from "./CovenantChart";
 import EvidencePicker from "./EvidencePicker";
 import { CashflowsPanel, WaiveCovenantForm } from "./CovenantOps";
+import DesignatedAccounts from "./DesignatedAccounts";
 import {
   CertifyForm,
   CostOfFinancePanel,
@@ -887,6 +888,7 @@ export default function FacilityDetail({
       ) : null}
 
       {/* ------------------ lender discipline (#744-751) ---------------------------- */}
+      <DesignatedAccounts base={base} facilityId={facilityId} currency={currency} />
       <ForecastPanel base={base} facilityId={facilityId} currency={currency} />
       <RecoveriesPanel base={base} facilityId={facilityId} currency={currency} />
       <CostOfFinancePanel base={base} facilityId={facilityId} />

@@ -10,6 +10,8 @@ import {
   budgetLineItems,
   companyMemberships,
   costCodes,
+  distributionGroupMembers,
+  distributionGroups,
   ledgerEntries,
   notifications,
   projectMemberships,
@@ -921,5 +923,149 @@ describe("CSV import", () => {
       payload: { csv: "path\nA" },
     });
     expect(res.statusCode).toBe(400);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Comments belong to the project in the URL                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The watchers and custom-value routes proved the record belonged to the
+ * project before writing; the comment route did not. It stamped the URL's
+ * companyId/projectId onto any client-supplied (recordType, recordId), and its
+ * #70 fan-out selected watchers by (companyId, recordType, recordId) with no
+ * project predicate — so a comment written in project A reached the watchers
+ * of a record in project B, carrying its first 280 characters.
+ */
+describe("POST /projects/:projectId/records/:type/:id/comments", () => {
+  it("refuses a record that lives in another project of the same tenant", async () => {
+    const rfiId = newId("rfi");
+    await app.db.insert(rfis).values({
+      id: rfiId,
+      companyId: owner.companyId,
+      projectId: projectB,
+      number: 9001,
+      subject: "B's RFI",
+      question: "?",
+      createdBy: owner.userId,
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectA}/records/rfi/${rfiId}/comments`,
+      headers: owner.headers,
+      payload: { body: "Filed under the wrong project" },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("in this project");
+  });
+
+  it("notifies only the watchers of THIS project's record", async () => {
+    const rfiId = newId("rfi");
+    await app.db.insert(rfis).values({
+      id: rfiId,
+      companyId: owner.companyId,
+      projectId: projectA,
+      number: 9002,
+      subject: "A's RFI",
+      question: "?",
+      createdBy: owner.userId,
+    });
+    // A watcher row with the SAME record id filed under project B: the shape
+    // a colliding id produces.
+    await app.db.insert(watchers).values({
+      id: newId("wch"),
+      companyId: owner.companyId,
+      projectId: projectB,
+      recordType: "rfi",
+      recordId: rfiId,
+      userId: guest.userId,
+    });
+    // …and a legitimate watcher on project A.
+    await app.db.insert(watchers).values({
+      id: newId("wch"),
+      companyId: owner.companyId,
+      projectId: projectA,
+      recordType: "rfi",
+      recordId: rfiId,
+      userId: member.userId,
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectA}/records/rfi/${rfiId}/comments`,
+      headers: owner.headers,
+      payload: { body: "Commercially sensitive detail" },
+    });
+    expect(res.statusCode).toBe(201);
+
+    const sent = await app.db
+      .select()
+      .from(notifications)
+      .where(
+        and(
+          eq(notifications.companyId, owner.companyId),
+          eq(notifications.recordType, "rfi"),
+          eq(notifications.recordId, rfiId),
+        ),
+      );
+    const recipients = sent.map((n) => n.userId);
+    expect(recipients).toContain(member.userId);
+    expect(recipients).not.toContain(guest.userId);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Cloning carries the recipients, not just the group names            */
+/* ------------------------------------------------------------------ */
+
+describe("POST /projects/:projectId/clone — distribution groups", () => {
+  it("copies the members of each group, not only the group row", async () => {
+    const source = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: owner.headers,
+      payload: { name: "Clone source" },
+    });
+    const sourceId = source.json().id as string;
+    const group = await app.inject({
+      method: "POST",
+      url: "/api/v1/distribution-groups",
+      headers: owner.headers,
+      payload: { name: "Minutes list", projectId: sourceId },
+    });
+    expect(group.statusCode).toBe(201);
+    const added = await app.inject({
+      method: "POST",
+      url: `/api/v1/distribution-groups/${group.json().id}/members`,
+      headers: owner.headers,
+      payload: { email: "site@example.test" },
+    });
+    expect(added.statusCode).toBe(201);
+
+    const cloned = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${sourceId}/clone`,
+      headers: owner.headers,
+      payload: { name: "Clone target", include: ["distributionGroups"] },
+    });
+    expect(cloned.statusCode).toBe(201);
+    expect(cloned.json().copied.distributionGroups).toBe(1);
+    // The count that used to read as confirmation while every group arrived
+    // empty.
+    expect(cloned.json().copied.distributionGroupMembers).toBe(1);
+
+    const groups = await app.db
+      .select()
+      .from(distributionGroups)
+      .where(eq(distributionGroups.projectId, cloned.json().id));
+    expect(groups).toHaveLength(1);
+    const members = await app.db
+      .select()
+      .from(distributionGroupMembers)
+      .where(eq(distributionGroupMembers.groupId, groups[0]!.id));
+    expect(members).toHaveLength(1);
+    expect(members[0]!.email).toBe("site@example.test");
   });
 });

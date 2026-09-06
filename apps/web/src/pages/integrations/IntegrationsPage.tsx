@@ -9,6 +9,10 @@
  *   · ERP export         — canonical AP/AR and job-cost extracts, rendered
  *     through per-system mapping profiles (#130-133, #582)
  *
+ * Above the tabs sits the developer-sandbox flag (#123): a tenant-level claim
+ * that everything leaving here is an exercise, which the exports, the webhook
+ * envelopes and the benchmark pool all honour.
+ *
  * Company scope, no project. The event catalogue and the scope vocabulary are
  * loaded once here and shared with every tab, as is the delivery-health read —
  * the signing contract it carries (key custody in particular) is a disclosure
@@ -27,6 +31,7 @@ import { PageHeader } from "../../ui";
 import ErpTab from "./ErpTab";
 import HealthTab from "./HealthTab";
 import OAuthTab from "./OAuthTab";
+import SandboxCard from "./SandboxCard";
 import SignatureTab from "./SignatureTab";
 import SourcesTab from "./SourcesTab";
 import WebhooksTab from "./WebhooksTab";
@@ -168,6 +173,8 @@ export default function IntegrationsPage() {
           </Caveat>
         </div>
       ) : null}
+
+      <SandboxCard isAdmin={isAdmin} />
 
       <TabBar tabs={TABS} active={tab} onSelect={selectTab} />
 

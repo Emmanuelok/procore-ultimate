@@ -69,10 +69,10 @@ async function makeProject(name: string, currency = "GBP") {
 
 /* Booting an embedded PGlite and applying the full migration set takes well
    over the repo-wide 30s hook budget whenever anything else is running on the
-   machine, and the failure looks like a worker abort rather than a failed
-   assertion. The hook is given its own budget so this suite means what it
-   says under load. */
-const BOOT_TIMEOUT_MS = 180_000;
+   machine, and the failure then looks like a worker abort rather than a failed
+   assertion. The boot hook is given its own budget so this suite reports what
+   it actually found, under load as well as idle. */
+const BOOT_TIMEOUT_MS = 600_000;
 
 beforeAll(async () => {
   built = await buildTestApp();

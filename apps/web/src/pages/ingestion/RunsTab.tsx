@@ -9,6 +9,7 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import { INGESTION_RUN_STATUSES, STAGED_RECORD_STATUSES } from "@constructos/shared";
+import { toast } from "sonner";
 import { api } from "../../lib/api";
 import {
   Badge,
@@ -210,6 +211,52 @@ export default function RunsTab({
     }
   }
 
+  /* ----------------------- reconcile resolutions ------------------------- */
+
+  /**
+   * Reconcile mode stages a matched row with its diff and NO decision, and the
+   * commit skips every undecided row. The wizard could ask for reconcile mode
+   * and the API could stage the matches, but nothing in the app could record
+   * the decision — so every reconcile run committed nothing but skips. These
+   * two calls are the missing half.
+   */
+  async function setResolution(recordId: string, resolution: "insert" | "update" | "skip") {
+    if (!run) return;
+    setBusy(true);
+    setActionError(null);
+    try {
+      await api.post<unknown>(
+        `/api/v1/ingestion/runs/${run.id}/records/${recordId}/resolution`,
+        { resolution },
+      );
+      await loadRecords(run.id);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Could not record the decision");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function setAllResolutions(resolution: "insert" | "update" | "skip") {
+    if (!run) return;
+    setBusy(true);
+    setActionError(null);
+    try {
+      const out = await api.post<{ rows: number }>(
+        `/api/v1/ingestion/runs/${run.id}/resolutions`,
+        { resolution },
+      );
+      toast.success(
+        `${out.rows} matched row${out.rows === 1 ? "" : "s"} set to ${resolution}`,
+      );
+      await loadRecords(run.id);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Could not record the decisions");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function onDiscard() {
     if (!run) return;
     if (
@@ -244,6 +291,15 @@ export default function RunsTab({
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const recordsPages = Math.max(1, Math.ceil(recordsTotal / RECORDS_PAGE_SIZE));
+
+  /*
+   * Reconcile bookkeeping. `undecidedOnPage` counts only what is on screen —
+   * the register is paginated, so the honest claim is "on this page", and the
+   * bulk action exists precisely because the whole run cannot be seen at once.
+   */
+  const isReconcile = run?.mode === "reconcile";
+  const matchedOnPage = (records ?? []).filter((r) => !!r.matchedRecordId);
+  const undecidedOnPage = matchedOnPage.filter((r) => !r.resolution);
 
   /* -------------------------------- render -------------------------------- */
 
@@ -526,6 +582,53 @@ export default function RunsTab({
               <ReportTable report={run.report ?? []} rejectedCount={run.rejectedCount} />
             </div>
 
+            {/* Reconcile decisions (#1045-1047) */}
+            {isReconcile && run.status !== "committed" && run.status !== "discarded" ? (
+              <div className="rounded-md bg-amber-50 p-3 ring-1 ring-amber-200">
+                <h3 className="text-sm font-semibold text-amber-900">
+                  Reconcile decisions required
+                </h3>
+                <p className="mt-1 text-xs text-amber-800">
+                  This run was staged in reconcile mode: rows whose external ID matches a record
+                  already committed carry the field-by-field difference below. A matched row with
+                  NO decision is skipped at commit — the platform will not guess whether a
+                  restatement should overwrite a record somebody is working from.
+                </p>
+                <p className="mt-1 text-xs text-amber-800">
+                  {matchedOnPage.length === 0
+                    ? "No matched rows on this page."
+                    : `${fmtInt(matchedOnPage.length)} matched row${matchedOnPage.length === 1 ? "" : "s"} on this page, ${fmtInt(undecidedOnPage.length)} still undecided.`}
+                </p>
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <span className="text-xs font-medium text-amber-900">Apply to every matched row:</span>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={busy}
+                    onClick={() => void setAllResolutions("update")}
+                  >
+                    Update
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={busy}
+                    onClick={() => void setAllResolutions("insert")}
+                  >
+                    Insert as new
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={busy}
+                    onClick={() => void setAllResolutions("skip")}
+                  >
+                    Skip
+                  </Button>
+                </div>
+              </div>
+            ) : null}
+
             {/* Staged records */}
             <div>
               <div className="mb-2 flex flex-wrap items-end justify-between gap-2">
@@ -567,6 +670,11 @@ export default function RunsTab({
                           <th className="px-3 py-1.5 text-left font-semibold uppercase tracking-wide text-ink-500">External ID</th>
                           <th className="px-3 py-1.5 text-left font-semibold uppercase tracking-wide text-ink-500">Payload</th>
                           <th className="px-3 py-1.5 text-left font-semibold uppercase tracking-wide text-ink-500">Reason / committed as</th>
+                          {isReconcile ? (
+                            <th className="px-3 py-1.5 text-left font-semibold uppercase tracking-wide text-ink-500">
+                              Restates / decision
+                            </th>
+                          ) : null}
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-ink-50 bg-white">
@@ -597,6 +705,46 @@ export default function RunsTab({
                                 <span className="text-ink-300">—</span>
                               )}
                             </td>
+                            {isReconcile ? (
+                              <td className="px-3 py-1.5 align-top">
+                                {rec.matchedRecordId ? (
+                                  <div className="space-y-1">
+                                    <div
+                                      className="font-mono text-[11px] text-ink-600"
+                                      title="The committed record this row restates"
+                                    >
+                                      {rec.matchedRecordId}
+                                    </div>
+                                    <DiffCell diff={rec.diff ?? null} />
+                                    <div className="flex flex-wrap items-center gap-1">
+                                      {(["update", "insert", "skip"] as const).map((r) => (
+                                        <button
+                                          key={r}
+                                          type="button"
+                                          disabled={busy || run.status === "committed" || run.status === "discarded"}
+                                          onClick={() => void setResolution(rec.id, r)}
+                                          className={
+                                            "rounded px-1.5 py-0.5 text-[11px] ring-1 disabled:opacity-50 " +
+                                            (rec.resolution === r
+                                              ? "bg-brand-600 text-white ring-brand-600"
+                                              : "bg-white text-ink-700 ring-ink-200 hover:bg-ink-50")
+                                          }
+                                        >
+                                          {r === "insert" ? "Insert as new" : humanize(r)}
+                                        </button>
+                                      ))}
+                                    </div>
+                                    {!rec.resolution ? (
+                                      <div className="text-[11px] text-amber-700">
+                                        Undecided — skipped at commit.
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                ) : (
+                                  <span className="text-ink-300">— (new record)</span>
+                                )}
+                              </td>
+                            ) : null}
                           </tr>
                         ))}
                       </tbody>
@@ -646,6 +794,13 @@ export default function RunsTab({
               <Caveat>
                 {fmtInt(run.rejectedCount)} rejected rows are NOT included. They stay on the run
                 with their reasons.
+              </Caveat>
+            ) : null}
+            {isReconcile && undecidedOnPage.length > 0 ? (
+              <Caveat tone="red">
+                {fmtInt(undecidedOnPage.length)} matched row(s) on the current page carry no
+                reconcile decision and WILL BE SKIPPED. Decide them, or use "apply to every
+                matched row", before committing.
               </Caveat>
             ) : null}
             <p className="text-xs text-ink-400">

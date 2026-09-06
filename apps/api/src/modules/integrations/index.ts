@@ -1703,7 +1703,7 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
     projectId: string,
     feed: ErpFeed,
     filters: { periodFrom?: string; periodTo?: string; status?: string; limit: number },
-  ): Promise<CanonicalRow[]> {
+  ): Promise<{ rows: CanonicalRow[]; invoicesScanned: number; truncated: boolean }> {
     const clauses = [
       eq(invoices.companyId, companyId),
       eq(invoices.projectId, projectId),
@@ -1719,7 +1719,18 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
       .where(and(...clauses))
       .orderBy(desc(invoices.billingDate), asc(invoices.number))
       .limit(filters.limit);
-    if (invoiceRows.length === 0) return [];
+    /*
+     * `limit` bounds the INVOICES read, and truncation is judged on that.
+     * Judging it on the emitted rows was wrong in both directions for the
+     * job-cost feed, which emits one row per LINE: a complete 1,200-line
+     * extract of 400 invoices reported itself truncated, and a 900-invoice
+     * extract that dropped 100 invoices reported itself complete. The header
+     * and the ledger now carry both figures.
+     */
+    const truncated = invoiceRows.length >= filters.limit;
+    if (invoiceRows.length === 0) {
+      return { rows: [], invoicesScanned: 0, truncated: false };
+    }
 
     const vendorIds = [
       ...new Set(invoiceRows.map((i) => i.vendorId).filter((v): v is string => Boolean(v))),
@@ -1761,7 +1772,7 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
           ),
         )
         .orderBy(asc(invoiceLineItems.invoiceId), asc(invoiceLineItems.sortOrder));
-      return lineRows.map((line) => {
+      const lines = lineRows.map((line) => {
         const inv = invoiceById.get(line.invoiceId);
         return {
           lineId: line.id,
@@ -1782,9 +1793,10 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
           amount: line.amount,
         } satisfies CanonicalRow;
       });
+      return { rows: lines, invoicesScanned: invoiceRows.length, truncated };
     }
 
-    return invoiceRows.map((inv) => {
+    const invoiceLevel = invoiceRows.map((inv) => {
       const vendor = inv.vendorId ? vendorById.get(inv.vendorId) : undefined;
       const base = {
         invoiceId: inv.id,
@@ -1813,6 +1825,7 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
       } satisfies CanonicalRow;
       return base;
     });
+    return { rows: invoiceLevel, invoicesScanned: invoiceRows.length, truncated };
   }
 
   /**
@@ -1836,12 +1849,13 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
       }
       const format = (q.format ?? profile?.format ?? "csv") as "csv" | "json";
       const limit = q.limit ?? 1_000;
-      const rows = await canonicalRows(req.companyId!, req.projectId!, feed, {
+      const extract = await canonicalRows(req.companyId!, req.projectId!, feed, {
         ...(q.periodFrom ? { periodFrom: q.periodFrom } : {}),
         ...(q.periodTo ? { periodTo: q.periodTo } : {}),
         ...(q.status ? { status: q.status } : {}),
         limit,
       });
+      const rows = extract.rows;
       const entries = (profile?.fieldMap as FieldMapEntry[] | undefined) ?? identityFieldMap(feed);
       const mapped = applyFieldMap(rows, entries);
       const currencies = currenciesIn(rows);
@@ -1863,7 +1877,9 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
           profileId: profile?.id ?? null,
           system: profile?.system ?? "canonical",
           rowCount: rows.length,
-          truncated: rows.length >= limit,
+          invoicesScanned: extract.invoicesScanned,
+          invoiceLimit: limit,
+          truncated: extract.truncated,
           currencies,
           periodFrom: q.periodFrom ?? null,
           periodTo: q.periodTo ?? null,
@@ -1880,7 +1896,9 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
           : { id: null, name: "Canonical (unmapped)", system: "constructos", notes: null },
         projectId: req.projectId!,
         rowCount: rows.length,
-        truncated: rows.length >= limit,
+        invoicesScanned: extract.invoicesScanned,
+        invoiceLimit: limit,
+        truncated: extract.truncated,
         currencies,
         sandbox,
         caveats: [
@@ -1891,8 +1909,18 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
                   "importing into a ledger that holds one currency per batch.",
               ]
             : []),
-          ...(rows.length >= limit
-            ? [`Truncated at ${limit} rows — narrow the period or raise limit to export the rest.`]
+          ...(extract.truncated
+            ? [
+                `Truncated at ${limit} invoices (${extract.invoicesScanned} scanned, ` +
+                  `${rows.length} rows emitted) — narrow the period or raise limit to export ` +
+                  "the rest.",
+              ]
+            : []),
+          ...(feed === "job_cost"
+            ? [
+                `The limit bounds invoices, not rows: ${extract.invoicesScanned} invoice(s) ` +
+                  `produced ${rows.length} cost line(s).`,
+              ]
             : []),
           ...(sandbox ? ["SANDBOX TENANT — these figures are not a record of real trade."] : []),
         ],
@@ -1914,6 +1942,7 @@ export const integrationsModule: FastifyPluginAsync = async (app) => {
         .type("text/csv; charset=utf-8")
         .header("content-disposition", `attachment; filename="${safeName}.csv"`)
         .header("x-export-rows", String(rows.length))
+        .header("x-export-invoices", String(extract.invoicesScanned))
         .header("x-export-truncated", String(header.truncated))
         .send(`${comments}\n${toCsv(mapped.columns, mapped.rows)}`);
     },

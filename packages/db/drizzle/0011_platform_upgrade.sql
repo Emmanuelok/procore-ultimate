@@ -1484,6 +1484,45 @@ CREATE TABLE "uplift_challenges" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
+CREATE TABLE "availability_payment_models" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"facility_id" text,
+	"name" text NOT NULL,
+	"currency" text DEFAULT 'GBP' NOT NULL,
+	"unitary_charge" double precision NOT NULL,
+	"period_months" integer DEFAULT 1 NOT NULL,
+	"availability_weight_percent" double precision DEFAULT 70 NOT NULL,
+	"performance_weight_percent" double precision DEFAULT 30 NOT NULL,
+	"performance_point_value_percent" double precision DEFAULT 0.1 NOT NULL,
+	"deduction_cap_percent" double precision,
+	"persistent_breach_points" double precision,
+	"notes" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "availability_periods" (
+	"id" text PRIMARY KEY NOT NULL,
+	"model_id" text NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"period_start" text NOT NULL,
+	"period_end" text NOT NULL,
+	"required_hours" double precision NOT NULL,
+	"unavailability_events" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"performance_points" double precision DEFAULT 0 NOT NULL,
+	"status" text DEFAULT 'draft' NOT NULL,
+	"computed" jsonb,
+	"certified_by" text,
+	"certified_at" timestamp with time zone,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
 CREATE TABLE "covenant_waivers" (
 	"id" text PRIMARY KEY NOT NULL,
 	"covenant_id" text NOT NULL,
@@ -1497,6 +1536,57 @@ CREATE TABLE "covenant_waivers" (
 	"evidence_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
 	"granted_by" text NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "designated_account_entries" (
+	"id" text PRIMARY KEY NOT NULL,
+	"account_id" text NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"entry_date" text NOT NULL,
+	"kind" text NOT NULL,
+	"amount" double precision NOT NULL,
+	"description" text NOT NULL,
+	"reference" text,
+	"disbursement_id" text,
+	"evidence_id" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "designated_account_reconciliations" (
+	"id" text PRIMARY KEY NOT NULL,
+	"account_id" text NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"period_end" text NOT NULL,
+	"statement_balance" double precision NOT NULL,
+	"computed_balance" double precision NOT NULL,
+	"difference" double precision NOT NULL,
+	"outcome" text NOT NULL,
+	"explanation" text,
+	"evidence_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"assurance_reconciliation_id" text,
+	"reconciled_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "designated_accounts" (
+	"id" text PRIMARY KEY NOT NULL,
+	"facility_id" text NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"name" text NOT NULL,
+	"bank_name" text,
+	"account_ref" text,
+	"currency" text DEFAULT 'GBP' NOT NULL,
+	"authorised_ceiling" double precision NOT NULL,
+	"opening_balance" double precision DEFAULT 0 NOT NULL,
+	"opened_on" text,
+	"status" text DEFAULT 'active' NOT NULL,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
 CREATE TABLE "disbursement_forecasts" (
@@ -7741,6 +7831,7 @@ ALTER TABLE "submittals" ADD COLUMN "closed_at" timestamp with time zone;--> sta
 ALTER TABLE "submittals" ADD COLUMN "distribution" jsonb DEFAULT '[]'::jsonb NOT NULL;--> statement-breakpoint
 ALTER TABLE "submittals" ADD COLUMN "is_closeout" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
 ALTER TABLE "submittals" ADD COLUMN "vendor_id" text;--> statement-breakpoint
+ALTER TABLE "notifications" ADD COLUMN "held_for_digest" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
 ALTER TABLE "workflow_instances" ADD COLUMN "blocked_reason" text;--> statement-breakpoint
 ALTER TABLE "workflow_instances" ADD COLUMN "cancelled_by" text;--> statement-breakpoint
 ALTER TABLE "workflow_instances" ADD COLUMN "cancel_reason" text;--> statement-breakpoint
@@ -7752,6 +7843,7 @@ ALTER TABLE "workflow_step_instances" ADD COLUMN "escalated_at" timestamp with t
 ALTER TABLE "workflow_step_instances" ADD COLUMN "reminded_at" timestamp with time zone;--> statement-breakpoint
 ALTER TABLE "workflow_step_instances" ADD COLUMN "reassigned_from" text;--> statement-breakpoint
 ALTER TABLE "workflow_step_instances" ADD COLUMN "decided_by" text;--> statement-breakpoint
+ALTER TABLE "workflow_templates" ADD COLUMN "is_mandatory" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
 ALTER TABLE "assertions" ADD COLUMN "created_by" text;--> statement-breakpoint
 ALTER TABLE "entities" ADD COLUMN "deleted_at" timestamp with time zone;--> statement-breakpoint
 ALTER TABLE "entities" ADD COLUMN "deleted_by" text;--> statement-breakpoint
@@ -8160,8 +8252,18 @@ CREATE UNIQUE INDEX "benefit_dependencies_uq" ON "benefit_dependencies" USING bt
 CREATE INDEX "benefit_dependencies_project_idx" ON "benefit_dependencies" USING btree ("project_id");--> statement-breakpoint
 CREATE INDEX "uplift_challenges_bc_idx" ON "uplift_challenges" USING btree ("business_case_id");--> statement-breakpoint
 CREATE INDEX "uplift_challenges_project_idx" ON "uplift_challenges" USING btree ("project_id");--> statement-breakpoint
+CREATE INDEX "availability_payment_models_project_idx" ON "availability_payment_models" USING btree ("project_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "availability_periods_uq" ON "availability_periods" USING btree ("model_id","period_start");--> statement-breakpoint
+CREATE INDEX "availability_periods_model_idx" ON "availability_periods" USING btree ("model_id");--> statement-breakpoint
+CREATE INDEX "availability_periods_project_idx" ON "availability_periods" USING btree ("project_id");--> statement-breakpoint
 CREATE INDEX "covenant_waivers_covenant_idx" ON "covenant_waivers" USING btree ("covenant_id");--> statement-breakpoint
 CREATE INDEX "covenant_waivers_facility_idx" ON "covenant_waivers" USING btree ("facility_id");--> statement-breakpoint
+CREATE INDEX "designated_account_entries_account_idx" ON "designated_account_entries" USING btree ("account_id","entry_date");--> statement-breakpoint
+CREATE INDEX "designated_account_entries_project_idx" ON "designated_account_entries" USING btree ("project_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "designated_account_recs_uq" ON "designated_account_reconciliations" USING btree ("account_id","period_end");--> statement-breakpoint
+CREATE INDEX "designated_account_recs_account_idx" ON "designated_account_reconciliations" USING btree ("account_id");--> statement-breakpoint
+CREATE INDEX "designated_accounts_facility_idx" ON "designated_accounts" USING btree ("facility_id");--> statement-breakpoint
+CREATE INDEX "designated_accounts_project_idx" ON "designated_accounts" USING btree ("project_id");--> statement-breakpoint
 CREATE INDEX "disbursement_forecasts_facility_idx" ON "disbursement_forecasts" USING btree ("facility_id");--> statement-breakpoint
 CREATE INDEX "disbursement_forecasts_period_idx" ON "disbursement_forecasts" USING btree ("facility_id","period_end");--> statement-breakpoint
 CREATE UNIQUE INDEX "facility_cashflows_uq" ON "facility_cashflows" USING btree ("facility_id","period_end");--> statement-breakpoint
@@ -8964,6 +9066,7 @@ CREATE INDEX "submittals_submit_by_idx" ON "submittals" USING btree ("project_id
 CREATE INDEX "submittals_bic_idx" ON "submittals" USING btree ("project_id","ball_in_court_id");--> statement-breakpoint
 CREATE INDEX "submittals_previous_idx" ON "submittals" USING btree ("previous_id");--> statement-breakpoint
 CREATE INDEX "submittals_spec_idx" ON "submittals" USING btree ("project_id","spec_section");--> statement-breakpoint
+CREATE INDEX "notifications_held_idx" ON "notifications" USING btree ("company_id","user_id","held_for_digest");--> statement-breakpoint
 CREATE INDEX "notifications_feed_idx" ON "notifications" USING btree ("company_id","user_id","created_at");--> statement-breakpoint
 CREATE INDEX "notifications_digest_idx" ON "notifications" USING btree ("company_id","user_id","kind","created_at");--> statement-breakpoint
 CREATE INDEX "workflow_instances_company_status_idx" ON "workflow_instances" USING btree ("company_id","status");--> statement-breakpoint

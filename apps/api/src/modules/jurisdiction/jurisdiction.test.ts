@@ -582,10 +582,26 @@ describe("permits", () => {
 });
 
 /* ------------------------------------------------------------------ */
-/* Permit sweeps (lazy, idempotent)                                    */
+/* Permit detectors (scheduled, advisory-locked, fingerprinted)         */
 /* ------------------------------------------------------------------ */
 
-describe("permit sweeps", () => {
+/**
+ * These findings used to be raised as a side effect of the permit list read,
+ * which duplicated them whenever the workspace loaded its two panels in
+ * parallel. They are now a scheduled job; a test triggers a cycle explicitly.
+ */
+async function runJurisdictionCycle(pid: string): Promise<void> {
+  const res = await app.inject({
+    method: "POST",
+    url: `/api/v1/projects/${pid}/jurisdiction/detectors/run`,
+    headers: owner.headers,
+  });
+  if (res.statusCode !== 200) {
+    throw new Error(`detector run failed: ${res.statusCode} ${res.body}`);
+  }
+}
+
+describe("permit detectors", () => {
   it("breaches the obligation and signals once when a determination runs late", async () => {
     const pid = await makeProject("Sweep Determination");
     const created = await createPermit(pid, {
@@ -596,18 +612,22 @@ describe("permit sweeps", () => {
 
     const first = await listPermits(pid);
     expect(first.statusCode).toBe(200);
+    // the READ reports the fact without writing anything
     expect(first.json().items[0].overdue).toBe(true);
     expect(first.json().items[0].daysToDue).toBeLessThan(0);
+    expect(await signalsFor(pid, "permit_determination_overdue")).toHaveLength(0);
 
+    await runJurisdictionCycle(pid);
     const [obl] = await app.db.select().from(obligations).where(eq(obligations.id, obligationId));
     expect(obl?.status).toBe("breached");
     let sigs = await signalsFor(pid, "permit_determination_overdue");
     expect(sigs).toHaveLength(1);
     expect(sigs[0]?.severity).toBe("medium");
 
-    // idempotent: re-reading the list does not re-raise
+    // idempotent: neither re-reading nor re-running re-raises
     await listPermits(pid);
     await listPermits(pid, "?overdue=true");
+    await runJurisdictionCycle(pid);
     sigs = await signalsFor(pid, "permit_determination_overdue");
     expect(sigs).toHaveLength(1);
 
@@ -630,6 +650,11 @@ describe("permit sweeps", () => {
       },
     });
 
+    const beforeCycle = await listPermits(pid);
+    expect(beforeCycle.json().items[0].status).toBe("granted");
+    expect(await signalsFor(pid, "permit_expired")).toHaveLength(0);
+
+    await runJurisdictionCycle(pid);
     const first = await listPermits(pid);
     expect(first.json().items[0].status).toBe("expired");
     let sigs = await signalsFor(pid, "permit_expired");
@@ -637,6 +662,7 @@ describe("permit sweeps", () => {
     expect(sigs[0]?.severity).toBe("high");
 
     await listPermits(pid);
+    await runJurisdictionCycle(pid);
     sigs = await signalsFor(pid, "permit_expired");
     expect(sigs).toHaveLength(1);
   });
@@ -649,12 +675,30 @@ describe("permit sweeps", () => {
     const permitId = created.json().id as string;
 
     await listPermits(pid);
+    expect(await signalsFor(pid, "permit_blocks_programme")).toHaveLength(0);
+
+    /*
+     * The consent-to-programme finding is raised by the LAND detector now:
+     * parcels and permits are one dependency set, because a task blocked by
+     * both is not two separate risks to a programme director.
+     */
+    const landCycle = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/land/detectors/run`,
+      headers: owner.headers,
+    });
+    expect(landCycle.statusCode).toBe(200);
     let sigs = await signalsFor(pid, "permit_blocks_programme");
     expect(sigs).toHaveLength(1);
     expect(sigs[0]?.severity).toBe("high");
-    expect(sigs[0]?.title).toMatch(/10 days/);
+    expect(sigs[0]?.title).toContain("Carriageway excavation");
 
     await listPermits(pid);
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/land/detectors/run`,
+      headers: owner.headers,
+    });
     sigs = await signalsFor(pid, "permit_blocks_programme");
     expect(sigs).toHaveLength(1);
 
@@ -724,6 +768,12 @@ describe("local content", () => {
     expect(short.statusCode).toBe(201);
     expect(short.json().compliant).toBe(0);
     expect(short.json().gap).toBe(7);
+    // recording a reading does not raise a finding — the detector does, as
+    // the system actor, so whoever keyed the number is not the ledger actor
+    // for an integrity finding about it
+    expect(await signalsFor(pid, "local_content_shortfall")).toHaveLength(0);
+
+    await runJurisdictionCycle(pid);
     const sigs = await signalsFor(pid, "local_content_shortfall");
     expect(sigs).toHaveLength(1);
     expect(sigs[0]?.severity).toBe("medium");

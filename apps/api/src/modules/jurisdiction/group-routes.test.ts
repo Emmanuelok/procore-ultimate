@@ -23,6 +23,7 @@ import {
   permits,
   projects,
   scheduleTasks,
+  schedules,
   signals,
   users,
   vendors,
@@ -36,12 +37,26 @@ let built: Awaited<ReturnType<typeof buildTestApp>>;
 let app: FastifyInstance;
 let owner: TestActor;
 let stranger: TestActor;
+let scheduleId: string;
 
 beforeAll(async () => {
   built = await buildTestApp();
   app = built.app;
   owner = await registerActor(app);
   stranger = await registerActor(app);
+  const holder = newId("prj");
+  await app.db
+    .insert(projects)
+    .values({ id: holder, companyId: owner.companyId, name: "Schedule holder" });
+  scheduleId = newId("sch");
+  await app.db.insert(schedules).values({
+    id: scheduleId,
+    companyId: owner.companyId,
+    projectId: holder,
+    name: "Baseline",
+    projectStart: todayISO(),
+    createdBy: owner.userId,
+  });
 });
 
 afterAll(async () => {
@@ -58,6 +73,7 @@ async function makeTask(pid: string, name: string, startDate: string | null, ext
   const id = newId("tsk");
   await app.db.insert(scheduleTasks).values({
     id,
+    scheduleId,
     projectId: pid,
     name,
     durationDays: 10,
@@ -355,7 +371,7 @@ describe("permit state machine", () => {
       url: `/api/v1/projects/${pid}/permits`,
       headers: owner.headers,
       payload: {
-        kind: "environmental",
+        kind: "environmental_consent",
         title: "Discharge consent",
         authority: "Environment Agency",
         appliedAt: todayISO(),
@@ -481,7 +497,7 @@ describe("permit referential validation", () => {
       contentType: "application/pdf",
       sizeBytes: 10,
       storageKey: `k/${foreignFile}`,
-      checksum: "abc",
+      sha256: "abc",
       uploadedBy: stranger.userId,
     });
     const res = await app.inject({
@@ -489,7 +505,7 @@ describe("permit referential validation", () => {
       url: `/api/v1/projects/${pid}/permits`,
       headers: owner.headers,
       payload: {
-        kind: "planning",
+        kind: "planning_condition",
         title: "Planning permission",
         authority: "Council",
         fileIds: [foreignFile],
@@ -513,7 +529,7 @@ describe("permit referential validation", () => {
       url: `/api/v1/projects/${pid}/permits`,
       headers: owner.headers,
       payload: {
-        kind: "planning",
+        kind: "planning_condition",
         title: "Planning permission",
         authority: "Council",
         ownerId: outsider,
@@ -534,7 +550,7 @@ describe("permit referential validation", () => {
       contentType: "application/pdf",
       sizeBytes: 10,
       storageKey: `k/${fileId}`,
-      checksum: "abc",
+      sha256: "abc",
       uploadedBy: owner.userId,
     });
     const res = await app.inject({
@@ -542,7 +558,7 @@ describe("permit referential validation", () => {
       url: `/api/v1/projects/${pid}/permits`,
       headers: owner.headers,
       payload: {
-        kind: "planning",
+        kind: "planning_condition",
         title: "Planning permission",
         authority: "Council",
         fileIds: [fileId],
@@ -569,7 +585,7 @@ describe("permit creation is atomic", () => {
       url: `/api/v1/projects/${pid}/permits`,
       headers: owner.headers,
       payload: {
-        kind: "planning",
+        kind: "planning_condition",
         title: "Planning permission",
         authority: "Council",
         appliedAt: todayISO(),
@@ -601,7 +617,7 @@ describe("jurisdiction detectors run from the scheduler", () => {
       url: `/api/v1/projects/${pid}/permits`,
       headers: owner.headers,
       payload: {
-        kind: "environmental",
+        kind: "environmental_consent",
         title: "Consent",
         authority: "EA",
         blockingTaskIds: [task],
@@ -630,7 +646,7 @@ describe("jurisdiction detectors run from the scheduler", () => {
       url: `/api/v1/projects/${pid}/permits`,
       headers: owner.headers,
       payload: {
-        kind: "environmental",
+        kind: "environmental_consent",
         title: "Overdue consent",
         authority: "EA",
         appliedAt: addDaysISO(todayISO(), -100),
@@ -671,12 +687,16 @@ describe("jurisdiction detectors run from the scheduler", () => {
       .where(
         and(
           eq(ledgerEntries.companyId, owner.companyId),
-          eq(ledgerEntries.objectType, "permit"),
-          eq(ledgerEntries.action, "create"),
+          eq(ledgerEntries.objectType, "signal"),
         ),
       );
-    const systemRaised = entries.filter((e) => e.actorId === null);
-    expect(systemRaised.length).toBeGreaterThan(0);
+    const systemRaised = entries.filter(
+      (e) =>
+        e.actorId === null &&
+        (e.payload as { detector?: string } | null)?.detector ===
+          "permit_determination_overdue",
+    );
+    expect(systemRaised).toHaveLength(1);
   });
 
   it("is registered with the platform scheduler", () => {
@@ -1016,6 +1036,7 @@ describe("local content computation", () => {
         reference: `W-${i}`,
         fullName: `Worker ${i}`,
         nationality,
+        createdBy: owner.userId,
       });
     }
     const res = await app.inject({
@@ -1049,6 +1070,7 @@ describe("local content computation", () => {
       reference: "W-P",
       fullName: "Worker",
       nationality: "Nigeria",
+      createdBy: owner.userId,
     });
     const res = await app.inject({
       method: "POST",

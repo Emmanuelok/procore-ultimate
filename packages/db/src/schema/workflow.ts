@@ -148,10 +148,25 @@ export const notifications = pgTable(
     recordType: text("record_type"),
     recordId: text("record_id"),
     readAt: timestamp("read_at", { withTimezone: true, mode: "string" }),
+    /**
+     * Held back from the unread count until the recipient's digest goes out
+     * (#96).
+     *
+     * A digest cadence is a promise of a quiet inbox. Writing the row
+     * immediately and counting it as unread the moment it lands makes the
+     * digest an EXTRA interruption summarising what already interrupted you.
+     * The row is written (so nothing is lost and the inbox can show it under
+     * "waiting for your digest"), but `GET /notifications/unread-count`
+     * excludes rows with this set, and the digest job clears it for exactly
+     * the rows it summarised.
+     */
+    heldForDigest: integer("held_for_digest").default(0).notNull(),
     createdAt: createdAt(),
   },
   (t) => [
     index("notifications_user_idx").on(t.userId, t.readAt),
+    // The unread count filters on it, so it is part of that predicate.
+    index("notifications_held_idx").on(t.companyId, t.userId, t.heldForDigest),
     // The centre lists by (companyId, userId) newest-first; the index above
     // does not serve that ordering.
     index("notifications_feed_idx").on(t.companyId, t.userId, t.createdAt),

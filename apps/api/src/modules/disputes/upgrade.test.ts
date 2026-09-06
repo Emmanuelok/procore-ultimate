@@ -302,7 +302,7 @@ describe("timetable lifecycle", () => {
 describe("standing dispute board", () => {
   it("records members with independence disclosures, warns about gaps and logs visits", async () => {
     const pid = await makeProject("DAAB Project");
-    const dispute = await createDispute(pid, { kind: "dispute_board", jurisdiction: "fidic_daab" });
+    const dispute = await createDispute(pid, { kind: "daab", jurisdiction: "fidic_daab" });
 
     const undisclosed = await app.inject({
       method: "POST",
@@ -470,9 +470,11 @@ describe("decision-tree settlement model", () => {
       },
     });
     expect(invalid.statusCode).toBe(200);
+    // The PUT returns the stored row; the evaluation (and the provision it
+    // implies) is frozen inside `computed`.
     expect(invalid.json().computed.valid).toBe(false);
     expect(invalid.json().computed.recommendation).toBe("insufficient_model");
-    expect(invalid.json().provision.provision).toBeNull();
+    expect(invalid.json().computed.provision.provision).toBeNull();
 
     const valid = await app.inject({
       method: "PUT",
@@ -511,8 +513,19 @@ describe("decision-tree settlement model", () => {
     expect(win.enhancedInterest).toBeGreaterThan(0);
     // Discounting is real: PV is strictly smaller in magnitude than the net.
     expect(Math.abs(win.presentValue)).toBeLessThan(Math.abs(win.netOutcome));
-    expect(valid.json().provision.provision).toBeGreaterThan(0);
-    expect(valid.json().provision.contingentAsset).toBeGreaterThan(0);
+    expect(valid.json().computed.provision.provision).toBeGreaterThan(0);
+    expect(valid.json().computed.provision.contingentAsset).toBeGreaterThan(0);
+
+    // The GET recomputes against today's offers and reports the provision
+    // alongside the stored model.
+    const fetched = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/disputes/${dispute.id}/settlement-model`,
+      headers: owner.headers,
+    });
+    expect(fetched.statusCode).toBe(200);
+    expect(fetched.json().computed.valid).toBe(true);
+    expect(fetched.json().provision.provision).toBeGreaterThan(0);
   });
 
   it("REGRESSION: compares only offers in the dispute's currency and warns about the rest", async () => {
@@ -553,7 +566,12 @@ describe("decision-tree settlement model", () => {
     const best = analysis.json().bestOpenOffer;
     expect(best?.currency).toBe("GBP");
     expect(best?.amount).toBe(350_000);
-    expect((analysis.json().caveats as string[]).join(" ")).toMatch(/currenc/i);
+    // The excluded offer is named rather than silently dropped, and the
+    // reason says there is no exchange rate on the platform.
+    const caveats = (analysis.json().caveats as string[]).join(" ");
+    expect(caveats).toMatch(/denominated in USD/);
+    expect(caveats).toMatch(/no exchange rate/i);
+    expect(analysis.json().otherCurrencyOffers).toHaveLength(1);
   });
 });
 
@@ -808,9 +826,11 @@ describe("outcome analytics and drafting recommendations", () => {
     // A live dispute that must not drag the rates down.
     await createDispute(pid, { currency: "GBP", amountInDispute: 900_000 });
 
+    // Scoped to this project: the company-wide view legitimately carries the
+    // terminal disputes the other tests in this file created.
     const analytics = await app.inject({
       method: "GET",
-      url: "/api/v1/disputes/analytics?groupBy=rootCause",
+      url: `/api/v1/disputes/analytics?groupBy=rootCause&projectId=${pid}`,
       headers: owner.headers,
     });
     expect(analytics.statusCode).toBe(200);

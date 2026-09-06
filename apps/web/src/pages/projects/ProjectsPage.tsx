@@ -964,7 +964,11 @@ const CLONE_PARTS = [
   { key: "wbs", label: "WBS", hint: "work breakdown segments" },
   { key: "workflowTemplates", label: "Workflow templates", hint: "project-scoped chains" },
   { key: "memberships", label: "Memberships", hint: "the same people, same templates" },
-  { key: "distributionGroups", label: "Distribution groups", hint: "recipients carried over" },
+  {
+    key: "distributionGroups",
+    label: "Distribution groups",
+    hint: "group names and their members (users, contacts, plain addresses)",
+  },
 ] as const;
 
 /**
@@ -1027,11 +1031,22 @@ function CloneProjectDrawer({
           ...(asSandbox ? { asSandbox: true } : {}),
         },
       );
-      const copied = Object.entries(res.copied ?? {})
+      const counts = res.copied ?? {};
+      const copiedParts = Object.entries(counts)
         .filter(([, n]) => n > 0)
-        .map(([k, n]) => `${n} ${k}`)
-        .join(", ");
-      toast.success(`Created — ${copied || "no configuration to copy"}`);
+        .map(([k, n]) => `${n} ${k}`);
+      /*
+       * A group count reads as confirmation that the recipients came too, so
+       * an empty member count is stated rather than filtered out of the
+       * summary.
+       */
+      if (
+        (counts["distributionGroups"] ?? 0) > 0 &&
+        (counts["distributionGroupMembers"] ?? 0) === 0
+      ) {
+        copiedParts.push("0 group recipients (the source groups were empty)");
+      }
+      toast.success(`Created — ${copiedParts.join(", ") || "no configuration to copy"}`);
       onCloned();
       onClose();
       navigate(`/projects/${res.id}`);

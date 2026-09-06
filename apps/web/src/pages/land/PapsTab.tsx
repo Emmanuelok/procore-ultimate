@@ -67,6 +67,16 @@ interface EntitlementDraft {
   delivered: boolean;
 }
 
+/** Why each transition is offered — shown on the button, not buried. */
+const STATUS_HINTS: Record<string, string> = {
+  surveyed: "The household's assets and losses have been measured.",
+  entitlement_agreed: "The entitlement matrix has been applied and agreed.",
+  resettled:
+    "Requires physical displacement AND compensation already paid — IFC PS5 para 20 puts payment before the move.",
+  livelihood_restored:
+    "Requires compensation on file, because restoration is measured from the displacement date (IFC PS5 para 29).",
+};
+
 export default function PapsTab({
   projectId,
   onChanged,
@@ -231,6 +241,24 @@ export default function PapsTab({
     setEntOpen(true);
   }
 
+  /*
+   * A line with an amount but a blank item or basis used to be filtered out
+   * on save without a word: the server recomputed a LOWER compensation total
+   * and the user watched the figure drop with no explanation. A half-filled
+   * line is a mistake to point at, not a line to discard.
+   */
+  const entRowIssues = entRows.map((r) => {
+    const touched = r.item.trim() !== "" || r.basis.trim() !== "" || r.amount.trim() !== "";
+    if (!touched) return null;
+    if (r.item.trim() === "") return "Item is required";
+    if (r.basis.trim() === "") return "Basis is required";
+    if (r.amount.trim() !== "" && !Number.isFinite(Number(r.amount))) {
+      return "Amount must be a number";
+    }
+    return null;
+  });
+  const entRowsValid = entRowIssues.every((issue) => issue === null);
+
   const entTotal = entRows.reduce((s, r) => s + (Number(r.amount) || 0), 0);
   const entDelivered = entRows.reduce(
     (s, r) => s + (r.delivered ? Number(r.amount) || 0 : 0),
@@ -244,7 +272,9 @@ export default function PapsTab({
     setBusy(true);
     try {
       const entitlements = entRows
-        .filter((r) => r.item.trim() && r.basis.trim())
+        // only genuinely EMPTY rows are dropped; a half-filled one is
+        // blocked at the submit button above, never silently discarded
+        .filter((r) => r.item.trim() !== "" || r.basis.trim() !== "" || r.amount.trim() !== "")
         .map((r) => ({
           item: r.item.trim(),
           basis: r.basis.trim(),
@@ -738,19 +768,28 @@ export default function PapsTab({
                   Record compensation
                 </Button>
               ) : null}
-              {selected.status !== "livelihood_restored" && selected.livelihoodRequired ? (
+              {/*
+                * Driven by the server's own state machine rather than offered
+                * unconditionally. "Mark resettled" used to appear on every
+                * household including registered and already-restored ones,
+                * and the server accepted it — so the RAP metrics and the
+                * ledger told different stories about the same household.
+                */}
+              {(selected.allowedTransitions ?? []).map((next) => (
                 <Button
+                  key={next}
                   variant="secondary"
                   size="sm"
-                  onClick={() => void setStatus("livelihood_restored")}
+                  onClick={() => void setStatus(next)}
+                  title={STATUS_HINTS[next]}
                 >
-                  Mark livelihood restored
+                  Mark {humanize(next).toLowerCase()}
                 </Button>
-              ) : null}
-              {selected.status !== "resettled" ? (
-                <Button variant="secondary" size="sm" onClick={() => void setStatus("resettled")}>
-                  Mark resettled
-                </Button>
+              ))}
+              {(selected.allowedTransitions ?? []).length === 0 ? (
+                <span className="text-xs text-ink-400">
+                  No further status change is available from {humanize(selected.status)}.
+                </span>
               ) : null}
             </div>
           </div>
@@ -788,16 +827,24 @@ export default function PapsTab({
                   )
                 }
               />
-              <Input
-                className="flex-1"
-                placeholder="Basis — e.g. Full replacement cost"
-                value={r.basis}
-                onChange={(e) =>
-                  setEntRows((rows) =>
-                    rows.map((x, j) => (j === i ? { ...x, basis: e.target.value } : x)),
-                  )
-                }
-              />
+              <div className="flex-1">
+                <Input
+                  className="w-full"
+                  placeholder="Basis — e.g. Full replacement cost"
+                  value={r.basis}
+                  aria-invalid={entRowIssues[i] ? true : undefined}
+                  onChange={(e) =>
+                    setEntRows((rows) =>
+                      rows.map((x, j) => (j === i ? { ...x, basis: e.target.value } : x)),
+                    )
+                  }
+                />
+                {entRowIssues[i] ? (
+                  <p className="mt-0.5 text-xs text-red-700" role="alert">
+                    {entRowIssues[i]}
+                  </p>
+                ) : null}
+              </div>
               <Input
                 className="w-32 text-right tabular-nums"
                 type="number"
@@ -862,7 +909,15 @@ export default function PapsTab({
             <Button variant="secondary" onClick={() => setEntOpen(false)}>
               Cancel
             </Button>
-            <Button type="submit" disabled={busy}>
+            <Button
+              type="submit"
+              disabled={busy || !entRowsValid}
+              title={
+                entRowsValid
+                  ? undefined
+                  : "Every line needs an item and a basis — a line with only an amount would be dropped, and the total would fall with no explanation"
+              }
+            >
               {busy ? "Saving…" : "Apply matrix"}
             </Button>
           </div>

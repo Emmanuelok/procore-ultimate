@@ -69,7 +69,7 @@ export default function OverviewTab({
       ),
     );
     if (r) {
-      toast.success("Site sweeps run");
+      toast.success("Site sweeps run for this project");
       summary.reload();
       signals.reload();
       health.reload();
@@ -220,7 +220,7 @@ export default function OverviewTab({
         <CardBody>
           <SectionHeading
             title="Open site signals"
-            hint="Raised by the sweeps and the engines. Each one names the record it is about and why it was raised."
+            hint="Raised by the sweeps and the engines. Each one names the record it is about and why it was raised. The button runs the sweeps for THIS project only; the scheduler runs them for every project on its own cadence."
             actions={
               <Button size="sm" variant="secondary" icon={IconZap} loading={action.busy === "sweeps"} onClick={() => void runSweeps()}>
                 Run the sweeps now

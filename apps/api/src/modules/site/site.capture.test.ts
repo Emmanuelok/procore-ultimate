@@ -159,8 +159,43 @@ describe("exceptional-weather analysis", () => {
   it("issues a draft once and refuses to issue it twice", async () => {
     const list = await get(`${base()}/weather/analyses`);
     const id = list.json().items[0].id;
-    expect((await post(`${base()}/weather/analyses/${id}/issue`, {})).json().status).toBe("issued");
+    const issued = await post(`${base()}/weather/analyses/${id}/issue`, {});
+    expect(issued.json().status).toBe("issued");
     expect((await post(`${base()}/weather/analyses/${id}/issue`, {})).statusCode).toBe(409);
+
+    // An issued analysis that found exceptional weather reaches the attention
+    // layer: without this the whole weather register produced no signal.
+    expect(issued.json().signalId).toBeTruthy();
+    const raised = await app.db
+      .select()
+      .from(signals)
+      .where(and(eq(signals.projectId, projectId), eq(signals.detector, "site_exceptional_weather")));
+    expect(raised).toHaveLength(1);
+    expect(raised[0]?.title).toContain("2 day(s)");
+    expect(raised[0]?.explanation).toContain("40% of the period");
+    const evidenceRefs = raised[0]?.evidenceRefs as { analysisId?: string; coveragePercent?: number };
+    expect(evidenceRefs.analysisId).toBe(id);
+    expect(evidenceRefs.coveragePercent).toBe(40);
+
+    const listed = await get(`${base()}/signals?detector=site_exceptional_weather`);
+    expect(listed.json().total).toBe(1);
+  });
+
+  it("raises no signal for an analysis that found nothing exceptional", async () => {
+    const quiet = await post(`${base()}/weather/analyses`, {
+      baselineId,
+      periodStart: "2026-01-02",
+      periodEnd: "2026-01-02",
+    });
+    expect(quiet.statusCode).toBe(201);
+    expect(quiet.json().exceptionalDays).toBe(0);
+    const issued = await post(`${base()}/weather/analyses/${quiet.json().id}/issue`, {});
+    expect(issued.json().signalId).toBeNull();
+    const raised = await app.db
+      .select()
+      .from(signals)
+      .where(and(eq(signals.projectId, projectId), eq(signals.detector, "site_exceptional_weather")));
+    expect(raised).toHaveLength(1);
   });
 
   it("declines to compute exceptional days without a baseline expectation", async () => {

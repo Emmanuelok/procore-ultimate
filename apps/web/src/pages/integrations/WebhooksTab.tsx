@@ -398,7 +398,9 @@ export default function WebhooksTab({
           The HKDF master key changed after {plural(rotated.length, "it was", "they were")} created,
           so what is signed now no longer matches what the receiver holds. Every verification on
           their side fails, silently, while the delivery log reports the sends as attempted. Open
-          the affected {plural(rotated.length, "endpoint", "endpoints")} below —{" "}
+          the affected {plural(rotated.length, "endpoint", "endpoints")} below and use{" "}
+          <strong>Rotate secret</strong>, which issues a working secret under the current master
+          key without losing the endpoint or its history —{" "}
           {rotated.map((e) => e.name).join(", ")}.
         </Caveat>
       ) : null}

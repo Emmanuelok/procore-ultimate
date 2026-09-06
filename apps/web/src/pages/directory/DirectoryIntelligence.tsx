@@ -273,6 +273,13 @@ function DuplicatesView() {
               <tbody>
                 {merges.map((m) => {
                   const expired = Date.parse(m.undoDeadline) < Date.now();
+                  /*
+                   * The API decides. `undoable` is false not only past the
+                   * window but for a merge whose journal recorded counts and
+                   * not row ids — undoing that would move the surviving
+                   * vendor's own records, so the button must not be offered.
+                   */
+                  const undoable = m.undoable ?? !expired;
                   return (
                     <tr key={m.id}>
                       <Td className="text-xs">
@@ -288,9 +295,12 @@ function DuplicatesView() {
                       <Td>
                         {m.undoneAt ? (
                           <Badge tone="neutral">Undone</Badge>
-                        ) : expired ? (
-                          <span className="text-2xs text-content-subtle">
-                            Undo window closed
+                        ) : !undoable ? (
+                          <span
+                            className="text-2xs text-content-subtle"
+                            title={m.undoBlockedReason ?? "Outside the 24-hour undo window"}
+                          >
+                            {m.undoBlockedReason ?? "Undo window closed"}
                           </span>
                         ) : (
                           <Button

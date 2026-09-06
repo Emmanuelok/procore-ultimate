@@ -351,7 +351,24 @@ export async function sweepPs5(
       .where(
         and(eq(affectedPersons.companyId, companyId), eq(affectedPersons.projectId, projectId)),
       );
-    if (parcelRows.length === 0 && papRows.length === 0) return result;
+    const projectRow0 = (
+      await tx
+        .select({ settings: projects.settings })
+        .from(projects)
+        .where(eq(projects.id, projectId))
+        .limit(1)
+    )[0];
+    const hasCutOff =
+      typeof (projectRow0?.settings as Record<string, unknown> | null)?.["landCutOffDate"] ===
+      "string";
+    /*
+     * A declared but undisclosed cut-off is a finding in its own right — it is
+     * the moment the entitlement population is frozen, and it is exactly the
+     * moment before the census exists. Skipping the whole PS5 pass because the
+     * registers are still empty would silence the one detector that matters
+     * most on day one.
+     */
+    if (parcelRows.length === 0 && papRows.length === 0 && !hasCutOff) return result;
 
     const taskIds = [...new Set(parcelRows.flatMap((p) => p.blockingTaskIds ?? []))];
     const taskRows = taskIds.length
@@ -387,14 +404,7 @@ export async function sweepPs5(
       livelihoodRestoredAt: p.livelihoodRestoredAt,
     }));
 
-    const projectRow = (
-      await tx
-        .select({ settings: projects.settings })
-        .from(projects)
-        .where(eq(projects.id, projectId))
-        .limit(1)
-    )[0];
-    const settings = (projectRow?.settings ?? {}) as Record<string, unknown>;
+    const settings = (projectRow0?.settings ?? {}) as Record<string, unknown>;
     const cutOffDate = typeof settings["landCutOffDate"] === "string" ? settings["landCutOffDate"] : null;
     const declaredAt =
       typeof settings["landCutOffDeclaredAt"] === "string"

@@ -47,7 +47,12 @@ interface Forecast {
   p80Uplift: number | null;
   referenceClass: string | null;
   sampleSize: number;
-  contributorCount?: number;
+  /** distinct contributing companies behind the distribution */
+  contributors?: number;
+  /** the figures came from illustrative seed rows, not contributed outcomes */
+  seedOnly?: boolean;
+  /** whether this tenant has earned access to the contributed pool (#855) */
+  contributedAccess?: boolean;
   basis: string;
   inputs: Record<string, unknown>;
   reasons: string[];
@@ -112,12 +117,27 @@ function ForecastCard({ forecast }: { forecast: Forecast }) {
           </div>
           <Badge tone={unavailable ? "gray" : forecast.probability! >= 0.5 ? "red" : "blue"}>
             n = {forecast.sampleSize}
-            {typeof forecast.contributorCount === "number"
-              ? ` · ${forecast.contributorCount} contributor(s)`
+            {typeof forecast.contributors === "number"
+              ? ` · ${forecast.contributors} contributor(s)`
               : ""}
           </Badge>
         </div>
 
+        {forecast.seedOnly ? (
+          <div className="rounded-md bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-800">
+            <span className="font-medium">Illustrative seed data.</span> These are worked-example
+            samples, not outcomes other companies contributed. Treat the figure as a demonstration
+            of the method, not a basis for a contingency decision.
+          </div>
+        ) : null}
+        {forecast.contributedAccess === false ? (
+          <div className="rounded-md bg-ink-50 px-3 py-2 text-xs leading-relaxed text-ink-600">
+            <span className="font-medium text-ink-900">Seed-only access.</span> The contributed
+            distribution of comparable projects is available to companies that contribute to it
+            (#855). Contribute a benchmark snapshot of this metric — Benchmarks → Project snapshots
+            → Contribute — and this forecast is computed against real outcomes.
+          </div>
+        ) : null}
         {unavailable ? (
           <div className="rounded-md bg-ink-50 px-3 py-2 text-xs leading-relaxed text-ink-600">
             <span className="font-medium text-ink-900">Not available.</span>{" "}

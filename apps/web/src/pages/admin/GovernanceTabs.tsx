@@ -278,6 +278,8 @@ export function RetentionTab() {
   const [policies, setPolicies] = useState<RetentionPolicy[] | null>(null);
   const [preview, setPreview] = useState<RetentionPreviewRow[] | null>(null);
   const [holdCount, setHoldCount] = useState<number | null>(null);
+  /** The API's own sentence about what is and is not enforced. */
+  const [enforcement, setEnforcement] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
@@ -303,11 +305,14 @@ export function RetentionTab() {
   const loadPreview = useCallback(async () => {
     setPreviewError(null);
     try {
-      const res = await api.get<{ items: RetentionPreviewRow[]; holds: number }>(
-        "/api/v1/company/retention-policies/preview",
-      );
+      const res = await api.get<{
+        items: RetentionPreviewRow[];
+        holds: number;
+        enforcement?: string;
+      }>("/api/v1/company/retention-policies/preview");
       setPreview(res.items);
       setHoldCount(res.holds);
+      setEnforcement(res.enforcement ?? null);
     } catch (err) {
       setPreview(null);
       setHoldCount(null);
@@ -403,7 +408,9 @@ export function RetentionTab() {
           <div>
             <h3 className="text-sm font-semibold text-content-strong">What the policies would act on</h3>
             <p className="mt-0.5 text-xs text-content-muted">
-              Computed now, executed by nobody. {holdCount === null ? "" : `${num(holdCount)} active hold(s).`}
+              {enforcement ??
+                "Recorded and previewed only — no sweep acts on a retention policy."}{" "}
+              {holdCount === null ? "" : `${num(holdCount)} active hold(s).`}
             </p>
           </div>
           <Button variant="ghost" size="sm" leadingIcon={IconRefresh} onClick={() => void loadPreview()}>
@@ -425,9 +432,9 @@ export function RetentionTab() {
               <thead>
                 <tr>
                   <Th>Record type</Th>
-                  <Th>Due for action</Th>
-                  <Th>Held back</Th>
-                  <Th>Enforced here</Th>
+                  <Th>Past retention</Th>
+                  <Th>Holds covering</Th>
+                  <Th>Acted on</Th>
                   <Th>Note</Th>
                 </tr>
               </thead>
@@ -435,14 +442,25 @@ export function RetentionTab() {
                 {preview.map((r) => (
                   <tr key={r.objectType}>
                     <Td className="font-medium">{humanize(r.objectType)}</Td>
-                    <Td>{num(r.dueForAction)}</Td>
-                    <Td>{num(r.heldBack)}</Td>
+                    {/* Not countable here is "—", never 0. */}
                     <Td>
-                      {r.enforced ? (
-                        <Badge tone="success">Yes</Badge>
+                      {r.dueForAction === null ? (
+                        <span className="text-content-subtle" title="The substrate does not own this record type">
+                          —
+                        </span>
                       ) : (
-                        <Badge tone="warning">Reported only</Badge>
+                        num(r.dueForAction)
                       )}
+                    </Td>
+                    <Td>{num(r.holdsCovering)}</Td>
+                    <Td>
+                      {/*
+                        Nothing reads retention_policies to delete, anonymise
+                        or archive. The badge used to read "Yes" here, and a
+                        compliance officer could record the tenant as
+                        compliant on the strength of it.
+                      */}
+                      <Badge tone="warning">Never</Badge>
                     </Td>
                     <Td className="max-w-lg text-xs text-content-muted">{r.note}</Td>
                   </tr>
@@ -728,16 +746,39 @@ export function LegalHoldTab({ projects }: { projects: Option[] }) {
 
 /* ============================== Exports ================================ */
 
+/**
+ * Hand the browser a file.
+ *
+ * The export bundle arrives in the response body; without this the operator
+ * was shown a row count and given nothing they could send to a regulator.
+ */
+function downloadFile(fileName: string, mime: string, content: string) {
+  const url = URL.createObjectURL(new Blob([content], { type: mime }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = fileName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+interface ExportBundle {
+  id: string;
+  manifest: Record<string, unknown>;
+  rowCount: number;
+  format: "json" | "csv";
+  data: Record<string, unknown[]>;
+  files: Array<{ dataset: string; fileName: string; csv: string }> | null;
+}
+
 export function ExportTab() {
   const [jobs, setJobs] = useState<ExportJob[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [datasets, setDatasets] = useState<string[]>([...EXPORT_DATASETS]);
-  const [lastBundle, setLastBundle] = useState<{
-    id: string;
-    manifest: Record<string, unknown>;
-    rowCount: number;
-  } | null>(null);
+  const [format, setFormat] = useState<"json" | "csv">("json");
+  const [lastBundle, setLastBundle] = useState<ExportBundle | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -754,18 +795,30 @@ export function ExportTab() {
     void load();
   }, [load]);
 
+  function downloadJson(bundle: ExportBundle) {
+    downloadFile(
+      `constructos-export-${bundle.id}.json`,
+      "application/json",
+      JSON.stringify({ id: bundle.id, manifest: bundle.manifest, data: bundle.data }, null, 2),
+    );
+  }
+
   async function run() {
     if (datasets.length === 0) return;
     setRunning(true);
     setError(null);
     try {
-      const res = await api.post<{
-        id: string;
-        manifest: Record<string, unknown>;
-        rowCount: number;
-        data: Record<string, unknown[]>;
-      }>("/api/v1/company/exports", { datasets });
-      setLastBundle({ id: res.id, manifest: res.manifest, rowCount: res.rowCount });
+      const res = await api.post<ExportBundle>("/api/v1/company/exports", { datasets, format });
+      setLastBundle(res);
+      /*
+       * Download immediately: "Produce bundle" is a request for the bundle,
+       * not for a row count. The buttons below let it be taken again without
+       * producing a second export (and a second ledger entry).
+       */
+      if (res.format === "json" || !res.files?.length) downloadJson(res);
+      else if (res.files.length === 1) {
+        downloadFile(res.files[0]!.fileName, "text/csv", res.files[0]!.csv);
+      }
       toast.success(`Export complete — ${res.rowCount} rows`);
       await load();
     } catch (err) {
@@ -804,7 +857,17 @@ export function ExportTab() {
               </label>
             ))}
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <Field label="Format" className="w-32">
+              <Select
+                value={format}
+                onChange={(e) => setFormat(e.target.value === "csv" ? "csv" : "json")}
+                size="sm"
+              >
+                <option value="json">JSON (one file)</option>
+                <option value="csv">CSV (one per dataset)</option>
+              </Select>
+            </Field>
             <Button
               size="sm"
               leadingIcon={IconDownload}
@@ -812,7 +875,7 @@ export function ExportTab() {
               disabled={datasets.length === 0}
               onClick={() => void run()}
             >
-              Produce bundle
+              Produce and download
             </Button>
             <span className="text-2xs text-content-subtle">
               {datasets.length === 0 ? "Pick at least one dataset" : `${datasets.length} selected`}
@@ -820,8 +883,8 @@ export function ExportTab() {
           </div>
           <ErrorAlert message={error} />
           {lastBundle ? (
-            <div className="rounded border border-border-subtle p-3">
-              <h4 className="mb-1 text-xs font-semibold text-content-strong">
+            <div className="space-y-2 rounded border border-border-subtle p-3">
+              <h4 className="text-xs font-semibold text-content-strong">
                 Manifest for {lastBundle.id} — {num(lastBundle.rowCount)} rows
               </h4>
               <ul className="grid gap-x-4 gap-y-0.5 text-2xs text-content-muted sm:grid-cols-3">
@@ -831,6 +894,31 @@ export function ExportTab() {
                   </li>
                 ))}
               </ul>
+              {/*
+                The bundle stays in memory until the next run, so it can be
+                taken again without producing a second export.
+              */}
+              <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                <Button size="xs" variant="secondary" onClick={() => downloadJson(lastBundle)}>
+                  Download JSON
+                </Button>
+                {(lastBundle.files ?? []).map((f) => (
+                  <Button
+                    key={f.dataset}
+                    size="xs"
+                    variant="ghost"
+                    onClick={() => downloadFile(f.fileName, "text/csv", f.csv)}
+                  >
+                    {f.fileName}
+                  </Button>
+                ))}
+              </div>
+              {lastBundle.format === "csv" && (lastBundle.files?.length ?? 0) > 1 ? (
+                <p className="text-2xs text-content-subtle">
+                  CSV is one sheet per dataset — take each one you need. Nested values are written
+                  as JSON inside the cell rather than flattened away.
+                </p>
+              ) : null}
             </div>
           ) : null}
         </CardBody>
@@ -898,11 +986,25 @@ export function DelegationTab({
     expiresAt: string;
   }>({ userId: "", capabilities: [], projectIds: [], note: "", expiresAt: "" });
 
+  /*
+   * What each capability actually opens comes from the API rather than from
+   * copy written here. The tab used to describe delegated administration in
+   * the abstract while no route consulted a delegation at all; the scopes
+   * below are the ones the gates enforce.
+   */
+  const [scopes, setScopes] = useState<
+    Array<{ key: string; scope: "company" | "project"; covers: string }> | null
+  >(null);
+
   const load = useCallback(async () => {
     setError(null);
     try {
-      const res = await api.get<unknown>("/api/v1/company/admin-delegations");
+      const res = await api.get<{
+        items?: AdminDelegation[];
+        capabilityScopes?: Array<{ key: string; scope: "company" | "project"; covers: string }>;
+      }>("/api/v1/company/admin-delegations");
       setItems(asList<AdminDelegation>(res).items);
+      setScopes(res.capabilityScopes ?? null);
     } catch (err) {
       setItems([]);
       setError(errorMessage(err, "Failed to load delegations"));
@@ -950,13 +1052,35 @@ export function DelegationTab({
       <div className="flex items-center justify-between gap-2">
         <p className="text-xs text-content-muted">
           A delegation hands a member a bounded slice of administration — named capabilities over
-          named projects, with an expiry — instead of a tenant-wide admin role. It never includes
-          assurance roles: those are the segregation-of-duties boundary.
+          named projects, with an expiry — instead of a tenant-wide admin role. The gates on those
+          routes admit a live delegation; it never includes assurance roles, which are the
+          segregation-of-duties boundary, nor the right to change a company role or remove a member.
         </p>
         <Button size="sm" leadingIcon={IconPlus} onClick={() => setOpen(true)}>
           Delegate
         </Button>
       </div>
+
+      {scopes && scopes.length > 0 ? (
+        <Card>
+          <div className="border-b border-border-subtle px-4 py-2">
+            <h3 className="text-xs font-semibold text-content-strong">
+              What each capability opens
+            </h3>
+          </div>
+          <CardBody className="space-y-1.5">
+            {scopes.map((s) => (
+              <div key={s.key} className="flex flex-wrap items-baseline gap-2 text-2xs">
+                <Badge tone="info">{humanize(s.key)}</Badge>
+                <Badge tone={s.scope === "company" ? "warning" : "neutral"}>
+                  {s.scope === "company" ? "Tenant-wide grants only" : "Per named project"}
+                </Badge>
+                <span className="text-content-muted">{s.covers}</span>
+              </div>
+            ))}
+          </CardBody>
+        </Card>
+      ) : null}
 
       <ErrorAlert message={error} onRetry={() => void load()} />
 

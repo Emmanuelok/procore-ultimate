@@ -156,8 +156,12 @@ describe("simulation jobs", () => {
       seed: 7,
     });
     expect(sync.statusCode).toBe(201);
+    // The synchronous response spreads the simulation results at the top
+    // level (summary, perRisk, contingencyAt) alongside the job metadata.
     const syncBody = sync.json() as Json;
-    const syncSummary = (syncBody.results as Json).summary as { percentiles: Json };
+    const syncSummary = syncBody.summary as { percentiles: Json };
+    expect(syncBody.simulationId).toBeTruthy();
+    expect(syncBody.jobId).toBeTruthy();
 
     const queued = await post(`/projects/${pid}/risk/simulations/qcra`, {
       iterations: 500,

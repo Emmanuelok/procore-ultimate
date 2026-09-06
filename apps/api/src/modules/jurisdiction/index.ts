@@ -1542,26 +1542,13 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
         basis: body.basis ?? null,
         recordedBy: req.user!.id,
       });
-      if (!compliant) {
-        await app.db.insert(signals).values({
-          id: newId("sig"),
-          companyId: req.companyId!,
-          projectId: req.projectId!,
-          detector: "local_content_shortfall",
-          severity: "medium",
-          confidence: 1,
-          title: `Local content shortfall — ${target.name}: ${body.value}${target.unit} against a ${target.targetValue}${target.unit} floor`,
-          explanation:
-            `The ${body.readingDate} reading of "${target.name}" (${target.metric}, ` +
-            `${target.jurisdiction}) is ${body.value}${target.unit}, ${gap}${target.unit} below the ` +
-            `contractual floor of ${target.targetValue}${target.unit}. ` +
-            `Local content and in-country value undertakings are typically conditions of the ` +
-            `licence or concession: sustained shortfall attracts penalties, withheld certificates ` +
-            `or, in Gulf ICV regimes, exclusion from future tenders. ` +
-            (body.basis ? `Basis: ${body.basis}.` : "No basis of measurement was stated."),
-          evidenceRefs: { targetId, readingId: id, value: body.value, gap },
-        });
-      }
+      /*
+       * The shortfall FINDING is the scheduled detector's job (system actor,
+       * advisory-locked, fingerprinted on the reading, auto-closed when a
+       * later reading meets the floor or the breaching one is superseded).
+       * Writing it here made whoever keyed the reading the ledger actor for
+       * an integrity finding, and two concurrent posts raised it twice.
+       */
       await appendLedger(app.db, {
         companyId: req.companyId!,
         actorId: req.user!.id,

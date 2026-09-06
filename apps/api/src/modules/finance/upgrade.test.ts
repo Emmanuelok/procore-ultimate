@@ -25,7 +25,9 @@ import {
   companyMemberships,
   disbursements,
   evidence,
+  ledgerEntries,
   projects,
+  reconciliations,
   scheduleTasks,
   schedules,
   signals,
@@ -792,6 +794,48 @@ describe("scheduled sweeps", () => {
       .where(and(eq(signals.companyId, owner.companyId), eq(signals.projectId, pid)));
     expect(raised.length).toBeGreaterThan(0);
   });
+
+  it("REGRESSION: a read-path sweep is attributed to the platform, never to the reader", async () => {
+    const pid = await makeProject("Read Sweep Attribution");
+    const facility = await createFacility(pid);
+    const condition = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/facilities/${facility.id}/conditions`,
+      headers: owner.headers,
+      payload: {
+        kind: "subsequent",
+        description: "Insurance certificate renewed",
+        dueDate: addDaysISO(todayISO(), -3),
+      },
+    });
+    expect(condition.statusCode).toBe(201);
+    const conditionId = condition.json().id as string;
+
+    // A plain GET still refreshes the state — but as the system, not as the
+    // auditor who happened to open the page.
+    const read = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/facilities`,
+      headers: owner.headers,
+    });
+    expect(read.statusCode).toBe(200);
+
+    const entries = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(
+        and(
+          eq(ledgerEntries.companyId, owner.companyId),
+          eq(ledgerEntries.objectType, "facility_condition"),
+          eq(ledgerEntries.objectId, conditionId),
+          eq(ledgerEntries.action, "state_change"),
+        ),
+      );
+    expect(entries.length).toBeGreaterThan(0);
+    for (const e of entries) {
+      expect(e.actorId).toBeNull();
+    }
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -846,4 +890,477 @@ describe("tenant isolation on the upgraded finance routes", () => {
     expect(res.statusCode).toBe(200);
     expect(res.json().facilities).toEqual([]);
   });
+});
+
+/* ------------------------------------------------------------------ */
+/* Designated (special) account reconciliation (#735, #745)            */
+/* ------------------------------------------------------------------ */
+
+describe("designated accounts", () => {
+  async function createAccount(pid: string, facilityId: string, payload: Record<string, unknown> = {}) {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/facilities/${facilityId}/designated-accounts`,
+      headers: owner.headers,
+      payload: {
+        name: "Designated Account A",
+        bankName: "Local Commercial Bank",
+        accountRef: "…4417",
+        authorisedCeiling: 500_000,
+        openingBalance: 0,
+        ...payload,
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    return res.json() as { id: string; currency: string };
+  }
+
+  async function addEntry(pid: string, accountId: string, payload: Record<string, unknown>) {
+    return app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/designated-accounts/${accountId}/entries`,
+      headers: owner.headers,
+      payload,
+    });
+  }
+
+  it("keeps a signed ledger and reports the outstanding advance", async () => {
+    const pid = await makeProject("Designated Account Project");
+    const facility = await createFacility(pid);
+    const account = await createAccount(pid, facility.id);
+
+    expect(
+      (
+        await addEntry(pid, account.id, {
+          entryDate: addDaysISO(todayISO(), -60),
+          kind: "advance",
+          amount: 300_000,
+          description: "Initial advance under the facility",
+        })
+      ).statusCode,
+    ).toBe(201);
+    expect(
+      (
+        await addEntry(pid, account.id, {
+          entryDate: addDaysISO(todayISO(), -30),
+          kind: "eligible_expenditure",
+          amount: 120_000,
+          description: "IPC 3 paid to the main contractor",
+        })
+      ).statusCode,
+    ).toBe(201);
+    expect(
+      (
+        await addEntry(pid, account.id, {
+          entryDate: addDaysISO(todayISO(), -10),
+          kind: "bank_charge",
+          amount: 400,
+          description: "Quarterly account charges",
+        })
+      ).statusCode,
+    ).toBe(201);
+
+    const view = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/designated-accounts/${account.id}`,
+      headers: owner.headers,
+    });
+    expect(view.statusCode).toBe(200);
+    const body = view.json();
+    expect(body.entries).toHaveLength(3);
+    expect(body.position.balance).toBe(179_600);
+    expect(body.position.outstandingAdvance).toBe(180_000);
+    expect(body.position.documentedPercent).toBe(40);
+    expect(body.position.ceilingHeadroom).toBe(320_400);
+    expect(body.position.basis).toMatch(/Entries after that date are excluded/);
+  });
+
+  it("raises a signal when the balance goes above the authorised ceiling, once", async () => {
+    const pid = await makeProject("Ceiling Breach Project");
+    const facility = await createFacility(pid);
+    const account = await createAccount(pid, facility.id, { authorisedCeiling: 100_000 });
+
+    const over = await addEntry(pid, account.id, {
+      entryDate: todayISO(),
+      kind: "advance",
+      amount: 150_000,
+      description: "Advance in excess of the ceiling",
+    });
+    expect(over.statusCode).toBe(201);
+    expect(over.json().position.overCeiling).toBe(true);
+
+    // A second breaching entry must not raise a second open signal.
+    await addEntry(pid, account.id, {
+      entryDate: todayISO(),
+      kind: "advance",
+      amount: 10_000,
+      description: "Further advance",
+    });
+
+    const raised = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.projectId, pid),
+          eq(signals.detector, "designated_account_over_ceiling"),
+        ),
+      );
+    expect(raised).toHaveLength(1);
+  });
+
+  it("raises an account nobody has reconciled from the scheduler, and clears it once they do", async () => {
+    const pid = await makeProject("Stale Reconciliation Project");
+    const facility = await createFacility(pid);
+    const account = await createAccount(pid, facility.id);
+
+    await app.scheduler.runNow("finance.designated-accounts");
+    const raised = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.projectId, pid),
+          eq(signals.detector, "designated_account_unreconciled_overdue"),
+        ),
+      );
+    expect(raised).toHaveLength(1);
+    expect(raised[0]?.explanation).toMatch(/never been reconciled/i);
+
+    // Running it again does not raise a second copy of the same finding.
+    await app.scheduler.runNow("finance.designated-accounts");
+    expect(
+      await app.db
+        .select()
+        .from(signals)
+        .where(
+          and(
+            eq(signals.projectId, pid),
+            eq(signals.detector, "designated_account_unreconciled_overdue"),
+          ),
+        ),
+    ).toHaveLength(1);
+
+    const done = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/designated-accounts/${account.id}/reconcile`,
+      headers: owner.headers,
+      payload: { periodEnd: todayISO(), statementBalance: 0 },
+    });
+    expect(done.statusCode).toBe(201);
+    expect(done.json().outcome).toBe("reconciled");
+
+    await app.scheduler.runNow("finance.designated-accounts");
+    const after = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.projectId, pid),
+          eq(signals.detector, "designated_account_unreconciled_overdue"),
+        ),
+      );
+    expect(after[0]?.disposition).toBe("closed");
+  });
+
+  it("reconciles against the bank, mirrors it into the assurance register and refuses a rewrite", async () => {
+    const pid = await makeProject("Reconciliation Project");
+    const facility = await createFacility(pid);
+    const account = await createAccount(pid, facility.id);
+    const periodEnd = addDaysISO(todayISO(), -1);
+    await addEntry(pid, account.id, {
+      entryDate: addDaysISO(todayISO(), -20),
+      kind: "advance",
+      amount: 200_000,
+      description: "Advance",
+    });
+    const ev = await insertEvidence(pid);
+
+    const clean = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/designated-accounts/${account.id}/reconcile`,
+      headers: owner.headers,
+      payload: { periodEnd, statementBalance: 200_000, evidenceIds: [ev] },
+    });
+    expect(clean.statusCode).toBe(201);
+    expect(clean.json().outcome).toBe("reconciled");
+    expect(clean.json().difference).toBe(0);
+    expect(clean.json().assuranceReconciliationId).toBeTruthy();
+
+    // The assurance register carries the same finding.
+    const mirrored = await app.db
+      .select()
+      .from(reconciliations)
+      .where(eq(reconciliations.id, clean.json().assuranceReconciliationId as string));
+    expect(mirrored).toHaveLength(1);
+    expect(mirrored[0]?.result).toBe("supported");
+    expect(mirrored[0]?.method).toBe("designated_account_balance");
+
+    // A reconciliation is a record of what was checked on a date, not a draft.
+    const again = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/designated-accounts/${account.id}/reconcile`,
+      headers: owner.headers,
+      payload: { periodEnd, statementBalance: 199_000 },
+    });
+    expect(again.statusCode).toBe(409);
+  });
+
+  it("raises a signal and contradicts the assertion when the bank does not agree", async () => {
+    const pid = await makeProject("Unreconciled Project");
+    const facility = await createFacility(pid);
+    const account = await createAccount(pid, facility.id);
+    await addEntry(pid, account.id, {
+      entryDate: addDaysISO(todayISO(), -20),
+      kind: "advance",
+      amount: 200_000,
+      description: "Advance",
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/designated-accounts/${account.id}/reconcile`,
+      headers: owner.headers,
+      payload: { periodEnd: todayISO(), statementBalance: 185_000 },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().outcome).toBe("unreconciled");
+    expect(res.json().difference).toBe(-15_000);
+
+    const raised = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.projectId, pid),
+          eq(signals.detector, "designated_account_unreconciled"),
+        ),
+      );
+    expect(raised).toHaveLength(1);
+    expect(raised[0]?.severity).toBe("high");
+
+    const mirrored = await app.db
+      .select()
+      .from(reconciliations)
+      .where(eq(reconciliations.id, res.json().assuranceReconciliationId as string));
+    expect(mirrored[0]?.result).toBe("contradicted");
+    // No evidence attached → the row is marked self-certified, not trusted.
+    expect(mirrored[0]?.selfCertified).toBe(true);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* PPP / availability payment mechanism                                */
+/* ------------------------------------------------------------------ */
+
+describe("availability payment mechanism", () => {
+  async function createModel(pid: string, payload: Record<string, unknown> = {}) {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/availability-models`,
+      headers: owner.headers,
+      payload: {
+        name: "Hospital concession — unitary charge",
+        unitaryCharge: 1_000_000,
+        availabilityWeightPercent: 70,
+        performanceWeightPercent: 30,
+        performancePointValuePercent: 0.1,
+        ...payload,
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    return res.json() as { id: string; currency: string };
+  }
+
+  it("computes the deduction and the net payment for a period", async () => {
+    const pid = await makeProject("Availability Project");
+    const model = await createModel(pid);
+
+    const period = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/availability-models/${model.id}/periods`,
+      headers: owner.headers,
+      payload: {
+        periodStart: addDaysISO(todayISO(), -30),
+        periodEnd: todayISO(),
+        requiredHours: 720,
+        unavailabilityEvents: [{ area: "Ward block", hours: 72, weight: 0.5 }],
+        performancePoints: 40,
+      },
+    });
+    expect(period.statusCode).toBe(201);
+    const computed = period.json().computed;
+    // 1,000,000 × 70% × (36/720) = 35,000 ; performance 1,000,000 × 30% × 4% = 12,000
+    expect(computed.availabilityDeduction).toBeCloseTo(35_000, 2);
+    expect(computed.performanceDeduction).toBeCloseTo(12_000, 2);
+    expect(computed.netPayment).toBeCloseTo(953_000, 2);
+    expect(computed.basis).toMatch(/Ratchets/);
+  });
+
+  it("refuses weights that together exceed the whole charge", async () => {
+    const pid = await makeProject("Bad Weights Project");
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/availability-models`,
+      headers: owner.headers,
+      payload: {
+        name: "Impossible mechanism",
+        unitaryCharge: 100,
+        availabilityWeightPercent: 80,
+        performanceWeightPercent: 40,
+      },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("certifies a period with separation of duties and excludes drafts from the totals", async () => {
+    const pid = await makeProject("Certified Period Project");
+    const model = await createModel(pid, { persistentBreachPoints: 100 });
+    const start = addDaysISO(todayISO(), -60);
+    const created = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/availability-models/${model.id}/periods`,
+      headers: owner.headers,
+      payload: {
+        periodStart: start,
+        periodEnd: addDaysISO(todayISO(), -30),
+        requiredHours: 720,
+        unavailabilityEvents: [],
+        performancePoints: 120,
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    const periodId = created.json().id as string;
+
+    // Before certification nothing counts toward the totals.
+    const drafts = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/availability-models/${model.id}/periods`,
+      headers: owner.headers,
+    });
+    expect(drafts.json().totals.certifiedPeriods).toBe(0);
+    expect(drafts.json().totals.certifiedNet).toBe(0);
+    expect(drafts.json().basis).toMatch(/draft period is an unagreed number/);
+
+    // The recorder may not certify their own period.
+    const self = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/availability-periods/${periodId}/certify`,
+      headers: owner.headers,
+      payload: {},
+    });
+    expect(self.statusCode).toBe(403);
+
+    const certified = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/availability-periods/${periodId}/certify`,
+      headers: approverHeaders,
+      payload: {},
+    });
+    expect(certified.statusCode).toBe(200);
+    expect(certified.json().status).toBe("certified");
+    expect(certified.json().certifiedBy).toBe(approver.userId);
+
+    // 120 points past the 100-point threshold raises the persistent-breach signal.
+    const raised = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.projectId, pid),
+          eq(signals.detector, "availability_persistent_breach"),
+        ),
+      );
+    expect(raised).toHaveLength(1);
+
+    const after = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/availability-models/${model.id}/periods`,
+      headers: owner.headers,
+    });
+    expect(after.json().totals.certifiedPeriods).toBe(1);
+    expect(after.json().totals.certifiedNet).toBeGreaterThan(0);
+
+    // Certifying twice is refused rather than silently re-freezing.
+    const twice = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/availability-periods/${periodId}/certify`,
+      headers: approverHeaders,
+      payload: {},
+    });
+    expect(twice.statusCode).toBe(400);
+  });
+
+  it("refuses a duplicate period on the same model", async () => {
+    const pid = await makeProject("Duplicate Period Project");
+    const model = await createModel(pid);
+    const payload = {
+      periodStart: addDaysISO(todayISO(), -30),
+      periodEnd: todayISO(),
+      requiredHours: 720,
+      unavailabilityEvents: [],
+      performancePoints: 0,
+    };
+    const first = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/availability-models/${model.id}/periods`,
+      headers: owner.headers,
+      payload,
+    });
+    expect(first.statusCode).toBe(201);
+    const second = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/availability-models/${model.id}/periods`,
+      headers: owner.headers,
+      payload,
+    });
+    expect(second.statusCode).toBe(409);
+  });
+
+  it("keeps designated accounts and availability models out of another company's reach", async () => {
+    const pid = await makeProject("New Routes Isolation");
+    const facility = await createFacility(pid);
+    const account = await createAccount(pid, facility.id);
+    const model = await createModel(pid);
+    const stranger = await registerActor(app);
+
+    for (const url of [
+      `/api/v1/projects/${pid}/facilities/${facility.id}/designated-accounts`,
+      `/api/v1/projects/${pid}/designated-accounts/${account.id}`,
+      `/api/v1/projects/${pid}/availability-models`,
+      `/api/v1/projects/${pid}/availability-models/${model.id}/periods`,
+    ]) {
+      const res = await app.inject({ method: "GET", url, headers: stranger.headers });
+      expect([403, 404]).toContain(res.statusCode);
+    }
+
+    const write = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/designated-accounts/${account.id}/entries`,
+      headers: stranger.headers,
+      payload: {
+        entryDate: todayISO(),
+        kind: "advance",
+        amount: 1,
+        description: "should not land",
+      },
+    });
+    expect([403, 404]).toContain(write.statusCode);
+  });
+
+  async function createAccount(pid: string, facilityId: string, payload: Record<string, unknown> = {}) {
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/facilities/${facilityId}/designated-accounts`,
+      headers: owner.headers,
+      payload: {
+        name: "Designated Account",
+        authorisedCeiling: 500_000,
+        ...payload,
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    return res.json() as { id: string };
+  }
 });

@@ -30,6 +30,7 @@ import {
   Caveat,
   asList,
   type DatasetInfo,
+  type MappingTemplate,
   type ProjectPick,
   type RunRow,
   type SourceRow,
@@ -51,16 +52,6 @@ interface ProgrammeResult {
     wbsCode: string | null;
   }[];
   next: string;
-}
-
-interface TemplateRow {
-  id: string;
-  name: string;
-  dataset: string;
-  sourceId: string | null;
-  columnMap: Record<string, string>;
-  useCount: number;
-  createdAt: string;
 }
 
 function fmtInt(n: number): string {
@@ -88,7 +79,7 @@ export default function ProgrammeTab({
   const [stage, setStage] = useState<"idle" | "validated" | "committed">("idle");
   const [outcome, setOutcome] = useState<string | null>(null);
 
-  const [templates, setTemplates] = useState<TemplateRow[] | null>(null);
+  const [templates, setTemplates] = useState<MappingTemplate[] | null>(null);
   const [templateError, setTemplateError] = useState<string | null>(null);
 
   const effectiveSourceId = sourceId || (csvSources.length === 1 ? csvSources[0]!.id : "");
@@ -98,7 +89,7 @@ export default function ProgrammeTab({
     setTemplateError(null);
     try {
       const res = await api.get<unknown>("/api/v1/ingestion/mapping-templates?page=1&pageSize=50");
-      setTemplates(asList<TemplateRow>(res).items);
+      setTemplates(asList<MappingTemplate>(res).items);
     } catch (err) {
       setTemplates([]);
       setTemplateError(err instanceof Error ? err.message : "Failed to load mapping templates");
@@ -108,6 +99,33 @@ export default function ProgrammeTab({
   useEffect(() => {
     void loadTemplates();
   }, [loadTemplates]);
+
+  const [deletingTemplateId, setDeletingTemplateId] = useState<string | null>(null);
+
+  /**
+   * Delete a saved map. The route existed from the start and nothing called
+   * it, so a template created by mistake was permanent.
+   */
+  async function deleteTemplate(t: MappingTemplate) {
+    if (
+      !window.confirm(
+        `Delete the mapping template "${t.name}"?\n\nRuns already mapped from it keep the map ` +
+          "they were mapped with — only the reusable template is removed.",
+      )
+    ) {
+      return;
+    }
+    setDeletingTemplateId(t.id);
+    setTemplateError(null);
+    try {
+      await api.del<unknown>(`/api/v1/ingestion/mapping-templates/${t.id}`);
+      await loadTemplates();
+    } catch (err) {
+      setTemplateError(err instanceof Error ? err.message : "Could not delete the template");
+    } finally {
+      setDeletingTemplateId(null);
+    }
+  }
 
   function onPickFile(e: ChangeEvent<HTMLInputElement>) {
     setFile(e.target.files?.[0] ?? null);
@@ -332,7 +350,8 @@ export default function ProgrammeTab({
               The mapping step is the slow part of every migration and it is identical every month.
               A saved map makes the second import of the same export a two-click operation — and
               makes it auditable, because two runs claiming the same source can be shown to have
-              read its columns the same way. Adopt one on the New import tab.
+              read its columns the same way. Save one from the mapping step of the New import tab,
+              and adopt it there on the next import.
             </p>
           </div>
           <ErrorAlert message={templateError} />
@@ -341,7 +360,7 @@ export default function ProgrammeTab({
           ) : templates.length === 0 ? (
             <EmptyState
               title="No saved mappings yet"
-              hint="Save a column map after your next CSV import and it becomes reusable here."
+              hint="On the New import tab, map a CSV's columns and use 'Save this mapping as' — the map appears here and can be adopted on the next import."
             />
           ) : (
             <Table>
@@ -352,6 +371,7 @@ export default function ProgrammeTab({
                   <Th className="text-right">Fields</Th>
                   <Th className="text-right">Runs adopted</Th>
                   <Th>Created</Th>
+                  <Th />
                 </tr>
               </thead>
               <tbody>
@@ -366,6 +386,16 @@ export default function ProgrammeTab({
                     </Td>
                     <Td className="text-right tabular-nums">{t.useCount}</Td>
                     <Td className="whitespace-nowrap">{formatDateTime(t.createdAt)}</Td>
+                    <Td className="text-right">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        disabled={deletingTemplateId === t.id}
+                        onClick={() => void deleteTemplate(t)}
+                      >
+                        {deletingTemplateId === t.id ? "Deleting…" : "Delete"}
+                      </Button>
+                    </Td>
                   </tr>
                 ))}
               </tbody>

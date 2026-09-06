@@ -28,6 +28,7 @@ import {
   equipmentReadings,
   equipmentTelematicsReadings,
   equipmentUtilisation,
+  evidence,
   ingestedRecords,
   ingestionRuns,
   ingestionSources,
@@ -37,10 +38,9 @@ import {
   materialItems,
   materialStockMovements,
   nonConformanceReports,
-  evidence,
-  reconciliations,
   obligations,
   projects,
+  reconciliations,
   signals,
   vendors,
 } from "@constructos/db";
@@ -3220,6 +3220,14 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     companyId: string,
     projectId: string | null,
     q: z.infer<typeof idleQuery>,
+    /**
+     * The caller's visibility, for the COMPANY-level route. Holding
+     * `equipment` on one job admits you to the fleet register; it does not
+     * hand you every other job's standing plant, and an idle list is a
+     * commercially sensitive read (it says which of a competitor-run job's
+     * machines are earning nothing).
+     */
+    scope?: CompanyScope,
   ): Promise<{
     from: string;
     to: string;
@@ -3235,10 +3243,15 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       q.thresholdPercent ?? IDLE_UTILISATION_THRESHOLD_PERCENT;
     const sustainedDays = q.sustainedDays ?? IDLE_SUSTAINED_DAYS;
 
+    const fleetScope = scope ? scopeProjectFilter(scope, equipment.projectId) : undefined;
     let fleet = await app.db
       .select()
       .from(equipment)
-      .where(eq(equipment.companyId, companyId));
+      .where(
+        fleetScope
+          ? and(eq(equipment.companyId, companyId), fleetScope)
+          : eq(equipment.companyId, companyId),
+      );
     if (projectId) {
       const assigned = await app.db
         .select({ equipmentId: equipmentAssignments.equipmentId })
@@ -3414,7 +3427,9 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     { preHandler: companyRead },
     async (req) => {
       const q = idleQuery.parse(req.query);
-      return idleResponse(await idleAssessments(req.companyId!, null, q));
+      return idleResponse(
+        await idleAssessments(req.companyId!, null, q, companyScopeOf(req)),
+      );
     },
   );
 
@@ -6067,6 +6082,22 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
               assertedAt: assertionValues.assertedAt,
             })
             .where(eq(assertions.id, assertionId));
+          /*
+           * The superseded reconciliation goes, and so does the evidence row
+           * it was drawn from — this route is the only author of those rows
+           * and they are a pure derivation of the feed, so leaving them would
+           * grow the evidence register by one dead pack per re-run while
+           * nothing points at them.
+           */
+          const stale = await app.db
+            .select({ evidenceIds: reconciliations.evidenceIds })
+            .from(reconciliations)
+            .where(
+              and(
+                eq(reconciliations.companyId, companyId),
+                eq(reconciliations.assertionId, assertionId),
+              ),
+            );
           await app.db
             .delete(reconciliations)
             .where(
@@ -6075,6 +6106,19 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
                 eq(reconciliations.assertionId, assertionId),
               ),
             );
+          const staleEvidence = [
+            ...new Set(stale.flatMap((r) => (r.evidenceIds as string[] | null) ?? [])),
+          ];
+          if (staleEvidence.length > 0) {
+            await app.db
+              .delete(evidence)
+              .where(
+                and(
+                  eq(evidence.companyId, companyId),
+                  inArray(evidence.id, staleEvidence),
+                ),
+              );
+          }
         } else {
           await app.db.insert(assertions).values(assertionValues);
         }

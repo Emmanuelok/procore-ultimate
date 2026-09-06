@@ -48,6 +48,11 @@ import {
 } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
+import {
+  DELEGATION_CAPABILITY_SCOPES,
+  toolGateOrDelegation,
+} from "./delegation.js";
+import { toCsv } from "../projects/import.js";
 import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { forEachCompany } from "../../lib/scheduler.js";
@@ -120,6 +125,14 @@ export const adminModule: FastifyPluginAsync = async (app) => {
     app.requireCompany,
     app.requireCompanyRole(["owner", "admin"]),
   ];
+  /*
+   * #27 — project memberships are the first surface a delegation actually
+   * opens. The `admin` tool gate runs unchanged; a live `memberships`
+   * delegation covering this project is a second way in, which is the whole
+   * point of bounded administration (delegation.ts).
+   */
+  const membershipReadGate = toolGateOrDelegation(app, "admin", "read", "memberships");
+  const membershipAdminGate = toolGateOrDelegation(app, "admin", "admin", "memberships");
 
   /* ----------------------- Permission templates -------------------- */
 
@@ -257,7 +270,7 @@ export const adminModule: FastifyPluginAsync = async (app) => {
 
   app.get(
     "/projects/:projectId/memberships",
-    { preHandler: [app.authenticate, app.requireCompany, app.requireTool("admin", "read")] },
+    { preHandler: [app.authenticate, app.requireCompany, membershipReadGate] },
     async (req) => {
       const q = pageQuerySchema.parse(req.query);
       const where = and(
@@ -287,7 +300,7 @@ export const adminModule: FastifyPluginAsync = async (app) => {
 
   app.post(
     "/projects/:projectId/memberships",
-    { preHandler: [app.authenticate, app.requireCompany, app.requireTool("admin", "admin")] },
+    { preHandler: [app.authenticate, app.requireCompany, membershipAdminGate] },
     async (req, reply) => {
       const body = membershipCreateSchema.parse(req.body);
       validateToolMap(body.overrides, "overrides");
@@ -363,7 +376,7 @@ export const adminModule: FastifyPluginAsync = async (app) => {
 
   app.patch(
     "/projects/:projectId/memberships/:membershipId",
-    { preHandler: [app.authenticate, app.requireCompany, app.requireTool("admin", "admin")] },
+    { preHandler: [app.authenticate, app.requireCompany, membershipAdminGate] },
     async (req) => {
       const { membershipId } = req.params as { projectId: string; membershipId: string };
       const body = membershipPatchSchema.parse(req.body);
@@ -392,7 +405,7 @@ export const adminModule: FastifyPluginAsync = async (app) => {
 
   app.delete(
     "/projects/:projectId/memberships/:membershipId",
-    { preHandler: [app.authenticate, app.requireCompany, app.requireTool("admin", "admin")] },
+    { preHandler: [app.authenticate, app.requireCompany, membershipAdminGate] },
     async (req) => {
       const { membershipId } = req.params as { projectId: string; membershipId: string };
       const membership = await getProjectMembershipOr404(
@@ -843,19 +856,29 @@ export const adminModule: FastifyPluginAsync = async (app) => {
       objectType: string;
       retainMonths: number;
       action: string;
-      dueForAction: number;
-      heldBack: number;
-      enforced: boolean;
+      dueForAction: number | null;
+      holdsCovering: number;
+      counted: boolean;
+      executed: boolean;
       note: string;
     }> = [];
     for (const policy of policies) {
       const cutoff = new Date(
         Date.now() - policy.retainMonths * 30 * 86_400_000,
       ).toISOString();
-      let dueForAction = 0;
-      let enforced = false;
+      let dueForAction: number | null = null;
+      /*
+       * `counted` says only that THIS endpoint can count what the policy would
+       * act on. It is not "enforced" — nothing in the codebase reads
+       * `retention_policies` to delete, anonymise or archive anything, and
+       * saying "Enforced by the substrate" let a compliance officer record a
+       * tenant as compliant on the strength of a number. What is enforced is
+       * the legal hold, which is a different control and applies whether or
+       * not a retention policy exists.
+       */
+      let counted = false;
       if (policy.objectType === "project") {
-        enforced = true;
+        counted = true;
         const [row] = await app.db
           .select({ n: count() })
           .from(projects)
@@ -868,7 +891,7 @@ export const adminModule: FastifyPluginAsync = async (app) => {
           );
         dueForAction = Number(row?.n ?? 0);
       } else if (policy.objectType === "vendor") {
-        enforced = true;
+        counted = true;
         const [row] = await app.db
           .select({ n: count() })
           .from(vendors)
@@ -881,22 +904,36 @@ export const adminModule: FastifyPluginAsync = async (app) => {
           );
         dueForAction = Number(row?.n ?? 0);
       }
-      const heldBack = holds.filter(
+      // Holds that COVER this object type — a count of holds, not of records
+      // held back. Named for what it is.
+      const holdsCovering = holds.filter(
         (h) => h.objectType === null || h.objectType === policy.objectType,
       ).length;
       results.push({
         objectType: policy.objectType,
         retainMonths: policy.retainMonths,
         action: policy.action,
+        // Not 0 when the substrate cannot count this object type: a figure
+        // with no source is "not available", never zero.
         dueForAction,
-        heldBack,
-        enforced,
-        note: enforced
-          ? "Enforced by the substrate: deletion refuses under a legal hold."
-          : "Recorded for the owning module; the substrate does not delete records it does not own.",
+        holdsCovering,
+        counted,
+        // Stated flatly, because the alternative is a tenant believing a
+        // sweep runs.
+        executed: false,
+        note: counted
+          ? `Recorded and previewed only — nothing deletes, anonymises or archives on this policy. ${dueForAction} record(s) are past the retention period and would be candidates if a sweep existed; deletion is separately refused while a legal hold covers the record.`
+          : "Recorded for the owning module. The substrate cannot count or act on records it does not own.",
       });
     }
-    return { items: results, total: results.length, holds: holds.length };
+    return {
+      items: results,
+      total: results.length,
+      holds: holds.length,
+      // One honest line the UI can render above the table.
+      enforcement:
+        "Retention policies are recorded and previewed. No scheduler job acts on them; the enforced control is the legal hold, which refuses deletion.",
+    };
   });
 
   /* ---------------------------------------------------------------- */
@@ -1106,7 +1143,35 @@ export const adminModule: FastifyPluginAsync = async (app) => {
   });
 
   /**
-   * Produce the company's data as one JSON bundle.
+   * Flatten one dataset into a CSV sheet.
+   *
+   * The union of every row's keys becomes the header, so a nullable column
+   * present on only some rows still gets one; objects and arrays are written
+   * as compact JSON rather than "[object Object]". `toCsv` (the same RFC-4180
+   * serialiser the import templates use) handles quoting.
+   */
+  function datasetToCsv(rows: Array<Record<string, unknown>>): string {
+    const header: string[] = [];
+    const seen = new Set<string>();
+    for (const row of rows) {
+      for (const key of Object.keys(row)) {
+        if (!seen.has(key)) {
+          seen.add(key);
+          header.push(key);
+        }
+      }
+    }
+    const cell = (value: unknown): string => {
+      if (value === null || value === undefined) return "";
+      if (typeof value === "object") return JSON.stringify(value);
+      return String(value);
+    };
+    return toCsv([header, ...rows.map((row) => header.map((key) => cell(row[key])))]);
+  }
+
+  /**
+   * Produce the company's data as one JSON bundle, or one CSV sheet per
+   * dataset (#45 — the brief says "JSON/CSV bundle").
    *
    * Synchronous and bounded rather than a background job with a download URL:
    * an export the operator cannot see complete is an export they cannot trust,
@@ -1119,6 +1184,7 @@ export const adminModule: FastifyPluginAsync = async (app) => {
     const body = z
       .object({
         datasets: z.array(z.enum(EXPORT_DATASETS)).min(1).default([...EXPORT_DATASETS]),
+        format: z.enum(["json", "csv"]).default("json"),
       })
       .parse(req.body ?? {});
     const id = newId("exp");
@@ -1127,7 +1193,7 @@ export const adminModule: FastifyPluginAsync = async (app) => {
       companyId: req.companyId!,
       status: "running",
       datasets: [...body.datasets],
-      format: "json",
+      format: body.format,
       requestedBy: req.user!.id,
     });
     try {
@@ -1150,13 +1216,29 @@ export const adminModule: FastifyPluginAsync = async (app) => {
         payload: { datasets: body.datasets, manifest, rowCount },
         storePayload: true,
       });
+      /*
+       * The bundle itself goes back in the response, in the format asked
+       * for. Returning only a manifest and a row count told the operator the
+       * export "succeeded" and handed them nothing they could give a
+       * regulator — the one thing an export is for.
+       */
+      const files =
+        body.format === "csv"
+          ? Object.entries(data).map(([dataset, rows]) => ({
+              dataset,
+              fileName: `${dataset}.csv`,
+              csv: datasetToCsv(rows as Array<Record<string, unknown>>),
+            }))
+          : null;
       return reply.status(201).send({
         id,
         status: "complete",
         generatedAt: now,
+        format: body.format,
         manifest,
         rowCount,
         data,
+        files,
       });
     } catch (err) {
       await app.db
@@ -1199,6 +1281,16 @@ export const adminModule: FastifyPluginAsync = async (app) => {
       items,
       total: items.length,
       capabilities: ADMIN_DELEGATION_CAPABILITIES,
+      /*
+       * What each capability actually opens, and at which scope. Without this
+       * the Delegation tab has to invent the copy, and it invented a scope
+       * the API does not honour: a project-scoped delegation cannot open a
+       * company-level route.
+       */
+      capabilityScopes: ADMIN_DELEGATION_CAPABILITIES.map((key) => ({
+        key,
+        ...DELEGATION_CAPABILITY_SCOPES[key],
+      })),
     };
   });
 

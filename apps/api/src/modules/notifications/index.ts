@@ -31,6 +31,7 @@ import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { forEachCompany } from "../../lib/scheduler.js";
 import type { Db } from "../../lib/db.js";
 import { buildDigest, nextDigestDue, type DigestItem } from "./policy.js";
+import { companyAdminOrDelegation } from "../admin/delegation.js";
 
 const listQuerySchema = pageQuerySchema.extend({
   unread: z.enum(["true", "false"]).optional(),
@@ -63,10 +64,14 @@ const DIGEST_JOB = "notifications.digest";
 
 export const notificationsModule: FastifyPluginAsync = async (app) => {
   const gate = [app.authenticate, app.requireCompany];
+  /*
+   * #27 — running the digest sweep by hand is delegable to a tenant-wide
+   * `notifications` delegation (modules/admin/delegation.ts).
+   */
   const adminGate = [
     app.authenticate,
     app.requireCompany,
-    app.requireCompanyRole(["owner", "admin"]),
+    companyAdminOrDelegation(app, "notifications"),
   ];
 
   app.get("/notifications", { preHandler: gate }, async (req) => {
@@ -90,32 +95,36 @@ export const notificationsModule: FastifyPluginAsync = async (app) => {
     return paginate(items, Number(totalRow?.n ?? 0), q);
   });
 
+  /**
+   * The unread count, excluding anything held for the digest (#96).
+   *
+   * A digest cadence defers the interruption; a row written for the digest is
+   * therefore not "new since you last looked" until the digest releases it.
+   * `heldBack` is reported separately so the inbox can say "12 waiting for
+   * your weekly digest" rather than hiding them.
+   */
   app.get("/notifications/unread-count", { preHandler: gate }, async (req) => {
-    const [row] = await app.db
+    const mine = and(
+      eq(notifications.companyId, req.companyId!),
+      eq(notifications.userId, req.user!.id),
+      isNull(notifications.readAt),
+    );
+    const countable = and(mine, eq(notifications.heldForDigest, 0));
+    const [row] = await app.db.select({ n: count() }).from(notifications).where(countable);
+    const [heldRow] = await app.db
       .select({ n: count() })
       .from(notifications)
-      .where(
-        and(
-          eq(notifications.companyId, req.companyId!),
-          eq(notifications.userId, req.user!.id),
-          isNull(notifications.readAt),
-        ),
-      );
+      .where(and(mine, eq(notifications.heldForDigest, 1)));
     // Per-kind so the shell can badge the right nav entry rather than one
     // undifferentiated number.
     const byKind = await app.db
       .select({ kind: notifications.kind, n: count() })
       .from(notifications)
-      .where(
-        and(
-          eq(notifications.companyId, req.companyId!),
-          eq(notifications.userId, req.user!.id),
-          isNull(notifications.readAt),
-        ),
-      )
+      .where(countable)
       .groupBy(notifications.kind);
     return {
       count: Number(row?.n ?? 0),
+      heldForDigest: Number(heldRow?.n ?? 0),
       byKind: Object.fromEntries(byKind.map((r) => [r.kind, Number(r.n)])),
     };
   });
@@ -355,7 +364,7 @@ export async function runDigestForCompany(
   db: Db,
   companyId: string,
   now: Date,
-): Promise<{ digests: number; items: number; skipped: number }> {
+): Promise<{ digests: number; items: number; skipped: number; released: number }> {
   const prefs = await db
     .select()
     .from(notificationPreferences)
@@ -368,6 +377,8 @@ export async function runDigestForCompany(
   let digests = 0;
   let items = 0;
   let skipped = 0;
+  /** Notifications taken off hold and made countable again. */
+  let released = 0;
   for (const pref of prefs) {
     if (!nextDigestDue(pref.digest, pref.lastDigestAt, now)) {
       skipped += 1;
@@ -384,6 +395,28 @@ export async function runDigestForCompany(
       .update(notificationPreferences)
       .set({ lastDigestAt: now.toISOString() })
       .where(eq(notificationPreferences.id, pref.id));
+    /*
+     * Release everything this user was holding for the digest.
+     *
+     * The hold is a DEFERRAL, not a suppression: the moment the digest goes
+     * out (or would have gone out, for an empty window) the items become
+     * ordinary unread notifications. Released before the empty-digest early
+     * return, so a quiet cadence can never strand a held row for ever.
+     */
+    released += (
+      await db
+        .update(notifications)
+        .set({ heldForDigest: 0 })
+        .where(
+          and(
+            eq(notifications.companyId, companyId),
+            eq(notifications.userId, pref.userId),
+            eq(notifications.heldForDigest, 1),
+            lt(notifications.createdAt, now.toISOString()),
+          ),
+        )
+        .returning({ id: notifications.id })
+    ).length;
     if (summary.total === 0) {
       skipped += 1;
       continue;
@@ -410,7 +443,7 @@ export async function runDigestForCompany(
       recordId: null,
     });
   }
-  return { digests, items, skipped };
+  return { digests, items, skipped, released };
 }
 
 export const NOTIFICATION_DIGEST_JOB = DIGEST_JOB;

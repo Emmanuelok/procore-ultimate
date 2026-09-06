@@ -24,6 +24,7 @@ import {
   obligations,
   projects,
   scheduleTasks,
+  schedules,
   signals,
 } from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
@@ -34,12 +35,26 @@ let built: Awaited<ReturnType<typeof buildTestApp>>;
 let app: FastifyInstance;
 let owner: TestActor;
 let stranger: TestActor;
+let scheduleId: string;
 
 beforeAll(async () => {
   built = await buildTestApp();
   app = built.app;
   owner = await registerActor(app);
   stranger = await registerActor(app);
+  scheduleId = newId("sch");
+  const holder = newId("prj");
+  await app.db
+    .insert(projects)
+    .values({ id: holder, companyId: owner.companyId, name: "Schedule holder" });
+  await app.db.insert(schedules).values({
+    id: scheduleId,
+    companyId: owner.companyId,
+    projectId: holder,
+    name: "Baseline",
+    projectStart: todayISO(),
+    createdBy: owner.userId,
+  });
 });
 
 afterAll(async () => {
@@ -86,6 +101,7 @@ async function makeTask(pid: string, name: string, startDate: string | null, ext
   const id = newId("tsk");
   await app.db.insert(scheduleTasks).values({
     id,
+    scheduleId,
     projectId: pid,
     name,
     durationDays: 10,
@@ -661,7 +677,7 @@ describe("detectors run once, from the scheduler — not from reads", () => {
       .where(
         and(
           eq(ledgerEntries.companyId, owner.companyId),
-          eq(ledgerEntries.objectType, "land_parcel"),
+          eq(ledgerEntries.objectType, "signal"),
         ),
       );
     const created = entries.filter(
@@ -669,6 +685,7 @@ describe("detectors run once, from the scheduler — not from reads", () => {
     );
     expect(created.length).toBe(1);
     expect(created[0]!.actorId).toBeNull();
+    expect((created[0]!.payload as { about: { objectId: string } }).about.objectId).toBeTruthy();
   });
 
   it("auto-closes the finding once the parcel is acquired", async () => {
@@ -1345,7 +1362,7 @@ describe("unified consent-to-programme view", () => {
       url: `/api/v1/projects/${pid}/permits`,
       headers: owner.headers,
       payload: {
-        kind: "environmental",
+        kind: "environmental_consent",
         title: "Discharge consent",
         authority: "Environment Agency",
         blockingTaskIds: [critical],

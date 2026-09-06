@@ -102,9 +102,14 @@ export interface RetentionPreviewRow {
   objectType: string;
   retainMonths: number;
   action: string;
-  dueForAction: number;
-  heldBack: number;
-  enforced: boolean;
+  /** null where the substrate cannot count this object type — never 0. */
+  dueForAction: number | null;
+  /** How many HOLDS cover this object type (not how many records are held). */
+  holdsCovering: number;
+  /** The substrate can count what this policy would act on. */
+  counted: boolean;
+  /** Whether anything actually acts on the policy. Always false today. */
+  executed: boolean;
   note: string;
 }
 
@@ -395,7 +400,14 @@ export interface NotificationRow {
 }
 
 export interface UnreadCount {
+  /** Unread and NOT deferred to a digest — what the bell should badge. */
   count: number;
+  /**
+   * Unread but deferred until the next digest goes out (#96). Reported
+   * separately so the inbox can say "12 waiting for your weekly digest"
+   * rather than hiding them or counting them as interruptions.
+   */
+  heldForDigest?: number;
   byKind: Record<string, number>;
 }
 
@@ -467,12 +479,18 @@ export interface VendorMerge {
   targetVendorId: string;
   sourceName: string;
   targetName: string;
-  /** [{ table, column, rows }] — enough to explain and reverse the merge */
-  movements: Array<{ table: string; column: string; rows: number }>;
+  /**
+   * [{ table, column, rows, ids }] — enough to explain and reverse the merge.
+   * `ids` names the rows THIS merge moved; without it an undo would sweep up
+   * the surviving vendor's own records, so the API refuses.
+   */
+  movements: Array<{ table: string; column: string; rows: number; ids?: string[] | null }>;
   undoneAt: string | null;
   undoneBy: string | null;
   /** Stated by the API so the UI never offers an undo the API will refuse. */
   undoDeadline: string;
+  undoable?: boolean;
+  undoBlockedReason?: string | null;
   performedBy: string;
   createdAt: string;
 }

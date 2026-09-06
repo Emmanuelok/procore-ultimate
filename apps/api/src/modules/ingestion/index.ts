@@ -134,6 +134,25 @@ const programmeFieldsSchema = z.object({
   format: z.enum(["p6_xer", "msp_xml"]).optional(),
 });
 
+/**
+ * What a programme upload may be (plan §6.5). A P6 XER is a tab-delimited text
+ * file and an MS Project export is XML; browsers and CLIs send them as one of
+ * these. `application/octet-stream` is allowed because that is what a file
+ * picker reports for an unknown extension, and the filename check still holds.
+ */
+const PROGRAMME_MIME_TYPES: readonly string[] = [
+  "text/plain",
+  "text/xml",
+  "application/xml",
+  "text/x-xer",
+  "application/octet-stream",
+];
+
+const PROGRAMME_EXTENSIONS: readonly string[] = [".xer", ".xml"];
+
+/** Programme exports are text; 32 MiB is a very large one. */
+const MAX_PROGRAMME_BYTES = 32 * 1024 * 1024;
+
 const templateListQuery = pageQuerySchema.extend({
   dataset: z.enum(ALL_INGESTION_DATASETS).optional(),
   sourceId: z.string().min(1).max(64).optional(),
@@ -2163,7 +2182,36 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
     }
     const mp = await req.file();
     if (!mp) throw badRequest("Expected a multipart file upload");
+    /*
+     * MIME allowlist and a programme-specific byte cap BEFORE the file is
+     * decoded (plan §6.5). The only bound used to be the global 256 MiB
+     * multipart cap, and the activity cap was checked after the whole file had
+     * been parsed — so a quarter-gigabyte of anything at all was read into a
+     * UTF-8 string and handed to the parser first.
+     */
+    const declaredType = (mp.mimetype ?? "").split(";")[0]!.trim().toLowerCase();
+    if (declaredType && !PROGRAMME_MIME_TYPES.includes(declaredType)) {
+      throw badRequest(
+        `Content type "${declaredType}" is not a programme export. Upload a P6 XER or an ` +
+          `MS Project XML file (${PROGRAMME_MIME_TYPES.join(", ")}).`,
+      );
+    }
+    const uploadName = mp.filename ?? "";
+    if (uploadName && !PROGRAMME_EXTENSIONS.some((ext) => uploadName.toLowerCase().endsWith(ext))) {
+      throw badRequest(
+        `"${uploadName}" is not a programme export: expected a ${PROGRAMME_EXTENSIONS.join(" or ")} ` +
+          "file. A .mpp (the binary format) cannot be read — export it as XML from Microsoft " +
+          "Project first.",
+      );
+    }
     const buf = await mp.toBuffer();
+    if (buf.byteLength > MAX_PROGRAMME_BYTES) {
+      throw badRequest(
+        `Programme file is ${Math.round(buf.byteLength / 1_048_576)} MiB — the cap for a ` +
+          `programme import is ${Math.round(MAX_PROGRAMME_BYTES / 1_048_576)} MiB. Export a ` +
+          "single programme rather than a full project archive.",
+      );
+    }
     const fieldVal = (name: string): string | undefined => {
       const raw = (mp.fields as Record<string, unknown>)[name];
       const f = Array.isArray(raw) ? raw[0] : raw;

@@ -221,6 +221,13 @@ export interface ObligationRow {
 export interface PermitDetail extends PermitRow {
   blockingTasks: PermitBlockingTask[];
   obligation: ObligationRow | null;
+  /**
+   * The server's own state machine. The drawer used to offer every status as
+   * a button and the route accepted every one of them — `granted → applied`
+   * left the determination obligation satisfied and grantedAt populated, so
+   * the overdue sweep could never fire again.
+   */
+  allowedTransitions?: string[];
 }
 
 export interface ScheduleRiskItem {

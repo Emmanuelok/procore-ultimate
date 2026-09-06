@@ -445,6 +445,22 @@ describe("carbon entries from BoQ", () => {
 /* Budgets (#494-495)                                                  */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Findings are raised by the scheduled ESG detector now, not as a side effect
+ * of a read. Tests that assert on a finding trigger a cycle explicitly, which
+ * is exactly what the scheduler does on its interval.
+ */
+async function runEsgDetectorCycle(pid: string): Promise<void> {
+  const res = await app.inject({
+    method: "POST",
+    url: `/api/v1/projects/${pid}/esg/detectors/run`,
+    headers: owner.headers,
+  });
+  if (res.statusCode !== 200) {
+    throw new Error(`detector run failed: ${res.statusCode} ${res.body}`);
+  }
+}
+
 describe("carbon budgets", () => {
   it("moves on_track -> at_risk -> exceeded and signals the exceedance once", async () => {
     const pid = await makeProject("Budget drawdown");
@@ -483,16 +499,21 @@ describe("carbon budgets", () => {
     expect(items[0]!.status).toBe("exceeded");
     expect(items[0]!.actualTco2e).toBeCloseTo(10.5, 6);
 
+    // reads are PURE: the exceedance is real but nothing has been raised yet
+    expect(await budgetSignals(pid)).toHaveLength(0);
+
+    await runEsgDetectorCycle(pid);
     const raised = await budgetSignals(pid);
     expect(raised).toHaveLength(1);
     expect(raised[0]!.severity).toBe("medium");
     expect(raised[0]!.title).toContain("Frame");
     expect((raised[0]!.evidenceRefs as { budgetId: string }).budgetId).toBe(budget.id);
 
-    // re-reading, and booking more, must not raise it again
+    // re-reading, booking more and re-running the cycle must not duplicate it
     await listBudgets(pid);
     await book(1000);
     await listBudgets(pid);
+    await runEsgDetectorCycle(pid);
     expect(await budgetSignals(pid)).toHaveLength(1);
   });
 
@@ -820,12 +841,17 @@ describe("social value", () => {
         .select()
         .from(signals)
         .where(and(eq(signals.projectId, pid), eq(signals.detector, "social_value_shortfall")));
+    // the delivery recomputed the STATUS (a pure function of the numbers and
+    // the calendar) but raised no finding — that is the detector's job
+    expect(await shortfallSignals()).toHaveLength(0);
+
+    await runEsgDetectorCycle(pid);
     const raised = await shortfallSignals();
     expect(raised).toHaveLength(1);
     expect(raised[0]!.severity).toBe("medium");
     expect(raised[0]!.explanation).toContain("shortfall of 80 GBP");
 
-    // repeated reads re-run the sweep but must not re-raise
+    // repeated reads and repeated cycles must not re-raise
     for (let i = 0; i < 3; i += 1) {
       await app.inject({
         method: "GET",
@@ -833,6 +859,7 @@ describe("social value", () => {
         headers: owner.headers,
       });
     }
+    await runEsgDetectorCycle(pid);
     expect(await shortfallSignals()).toHaveLength(1);
   });
 

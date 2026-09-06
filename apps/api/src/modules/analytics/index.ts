@@ -187,12 +187,20 @@ function metricProjectClause(column: AnyPgColumn, scope: MetricScope): SQL | und
     : inArray(column, scope.projectIds as never[]);
 }
 
+/**
+ * Metric widgets are governed exactly like report widgets: each names the tool
+ * whose data it counts, and the widget resolves reach on THAT tool rather than
+ * on bare membership. `open_signals` counts assurance rows — a subcontractor
+ * membership holding `none` on assurance must not learn how many signals are
+ * open on their project through a dashboard tile.
+ */
 const METRICS: Record<
   string,
-  { label: string; run: (db: Db, scope: MetricScope) => Promise<number> }
+  { label: string; tool: ToolKey; run: (db: Db, scope: MetricScope) => Promise<number> }
 > = {
   open_obligations: {
     label: "Open obligations",
+    tool: "contracts",
     run: async (db, scope) => {
       const clauses: (SQL | undefined)[] = [
         eq(obligations.companyId, scope.companyId),
@@ -208,6 +216,7 @@ const METRICS: Record<
   },
   open_signals: {
     label: "Signals awaiting review",
+    tool: "assurance",
     run: async (db, scope) => {
       const clauses: (SQL | undefined)[] = [
         eq(signals.companyId, scope.companyId),
@@ -1362,7 +1371,6 @@ export const analyticsModule: FastifyPluginAsync = async (app) => {
           )
       : [];
     const reportsById = new Map(reportRows.map((r) => [r.id, r]));
-    const metricReach = dash.projectId ? null : await reach(req).anyReach();
     const results = [];
     for (const w of widgets) {
       const base = { widgetId: w.id, kind: w.kind, title: w.title, span: w.span };
@@ -1385,11 +1393,17 @@ export const analyticsModule: FastifyPluginAsync = async (app) => {
         } else if (w.metric) {
           if (!Object.hasOwn(METRICS, w.metric)) throw badRequest(`Unknown metric "${w.metric}"`);
           const metric = METRICS[w.metric]!;
-          if (dash.projectId) await assertProjectVisible(req, dash.projectId);
+          // A metric tile is a read of the tool it counts, so it takes the
+          // tool's reach — not bare membership. A project dashboard needs read
+          // on that project; a company-wide one counts only the projects the
+          // caller may read the tool on.
+          if (dash.projectId) {
+            await assertProjectReadable(req, dash.projectId, metric.tool);
+          }
           const value = await metric.run(app.db, {
             companyId: req.companyId!,
             projectId: dash.projectId,
-            projectIds: metricReach,
+            projectIds: dash.projectId ? null : await reach(req).reachFor(metric.tool, "read"),
           });
           results.push({ ...base, metric: w.metric, data: { label: metric.label, value } });
         } else {

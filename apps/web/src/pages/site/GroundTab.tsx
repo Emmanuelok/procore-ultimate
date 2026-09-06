@@ -9,7 +9,7 @@
  * The strike register records the three controls (permit, survey, marks) for
  * every strike, so the pattern in their absence is visible at a glance.
  */
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { toast } from "sonner";
 import { Alert, Badge, Button, Card, CardBody, Drawer, Field, Input, Select, Textarea } from "../../ui";
 import { DataTable, type DataColumns } from "../../ui/data";
@@ -75,6 +75,8 @@ function GeotechPanel({ base, lookups, onChanged }: { base: string; lookups: Sit
   const list = useResource<ListResponse<GeotechRow>>(`${base}/geotech?pageSize=200`);
   const action = useAction();
   const [open, setOpen] = useState(false);
+  /** the hole being corrected — null when the drawer is a new one */
+  const [editing, setEditing] = useState<GeotechRow | null>(null);
   const [compareResult, setCompareResult] = useState<{
     findings: GroundFindingRow[];
     slicesCompared: number;
@@ -153,7 +155,14 @@ function GeotechPanel({ base, lookups, onChanged }: { base: string; lookups: Sit
             title="Geotechnical investigations"
             hint="Flag the tender-stage holes as the baseline ground model. Everything else is compared against them — and the comparison is arithmetic, not somebody's eye."
             actions={
-              <Button size="sm" icon={IconPlus} onClick={() => setOpen(true)}>
+              <Button
+                size="sm"
+                icon={IconPlus}
+                onClick={() => {
+                  setEditing(null);
+                  setOpen(true);
+                }}
+              >
                 Record a hole
               </Button>
             }
@@ -168,18 +177,36 @@ function GeotechPanel({ base, lookups, onChanged }: { base: string; lookups: Sit
             stickyHeader
             filterRow
             exportFileName="geotech-investigations"
-            rowActions={(row) =>
-              row.isBaseline === 1 ? null : (
-                <Button size="xs" variant="ghost" loading={action.busy === "compare"} onClick={() => void compare(row)}>
-                  Compare with baseline
+            rowActions={(row) => (
+              <span className="flex gap-1">
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  onClick={() => {
+                    setEditing(row);
+                    setOpen(true);
+                  }}
+                >
+                  Edit
                 </Button>
-              )
-            }
+                {row.isBaseline === 1 ? null : (
+                  <Button size="xs" variant="ghost" loading={action.busy === "compare"} onClick={() => void compare(row)}>
+                    Compare with baseline
+                  </Button>
+                )}
+              </span>
+            )}
             empty={{
               title: "No investigations",
               description: "Enter the baseline ground model first, then the holes sunk during the works. The difference between them is a ground-conditions claim in record form.",
               action: (
-                <Button size="sm" onClick={() => setOpen(true)}>
+                <Button
+                  size="sm"
+                  onClick={() => {
+                    setEditing(null);
+                    setOpen(true);
+                  }}
+                >
                   Record the first hole
                 </Button>
               ),
@@ -229,10 +256,15 @@ function GeotechPanel({ base, lookups, onChanged }: { base: string; lookups: Sit
       <GeotechForm
         base={base}
         lookups={lookups}
+        record={editing}
         open={open}
-        onClose={() => setOpen(false)}
-        onCreated={() => {
+        onClose={() => {
           setOpen(false);
+          setEditing(null);
+        }}
+        onSaved={() => {
+          setOpen(false);
+          setEditing(null);
           list.reload();
           onChanged();
         }}
@@ -241,18 +273,23 @@ function GeotechPanel({ base, lookups, onChanged }: { base: string; lookups: Sit
   );
 }
 
+const DEFAULT_STRATA = "0, 2, Made ground, made_ground\n2, 6, Firm clay, clay, 20\n6, 12, Dense sand, sand, 40";
+
 function GeotechForm({
   base,
   lookups,
+  record,
   open,
   onClose,
-  onCreated,
+  onSaved,
 }: {
   base: string;
   lookups: SiteLookups;
+  /** the investigation being corrected, or null for a new one */
+  record: GeotechRow | null;
   open: boolean;
   onClose: () => void;
-  onCreated: () => void;
+  onSaved: () => void;
 }) {
   const action = useAction();
   const [holeRef, setHoleRef] = useState("");
@@ -262,7 +299,33 @@ function GeotechForm({
   const [depthM, setDepthM] = useState("");
   const [waterStrikeDepthM, setWaterStrikeDepthM] = useState("");
   const [contractorVendorId, setContractorVendorId] = useState("");
-  const [strata, setStrata] = useState("0, 2, Made ground, made_ground\n2, 6, Firm clay, clay, 20\n6, 12, Dense sand, sand, 40");
+  const [strata, setStrata] = useState(DEFAULT_STRATA);
+
+  // A borehole log is typed from a paper record; typos in it are inevitable,
+  // so the drawer opens on what is stored and PATCHes the difference.
+  useEffect(() => {
+    if (!open) return;
+    setHoleRef(record?.holeRef ?? "");
+    setKind(record?.kind ?? "borehole");
+    setIsBaseline(record?.isBaseline === 1);
+    setInvestigatedOn(record?.investigatedOn ?? "");
+    setDepthM(record?.depthM === null || record?.depthM === undefined ? "" : String(record.depthM));
+    setWaterStrikeDepthM(
+      record?.waterStrikeDepthM === null || record?.waterStrikeDepthM === undefined ? "" : String(record.waterStrikeDepthM),
+    );
+    setContractorVendorId("");
+    setStrata(
+      record
+        ? record.strata
+            .map((x) =>
+              [x.fromM, x.toM, x.description, x.soilType ?? "", x.spt === undefined ? "" : x.spt]
+                .join(", ")
+                .replace(/,\s*$/, ""),
+            )
+            .join("\n")
+        : DEFAULT_STRATA,
+    );
+  }, [open, record]);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -278,16 +341,30 @@ function GeotechForm({
         ...(parts[4] && Number.isFinite(Number(parts[4])) ? { spt: Number(parts[4]) } : {}),
       }))
       .filter((s) => Number.isFinite(s.fromM) && Number.isFinite(s.toM));
-    const payload: Record<string, unknown> = { holeRef: holeRef.trim(), kind, isBaseline, strata: parsed };
-    if (investigatedOn) payload["investigatedOn"] = investigatedOn;
-    if (depthM.trim()) payload["depthM"] = Number(depthM);
-    if (waterStrikeDepthM.trim()) payload["waterStrikeDepthM"] = Number(waterStrikeDepthM);
+    const payload: Record<string, unknown> = {
+      holeRef: holeRef.trim(),
+      kind,
+      isBaseline,
+      strata: parsed,
+      investigatedOn: investigatedOn || null,
+      depthM: depthM.trim() ? Number(depthM) : null,
+      waterStrikeDepthM: waterStrikeDepthM.trim() ? Number(waterStrikeDepthM) : null,
+    };
     if (contractorVendorId) payload["contractorVendorId"] = contractorVendorId;
-    const r = await action.run("create", () => api.post<GeotechRow>(`${base}/geotech`, payload));
+    if (!record) {
+      for (const key of Object.keys(payload)) {
+        if (payload[key] === null) delete payload[key];
+      }
+    }
+    const r = record
+      ? await action.run("save", () => api.patch<GeotechRow>(`${base}/geotech/${record.id}`, payload))
+      : await action.run("save", () => api.post<GeotechRow>(`${base}/geotech`, payload));
     if (r) {
-      toast.success(`${r.reference} recorded with ${r.strata.length} stratum/strata`);
-      setHoleRef("");
-      onCreated();
+      toast.success(
+        record ? `${r.reference} updated` : `${r.reference} recorded with ${r.strata.length} stratum/strata`,
+      );
+      if (!record) setHoleRef("");
+      onSaved();
     }
   }
 
@@ -295,8 +372,8 @@ function GeotechForm({
     <Drawer
       open={open}
       onClose={onClose}
-      title="Record an investigation"
-      description="Strata: one per line as `from, to, description, soil type, SPT`. Intervals must not overlap — a borehole log describes one material per depth."
+      title={record ? `Correct ${record.reference} (${record.holeRef})` : "Record an investigation"}
+      description="Strata: one per line as `from, to, description, soil type, SPT`. Intervals must not overlap — a borehole log describes one material per depth. Correcting a log does not re-open findings already raised against it; run the comparison again."
       size="md"
     >
       <form onSubmit={(e) => void submit(e)} className="space-y-3">
@@ -347,8 +424,8 @@ function GeotechForm({
           <Button type="button" variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button type="submit" loading={action.busy === "create"}>
-            Record
+          <Button type="submit" loading={action.busy === "save"}>
+            {record ? "Save" : "Record"}
           </Button>
         </div>
       </form>

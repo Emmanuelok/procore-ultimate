@@ -1143,20 +1143,23 @@ describe("delivery lines", () => {
   it("refuses lines once the receipt is closed", async () => {
     const lines = (
       await get(`/projects/${projectA}/material-deliveries/${deliveryId}`)
-    ).json().lines as Array<{ id: string }>;
+    ).json().lines as Array<{ id: string; quantityExpected: number | null }>;
+    // Received IN FULL, so the delivery closes. A partially received delivery
+    // deliberately stays open: the rest of the load may still turn up.
     const received = await post(
       `/projects/${projectA}/material-deliveries/${deliveryId}/receive`,
       {
         createStockMovements: false,
         lines: lines.map((l) => ({
           lineId: l.id,
-          quantityReceived: 1,
-          quantityAccepted: 1,
+          quantityReceived: l.quantityExpected ?? 1,
+          quantityAccepted: l.quantityExpected ?? 1,
           quantityRejected: 0,
         })),
       },
     );
     expect(received.statusCode, received.body).toBe(200);
+    expect(received.json().status).toBe("received");
 
     const late = await post(
       `/projects/${projectA}/material-deliveries/${deliveryId}/lines`,
@@ -1346,6 +1349,52 @@ describe("certificate and maintenance verification respect the caller's scope", 
     expect(ids).not.toContain(outOfScopeMachine);
   });
 
+  /*
+   * The idle list says which of a job's machines are earning nothing, which
+   * is commercially sensitive on somebody else's job. Scoping the fleet
+   * register while leaving the idle list company-wide would have handed it
+   * over anyway.
+   */
+  it("narrows the company idle list to the plant the caller may see", async () => {
+    // Nine days of near-total standing on the out-of-scope machine, so it
+    // qualifies for the idle list at all.
+    for (let i = 1; i <= 9; i += 1) {
+      const res = await post(`/projects/${projectB}/equipment-utilisation`, {
+        equipmentId: outOfScopeMachine,
+        utilisationDate: daysAgo(i),
+        availableHours: 10,
+        workingHours: 0,
+        standbyHours: 10,
+      });
+      expect(res.statusCode, res.body).toBe(201);
+    }
+    const mine = await get(
+      `/companies/current/equipment-idle?from=${daysAgo(10)}&to=${today()}`,
+    );
+    expect(mine.statusCode, mine.body).toBe(200);
+    expect(
+      (mine.json().items as Array<{ equipmentId: string }>).some(
+        (i) => i.equipmentId === outOfScopeMachine,
+      ),
+    ).toBe(true);
+
+    const theirs = await get(
+      `/companies/current/equipment-idle?from=${daysAgo(10)}&to=${today()}`,
+      scopedHeaders,
+    );
+    expect(theirs.statusCode, theirs.body).toBe(200);
+    expect(
+      (theirs.json().items as Array<{ equipmentId: string }>).some(
+        (i) => i.equipmentId === outOfScopeMachine,
+      ),
+    ).toBe(false);
+  });
+
+  it("refuses the company idle list to a guest who holds equipment nowhere", async () => {
+    const res = await get("/companies/current/equipment-idle", guestHeaders);
+    expect(res.statusCode).toBe(403);
+  });
+
   it("404s a certificate verification on plant outside that scope", async () => {
     const res = await post(
       `/companies/current/equipment-certificates/${outOfScopeCertificate}/verify`,
@@ -1515,6 +1564,19 @@ describe("telematics reconciliation recorded as assertion, evidence and reconcil
       .from(reconciliations)
       .where(eq(reconciliations.assertionId, assertionId));
     expect(recs).toHaveLength(1);
+
+    // And the superseded evidence pack goes with it: one re-run must not leave
+    // a dead pack behind in the evidence register.
+    const packs = await app.db
+      .select()
+      .from(evidence)
+      .where(
+        and(
+          eq(evidence.projectId, projectC),
+          eq(evidence.kind, "telematics"),
+        ),
+      );
+    expect(packs).toHaveLength(1);
   });
 
   it("marks a pack assembled by one of the claimants self-certified and downgrades it", async () => {

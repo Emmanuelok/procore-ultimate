@@ -121,6 +121,25 @@ describe("inductions", () => {
     expect(res.statusCode).toBe(400);
   });
 
+  it("refuses a PATCH that would invert the validity window a POST would refuse", async () => {
+    const created = await post(`/projects/${projectId}/site/inductions`, {
+      personName: "Gus Payne",
+      validFrom: "2026-06-01",
+      validUntil: "2026-12-01",
+    });
+    expect(created.statusCode).toBe(201);
+    // one call at a time must not reach a state one call is refused for
+    const inverted = await patch(`/projects/${projectId}/site/inductions/${created.json().id}`, { validUntil: "2026-01-01" });
+    expect(inverted.statusCode).toBe(400);
+    expect(inverted.json().message).toContain("expire before it becomes valid");
+    const moved = await patch(`/projects/${projectId}/site/inductions/${created.json().id}`, {
+      validFrom: "2026-01-01",
+      validUntil: "2026-02-01",
+    });
+    expect(moved.statusCode).toBe(200);
+    expect(moved.json().validUntil).toBe("2026-02-01");
+  });
+
   it("lists and filters", async () => {
     const res = await get(`/projects/${projectId}/site/inductions?status=valid`);
     expect(res.statusCode).toBe(200);
@@ -181,6 +200,24 @@ describe("passes", () => {
     expect(revoked.json().passesSuspended).toBe(1);
     const after = await app.db.select().from(siteAccessPasses).where(eq(siteAccessPasses.id, pass.json().id));
     expect(after[0]?.status).toBe("suspended");
+  });
+
+  it("refuses a pass PATCH that would invert the validity window, and corrects one that would not", async () => {
+    const inverted = await patch(`/projects/${projectId}/site/passes/${passId}`, { validUntil: "2025-01-01" });
+    expect(inverted.statusCode).toBe(400);
+    expect(inverted.json().message).toContain("expire before it becomes valid");
+    const corrected = await patch(`/projects/${projectId}/site/passes/${passId}`, { validUntil: "2027-09-30", notes: "Extended" });
+    expect(corrected.statusCode).toBe(200);
+    expect(corrected.json().validUntil).toBe("2027-09-30");
+    // the badge code is not editable — one badge, one person, for the life of the register
+    expect(corrected.json().badgeCode).toBe("B-1001");
+  });
+
+  it("refuses to move an active pass onto an induction that is not in force", async () => {
+    const failed = await post(`/projects/${projectId}/site/inductions`, { personName: "Hal Vine", scorePercent: 10, passMark: 80 });
+    const res = await patch(`/projects/${projectId}/site/passes/${passId}`, { inductionId: failed.json().id });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("not valid");
   });
 
   it("refuses to edit a revoked induction", async () => {

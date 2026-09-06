@@ -65,6 +65,7 @@ import {
   referencedVendorNames,
   unresolvedVendorNames,
 } from "./importrefs.js";
+import { companyAdminOrDelegation } from "../admin/delegation.js";
 // Phase 8 — an invitation now produces a record and a message instead of a
 // temporary password and silence. Everything about tokens, dispatch and
 // acceptance lives in modules/account; this module keeps the route.
@@ -158,10 +159,28 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
     app.requireCompany,
     app.requireCompanyRole(["owner", "admin", "member"]),
   ];
+  /**
+   * People administration: changing a company role, removing a member,
+   * revoking their sessions. Owner/admin only, and NOT delegable — a
+   * `directory` delegate who could demote an owner would have escalated
+   * itself out of the bound the delegation exists to impose.
+   */
   const adminOnly = [
     app.authenticate,
     app.requireCompany,
     app.requireCompanyRole(["owner", "admin"]),
+  ];
+  /*
+   * #27 — vendor/contact administration IS delegable. The gate admits an
+   * owner/admin as before, or a tenant-wide `directory` delegation. A
+   * project-scoped delegation deliberately does not open these: the directory
+   * is company-level, and "administer project P" is not "administer every
+   * vendor in the tenant" (modules/admin/delegation.ts).
+   */
+  const directoryAdmin = [
+    app.authenticate,
+    app.requireCompany,
+    companyAdminOrDelegation(app, "directory"),
   ];
 
   /** Refuse a delete while an active legal hold covers the record (#47). */
@@ -347,7 +366,7 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
    * read path marks the vendor instead — GET /contacts hydrates `vendorName`
    * with `vendorDeleted: true`.
    */
-  app.delete("/vendors/:vendorId", { preHandler: adminOnly }, async (req) => {
+  app.delete("/vendors/:vendorId", { preHandler: directoryAdmin }, async (req) => {
     const { vendorId } = req.params as { vendorId: string };
     const vendor = await getVendorOr404(req.companyId!, vendorId);
     await assertNoLegalHold(req.companyId!, "vendor", vendorId);
@@ -369,7 +388,7 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
     return { ok: true, deletedAt: now, restorable: true, references };
   });
 
-  app.post("/vendors/:vendorId/restore", { preHandler: adminOnly }, async (req) => {
+  app.post("/vendors/:vendorId/restore", { preHandler: directoryAdmin }, async (req) => {
     const { vendorId } = req.params as { vendorId: string };
     const vendor = await getVendorOr404(req.companyId!, vendorId, true);
     if (!vendor.deletedAt) return { ok: true, alreadyActive: true };
@@ -394,7 +413,7 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
   });
 
   /** Deleted vendors and contacts, for the recycle bin. */
-  app.get("/directory/recycle-bin", { preHandler: adminOnly }, async (req) => {
+  app.get("/directory/recycle-bin", { preHandler: directoryAdmin }, async (req) => {
     const deletedVendors = await app.db
       .select({
         id: vendors.id,
@@ -434,7 +453,7 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
    * Read-only and explainable: nothing is merged here. The confidence and
    * the reason list are what an administrator decides on.
    */
-  app.get("/vendors/duplicates", { preHandler: adminOnly }, async (req) => {
+  app.get("/vendors/duplicates", { preHandler: directoryAdmin }, async (req) => {
     const q = z
       .object({
         limit: z.coerce.number().int().min(1).max(200).default(50),
@@ -586,7 +605,7 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
     };
   });
 
-  app.post("/vendors/:vendorId/merge", { preHandler: adminOnly }, async (req) => {
+  app.post("/vendors/:vendorId/merge", { preHandler: directoryAdmin }, async (req) => {
     const { vendorId } = req.params as { vendorId: string };
     const body = z.object({ intoVendorId: z.string().min(1) }).parse(req.body);
     if (body.intoVendorId === vendorId) {
@@ -692,7 +711,7 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
    * `MERGE_UNDO_MAX_ROWS`, or one written before ids were recorded) is
    * refused rather than guessed at.
    */
-  app.post("/vendor-merges/:mergeId/undo", { preHandler: adminOnly }, async (req) => {
+  app.post("/vendor-merges/:mergeId/undo", { preHandler: directoryAdmin }, async (req) => {
     const { mergeId } = req.params as { mergeId: string };
     const rows = await app.db
       .select()
@@ -768,7 +787,7 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
    * exists to be read. `undoDeadline` is stated rather than left for the
    * caller to compute, so the UI never offers an undo the API will refuse.
    */
-  app.get("/vendor-merges", { preHandler: adminOnly }, async (req) => {
+  app.get("/vendor-merges", { preHandler: directoryAdmin }, async (req) => {
     const q = pageQuerySchema.parse(req.query);
     const where = eq(vendorMerges.companyId, req.companyId!);
     const [totalRow] = await app.db.select({ n: count() }).from(vendorMerges).where(where);
@@ -1647,7 +1666,7 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
   /* Bulk edit and CSV import (#76, #77)                               */
   /* ---------------------------------------------------------------- */
 
-  app.post("/vendors/bulk", { preHandler: adminOnly }, async (req) => {
+  app.post("/vendors/bulk", { preHandler: directoryAdmin }, async (req) => {
     const body = z
       .object({
         ids: z.array(z.string().min(1)).min(1).max(500),
@@ -1700,7 +1719,7 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
     return { updated: rows.length, refused };
   });
 
-  app.post("/contacts/bulk", { preHandler: adminOnly }, async (req) => {
+  app.post("/contacts/bulk", { preHandler: directoryAdmin }, async (req) => {
     const body = z
       .object({
         ids: z.array(z.string().min(1)).min(1).max(500),
@@ -1761,7 +1780,7 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
    * The commit replays the stored rows so the person cannot review one file
    * and commit another.
    */
-  app.post("/directory/imports/:jobId/commit", { preHandler: adminOnly }, async (req) => {
+  app.post("/directory/imports/:jobId/commit", { preHandler: directoryAdmin }, async (req) => {
     const { jobId } = req.params as { jobId: string };
     const rows = await app.db
       .select()

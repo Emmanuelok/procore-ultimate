@@ -148,6 +148,17 @@ function ScheduleRiskBanner({ risk }: { risk: ScheduleRiskResponse }) {
 
 /* ================================== Tab =================================== */
 
+/** Statuses from which "applied" is a RE-application, not a first one. */
+const PERMIT_REAPPLY_FROM: readonly string[] = ["refused", "expired"];
+
+const TRANSITION_HINTS: Record<string, string> = {
+  applied: "Starts the statutory determination clock and opens the determination obligation.",
+  in_review: "The authority has the application and is considering it.",
+  refused:
+    "A determination: it discharges the determination obligation. The programme consequence shows in the consent view.",
+  expired: "A granted consent that has lapsed. Any dependent work is now unauthorised.",
+};
+
 export default function PermitsTab({ projectId }: { projectId: string }) {
   const base = `/api/v1/projects/${projectId}`;
 
@@ -870,25 +881,40 @@ export default function PermitsTab({ projectId }: { projectId: string }) {
             <div className="mb-4 rounded-md bg-ink-50 p-3">
               <p className="mb-2 text-xs font-medium text-ink-600">Record a determination</p>
               <div className="flex flex-wrap gap-2">
-                <Button size="sm" disabled={detailBusy} onClick={openGrant}>
-                  Grant…
-                </Button>
-                {PERMIT_STATUSES.filter((s) => s !== "granted").map((s) => (
-                  <Button
-                    key={s}
-                    size="sm"
-                    variant="secondary"
-                    disabled={detailBusy || detail.status === s}
-                    onClick={() => void setStatus(s)}
-                  >
-                    {PERMIT_STATUS_LABELS[s] ?? s}
+                {(detail.allowedTransitions ?? []).includes("granted") ? (
+                  <Button size="sm" disabled={detailBusy} onClick={openGrant}>
+                    Grant…
                   </Button>
-                ))}
+                ) : null}
+                {(detail.allowedTransitions ?? [])
+                  .filter((s) => s !== "granted")
+                  .map((s) => (
+                    <Button
+                      key={s}
+                      size="sm"
+                      variant="secondary"
+                      disabled={detailBusy}
+                      onClick={() => void setStatus(s)}
+                      title={TRANSITION_HINTS[s]}
+                    >
+                      {s === "applied" && PERMIT_REAPPLY_FROM.includes(detail.status)
+                        ? "Re-apply"
+                        : (PERMIT_STATUS_LABELS[s] ?? s)}
+                    </Button>
+                  ))}
+                {(detail.allowedTransitions ?? []).length === 0 ? (
+                  <span className="text-xs text-ink-400">
+                    No determination can be recorded from{" "}
+                    {PERMIT_STATUS_LABELS[detail.status] ?? detail.status}.
+                  </span>
+                ) : null}
               </div>
               <p className="mt-2 text-[11px] leading-relaxed text-ink-400">
-                A refusal is a determination too — it discharges the determination obligation, and
-                the programme consequence surfaces in the consent-to-programme view rather than
-                being buried in the status.
+                Only the transitions the statutory process actually allows are offered. A refusal
+                is a determination too — it discharges the determination obligation, and the
+                programme consequence surfaces in the consent-to-programme view rather than being
+                buried in the status. Re-applying after a refusal or a lapse opens a FRESH
+                determination clock and a new obligation.
               </p>
             </div>
 

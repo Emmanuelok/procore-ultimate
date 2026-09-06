@@ -37,7 +37,7 @@ import { appendLedger } from "../../lib/ledger.js";
 import { forEachCompany } from "../../lib/scheduler.js";
 import type { Db } from "../../lib/db.js";
 import { metricByKey, percentileOf, round2 } from "../benchmarks/metrics.js";
-import { assessPool, readCell, type PoolVerdict } from "../benchmarks/pool.js";
+import { assessPool, hasContributed, readCell, type PoolVerdict } from "../benchmarks/pool.js";
 
 export type ForecastKindKey = ForecastKind;
 
@@ -86,6 +86,10 @@ export interface ForecastComputation {
   referenceClass: string | null;
   sampleSize: number;
   contributors: number;
+  /** true when the figures came from illustrative seed rows, not outcomes */
+  seedOnly: boolean;
+  /** whether the tenant has earned access to the contributed pool (#855) */
+  contributedAccess: boolean;
   basis: string;
   inputs: Record<string, unknown>;
   reasons: string[];
@@ -103,6 +107,8 @@ export function buildForecast(input: {
   pool: PoolVerdict;
   referenceClass: string | null;
   seedOnly: boolean;
+  /** defaults to true: only the database-facing path can know otherwise */
+  contributedAccess?: boolean;
 }): ForecastComputation {
   const reasons: string[] = [...input.growthReasons];
   const values = input.pool.suppressed ? [] : input.pool.values;
@@ -139,6 +145,8 @@ export function buildForecast(input: {
     referenceClass: input.referenceClass,
     sampleSize: values.length,
     contributors: input.pool.contributors,
+    seedOnly: input.seedOnly,
+    contributedAccess: input.contributedAccess ?? true,
     basis,
     inputs: {
       ...input.growthInputs,
@@ -245,9 +253,43 @@ export async function computeForecast(
   }
 
   const key = { metric: metricKey, assetClass, region, currency: null };
-  const contributed = await readCell(db, key, "contributed");
-  let pool = assessPool(contributed, req.companyId);
+
+  /*
+   * CONTRIBUTE-TO-ACCESS (#855) APPLIES HERE TOO.
+   *
+   * This route reads the very cells GET /benchmarks/distributions,
+   * /benchmarks/compare and /benchmarks/reference-classes/forecast gate behind
+   * hasContributed(). Without the same check a tenant that had never
+   * contributed a single sample read the other tenants' contributed P50/P80
+   * uplift and exceedance probabilities through the forecast — the reference
+   * class is derivable from nothing more than projects.settings, so it cost
+   * them nothing. A door is never allowed to be wider than the room it opens
+   * onto, least of all across a tenant boundary.
+   */
+  const contributedAccess = await hasContributed(db, req.companyId, metricKey);
+  let pool: PoolVerdict;
   let seedOnly = false;
+  const accessReasons: string[] = [];
+  if (contributedAccess) {
+    const contributed = await readCell(db, key, "contributed");
+    pool = assessPool(contributed, req.companyId);
+  } else {
+    pool = {
+      rows: [],
+      values: [],
+      totalSamples: 0,
+      contributors: 0,
+      ownSamples: 0,
+      suppressed: false,
+      reasons: [],
+      disclosures: [],
+    };
+    accessReasons.push(
+      `Access to the contributed "${metricKey}" pool is seed-only: contribute a snapshot of ` +
+        "that metric to be compared against other contributors' outcomes (#855 " +
+        "contribute-to-access).",
+    );
+  }
   if (pool.suppressed || pool.values.length === 0) {
     const seed = await readCell(db, key, "seed");
     if (seed.length > 0) {
@@ -259,11 +301,16 @@ export async function computeForecast(
   return buildForecast({
     kind: req.kind,
     growthToDate: computation.value,
-    growthReasons: computation.reasons,
-    growthInputs: { ...computation.inputs, referenceClassSource: derived.source },
+    growthReasons: [...computation.reasons, ...accessReasons],
+    growthInputs: {
+      ...computation.inputs,
+      referenceClassSource: derived.source,
+      contributedAccess,
+    },
     pool,
     referenceClass: `${assetClass}/${region}`,
     seedOnly,
+    contributedAccess,
   });
 }
 
