@@ -946,6 +946,55 @@ describe("login audit and export (§0.2)", () => {
     expect(lines.length).toBeGreaterThan(1);
   });
 
+  /**
+   * AN EXPORT IS AN ACCESS, NOT A POLICY CHANGE.
+   *
+   * The export used to record itself as `security_policy_changed`: a false
+   * statement in the one log that must not carry one. The row is filterable as
+   * a policy change on the page above it and is pushed to every tenant SIEM,
+   * so a customer's detection rule on "a security policy changed" fired on
+   * every export and an auditor counting policy changes got the wrong number.
+   */
+  it("records the export under its own kind, and not as a policy change", async () => {
+    const actor = await signUp(app);
+    const before = await app.db
+      .select()
+      .from(authSecurityEvents)
+      .where(
+        and(
+          eq(authSecurityEvents.companyId, actor.companyId),
+          eq(authSecurityEvents.kind, "security_policy_changed"),
+        ),
+      );
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/v1/company/security-events/export?format=json",
+      headers: actor.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const exported = await app.db
+      .select()
+      .from(authSecurityEvents)
+      .where(
+        and(
+          eq(authSecurityEvents.companyId, actor.companyId),
+          eq(authSecurityEvents.kind, "security_events_exported"),
+        ),
+      );
+    expect(exported).toHaveLength(1);
+    expect(exported[0]!.reason).toContain("exported");
+    const after = await app.db
+      .select()
+      .from(authSecurityEvents)
+      .where(
+        and(
+          eq(authSecurityEvents.companyId, actor.companyId),
+          eq(authSecurityEvents.kind, "security_policy_changed"),
+        ),
+      );
+    expect(after).toHaveLength(before.length);
+  });
+
   it("exports JSON when asked, with the row count and the bound", async () => {
     const actor = await signUp(app);
     const res = await app.inject({
@@ -1285,6 +1334,72 @@ describe("SCIM 2.0 (#21)", () => {
         ),
       );
     expect(ownerRow?.role).toBe("owner");
+  });
+
+  /**
+   * THE DIRECTORY PAGES IN THE DATABASE.
+   *
+   * `GET /Users` used to load every member of the tenant and slice the array,
+   * so an IdP walking startIndex/count re-read the whole membership on every
+   * page — the "no roll-up may load an unbounded table into memory" rule, on
+   * the one route a directory hits in a loop. The count is now a `count()` and
+   * the page is a LIMIT/OFFSET, so `totalResults` must still be the full
+   * total while the page is exactly one row.
+   */
+  it("pages in the database: totalResults is the whole set, the page is not", async () => {
+    for (let i = 0; i < 3; i += 1) {
+      const created = await scim("POST", "/Users", {
+        userName: `scim-page-${i}-${Date.now()}@test.dev`,
+      });
+      expect(created.statusCode).toBe(201);
+    }
+    const all = await scim("GET", "/Users");
+    const total = (all.json() as { totalResults: number }).totalResults;
+    expect(total).toBeGreaterThanOrEqual(4);
+
+    const page = await scim("GET", "/Users?startIndex=2&count=1");
+    const body = page.json() as {
+      totalResults: number;
+      itemsPerPage: number;
+      startIndex: number;
+      Resources: unknown[];
+    };
+    expect(body.totalResults).toBe(total);
+    expect(body.itemsPerPage).toBe(1);
+    expect(body.startIndex).toBe(2);
+    expect(body.Resources).toHaveLength(1);
+
+    // The pages tile the set rather than repeating it.
+    const first = await scim("GET", "/Users?startIndex=1&count=1");
+    const firstId = (first.json() as { Resources: Array<{ id: string }> }).Resources[0]?.id;
+    const secondId = (body.Resources as Array<{ id: string }>)[0]?.id;
+    expect(firstId).toBeTruthy();
+    expect(secondId).not.toBe(firstId);
+  });
+
+  /**
+   * THE OWNER GUARD RUNS IN BOTH DIRECTIONS.
+   *
+   * Filtering only the removal branch left the other half open: adding the
+   * owner to `role:admin` took the GRANT branch and wrote `role = admin` over
+   * `owner`, so the mapping mistake that could not remove an owner could still
+   * demote the last one — exactly the lockout the guard exists to prevent.
+   */
+  it("will not let a directory demote an owner by granting them another role", async () => {
+    const promote = await scim("PATCH", "/Groups/role:admin", {
+      Operations: [{ op: "add", path: "members", value: [{ value: actor.userId }] }],
+    });
+    expect(promote.statusCode).toBe(200);
+    const [row] = await app.db
+      .select()
+      .from(companyMemberships)
+      .where(
+        and(
+          eq(companyMemberships.companyId, actor.companyId),
+          eq(companyMemberships.userId, actor.userId),
+        ),
+      );
+    expect(row?.role).toBe("owner");
   });
 
   it("a revoked token stops working immediately", async () => {

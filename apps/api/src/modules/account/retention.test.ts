@@ -284,6 +284,118 @@ describe("authentication-record retention (§0.2 #46, #47)", () => {
     expect(res.statusCode).toBe(403);
   });
 
+  /**
+   * A SWEEP THAT DESTROYS RECORDS MUST APPEAR IN THE LOG THE TENANT WATCHES.
+   *
+   * `retention_applied` was declared in enums-auth.ts and emitted by nothing:
+   * the ledger recorded the sweep, but the ledger is not what a SIEM consumes
+   * and not what /company/security-events shows. Worse, the sweep pseudonymises
+   * rows in the very table a tenant would look at to notice — so without this
+   * row the destruction is invisible from the audit surface by construction.
+   */
+  it("records retention_applied in the trail, with the counts", async () => {
+    const actor = await signUp(app);
+    await plantTrailRow(app, actor, 400);
+    await plantDispatch(app, actor, 400);
+    await app.inject({
+      method: "PUT",
+      url: "/api/v1/company/security-policy",
+      headers: actor.headers,
+      payload: { securityEventRetentionDays: 30, emailDispatchRetentionDays: 30 },
+    });
+    const outcome = await applyRetention(app.db, actor.companyId);
+    expect(outcome.skipped).toBe(false);
+
+    const rows = await app.db
+      .select()
+      .from(authSecurityEvents)
+      .where(
+        and(
+          eq(authSecurityEvents.companyId, actor.companyId),
+          eq(authSecurityEvents.kind, "retention_applied"),
+        ),
+      );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.outcome).toBe("success");
+    expect(rows[0]!.reason).toContain("pseudonymised");
+    const metadata = rows[0]!.metadata as { securityEventsPseudonymised?: number; trigger?: string };
+    expect(metadata.securityEventsPseudonymised).toBe(outcome.securityEventsPseudonymised);
+    expect(metadata.trigger).toBe("scheduled");
+    // The row it wrote is younger than any cutoff, so it does not sweep itself.
+    expect(rows[0]!.ip).toBeNull();
+  });
+
+  it("records the run a legal hold stopped, and says nothing when no policy is set", async () => {
+    const held = await signUp(app);
+    await app.inject({
+      method: "PUT",
+      url: "/api/v1/company/security-policy",
+      headers: held.headers,
+      payload: {
+        securityEventRetentionDays: 30,
+        legalHold: true,
+        legalHoldReason: "Adjudication 2026/114 — preserve everything",
+      },
+    });
+    await applyRetention(app.db, held.companyId);
+    const heldRows = await app.db
+      .select()
+      .from(authSecurityEvents)
+      .where(
+        and(
+          eq(authSecurityEvents.companyId, held.companyId),
+          eq(authSecurityEvents.kind, "retention_applied"),
+        ),
+      );
+    expect(heldRows).toHaveLength(1);
+    expect(heldRows[0]!.outcome).toBe("blocked");
+    expect(heldRows[0]!.reason).toContain("Adjudication 2026/114");
+
+    // A tenant that has chosen no retention is the state of most tenants on
+    // most days: writing a row daily for each of them would bury the log.
+    const quiet = await signUp(app);
+    await applyRetention(app.db, quiet.companyId);
+    const quietRows = await app.db
+      .select()
+      .from(authSecurityEvents)
+      .where(
+        and(
+          eq(authSecurityEvents.companyId, quiet.companyId),
+          eq(authSecurityEvents.kind, "retention_applied"),
+        ),
+      );
+    expect(quietRows).toHaveLength(0);
+  });
+
+  it("names the administrator who ran retention by hand", async () => {
+    const actor = await signUp(app);
+    await plantTrailRow(app, actor, 400);
+    await app.inject({
+      method: "PUT",
+      url: "/api/v1/company/security-policy",
+      headers: actor.headers,
+      payload: { securityEventRetentionDays: 30 },
+    });
+    const run = await app.inject({
+      method: "POST",
+      url: "/api/v1/company/security/retention/run",
+      headers: actor.headers,
+    });
+    expect(run.statusCode).toBe(200);
+    const rows = await app.db
+      .select()
+      .from(authSecurityEvents)
+      .where(
+        and(
+          eq(authSecurityEvents.companyId, actor.companyId),
+          eq(authSecurityEvents.kind, "retention_applied"),
+        ),
+      );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.userId).toBe(actor.userId);
+    expect((rows[0]!.metadata as { trigger?: string }).trigger).toBe("manual");
+  });
+
   it("registers the retention sweep with the platform scheduler", async () => {
     const names = app.scheduler.list().map((j) => j.name);
     expect(names).toContain("account.trail-retention");
