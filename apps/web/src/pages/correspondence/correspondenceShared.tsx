@@ -987,6 +987,10 @@ export const corrApi = {
     api.post<CorrespondenceType>("/api/v1/correspondence/types", body),
   patchType: (id: string, body: Record<string, unknown>) =>
     api.patch<CorrespondenceType>(`/api/v1/correspondence/types/${id}`, body),
+  deleteType: (id: string) =>
+    api.del<{ deleted: boolean; deactivated: boolean; letterCount: number }>(
+      `/api/v1/correspondence/types/${id}`,
+    ),
 
   /* letters */
   createLetter: (projectId: string, body: Record<string, unknown>) =>
@@ -1047,6 +1051,8 @@ export const corrApi = {
   /* action plans */
   createPlanTemplate: (body: Record<string, unknown>) =>
     api.post<ActionPlanTemplate>("/api/v1/correspondence/action-plan-templates", body),
+  patchPlanTemplate: (id: string, body: Record<string, unknown>) =>
+    api.patch<ActionPlanTemplate>(`/api/v1/correspondence/action-plan-templates/${id}`, body),
   createPlan: (projectId: string, body: Record<string, unknown>) =>
     api.post<ActionPlanDetail>(`${p(projectId)}/action-plans`, body),
   activatePlan: (projectId: string, id: string) =>
@@ -1061,6 +1067,12 @@ export const corrApi = {
     api.post<{ activity: PlanActivity; progress: PlanProgress; planStatus: string }>(
       `${p(projectId)}/activities/${activityId}/signoffs/${signoffId}/sign`,
       body,
+    ),
+  /** close an activity the plan asked nobody to sign */
+  completeActivity: (projectId: string, activityId: string, note?: string) =>
+    api.post<{ progress: PlanProgress; planStatus: string } & PlanActivity>(
+      `${p(projectId)}/activities/${activityId}/complete`,
+      { note },
     ),
   waive: (projectId: string, activityId: string, reason: string) =>
     api.post<PlanActivity>(`${p(projectId)}/activities/${activityId}/waive`, { reason }),

@@ -33,6 +33,8 @@ import {
 import { IconPlus, IconUsers } from "../../ui/icons";
 import {
   DASH,
+  EditButton,
+  EditForm,
   JV_DECISION_TYPES,
   JV_LIABILITY_BASES,
   JV_PARTNER_ROLES,
@@ -52,11 +54,64 @@ import {
   useAction,
   useResource,
   type DecisionOutcome,
+  type EditFieldSpec,
+  type JvPartner,
   type JvTransaction,
   type Paginated,
   type PartnerPosition,
   type Venture,
 } from "./portfolioShared";
+
+/* ============================ Edit field sets ============================= */
+
+const VENTURE_FIELDS: readonly EditFieldSpec[] = [
+  { key: "name", label: "Venture name", type: "text", wide: true },
+  { key: "structure", label: "Structure", type: "select", options: JV_STRUCTURES },
+  { key: "status", label: "Status", type: "select", options: ["forming", "active", "winding_up", "dissolved"] },
+  { key: "deedReference", label: "Deed reference", type: "text", nullable: true },
+  { key: "registeredNumber", label: "Registered number", type: "text", nullable: true },
+  { key: "jurisdiction", label: "Jurisdiction", type: "text", nullable: true },
+  {
+    key: "quorumPercent",
+    label: "Quorum %",
+    type: "number",
+    min: 0,
+    step: 0.01,
+    nullable: true,
+    hint: "Blank means the deed records none, and a vote is then treated as quorate — which the minute says.",
+  },
+  {
+    key: "reservedMatterThresholdPercent",
+    label: "Reserved-matter threshold %",
+    type: "number",
+    min: 0,
+    step: 0.01,
+    nullable: true,
+    hint: "Blank means unanimity of the shares present is required for a reserved matter.",
+  },
+  { key: "formationDate", label: "Formed", type: "date", nullable: true },
+  { key: "endDate", label: "Ends", type: "date", nullable: true },
+  { key: "notes", label: "Notes", type: "textarea", nullable: true, wide: true },
+];
+
+const PARTNER_FIELDS: readonly EditFieldSpec[] = [
+  { key: "name", label: "Partner name", type: "text", wide: true },
+  { key: "role", label: "Role", type: "select", options: JV_PARTNER_ROLES },
+  { key: "sharePercent", label: "Share %", type: "number", min: 0, step: 0.01 },
+  { key: "committedCapital", label: "Committed capital", type: "number", min: 0, step: 0.01, nullable: true },
+  { key: "liabilityBasis", label: "Liability basis", type: "select", options: JV_LIABILITY_BASES },
+  { key: "boardSeats", label: "Board seats", type: "number", min: 0, step: 1, nullable: true },
+  { key: "status", label: "Status", type: "select", options: ["active", "withdrawn", "transferred"] },
+  { key: "joinedAt", label: "Joined", type: "date", nullable: true },
+  { key: "leftAt", label: "Left", type: "date", nullable: true },
+  {
+    key: "isSelf",
+    label: "This is our own participation",
+    type: "checkbox",
+    hint: "A venture has one \"our share\"; the API refuses a second.",
+  },
+  { key: "notes", label: "Notes", type: "textarea", nullable: true, wide: true },
+];
 
 export default function VenturesTab({ projectId, onChanged }: { projectId: string; onChanged: () => void }) {
   const list = useResource<Paginated<Venture>>(
@@ -190,6 +245,8 @@ function VentureDrawer({
   const [votes, setVotes] = useState<Record<string, string>>({});
   const [decisionForm, setDecisionForm] = useState<Record<string, string>>({ decisionType: "ordinary" });
   const [preview, setPreview] = useState<DecisionOutcome | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [editingPartner, setEditingPartner] = useState<JvPartner | null>(null);
 
   useEffect(() => {
     setPartnerForm({});
@@ -197,6 +254,8 @@ function VentureDrawer({
     setVotes({});
     setDecisionForm({ decisionType: "ordinary" });
     setPreview(null);
+    setEditing(false);
+    setEditingPartner(null);
     action.clear();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jvId]);
@@ -337,6 +396,30 @@ function VentureDrawer({
     [v?.partners],
   );
 
+  async function saveVenture(patch: Record<string, unknown>) {
+    if (!jvId) return;
+    const res = await action.run("edit", () => api.patchVenture(jvId, patch));
+    if (res) {
+      toast.success("Venture updated");
+      setEditing(false);
+      detail.reload();
+      onChanged();
+    }
+  }
+
+  async function savePartner(patch: Record<string, unknown>) {
+    if (!jvId || !editingPartner) return;
+    const res = await action.run("edit-partner", () =>
+      api.patchPartner(jvId, editingPartner.id, patch),
+    );
+    if (res) {
+      toast.success(`${res.partner.name} updated`);
+      setEditingPartner(null);
+      detail.reload();
+      onChanged();
+    }
+  }
+
   async function addPartner(e: FormEvent) {
     e.preventDefault();
     if (!jvId) return;
@@ -455,6 +538,22 @@ function VentureDrawer({
             </Alert>
           ) : null}
 
+          {v.status !== "dissolved" ? (
+            <div className="flex justify-end">
+              <EditButton editing={editing} onToggle={() => setEditing((x) => !x)} />
+            </div>
+          ) : null}
+          {editing ? (
+            <EditForm
+              key={v.id}
+              fields={VENTURE_FIELDS}
+              initial={v as unknown as Record<string, unknown>}
+              busy={action.busy === "edit"}
+              onSubmit={saveVenture}
+              onCancel={() => setEditing(false)}
+              note="The currency is fixed: the contributions and distributions already recorded are in it, and this platform never converts."
+            />
+          ) : null}
           <dl className="divide-y divide-border">
             <Row label="Deed">{v.deedReference ?? DASH}</Row>
             <Row label="Formed">{isoDate(v.formationDate)}</Row>
@@ -500,6 +599,38 @@ function VentureDrawer({
               empty={{ title: "No partners on the register" }}
               aria-label="Partner positions"
             />
+            {(v.partners ?? []).length > 0 ? (
+              <div className="mt-2 flex flex-wrap gap-1">
+                <span className="self-center text-2xs text-content-subtle">Correct a partner:</span>
+                {(v.partners ?? []).map((partner) => (
+                  <Button
+                    key={partner.id}
+                    size="xs"
+                    variant="ghost"
+                    onClick={() => setEditingPartner(partner)}
+                  >
+                    {partner.name}
+                    {partner.isSelf ? " (us)" : ""}
+                  </Button>
+                ))}
+              </div>
+            ) : null}
+            {editingPartner ? (
+              <div className="mt-2">
+                <EditForm
+                  key={editingPartner.id}
+                  fields={PARTNER_FIELDS}
+                  initial={
+                    { ...editingPartner, isSelf: editingPartner.isSelf } as unknown as Record<string, unknown>
+                  }
+                  busy={action.busy === "edit-partner"}
+                  submitLabel={`Save ${editingPartner.name}`}
+                  onSubmit={savePartner}
+                  onCancel={() => setEditingPartner(null)}
+                  note="Shares are the basis of every vote and every distribution on this screen; changing one re-computes the whole register."
+                />
+              </div>
+            ) : null}
             <form onSubmit={addPartner} className="mt-2 grid gap-2 rounded-md border border-border p-2 sm:grid-cols-6">
               <Field label="Name" className="sm:col-span-2">
                 <Input

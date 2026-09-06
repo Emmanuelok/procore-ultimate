@@ -49,7 +49,7 @@
  *     reconciliation engine's job.
  */
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, gt, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, gt, ne, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   anchorSubmissions,
@@ -63,7 +63,6 @@ import { ANCHOR_PROVIDERS, type AnchorProvider, type ChainVerdict } from "@const
 import {
   buildSealBody,
   canonicalize,
-  classifyChain,
   hashPayload,
   merkleRoot,
   sealBodyHash,
@@ -76,6 +75,13 @@ import {
   type SealRecord,
   type SealedChainEntry,
 } from "@constructos/ledger";
+import {
+  checkpointCountsFor,
+  classifyScan,
+  scanChain,
+  type ChainScan,
+  type ScanEntry,
+} from "./scan.js";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { forEachCompany } from "../../lib/scheduler.js";
@@ -221,7 +227,7 @@ function isoOf(value: string): string {
 
 /**
  * Build a `SealRecord` from a stored row WITHOUT validating it. Validation is
- * `classifyChain`'s job: a row with an impossible `entryCount` must produce a
+ * `classifyScan`'s job: a row with an impossible `entryCount` must produce a
  * verdict, not a 500.
  */
 function toSealRecord(row: SealRow): SealRecord {
@@ -310,6 +316,18 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
     };
   }
 
+  /**
+   * May a TENANT admin retire platform-wide signing keys from this route?
+   *
+   * Off unless the deployment says otherwise: signing keys with a null
+   * companyId are read by every tenant, and one tenant's admin must not be
+   * able to mark another's key register retired.
+   */
+  function platformKeyRetirementAllowed(): boolean {
+    const raw = (process.env["ANCHOR_ALLOW_TENANT_KEY_RETIREMENT"] ?? "").trim().toLowerCase();
+    return raw === "1" || raw === "true" || raw === "yes";
+  }
+
   /** Heartbeat interval in hours; bounds how long a truncation can hide. */
   function heartbeatHours(): number {
     const raw = Number(process.env["ANCHOR_HEARTBEAT_HOURS"]);
@@ -321,26 +339,26 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
   /* ---------------------------------------------------------------- */
 
   /**
-   * The chain, WITHOUT payload snapshots, read in bounded pages.
+   * The chain, WITHOUT payload snapshots, read one bounded page at a time.
    *
    * The chain covers `payloadHash`, never the snapshot the hash was taken
    * over, so every link check, every entry-hash check and every Merkle root is
-   * answerable from the hash columns alone. Loading `payload` jsonb as well —
-   * which is what this used to do, on every seal list, every chain verdict,
-   * every per-seal verify and every escrow verification — made a monitoring
-   * read scale with the tenant's entire commercial history and could OOM the
-   * process from a single page view.
+   * answerable from the hash columns alone.
+   *
+   * Nothing accumulates the pages. `scanChain` folds each one into a running
+   * previous-hash, a Merkle frontier and a handful of per-seal checkpoints, so
+   * a verdict costs O(log n) memory however old the tenant is. It used to cost
+   * O(n) — one JS object per ledger entry, on an endpoint the Ledger workspace
+   * fires several times on mount, which is how a single page view could take
+   * the API down on a large tenant.
    *
    * The snapshot re-hash is not lost; it moved to `deepVerifyPayloads`, which
    * runs on the scheduler in bounded batches and records its progress on the
    * per-company watermark. That is the right place for it: it is the expensive
    * check, and it is the one nobody should be able to trigger by opening a tab.
    */
-  async function loadEntries(companyId: string): Promise<SealedChainEntry[]> {
-    const out: SealedChainEntry[] = [];
-    let cursor = 0;
-    const batchSize = 10_000;
-    for (;;) {
+  function chainPageReader(companyId: string) {
+    return async (afterSeq: number, limit: number): Promise<ScanEntry[]> => {
       const rows = await app.db
         .select({
           seq: ledgerEntries.seq,
@@ -355,30 +373,36 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
           entryHash: ledgerEntries.entryHash,
         })
         .from(ledgerEntries)
-        .where(and(eq(ledgerEntries.companyId, companyId), gt(ledgerEntries.seq, cursor)))
+        .where(and(eq(ledgerEntries.companyId, companyId), gt(ledgerEntries.seq, afterSeq)))
         .orderBy(asc(ledgerEntries.seq))
-        .limit(batchSize);
-      if (rows.length === 0) break;
-      for (const r of rows) {
-        out.push({
-          seq: Number(r.seq),
-          companyId: r.companyId,
-          actorId: r.actorId,
-          action: r.action,
-          objectType: r.objectType,
-          objectId: r.objectId,
-          payloadHash: r.payloadHash,
-          // Deliberately absent: `undefined` means "nothing is claimed about
-          // the snapshot", which is exactly true here (see deepVerifyPayloads).
-          at: isoOf(r.at),
-          prevHash: r.prevHash,
-          entryHash: r.entryHash,
-        });
-      }
-      cursor = Number(rows[rows.length - 1]!.seq);
-      if (rows.length < batchSize) break;
-    }
-    return out;
+        .limit(limit);
+      return rows.map((r) => ({
+        seq: Number(r.seq),
+        companyId: r.companyId,
+        actorId: r.actorId,
+        action: r.action,
+        objectType: r.objectType,
+        objectId: r.objectId,
+        payloadHash: r.payloadHash,
+        at: isoOf(r.at),
+        prevHash: r.prevHash,
+        entryHash: r.entryHash,
+      }));
+    };
+  }
+
+  /**
+   * Walk this company's chain once, checkpointing at every position a seal
+   * commits to (plus anything the caller additionally needs).
+   */
+  async function scanCompanyChain(
+    companyId: string,
+    extraCheckpoints: number[] = [],
+  ): Promise<ChainScan> {
+    const seals = await loadSeals(companyId);
+    return scanChain(chainPageReader(companyId), {
+      checkpoints: [...checkpointCountsFor(seals), ...extraCheckpoints],
+    });
   }
 
   /**
@@ -721,15 +745,17 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
     return [...new Set(seals.map((s) => s.keyId))].filter((id) => id !== held);
   }
 
-  async function classifyCompany(companyId: string): Promise<VerdictResult> {
-    const [entries, sealRows, keys] = await Promise.all([
-      loadEntries(companyId),
-      loadSeals(companyId),
-      publicKeyMap(companyId),
-    ]);
+  async function classifyCompany(
+    companyId: string,
+    extraCheckpoints: number[] = [],
+  ): Promise<VerdictResult & { scan: ChainScan }> {
+    const [sealRows, keys] = await Promise.all([loadSeals(companyId), publicKeyMap(companyId)]);
     const seals = sealRows.map(toSealRecord);
-    let result = classifyChain({ entries, seals, publicKeys: keys });
-    // classifyChain treats a key it has never seen as UNCHECKABLE, which is
+    const scan = await scanChain(chainPageReader(companyId), {
+      checkpoints: [...checkpointCountsFor(seals), ...extraCheckpoints],
+    });
+    let result = classifyScan(scan, seals, keys);
+    // classifyScan treats a key it has never seen as UNCHECKABLE, which is
     // right when trust comes from the database: an unregistered key id is
     // usually a rotation nobody wrote down. Under a pin it means the opposite.
     // The operator has said which keys they will accept, so a seal signed
@@ -762,6 +788,7 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
       keyIdsNotHeldByThisProcess: foreign,
       trustAnchor: trustAnchor(anchorEnv()),
       limitations: limitationsFor(derived, seals.length, foreign),
+      scan,
     };
   }
 
@@ -806,8 +833,11 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
           "this fingerprint to the pin, or run with a key that is already in it.",
       );
     }
-    const entries = await loadEntries(companyId);
-    if (entries.length === 0) {
+    // The chain is walked, not loaded: the seal needs its length, its first
+    // and last seq, its head hash and its Merkle root, and all four fall out
+    // of one streaming pass in constant memory.
+    const scan = await scanChain(chainPageReader(companyId));
+    if (scan.entryCount === 0) {
       throw badRequest(
         "There are no ledger entries to seal for this company. A seal commits to a chain; " +
           "there is nothing here to commit to yet.",
@@ -848,9 +878,26 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
         .where(eq(chainSeals.companyId, companyId))
         .orderBy(asc(chainSeals.sequence));
       const last = existing[existing.length - 1];
+      // "Has anything MATERIAL been appended since the last seal?" — counted in
+      // the database rather than by filtering a materialised chain. The
+      // module's own chain_seal entries do not count: sealing appends one, and
+      // counting it would make every seal justify the next.
       const sinceLast = last
-        ? entries.filter((e) => e.seq > last.toEntrySeq && e.objectType !== SEAL_OBJECT).length
-        : entries.length;
+        ? Number(
+            (
+              await tx
+                .select({ n: count() })
+                .from(ledgerEntries)
+                .where(
+                  and(
+                    eq(ledgerEntries.companyId, companyId),
+                    gt(ledgerEntries.seq, last.toEntrySeq),
+                    ne(ledgerEntries.objectType, SEAL_OBJECT),
+                  ),
+                )
+            )[0]?.n ?? 0,
+          )
+        : scan.entryCount;
 
       if (last && !opts.force) {
         const ageMs = Date.now() - Date.parse(isoOf(last.sealedAt));
@@ -859,18 +906,17 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
         }
       }
 
-      const head = entries[entries.length - 1]!;
       const sealedAt = new Date().toISOString();
       const body = buildSealBody({
         companyId,
         sequence: (last?.sequence ?? 0) + 1,
         // The seal commits to the WHOLE chain, so the range is the whole chain.
         // What is new since the previous seal is `prevSeal.toEntrySeq + 1`.
-        fromEntrySeq: entries[0]!.seq,
-        toEntrySeq: head.seq,
-        entryCount: entries.length,
-        headHash: head.entryHash,
-        merkleRoot: merkleRoot(entries.map((e) => e.entryHash)),
+        fromEntrySeq: scan.firstSeq!,
+        toEntrySeq: scan.lastSeq!,
+        entryCount: scan.entryCount,
+        headHash: scan.headHash!,
+        merkleRoot: scan.root,
         prevSealHash: last?.bodyHash ?? null,
         sealedAt,
         keyId: key.record.keyId,
@@ -1049,7 +1095,26 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
      * register changes silently.
      */
     let retired = 0;
-    if (body.retireOtherPlatformKeys) {
+    let retirementRefusal: string | null = null;
+    if (body.retireOtherPlatformKeys && !platformKeyRetirementAllowed()) {
+      /*
+       * AUTHORISATION, not merely transparency.
+       *
+       * Making retirement opt-in and ledgering it into every affected tenant
+       * told the other tenants what had happened; it did not stop it. A
+       * company admin is an admin of ONE tenant, and rows with companyId NULL
+       * belong to the platform, so retiring them is a platform-operator act.
+       * It now requires ANCHOR_ALLOW_TENANT_KEY_RETIREMENT to be set on the
+       * deployment — a capability the tenant cannot grant itself — and is
+       * refused (with the reason, not silently) otherwise.
+       */
+      retirementRefusal =
+        "Refused: retiring platform-wide signing keys (companyId null) affects every tenant on " +
+        "this deployment, so it is a platform-operator action, not a tenant admin one. Set " +
+        "ANCHOR_ALLOW_TENANT_KEY_RETIREMENT=true on the deployment if an operator intends to " +
+        "allow it from this route. Registration of this process's own key was still performed.";
+    }
+    if (body.retireOtherPlatformKeys && platformKeyRetirementAllowed()) {
       const affected = await app.db
         .selectDistinct({ companyId: chainSeals.companyId })
         .from(chainSeals);
@@ -1090,6 +1155,7 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
         source: key.record.source,
         derivedFromAuthSecret: key.record.derivedFromAuthSecret,
         retiredOthers: retired,
+        retirementRefused: retirementRefusal,
       },
       storePayload: true,
     });
@@ -1107,15 +1173,19 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
       },
       created,
       retiredOtherKeys: retired,
+      retirementRefused: retirementRefusal,
       note:
         "Only the public half was written. Rotation does not invalidate earlier seals: they " +
         "are verified against the key id they were made under, which stays on record. " +
-        (body.retireOtherPlatformKeys
-          ? "Other platform keys were retired, and the retirement was ledgered into every " +
-            "tenant chain it affects."
-          : "Other platform keys were NOT retired — signing keys are platform-wide, so " +
-            "retiring them from a per-tenant route would change other tenants' key registers. " +
-            "Pass {\"retireOtherPlatformKeys\":true} to do it deliberately."),
+        (retirementRefusal
+          ? retirementRefusal
+          : retired > 0
+            ? "Other platform keys were retired, and the retirement was ledgered into every " +
+              "tenant chain it affects."
+            : "Other platform keys were NOT retired — signing keys are platform-wide, so " +
+              "retiring them from a per-tenant route would change other tenants' key " +
+              "registers. It requires ANCHOR_ALLOW_TENANT_KEY_RETIREMENT on the deployment " +
+              "and an explicit {\"retireOtherPlatformKeys\":true}."),
     };
   });
 
@@ -1186,7 +1256,6 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
     const row = await fetchSeal(sealId, req.companyId!);
     const record = toSealRecord(row);
     const key = await keyInfoFor(row.keyId, req.companyId!);
-    const entries = await loadEntries(req.companyId!);
 
     let body: SealBody | null = null;
     let bodyError: string | null = null;
@@ -1201,11 +1270,6 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
         ? verifySealSignature(body, row.signature, key.publicKeyPem)
         : false;
 
-    const prefix = entries.slice(0, row.entryCount);
-    const entriesPresent = entries.length >= row.entryCount;
-    const recomputedRoot = entriesPresent ? merkleRoot(prefix.map((e) => e.entryHash)) : null;
-    const headEntry = entriesPresent ? prefix[prefix.length - 1]! : null;
-
     // The single-seal verdict is the whole-chain classification restricted to
     // this seal, so one seal and the chain as a whole can never disagree.
     //
@@ -1217,11 +1281,14 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
     const sealChainToHere = (await loadSeals(req.companyId!))
       .filter((s) => s.sequence <= row.sequence)
       .map(toSealRecord);
-    const whole = classifyChain({
-      entries,
-      seals: sealChainToHere,
-      publicKeys: await publicKeyMap(req.companyId!),
+    // ONE streaming pass answers both the prefix checks and the classification.
+    const scan = await scanChain(chainPageReader(req.companyId!), {
+      checkpoints: [...checkpointCountsFor(sealChainToHere), row.entryCount],
     });
+    const checkpoint = scan.checkpoints.get(row.entryCount) ?? null;
+    const entriesPresent = scan.entryCount >= row.entryCount;
+    const recomputedRoot = entriesPresent ? (checkpoint?.root ?? null) : null;
+    const whole = classifyScan(scan, sealChainToHere, await publicKeyMap(req.companyId!));
 
     return {
       sealId: row.id,
@@ -1237,10 +1304,10 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
         signatureCheckable: key.known,
         entriesPresent,
         entryCountSealed: row.entryCount,
-        entryCountNow: entries.length,
+        entryCountNow: scan.entryCount,
         merkleRootMatches: recomputedRoot === row.merkleRoot,
         recomputedMerkleRoot: recomputedRoot,
-        headHashMatches: headEntry ? headEntry.entryHash === row.headHash : false,
+        headHashMatches: checkpoint ? checkpoint.headHash === row.headHash : false,
       },
       key: {
         keyId: key.keyId,
@@ -1811,21 +1878,22 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
     } | null = null;
 
     if (sameCompany) {
-      const entries = await loadEntries(req.companyId!);
-      const prefix = entries.slice(0, sealFields.entryCount);
-      const entriesPresent = entries.length >= sealFields.entryCount;
-      const recomputedRoot = entriesPresent ? merkleRoot(prefix.map((e) => e.entryHash)) : null;
+      // One streaming pass serves both the receipt's prefix checks and the
+      // whole-chain classification: the receipt's own entryCount is added as a
+      // checkpoint alongside every seal's.
+      chain = await classifyCompany(req.companyId!, [sealFields.entryCount]);
+      const scan = chain.scan;
+      const checkpoint = scan.checkpoints.get(sealFields.entryCount) ?? null;
+      const entriesPresent = scan.entryCount >= sealFields.entryCount;
+      const recomputedRoot = entriesPresent ? (checkpoint?.root ?? null) : null;
       prefixChecks = {
-        entriesNow: entries.length,
+        entriesNow: scan.entryCount,
         entriesSealed: sealFields.entryCount,
         entriesPresent,
         merkleRootMatches: recomputedRoot === sealFields.merkleRoot,
-        headHashMatches: entriesPresent
-          ? prefix[prefix.length - 1]!.entryHash === sealFields.headHash
-          : false,
+        headHashMatches: checkpoint ? checkpoint.headHash === sealFields.headHash : false,
         recomputedMerkleRoot: recomputedRoot,
       };
-      chain = await classifyCompany(req.companyId!);
       const sealRows = await app.db
         .select()
         .from(chainSeals)
@@ -1891,7 +1959,7 @@ export const anchoringModule: FastifyPluginAsync = async (app) => {
        *
        * This is the attack escrow exists to expose, and it used to report
        * "intact": an insider deletes seal N and every seal after it, so the
-       * remaining seal chain is contiguous 1..N-1 and classifyChain is happy;
+       * remaining seal chain is contiguous 1..N-1 and classifyScan is happy;
        * the entries are untouched, so the prefix checks pass; and the holder
        * of the receipt for seal N was told their chain was intact while the
        * seal they hold had been erased from the record they were verifying

@@ -29,6 +29,7 @@ let owner: TestActor;
 let engineer: TestActor;
 let inspector: TestActor;
 let stranger: TestActor;
+let viewerHeaders: Record<string, string>;
 let projectId: string;
 let locationId: string;
 let taskId: string;
@@ -65,6 +66,15 @@ beforeAll(async () => {
   owner = await registerActor(app);
   engineer = await member("admin");
   inspector = await member("admin");
+  const readOnly = await registerActor(app);
+  await app.db
+    .insert(companyMemberships)
+    .values({ id: newId("cm"), companyId: owner.companyId, userId: readOnly.userId, role: "member" });
+  viewerHeaders = {
+    authorization: readOnly.headers["authorization"]!,
+    "x-company-id": owner.companyId,
+  };
+
   stranger = await registerActor(app);
 
   projectId = newId("prj");
@@ -451,6 +461,124 @@ describe("action plans (#452–#456)", () => {
       { reason: "again" },
     );
     expect(again.statusCode).toBe(409);
+  });
+
+  it("drives a plan whose activities name no signatory all the way to completed (#454–455)", async () => {
+    // Regression: `signoffParties` defaults to [] and the only route that wrote
+    // `signed_off` needed a sign-off row to address, so an activity nobody was
+    // asked to sign stayed open forever — progress never reached 100% and the
+    // plan could never be reported complete.
+    const plan = await post(`/projects/${projectId}/correspondence/action-plans`, {
+      title: "Nobody signs this one",
+      activities: [
+        { title: "Just do it" },
+        {
+          title: "Do it and show the record",
+          evidenceRequired: true,
+          evidenceRequirement: "The delivery ticket.",
+        },
+      ],
+    });
+    expect(plan.statusCode).toBe(201);
+    const id = plan.json().id as string;
+    const [first, second] = plan.json().activities as Array<{ id: string; signoffRequiredCount: number }>;
+    expect(first!.signoffRequiredCount).toBe(0);
+    await post(`/projects/${projectId}/correspondence/action-plans/${id}/activate`, {});
+
+    const done = await post(
+      `/projects/${projectId}/correspondence/activities/${first!.id}/complete`,
+      { note: "Done on site." },
+    );
+    expect(done.statusCode).toBe(200);
+    expect(done.json().status).toBe("signed_off");
+    expect(done.json().completedAt).toBeTruthy();
+    expect(done.json().progress.percent).toBe(50);
+    expect(done.json().planStatus).toBe("active");
+
+    // the evidence rule still applies to an activity nobody signs
+    const early = await post(
+      `/projects/${projectId}/correspondence/activities/${second!.id}/complete`,
+      {},
+    );
+    expect(early.statusCode).toBe(409);
+    expect(early.json().message).toContain("requires evidence");
+
+    await post(`/projects/${projectId}/correspondence/activities/${second!.id}/evidence`, {
+      fileIds: [fileId],
+    });
+    const closed = await post(
+      `/projects/${projectId}/correspondence/activities/${second!.id}/complete`,
+      {},
+    );
+    expect(closed.statusCode).toBe(200);
+    expect(closed.json().progress.percent).toBe(100);
+    expect(closed.json().planStatus).toBe("completed");
+
+    const report = await get(`/projects/${projectId}/correspondence/action-plans/${id}/report`);
+    expect(report.json().complete).toBe(true);
+    expect(report.json().gaps).toEqual([]);
+
+    const twice = await post(
+      `/projects/${projectId}/correspondence/activities/${first!.id}/complete`,
+      {},
+    );
+    expect(twice.statusCode).toBe(409);
+  });
+
+  it("refuses `complete` on an activity that has signatories, and honours a checkpoint", async () => {
+    const plan = await post(`/projects/${projectId}/correspondence/action-plans`, {
+      title: "Held behind a checkpoint",
+      activities: [
+        { title: "Hold point", isQualityCheckpoint: true },
+        { title: "Work behind the hold point" },
+        { title: "Somebody must sign this", signoffParties: [{ partyType: "user", label: "PM" }] },
+      ],
+    });
+    const id = plan.json().id as string;
+    const activities = plan.json().activities as Array<{ id: string }>;
+    await post(`/projects/${projectId}/correspondence/action-plans/${id}/activate`, {});
+
+    const held = await post(
+      `/projects/${projectId}/correspondence/activities/${activities[1]!.id}/complete`,
+      {},
+    );
+    expect(held.statusCode).toBe(409);
+    expect(held.json().message).toContain("quality checkpoint");
+
+    const signed = await post(
+      `/projects/${projectId}/correspondence/activities/${activities[2]!.id}/complete`,
+      {},
+    );
+    expect(signed.statusCode).toBe(409);
+    expect(signed.json().message).toContain("closes when they sign");
+
+    // release the checkpoint and the activity behind it can close
+    await post(`/projects/${projectId}/correspondence/activities/${activities[0]!.id}/complete`, {});
+    const released = await post(
+      `/projects/${projectId}/correspondence/activities/${activities[1]!.id}/complete`,
+      {},
+    );
+    expect(released.statusCode).toBe(200);
+  });
+
+  it("refuses a stranger and a read-only member the completion transition", async () => {
+    const plan = await post(`/projects/${projectId}/correspondence/action-plans`, {
+      title: "Gate check",
+      activities: [{ title: "Anything" }],
+    });
+    const activityId = (plan.json().activities as Array<{ id: string }>)[0]!.id;
+    const outsider = await post(
+      `/projects/${projectId}/correspondence/activities/${activityId}/complete`,
+      {},
+      stranger.headers,
+    );
+    expect(outsider.statusCode).toBe(403);
+    const viewer = await post(
+      `/projects/${projectId}/correspondence/activities/${activityId}/complete`,
+      {},
+      viewerHeaders,
+    );
+    expect(viewer.statusCode).toBe(403);
   });
 
   it("refuses to edit an activity that has been signed off", async () => {

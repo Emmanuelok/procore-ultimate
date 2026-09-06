@@ -494,7 +494,7 @@ describe("hearing bundles (#343-344)", () => {
     expect(csv.statusCode).toBe(200);
     expect(csv.headers["content-type"]).toContain("text/csv");
     const lines = csv.body.trim().split("\n");
-    expect(lines[0]).toBe("tab,title,date,source,sha256");
+    expect(lines[0]).toBe("tab,page,title,date,source,sha256");
     expect(lines).toHaveLength(4);
     expect(lines[1]).toContain("A1");
     expect(lines[1]).toContain(sha256Hex("content-a"));

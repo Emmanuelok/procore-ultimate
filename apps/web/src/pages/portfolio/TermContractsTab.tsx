@@ -31,6 +31,8 @@ import {
 import { IconPlus, IconSpreadsheet } from "../../ui/icons";
 import {
   DASH,
+  EditButton,
+  EditForm,
   LoadError,
   ReasonList,
   Row,
@@ -45,11 +47,52 @@ import {
   useIsCompanyAdmin,
   useResource,
   useVendors,
+  type EditFieldSpec,
   type Paginated,
   type PricedOrder,
   type SorItem,
   type TermContract,
 } from "./portfolioShared";
+
+/* ============================ Edit field sets ============================= */
+
+const CONTRACT_FIELDS: readonly EditFieldSpec[] = [
+  { key: "title", label: "Title", type: "text", wide: true },
+  { key: "supplierName", label: "Supplier", type: "text" },
+  { key: "status", label: "Status", type: "select", options: ["draft", "live", "expired", "terminated"] },
+  { key: "startDate", label: "Start", type: "date", nullable: true },
+  { key: "endDate", label: "End", type: "date", nullable: true },
+  { key: "maximumValue", label: "Maximum value", type: "number", min: 0, step: 0.01, nullable: true },
+  {
+    key: "adjustmentPercent",
+    label: "Rate adjustment %",
+    type: "number",
+    step: 0.01,
+    hint: "Applied to every scheduled rate when an order is priced.",
+  },
+  {
+    key: "adjustmentBasis",
+    label: "Adjustment basis",
+    type: "select",
+    options: ["none", "fixed_percent", "index_linked", "negotiated"],
+  },
+  { key: "indexReference", label: "Index reference", type: "text", nullable: true },
+  { key: "priceBaseDate", label: "Price base date", type: "date", nullable: true },
+  { key: "notes", label: "Notes", type: "textarea", nullable: true, wide: true },
+];
+
+const RATE_FIELDS: readonly EditFieldSpec[] = [
+  { key: "description", label: "Description", type: "text", wide: true },
+  { key: "unit", label: "Unit", type: "text" },
+  { key: "rate", label: "Rate", type: "number", min: 0, step: 0.01 },
+  { key: "category", label: "Category", type: "text", nullable: true },
+  {
+    key: "active",
+    label: "Active in the schedule",
+    type: "checkbox",
+    hint: "A withdrawn rate stops pricing new orders; the orders already priced on it keep their prices.",
+  },
+];
 
 export default function TermContractsTab({ onChanged }: { onChanged: () => void }) {
   const isAdmin = useIsCompanyAdmin();
@@ -214,16 +257,44 @@ function TermContractDrawer({
     { code: "", quantity: "", rate: "" },
   ]);
   const [priced, setPriced] = useState<PricedOrder | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [editingRate, setEditingRate] = useState<SorItem | null>(null);
 
   useEffect(() => {
     setRateForm({});
     setPriced(null);
     setPriceLines([{ code: "", quantity: "", rate: "" }]);
+    setEditing(false);
+    setEditingRate(null);
     action.clear();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [contractId]);
 
   const c = detail.data;
+
+  async function saveContract(patch: Record<string, unknown>) {
+    if (!contractId) return;
+    const res = await action.run("edit", () => portfolioApi.patchTermContract(contractId, patch));
+    if (res) {
+      toast.success("Term contract updated");
+      setEditing(false);
+      detail.reload();
+      onChanged();
+    }
+  }
+
+  async function saveRate(patch: Record<string, unknown>) {
+    if (!contractId || !editingRate) return;
+    const res = await action.run("edit-rate", () =>
+      portfolioApi.patchRate(contractId, editingRate.id, patch),
+    );
+    if (res) {
+      toast.success(`Rate ${res.code} updated`);
+      setEditingRate(null);
+      detail.reload();
+      onChanged();
+    }
+  }
 
   async function addRate(e: FormEvent) {
     e.preventDefault();
@@ -287,8 +358,21 @@ function TermContractDrawer({
           </Badge>
         ),
       },
+      {
+        id: "edit",
+        header: "",
+        accessor: () => "",
+        type: "text",
+        width: 80,
+        cell: ({ row }) =>
+          isAdmin ? (
+            <Button size="xs" variant="ghost" onClick={() => setEditingRate(row)}>
+              Edit
+            </Button>
+          ) : null,
+      },
     ],
-    [],
+    [isAdmin],
   );
 
   return (
@@ -309,6 +393,22 @@ function TermContractDrawer({
             <Alert tone="danger" size="sm">
               {action.error}
             </Alert>
+          ) : null}
+          {isAdmin ? (
+            <div className="flex justify-end">
+              <EditButton editing={editing} onToggle={() => setEditing((v) => !v)} />
+            </div>
+          ) : null}
+          {editing ? (
+            <EditForm
+              key={c.id}
+              fields={CONTRACT_FIELDS}
+              initial={c as unknown as Record<string, unknown>}
+              busy={action.busy === "edit"}
+              onSubmit={saveContract}
+              onCancel={() => setEditing(false)}
+              note="Reference and currency are fixed: the orders already placed against this contract were priced in it."
+            />
           ) : null}
           <dl className="divide-y divide-border">
             <Row label="Term">
@@ -357,6 +457,25 @@ function TermContractDrawer({
               }}
               aria-label="Schedule of rates"
             />
+            {editingRate ? (
+              <div className="mt-2">
+                <EditForm
+                  key={editingRate.id}
+                  fields={RATE_FIELDS}
+                  initial={
+                    {
+                      ...editingRate,
+                      active: editingRate.active === 1,
+                    } as unknown as Record<string, unknown>
+                  }
+                  busy={action.busy === "edit-rate"}
+                  submitLabel={`Save rate ${editingRate.code}`}
+                  onSubmit={saveRate}
+                  onCancel={() => setEditingRate(null)}
+                  note="The code identifies the rate that orders were priced against, so it is not editable; withdraw it and add a new one instead."
+                />
+              </div>
+            ) : null}
             {isAdmin ? (
               <form onSubmit={addRate} className="mt-2 grid gap-2 rounded-md border border-border p-2 sm:grid-cols-6">
                 <Field label="Code">

@@ -37,6 +37,8 @@ import { IconPlus, IconProcurement } from "../../ui/icons";
 import {
   AWARD_MODES,
   DASH,
+  EditButton,
+  EditForm,
   LoadError,
   ReasonList,
   Row,
@@ -54,12 +56,78 @@ import {
   useResource,
   useVendors,
   utilisationTone,
+  type EditFieldSpec,
   type Framework,
   type FrameworkDetail,
+  type FrameworkLot,
+  type FrameworkSupplier,
   type MiniCompetition,
   type MiniCompetitionEvaluation,
   type Paginated,
 } from "./portfolioShared";
+
+/* ============================ Edit field sets ============================= */
+
+const FRAMEWORK_FIELDS: readonly EditFieldSpec[] = [
+  { key: "title", label: "Title", type: "text", wide: true },
+  { key: "contractingAuthority", label: "Contracting authority", type: "text", nullable: true },
+  { key: "awardMode", label: "Award mode", type: "select", options: AWARD_MODES },
+  {
+    key: "maximumValue",
+    label: "Maximum value",
+    type: "number",
+    min: 0,
+    step: 0.01,
+    nullable: true,
+    hint: "Blank means uncapped, and the register says so rather than showing an infinite headroom.",
+  },
+  {
+    key: "directAwardThreshold",
+    label: "Direct-award threshold",
+    type: "number",
+    min: 0,
+    step: 0.01,
+    nullable: true,
+    hint: "Checked again when an order is ISSUED, not only when it is drafted.",
+  },
+  { key: "startDate", label: "Start", type: "date", nullable: true },
+  { key: "endDate", label: "End", type: "date", nullable: true },
+  { key: "extensionToDate", label: "Extension to", type: "date", nullable: true },
+  { key: "rulesReference", label: "Rules reference", type: "text", nullable: true, wide: true },
+];
+
+const LOT_FIELDS: readonly EditFieldSpec[] = [
+  { key: "title", label: "Lot title", type: "text", wide: true },
+  { key: "ceilingValue", label: "Ceiling", type: "number", min: 0, step: 0.01, nullable: true },
+  {
+    key: "awardMode",
+    label: "Award mode",
+    type: "select",
+    options: AWARD_MODES,
+    nullable: true,
+    placeholder: "Follow the framework",
+  },
+  { key: "description", label: "Description", type: "textarea", nullable: true, wide: true },
+];
+
+const SUPPLIER_FIELDS: readonly EditFieldSpec[] = [
+  { key: "supplierName", label: "Supplier name", type: "text", wide: true },
+  { key: "rank", label: "Rank", type: "number", min: 1, step: 1, nullable: true },
+  {
+    key: "status",
+    label: "Status",
+    type: "select",
+    options: ["appointed", "suspended", "removed", "expired"],
+  },
+  {
+    key: "suspendedReason",
+    label: "Reason",
+    type: "textarea",
+    nullable: true,
+    wide: true,
+    hint: "Suspending or removing an appointed supplier requires a reason; the appointment is a contractual position.",
+  },
+];
 
 export default function FrameworksTab({ onChanged }: { onChanged: () => void }) {
   const isAdmin = useIsCompanyAdmin();
@@ -257,10 +325,18 @@ function FrameworkDrawer({
   const [lotForm, setLotForm] = useState<Record<string, string>>({});
   const [supplierForm, setSupplierForm] = useState<Record<string, string>>({});
   const [openCompetition, setOpenCompetition] = useState<string | null>(null);
+  const [newCompetition, setNewCompetition] = useState(false);
+  const [editingFramework, setEditingFramework] = useState(false);
+  const [editingLot, setEditingLot] = useState<FrameworkLot | null>(null);
+  const [editingSupplier, setEditingSupplier] = useState<FrameworkSupplier | null>(null);
 
   useEffect(() => {
     setLotForm({});
     setSupplierForm({});
+    setEditingFramework(false);
+    setEditingLot(null);
+    setEditingSupplier(null);
+    setNewCompetition(false);
     action.clear();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [frameworkId]);
@@ -307,6 +383,41 @@ function FrameworkDrawer({
     }
   }
 
+  async function saveFramework(patch: Record<string, unknown>) {
+    if (!frameworkId) return;
+    const res = await action.run("edit", () => portfolioApi.patchFramework(frameworkId, patch));
+    if (res) {
+      toast.success("Framework updated");
+      setEditingFramework(false);
+      detail.reload();
+      onChanged();
+    }
+  }
+
+  async function saveLot(patch: Record<string, unknown>) {
+    if (!frameworkId || !editingLot) return;
+    const res = await action.run("edit-lot", () => portfolioApi.patchLot(frameworkId, editingLot.id, patch));
+    if (res) {
+      toast.success(`Lot ${res.lotNumber} updated`);
+      setEditingLot(null);
+      detail.reload();
+      onChanged();
+    }
+  }
+
+  async function saveSupplier(patch: Record<string, unknown>) {
+    if (!frameworkId || !editingSupplier) return;
+    const res = await action.run("edit-supplier", () =>
+      portfolioApi.patchSupplier(frameworkId, editingSupplier.id, patch),
+    );
+    if (res) {
+      toast.success("Appointment updated");
+      setEditingSupplier(null);
+      detail.reload();
+      onChanged();
+    }
+  }
+
   async function setStatus(status: string) {
     if (!frameworkId) return;
     const reason = status === "suspended" || status === "terminated" ? window.prompt(`Why is the framework being ${status}?`) : undefined;
@@ -339,6 +450,23 @@ function FrameworkDrawer({
             <Alert tone="danger" size="sm">
               {action.error}
             </Alert>
+          ) : null}
+
+          {isAdmin ? (
+            <div className="flex justify-end">
+              <EditButton editing={editingFramework} onToggle={() => setEditingFramework((v) => !v)} />
+            </div>
+          ) : null}
+          {editingFramework ? (
+            <EditForm
+              key={fw.id}
+              fields={FRAMEWORK_FIELDS}
+              initial={fw as unknown as Record<string, unknown>}
+              busy={action.busy === "edit"}
+              onSubmit={saveFramework}
+              onCancel={() => setEditingFramework(false)}
+              note="Reference and currency are fixed: they identify the agreement the orders already placed were called off."
+            />
           ) : null}
 
           <div className="rounded-md border border-border p-3">
@@ -401,6 +529,7 @@ function FrameworkDrawer({
                       <Th align="right">Ordered</Th>
                       <Th align="right">Headroom</Th>
                       <Th align="right">Used</Th>
+                      {isAdmin ? <Th /> : null}
                     </tr>
                   </thead>
                   <tbody>
@@ -422,12 +551,41 @@ function FrameworkDrawer({
                           )}
                         </Td>
                         <Td align="right">{pct(l.utilisationPercent, 0)}</Td>
+                        {isAdmin ? (
+                          <Td align="right">
+                            <Button
+                              size="xs"
+                              variant="ghost"
+                              onClick={() => {
+                                const row = fw.lots.find((x) => x.id === l.lotId);
+                                if (row) setEditingSupplier(null);
+                                setEditingLot(row ?? null);
+                              }}
+                            >
+                              Edit
+                            </Button>
+                          </Td>
+                        ) : null}
                       </tr>
                     ))}
                   </tbody>
                 </Table>
               </div>
             )}
+            {editingLot ? (
+              <div className="mt-2">
+                <EditForm
+                  key={editingLot.id}
+                  fields={LOT_FIELDS}
+                  initial={editingLot as unknown as Record<string, unknown>}
+                  busy={action.busy === "edit-lot"}
+                  submitLabel={`Save lot ${editingLot.lotNumber}`}
+                  onSubmit={saveLot}
+                  onCancel={() => setEditingLot(null)}
+                  note="The lot number identifies the lot the orders already placed were called off, so it is not editable here."
+                />
+              </div>
+            ) : null}
             {isAdmin ? (
               <form onSubmit={addLot} className="mt-2 grid gap-2 rounded-md border border-border p-2 sm:grid-cols-5">
                 <Field label="Lot number">
@@ -483,13 +641,40 @@ function FrameworkDrawer({
                         </span>
                       ) : null}
                     </span>
-                    <Badge tone={statusTone(s.status)} size="xs">
-                      {titleCase(s.status)}
-                    </Badge>
+                    <span className="flex items-center gap-2">
+                      <Badge tone={statusTone(s.status)} size="xs">
+                        {titleCase(s.status)}
+                      </Badge>
+                      {isAdmin ? (
+                        <Button
+                          size="xs"
+                          variant="ghost"
+                          onClick={() => {
+                            setEditingLot(null);
+                            setEditingSupplier(s);
+                          }}
+                        >
+                          Edit
+                        </Button>
+                      ) : null}
+                    </span>
                   </li>
                 ))}
               </ul>
             )}
+            {editingSupplier ? (
+              <div className="mt-2">
+                <EditForm
+                  key={editingSupplier.id}
+                  fields={SUPPLIER_FIELDS}
+                  initial={editingSupplier as unknown as Record<string, unknown>}
+                  busy={action.busy === "edit-supplier"}
+                  submitLabel="Save appointment"
+                  onSubmit={saveSupplier}
+                  onCancel={() => setEditingSupplier(null)}
+                />
+              </div>
+            ) : null}
             {isAdmin ? (
               <form onSubmit={addSupplier} className="mt-2 grid gap-2 rounded-md border border-border p-2 sm:grid-cols-5">
                 <Field label="Supplier name" className="sm:col-span-2">
@@ -545,11 +730,21 @@ function FrameworkDrawer({
           </div>
 
           <div>
-            <div className="mb-1 text-2xs font-semibold uppercase tracking-wide text-content-subtle">
-              Mini-competitions ({fw.miniCompetitions.length})
+            <div className="mb-1 flex items-center justify-between gap-2">
+              <span className="text-2xs font-semibold uppercase tracking-wide text-content-subtle">
+                Mini-competitions ({fw.miniCompetitions.length})
+              </span>
+              {isAdmin ? (
+                <Button size="xs" variant="ghost" icon={IconPlus} onClick={() => setNewCompetition(true)}>
+                  New competition
+                </Button>
+              ) : null}
             </div>
             {fw.miniCompetitions.length === 0 ? (
-              <p className="text-meta text-content-subtle">None run under this framework.</p>
+              <p className="text-meta text-content-subtle">
+                None run under this framework. A competition invites appointed suppliers, records what each
+                one answered, and ranks them — the award is still a decision a person takes against that.
+              </p>
             ) : (
               <ul className="space-y-1">
                 {fw.miniCompetitions.map((c) => (
@@ -598,6 +793,18 @@ function FrameworkDrawer({
             }}
             isAdmin={isAdmin}
           />
+
+          <CompetitionCreateDrawer
+            open={newCompetition}
+            framework={fw}
+            onClose={() => setNewCompetition(false)}
+            onCreated={(id) => {
+              setNewCompetition(false);
+              detail.reload();
+              onChanged();
+              setOpenCompetition(id);
+            }}
+          />
         </div>
       )}
     </Drawer>
@@ -617,23 +824,88 @@ function CompetitionDrawer({
   onChanged: () => void;
   isAdmin: boolean;
 }) {
-  const detail = useResource<MiniCompetition & { evaluation: MiniCompetitionEvaluation }>(
-    competitionId ? `/api/v1/portfolio/mini-competitions/${competitionId}` : null,
-  );
+  const detail = useResource<
+    MiniCompetition & { evaluation: MiniCompetitionEvaluation; invitedSuppliers?: FrameworkSupplier[] }
+  >(competitionId ? `/api/v1/portfolio/mini-competitions/${competitionId}` : null);
   const action = useAction();
   const [awardNote, setAwardNote] = useState("");
   const [awardSupplier, setAwardSupplier] = useState("");
   const [awardValue, setAwardValue] = useState("");
+  const [responseSupplier, setResponseSupplier] = useState("");
+  const [responsePrice, setResponsePrice] = useState("");
+  const [responseNote, setResponseNote] = useState("");
+  const [responseScores, setResponseScores] = useState<Record<string, string>>({});
+  const [responseWithdrawn, setResponseWithdrawn] = useState(false);
 
   useEffect(() => {
     setAwardNote("");
     setAwardSupplier("");
     setAwardValue("");
+    setResponseSupplier("");
+    setResponsePrice("");
+    setResponseNote("");
+    setResponseScores({});
+    setResponseWithdrawn(false);
     action.clear();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [competitionId]);
 
   const c = detail.data;
+
+  async function issue() {
+    if (!competitionId) return;
+    const res = await action.run("issue", () => portfolioApi.issueCompetition(competitionId));
+    if (res) {
+      toast.success("Competition issued to the invited suppliers");
+      detail.reload();
+      onChanged();
+    }
+  }
+
+  async function cancel() {
+    if (!competitionId) return;
+    const reason = window.prompt("Why is this competition being cancelled?");
+    if (!reason) return;
+    const res = await action.run("cancel", () =>
+      portfolioApi.cancelCompetition(competitionId, { reason, outcome: "cancelled" }),
+    );
+    if (res) {
+      toast.success("Competition cancelled with its reason on the ledger");
+      detail.reload();
+      onChanged();
+    }
+  }
+
+  async function recordResponse(e: FormEvent) {
+    e.preventDefault();
+    if (!competitionId) return;
+    const price = responsePrice.trim() === "" ? null : Number(responsePrice);
+    const scores: Record<string, number> = {};
+    for (const [key, raw] of Object.entries(responseScores)) {
+      if (raw.trim() === "") continue;
+      const parsed = Number(raw);
+      if (Number.isFinite(parsed)) scores[key] = parsed;
+    }
+    const res = await action.run("response", () =>
+      portfolioApi.recordResponse(competitionId, {
+        supplierId: responseSupplier,
+        price: price !== null && Number.isFinite(price) ? price : null,
+        scores,
+        withdrawn: responseWithdrawn,
+        note: responseNote || undefined,
+      }),
+    );
+    if (res) {
+      toast.success(responseWithdrawn ? "Withdrawal recorded" : "Response recorded and re-evaluated");
+      setResponseSupplier("");
+      setResponsePrice("");
+      setResponseNote("");
+      setResponseScores({});
+      setResponseWithdrawn(false);
+      detail.reload();
+      onChanged();
+    }
+  }
 
   async function award(e: FormEvent) {
     e.preventDefault();
@@ -748,6 +1020,98 @@ function CompetitionDrawer({
             <ReasonList reasons={c.evaluation.warnings} className="mt-1" />
           </div>
 
+          {isAdmin && c.status === "draft" ? (
+            <div className="rounded-md border border-border p-3">
+              <div className="mb-1 text-2xs font-semibold uppercase tracking-wide text-content-subtle">
+                Issue
+              </div>
+              <p className="mb-2 text-meta text-content-muted">
+                Issuing sends the competition to the {num(c.invitedSupplierIds.length)} invited supplier(s).
+                A competition with nobody invited cannot be issued, and neither can one under a framework
+                that is not live.
+              </p>
+              <Button size="sm" onClick={() => void issue()} loading={action.busy === "issue"}>
+                Issue this competition
+              </Button>
+            </div>
+          ) : null}
+
+          {isAdmin && (c.status === "issued" || c.status === "evaluating") ? (
+            <form onSubmit={recordResponse} className="space-y-2 rounded-md border border-border p-3">
+              <div className="text-2xs font-semibold uppercase tracking-wide text-content-subtle">
+                Record a response
+              </div>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <Field label="Supplier" required>
+                  <Select
+                    value={responseSupplier}
+                    onChange={(e) => setResponseSupplier(e.target.value)}
+                    size="sm"
+                    required
+                  >
+                    <option value="">Choose</option>
+                    {(c.invitedSuppliers ?? []).map((sup) => (
+                      <option key={sup.id} value={sup.id}>
+                        {sup.supplierName}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+                <Field label={`Price (${c.currency})`} hint="Leave blank where the supplier gave no price; it is not scored as zero.">
+                  <Input
+                    type="number"
+                    value={responsePrice}
+                    onChange={(e) => setResponsePrice(e.target.value)}
+                    size="sm"
+                    min={0}
+                    step="0.01"
+                  />
+                </Field>
+              </div>
+              {c.evaluationCriteria.filter((crit) => !crit.isPrice).length > 0 ? (
+                <div className="grid gap-2 sm:grid-cols-3">
+                  {c.evaluationCriteria
+                    .filter((crit) => !crit.isPrice)
+                    .map((crit) => (
+                      <Field key={crit.key} label={`${crit.label} (weight ${crit.weight})`}>
+                        <Input
+                          type="number"
+                          value={responseScores[crit.key] ?? ""}
+                          onChange={(e) =>
+                            setResponseScores((prev) => ({ ...prev, [crit.key]: e.target.value }))
+                          }
+                          size="sm"
+                          step="0.1"
+                        />
+                      </Field>
+                    ))}
+                </div>
+              ) : (
+                <p className="text-2xs text-content-subtle">
+                  This competition declares no quality criteria, so the evaluation is on price alone and says so.
+                </p>
+              )}
+              <Field label="Note">
+                <Input value={responseNote} onChange={(e) => setResponseNote(e.target.value)} size="sm" />
+              </Field>
+              <label className="flex items-center gap-2 text-meta text-content">
+                <input
+                  type="checkbox"
+                  checked={responseWithdrawn}
+                  onChange={(e) => setResponseWithdrawn(e.target.checked)}
+                />
+                Record this as a withdrawal rather than an offer
+              </label>
+              <Button size="sm" type="submit" loading={action.busy === "response"} disabled={!responseSupplier}>
+                Record response
+              </Button>
+              <p className="text-2xs text-content-subtle">
+                Recording a response re-runs the evaluation immediately, so the table above always reflects
+                what has actually been received.
+              </p>
+            </form>
+          ) : null}
+
           {isAdmin && (c.status === "evaluating" || c.status === "issued") ? (
             <form onSubmit={award} className="space-y-2 rounded-md border border-border p-3">
               <div className="text-2xs font-semibold uppercase tracking-wide text-content-subtle">Award</div>
@@ -782,8 +1146,272 @@ function CompetitionDrawer({
               </Button>
             </form>
           ) : null}
+
+          {isAdmin && !["awarded", "cancelled", "abandoned"].includes(c.status) ? (
+            <div className="border-t border-border pt-3">
+              <Button size="sm" variant="ghost" onClick={() => void cancel()} loading={action.busy === "cancel"}>
+                Cancel this competition
+              </Button>
+            </div>
+          ) : null}
         </div>
       )}
+    </Drawer>
+  );
+}
+
+/* ======================= Mini-competition — create ======================== */
+
+interface DraftEvaluationCriterion {
+  key: string;
+  label: string;
+  weight: string;
+  isPrice: boolean;
+}
+
+const BLANK_CRITERION: DraftEvaluationCriterion = { key: "", label: "", weight: "10", isPrice: false };
+
+/**
+ * Creating a competition is where #1054 begins: who was invited, on what
+ * terms, and against which criteria. Without this the award form further down
+ * could never succeed, because the API refuses an award to a supplier that
+ * never answered.
+ */
+function CompetitionCreateDrawer({
+  open,
+  framework,
+  onClose,
+  onCreated,
+}: {
+  open: boolean;
+  framework: FrameworkDetail;
+  onClose: () => void;
+  onCreated: (id: string) => void;
+}) {
+  const action = useAction();
+  const [form, setForm] = useState<Record<string, string>>({});
+  const [invited, setInvited] = useState<string[]>([]);
+  const [criteria, setCriteria] = useState<DraftEvaluationCriterion[]>([
+    { key: "price", label: "Price", weight: "60", isPrice: true },
+    { key: "quality", label: "Quality", weight: "40", isPrice: false },
+  ]);
+
+  useEffect(() => {
+    if (!open) return;
+    setForm({});
+    setInvited([]);
+    setCriteria([
+      { key: "price", label: "Price", weight: "60", isPrice: true },
+      { key: "quality", label: "Quality", weight: "40", isPrice: false },
+    ]);
+    action.clear();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  const set = (key: string, value: string) => setForm((f) => ({ ...f, [key]: value }));
+  const appointable = framework.suppliers.filter((sup) => sup.status === "appointed");
+  const lotFilter = form["lotId"] ?? "";
+  const eligible = lotFilter
+    ? appointable.filter((sup) => sup.lotId === lotFilter || sup.lotId === null)
+    : appointable;
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    const estimated = Number(form["estimatedValue"] ?? "");
+    const res = await action.run("create", () =>
+      portfolioApi.createCompetition({
+        reference: form["reference"] ?? "",
+        title: form["title"] ?? "",
+        scope: form["scope"] || undefined,
+        frameworkId: framework.id,
+        lotId: form["lotId"] || undefined,
+        currency: framework.currency,
+        estimatedValue:
+          form["estimatedValue"] && Number.isFinite(estimated) ? estimated : undefined,
+        invitedSupplierIds: invited,
+        responsesDueAt: form["responsesDueAt"] || undefined,
+        evaluationCriteria: criteria
+          .filter((crit) => crit.key.trim() !== "")
+          .map((crit) => ({
+            key: crit.key.trim(),
+            label: crit.label.trim() || crit.key.trim(),
+            weight: Number(crit.weight) || 0,
+            isPrice: crit.isPrice,
+          })),
+      }),
+    );
+    if (res) {
+      toast.success("Competition drafted — issue it when the invitation goes out");
+      onCreated(res.id);
+    }
+  }
+
+  return (
+    <Drawer
+      open={open}
+      onClose={onClose}
+      size="lg"
+      title={`New mini-competition under ${framework.reference}`}
+      description={`${framework.currency} · invitations are limited to suppliers appointed to this framework`}
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button type="submit" form="portfolio-competition-create" loading={action.busy === "create"}>
+            Create draft
+          </Button>
+        </div>
+      }
+    >
+      <form id="portfolio-competition-create" onSubmit={submit} className="space-y-4">
+        {action.error ? (
+          <Alert tone="danger" size="sm">
+            {action.error}
+          </Alert>
+        ) : null}
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Reference" required>
+            <Input value={form["reference"] ?? ""} onChange={(e) => set("reference", e.target.value)} required />
+          </Field>
+          <Field label="Lot">
+            <Select
+              value={form["lotId"] ?? ""}
+              onChange={(e) => {
+                set("lotId", e.target.value);
+                setInvited([]);
+              }}
+            >
+              <option value="">Whole framework</option>
+              {framework.lots.map((l) => (
+                <option key={l.id} value={l.id}>
+                  Lot {l.lotNumber} — {l.title}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        </div>
+        <Field label="Title" required>
+          <Input value={form["title"] ?? ""} onChange={(e) => set("title", e.target.value)} required />
+        </Field>
+        <Field label="Scope">
+          <Textarea rows={3} value={form["scope"] ?? ""} onChange={(e) => set("scope", e.target.value)} />
+        </Field>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label={`Estimated value (${framework.currency})`}>
+            <Input
+              type="number"
+              value={form["estimatedValue"] ?? ""}
+              onChange={(e) => set("estimatedValue", e.target.value)}
+              min={0}
+              step="0.01"
+            />
+          </Field>
+          <Field label="Responses due">
+            <Input
+              type="date"
+              value={form["responsesDueAt"] ?? ""}
+              onChange={(e) => set("responsesDueAt", e.target.value)}
+            />
+          </Field>
+        </div>
+
+        <div>
+          <div className="mb-1 text-2xs font-semibold uppercase tracking-wide text-content-subtle">
+            Invite ({invited.length} selected)
+          </div>
+          {eligible.length === 0 ? (
+            <Alert tone="warning" size="sm">
+              No appointed supplier is available for this lot. Appoint suppliers to the framework first — a
+              competition run among nobody is not a competition.
+            </Alert>
+          ) : (
+            <ul className="space-y-1">
+              {eligible.map((sup) => (
+                <li key={sup.id}>
+                  <label className="flex items-center gap-2 rounded-md border border-border px-2 py-1 text-meta text-content">
+                    <input
+                      type="checkbox"
+                      checked={invited.includes(sup.id)}
+                      onChange={(e) =>
+                        setInvited((list) =>
+                          e.target.checked ? [...list, sup.id] : list.filter((x) => x !== sup.id),
+                        )
+                      }
+                    />
+                    {sup.rank ? <span className="text-content-subtle">#{sup.rank}</span> : null}
+                    {sup.supplierName}
+                  </label>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        <div>
+          <div className="mb-2 flex items-center justify-between">
+            <span className="text-2xs font-semibold uppercase tracking-wide text-content-subtle">
+              Evaluation criteria
+            </span>
+            <Button
+              size="xs"
+              variant="ghost"
+              onClick={() => setCriteria((l) => [...l, { ...BLANK_CRITERION }])}
+            >
+              Add criterion
+            </Button>
+          </div>
+          <div className="space-y-2">
+            {criteria.map((crit, i) => (
+              <div key={i} className="grid items-end gap-2 rounded-md border border-border p-2 sm:grid-cols-5">
+                <Field label="Key">
+                  <Input
+                    value={crit.key}
+                    onChange={(e) =>
+                      setCriteria((l) => l.map((x, j) => (j === i ? { ...x, key: e.target.value } : x)))
+                    }
+                    size="sm"
+                  />
+                </Field>
+                <Field label="Label" className="sm:col-span-2">
+                  <Input
+                    value={crit.label}
+                    onChange={(e) =>
+                      setCriteria((l) => l.map((x, j) => (j === i ? { ...x, label: e.target.value } : x)))
+                    }
+                    size="sm"
+                  />
+                </Field>
+                <Field label="Weight">
+                  <Input
+                    type="number"
+                    value={crit.weight}
+                    onChange={(e) =>
+                      setCriteria((l) => l.map((x, j) => (j === i ? { ...x, weight: e.target.value } : x)))
+                    }
+                    size="sm"
+                    min={0}
+                  />
+                </Field>
+                <label className="flex items-center gap-2 pb-2 text-meta text-content">
+                  <input
+                    type="checkbox"
+                    checked={crit.isPrice}
+                    onChange={(e) =>
+                      setCriteria((l) => l.map((x, j) => (j === i ? { ...x, isPrice: e.target.checked } : x)))
+                    }
+                  />
+                  Price
+                </label>
+              </div>
+            ))}
+          </div>
+          <p className="mt-1 text-2xs text-content-subtle">
+            The price criterion is scored from the prices actually offered; the rest are scored by the
+            evaluators. A supplier that gave no price is named as unscored, never scored as zero.
+          </p>
+        </div>
+      </form>
     </Drawer>
   );
 }

@@ -2153,9 +2153,18 @@ export const aiModule: FastifyPluginAsync = async (app) => {
       .where(and(eq(aiRuns.id, id), eq(aiRuns.companyId, req.companyId!)))
       .limit(1);
     if (!run) throw notFound("Run not found");
-    // Prompts carry record content: the gate is the run's own project.
+    // Prompts carry record content: the gate is the run's own project AND the
+    // tools that own the tables the agent read. `ai:read` alone is not a gate
+    // for a cost_forecaster prompt full of budget lines — a field engineer
+    // with budget:none would read every figure their template denies. The
+    // same list that decides who may START the run decides who may read it
+    // back (agents/types.ts `requiredTools`).
     if (run.projectId) {
       await requireProjectTool(req, reply, run.projectId, "ai", "read");
+      const entry = AGENT_INVENTORY.find((a) => a.kind === run.agentKind);
+      for (const tool of entry?.requiredTools ?? []) {
+        await requireProjectTool(req, reply, run.projectId, tool, "read");
+      }
     } else {
       // A company-scoped run's prompt can carry records from EVERY project (a
       // company-wide fleet run gathers across the tenant), and there is no

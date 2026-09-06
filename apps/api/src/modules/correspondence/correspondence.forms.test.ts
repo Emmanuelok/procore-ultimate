@@ -424,6 +424,104 @@ describe("assignment, completion and review (#460–#462)", () => {
 });
 
 /* ================================================================== */
+/* Multi-value fields (#461)                                           */
+/* ================================================================== */
+
+describe("multi-value fields round-trip", () => {
+  // Regression: the builder offers multiselect / photo / file, and the
+  // validator demands a LIST for exactly those three. A renderer that hands
+  // back a string makes such a form unsavable and unsubmittable, so the wire
+  // contract is pinned here.
+  let listTemplateId: string;
+  let listResponseId: string;
+
+  it("publishes a form carrying a multiselect, a photo and a file field", async () => {
+    const res = await post("/correspondence/form-templates", {
+      key: "multi_value",
+      name: "Multi-value capture",
+      fields: [
+        {
+          key: "trades",
+          label: "Trades on site",
+          type: "multiselect",
+          required: true,
+          options: [
+            { value: "steel", label: "Steel" },
+            { value: "mep", label: "MEP" },
+            { value: "cladding", label: "Cladding" },
+          ],
+        },
+        { key: "photos", label: "Photographs", type: "photo" },
+        { key: "docs", label: "Supporting files", type: "file" },
+      ],
+    });
+    expect(res.statusCode).toBe(201);
+    listTemplateId = res.json().id;
+    const published = await post(`/correspondence/form-templates/${listTemplateId}/publish`, {});
+    expect(published.statusCode).toBe(200);
+  });
+
+  it("saves a draft and submits with array values", async () => {
+    const created = await post(
+      `/projects/${projectId}/correspondence/form-responses`,
+      { templateId: listTemplateId, values: {} },
+      inspector.headers,
+    );
+    expect(created.statusCode).toBe(201);
+    listResponseId = created.json().id;
+
+    const draft = await patch(
+      `/projects/${projectId}/correspondence/form-responses/${listResponseId}`,
+      { values: { trades: ["steel", "mep"], photos: [fileId] } },
+      inspector.headers,
+    );
+    expect(draft.statusCode).toBe(200);
+    expect(draft.json().values.trades).toEqual(["steel", "mep"]);
+    expect(draft.json().values.photos).toEqual([fileId]);
+
+    const submitted = await post(
+      `/projects/${projectId}/correspondence/form-responses/${listResponseId}/submit`,
+      { values: { trades: ["cladding"], photos: [], docs: [fileId] } },
+      inspector.headers,
+    );
+    expect(submitted.statusCode).toBe(200);
+    expect(submitted.json().status).toBe("submitted");
+    expect(submitted.json().values.trades).toEqual(["cladding"]);
+    expect(submitted.json().values.docs).toEqual([fileId]);
+  });
+
+  it("says plainly that a list field was given a string", async () => {
+    const created = await post(
+      `/projects/${projectId}/correspondence/form-responses`,
+      { templateId: listTemplateId, values: {} },
+      inspector.headers,
+    );
+    const res = await patch(
+      `/projects/${projectId}/correspondence/form-responses/${created.json().id}`,
+      { values: { trades: "steel" } },
+      inspector.headers,
+    );
+    expect(res.statusCode).toBe(400);
+    expect(JSON.stringify(res.json())).toContain("must be a list");
+  });
+
+  it("refuses an option the multiselect never offered", async () => {
+    const created = await post(
+      `/projects/${projectId}/correspondence/form-responses`,
+      { templateId: listTemplateId, values: {} },
+      inspector.headers,
+    );
+    const res = await patch(
+      `/projects/${projectId}/correspondence/form-responses/${created.json().id}`,
+      { values: { trades: ["steel", "groundworks"] } },
+      inspector.headers,
+    );
+    expect(res.statusCode).toBe(400);
+    expect(JSON.stringify(res.json())).toContain("not one of the offered options");
+  });
+});
+
+/* ================================================================== */
 /* Overdue sweep                                                       */
 /* ================================================================== */
 
@@ -472,7 +570,8 @@ describe("overdue form sweep (#460)", () => {
     expect(summary.json().forms.templates).toBeGreaterThanOrEqual(2);
     expect(summary.json().forms.published).toBeGreaterThanOrEqual(1);
     expect(summary.json().forms.overdueAssignments).toBe(1);
-    expect(summary.json().forms.submitted).toBe(1);
+    // the plant-room walk plus the multi-value submission above
+    expect(summary.json().forms.submitted).toBe(2);
 
     const health = await get(`/projects/${projectId}/correspondence/health-inputs`);
     expect(health.json().metrics.formAssignmentsOverdue).toBe(1);

@@ -32,6 +32,7 @@ import { IconPlus } from "../../ui/icons";
 import {
   DASH,
   EXPENDITURE_CLASSES,
+  EditForm,
   LoadError,
   ReasonList,
   headroomTone,
@@ -48,6 +49,7 @@ import {
   utilisationTone,
   type AffordabilityLine,
   type AffordabilityResult,
+  type EditFieldSpec,
   type Envelope,
   type Paginated,
 } from "./portfolioShared";
@@ -56,6 +58,7 @@ export default function AffordabilityTab({ onChanged }: { onChanged: () => void 
   const isAdmin = useIsCompanyAdmin();
   const action = useAction();
   const [creating, setCreating] = useState(false);
+  const [editing, setEditing] = useState<Envelope | null>(null);
 
   const envelopes = useResource<Paginated<Envelope>>("/api/v1/portfolio/envelopes?page=1&pageSize=200");
   const affordability = useResource<AffordabilityResult>("/api/v1/portfolio/affordability");
@@ -125,12 +128,17 @@ export default function AffordabilityTab({ onChanged }: { onChanged: () => void 
         header: "",
         accessor: () => "",
         type: "text",
-        width: 110,
+        width: 160,
         cell: ({ row }) =>
           isAdmin && row.status === "draft" ? (
-            <Button size="xs" onClick={() => void activate(row.id)} loading={action.busy === row.id}>
-              Activate
-            </Button>
+            <div className="flex gap-1">
+              <Button size="xs" onClick={() => void activate(row.id)} loading={action.busy === row.id}>
+                Activate
+              </Button>
+              <Button size="xs" variant="ghost" onClick={() => setEditing(row)}>
+                Edit
+              </Button>
+            </div>
           ) : null,
       },
     ],
@@ -362,7 +370,86 @@ export default function AffordabilityTab({ onChanged }: { onChanged: () => void 
           reloadAll();
         }}
       />
+
+      <EnvelopeEditDrawer
+        envelope={editing}
+        onClose={() => setEditing(null)}
+        onSaved={() => {
+          setEditing(null);
+          reloadAll();
+        }}
+      />
     </div>
+  );
+}
+
+const ENVELOPE_FIELDS: readonly EditFieldSpec[] = [
+  { key: "name", label: "Envelope name", type: "text" },
+  { key: "fiscalYear", label: "Fiscal year", type: "text", placeholder: "2026 or 2026-27" },
+  { key: "envelopeAmount", label: "Ceiling", type: "number", min: 0, step: 0.01 },
+  { key: "expenditureClass", label: "Expenditure class", type: "select", options: EXPENDITURE_CLASSES },
+  {
+    key: "basis",
+    label: "Basis",
+    type: "textarea",
+    nullable: true,
+    wide: true,
+    hint: "Where the ceiling comes from. A ceiling with no stated basis is an assertion, and the register flags it as one.",
+  },
+  { key: "notes", label: "Notes", type: "textarea", nullable: true, wide: true },
+];
+
+/**
+ * A draft envelope is editable; an active or superseded one is the ceiling a
+ * past decision was taken against, so the API refuses to change it and this
+ * drawer only opens for drafts.
+ */
+function EnvelopeEditDrawer({
+  envelope,
+  onClose,
+  onSaved,
+}: {
+  envelope: Envelope | null;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const action = useAction();
+  if (!envelope) return <Drawer open={false} onClose={onClose} title="Envelope" />;
+
+  async function save(patch: Record<string, unknown>) {
+    if (!envelope) return;
+    const res = await action.run("edit", () => portfolioApi.patchEnvelope(envelope.id, patch));
+    if (res) {
+      toast.success("Envelope updated");
+      onSaved();
+    }
+  }
+
+  return (
+    <Drawer
+      open
+      onClose={onClose}
+      size="md"
+      title={envelope.name}
+      description={`${envelope.fiscalYear} · ${envelope.currency} · ${titleCase(envelope.status)}`}
+    >
+      <div className="space-y-3">
+        {action.error ? (
+          <Alert tone="danger" size="sm">
+            {action.error}
+          </Alert>
+        ) : null}
+        <EditForm
+          key={envelope.id}
+          fields={ENVELOPE_FIELDS}
+          initial={envelope as unknown as Record<string, unknown>}
+          busy={action.busy === "edit"}
+          onSubmit={save}
+          onCancel={onClose}
+          note="The currency is fixed: an envelope measures demand in one currency, and this platform never converts."
+        />
+      </div>
+    </Drawer>
   );
 }
 

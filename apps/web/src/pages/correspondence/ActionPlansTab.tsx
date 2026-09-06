@@ -509,10 +509,16 @@ function PlanDrawer({
   const action = useAction();
   const [evidenceIds, setEvidenceIds] = useState<Record<string, string>>({});
   const [waiveReason, setWaiveReason] = useState<Record<string, string>>({});
+  const [cancelReason, setCancelReason] = useState("");
+  const [newActivity, setNewActivity] = useState<ActivityDraft>(emptyActivity());
+  const [addingActivity, setAddingActivity] = useState(false);
 
   useEffect(() => {
     setEvidenceIds({});
     setWaiveReason({});
+    setCancelReason("");
+    setNewActivity(emptyActivity());
+    setAddingActivity(false);
     action.clear();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [planId]);
@@ -656,6 +662,28 @@ function PlanDrawer({
                           Submit evidence
                         </Button>
                       </div>
+                      {activity.signoffRequiredCount === 0 ? (
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-2xs text-content-muted">
+                            This plan asked nobody to sign this activity, so it closes when the work is
+                            recorded as done.
+                          </span>
+                          <Button
+                            size="xs"
+                            disabled={activity.readiness ? !activity.readiness.ready : false}
+                            loading={action.busy === `complete-${activity.id}`}
+                            onClick={() =>
+                              run(
+                                `complete-${activity.id}`,
+                                () => corrApi.completeActivity(projectId, activity.id),
+                                `Activity ${activity.seq} closed.`,
+                              )
+                            }
+                          >
+                            Mark complete
+                          </Button>
+                        </div>
+                      ) : null}
                       {(activity.signoffs ?? []).map((s) => (
                         <div key={s.id} className="flex items-center justify-between gap-2">
                           <span className="text-2xs text-content-muted">
@@ -737,6 +765,102 @@ function PlanDrawer({
             </ul>
           </section>
 
+          {plan.status !== "completed" && plan.status !== "cancelled" ? (
+            <section className="rounded-md border border-border p-3">
+              <div className="flex items-center justify-between gap-2">
+                <h3 className="text-meta font-semibold text-content">Add a required activity</h3>
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  icon={IconPlus}
+                  onClick={() => setAddingActivity((v) => !v)}
+                >
+                  {addingActivity ? "Close" : "Add"}
+                </Button>
+              </div>
+              {addingActivity ? (
+                <div className="mt-2 space-y-2">
+                  <Input
+                    size="sm"
+                    placeholder="What has to happen"
+                    value={newActivity.title}
+                    onChange={(e) => setNewActivity((a) => ({ ...a, title: e.target.value }))}
+                  />
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    <Input
+                      size="sm"
+                      placeholder="Who must sign, comma separated"
+                      value={newActivity.signoffLabels}
+                      onChange={(e) => setNewActivity((a) => ({ ...a, signoffLabels: e.target.value }))}
+                    />
+                    <Input
+                      size="sm"
+                      type="date"
+                      value={newActivity.dueOffsetDays}
+                      onChange={(e) => setNewActivity((a) => ({ ...a, dueOffsetDays: e.target.value }))}
+                    />
+                  </div>
+                  <Input
+                    size="sm"
+                    placeholder="Evidence required (leave blank if none)"
+                    value={newActivity.evidenceRequirement}
+                    onChange={(e) =>
+                      setNewActivity((a) => ({
+                        ...a,
+                        evidenceRequirement: e.target.value,
+                        evidenceRequired: e.target.value.trim() !== "",
+                      }))
+                    }
+                  />
+                  <label className="flex items-center gap-2 text-2xs text-content-muted">
+                    <input
+                      type="checkbox"
+                      checked={newActivity.isQualityCheckpoint}
+                      onChange={(e) =>
+                        setNewActivity((a) => ({ ...a, isQualityCheckpoint: e.target.checked }))
+                      }
+                    />
+                    A quality checkpoint — everything after it is held until this is closed (#456)
+                  </label>
+                  <p className="text-2xs text-content-subtle">
+                    With nobody named to sign, the activity closes with "Mark complete"; naming a
+                    signatory makes it close only when they sign.
+                  </p>
+                  <Button
+                    size="sm"
+                    disabled={newActivity.title.trim() === ""}
+                    loading={action.busy === "add-activity"}
+                    onClick={async () => {
+                      const ok = await action.run("add-activity", () =>
+                        corrApi.addActivity(projectId, plan.id, {
+                          title: newActivity.title.trim(),
+                          evidenceRequired: newActivity.evidenceRequired,
+                          evidenceRequirement: newActivity.evidenceRequirement.trim() || null,
+                          isQualityCheckpoint: newActivity.isQualityCheckpoint,
+                          dueDate: newActivity.dueOffsetDays || null,
+                          signoffParties: newActivity.signoffLabels
+                            .split(",")
+                            .map((l) => l.trim())
+                            .filter((l) => l !== "")
+                            .map((label) => ({ partyType: "user", label })),
+                        }),
+                      );
+                      if (ok) {
+                        toast.success("Activity added.");
+                        setNewActivity(emptyActivity());
+                        setAddingActivity(false);
+                        detail.reload();
+                        onChanged();
+                      }
+                    }}
+                  >
+                    Add it
+                  </Button>
+                </div>
+              ) : null}
+            </section>
+          ) : null}
+
           <section>
             <h3 className="mb-1 text-meta font-semibold text-content">What stands in the way</h3>
             {plan.report.gaps.length === 0 ? (
@@ -747,6 +871,39 @@ function PlanDrawer({
               <ReasonList reasons={plan.report.gaps} />
             )}
           </section>
+
+          {plan.status !== "completed" && plan.status !== "cancelled" ? (
+            <section className="rounded-md border border-danger-border p-3">
+              <h3 className="mb-1 text-meta font-semibold text-danger-text">Cancel this plan</h3>
+              <p className="mb-2 text-2xs text-content-muted">
+                Cancelling keeps the record and everything already signed; it stops the plan being
+                chased. Say why.
+              </p>
+              <div className="flex gap-2">
+                <Input
+                  size="sm"
+                  value={cancelReason}
+                  placeholder="Reason"
+                  onChange={(e) => setCancelReason(e.target.value)}
+                />
+                <Button
+                  size="sm"
+                  variant="danger"
+                  disabled={cancelReason.trim().length < 3}
+                  loading={action.busy === "cancel"}
+                  onClick={() =>
+                    run(
+                      "cancel",
+                      () => corrApi.cancelPlan(projectId, plan.id, cancelReason.trim()),
+                      `${plan.reference} cancelled.`,
+                    )
+                  }
+                >
+                  Cancel plan
+                </Button>
+              </div>
+            </section>
+          ) : null}
         </div>
       ) : null}
     </Drawer>

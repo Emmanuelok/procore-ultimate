@@ -1547,19 +1547,44 @@ describe("REGRESSION: key rotation is not a cross-tenant act", () => {
     expect(untouched[0]!.retiredAt).toBeNull();
     expect(plain.json().note).toMatch(/were NOT retired/);
 
-    const deliberate = await app.inject({
+    // REGRESSION (verifier): asking is not authority. Platform-wide keys
+    // (companyId null) are read by every tenant, so retiring them is a
+    // platform-operator act. A tenant admin who asks is REFUSED, with the
+    // reason, unless the deployment has explicitly enabled it.
+    const asked = await app.inject({
       method: "POST",
       url: url("/ledger/keys/rotate"),
       headers: a.headers,
       payload: { retireOtherPlatformKeys: true },
     });
-    expect(deliberate.statusCode).toBe(200);
-    expect(deliberate.json().retiredOtherKeys).toBeGreaterThanOrEqual(1);
-    const retired = await app.db
+    expect(asked.statusCode).toBe(200);
+    expect(asked.json().retiredOtherKeys).toBe(0);
+    expect(asked.json().retirementRefused).toMatch(/platform-operator action/);
+    const stillUntouched = await app.db
       .select()
       .from(signingKeys)
       .where(eq(signingKeys.keyId, foreignKeyId));
-    expect(retired[0]!.retiredAt).not.toBeNull();
+    expect(stillUntouched[0]!.retiredAt).toBeNull();
+
+    process.env["ANCHOR_ALLOW_TENANT_KEY_RETIREMENT"] = "true";
+    try {
+      const deliberate = await app.inject({
+        method: "POST",
+        url: url("/ledger/keys/rotate"),
+        headers: a.headers,
+        payload: { retireOtherPlatformKeys: true },
+      });
+      expect(deliberate.statusCode).toBe(200);
+      expect(deliberate.json().retiredOtherKeys).toBeGreaterThanOrEqual(1);
+      expect(deliberate.json().retirementRefused).toBeNull();
+      const retired = await app.db
+        .select()
+        .from(signingKeys)
+        .where(eq(signingKeys.keyId, foreignKeyId));
+      expect(retired[0]!.retiredAt).not.toBeNull();
+    } finally {
+      delete process.env["ANCHOR_ALLOW_TENANT_KEY_RETIREMENT"];
+    }
   });
 });
 

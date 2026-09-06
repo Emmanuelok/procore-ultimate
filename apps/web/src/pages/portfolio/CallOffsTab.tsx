@@ -33,6 +33,8 @@ import { IconPlus } from "../../ui/icons";
 import {
   CALL_OFF_ROUTES,
   DASH,
+  EditButton,
+  EditForm,
   LoadError,
   ReasonList,
   Row,
@@ -49,7 +51,31 @@ import {
   type AvailableFrameworks,
   type CallOff,
   type CallOffListResponse,
+  type EditFieldSpec,
 } from "./portfolioShared";
+
+/**
+ * A draft order is editable; an issued one is not, because the supplier has
+ * been told what was ordered. The direct-award rule is re-tested at ISSUE
+ * against whatever the value has become, so editing a draft upward cannot
+ * walk an uncompeted award past the framework's threshold.
+ */
+const CALL_OFF_FIELDS: readonly EditFieldSpec[] = [
+  { key: "title", label: "Title", type: "text", wide: true },
+  { key: "supplierName", label: "Supplier", type: "text" },
+  { key: "orderValue", label: "Order value", type: "number", min: 0, step: 0.01 },
+  { key: "requiredBy", label: "Required by", type: "date", nullable: true },
+  { key: "scope", label: "Scope", type: "textarea", nullable: true, wide: true },
+  {
+    key: "justification",
+    label: "Justification",
+    type: "textarea",
+    nullable: true,
+    wide: true,
+    hint: "A direct award is only defensible with one.",
+  },
+  { key: "notes", label: "Notes", type: "textarea", nullable: true, wide: true },
+];
 
 export default function CallOffsTab({
   projectId,
@@ -290,15 +316,28 @@ function CallOffDrawer({
   const api = projectApi(projectId);
   const [certifyAmount, setCertifyAmount] = useState("");
   const [cancelReason, setCancelReason] = useState("");
+  const [editing, setEditing] = useState(false);
 
   useEffect(() => {
     setCertifyAmount("");
     setCancelReason("");
+    setEditing(false);
     action.clear();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [callOffId]);
 
   const c = detail.data;
+
+  async function save(patch: Record<string, unknown>) {
+    if (!callOffId) return;
+    const res = await action.run("edit", () => api.patchCallOff(callOffId, patch));
+    if (res) {
+      toast.success("Order updated");
+      setEditing(false);
+      detail.reload();
+      onChanged();
+    }
+  }
 
   async function run(key: string, fn: () => Promise<CallOff>, message: string) {
     const res = await action.run(key, fn);
@@ -327,6 +366,22 @@ function CallOffDrawer({
             <Alert tone="danger" size="sm">
               {action.error}
             </Alert>
+          ) : null}
+          {c.status === "draft" ? (
+            <div className="flex justify-end">
+              <EditButton editing={editing} onToggle={() => setEditing((v) => !v)} />
+            </div>
+          ) : null}
+          {editing ? (
+            <EditForm
+              key={c.id}
+              fields={CALL_OFF_FIELDS}
+              initial={c as unknown as Record<string, unknown>}
+              busy={action.busy === "edit"}
+              onSubmit={save}
+              onCancel={() => setEditing(false)}
+              note="Once the order is issued its value is fixed — cancel and re-issue, or certify against it. A direct award is re-checked against the framework's threshold at issue, using the value as it then stands."
+            />
           ) : null}
           <dl className="divide-y divide-border">
             <Row label="Order value">{money(c.orderValue, c.currency)}</Row>

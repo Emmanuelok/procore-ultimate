@@ -57,6 +57,7 @@ export default function PrioritisationTab() {
   const models = useResource<Paginated<ScoringModel>>("/api/v1/portfolio/scoring-models?page=1&pageSize=100");
   const [modelId, setModelId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [editingModel, setEditingModel] = useState(false);
   const [scoring, setScoring] = useState(false);
   const [openRow, setOpenRow] = useState<McdaRanked | null>(null);
   const action = useAction();
@@ -181,6 +182,11 @@ export default function PrioritisationTab() {
             {isAdmin && model ? (
               <Button size="sm" icon={IconTarget} variant="secondary" onClick={() => setScoring(true)}>
                 Score a project
+              </Button>
+            ) : null}
+            {isAdmin && model && model.status !== "archived" ? (
+              <Button size="sm" variant="ghost" onClick={() => setEditingModel(true)}>
+                Edit model
               </Button>
             ) : null}
             {isAdmin ? (
@@ -374,15 +380,27 @@ export default function PrioritisationTab() {
         ) : null}
       </Drawer>
 
-      <ModelCreateDrawer
+      <ModelEditorDrawer
         open={creating}
+        model={null}
         onClose={() => setCreating(false)}
-        onCreated={(id) => {
+        onSaved={(id) => {
           setCreating(false);
           setModelId(id);
           reloadAll();
         }}
       />
+      {model ? (
+        <ModelEditorDrawer
+          open={editingModel}
+          model={model}
+          onClose={() => setEditingModel(false)}
+          onSaved={() => {
+            setEditingModel(false);
+            reloadAll();
+          }}
+        />
+      ) : null}
       {model ? (
         <ScoreDrawer
           open={scoring}
@@ -412,30 +430,56 @@ interface DraftCriterion {
 
 const BLANK: DraftCriterion = { key: "", label: "", weight: "10", direction: "benefit", min: "0", max: "10" };
 
-function ModelCreateDrawer({
+const DEFAULT_CRITERIA: DraftCriterion[] = [
+  { ...BLANK, key: "strategic_fit", label: "Strategic fit", weight: "40" },
+  { ...BLANK, key: "deliverability", label: "Deliverability", weight: "30" },
+  { ...BLANK, key: "whole_life_cost", label: "Whole-life cost", weight: "30", direction: "cost", max: "100" },
+];
+
+/**
+ * One drawer creates a model and corrects one. A model's criteria and weights
+ * are exactly the thing that gets argued about after the first ranking is
+ * seen, so being unable to change them would make the model a one-shot.
+ * Editing the criteria bumps the model's version server-side, so the ranking
+ * a past decision was taken on stays identifiable.
+ */
+function ModelEditorDrawer({
   open,
+  model,
   onClose,
-  onCreated,
+  onSaved,
 }: {
   open: boolean;
+  model: ScoringModel | null;
   onClose: () => void;
-  onCreated: (id: string) => void;
+  onSaved: (id: string) => void;
 }) {
   const action = useAction();
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [normalisation, setNormalisation] = useState("fixed_scale");
-  const [criteria, setCriteria] = useState<DraftCriterion[]>([
-    { ...BLANK, key: "strategic_fit", label: "Strategic fit", weight: "40" },
-    { ...BLANK, key: "deliverability", label: "Deliverability", weight: "30" },
-    { ...BLANK, key: "whole_life_cost", label: "Whole-life cost", weight: "30", direction: "cost", max: "100" },
-  ]);
+  const [criteria, setCriteria] = useState<DraftCriterion[]>(DEFAULT_CRITERIA);
 
   useEffect(() => {
     if (!open) return;
     action.clear();
+    setName(model?.name ?? "");
+    setDescription(model?.description ?? "");
+    setNormalisation(model?.normalisation ?? "fixed_scale");
+    setCriteria(
+      model
+        ? model.criteria.map((c) => ({
+            key: c.key,
+            label: c.label,
+            weight: String(c.weight),
+            direction: c.direction,
+            min: String(c.min),
+            max: String(c.max),
+          }))
+        : DEFAULT_CRITERIA,
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  }, [open, model?.id]);
 
   function update(index: number, patch: Partial<DraftCriterion>) {
     setCriteria((list) => list.map((c, i) => (i === index ? { ...c, ...patch } : c)));
@@ -456,10 +500,12 @@ function ModelCreateDrawer({
         max: Number(c.max) || 10,
       })),
     };
-    const res = await action.run("create", () => portfolioApi.createModel(body));
+    const res = await action.run("save", () =>
+      model ? portfolioApi.patchModel(model.id, body) : portfolioApi.createModel(body),
+    );
     if (res) {
-      toast.success("Scoring model created");
-      onCreated(res.id);
+      toast.success(model ? `Model updated — now version ${res.version}` : "Scoring model created");
+      onSaved(res.id);
     }
   }
 
@@ -468,15 +514,15 @@ function ModelCreateDrawer({
       open={open}
       onClose={onClose}
       size="lg"
-      title="New scoring model"
+      title={model ? `Edit ${model.name}` : "New scoring model"}
       description="A cost criterion is inverted during normalisation, so enter whole-life cost as the cost it is rather than remembering to score it backwards."
       footer={
         <div className="flex justify-end gap-2">
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button type="submit" form="portfolio-model-create" loading={action.busy === "create"}>
-            Create
+          <Button type="submit" form="portfolio-model-create" loading={action.busy === "save"}>
+            {model ? "Save model" : "Create"}
           </Button>
         </div>
       }
@@ -493,6 +539,13 @@ function ModelCreateDrawer({
         <Field label="Description">
           <Textarea rows={2} value={description} onChange={(e) => setDescription(e.target.value)} />
         </Field>
+        {model ? (
+          <Alert tone="info" size="sm">
+            Changing the criteria issues version {model.version + 1} of this model. Scores already recorded
+            against a criterion key are kept; a key you remove stops counting and a key you add is unscored
+            until someone scores it, which the ranking says in its own words.
+          </Alert>
+        ) : null}
         <Field
           label="Normalisation"
           hint="Relative normalisation compares candidates against each other, and is honest about the fact that its ranks move when the candidate set does."

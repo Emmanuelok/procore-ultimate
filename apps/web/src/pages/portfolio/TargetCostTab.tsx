@@ -158,9 +158,10 @@ export default function TargetCostTab({ projectId, onChanged }: { projectId: str
           onChanged();
         }}
       />
-      <TargetCostCreateDrawer
+      <TargetCostEditorDrawer
         projectId={projectId}
         open={creating}
+        contract={null}
         onClose={() => setCreating(false)}
         onCreated={(id) => {
           setCreating(false);
@@ -492,32 +493,73 @@ interface DraftBand {
   contractorSharePercent: string;
 }
 
-function TargetCostCreateDrawer({
+const DEFAULT_BANDS: DraftBand[] = [
+  { fromPercent: "-100", toPercent: "0", contractorSharePercent: "50" },
+  { fromPercent: "0", toPercent: "5", contractorSharePercent: "50" },
+  { fromPercent: "5", toPercent: "", contractorSharePercent: "20" },
+];
+
+/**
+ * One drawer both creates a target-cost model and corrects one. The band set
+ * IS the commercial deal, and it is renegotiated — a model that could only
+ * ever be entered once would be abandoned the first time a band moved.
+ * The API refuses gaps and overlaps either way, so a bad correction is
+ * refused with the arithmetic that makes it bad rather than silently stored.
+ */
+function TargetCostEditorDrawer({
   projectId,
   open,
+  contract,
   onClose,
   onCreated,
 }: {
   projectId: string;
   open: boolean;
+  contract: TargetCost | null;
   onClose: () => void;
   onCreated: (id: string) => void;
 }) {
   const action = useAction();
   const api = projectApi(projectId);
   const [form, setForm] = useState<Record<string, string>>({ mechanism: "banded_share" });
-  const [bands, setBands] = useState<DraftBand[]>([
-    { fromPercent: "-100", toPercent: "0", contractorSharePercent: "50" },
-    { fromPercent: "0", toPercent: "5", contractorSharePercent: "50" },
-    { fromPercent: "5", toPercent: "", contractorSharePercent: "20" },
-  ]);
+  const [bands, setBands] = useState<DraftBand[]>(DEFAULT_BANDS);
   const [participants, setParticipants] = useState<Array<{ name: string; sharePercent: string }>>([]);
 
   useEffect(() => {
-    setForm({ mechanism: "banded_share" });
+    if (!open) return;
     action.clear();
+    if (contract) {
+      setForm({
+        name: contract.name,
+        contractReference: contract.contractReference ?? "",
+        currency: contract.currency,
+        baseTargetCost: String(contract.baseTargetCost),
+        targetAdjustments: String(contract.targetAdjustments),
+        actualDefinedCost: String(contract.actualDefinedCost),
+        forecastDefinedCost:
+          contract.forecastDefinedCost === null ? "" : String(contract.forecastDefinedCost),
+        feePercent: String(contract.feePercent),
+        mechanism: contract.mechanism,
+        painCap: contract.painCap === null ? "" : String(contract.painCap),
+        gainCap: contract.gainCap === null ? "" : String(contract.gainCap),
+      });
+      setBands(
+        contract.shareBands.map((b) => ({
+          fromPercent: String(b.fromPercent),
+          toPercent: b.toPercent === null ? "" : String(b.toPercent),
+          contractorSharePercent: String(b.contractorSharePercent),
+        })),
+      );
+      setParticipants(
+        (contract.participants ?? []).map((x) => ({ name: x.name, sharePercent: String(x.sharePercent) })),
+      );
+    } else {
+      setForm({ mechanism: "banded_share" });
+      setBands(DEFAULT_BANDS);
+      setParticipants([]);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  }, [open, contract?.id]);
 
   const set = (key: string, value: string) => setForm((f) => ({ ...f, [key]: value }));
   const numeric = (key: string, fallback?: number): number | undefined => {
@@ -529,8 +571,7 @@ function TargetCostCreateDrawer({
 
   async function submit(e: FormEvent) {
     e.preventDefault();
-    const res = await action.run("create", () =>
-      api.createTargetCost({
+    const body = {
         name: form["name"] ?? "",
         contractReference: form["contractReference"] || undefined,
         isAlliance: participants.length > 0,
@@ -551,10 +592,14 @@ function TargetCostCreateDrawer({
         participants: participants
           .filter((p) => p.name.trim() !== "")
           .map((p) => ({ name: p.name.trim(), sharePercent: Number(p.sharePercent) || 0 })),
-      }),
-    );
+    };
+    const res = await action.run("save", () => {
+      if (!contract) return api.createTargetCost(body);
+      const { currency: _currency, ...editable } = body;
+      return api.patchTargetCost(contract.id, editable);
+    });
     if (res) {
-      toast.success("Target-cost model created");
+      toast.success(contract ? "Target-cost model updated" : "Target-cost model created");
       onCreated(res.id);
     }
   }
@@ -564,15 +609,15 @@ function TargetCostCreateDrawer({
       open={open}
       onClose={onClose}
       size="lg"
-      title="New target-cost model"
+      title={contract ? `Edit ${contract.name}` : "New target-cost model"}
       description="Bands are percentages of the adjusted target, measured from zero variance outwards; the gain side is negative. Gaps and overlaps are refused, because they make the apportionment ambiguous."
       footer={
         <div className="flex justify-end gap-2">
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button type="submit" form="portfolio-target-create" loading={action.busy === "create"}>
-            Create
+          <Button type="submit" form="portfolio-target-create" loading={action.busy === "save"}>
+            {contract ? "Save model" : "Create"}
           </Button>
         </div>
       }
@@ -587,8 +632,18 @@ function TargetCostCreateDrawer({
           <Field label="Name" required className="sm:col-span-2">
             <Input value={form["name"] ?? ""} onChange={(e) => set("name", e.target.value)} required />
           </Field>
-          <Field label="Currency" required>
-            <Input value={form["currency"] ?? ""} onChange={(e) => set("currency", e.target.value)} maxLength={3} required />
+          <Field
+            label="Currency"
+            required
+            hint={contract ? "Fixed once the model exists; the frozen calculations are in it." : undefined}
+          >
+            <Input
+              value={form["currency"] ?? ""}
+              onChange={(e) => set("currency", e.target.value)}
+              maxLength={3}
+              required
+              disabled={contract !== null}
+            />
           </Field>
         </div>
         <Field label="Contract reference">

@@ -249,6 +249,36 @@ describe("RFIs", () => {
     const res = await inject("GET", api(`/rfis/${rfiId}`), { authorization: `Bearer ${stranger.accessToken}`, "x-company-id": stranger.companyId });
     expect([403, 404]).toContain(res.statusCode);
   });
+
+  it("refuses to reference a private RFI the caller cannot see (no subject leak via relatedRfiIds)", async () => {
+    const priv = await inject("POST", api("/rfis"), H(sub), { subject: "SECRET SUBJECT LINE", question: "internal", isPrivate: true });
+    expect(priv.statusCode).toBe(201);
+    const privId = priv.json().id as string;
+    expect((await inject("GET", api(`/rfis/${privId}`), H(engineer))).statusCode).toBe(404);
+    // Referencing it from your own RFI used to echo its subject back in `related`.
+    const leak = await inject("POST", api("/rfis"), H(engineer), { subject: "Mine", question: "q", relatedRfiIds: [privId] });
+    expect(leak.statusCode).toBe(400);
+    expect(leak.json().message).toContain(privId);
+    // An admin, who may see it, may still reference it.
+    const byAdmin = await inject("POST", api("/rfis"), H(owner), { subject: "Admin ref", question: "q", relatedRfiIds: [privId] });
+    expect(byAdmin.statusCode).toBe(201);
+    const detail = await inject("GET", api(`/rfis/${byAdmin.json().id}`), H(owner));
+    expect(JSON.stringify(detail.json().related)).toContain("SECRET SUBJECT LINE");
+    await inject("POST", api(`/rfis/${privId}/void`), H(sub));
+  });
+
+  it("restricts close to the parties and reports canClose", async () => {
+    const created = await inject("POST", api("/rfis"), H(owner), { subject: "Closable", question: "q", assigneeId: engineer.userId });
+    const id = created.json().id as string;
+    await inject("POST", api(`/rfis/${id}/issue`), H(owner));
+    const byStranger = await inject("POST", api(`/rfis/${id}/close`), H(sub));
+    expect(byStranger.statusCode).toBe(403);
+    expect((await inject("GET", api(`/rfis/${id}`), H(sub))).json().permissions.canClose).toBe(false);
+    expect((await inject("GET", api(`/rfis/${id}`), H(engineer))).json().permissions.canClose).toBe(true);
+    const byAssignee = await inject("POST", api(`/rfis/${id}/close`), H(engineer));
+    expect(byAssignee.statusCode).toBe(200);
+    expect(byAssignee.json().status).toBe("closed");
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -618,6 +648,22 @@ describe("Daily logs", () => {
     expect(rec.json().signalsRaised).toBe(1);
     const again = await inject("POST", api(`/daily-logs/${date}/reconcile`), H(pm), {});
     expect(again.json().signalsRaised).toBe(0);
+  });
+
+  it("refuses an over-long reporting window instead of silently truncating it", async () => {
+    // The old guard counted business days returned by a helper that stopped
+    // after 400 CALENDAR steps, so it could never fire and a multi-year
+    // request came back covering only the first ~13 months.
+    const wide = await inject("GET", api("/daily-logs/missing?from=2020-01-01&to=2026-01-01"), H(engineer));
+    expect(wide.statusCode).toBe(400);
+    expect(wide.json().message).toContain("Range too large");
+    const wideCompliance = await inject("GET", api("/daily-logs/compliance?from=2020-01-01&to=2026-01-01"), H(engineer));
+    expect(wideCompliance.statusCode).toBe(400);
+    // A window inside the bound still answers, and covers its whole span.
+    const ok = await inject("GET", api(`/daily-logs/missing?from=${addDaysISO(todayISO(), -300)}&to=${todayISO()}`), H(engineer));
+    expect(ok.statusCode).toBe(200);
+    expect(ok.json().days[ok.json().days.length - 1] <= todayISO()).toBe(true);
+    expect(ok.json().days.length).toBeGreaterThan(200);
   });
 
   it("captures weather honestly: disabled in tests, so it reports the reason", async () => {
