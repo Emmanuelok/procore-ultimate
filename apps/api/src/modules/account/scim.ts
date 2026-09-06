@@ -1,6 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, count, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import {
   authSessions,
@@ -124,6 +124,16 @@ function constantTimeEqual(a: string, b: string): boolean {
 /* ------------------------------------------------------------------ */
 /* Representations                                                     */
 /* ------------------------------------------------------------------ */
+
+/**
+ * The ceiling on a whole-tenant membership read.
+ *
+ * SCIM Groups are computed from the entire membership, so the Group routes
+ * cannot be answered from a page. They are still not allowed to be unbounded:
+ * this is the bound, and every place it can bite says so in the response
+ * rather than quietly returning a partial answer.
+ */
+const MAX_GROUP_SCAN = 5_000;
 
 export interface ScimUserRow {
   id: string;
@@ -443,37 +453,112 @@ export function registerScimRoutes(app: FastifyInstance): void {
     return principal;
   }
 
-  async function loadMembers(companyId: string, filter?: { email?: string; active?: boolean }) {
+  /**
+   * THE MEMBERSHIP READ, PAGED IN THE DATABASE.
+   *
+   * A directory doing a full sync walks `GET /Users` with startIndex/count.
+   * This used to load every member of the tenant on every one of those pages
+   * and slice the array, so a 10,000-seat customer re-read 10,000 joined rows
+   * a hundred times to serve one sync — the "no roll-up may load an unbounded
+   * table into memory" rule (plan §6.4), on the one route an IdP hits in a
+   * loop. The filter goes into the WHERE and the total comes from `count()`.
+   */
+  const memberWhere = (companyId: string, filter?: { email?: string; active?: boolean }) =>
+    and(
+      eq(companyMemberships.companyId, companyId),
+      filter?.email ? eq(users.email, filter.email) : undefined,
+      filter?.active === undefined ? undefined : eq(users.isActive, filter.active),
+    );
+
+  const memberColumns = {
+    id: users.id,
+    email: users.email,
+    name: users.name,
+    isActive: users.isActive,
+    role: companyMemberships.role,
+    createdAt: users.createdAt,
+    updatedAt: users.updatedAt,
+  };
+
+  const toScimRow = (r: {
+    id: string;
+    email: string;
+    name: string;
+    isActive: boolean;
+    role: string;
+    createdAt: string;
+    updatedAt: string;
+  }): ScimUserRow => ({
+    id: r.id,
+    email: r.email,
+    name: r.name,
+    isActive: r.isActive,
+    role: r.role as CompanyRole,
+    createdAt: r.createdAt,
+    updatedAt: r.updatedAt,
+  });
+
+  async function loadMembersPage(
+    companyId: string,
+    filter: { email?: string; active?: boolean } | undefined,
+    page: { limit: number; offset: number },
+  ): Promise<{ items: ScimUserRow[]; total: number }> {
+    const where = memberWhere(companyId, filter);
     const rows = await app.db
-      .select({
-        id: users.id,
-        email: users.email,
-        name: users.name,
-        isActive: users.isActive,
-        role: companyMemberships.role,
-        createdAt: users.createdAt,
-        updatedAt: users.updatedAt,
-      })
+      .select(memberColumns)
+      .from(companyMemberships)
+      .innerJoin(users, eq(users.id, companyMemberships.userId))
+      .where(where)
+      .orderBy(asc(users.email))
+      .limit(page.limit)
+      .offset(page.offset);
+    const [totalRow] = await app.db
+      .select({ n: count() })
+      .from(companyMemberships)
+      .innerJoin(users, eq(users.id, companyMemberships.userId))
+      .where(where);
+    return { items: rows.map(toScimRow), total: Number(totalRow?.n ?? 0) };
+  }
+
+  /**
+   * Every member, for the Group routes — which are defined over the WHOLE
+   * membership (a SCIM `replace` on a group means "these people and nobody
+   * else") and cannot be answered from a page.
+   *
+   * Bounded anyway, at `MAX_GROUP_SCAN`. The bound is never silent: the Group
+   * responses carry `urn:constructos:scim:truncated` when it bites, and a
+   * `replace` over a membership larger than the bound is REFUSED rather than
+   * applied to the part we happened to read — applying it would demote or
+   * promote people on the strength of an arbitrary alphabetical cut.
+   */
+  async function loadMembers(
+    companyId: string,
+    filter?: { email?: string; active?: boolean },
+  ): Promise<ScimUserRow[]> {
+    const rows = await app.db
+      .select(memberColumns)
+      .from(companyMemberships)
+      .innerJoin(users, eq(users.id, companyMemberships.userId))
+      .where(memberWhere(companyId, filter))
+      .orderBy(asc(users.email))
+      .limit(MAX_GROUP_SCAN);
+    return rows.map(toScimRow);
+  }
+
+  /** Just the members an IdP named in a PatchOp — no scan of the tenant. */
+  async function loadMembersByIds(companyId: string, ids: readonly string[]): Promise<ScimUserRow[]> {
+    if (ids.length === 0) return [];
+    const rows = await app.db
+      .select(memberColumns)
       .from(companyMemberships)
       .innerJoin(users, eq(users.id, companyMemberships.userId))
       .where(
         and(
           eq(companyMemberships.companyId, companyId),
-          filter?.email ? eq(users.email, filter.email) : undefined,
+          inArray(companyMemberships.userId, [...ids].slice(0, MAX_GROUP_SCAN)),
         ),
-      )
-      .orderBy(asc(users.email));
-    const mapped: ScimUserRow[] = rows.map((r) => ({
-      id: r.id,
-      email: r.email,
-      name: r.name,
-      isActive: r.isActive,
-      role: r.role as CompanyRole,
-      createdAt: r.createdAt,
-      updatedAt: r.updatedAt,
-    }));
-    if (filter?.active === undefined) return mapped;
-    return mapped.filter((r) => r.isActive === filter.active);
+      );
+    return rows.map(toScimRow);
   }
 
   async function loadMember(companyId: string, userId: string): Promise<ScimUserRow | null> {
@@ -627,16 +712,18 @@ export function registerScimRoutes(app: FastifyInstance): void {
         });
       }
     }
-    const all = await loadMembers(principal.companyId, filter);
     const startIndex = Math.max(1, Number(query["startIndex"] ?? 1) || 1);
-    const count = Math.min(500, Math.max(0, Number(query["count"] ?? 100) || 100));
-    const page = all.slice(startIndex - 1, startIndex - 1 + count);
+    const pageSize = Math.min(500, Math.max(0, Number(query["count"] ?? 100) || 100));
+    const { items, total } = await loadMembersPage(principal.companyId, filter, {
+      limit: pageSize,
+      offset: startIndex - 1,
+    });
     return reply.type("application/scim+json").send({
       schemas: [SCIM_LIST_SCHEMA],
-      totalResults: all.length,
-      itemsPerPage: page.length,
+      totalResults: total,
+      itemsPerPage: items.length,
       startIndex,
-      Resources: page.map((r) => scimUser(r, base)),
+      Resources: items.map((r) => scimUser(r, base)),
     });
   });
 
@@ -935,13 +1022,15 @@ export function registerScimRoutes(app: FastifyInstance): void {
     const principal = await scimAuth(req, reply);
     if (!principal) return reply;
     const members = await loadMembers(principal.companyId);
-    const resources = COMPANY_ROLES.map((role) =>
-      scimGroup(
+    const resources = COMPANY_ROLES.map((role) => {
+      const group = scimGroup(
         role,
         members.filter((m) => m.role === role).map((m) => ({ id: m.id, name: m.name })),
         base,
-      ),
-    );
+      ) as Record<string, unknown>;
+      if (members.length >= MAX_GROUP_SCAN) group["urn:constructos:scim:truncated"] = MAX_GROUP_SCAN;
+      return group;
+    });
     return reply.type("application/scim+json").send({
       schemas: [SCIM_LIST_SCHEMA],
       totalResults: resources.length,
@@ -958,15 +1047,13 @@ export function registerScimRoutes(app: FastifyInstance): void {
     const role = id.replace(/^role:/, "") as CompanyRole;
     if (!COMPANY_ROLES.includes(role)) return scimError(reply, 404, `No group ${id}.`);
     const members = await loadMembers(principal.companyId);
-    return reply
-      .type("application/scim+json")
-      .send(
-        scimGroup(
-          role,
-          members.filter((m) => m.role === role).map((m) => ({ id: m.id, name: m.name })),
-          base,
-        ),
-      );
+    const group = scimGroup(
+      role,
+      members.filter((m) => m.role === role).map((m) => ({ id: m.id, name: m.name })),
+      base,
+    ) as Record<string, unknown>;
+    if (members.length >= MAX_GROUP_SCAN) group["urn:constructos:scim:truncated"] = MAX_GROUP_SCAN;
+    return reply.type("application/scim+json").send(group);
   });
 
   app.patch(`${route}/Groups/:id`, async (req, reply) => {
@@ -986,16 +1073,33 @@ export function registerScimRoutes(app: FastifyInstance): void {
         "invalidSyntax",
       );
     }
-    const members = await loadMembers(principal.companyId);
-    const byId = new Map(members.map((m) => [m.id, m]));
     const toRole: string[] = [];
     const toMember: string[] = [];
+    // `replace` is defined over the WHOLE membership ("these people and nobody
+    // else"), so it is the one operation that needs the scan; `add`/`remove`
+    // name their subjects and are read by id.
+    let byId: Map<string, ScimUserRow>;
     if (patch.replaceWith) {
+      const members = await loadMembers(principal.companyId);
+      if (members.length >= MAX_GROUP_SCAN) {
+        return scimError(
+          reply,
+          413,
+          `This company has more than ${MAX_GROUP_SCAN} members, and a group "replace" is defined ` +
+            `over all of them. Applying it to the first ${MAX_GROUP_SCAN} would promote or demote ` +
+            `people on the strength of an alphabetical cut, so it is refused. Use add/remove ` +
+            `operations, which name their subjects.`,
+          "tooMany",
+        );
+      }
+      byId = new Map(members.map((m) => [m.id, m]));
       for (const m of members) {
         if (patch.replaceWith.includes(m.id) && m.role !== role) toRole.push(m.id);
         if (!patch.replaceWith.includes(m.id) && m.role === role) toMember.push(m.id);
       }
     } else {
+      const named = await loadMembersByIds(principal.companyId, [...patch.add, ...patch.remove]);
+      byId = new Map(named.map((m) => [m.id, m]));
       for (const memberId of patch.add) if (byId.has(memberId)) toRole.push(memberId);
       for (const memberId of patch.remove) {
         if (byId.get(memberId)?.role === role) toMember.push(memberId);
@@ -1054,12 +1158,12 @@ export function registerScimRoutes(app: FastifyInstance): void {
       });
     }
     const after = await loadMembers(principal.companyId);
-    return reply.type("application/scim+json").send(
-      scimGroup(
-        role,
-        after.filter((m) => m.role === role).map((m) => ({ id: m.id, name: m.name })),
-        base,
-      ),
-    );
+    const body = scimGroup(
+      role,
+      after.filter((m) => m.role === role).map((m) => ({ id: m.id, name: m.name })),
+      base,
+    ) as Record<string, unknown>;
+    if (after.length >= MAX_GROUP_SCAN) body["urn:constructos:scim:truncated"] = MAX_GROUP_SCAN;
+    return reply.type("application/scim+json").send(body);
   });
 }
