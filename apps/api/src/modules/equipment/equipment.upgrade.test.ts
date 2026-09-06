@@ -15,6 +15,7 @@ import {
   equipment,
   equipmentCertificates,
   equipmentMaintenanceSchedules,
+  equipmentReadings,
   equipmentTelematicsReadings,
   evidence,
   materialItems,
@@ -1690,6 +1691,218 @@ describe("telematics reconciliation recorded as assertion, evidence and reconcil
       `/projects/${projectC}/equipment-telematics/reconciliation/run`,
       {},
       stranger.headers,
+    );
+    expect(res.statusCode).toBe(403);
+  });
+});
+
+/* ================================================================== */
+/* The telematics detectors ACT — signals, and a machine off the fleet */
+/* ================================================================== */
+
+/**
+ * The intelligence ROUTE reports; these detectors leave a Signal and, for a
+ * fault the manufacturer grades critical, take the machine out of service.
+ * The three things worth testing are that it fires, that it fires ONCE, and
+ * that it never restates the status of a machine that is already off the job.
+ */
+describe("telematics detectors act on what the feed says", () => {
+  let fenced: string;
+  let wanderer: string;
+  let thirsty: string;
+  let broken: string;
+  let offHired: string;
+
+  beforeAll(async () => {
+    fenced = await makeProject("Detector site");
+    await app.db
+      .update(projects)
+      .set({ latitude: 51.5007, longitude: -0.1246 })
+      .where(eq(projects.id, fenced));
+
+    /* 1. worked ninety kilometres from the job, engine running */
+    wanderer = await makeMachine({ name: "Detector wanderer" });
+    await mobilise(fenced, wanderer);
+    for (const [i, point] of [
+      { latitude: 52.2053, longitude: 0.1218 },
+      { latitude: 52.2054, longitude: 0.1219 },
+    ].entries()) {
+      await app.db.insert(equipmentTelematicsReadings).values({
+        id: newId("etr"),
+        companyId: owner.companyId,
+        projectId: fenced,
+        equipmentId: wanderer,
+        providerKey: "custom",
+        deviceId: `DEV-DET-W${i}`,
+        recordedAt: `${daysAgo(1)}T0${8 + i}:00:00.000Z`,
+        latitude: point.latitude,
+        longitude: point.longitude,
+        engineRunning: 1,
+      });
+    }
+
+    /* 2. 400 litres booked in against 60 the machine says it burned */
+    thirsty = await makeMachine({ name: "Detector thirsty" });
+    await mobilise(fenced, thirsty);
+    await app.db.insert(equipmentTelematicsReadings).values({
+      id: newId("etr"),
+      companyId: owner.companyId,
+      projectId: fenced,
+      equipmentId: thirsty,
+      providerKey: "custom",
+      deviceId: "DEV-DET-F",
+      recordedAt: `${daysAgo(1)}T09:00:00.000Z`,
+      latitude: 51.5007,
+      longitude: -0.1246,
+      engineRunning: 1,
+      fuelUsedLitres: 60,
+    });
+    for (const litres of [200, 200]) {
+      await app.db.insert(equipmentReadings).values({
+        id: newId("erd"),
+        companyId: owner.companyId,
+        projectId: fenced,
+        equipmentId: thirsty,
+        readingType: "fuel_fill",
+        readAt: `${daysAgo(1)}T17:00:00.000Z`,
+        value: litres,
+        createdBy: owner.userId,
+      });
+    }
+
+    /* 3. a critical fault code — the manufacturer saying stop */
+    broken = await makeMachine({ name: "Detector broken" });
+    await mobilise(fenced, broken);
+    await app.db.insert(equipmentTelematicsReadings).values({
+      id: newId("etr"),
+      companyId: owner.companyId,
+      projectId: fenced,
+      equipmentId: broken,
+      providerKey: "custom",
+      deviceId: "DEV-DET-B",
+      recordedAt: `${daysAgo(1)}T10:00:00.000Z`,
+      latitude: 51.5007,
+      longitude: -0.1246,
+      engineRunning: 1,
+      faultCodes: [
+        { code: "SPN-100-FMI-1", description: "Oil pressure critical", severity: "critical" },
+      ],
+    });
+
+    /* 4. the same critical fault on a machine already off hire */
+    offHired = await makeMachine({ name: "Detector off-hired" });
+    await mobilise(fenced, offHired);
+    await app.db
+      .update(equipment)
+      .set({ status: "off_hired" })
+      .where(eq(equipment.id, offHired));
+    await app.db.insert(equipmentTelematicsReadings).values({
+      id: newId("etr"),
+      companyId: owner.companyId,
+      projectId: fenced,
+      equipmentId: offHired,
+      providerKey: "custom",
+      deviceId: "DEV-DET-O",
+      recordedAt: `${daysAgo(1)}T10:00:00.000Z`,
+      engineRunning: 1,
+      faultCodes: [
+        { code: "SPN-110-FMI-0", description: "Coolant over temperature", severity: "critical" },
+      ],
+    });
+  });
+
+  it("raises each detector once and takes the critically faulted machine off the fleet", async () => {
+    const res = await post(`/projects/${fenced}/equipment-telematics/intelligence/run`, {});
+    expect(res.statusCode, res.body).toBe(200);
+    const body = res.json() as {
+      machinesAssessed: number;
+      signalsRaised: number;
+      takenOutOfService: string[];
+    };
+    expect(body.machinesAssessed).toBe(4);
+    // one off-site, one fuel, two faults
+    expect(body.signalsRaised).toBe(4);
+
+    const offSite = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "equipment_off_site_use"),
+        ),
+      );
+    expect(offSite).toHaveLength(1);
+    expect(offSite[0]!.severity).toBe("high");
+    expect(offSite[0]!.explanation).toContain("engine RUNNING");
+
+    const fuel = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "equipment_fuel_unaccounted"),
+        ),
+      );
+    expect(fuel).toHaveLength(1);
+    expect(fuel[0]!.explanation).toContain("340");
+
+    const faults = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(eq(signals.companyId, owner.companyId), eq(signals.detector, "equipment_fault_active")),
+      );
+    expect(faults).toHaveLength(2);
+    expect(faults.every((f) => f.severity === "critical")).toBe(true);
+
+    // The working machine is stopped; the off-hired one is left alone, and the
+    // signal says which of the two happened.
+    const [brokenRow] = await app.db.select().from(equipment).where(eq(equipment.id, broken));
+    expect(brokenRow?.status).toBe("breakdown");
+    const [offRow] = await app.db.select().from(equipment).where(eq(equipment.id, offHired));
+    expect(offRow?.status).toBe("off_hired");
+    expect(body.takenOutOfService).toEqual([brokenRow!.reference]);
+    const leftAlone = faults.find(
+      (f) => (f.evidenceRefs as { equipmentId?: string }).equipmentId === offHired,
+    );
+    expect(leftAlone!.explanation).toContain('was left at "off_hired"');
+  });
+
+  it("says nothing new on a second run over the same window", async () => {
+    const again = await post(`/projects/${fenced}/equipment-telematics/intelligence/run`, {});
+    expect(again.statusCode).toBe(200);
+    expect(again.json().signalsRaised).toBe(0);
+    expect(again.json().takenOutOfService).toEqual([]);
+    const all = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(eq(signals.companyId, owner.companyId), eq(signals.detector, "equipment_fault_active")),
+      );
+    expect(all).toHaveLength(2);
+  });
+
+  it("registers the detector sweep as a job", async () => {
+    const names = app.scheduler.list().map((j) => j.name);
+    expect(names).toContain("equipment.telematics-intelligence");
+  });
+
+  it("refuses the run to another company", async () => {
+    const res = await post(
+      `/projects/${fenced}/equipment-telematics/intelligence/run`,
+      {},
+      stranger.headers,
+    );
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("refuses the run to a read-only member", async () => {
+    const res = await post(
+      `/projects/${projectA}/equipment-telematics/intelligence/run`,
+      {},
+      readerHeaders,
     );
     expect(res.statusCode).toBe(403);
   });

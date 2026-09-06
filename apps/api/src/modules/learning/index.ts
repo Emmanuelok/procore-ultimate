@@ -1262,6 +1262,11 @@ export const learningModule: FastifyPluginAsync = async (app) => {
 
   app.get("/learning/triggers/rules", { preHandler: companyRead }, async () => ({
     rules: describeTriggerRules(),
+    /* The record types the graph can VERIFY an evidence reference against.
+       Published here so the UI's reverse-lookup picker cannot drift from what
+       the server actually resolves — a picker offering a type the registry
+       does not know produces edges that are stored unverified. */
+    resolvableTypes: knownTargetTypes(),
     note:
       "Every rule reads records another module already writes. Nothing here depends on a " +
       "human remembering to tell the learning module that something happened.",
