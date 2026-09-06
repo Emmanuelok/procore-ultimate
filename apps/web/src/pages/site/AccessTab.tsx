@@ -13,6 +13,7 @@ import { DataTable, type DataColumns } from "../../ui/data";
 import { IconPlus, IconUsers } from "../../ui/icons";
 import { api } from "../../lib/api";
 import {
+  ATTENDANCE_RESULT_TONE,
   EM_DASH,
   INDUCTION_STATUS_TONE,
   KeyValue,
@@ -29,6 +30,8 @@ import {
   optionList,
   useAction,
   useResource,
+  type AttendanceLine,
+  type AttendanceReport,
   type GateEventRow,
   type InductionRow,
   type ListResponse,
@@ -40,13 +43,14 @@ import {
   type SiteLookups,
 } from "./siteShared";
 
-type Panel = "register" | "inductions" | "passes" | "feed" | "musters";
+type Panel = "register" | "inductions" | "passes" | "feed" | "attendance" | "musters";
 
 const PANELS: Array<{ value: Panel; label: string }> = [
   { value: "register", label: "On site now" },
   { value: "inductions", label: "Inductions" },
   { value: "passes", label: "Passes" },
   { value: "feed", label: "Gate feed" },
+  { value: "attendance", label: "Attendance vs feed" },
   { value: "musters", label: "Musters" },
 ];
 
@@ -75,6 +79,7 @@ export default function AccessTab({
       {panel === "inductions" ? <InductionsPanel base={base} lookups={lookups} onChanged={onChanged} /> : null}
       {panel === "passes" ? <PassesPanel base={base} lookups={lookups} onChanged={onChanged} /> : null}
       {panel === "feed" ? <FeedPanel base={base} onChanged={onChanged} /> : null}
+      {panel === "attendance" ? <AttendancePanel base={base} /> : null}
       {panel === "musters" ? <MustersPanel base={base} onChanged={onChanged} /> : null}
     </div>
   );
@@ -1008,6 +1013,169 @@ function GateEventForm({ base, open, onClose, onCreated }: { base: string; open:
 /* ------------------------------------------------------------------ */
 /* Musters                                                             */
 /* ------------------------------------------------------------------ */
+
+/**
+ * The gate feed against the workforce module's own attendance records.
+ *
+ * The comparison is deliberately timid about accusing anybody: a day the feed
+ * never ran is "not comparable", a badge with no worker behind it is listed
+ * apart from the register rather than counted against it, and a session still
+ * open has no hours yet.
+ */
+function AttendancePanel({ base }: { base: string }) {
+  const today = new Date().toISOString().slice(0, 10);
+  const twoWeeksAgo = new Date(Date.now() - 13 * 86_400_000).toISOString().slice(0, 10);
+  const [from, setFrom] = useState(twoWeeksAgo);
+  const [to, setTo] = useState(today);
+  const [tolerance, setTolerance] = useState("0.5");
+  const [result, setResult] = useState("");
+  const query = `from=${from}&to=${to}&toleranceHours=${tolerance || "0.5"}${result ? `&result=${result}` : ""}`;
+  const report = useResource<AttendanceReport>(`${base}/attendance-reconciliation?${query}`);
+  const r = report.data;
+
+  const columns = useMemo<DataColumns<AttendanceLine>>(
+    () => [
+      { id: "date", header: "Day", accessor: "date", type: "text", sticky: "start", width: 120 },
+      { id: "name", header: "Worker", accessor: "name", type: "text", width: 200 },
+      {
+        id: "claimedHours",
+        header: "Claimed h",
+        accessor: (row) => row.claimedHours ?? 0,
+        type: "number",
+        width: 110,
+        cell: ({ row }) => (row.claimedHours === null ? EM_DASH : num(row.claimedHours, 2)),
+      },
+      {
+        id: "observedHours",
+        header: "At the gate h",
+        accessor: (row) => row.observedHours ?? 0,
+        type: "number",
+        width: 130,
+        cell: ({ row }) => (row.observedHours === null ? EM_DASH : num(row.observedHours, 2)),
+      },
+      {
+        id: "varianceHours",
+        header: "Variance h",
+        accessor: (row) => row.varianceHours ?? 0,
+        type: "number",
+        width: 120,
+        cell: ({ row }) => (row.varianceHours === null ? EM_DASH : num(row.varianceHours, 2)),
+      },
+      {
+        id: "result",
+        header: "Verdict",
+        accessor: "result",
+        type: "status",
+        width: 190,
+        groupable: true,
+        cell: ({ row }) => (
+          <Badge tone={ATTENDANCE_RESULT_TONE[row.result] ?? "neutral"} size="xs" dot>
+            {labelize(row.result)}
+          </Badge>
+        ),
+      },
+      { id: "claimSource", header: "Claim source", accessor: (row) => row.claimSource ?? "", type: "text", width: 130, cell: ({ row }) => (row.claimSource ? labelize(row.claimSource) : EM_DASH) },
+      { id: "why", header: "Why", accessor: (row) => row.reasons.join(" "), type: "text", width: 420 },
+    ],
+    [],
+  );
+
+  return (
+    <Card>
+      <CardBody>
+        <SectionHeading
+          title="Attendance against the gate feed"
+          hint="The workforce module's attendance records say who was on site and for how long; this module's turnstile feed says who actually walked through a gate. Nothing here is written back: the labour register belongs to the workforce module, and what this produces is a finding."
+          actions={
+            <div className="flex flex-wrap items-end gap-2">
+              <Field label="From">
+                <Input type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
+              </Field>
+              <Field label="To">
+                <Input type="date" value={to} onChange={(e) => setTo(e.target.value)} />
+              </Field>
+              <Field label="Tolerance (h)">
+                <Input type="number" min={0} max={24} step="0.25" value={tolerance} onChange={(e) => setTolerance(e.target.value)} className="w-24" />
+              </Field>
+              <Field label="Verdict">
+                <Select value={result} onChange={(e) => setResult(e.target.value)}>
+                  <option value="">All</option>
+                  {["agreed", "over_claimed", "under_claimed", "no_gate_record", "no_attendance_record", "not_comparable"].map((k) => (
+                    <option key={k} value={k}>
+                      {labelize(k)}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+            </div>
+          }
+        />
+        {report.error ? <LoadError message={report.error} onRetry={report.reload} /> : null}
+        {r ? (
+          <>
+            <div className="mb-3">
+              <KeyValue
+                items={[
+                  { label: "Compared", value: `${num(r.comparedLines)} worker-day(s)` },
+                  {
+                    label: "Claimed vs at the gate",
+                    value:
+                      r.comparedLines === 0
+                        ? EM_DASH
+                        : `${num(r.comparedClaimedHours, 1)} h vs ${num(r.comparedObservedHours, 1)} h`,
+                  },
+                  {
+                    label: "Worst single over-claim",
+                    value:
+                      r.worstOverclaimHours === null ? EM_DASH : (
+                        <span className="font-semibold text-danger-fg">{num(r.worstOverclaimHours, 2)} h</span>
+                      ),
+                  },
+                  { label: "Feed coverage", value: `${num(r.daysWithGateReads)} of ${num(r.daysInWindow)} day(s)` },
+                ]}
+              />
+            </div>
+            <ReasonList reasons={r.reasons} className="mb-3" />
+          </>
+        ) : null}
+        <DataTable
+          data={r?.lines ?? []}
+          columns={columns}
+          getRowId={(row) => `${row.date}|${row.workerId ?? row.personKey ?? row.name}`}
+          loading={report.loading && !report.data}
+          height={440}
+          stickyHeader
+          filterRow
+          exportFileName="attendance-reconciliation"
+          rowTone={(row) => (row.result === "over_claimed" || row.result === "no_gate_record" ? "danger" : row.result === "under_claimed" || row.result === "no_attendance_record" ? "warning" : undefined)}
+          empty={{
+            title: "Nothing to reconcile in this window",
+            description:
+              "Either the workforce module holds no attendance for these days, or the gate feed recorded nothing to compare it with. The panel says which above rather than showing a clean bill of health.",
+          }}
+        />
+        {r && r.unattributedPresence.length > 0 ? (
+          <div className="mt-3">
+            <SectionHeading
+              title="Gate presence with no worker behind it"
+              hint="Visitors, staff and badges the labour register does not know. Listed here rather than counted against anybody's attendance."
+            />
+            <ul className="space-y-1 text-meta">
+              {r.unattributedPresence.slice(0, 50).map((p) => (
+                <li key={`${p.date}|${p.personKey}`} className="flex items-center justify-between gap-2 rounded-md border border-border-subtle px-3 py-1.5">
+                  <span className="text-content">
+                    {p.personName} <span className="text-content-muted">· {p.date}</span>
+                  </span>
+                  <span className="text-content-muted">{num(p.hours, 2)} h</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+      </CardBody>
+    </Card>
+  );
+}
 
 function MustersPanel({ base, onChanged }: { base: string; onChanged: () => void }) {
   const list = useResource<ListResponse<MusterRow>>(`${base}/musters?pageSize=100`);

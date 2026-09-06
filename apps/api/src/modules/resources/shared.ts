@@ -104,6 +104,15 @@ export async function ledgerResources(
   objectType: string,
   objectId: string,
   payload: Record<string, unknown>,
+  /**
+   * `storePayload` keeps the whole payload next to its hash instead of the
+   * hash alone. Reserved for the handful of acts where the detail IS the
+   * record and a hash proves nothing to a reader — withdrawing somebody's
+   * approval, above all: "this booking was confirmed for these dates at this
+   * allocation and the confirmation was taken away" has to stay readable,
+   * because the numbers it refers to no longer exist anywhere else.
+   */
+  options: { storePayload?: boolean } = {},
 ): Promise<void> {
   const projectId = (req as ActorRequest).projectId ?? null;
   await appendLedger(db, {
@@ -114,6 +123,7 @@ export async function ledgerResources(
     objectId,
     projectId,
     payload: projectId ? { projectId, ...payload } : payload,
+    ...(options.storePayload ? { storePayload: true } : {}),
   });
 }
 

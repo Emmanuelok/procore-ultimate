@@ -322,7 +322,12 @@ export const assignmentRoutes: FastifyPluginAsync = async (app) => {
               withdrawnConfirmedAt: assignment.confirmedAt,
             }
           : {}),
-      });
+      },
+      /* Withdrawing an approval is one of the few acts whose payload is kept
+         in full rather than hashed: the window and the allocation somebody
+         actually agreed to are about to stop existing on the record, and a
+         hash proves nothing to whoever asks later what was approved. */
+      { storePayload: confirmationReset });
       const updated = await fetchAssignment(app.db, assignmentId, companyId, projectId);
       const conflicts = (
         await conflictsForSubject(companyId, projectId, updated.subjectKind, subjectIdOf(updated))

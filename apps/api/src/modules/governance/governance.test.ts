@@ -42,7 +42,7 @@ beforeAll(async () => {
     companyId: owner.companyId,
     name: "Capital Governance Test Project",
   });
-});
+}, 240_000);
 
 afterAll(async () => {
   await built.close();

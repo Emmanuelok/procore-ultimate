@@ -8006,6 +8006,7 @@ ALTER TABLE "disputes" ADD COLUMN "resolved_at" text;--> statement-breakpoint
 ALTER TABLE "disputes" ADD COLUMN "enforcement_status" text DEFAULT 'not_applicable' NOT NULL;--> statement-breakpoint
 ALTER TABLE "disputes" ADD COLUMN "compliance_deadline" text;--> statement-breakpoint
 ALTER TABLE "disputes" ADD COLUMN "nod_deadline" text;--> statement-breakpoint
+ALTER TABLE "affected_persons" ADD COLUMN "currency" text DEFAULT 'USD' NOT NULL;--> statement-breakpoint
 ALTER TABLE "grievances" ADD COLUMN "escalation_tier" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
 ALTER TABLE "grievances" ADD COLUMN "escalated_at" timestamp with time zone;--> statement-breakpoint
 ALTER TABLE "grievances" ADD COLUMN "escalation_history" jsonb DEFAULT '[]'::jsonb NOT NULL;--> statement-breakpoint

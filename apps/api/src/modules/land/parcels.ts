@@ -37,7 +37,13 @@ const parcelCreateSchema = z.object({
   encumbrances: z.string().max(20000).nullable().optional(),
   valuationAmount: z.number().nonnegative().nullable().optional(),
   compensationAmount: z.number().nonnegative().nullable().optional(),
-  currency: z.string().length(3).optional(),
+  // normalised, so "ugx" and "UGX" are one currency in the RAP roll-up
+  currency: z
+    .string()
+    .trim()
+    .length(3)
+    .transform((c) => c.toUpperCase())
+    .optional(),
   latitude: z.number().min(-90).max(90).nullable().optional(),
   longitude: z.number().min(-180).max(180).nullable().optional(),
   blockingTaskIds: z.array(z.string().min(1)).max(500).optional(),

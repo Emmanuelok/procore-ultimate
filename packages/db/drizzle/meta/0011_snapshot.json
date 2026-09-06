@@ -1,5 +1,5 @@
 {
-  "id": "071c2849-76be-4548-b397-028749bd7da4",
+  "id": "de41d96d-0c83-47cf-b0f6-fa3b71f56948",
   "prevId": "340cf323-a4ed-4b81-8d6c-8f3e94b698e3",
   "version": "7",
   "dialect": "postgresql",
@@ -30585,6 +30585,13 @@
           "type": "double precision",
           "primaryKey": false,
           "notNull": false
+        },
+        "currency": {
+          "name": "currency",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'USD'"
         },
         "compensation_paid_at": {
           "name": "compensation_paid_at",

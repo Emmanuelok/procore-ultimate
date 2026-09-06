@@ -183,8 +183,8 @@ export const progressRoutes: FastifyPluginAsync = async (app) => {
 
     let signalId: string | null = null;
     if (assessment.overclaim && assessment.variancePercent >= 10) {
-      const raised = await alreadySignalled(app.db, companyId, ["site_progress_overclaim"], projectId);
       const key = `progress:${saved.record.id}`;
+      const raised = await alreadySignalled(app.db, companyId, ["site_progress_overclaim"], { projectId, keys: [key] });
       if (!raised.has(key)) {
         signalId = await raiseSignal(app.db, companyId, projectId, req.user!.id, {
           detector: "site_progress_overclaim",

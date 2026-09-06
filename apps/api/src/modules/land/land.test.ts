@@ -727,10 +727,79 @@ describe("project affected persons", () => {
     expect(rap.compensationCommitted).toBe(11600);
     expect(rap.compensationPaid).toBe(10600);
     expect(rap.compensationOutstanding).toBe(1000);
+    // one currency in play, so the flat totals mean something and say which
+    expect(rap.compensationMixedCurrency).toBe(false);
+    expect(rap.compensationCurrency).toBe("USD");
+    expect(rap.compensationCurrencies).toEqual(["USD"]);
+    expect(rap.compensationByCurrency.USD.committed).toBe(11600);
     expect(rap.livelihoodRequired).toBe(2);
     expect(rap.livelihoodRestored).toBe(1);
     expect(rap.livelihoodRestoredPercent).toBe(50);
     expect(rap.readyForConstructionPercent).toBe(50);
+  });
+
+  /*
+   * A corridor scheme crossing a border compensates in two currencies. Adding
+   * them produces a figure that is not money, so the flat totals go null with
+   * the reason and the per-currency breakdown carries the answer.
+   */
+  it("never sums compensation across currencies", async () => {
+    const pid = await makeProject("Cross-border RAP");
+    const usd = (
+      await createParcel(pid, {
+        reference: "X-USD",
+        compensationAmount: 1000,
+        currency: "USD",
+      })
+    ).json();
+    const ugx = (
+      await createParcel(pid, {
+        reference: "X-UGX",
+        compensationAmount: 4_000_000,
+        currency: "UGX",
+      })
+    ).json();
+    expect(usd.currency).toBe("USD");
+    expect(ugx.currency).toBe("UGX");
+
+    // and a household priced in the local currency
+    const pap = await createPap(pid, {
+      reference: "PAP-UGX",
+      displacementType: "economic",
+      currency: "ugx",
+    });
+    expect(pap.statusCode).toBe(201);
+    expect(pap.json().currency).toBe("UGX");
+    await app.inject({
+      method: "PUT",
+      url: `/api/v1/projects/${pid}/affected-persons/${pap.json().id}/entitlements`,
+      headers: owner.headers,
+      payload: {
+        entitlements: [
+          { item: "Crop compensation", basis: "District rate schedule", amount: 500_000 },
+        ],
+      },
+    });
+
+    const rap = (
+      await app.inject({
+        method: "GET",
+        url: `/api/v1/projects/${pid}/land/rap-progress`,
+        headers: owner.headers,
+      })
+    ).json();
+    expect(rap.compensationMixedCurrency).toBe(true);
+    expect(rap.compensationCurrency).toBeNull();
+    expect(rap.compensationCommitted).toBeNull();
+    expect(rap.compensationPaid).toBeNull();
+    expect(rap.compensationOutstanding).toBeNull();
+    expect(rap.compensation.parcels.committed).toBeNull();
+    expect(rap.compensationCurrencies).toEqual(["UGX", "USD"]);
+    expect(rap.compensationByCurrency.USD.committed).toBe(1000);
+    expect(rap.compensationByCurrency.UGX.committed).toBe(4_500_000);
+    expect(rap.compensationByCurrency.UGX.parcels.committed).toBe(4_000_000);
+    expect(rap.compensationByCurrency.UGX.paps.committed).toBe(500_000);
+    expect(rap.compensationReasons[0]).toContain("UGX");
   });
 
   it("returns null percentages rather than a false 100% on an empty programme", async () => {

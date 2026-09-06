@@ -156,6 +156,8 @@ export default function PapsTab({
   const [censusDate, setCensusDate] = useState("");
   const [flags, setFlags] = useState<string[]>([]);
   const [parcelId, setParcelId] = useState("");
+  /* The currency the entitlement matrix will be priced in (#567). */
+  const [currency, setCurrency] = useState("USD");
 
   function openCreate() {
     setCreateError(null);
@@ -166,6 +168,7 @@ export default function PapsTab({
     setCensusDate("");
     setFlags([]);
     setParcelId("");
+    setCurrency("USD");
     setCreateOpen(true);
   }
 
@@ -183,6 +186,7 @@ export default function PapsTab({
       if (censusDate) payload["censusDate"] = censusDate;
       if (flags.length > 0) payload["vulnerabilities"] = flags;
       if (parcelId) payload["parcelId"] = parcelId;
+      if (currency.trim().length === 3) payload["currency"] = currency.trim().toUpperCase();
       await api.post(`${base}/affected-persons`, payload);
       setCreateOpen(false);
       await load();
@@ -502,10 +506,10 @@ export default function PapsTab({
                 <Td className="text-right tabular-nums">
                   {p.compensationPaidAt ? (
                     <span className="font-medium text-emerald-700">
-                      {fmtMoney(p.compensationTotal)}
+                      {fmtMoney(p.compensationTotal, p.currency)}
                     </span>
                   ) : (
-                    <span className="text-ink-500">{fmtMoney(p.compensationTotal)}</span>
+                    <span className="text-ink-500">{fmtMoney(p.compensationTotal, p.currency)}</span>
                   )}
                 </Td>
                 <Td className="tabular-nums">{formatDate(p.censusDate)}</Td>
@@ -571,6 +575,19 @@ export default function PapsTab({
                 value={censusDate}
                 max={cutOff?.cutOffDate ?? undefined}
                 onChange={(e) => setCensusDate(e.target.value)}
+              />
+            </Field>
+          </div>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <Field
+              label="Compensation currency"
+              hint="What the entitlement matrix is priced in. Totals are never summed across currencies."
+            >
+              <Input
+                value={currency}
+                onChange={(e) => setCurrency(e.target.value.toUpperCase())}
+                maxLength={3}
+                placeholder="USD"
               />
             </Field>
           </div>
@@ -709,7 +726,9 @@ export default function PapsTab({
                       <tr key={`${e.item}-${i}`}>
                         <Td>{e.item}</Td>
                         <Td className="text-ink-500">{e.basis}</Td>
-                        <Td className="text-right tabular-nums">{fmtMoney(e.amount)}</Td>
+                        <Td className="text-right tabular-nums">
+                          {fmtMoney(e.amount, selected.currency)}
+                        </Td>
                         <Td className="text-right">
                           {e.delivered ? (
                             <Badge tone="green">Delivered</Badge>
@@ -723,13 +742,14 @@ export default function PapsTab({
                       <Td className="font-semibold">Total</Td>
                       <Td />
                       <Td className="text-right font-semibold tabular-nums">
-                        {fmtMoney(selected.compensationTotal)}
+                        {fmtMoney(selected.compensationTotal, selected.currency)}
                       </Td>
                       <Td className="text-right text-xs tabular-nums text-ink-500">
                         {fmtMoney(
                           selected.entitlements
                             .filter((e) => e.delivered)
                             .reduce((s, e) => s + e.amount, 0),
+                          selected.currency,
                         )}{" "}
                         delivered
                       </Td>
@@ -741,7 +761,7 @@ export default function PapsTab({
 
             {selected.compensationPaidAt ? (
               <p className="rounded-md bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
-                Compensation of {fmtMoney(selected.compensationTotal)} recorded as paid on{" "}
+                Compensation of {fmtMoney(selected.compensationTotal, selected.currency)} recorded as paid on{" "}
                 {formatDate(selected.compensationPaidAt)} against evidence held in the ledger.
               </p>
             ) : null}
@@ -899,10 +919,11 @@ export default function PapsTab({
             <span className="text-sm tabular-nums text-ink-700">
               {entDelivered > 0 ? (
                 <span className="mr-3 text-xs text-emerald-700">
-                  {fmtMoney(entDelivered)} delivered
+                  {fmtMoney(entDelivered, selected?.currency)} delivered
                 </span>
               ) : null}
-              Total <span className="font-semibold">{fmtMoney(entTotal)}</span>
+              Total{" "}
+              <span className="font-semibold">{fmtMoney(entTotal, selected?.currency)}</span>
             </span>
           </div>
           <div className="flex justify-end gap-2 pt-2">
@@ -933,7 +954,8 @@ export default function PapsTab({
       >
         <form onSubmit={onCompensate} className="space-y-4">
           <p className="text-sm text-ink-600">
-            Paying {fmtMoney(selected?.compensationTotal ?? null)} — the determined entitlement
+            Paying {fmtMoney(selected?.compensationTotal ?? null, selected?.currency)} — the
+            determined entitlement
             total. Evidence of the payment reaching the household is mandatory (#567).
           </p>
           <Field label="Paid on">

@@ -674,32 +674,44 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
    *
    * `candidateKeys` narrows the query to the keys actually being considered:
    * the previous version loaded every signal row for the detector into a Set
-   * on every list read, which grows without bound. `signals` has no index on
-   * (company_id, detector) and belongs to another package, so the honest fix
-   * available here is to ask a bounded question.
+   * on every list read, which grows without bound. `signals` is indexed on
+   * (company_id, detector, …) but belongs to another package, so the honest
+   * fix available here is to ask a bounded question.
+   *
+   * The keys are asked in batches. A company-wide sweep can produce thousands
+   * of candidates, and every key becomes a bind parameter — one query with
+   * more than 65,535 of them does not run slowly, it fails outright, and it
+   * would fail on exactly the large tenant that needs the sweep most.
    */
+  const SIGNAL_KEY_BATCH = 500;
+
   async function alreadySignalled(
     companyId: string,
     detector: string,
     candidateKeys?: readonly string[],
   ): Promise<Set<string>> {
     if (candidateKeys && candidateKeys.length === 0) return new Set();
-    const rows = await app.db
-      .select({ refs: signals.evidenceRefs })
-      .from(signals)
-      .where(
-        and(
-          eq(signals.companyId, companyId),
-          eq(signals.detector, detector),
-          candidateKeys
-            ? sql`${signals.evidenceRefs} ->> 'key' in ${candidateKeys}`
-            : undefined,
-        ),
-      );
+    const batches: Array<readonly string[] | null> = candidateKeys
+      ? Array.from({ length: Math.ceil(candidateKeys.length / SIGNAL_KEY_BATCH) }, (_, i) =>
+          candidateKeys.slice(i * SIGNAL_KEY_BATCH, (i + 1) * SIGNAL_KEY_BATCH),
+        )
+      : [null];
     const keys = new Set<string>();
-    for (const row of rows) {
-      const refs = row.refs as { key?: unknown } | null;
-      if (typeof refs?.key === "string") keys.add(refs.key);
+    for (const batch of batches) {
+      const rows = await app.db
+        .select({ refs: signals.evidenceRefs })
+        .from(signals)
+        .where(
+          and(
+            eq(signals.companyId, companyId),
+            eq(signals.detector, detector),
+            batch ? sql`${signals.evidenceRefs} ->> 'key' in ${batch}` : undefined,
+          ),
+        );
+      for (const row of rows) {
+        const refs = row.refs as { key?: unknown } | null;
+        if (typeof refs?.key === "string") keys.add(refs.key);
+      }
     }
     return keys;
   }

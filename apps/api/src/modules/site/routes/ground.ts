@@ -345,7 +345,12 @@ export const groundRoutes: FastifyPluginAsync = async (app) => {
       await app.db.delete(siteGroundFindings).where(and(eq(siteGroundFindings.id, findingId), eq(siteGroundFindings.companyId, companyId)));
     }
 
-    const raised = await alreadySignalled(app.db, companyId, ["site_ground_condition_change"], projectId);
+    // Every key this comparison could raise, so the dedupe read is a point
+    // lookup rather than a scan of the project's whole signal history.
+    const raised = await alreadySignalled(app.db, companyId, ["site_ground_condition_change"], {
+      projectId,
+      keys: comparison.findings.map((finding) => `ground:${id}:${finding.category}:${finding.depthFromM}-${finding.depthToM}`),
+    });
     const created: Array<typeof siteGroundFindings.$inferSelect> = [];
     let signalsRaised = 0;
 
@@ -735,8 +740,8 @@ export const groundRoutes: FastifyPluginAsync = async (app) => {
             ? "high"
             : "medium";
 
-    const raised = await alreadySignalled(app.db, companyId, ["site_utility_strike"], projectId);
     const key = `strike:${id}`;
+    const raised = await alreadySignalled(app.db, companyId, ["site_utility_strike"], { projectId, keys: [key] });
     const signalId = raised.has(key)
       ? null
       : await raiseSignal(app.db, companyId, projectId, req.user!.id, {

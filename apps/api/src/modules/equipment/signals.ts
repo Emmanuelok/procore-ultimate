@@ -6,7 +6,12 @@
  * can argue with rather than an inline condition.
  */
 
-import type { EquipmentCertificateType, SignalSeverity } from "@constructos/shared";
+import {
+  MATERIAL_SUPPLY_DETECTORS,
+  TELEMATICS_DETECTORS,
+  type EquipmentCertificateType,
+  type SignalSeverity,
+} from "@constructos/shared";
 
 /** Every detector this module raises. Listed so the module summary can
  *  report a zero count for a detector that has never fired, rather than
@@ -19,15 +24,11 @@ export const EQUIPMENT_DETECTORS = [
   "equipment_idle_on_hire",
   "equipment_meter_anomaly",
   "equipment_telematics_variance",
-  /* telematics intelligence — geofence, fuel and fault codes */
-  "equipment_off_site_use",
-  "equipment_fuel_unaccounted",
-  "equipment_fault_active",
+  /* geofence, fuel and fault codes — the vocabulary lives in the shared enums
+     so the API, the web and this catalogue cannot drift apart */
+  ...TELEMATICS_DETECTORS,
   "material_stock_negative",
-  /* materials supply chain */
-  "material_order_by_date_missed",
-  "material_shortage_forecast",
-  "material_delivery_delayed",
+  ...MATERIAL_SUPPLY_DETECTORS,
 ] as const;
 export type EquipmentDetector = (typeof EQUIPMENT_DETECTORS)[number];
 

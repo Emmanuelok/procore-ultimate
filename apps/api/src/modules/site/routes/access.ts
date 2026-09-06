@@ -17,10 +17,12 @@ import { and, asc, count, desc, eq, gte, inArray, lte } from "drizzle-orm";
 import { z } from "zod";
 import {
   siteAccessPasses,
+  siteAccessRecords,
   siteGateEvents,
   siteInductions,
   siteMusterCheckins,
   siteMusters,
+  workers,
 } from "@constructos/db";
 import {
   SITE_CREDENTIAL_TYPES,
@@ -35,6 +37,7 @@ import {
 import { badRequest, conflict, notFound } from "../../../lib/errors.js";
 import { newId } from "../../../lib/ids.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.js";
+import { reconcileAttendance, type AttendanceClaim } from "../engines/attendance.js";
 import { dailyPresence } from "../engines/occupancy.js";
 import {
   ingestGateEvents,
@@ -113,6 +116,9 @@ const gateEventBody = z.object({
   externalRef: z.string().trim().min(1).max(200).nullish(),
   raw: z.record(z.string(), z.unknown()).nullish(),
 });
+
+/** How many rows either stream may contribute to one reconciliation. */
+const FEED_READ_CAP = 20_000;
 
 export const accessRoutes: FastifyPluginAsync = async (app) => {
   const { readGate, standardGate, adminGate } = buildGates(app);
@@ -644,6 +650,102 @@ export const accessRoutes: FastifyPluginAsync = async (app) => {
         events.length === 0
           ? ["No gate events in this window. Hours on site cannot be derived from a feed that holds nothing."]
           : [],
+    };
+  });
+
+  /**
+   * The gate feed against the labour register (Vol II Z #1067–1069, M #689).
+   *
+   * `workforce.site_access_records` is an independent stream: one row per
+   * worker per day with the hours somebody says they were on site. This route
+   * folds THIS module's gate feed over the same window and compares the two,
+   * which is the reconciliation the ghost-worker family is built on.
+   *
+   * It writes nothing. The labour register belongs to the workforce module and
+   * the platform does not keep a second one; what this endpoint produces is a
+   * finding, not a correction.
+   */
+  app.get(`${base}/attendance-reconciliation`, { preHandler: readGate }, async (req) => {
+    const { projectId } = req.params as { projectId: string };
+    const companyId = req.companyId!;
+    const q = z
+      .object({
+        from: isoDateSchema,
+        to: isoDateSchema,
+        toleranceHours: z.coerce.number().min(0).max(24).optional(),
+        result: z.string().max(30).optional(),
+      })
+      .parse(req.query);
+    if (q.to < q.from) throw badRequest("`to` must not be before `from`.");
+    const spanDays = Math.round((Date.parse(`${q.to}T00:00:00Z`) - Date.parse(`${q.from}T00:00:00Z`)) / 86_400_000);
+    if (spanDays > 92) {
+      throw badRequest("Attendance may be reconciled a quarter at a time at most (92 days).");
+    }
+
+    const [events, attendance] = await Promise.all([
+      loadGateEvents(app.db, companyId, projectId, `${q.from}T00:00:00.000Z`, `${q.to}T23:59:59.999Z`, FEED_READ_CAP),
+      app.db
+        .select({
+          workerId: siteAccessRecords.workerId,
+          date: siteAccessRecords.accessDate,
+          firstIn: siteAccessRecords.firstIn,
+          lastOut: siteAccessRecords.lastOut,
+          hours: siteAccessRecords.hoursOnSite,
+          source: siteAccessRecords.source,
+          workerName: workers.fullName,
+        })
+        .from(siteAccessRecords)
+        .leftJoin(workers, eq(workers.id, siteAccessRecords.workerId))
+        .where(
+          and(
+            eq(siteAccessRecords.companyId, companyId),
+            eq(siteAccessRecords.projectId, projectId),
+            gte(siteAccessRecords.accessDate, q.from),
+            lte(siteAccessRecords.accessDate, q.to),
+          ),
+        )
+        .orderBy(asc(siteAccessRecords.accessDate))
+        .limit(FEED_READ_CAP),
+    ]);
+
+    const claims: AttendanceClaim[] = attendance.map((row) => ({
+      workerId: row.workerId,
+      workerName: row.workerName ?? null,
+      date: row.date,
+      firstIn: row.firstIn,
+      lastOut: row.lastOut,
+      hours: row.hours,
+      source: row.source,
+    }));
+    const observations = dailyPresence(events, { from: q.from, to: q.to });
+    const report = reconcileAttendance(claims, observations, {
+      from: q.from,
+      to: q.to,
+      ...(q.toleranceHours === undefined ? {} : { toleranceHours: q.toleranceHours }),
+    });
+    const lines = q.result ? report.lines.filter((line) => line.result === q.result) : report.lines;
+    // Both streams are read with a hard cap. A window that hits it produces a
+    // partial fold, and a partial fold that says nothing about being partial
+    // is the sort of figure this module refuses to print.
+    const capped: string[] = [];
+    if (events.length >= FEED_READ_CAP) {
+      capped.push(
+        `The gate feed returned the maximum of ${FEED_READ_CAP} reads for this window, so the comparison is folded from a partial stream. Narrow the window.`,
+      );
+    }
+    if (claims.length >= FEED_READ_CAP) {
+      capped.push(
+        `The labour register returned the maximum of ${FEED_READ_CAP} attendance records for this window; later days are not compared. Narrow the window.`,
+      );
+    }
+    return {
+      ...report,
+      reasons: [...capped, ...report.reasons],
+      truncated: capped.length > 0,
+      lines,
+      total: lines.length,
+      attendanceRecords: claims.length,
+      gateEvents: events.length,
     };
   });
 

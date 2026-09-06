@@ -217,7 +217,17 @@ describe("programme import", () => {
       payload: upload.payload,
     });
     expect(res.statusCode).toBe(400);
-    expect((res.json() as { message: string }).message).toContain(".mpp");
+    /*
+     * REGRESSION. The content-type allowlist added for plan 6.5 runs before the
+     * filename check, so a CSV the browser labelled text/csv started being
+     * refused by the MIME guard — whose message named neither the formats this
+     * route takes nor the .mpp remedy. A refusal an operator cannot act on is a
+     * dead end: both guards now carry the same remedy sentence.
+     */
+    const message = (res.json() as { message: string }).message;
+    expect(message).toContain(".mpp");
+    expect(message).toContain(".xer");
+    expect(message).toContain("export it as XML");
   });
 
   it("refuses a programme with no activities rather than staging an empty run", async () => {

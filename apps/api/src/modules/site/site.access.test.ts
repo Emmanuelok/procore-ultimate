@@ -12,6 +12,7 @@ import {
   projects,
   signals,
   siteAccessPasses,
+  siteAccessRecords,
   vendors,
   workers,
 } from "@constructos/db";
@@ -465,6 +466,100 @@ describe("musters", () => {
   it("answers 404 rather than failing when the muster does not exist", async () => {
     expect((await post(`/projects/${projectId}/site/musters/mus_nope/close`, {})).statusCode).toBe(404);
     expect((await post(`/projects/${projectId}/site/musters/mus_nope/reconcile`, {})).statusCode).toBe(404);
+  });
+});
+
+describe("the gate feed against the labour register", () => {
+  const day = "2026-05-09";
+  const quiet = "2026-05-10";
+  let mateId: string;
+
+  it("agrees, names a claim with no read behind it, and refuses to judge a day the feed never ran", async () => {
+    mateId = newId("wkr");
+    await app.db.insert(workers).values({
+      id: mateId,
+      companyId: owner.companyId,
+      projectId,
+      reference: "W-002",
+      fullName: "Ken Ellis",
+      vendorId,
+      createdBy: owner.userId,
+    });
+    // Ada badges a full shift on the 9th; the gate feed records it.
+    const reads = await post(`/projects/${projectId}/site/gate-events`, {
+      events: [
+        { badgeCode: "B-1001", direction: "in", occurredAt: `${day}T07:00:00.000Z`, externalRef: "att-1" },
+        { badgeCode: "B-1001", direction: "out", occurredAt: `${day}T16:00:00.000Z`, externalRef: "att-2" },
+      ],
+    });
+    expect(reads.json().accepted).toBe(2);
+
+    // The workforce module's own record of the same day, plus one for a mate
+    // who never walked through a gate, plus one on a day with no feed at all.
+    await app.db.insert(siteAccessRecords).values([
+      {
+        id: newId("sar"),
+        companyId: owner.companyId,
+        projectId,
+        workerId,
+        accessDate: day,
+        firstIn: "07:00",
+        lastOut: "16:00",
+        hoursOnSite: 9,
+        source: "turnstile",
+      },
+      {
+        id: newId("sar"),
+        companyId: owner.companyId,
+        projectId,
+        workerId: mateId,
+        accessDate: day,
+        firstIn: "07:00",
+        lastOut: "15:00",
+        hoursOnSite: 8,
+        source: "manual",
+      },
+      {
+        id: newId("sar"),
+        companyId: owner.companyId,
+        projectId,
+        workerId,
+        accessDate: quiet,
+        firstIn: "07:00",
+        lastOut: "15:00",
+        hoursOnSite: 8,
+        source: "manual",
+      },
+    ]);
+
+    const res = await get(`/projects/${projectId}/site/attendance-reconciliation?from=${day}&to=${quiet}`);
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    const lines = body.lines as Array<{ date: string; workerId: string; result: string; varianceHours: number | null }>;
+    const ada = lines.find((l) => l.workerId === workerId && l.date === day);
+    expect(ada?.result).toBe("agreed");
+    expect(ada?.varianceHours).toBe(0);
+    const ken = lines.find((l) => l.workerId === mateId);
+    expect(ken?.result).toBe("no_gate_record");
+    const untested = lines.find((l) => l.date === quiet);
+    expect(untested?.result).toBe("not_comparable");
+    expect(body.daysWithGateReads).toBe(1);
+    expect(body.reasons.join(" ")).toContain("covers 1 of the 2 day(s)");
+    expect(body.attendanceRecords).toBe(3);
+  });
+
+  it("filters by result and refuses a window longer than a quarter", async () => {
+    const filtered = await get(`/projects/${projectId}/site/attendance-reconciliation?from=${day}&to=${quiet}&result=no_gate_record`);
+    expect(filtered.json().lines.every((l: { result: string }) => l.result === "no_gate_record")).toBe(true);
+    expect(filtered.json().total).toBe(1);
+    const tooLong = await get(`/projects/${projectId}/site/attendance-reconciliation?from=2026-01-01&to=2026-12-31`);
+    expect(tooLong.statusCode).toBe(400);
+    expect(tooLong.json().message).toContain("quarter at a time");
+  });
+
+  it("is closed to another company", async () => {
+    const res = await get(`/projects/${projectId}/site/attendance-reconciliation?from=${day}&to=${quiet}`, stranger.headers);
+    expect(res.statusCode).toBe(403);
   });
 });
 

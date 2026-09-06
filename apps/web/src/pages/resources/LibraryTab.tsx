@@ -709,7 +709,9 @@ function TypeDrawer({
             </CardBody>
           </Card>
 
-          <EditTypeForm type={t} onSave={save} busy={action.busy} />
+          {/* keyed so opening a different type — or re-reading after a save —
+              re-seeds the form rather than showing the last one's values */}
+          <EditTypeForm key={`${t.id}-${nonce}`} type={t} onSave={save} busy={action.busy} />
 
           <Card>
             <CardHeader
@@ -883,7 +885,7 @@ function SkillDrawer({
             </CardBody>
           </Card>
 
-          <EditSkillForm skill={s} onSave={save} busy={action.busy} />
+          <EditSkillForm key={`${s.id}-${nonce}`} skill={s} onSave={save} busy={action.busy} />
 
           <Button
             size="sm"

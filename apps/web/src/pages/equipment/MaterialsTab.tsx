@@ -1428,11 +1428,7 @@ function SlotsView({
                   {day.rows.map((row) => {
                     const drift = slotDrift(row);
                     return (
-                      <Tr
-                        key={row.id}
-                        onClick={() => onSelectDelivery(row.id)}
-                        className="cursor-pointer"
-                      >
+                      <Tr key={row.id} interactive onClick={() => onSelectDelivery(row.id)}>
                         <Td className="font-mono tabular-nums">
                           {row.scheduledFor ? slotTime(row.scheduledFor) : EM_DASH}
                         </Td>

@@ -995,6 +995,7 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
     const existingKeys = new Set(
       before.map((b) => `${b.workerId}|${b.periodStart}|${b.periodEnd}|${b.sourceRef}`),
     );
+    const postedKeys = new Set(keys);
     const replaced = keys.filter((k) => existingKeys.has(k)).length;
 
     for (let i = 0; i < rows.length; i += 500) {
@@ -1049,7 +1050,7 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
       : [];
     for (const entry of stored) {
       const key = `${entry.workerId}|${entry.periodStart}|${entry.periodEnd}|${entry.sourceRef}`;
-      if (!keys.includes(key)) continue;
+      if (!postedKeys.has(key)) continue;
       const updated = await app.db
         .update(timecards)
         .set({ payrollEntryId: entry.id, updatedAt: new Date().toISOString() })

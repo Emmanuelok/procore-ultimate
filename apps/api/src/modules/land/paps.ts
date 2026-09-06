@@ -43,6 +43,13 @@ const papCreateSchema = z.object({
   baseline: z.record(z.string(), z.unknown()).optional(),
   censusDate: isoDateSchema.nullable().optional(),
   livelihoodProgramme: z.string().max(2000).nullable().optional(),
+  /** the currency the entitlement matrix is priced in (defaults to USD) */
+  currency: z
+    .string()
+    .trim()
+    .length(3)
+    .transform((c) => c.toUpperCase())
+    .optional(),
 });
 
 const papPatchSchema = papCreateSchema.partial().extend({
@@ -284,6 +291,7 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
         entitlements: [],
         censusDate: body.censusDate ?? null,
         livelihoodProgramme: body.livelihoodProgramme ?? null,
+        currency: body.currency ?? "USD",
         status: "registered",
         createdBy: req.user!.id,
       });
@@ -301,6 +309,7 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
           displacementType: body.displacementType,
           vulnerabilities: body.vulnerabilities ?? [],
           censusDate: body.censusDate ?? null,
+          currency: body.currency ?? "USD",
         },
         storePayload: true,
       });
@@ -387,6 +396,22 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
       if (body.parcelId) {
         await assertParcelInProject(req.companyId!, req.projectId!, body.parcelId);
       }
+      /*
+       * Once the household has been paid, the currency is a fact about a
+       * transaction that happened. Re-denominating it afterwards would
+       * silently restate every figure the RAP dashboard and the lender pack
+       * were built from.
+       */
+      if (
+        pap.compensationPaidAt &&
+        body.currency !== undefined &&
+        body.currency !== pap.currency
+      ) {
+        throw conflict(
+          `Household ${pap.reference} was compensated on ${pap.compensationPaidAt}: the ` +
+            `currency cannot be changed afterwards.`,
+        );
+      }
       const before: Record<string, unknown> = {};
       const after: Record<string, unknown> = {};
       const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
@@ -401,6 +426,7 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
         "censusDate",
         "livelihoodProgramme",
         "livelihoodRestoredAt",
+        "currency",
       ] as const) {
         if (body[key] !== undefined) {
           set[key] = body[key];
@@ -472,6 +498,7 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
           reference: pap.reference,
           entitlements,
           compensationTotal,
+          currency: pap.currency,
           previousTotal: pap.compensationTotal,
         },
         storePayload: true,
@@ -518,6 +545,7 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
           reference: pap.reference,
           householdHead: pap.householdHead,
           amount: pap.compensationTotal,
+          currency: pap.currency,
           paidAt: body.paidAt,
           evidenceIds: body.evidenceIds,
           note: body.note ?? null,
@@ -655,20 +683,84 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
     ).length;
     const vulnerableHouseholds = paps.filter((p) => p.vulnerabilities.length > 0).length;
 
-    const parcelCommitted = round2(
-      parcels.reduce((s, p) => s + (p.compensationAmount ?? p.valuationAmount ?? 0), 0),
+    /*
+     * Compensation is bucketed BY CURRENCY. A corridor scheme crossing a
+     * border holds parcels priced in two currencies, and adding them
+     * produces a figure that is not money. The flat totals below are
+     * therefore reported only when one currency is in play; when more than
+     * one is, they are null with the reason, and the per-currency breakdown
+     * carries the answer.
+     */
+    interface CompBucket {
+      currency: string;
+      parcelsCommitted: number;
+      parcelsPaid: number;
+      papsCommitted: number;
+      papsPaid: number;
+    }
+    const buckets = new Map<string, CompBucket>();
+    const bucketFor = (currency: string): CompBucket => {
+      const key = currency.toUpperCase();
+      const existing = buckets.get(key);
+      if (existing) return existing;
+      const fresh: CompBucket = {
+        currency: key,
+        parcelsCommitted: 0,
+        parcelsPaid: 0,
+        papsCommitted: 0,
+        papsPaid: 0,
+      };
+      buckets.set(key, fresh);
+      return fresh;
+    };
+    for (const p of parcels) {
+      const amount = p.compensationAmount ?? p.valuationAmount ?? 0;
+      if (amount === 0 && !p.compensationPaidAt) continue;
+      const b = bucketFor(p.currency);
+      b.parcelsCommitted += amount;
+      if (p.compensationPaidAt) b.parcelsPaid += p.compensationAmount ?? 0;
+    }
+    for (const p of paps) {
+      const amount = p.compensationTotal ?? 0;
+      if (amount === 0 && !p.compensationPaidAt) continue;
+      const b = bucketFor(p.currency);
+      b.papsCommitted += amount;
+      if (p.compensationPaidAt) b.papsPaid += amount;
+    }
+    const currencies = [...buckets.keys()].sort();
+    const mixedCurrency = currencies.length > 1;
+    const byCurrency = Object.fromEntries(
+      [...buckets.values()]
+        .sort((a, b) => a.currency.localeCompare(b.currency))
+        .map((b) => [
+          b.currency,
+          {
+            currency: b.currency,
+            committed: round2(b.parcelsCommitted + b.papsCommitted),
+            paid: round2(b.parcelsPaid + b.papsPaid),
+            outstanding: round2(
+              b.parcelsCommitted + b.papsCommitted - b.parcelsPaid - b.papsPaid,
+            ),
+            parcels: { committed: round2(b.parcelsCommitted), paid: round2(b.parcelsPaid) },
+            paps: { committed: round2(b.papsCommitted), paid: round2(b.papsPaid) },
+          },
+        ]),
     );
-    const parcelPaid = round2(
-      parcels
-        .filter((p) => p.compensationPaidAt)
-        .reduce((s, p) => s + (p.compensationAmount ?? 0), 0),
-    );
-    const papCommitted = round2(paps.reduce((s, p) => s + (p.compensationTotal ?? 0), 0));
-    const papPaid = round2(
-      paps.filter((p) => p.compensationPaidAt).reduce((s, p) => s + (p.compensationTotal ?? 0), 0),
-    );
-    const compensationCommitted = round2(parcelCommitted + papCommitted);
-    const compensationPaid = round2(parcelPaid + papPaid);
+    const only = mixedCurrency ? null : [...buckets.values()][0] ?? null;
+    const parcelCommitted = only ? round2(only.parcelsCommitted) : mixedCurrency ? null : 0;
+    const parcelPaid = only ? round2(only.parcelsPaid) : mixedCurrency ? null : 0;
+    const papCommitted = only ? round2(only.papsCommitted) : mixedCurrency ? null : 0;
+    const papPaid = only ? round2(only.papsPaid) : mixedCurrency ? null : 0;
+    const compensationCommitted = only
+      ? round2(only.parcelsCommitted + only.papsCommitted)
+      : mixedCurrency
+        ? null
+        : 0;
+    const compensationPaid = only
+      ? round2(only.parcelsPaid + only.papsPaid)
+      : mixedCurrency
+        ? null
+        : 0;
 
     const livelihoodRequired = economicallyDisplaced;
     const livelihoodRestored = paps.filter(
@@ -707,11 +799,25 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
       byVulnerability,
       compensationCommitted,
       compensationPaid,
-      compensationOutstanding: round2(compensationCommitted - compensationPaid),
+      compensationOutstanding:
+        compensationCommitted === null || compensationPaid === null
+          ? null
+          : round2(compensationCommitted - compensationPaid),
       compensation: {
         parcels: { committed: parcelCommitted, paid: parcelPaid },
         paps: { committed: papCommitted, paid: papPaid },
       },
+      /** the single currency the flat totals are stated in, or null when mixed */
+      compensationCurrency: mixedCurrency ? null : (currencies[0] ?? null),
+      compensationCurrencies: currencies,
+      compensationMixedCurrency: mixedCurrency,
+      compensationByCurrency: byCurrency,
+      compensationReasons: mixedCurrency
+        ? [
+            `Compensation is recorded in ${currencies.join(", ")}. A single total across ` +
+              `currencies would not be money, so it is reported per currency instead.`,
+          ]
+        : [],
       livelihoodRequired,
       livelihoodRestored,
       /** null when no household requires livelihood restoration */

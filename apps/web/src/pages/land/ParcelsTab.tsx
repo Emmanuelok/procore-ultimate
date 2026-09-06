@@ -36,6 +36,7 @@ import {
   type ListResponse,
   type ParcelDetail,
   type ParcelRow,
+  type ParcelSummary,
 } from "./landShared";
 
 interface FormState {
@@ -107,6 +108,13 @@ export default function ParcelsTab({
   const [statusFilter, setStatusFilter] = useState("");
   const [tenureFilter, setTenureFilter] = useState("");
   const [selected, setSelected] = useState<ParcelDetail | null>(null);
+  /*
+   * The pipeline is counted over the WHOLE register, not the filtered page:
+   * "12 under negotiation" has to keep meaning the same thing while you are
+   * looking at one status. It fails alone — the register still renders when
+   * the aggregate does not.
+   */
+  const [pipeline, setPipeline] = useState<ParcelSummary | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -119,6 +127,11 @@ export default function ParcelsTab({
     } catch (err) {
       setParcels([]);
       setError(err instanceof Error ? err.message : "Failed to load the parcel register");
+    }
+    try {
+      setPipeline(await api.get<ParcelSummary>(`${base}/land/parcel-summary`));
+    } catch {
+      setPipeline(null);
     }
   }, [base, statusFilter, tenureFilter]);
 
@@ -341,11 +354,40 @@ export default function ParcelsTab({
           {parcels ? (
             <span className="text-xs tabular-nums text-ink-400">
               {parcels.length} parcel{parcels.length === 1 ? "" : "s"}
+              {pipeline && pipeline.total !== parcels.length ? (
+                <> of {pipeline.total}</>
+              ) : null}
             </span>
           ) : null}
         </div>
         <Button onClick={openCreate}>Register parcel</Button>
       </div>
+
+      {/* Acquisition pipeline over the whole register — also the filter. */}
+      {pipeline && pipeline.total > 0 ? (
+        <div className="mb-3 flex flex-wrap items-center gap-1.5">
+          {PARCEL_STATUSES.filter((s) => (pipeline.byStatus[s] ?? 0) > 0).map((s) => {
+            const active = statusFilter === s;
+            return (
+              <button
+                key={s}
+                type="button"
+                onClick={() => setStatusFilter(active ? "" : s)}
+                aria-pressed={active}
+                className={`rounded-full px-2.5 py-1 text-xs ring-1 transition ${
+                  active
+                    ? "bg-brand-600 text-white ring-brand-600"
+                    : "bg-white text-ink-600 ring-ink-200 hover:bg-ink-50"
+                }`}
+                title={`${pipeline.byStatus[s]} parcel(s) ${humanize(s).toLowerCase()} — click to filter`}
+              >
+                {humanize(s)}{" "}
+                <span className="tabular-nums font-medium">{pipeline.byStatus[s]}</span>
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
 
       <ErrorAlert message={error} />
 

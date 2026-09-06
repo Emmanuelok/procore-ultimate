@@ -54,7 +54,7 @@ beforeAll(async () => {
     companyId: owner.companyId,
     name: "Disbursement Test Project",
   });
-});
+}, 240_000);
 
 afterAll(async () => {
   await built.close();

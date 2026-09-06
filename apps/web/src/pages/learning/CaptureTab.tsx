@@ -518,7 +518,7 @@ export default function CaptureTab({
 /* ------------------------------------------------------------------ */
 
 interface ForRecordEdge {
-  edge: { id: string; role: string; label: string | null; verified: number };
+  edge: { id: string; role: string; targetLabel: string | null; verified: number };
   lesson: Lesson | null;
 }
 
@@ -542,15 +542,13 @@ function ForRecordPanel({
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
-  /* The list the API itself publishes on the graph route, so the picker can
-     never drift from what the server can actually verify. */
+  /* The list the API itself publishes on the trigger-rules route, so the
+     picker can never drift from what the server can actually verify. */
   const [types, setTypes] = useState<string[]>([]);
   useEffect(() => {
     let cancelled = false;
     api
-      .get<{ resolvableTypes?: string[] }>(
-        `/api/v1/projects/${projectId}/learning/triggers/rules`,
-      )
+      .get<{ resolvableTypes?: string[] }>("/api/v1/learning/triggers/rules")
       .then((res) => {
         if (!cancelled && Array.isArray(res.resolvableTypes)) setTypes(res.resolvableTypes);
       })
@@ -558,7 +556,7 @@ function ForRecordPanel({
     return () => {
       cancelled = true;
     };
-  }, [projectId]);
+  }, []);
 
   const run = useCallback(async () => {
     if (id.trim().length === 0) return;
@@ -640,7 +638,7 @@ function ForRecordPanel({
                           <span className="font-mono text-xs text-ink-500">{lesson.number}</span>{" "}
                           {lesson.title}
                         </button>
-                        <Badge tone="ink">{label(edge.role)}</Badge>
+                        <Badge tone="gray">{label(edge.role)}</Badge>
                         {edge.verified ? null : <Badge tone="amber">unverified edge</Badge>}
                       </li>
                     ) : null,

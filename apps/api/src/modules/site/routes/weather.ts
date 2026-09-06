@@ -437,7 +437,7 @@ export const weatherRoutes: FastifyPluginAsync = async (app) => {
     const exceptional = row.exceptionalDays ?? 0;
     if (exceptional > 0) {
       const key = `weather-exceptional:${row.id}`;
-      const raised = await alreadySignalled(app.db, companyId, ["site_exceptional_weather"], projectId);
+      const raised = await alreadySignalled(app.db, companyId, ["site_exceptional_weather"], { projectId, keys: [key] });
       if (!raised.has(key)) {
         const coverage = row.coveragePercent;
         signalId = await raiseSignal(app.db, companyId, projectId, req.user!.id, {

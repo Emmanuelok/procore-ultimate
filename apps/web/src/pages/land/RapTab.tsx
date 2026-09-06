@@ -147,6 +147,8 @@ export default function RapTab({
       )
     : [];
   const slipDays = risk?.summary?.projectedSlipDays ?? null;
+  /** The currency the flat compensation totals are stated in, when there is one. */
+  const ccy = rap.compensationCurrency ?? "USD";
 
   return (
     <div className="space-y-4">
@@ -353,38 +355,97 @@ export default function RapTab({
             />
 
             <div className="mt-5 space-y-3 border-t border-ink-100 pt-4">
-              <div>
-                <div className="mb-1 flex flex-wrap items-baseline justify-between gap-2 text-xs">
-                  <span className="font-medium text-ink-700">
-                    Compensation paid vs committed{" "}
-                    <span className="font-normal text-ink-400">(#553, #567)</span>
-                  </span>
-                  <span className="tabular-nums text-ink-500">
-                    {fmtMoney(rap.compensationPaid)} of {fmtMoney(rap.compensationCommitted)}
-                  </span>
-                </div>
-                <Meter
-                  value={rap.compensationPaid}
-                  max={rap.compensationCommitted}
-                  tone="brand"
-                  caption={
-                    <span className="tabular-nums">
-                      {rap.compensationOutstanding > 0 ? (
-                        <>
-                          <span className="font-medium text-amber-700">
-                            {fmtMoney(rap.compensationOutstanding)} outstanding
-                          </span>
-                          {" · "}
-                        </>
-                      ) : null}
-                      landowners {fmtMoney(rap.compensation.parcels.paid)}/
-                      {fmtMoney(rap.compensation.parcels.committed)} · households{" "}
-                      {fmtMoney(rap.compensation.paps.paid)}/
-                      {fmtMoney(rap.compensation.paps.committed)}
+              {/*
+                Compensation is stated PER CURRENCY. On a single-currency
+                scheme (almost all of them) this renders exactly as before;
+                on a corridor crossing a border it renders one line per
+                currency rather than a total that adds UGX to USD.
+              */}
+              {rap.compensationMixedCurrency ? (
+                <div>
+                  <div className="mb-1 flex flex-wrap items-baseline justify-between gap-2 text-xs">
+                    <span className="font-medium text-ink-700">
+                      Compensation paid vs committed{" "}
+                      <span className="font-normal text-ink-400">(#553, #567)</span>
                     </span>
-                  }
-                />
-              </div>
+                    <span className="text-ink-400">
+                      {rap.compensationCurrencies.join(" · ")}
+                    </span>
+                  </div>
+                  <div className="space-y-2">
+                    {Object.values(rap.compensationByCurrency).map((b) => (
+                      <div key={b.currency}>
+                        <div className="mb-0.5 flex items-baseline justify-between gap-2 text-xs">
+                          <span className="font-medium text-ink-600">{b.currency}</span>
+                          <span className="tabular-nums text-ink-500">
+                            {fmtMoney(b.paid, b.currency)} of {fmtMoney(b.committed, b.currency)}
+                          </span>
+                        </div>
+                        <Meter
+                          value={b.paid}
+                          max={b.committed}
+                          tone="brand"
+                          caption={
+                            <span className="tabular-nums">
+                              {b.outstanding > 0 ? (
+                                <>
+                                  <span className="font-medium text-amber-700">
+                                    {fmtMoney(b.outstanding, b.currency)} outstanding
+                                  </span>
+                                  {" · "}
+                                </>
+                              ) : null}
+                              landowners {fmtMoney(b.parcels.paid, b.currency)}/
+                              {fmtMoney(b.parcels.committed, b.currency)} · households{" "}
+                              {fmtMoney(b.paps.paid, b.currency)}/
+                              {fmtMoney(b.paps.committed, b.currency)}
+                            </span>
+                          }
+                        />
+                      </div>
+                    ))}
+                  </div>
+                  {rap.compensationReasons.map((reason) => (
+                    <p key={reason} className="mt-1.5 text-xs text-ink-400">
+                      {reason}
+                    </p>
+                  ))}
+                </div>
+              ) : (
+                <div>
+                  <div className="mb-1 flex flex-wrap items-baseline justify-between gap-2 text-xs">
+                    <span className="font-medium text-ink-700">
+                      Compensation paid vs committed{" "}
+                      <span className="font-normal text-ink-400">(#553, #567)</span>
+                    </span>
+                    <span className="tabular-nums text-ink-500">
+                      {fmtMoney(rap.compensationPaid, ccy)} of{" "}
+                      {fmtMoney(rap.compensationCommitted, ccy)}
+                    </span>
+                  </div>
+                  <Meter
+                    value={rap.compensationPaid ?? 0}
+                    max={rap.compensationCommitted ?? 0}
+                    tone="brand"
+                    caption={
+                      <span className="tabular-nums">
+                        {(rap.compensationOutstanding ?? 0) > 0 ? (
+                          <>
+                            <span className="font-medium text-amber-700">
+                              {fmtMoney(rap.compensationOutstanding, ccy)} outstanding
+                            </span>
+                            {" · "}
+                          </>
+                        ) : null}
+                        landowners {fmtMoney(rap.compensation.parcels.paid, ccy)}/
+                        {fmtMoney(rap.compensation.parcels.committed, ccy)} · households{" "}
+                        {fmtMoney(rap.compensation.paps.paid, ccy)}/
+                        {fmtMoney(rap.compensation.paps.committed, ccy)}
+                      </span>
+                    }
+                  />
+                </div>
+              )}
               <div>
                 <div className="mb-1 flex flex-wrap items-baseline justify-between gap-2 text-xs">
                   <span className="font-medium text-ink-700">

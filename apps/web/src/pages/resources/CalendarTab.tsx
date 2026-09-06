@@ -639,7 +639,11 @@ function CreateAssignmentModal({
         </Field>
         <Field
           label="Trade or plant class"
-          hint="Setting this is what makes the certification check run against the booking."
+          hint={
+            types.length === 0
+              ? "No trades or plant classes exist yet — create them on the Library tab. Without one, this booking is never certification-checked."
+              : "Setting this is what makes the certification check run against the booking."
+          }
         >
           <Select value={typeId} onChange={(e) => setTypeId(e.target.value)}>
             <option value="">Not stated</option>

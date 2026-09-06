@@ -538,7 +538,7 @@ function IntelligencePanel({
           title="What the feed says beyond hours"
           hint="Where the machine was worked, what it burned against what was put in it, and what it is complaining about. Every one of these refuses rather than guesses."
           className="mb-0"
-          action={
+          actions={
             onRun ? (
               <Button size="sm" variant="secondary" onClick={onRun} loading={busy}>
                 Raise the signals

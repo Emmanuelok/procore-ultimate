@@ -150,8 +150,8 @@ export default function OverviewTab({
                   {count(s.coverage.overWeeks)}
                 </Row>
                 <Row
-                  label="Weeks with no supply recorded"
-                  hint="Unknown supply is a question, not a crisis"
+                  label="Weeks with hours and no supply recorded"
+                  hint="Trade-weeks the plan asks for and nobody has said whether they can be fielded. Unknown supply is a question, not a crisis."
                 >
                   {count(s.coverage.unknownSupplyWeeks)}
                 </Row>

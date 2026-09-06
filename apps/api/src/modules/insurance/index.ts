@@ -1053,26 +1053,41 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
    * with the tenant's signal history. `signals` belongs to another package,
    * so the fix available here is to ask a bounded question.
    */
+  /*
+   * Asked in batches: every key is a bind parameter, and a company-wide sweep
+   * over a large supply chain can produce thousands of them. Past ~65,000 the
+   * query does not run slowly, it fails — on exactly the tenant whose cover
+   * gaps most need finding.
+   */
+  const SIGNAL_KEY_BATCH = 500;
+
   async function alreadySignalled(
     companyId: string,
     detector: string,
     candidateKeys?: readonly string[],
   ): Promise<Set<string>> {
     if (candidateKeys && candidateKeys.length === 0) return new Set();
-    const rows = await app.db
-      .select({ refs: signals.evidenceRefs })
-      .from(signals)
-      .where(
-        and(
-          eq(signals.companyId, companyId),
-          eq(signals.detector, detector),
-          candidateKeys ? sql`${signals.evidenceRefs} ->> 'key' in ${candidateKeys}` : undefined,
-        ),
-      );
+    const batches: Array<readonly string[] | null> = candidateKeys
+      ? Array.from({ length: Math.ceil(candidateKeys.length / SIGNAL_KEY_BATCH) }, (_, i) =>
+          candidateKeys.slice(i * SIGNAL_KEY_BATCH, (i + 1) * SIGNAL_KEY_BATCH),
+        )
+      : [null];
     const keys = new Set<string>();
-    for (const row of rows) {
-      const refs = row.refs as { key?: unknown } | null;
-      if (typeof refs?.key === "string") keys.add(refs.key);
+    for (const batch of batches) {
+      const rows = await app.db
+        .select({ refs: signals.evidenceRefs })
+        .from(signals)
+        .where(
+          and(
+            eq(signals.companyId, companyId),
+            eq(signals.detector, detector),
+            batch ? sql`${signals.evidenceRefs} ->> 'key' in ${batch}` : undefined,
+          ),
+        );
+      for (const row of rows) {
+        const refs = row.refs as { key?: unknown } | null;
+        if (typeof refs?.key === "string") keys.add(refs.key);
+      }
     }
     return keys;
   }

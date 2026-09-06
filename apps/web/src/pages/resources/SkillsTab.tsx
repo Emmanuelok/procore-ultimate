@@ -457,7 +457,15 @@ function RecordTicketModal({
             onChange={setWorkerId}
           />
         </Field>
-        <Field label="Ticket" required>
+        <Field
+          label="Ticket"
+          required
+          hint={
+            skills.length === 0
+              ? "No tickets are defined for this company yet. Define them on the Library tab — the matrix has one column per ticket, so until one exists there is nothing to record."
+              : undefined
+          }
+        >
           <Select value={skillId} onChange={(e) => setSkillId(e.target.value)}>
             <option value="">Choose…</option>
             {skills.map((s) => (

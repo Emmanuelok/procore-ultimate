@@ -75,6 +75,49 @@ export interface RegisterResponse {
   reasons: string[];
 }
 
+/** One worker-day compared between the labour register and the gate feed. */
+export interface AttendanceLine {
+  date: string;
+  workerId: string | null;
+  personKey: string | null;
+  name: string;
+  claimedHours: number | null;
+  observedHours: number | null;
+  varianceHours: number | null;
+  claimSource: string | null;
+  result: string;
+  reasons: string[];
+}
+
+export interface AttendanceReport {
+  from: string;
+  to: string;
+  toleranceHours: number;
+  lines: AttendanceLine[];
+  total: number;
+  byResult: Record<string, number>;
+  comparedClaimedHours: number;
+  comparedObservedHours: number;
+  comparedLines: number;
+  worstOverclaimHours: number | null;
+  daysWithGateReads: number;
+  daysInWindow: number;
+  unattributedPresence: Array<{ date: string; personKey: string; personName: string; hours: number }>;
+  attendanceRecords: number;
+  gateEvents: number;
+  truncated: boolean;
+  reasons: string[];
+}
+
+export const ATTENDANCE_RESULT_TONE: Record<string, "success" | "danger" | "warning" | "neutral" | "info"> = {
+  agreed: "success",
+  over_claimed: "danger",
+  under_claimed: "warning",
+  no_gate_record: "danger",
+  no_attendance_record: "warning",
+  not_comparable: "neutral",
+};
+
 export interface InductionRow {
   id: string;
   personName: string;

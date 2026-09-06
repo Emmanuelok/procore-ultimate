@@ -15,7 +15,7 @@
  *              whether the quorum was met when it was taken.
  *   Actions    the point of the whole thing.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Alert,
   Badge,
@@ -538,6 +538,16 @@ function AgendaPanel({
                   <p className="mt-2 whitespace-pre-wrap text-meta text-content">
                     {item.discussion}
                   </p>
+                ) : null}
+                {/*
+                  THE LIVE STATUS OF WHAT WAS RAISED FROM THIS ITEM.
+                  The raise dialog promises it; without this it was a promise
+                  the page did not keep. Only fetched for items that actually
+                  point at another record, so an agenda of twenty items does
+                  not make twenty requests.
+                */}
+                {item.originId ? (
+                  <AgendaItemLinks projectId={projectId} itemId={item.id} />
                 ) : null}
                 {item.carryCount > 0 ? (
                   <p className="mt-2 text-2xs text-content-subtle">
@@ -2284,4 +2294,81 @@ function AiDraftPanel({
       </CardBody>
     </Card>
   );
+}
+
+/**
+ * The records raised from one agenda item, with the status they hold NOW.
+ *
+ * A copy of the status taken at raise time would be wrong the moment the RFI
+ * was answered, and an item carried forward because "the RFI is still open"
+ * when it was closed three weeks ago is exactly the failure this module exists
+ * to stop. The API resolves each edge against the record's own table, and says
+ * so when it cannot: an unresolvable pointer is shown as a finding, never
+ * hidden.
+ */
+function AgendaItemLinks({ projectId, itemId }: { projectId: string; itemId: string }) {
+  const [data, setData] = useState<AgendaLinks | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .get<AgendaLinks>(`/api/v1/projects/${projectId}/meeting-agenda-items/${itemId}/links`)
+      .then((res) => {
+        if (!cancelled) setData(res);
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, itemId]);
+
+  if (failed) {
+    return (
+      <p className="mt-2 text-2xs text-content-subtle">
+        The linked records could not be read, so their status is not shown here rather than shown
+        as stale.
+      </p>
+    );
+  }
+  if (!data || (data.items.length === 0 && data.unresolved.length === 0)) return null;
+
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-1.5">
+      <span className="text-2xs text-content-subtle">Raised from this item:</span>
+      {data.items.map((l) => (
+        <Tooltip
+          key={`${l.type}:${l.id}`}
+          content={`${l.title} — status read from the ${l.type.replace(/_/g, " ")} register just now, not copied when it was raised.`}
+        >
+          <span>
+            <Badge tone="accent" size="xs" variant="outline">
+              {l.reference} · {titleCase(l.status)}
+            </Badge>
+          </span>
+        </Tooltip>
+      ))}
+      {data.unresolved.map((l) => (
+        <Tooltip
+          key={`u:${l.type}:${l.id}`}
+          content="This link points at a record the platform cannot resolve — it may have been deleted, or it belongs to a type the resolver does not know. Shown rather than hidden: a broken pointer is a finding."
+        >
+          <span>
+            <Badge tone="warning" size="xs" variant="outline">
+              {l.type.replace(/_/g, " ")} · unresolved
+            </Badge>
+          </span>
+        </Tooltip>
+      ))}
+    </div>
+  );
+}
+
+interface AgendaLinks {
+  agendaItemId: string;
+  items: Array<{ type: string; id: string; reference: string; title: string; status: string }>;
+  unresolved: Array<{ type: string; id: string }>;
+  total: number;
 }

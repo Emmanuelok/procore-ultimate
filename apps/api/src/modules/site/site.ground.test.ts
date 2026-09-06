@@ -83,6 +83,17 @@ describe("survey control", () => {
     expect(res.json().verdict).toContain("treated as disturbed");
   });
 
+  it("refuses to certify a point as active on a check that failed its own accuracy", async () => {
+    const created = await post(`${base()}/survey-points`, { pointRef: "CP04", lat: 51.62, lon: -0.12, accuracyMm: 5 });
+    const refused = await post(`${base()}/survey-points/${created.json().id}/check`, { deltaMm: 30, status: "active" });
+    expect(refused.statusCode).toBe(400);
+    expect(refused.json().message).toContain("cannot be recorded as active");
+    // ...but a worse verdict than the measurement implies is the surveyor's to record.
+    const destroyed = await post(`${base()}/survey-points/${created.json().id}/check`, { deltaMm: 30, status: "destroyed" });
+    expect(destroyed.statusCode).toBe(200);
+    expect(destroyed.json().status).toBe("destroyed");
+  });
+
   it("declines a verdict when the point carries no stated accuracy", async () => {
     const created = await post(`${base()}/survey-points`, { pointRef: "CP03", lat: 51.6, lon: -0.13 });
     const res = await post(`${base()}/survey-points/${created.json().id}/check`, { deltaMm: 40 });

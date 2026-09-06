@@ -39,6 +39,12 @@ export interface ParcelRow {
   papCount: number;
 }
 
+/** Acquisition pipeline over the whole register (#551). */
+export interface ParcelSummary {
+  byStatus: Record<string, number>;
+  total: number;
+}
+
 export interface BlockingTask {
   id: string;
   name: string | null;
@@ -81,6 +87,8 @@ export interface PapRow {
   baseline: Record<string, unknown>;
   entitlements: Entitlement[];
   compensationTotal: number | null;
+  /** the currency the entitlement matrix is priced in */
+  currency: string;
   compensationPaidAt: string | null;
   livelihoodProgramme: string | null;
   livelihoodRestoredAt: string | null;
@@ -183,13 +191,34 @@ export interface RapProgress {
   economicallyDisplaced: number;
   vulnerableHouseholds: number;
   byVulnerability: Record<string, number>;
-  compensationCommitted: number;
-  compensationPaid: number;
-  compensationOutstanding: number;
+  /*
+   * Flat totals are stated only when ONE currency is in play. On a scheme
+   * holding compensation in two currencies they are null with a reason, and
+   * `compensationByCurrency` carries the answer — adding UGX to USD would
+   * produce a figure that is not money.
+   */
+  compensationCommitted: number | null;
+  compensationPaid: number | null;
+  compensationOutstanding: number | null;
   compensation: {
-    parcels: { committed: number; paid: number };
-    paps: { committed: number; paid: number };
+    parcels: { committed: number | null; paid: number | null };
+    paps: { committed: number | null; paid: number | null };
   };
+  compensationCurrency: string | null;
+  compensationCurrencies: string[];
+  compensationMixedCurrency: boolean;
+  compensationByCurrency: Record<
+    string,
+    {
+      currency: string;
+      committed: number;
+      paid: number;
+      outstanding: number;
+      parcels: { committed: number; paid: number };
+      paps: { committed: number; paid: number };
+    }
+  >;
+  compensationReasons: string[];
   livelihoodRequired: number;
   livelihoodRestored: number;
   livelihoodRestoredPercent: number | null;

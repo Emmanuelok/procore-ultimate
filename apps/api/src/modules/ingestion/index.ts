@@ -150,6 +150,20 @@ const PROGRAMME_MIME_TYPES: readonly string[] = [
 
 const PROGRAMME_EXTENSIONS: readonly string[] = [".xer", ".xml"];
 
+/**
+ * The remedy sentence every programme refusal carries.
+ *
+ * Both guards — the content-type allowlist and the filename check — refuse the
+ * same mistake for different reasons, and the operator making it needs the same
+ * answer either way: what this route accepts, and that the binary .mpp is not
+ * it. Naming the remedy on only one of the two refusals meant an upload the
+ * browser labelled text/csv got a refusal it could not act on.
+ */
+const PROGRAMME_REMEDY =
+  `Upload a Primavera P6 export (${PROGRAMME_EXTENSIONS[0]}) or an MS Project XML export ` +
+  `(${PROGRAMME_EXTENSIONS[1]}). A .mpp is Microsoft Project's binary format and cannot be ` +
+  "read here — export it as XML from Microsoft Project first.";
+
 /** Programme exports are text; 32 MiB is a very large one. */
 const MAX_PROGRAMME_BYTES = 32 * 1024 * 1024;
 
@@ -2192,17 +2206,13 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
     const declaredType = (mp.mimetype ?? "").split(";")[0]!.trim().toLowerCase();
     if (declaredType && !PROGRAMME_MIME_TYPES.includes(declaredType)) {
       throw badRequest(
-        `Content type "${declaredType}" is not a programme export. Upload a P6 XER or an ` +
-          `MS Project XML file (${PROGRAMME_MIME_TYPES.join(", ")}).`,
+        `Content type "${declaredType}" is not a programme export. ${PROGRAMME_REMEDY} ` +
+          `Accepted content types: ${PROGRAMME_MIME_TYPES.join(", ")}.`,
       );
     }
     const uploadName = mp.filename ?? "";
     if (uploadName && !PROGRAMME_EXTENSIONS.some((ext) => uploadName.toLowerCase().endsWith(ext))) {
-      throw badRequest(
-        `"${uploadName}" is not a programme export: expected a ${PROGRAMME_EXTENSIONS.join(" or ")} ` +
-          "file. A .mpp (the binary format) cannot be read — export it as XML from Microsoft " +
-          "Project first.",
-      );
+      throw badRequest(`"${uploadName}" is not a programme export. ${PROGRAMME_REMEDY}`);
     }
     const buf = await mp.toBuffer();
     if (buf.byteLength > MAX_PROGRAMME_BYTES) {

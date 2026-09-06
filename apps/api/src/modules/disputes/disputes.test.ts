@@ -108,7 +108,7 @@ beforeAll(async () => {
     storageKey: "test/b",
     uploadedBy: owner.userId,
   });
-});
+}, 240_000);
 
 afterAll(async () => {
   await built.close();

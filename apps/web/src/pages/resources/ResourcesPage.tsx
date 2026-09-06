@@ -122,7 +122,7 @@ export default function ResourcesPage() {
             s
               ? s.coverage.overWeeks === null
                 ? "No active plan — unknown, not zero"
-                : `Next quarter · ${count(s.coverage.unknownSupplyWeeks)} with no supply recorded`
+                : `Next quarter · ${count(s.coverage.unknownSupplyWeeks)} with hours planned and no supply recorded`
               : undefined
           }
           loading={summary.loading}

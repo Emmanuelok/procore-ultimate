@@ -81,6 +81,13 @@ export const affectedPersons = pgTable(
     /** entitlement matrix application (#566): [{ item, basis, amount, delivered }] */
     entitlements: jsonb("entitlements").$type<unknown[]>().default([]).notNull(),
     compensationTotal: doublePrecision("compensation_total"),
+    /**
+     * The currency the entitlement matrix is priced in. Parcels have always
+     * carried one; households did not, so every household figure was summed
+     * into the parcel total and rendered as dollars regardless of where the
+     * scheme is. A compensation total that adds UGX to USD is not a number.
+     */
+    currency: text("currency").default("USD").notNull(),
     compensationPaidAt: text("compensation_paid_at"),
     /** livelihood restoration programme tracking (#561) */
     livelihoodProgramme: text("livelihood_programme"),

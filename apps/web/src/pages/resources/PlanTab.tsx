@@ -318,7 +318,9 @@ function HistogramPanel({
         Reset
       </Button>
       {defaultedToPlan ? (
-        <span className="pb-2 text-2xs text-content-subtle">Showing the active plan's period</span>
+        <span className="pb-2 text-2xs text-content-subtle">
+          {"Showing the active plan's period"}
+        </span>
       ) : null}
     </div>
   );
@@ -461,7 +463,7 @@ function HistogramPanel({
         )}
       </CardBody>
       <CardBody>
-        <div className="grid gap-3 sm:grid-cols-3">
+        <div className="grid gap-3 sm:grid-cols-4">
           <Row label="Total demand">{hours(histogram.totals.demandHours)}</Row>
           <Row
             label="Total supply"
@@ -470,6 +472,14 @@ function HistogramPanel({
             {hours(histogram.totals.availableHours)}
           </Row>
           <Row label="Weeks short">{count(histogram.totals.overAllocatedCells)}</Row>
+          <Row
+            label="Supply not stated"
+            hint="Trade-weeks with hours planned and nobody saying whether they can be fielded"
+          >
+            {count(
+              histogram.totals.unknownSupplyDemandCells ?? histogram.totals.unknownSupplyCells,
+            )}
+          </Row>
         </div>
         <ReasonList reasons={[histogram.calendar.source, ...histogram.reasons]} className="mt-2" />
 
@@ -773,6 +783,7 @@ function PlanDrawer({
                               size="xs"
                               variant="ghost"
                               icon={IconTrash}
+                              iconOnly
                               aria-label={`Delete the ${d.resourceTypeName ?? "demand"} row for the week of ${dateOnly(d.weekStart)}`}
                               loading={action.busy === `del-${d.id}`}
                               disabled={p.status === "superseded" || p.status === "archived"}
@@ -1088,7 +1099,15 @@ function SupplyModal({
           ]}
           aria-label="How much of the calendar this statement covers"
         />
-        <Field label="Trade or plant class" required>
+        <Field
+          label="Trade or plant class"
+          required
+          hint={
+            types.length === 0
+              ? "No trades or plant classes exist yet. Create them on the Library tab — supply is stated per trade, so there is nothing to state it against."
+              : undefined
+          }
+        >
           <Select value={typeId} onChange={(e) => setTypeId(e.target.value)}>
             <option value="">Choose…</option>
             {types.map((t) => (

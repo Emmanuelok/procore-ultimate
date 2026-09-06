@@ -662,6 +662,14 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       detector: input.detector,
       severity: input.severity,
       confidence: 1,
+      /*
+       * The dedupe key also goes in the INDEXED column, namespaced by
+       * detector so it cannot collide with another module's fingerprints.
+       * `alreadySignalled` still reads `evidenceRefs->>'key'` because rows
+       * written before this carry no fingerprint, and switching the read
+       * would make the sweep re-raise every one of them once.
+       */
+      fingerprint: `${input.detector}:${input.key}`,
       title: input.title,
       explanation: input.explanation,
       evidenceRefs: { key: input.key, ...input.refs },
@@ -9538,29 +9546,6 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       .where(
         and(eq(equipment.companyId, companyId), inArray(equipment.id, machineIds)),
       );
-    const readings = await app.db
-      .select()
-      .from(equipmentTelematicsReadings)
-      .where(
-        and(
-          eq(equipmentTelematicsReadings.companyId, companyId),
-          inArray(equipmentTelematicsReadings.equipmentId, machineIds),
-          gte(equipmentTelematicsReadings.recordedAt, `${from}T00:00:00.000Z`),
-          lte(equipmentTelematicsReadings.recordedAt, `${to}T23:59:59.999Z`),
-        ),
-      );
-    const fuelFills = await app.db
-      .select()
-      .from(equipmentReadings)
-      .where(
-        and(
-          eq(equipmentReadings.companyId, companyId),
-          inArray(equipmentReadings.equipmentId, machineIds),
-          eq(equipmentReadings.readingType, "fuel_fill"),
-          gte(equipmentReadings.readAt, `${from}T00:00:00.000Z`),
-          lte(equipmentReadings.readAt, `${to}T23:59:59.999Z`),
-        ),
-      );
 
     const keys = machineIds.map((id) => `${id}|${from}`);
     const seenOffSite = await alreadySignalled(companyId, "equipment_off_site_use", keys);
@@ -9571,144 +9556,192 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     const takenOutOfService: string[] = [];
     const now = new Date().toISOString();
 
-    for (const machine of fleet) {
-      const projectId = projectOf.get(machine.id) ?? null;
-      const site = projectId ? (siteOf.get(projectId) ?? null) : null;
-      const own = readings.filter((r) => r.equipmentId === machine.id);
-      const key = `${machine.id}|${from}`;
+    /*
+     * READ THE FEED IN BATCHES. A minute-level feed is ~10k readings per
+     * machine per week; a company-wide sweep that pulled the whole fleet's
+     * week into memory at once would be the very unbounded roll-up this
+     * platform forbids. Twenty machines at a time, and only the columns the
+     * three engines actually read.
+     */
+    const FEED_BATCH = 20;
+    for (let i = 0; i < fleet.length; i += FEED_BATCH) {
+      const batch = fleet.slice(i, i + FEED_BATCH);
+      const batchIds = batch.map((m) => m.id);
+      const readings = await app.db
+        .select({
+          equipmentId: equipmentTelematicsReadings.equipmentId,
+          recordedAt: equipmentTelematicsReadings.recordedAt,
+          latitude: equipmentTelematicsReadings.latitude,
+          longitude: equipmentTelematicsReadings.longitude,
+          engineRunning: equipmentTelematicsReadings.engineRunning,
+          fuelUsedLitres: equipmentTelematicsReadings.fuelUsedLitres,
+          faultCodes: equipmentTelematicsReadings.faultCodes,
+        })
+        .from(equipmentTelematicsReadings)
+        .where(
+          and(
+            eq(equipmentTelematicsReadings.companyId, companyId),
+            inArray(equipmentTelematicsReadings.equipmentId, batchIds),
+            gte(equipmentTelematicsReadings.recordedAt, `${from}T00:00:00.000Z`),
+            lte(equipmentTelematicsReadings.recordedAt, `${to}T23:59:59.999Z`),
+          ),
+        );
+      const fuelFills = await app.db
+        .select({
+          equipmentId: equipmentReadings.equipmentId,
+          value: equipmentReadings.value,
+          readAt: equipmentReadings.readAt,
+        })
+        .from(equipmentReadings)
+        .where(
+          and(
+            eq(equipmentReadings.companyId, companyId),
+            inArray(equipmentReadings.equipmentId, batchIds),
+            eq(equipmentReadings.readingType, "fuel_fill"),
+            gte(equipmentReadings.readAt, `${from}T00:00:00.000Z`),
+            lte(equipmentReadings.readAt, `${to}T23:59:59.999Z`),
+          ),
+        );
 
-      const geofence = checkGeofence({
-        site,
-        readings: own
-          .filter((r) => r.latitude !== null && r.longitude !== null)
-          .map((r) => ({
-            latitude: r.latitude as number,
-            longitude: r.longitude as number,
-            recordedAt: r.recordedAt,
-            engineRunning: r.engineRunning,
-          })),
-      });
-      if (geofence.breaches.length > 0) {
-        const id = await raiseSignalOnce({
-          companyId,
-          projectId,
-          detector: "equipment_off_site_use",
-          key,
-          severity: "high",
-          title: `Plant worked off site — ${machine.reference} ${machine.name}`,
-          explanation:
-            `${machine.reference} ${machine.name} reported ${geofence.breaches.length} reading(s) ` +
-            `with the engine RUNNING more than the site radius from the project it is hired to, ` +
-            `up to ${geofence.maxDistanceMetres} m away, between ${from} and ${to}` +
-            `${geofence.spanHours !== null ? ` — the breaching readings span ${geofence.spanHours} hours` : ""}. ` +
-            "Hire is being charged to this job for hours the machine spent somewhere else: either " +
-            "the plant sheet is wrong, the machine was lent out, or it is being used privately. " +
-            (geofence.reasons.length > 0 ? geofence.reasons.join(" ") : ""),
-          refs: {
-            equipmentId: machine.id,
-            from,
-            to,
-            breaches: geofence.breaches.length,
-            maxDistanceMetres: geofence.maxDistanceMetres,
-            spanHours: geofence.spanHours,
-          },
-          seen: seenOffSite,
-        });
-        if (id) signalsRaised += 1;
-      }
+      for (const machine of batch) {
+        const projectId = projectOf.get(machine.id) ?? null;
+        const site = projectId ? (siteOf.get(projectId) ?? null) : null;
+        const own = readings.filter((r) => r.equipmentId === machine.id);
+        const key = `${machine.id}|${from}`;
 
-      const fuel = reconcileFuel({
-        telematicsFuelUsedLitres: own.map((r) => r.fuelUsedLitres),
-        fills: fuelFills
-          .filter((f) => f.equipmentId === machine.id && (f.value ?? 0) > 0)
-          .map((f) => ({ litres: f.value as number, at: f.readAt })),
-      });
-      if (fuel.unexplained) {
-        const id = await raiseSignalOnce({
-          companyId,
-          projectId,
-          detector: "equipment_fuel_unaccounted",
-          key,
-          severity: "high",
-          title: `Fuel unaccounted for — ${machine.reference} ${machine.name}`,
-          explanation: `${from} → ${to}. ${fuel.reasons.join(" ")}`,
-          refs: {
-            equipmentId: machine.id,
-            from,
-            to,
-            filledLitres: fuel.filledLitres,
-            burnLitres: fuel.burnLitres,
-            differenceLitres: fuel.differenceLitres,
-            ratio: fuel.ratio,
-          },
-          seen: seenFuel,
+        const geofence = checkGeofence({
+          site,
+          readings: own
+            .filter((r) => r.latitude !== null && r.longitude !== null)
+            .map((r) => ({
+              latitude: r.latitude as number,
+              longitude: r.longitude as number,
+              recordedAt: r.recordedAt,
+              engineRunning: r.engineRunning,
+            })),
         });
-        if (id) signalsRaised += 1;
-      }
-
-      const faults = assessFaults(
-        own.flatMap((r) => (r.faultCodes as TelematicsFault[] | null) ?? []),
-      );
-      if (faults.actionable.length > 0) {
-        const stopped =
-          faults.stopWork &&
-          (STOPPABLE_STATUSES as readonly string[]).includes(machine.status);
-        const id = await raiseSignalOnce({
-          companyId,
-          projectId,
-          detector: "equipment_fault_active",
-          key,
-          severity: faults.stopWork ? "critical" : "medium",
-          title:
-            `${faults.stopWork ? "Critical" : "Active"} fault reported by ` +
-            `${machine.reference} ${machine.name}`,
-          explanation:
-            `${faults.reason ?? "The machine reports active fault codes."} ` +
-            (stopped
-              ? `${machine.reference} has been moved to "breakdown" by this sweep and is off the ` +
-                "available fleet until somebody looks at it. Raising the maintenance record with " +
-                "returnToService set is what puts it back to work — the platform will not do that " +
-                "on a fault code clearing itself."
-              : faults.stopWork
-                ? `${machine.reference} was left at "${machine.status}": the sweep does not take a ` +
-                  "machine that is already off-hired, quarantined, disposed or in the workshop and " +
-                  "restate its status."
-                : "Book the work before the fault becomes the breakdown."),
-          refs: {
-            equipmentId: machine.id,
-            from,
-            to,
-            worst: faults.worst,
-            stopWork: faults.stopWork,
-            codes: faults.actionable.map((f) => f.code),
-            statusChangedTo: stopped ? "breakdown" : null,
-          },
-          seen: seenFault,
-        });
-        if (id) signalsRaised += 1;
-        if (id && stopped) {
-          await app.db
-            .update(equipment)
-            .set({ status: "breakdown", updatedAt: now })
-            .where(eq(equipment.id, machine.id));
-          await appendLedger(app.db, {
+        if (geofence.breaches.length > 0) {
+          const id = await raiseSignalOnce({
             companyId,
-            actorId: null,
-            action: "state_change",
-            objectType: "equipment",
-            objectId: machine.id,
             projectId,
-            payload: {
-              from: machine.status,
-              to: "breakdown",
-              derived: true,
-              reason: "critical fault code on the telematics feed",
-              codes: faults.actionable.map((f) => f.code),
-              signalId: id,
+            detector: "equipment_off_site_use",
+            key,
+            severity: "high",
+            title: `Plant worked off site — ${machine.reference} ${machine.name}`,
+            explanation:
+              `${machine.reference} ${machine.name} reported ${geofence.breaches.length} reading(s) ` +
+              `with the engine RUNNING more than the site radius from the project it is hired to, ` +
+              `up to ${geofence.maxDistanceMetres} m away, between ${from} and ${to}` +
+              `${geofence.spanHours !== null ? ` — the breaching readings span ${geofence.spanHours} hours` : ""}. ` +
+              "Hire is being charged to this job for hours the machine spent somewhere else: either " +
+              "the plant sheet is wrong, the machine was lent out, or it is being used privately. " +
+              (geofence.reasons.length > 0 ? geofence.reasons.join(" ") : ""),
+            refs: {
+              equipmentId: machine.id,
+              from,
+              to,
+              breaches: geofence.breaches.length,
+              maxDistanceMetres: geofence.maxDistanceMetres,
+              spanHours: geofence.spanHours,
             },
-            storePayload: true,
+            seen: seenOffSite,
           });
-          takenOutOfService.push(machine.reference);
+          if (id) signalsRaised += 1;
+        }
+
+        const fuel = reconcileFuel({
+          telematicsFuelUsedLitres: own.map((r) => r.fuelUsedLitres),
+          fills: fuelFills
+            .filter((f) => f.equipmentId === machine.id && (f.value ?? 0) > 0)
+            .map((f) => ({ litres: f.value as number, at: f.readAt })),
+        });
+        if (fuel.unexplained) {
+          const id = await raiseSignalOnce({
+            companyId,
+            projectId,
+            detector: "equipment_fuel_unaccounted",
+            key,
+            severity: "high",
+            title: `Fuel unaccounted for — ${machine.reference} ${machine.name}`,
+            explanation: `${from} → ${to}. ${fuel.reasons.join(" ")}`,
+            refs: {
+              equipmentId: machine.id,
+              from,
+              to,
+              filledLitres: fuel.filledLitres,
+              burnLitres: fuel.burnLitres,
+              differenceLitres: fuel.differenceLitres,
+              ratio: fuel.ratio,
+            },
+            seen: seenFuel,
+          });
+          if (id) signalsRaised += 1;
+        }
+
+        const faults = assessFaults(
+          own.flatMap((r) => (r.faultCodes as TelematicsFault[] | null) ?? []),
+        );
+        if (faults.actionable.length > 0) {
+          const stopped =
+            faults.stopWork &&
+            (STOPPABLE_STATUSES as readonly string[]).includes(machine.status);
+          const id = await raiseSignalOnce({
+            companyId,
+            projectId,
+            detector: "equipment_fault_active",
+            key,
+            severity: faults.stopWork ? "critical" : "medium",
+            title:
+              `${faults.stopWork ? "Critical" : "Active"} fault reported by ` +
+              `${machine.reference} ${machine.name}`,
+            explanation:
+              `${faults.reason ?? "The machine reports active fault codes."} ` +
+              (stopped
+                ? `${machine.reference} has been moved to "breakdown" by this sweep and is off the ` +
+                  "available fleet until somebody looks at it. Raising the maintenance record with " +
+                  "returnToService set is what puts it back to work — the platform will not do that " +
+                  "on a fault code clearing itself."
+                : faults.stopWork
+                  ? `${machine.reference} was left at "${machine.status}": the sweep does not take a ` +
+                    "machine that is already off-hired, quarantined, disposed or in the workshop and " +
+                    "restate its status."
+                  : "Book the work before the fault becomes the breakdown."),
+            refs: {
+              equipmentId: machine.id,
+              from,
+              to,
+              worst: faults.worst,
+              stopWork: faults.stopWork,
+              codes: faults.actionable.map((f) => f.code),
+              statusChangedTo: stopped ? "breakdown" : null,
+            },
+            seen: seenFault,
+          });
+          if (id) signalsRaised += 1;
+          if (id && stopped) {
+            await app.db
+              .update(equipment)
+              .set({ status: "breakdown", updatedAt: now })
+              .where(eq(equipment.id, machine.id));
+            await appendLedger(app.db, {
+              companyId,
+              actorId: null,
+              action: "state_change",
+              objectType: "equipment",
+              objectId: machine.id,
+              projectId,
+              payload: {
+                from: machine.status,
+                to: "breakdown",
+                derived: true,
+                reason: "critical fault code on the telematics feed",
+                codes: faults.actionable.map((f) => f.code),
+                signalId: id,
+              },
+              storePayload: true,
+            });
+            takenOutOfService.push(machine.reference);
+          }
         }
       }
     }

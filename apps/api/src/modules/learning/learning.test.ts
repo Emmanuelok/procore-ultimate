@@ -738,6 +738,21 @@ describe("mandatory-capture triggers", () => {
     expect(body.rules).toHaveLength(7);
     expect(body.rules.find((r) => r.kind === "signal_confirmed")!.reads).toContain("signals");
   });
+
+  it("publishes the record types an evidence reference can be verified against", async () => {
+    /*
+     * The reverse-lookup picker is built from this list. If the UI offered a
+     * type the registry does not know, every edge it produced would be stored
+     * unverified and never mirrored into record_links — a silent downgrade
+     * nobody would see. Publishing the list is what stops the two drifting.
+     */
+    const res = await get("/learning/triggers/rules");
+    const body = res.json() as { resolvableTypes: string[] };
+    expect(Array.isArray(body.resolvableTypes)).toBe(true);
+    expect(body.resolvableTypes).toContain("dispute");
+    expect(body.resolvableTypes).toContain("delay_event");
+    expect(body.resolvableTypes).toEqual([...body.resolvableTypes].sort());
+  });
 });
 
 /* ================================================================== */

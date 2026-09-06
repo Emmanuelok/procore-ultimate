@@ -440,8 +440,8 @@ export const captureRoutes: FastifyPluginAsync = async (app) => {
 
     let signalId: string | null = null;
     if (report.verdict === "out_of_tolerance") {
-      const raised = await alreadySignalled(app.db, companyId, ["site_scan_out_of_tolerance"], projectId);
       const key = `deviation:${devId}`;
+      const raised = await alreadySignalled(app.db, companyId, ["site_scan_out_of_tolerance"], { projectId, keys: [key] });
       if (!raised.has(key)) {
         signalId = await raiseSignal(app.db, companyId, projectId, req.user!.id, {
           detector: "site_scan_out_of_tolerance",

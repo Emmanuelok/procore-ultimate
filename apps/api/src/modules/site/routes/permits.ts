@@ -468,7 +468,7 @@ export const permitRoutes: FastifyPluginAsync = async (app) => {
       // somebody signed off digging with nothing to say what is buried there.
       if (action === "approve" && SCAN_REQUIRED_TYPES.has(row.permitType) && !row.utilityScanId) {
         const key = `permit-no-survey:${id}`;
-        const already = await alreadySignalled(app.db, companyId, ["site_excavation_without_scan"], projectId);
+        const already = await alreadySignalled(app.db, companyId, ["site_excavation_without_scan"], { projectId, keys: [key] });
         if (!already.has(key)) {
           await raiseSignal(app.db, companyId, projectId, req.user!.id, {
             detector: "site_excavation_without_scan",

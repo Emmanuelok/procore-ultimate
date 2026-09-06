@@ -223,10 +223,18 @@ export const surveyRoutes: FastifyPluginAsync = async (app) => {
       )[0],
       "Survey point",
     );
-    // A point whose check exceeds its own stated accuracy has moved.
-    const status =
-      body.status ??
-      (point.accuracyMm !== null && body.deltaMm > point.accuracyMm ? "disturbed" : point.status);
+    // A point whose check exceeds its own stated accuracy has moved — and the
+    // measurement, not the body, decides that. A caller may record something
+    // WORSE than the measurement implies (destroyed, superseded) but may not
+    // certify a point as active on the strength of a check that failed: that
+    // would make the accuracy figure decoration.
+    const exceeded = point.accuracyMm !== null && body.deltaMm > point.accuracyMm;
+    if (exceeded && body.status === "active") {
+      throw badRequest(
+        `The check is ${body.deltaMm} mm from the recorded position against a stated accuracy of ${point.accuracyMm} mm, so this point cannot be recorded as active on the strength of it. Re-establish the point and record the new position, or leave it disturbed.`,
+      );
+    }
+    const status = body.status ?? (exceeded ? "disturbed" : point.status);
     const at = body.checkedAt ?? nowISO();
     const [row] = await app.db
       .update(siteSurveyPoints)

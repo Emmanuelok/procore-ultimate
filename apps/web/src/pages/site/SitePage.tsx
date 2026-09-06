@@ -89,7 +89,9 @@ export default function SitePage() {
           <span className="flex flex-wrap items-center gap-2">
             {s ? (
               <span>
-                {s.register.reasons.length > 0 && s.register.headcount === 0
+                {/* No reads folded means no feed; a feed that folded reads and
+                    found nobody inside is a headcount of zero, not an unknown. */}
+                {s.register.eventsConsidered === 0
                   ? "Headcount unavailable — no gate feed"
                   : `${num(s.register.headcount)} on site`}{" "}
                 · {num(s.permits.active)} permit{s.permits.active === 1 ? "" : "s"} active · {num(s.entries.inside)} in a permitted space ·{" "}

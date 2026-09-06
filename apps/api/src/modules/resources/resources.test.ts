@@ -1493,6 +1493,46 @@ describe("regressions", () => {
     expect(rows.every((r) => new Date(`${r.weekStart}T00:00:00Z`).getUTCDay() === 1)).toBe(true);
   });
 
+  /**
+   * Regression: the plan roll-ups are computed with SQL aggregates rather than
+   * by loading every demand row into memory (master plan §6.4 — a per-activity
+   * derive over a large programme writes far more rows than a roll-up that
+   * runs on every add, edit and delete should ever hold). The answer must be
+   * identical to the one the in-memory pass gave.
+   */
+  it("recomputes the plan roll-ups in SQL and gets the same totals", async () => {
+    const before = await get(`/api/v1/projects/${projectA}/resource-plans/${planId}`);
+    expect(before.json().demandHours).toBe(800);
+    expect(before.json().peakWeekStart).toBe(W0);
+    const peakHeadcountBefore = before.json().peakHeadcount as number | null;
+    expect(peakHeadcountBefore).not.toBeNull();
+
+    const added = await post(`/api/v1/projects/${projectA}/resource-plans/${planId}/demand`, {
+      resourceTypeId: labourTypeId,
+      weekStart: W1,
+      demandHours: 100,
+    });
+    expect(added.statusCode).toBe(201);
+
+    const during = await get(`/api/v1/projects/${projectA}/resource-plans/${planId}`);
+    expect(during.json().demandHours).toBe(900);
+    // W0 still carries 400 h against W1's 300 — the peak did not move
+    expect(during.json().peakWeekStart).toBe(W0);
+
+    expect(
+      (
+        await del(
+          `/api/v1/projects/${projectA}/resource-plans/${planId}/demand/${added.json().id}`,
+        )
+      ).statusCode,
+    ).toBe(200);
+
+    const after = await get(`/api/v1/projects/${projectA}/resource-plans/${planId}`);
+    expect(after.json().demandHours).toBe(800);
+    expect(after.json().peakWeekStart).toBe(W0);
+    expect(after.json().peakHeadcount).toBe(peakHeadcountBefore);
+  });
+
   /* ---- the library detail routes ---- */
 
   it("reads and edits one skill, and hides both from another company", async () => {
@@ -1592,8 +1632,21 @@ describe("regressions", () => {
           eq(ledgerEntries.objectId, id),
         ),
       );
-    const payloads = entries.map((e) => JSON.stringify(e.payload));
-    expect(payloads.some((p) => p.includes("confirmationReset"))).toBe(true);
+    /* The withdrawal is kept in FULL in the ledger, not merely hashed: what
+       somebody actually approved — the old window and the old allocation — is
+       about to exist nowhere else on the record. */
+    const kept = entries
+      .map((e) => e.payload as Record<string, unknown> | null)
+      .find((p) => p !== null && p["confirmationReset"] === true);
+    expect(kept).toBeDefined();
+    expect(kept!["statusFrom"]).toBe("confirmed");
+    expect(kept!["statusTo"]).toBe("planned");
+    expect(kept!["previousAllocationPercent"]).toBe(50);
+    expect(kept!["withdrawnConfirmedBy"]).toBe(owner.userId);
+    expect(kept!["previousWindow"]).toEqual({
+      fromDate: shift(W2, 7),
+      toDate: shift(W2, 11),
+    });
   });
 
   /* ---- the booking picker ---- */
@@ -1709,7 +1762,8 @@ describe("regressions", () => {
     expect(res.statusCode).toBe(200);
     expect(res.json().scope).toBe("project");
     expect(res.json().projectId).toBe(projectB);
-    expect(res.json().conflicts.projects).toBe(1);
+    // nothing of projectA's was even looked at, so nothing of projectA's closed
+    expect(res.json().conflicts.signalsClosed).toBe(0);
 
     const openAfter = await app.db
       .select()
@@ -1826,5 +1880,184 @@ describe("tenant isolation", () => {
       .from(resourcePlans)
       .where(eq(resourcePlans.projectId, strangerProject));
     expect(theirPlans).toHaveLength(0);
+  });
+});
+
+/* ================================================================== */
+/* 8. Week boundaries                                                  */
+/* ================================================================== */
+
+/**
+ * Regression: DEMAND AND SUPPLY MUST BUCKET ON THE SAME WEEK BOUNDARY, AND
+ * THAT BOUNDARY BELONGS TO THE PROJECT.
+ *
+ * A Sunday-start week and a Monday-start week put a Saturday's hours in
+ * different weeks. If demand normalises to the plan's boundary and supply
+ * normalises to Monday, every cell on a Sunday-start project reads as BOTH
+ * short (demand with no matching supply row) and unknown (supply with no
+ * matching demand row) — the histogram is unusable in exactly the projects
+ * that most need it.
+ *
+ * Resolving the boundary from the ACTIVE plan alone left two further holes:
+ * supply is stated with no activation required, so a Sunday-start plan still
+ * in draft got Monday supply rows; and archiving the live plan flipped the
+ * boundary under rows already stored.
+ *
+ * These run on their own projects inside the same app so the suite pays for
+ * one embedded Postgres rather than two.
+ */
+describe("week boundaries", () => {
+  /** A Wednesday, so Monday-start and Sunday-start weeks differ. */
+  const WEDNESDAY = "2026-11-11";
+  const SUNDAY_WEEK = "2026-11-08";
+  const MONDAY_WEEK = "2026-11-09";
+
+  let weekProject: string;
+  /** A project that has never held a plan at all. */
+  let virginProject: string;
+  let weekTypeId: string;
+  let weekPlanId: string;
+
+  beforeAll(async () => {
+    weekProject = await makeProject(owner.companyId, "Sunday shift project");
+    virginProject = await makeProject(owner.companyId, "Never planned");
+
+    const type = await post("/api/v1/resource-types", {
+      code: "SF",
+      name: "Steel fixers",
+      standardHoursPerDay: 10,
+    });
+    expect(type.statusCode).toBe(201);
+    weekTypeId = type.json().id as string;
+
+    const plan = await post(`/api/v1/projects/${weekProject}/resource-plans`, {
+      name: "Sunday-start plan",
+      weekStartsOn: 0,
+    });
+    expect(plan.statusCode).toBe(201);
+    weekPlanId = plan.json().id as string;
+    expect(
+      (await post(`/api/v1/projects/${weekProject}/resource-plans/${weekPlanId}/activate`, {}))
+        .statusCode,
+    ).toBe(200);
+  });
+
+  it("normalises a demand row to the plan's week start", async () => {
+    const res = await post(`/api/v1/projects/${weekProject}/resource-plans/${weekPlanId}/demand`, {
+      resourceTypeId: weekTypeId,
+      weekStart: WEDNESDAY,
+      demandHours: 300,
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().weekStart).toBe(SUNDAY_WEEK);
+    expect(res.json().weekStart).not.toBe(MONDAY_WEEK);
+  });
+
+  it("normalises supply to the SAME week start, not to Monday", async () => {
+    const res = await put(`/api/v1/projects/${weekProject}/resource-availability`, {
+      resourceTypeId: weekTypeId,
+      weekStart: WEDNESDAY,
+      availableHours: 400,
+      source: "roster",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().weekStart).toBe(SUNDAY_WEEK);
+  });
+
+  it("lines demand up against supply in one cell", async () => {
+    const res = await get(
+      `/api/v1/projects/${weekProject}/resources/histogram?from=${SUNDAY_WEEK}&to=${SUNDAY_WEEK}`,
+    );
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.weeks).toEqual([SUNDAY_WEEK]);
+    const cell = body.series[0].cells[0];
+    expect(cell.demandHours).toBe(300);
+    expect(cell.availableHours).toBe(400);
+    // the cell is covered, not simultaneously "short" and "supply unknown"
+    expect(cell.state).toBe("ok");
+    expect(cell.utilisationPercent).toBe(75);
+    expect(body.totals.unknownSupplyCells).toBe(0);
+  });
+
+  it("buckets a bulk supply window on the plan's boundary too", async () => {
+    const res = await post(`/api/v1/projects/${weekProject}/resource-availability/bulk`, {
+      resourceTypeId: weekTypeId,
+      from: WEDNESDAY,
+      to: "2026-11-25",
+      availableHours: 400,
+      source: "roster",
+    });
+    expect(res.statusCode).toBe(200);
+    const listed = await get(
+      `/api/v1/projects/${weekProject}/resource-availability?resourceTypeId=${weekTypeId}`,
+    );
+    const weeks = (listed.json().items as Array<{ weekStart: string }>).map((r) => r.weekStart);
+    // every stored week begins on a Sunday
+    expect(weeks.every((w) => new Date(`${w}T00:00:00Z`).getUTCDay() === 0)).toBe(true);
+  });
+
+  it("refuses to move a plan's week boundary once demand is bucketed on it", async () => {
+    const res = await patch(`/api/v1/projects/${weekProject}/resource-plans/${weekPlanId}`, {
+      weekStartsOn: 1,
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toContain("histogram no longer draws");
+  });
+
+  it("allows a no-op restatement of the same boundary", async () => {
+    const res = await patch(`/api/v1/projects/${weekProject}/resource-plans/${weekPlanId}`, {
+      weekStartsOn: 0,
+      name: "Sunday-start plan",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().weekStartsOn).toBe(0);
+  });
+
+  it("refuses a second plan that would introduce a second boundary", async () => {
+    const res = await post(`/api/v1/projects/${weekProject}/resource-plans`, {
+      name: "Monday rebel",
+      weekStartsOn: 1,
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toContain("already buckets its weeks");
+  });
+
+  it("keeps the project's boundary when no plan is active", async () => {
+    await app.db
+      .update(resourcePlans)
+      .set({ status: "archived" })
+      .where(eq(resourcePlans.id, weekPlanId));
+    const res = await put(`/api/v1/projects/${weekProject}/resource-availability`, {
+      resourceTypeId: weekTypeId,
+      weekStart: "2026-12-09", // a Wednesday
+      availableHours: 100,
+      source: "roster",
+    });
+    expect(res.statusCode).toBe(200);
+    // Sunday, not the Monday a "no active plan → default" fallback would give:
+    // the rows already stored on this project all begin on a Sunday.
+    expect(res.json().weekStart).toBe("2026-12-06");
+  });
+
+  it("falls back to Monday only on a project that has never had a plan", async () => {
+    const res = await put(`/api/v1/projects/${virginProject}/resource-availability`, {
+      resourceTypeId: weekTypeId,
+      weekStart: "2026-12-09", // a Wednesday
+      availableHours: 100,
+      source: "roster",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().weekStart).toBe("2026-12-07"); // the ISO-8601 Monday
+  });
+
+  it("refuses a boundary that would strand the supply already stored", async () => {
+    const res = await post(`/api/v1/projects/${virginProject}/resource-plans`, {
+      name: "Saturday shift",
+      weekStartsOn: 6,
+    });
+    // one supply row exists on this project now, so the boundary is settled
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toContain("already buckets its weeks");
   });
 });

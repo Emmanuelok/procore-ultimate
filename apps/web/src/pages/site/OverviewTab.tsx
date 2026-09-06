@@ -114,7 +114,9 @@ export default function OverviewTab({
           <CardBody>
             <div className="text-label uppercase text-content-subtle">On site now</div>
             <div className="text-display-xs font-semibold tabular-nums text-content">
-              {s ? (s.register.reasons.length > 0 && s.register.headcount === 0 ? EM_DASH : num(s.register.headcount)) : EM_DASH}
+              {/* Unknown only when NO read was folded. A feed that ran and found
+                  the site empty reports 0, which is a fact, not a gap. */}
+              {s ? (s.register.eventsConsidered === 0 ? EM_DASH : num(s.register.headcount)) : EM_DASH}
             </div>
             <ReasonList reasons={s?.register.reasons ?? []} className="mt-1.5" />
           </CardBody>
