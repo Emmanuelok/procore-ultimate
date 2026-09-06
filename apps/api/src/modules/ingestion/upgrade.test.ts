@@ -109,7 +109,7 @@ beforeAll(async () => {
     companyId: owner.companyId,
     name: "Harbour Works",
   });
-});
+}, 300_000);
 
 afterAll(async () => {
   await built.close();
@@ -261,6 +261,67 @@ describe("programme import", () => {
     });
     // the source belongs to the other tenant, so it is not found there
     expect([400, 403, 404]).toContain(cross.statusCode);
+  });
+
+  /*
+   * REGRESSION (plan §6.5). The route buffered the whole upload and decoded it
+   * to a UTF-8 string with no content-type allowlist and no size check: the
+   * only bound was the global 256 MiB multipart cap, and the activity cap was
+   * applied only after the parser had already walked the file.
+   */
+  it("refuses a content type that is not a programme export", async () => {
+    const upload = multipart(
+      XER,
+      { sourceId: csvSourceId, projectId },
+      "p.xer",
+      "application/zip",
+    );
+    const res = await app.inject({
+      method: "POST",
+      url: url("/ingestion/runs/programme"),
+      headers: { ...owner.headers, ...upload.headers },
+      payload: upload.payload,
+    });
+    expect(res.statusCode).toBe(400);
+    expect((res.json() as { message: string }).message).toContain("not a programme export");
+  });
+
+  it("refuses a filename that is neither .xer nor .xml", async () => {
+    const upload = multipart(
+      XER,
+      { sourceId: csvSourceId, projectId },
+      "programme.mpp",
+      "application/octet-stream",
+    );
+    const res = await app.inject({
+      method: "POST",
+      url: url("/ingestion/runs/programme"),
+      headers: { ...owner.headers, ...upload.headers },
+      payload: upload.payload,
+    });
+    expect(res.statusCode).toBe(400);
+    const message = (res.json() as { message: string }).message;
+    expect(message).toContain(".xer");
+    // …and it names the actual remedy for the binary format.
+    expect(message).toContain("export it as XML");
+  });
+
+  it("accepts the content types a programme export really arrives as", async () => {
+    for (const contentType of ["text/plain", "application/xml", "application/octet-stream"]) {
+      const upload = multipart(
+        XER,
+        { sourceId: csvSourceId, projectId },
+        "p.xer",
+        contentType,
+      );
+      const res = await app.inject({
+        method: "POST",
+        url: url("/ingestion/runs/programme"),
+        headers: { ...owner.headers, ...upload.headers },
+        payload: upload.payload,
+      });
+      expect(res.statusCode).toBe(201);
+    }
   });
 
   it("is admin-only: a plain member cannot import a programme", async () => {

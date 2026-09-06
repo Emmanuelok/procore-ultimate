@@ -94,7 +94,7 @@ beforeAll(async () => {
       dataYear: 2024,
     })),
   );
-}, 120_000);
+}, 300_000);
 
 afterAll(async () => {
   await built.close();

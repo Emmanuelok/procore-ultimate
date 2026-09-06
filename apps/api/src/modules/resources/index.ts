@@ -65,6 +65,7 @@
  *   /projects/:projectId/resources/histogram         demand vs supply + levelling
  *   /projects/:projectId/resource-assignments        (+ /:id, /confirm, /start,
  *                                                       /complete, /cancel)
+ *   /projects/:projectId/resources/subjects          bookable crews/workers/plant
  *   /projects/:projectId/resources/calendar          lanes, days, conflicts
  *   /projects/:projectId/resources/conflicts         double bookings
  *   /projects/:projectId/resources/utilisation       booked days per resource

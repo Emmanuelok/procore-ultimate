@@ -38,6 +38,7 @@ import {
   resourceGates,
   standardWorkingDaysPerWeek,
   todayIso,
+  typesForProject,
   visibleProjectIds,
   workPatternFor,
 } from "../shared.js";
@@ -130,12 +131,20 @@ export const summaryRoutes: FastifyPluginAsync = async (app) => {
             lte(resourceAvailability.weekStart, horizonEnd),
           ),
         );
-      const typeRows = await app.db
-        .select()
-        .from(resourceTypes)
-        .where(eq(resourceTypes.companyId, companyId));
+      /* Only the trades this project actually plans or staffs.
+         Building the summary histogram over the whole company library
+         manufactures an "unknown supply" cell for every archived trade in
+         every horizon week — a number driven by how many trades exist in the
+         company rather than by anything about the project, and it is a health
+         input. `typesForProject` also drops archived types, which the raw
+         read did not. */
+      const usedTypeIds = new Set([
+        ...demand.map((r) => r.resourceTypeId),
+        ...supply.map((r) => r.resourceTypeId),
+      ]);
+      const typeRows = await typesForProject(app.db, companyId, projectId);
       const types: HistogramType[] = typeRows
-        .filter((t) => t.projectId === null || t.projectId === projectId)
+        .filter((t) => usedTypeIds.has(t.id))
         .map((t) => ({
           id: t.id,
           code: t.code,
@@ -154,7 +163,10 @@ export const summaryRoutes: FastifyPluginAsync = async (app) => {
         workingDaysPerWeek: standardWorkingDaysPerWeek(pattern),
       });
       overWeeks = histogram.totals.overAllocatedCells;
-      unknownSupplyWeeks = histogram.totals.unknownSupplyCells;
+      /* Only the blank cells that carry planned hours. A trade-week with no
+         demand and no stated supply is not a finding — nobody has asked for
+         anybody. */
+      unknownSupplyWeeks = histogram.totals.unknownSupplyDemandCells;
       peakDemandHours = histogram.totals.peakDemandHours;
       peakWeekStart = histogram.totals.peakWeekStart;
       for (const series of histogram.series) {
@@ -175,8 +187,8 @@ export const summaryRoutes: FastifyPluginAsync = async (app) => {
       }
       if (unknownSupplyWeeks > 0) {
         reasons.push(
-          `${unknownSupplyWeeks} trade-week(s) in the next quarter have no recorded availability, ` +
-            "so their coverage is unknown rather than short.",
+          `${unknownSupplyWeeks} trade-week(s) in the next quarter have planned hours but no ` +
+            "recorded availability, so their coverage is unknown rather than short.",
         );
       }
     }
@@ -386,25 +398,45 @@ export const summaryRoutes: FastifyPluginAsync = async (app) => {
   app.post("/projects/:projectId/resources/sweeps/run", { preHandler: gates.admin }, async (req) => {
     const body = S.sweepRunSchema.parse(req.body ?? {});
     const companyId = companyOf(req);
+    const projectId = projectOf(req);
     const now = new Date();
-    if (!body.job) return { ranAt: now.toISOString(), ...(await runResourceSweeps(app.db, companyId, now)) };
+    /* Scoped to the route's own project. `requireTool` resolved and checked
+       :projectId and nothing else, so a company-wide run here would let a
+       user holding resources:admin on one job raise signals and fan
+       notifications out across every project in the tenant (§6.3). */
+    const scope = { projectIds: [projectId] };
+    const scopedTo = { scope: "project" as const, projectId };
+    if (!body.job) {
+      return {
+        ranAt: now.toISOString(),
+        ...scopedTo,
+        ...(await runResourceSweeps(app.db, companyId, now, scope)),
+      };
+    }
     switch (body.job) {
       case "resources.plan-coverage":
-        return { ranAt: now.toISOString(), coverage: await sweepPlanCoverage(app.db, companyId, now) };
+        return {
+          ranAt: now.toISOString(),
+          ...scopedTo,
+          coverage: await sweepPlanCoverage(app.db, companyId, now, scope),
+        };
       case "resources.assignment-conflicts":
         return {
           ranAt: now.toISOString(),
-          conflicts: await sweepAssignmentConflicts(app.db, companyId, now),
+          ...scopedTo,
+          conflicts: await sweepAssignmentConflicts(app.db, companyId, now, scope),
         };
       case "resources.certification-expiry":
         return {
           ranAt: now.toISOString(),
-          certifications: await sweepCertificationExpiry(app.db, companyId, now),
+          ...scopedTo,
+          certifications: await sweepCertificationExpiry(app.db, companyId, now, scope),
         };
       default:
         return {
           ranAt: now.toISOString(),
-          productivity: await sweepProductivity(app.db, companyId, now),
+          ...scopedTo,
+          productivity: await sweepProductivity(app.db, companyId, now, scope),
         };
     }
   });

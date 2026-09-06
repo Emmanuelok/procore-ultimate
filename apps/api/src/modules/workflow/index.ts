@@ -26,6 +26,17 @@
  *  • reading an instance requires the `workflow` tool on the instance's
  *    project, not merely company membership.
  *
+ *  • `isMandatory` is STORED (#788). It used to be accepted, echoed once and
+ *    discarded — there was no column — and "is a workflow required here" was
+ *    answered by the mere existence of an active template, so one optional
+ *    design-review template blocked every RFI in the tenant.
+ *  • a retroactive template application (#90) rebuilds the pending part of
+ *    the current group and leaves already-decided steps alone, and reports
+ *    per-instance outcomes instead of aborting the batch on the first one it
+ *    cannot rebuild.
+ *  • concurrent starts on one record serialise on an advisory lock and
+ *    re-check inside it, so a double click opens one chain, not two.
+ *
  * WHAT IT DELIBERATELY DOES NOT DO
  * It does not decide whether a record is ALLOWED to move on without a
  * workflow — the owning module does that. It exposes the "is a workflow

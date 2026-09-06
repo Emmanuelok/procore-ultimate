@@ -13,8 +13,22 @@
  *    tenant. It used to join through company_memberships, showing an admin of
  *    company A every sign-in a shared user made while working in company B.
  *  • an audit viewer over the hash-chained ledger (#92), retention policies
- *    and legal holds with real enforcement (#46–#47), a company data export
- *    (#45), and delegated administration (#27).
+ *    and legal holds (#46–#47), a company data export (#45), and delegated
+ *    administration (#27).
+ *  • delegated administration is now ENFORCED, not merely recorded:
+ *    delegation.ts holds the gates, and modules/{admin,directory,workflow,
+ *    notifications} consult them. A delegation that changed no authorisation
+ *    decision anywhere was worse than an absent one, because an owner
+ *    believed they had exercised it.
+ *  • the export hands over the bundle it produced, as JSON or as one CSV
+ *    sheet per dataset. It used to return a manifest and a row count and
+ *    drop the data.
+ *
+ * WHAT IT DELIBERATELY DOES NOT DO
+ * Nothing here EXECUTES a retention policy. Policies are recorded and
+ * previewed; the preview says so in the row (`executed: false`) rather than
+ * claiming enforcement, because the enforced control is the legal hold, which
+ * refuses deletion whether or not a retention policy exists.
  */
 import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";

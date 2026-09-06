@@ -453,6 +453,39 @@ describe("assignment, cancellation and recovery", () => {
     expect(second.json().id).toBe(first.json().id);
   });
 
+  /*
+   * The read-then-insert the idempotency check used to be is not idempotent
+   * under the double click it was written for: both requests observe nothing
+   * live and both insert. Concurrent starts now serialise on a
+   * transaction-scoped advisory lock and the existence check is repeated
+   * inside it, so the loser returns the winner's instance.
+   */
+  it("opens exactly one chain when two starts land together on one record", async () => {
+    const templateId = await makeTemplate(
+      [{ name: "One", type: "approval", assigneeIds: [pm.userId] }],
+      "Concurrent start",
+    );
+    const recordId = newId("rfi");
+    const [a, b] = await Promise.all([
+      start(templateId, recordId),
+      start(templateId, recordId),
+    ]);
+    expect([a.statusCode, b.statusCode].sort()).toEqual([200, 201]);
+    expect(a.json().id).toBe(b.json().id);
+
+    const rows = await app.db
+      .select()
+      .from(workflowInstances)
+      .where(
+        and(
+          eq(workflowInstances.companyId, owner.companyId),
+          eq(workflowInstances.recordType, "rfi"),
+          eq(workflowInstances.recordId, recordId),
+        ),
+      );
+    expect(rows).toHaveLength(1);
+  });
+
   it("cancels a stuck instance and withdraws its pending steps", async () => {
     const templateId = await makeTemplate(
       [{ name: "One", type: "approval", assigneeIds: [pm.userId] }],

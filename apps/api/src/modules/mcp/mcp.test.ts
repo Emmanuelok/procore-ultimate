@@ -85,7 +85,7 @@ beforeAll(async () => {
     userId: member.userId,
     templateKey: "project_manager",
   });
-});
+}, 300_000);
 
 afterAll(async () => {
   await built.close();

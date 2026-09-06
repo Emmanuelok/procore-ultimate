@@ -40,6 +40,10 @@ export type ResourceSkillRow = typeof resourceSkills.$inferSelect;
 
 /** Ceiling on the activities read when deriving planned hours per budget line. */
 export const MAX_SCHEDULE_TASKS = 50_000;
+/** Ceiling on the budget lines read for the planned side of productivity. A
+ *  project with more lines than this is not a project, it is an import bug —
+ *  and the read runs on every productivity, forecast and summary request. */
+export const MAX_BUDGET_LINES = 20_000;
 
 export const nowIso = (): string => new Date().toISOString();
 export const todayIso = (now: Date = new Date()): string => now.toISOString().slice(0, 10);
@@ -164,6 +168,76 @@ export async function fetchPlan(
     .limit(1);
   if (!rows[0]) throw notFound("Resource plan not found on this project");
   return rows[0];
+}
+
+/**
+ * The one live `current` plan on a project, or null.
+ *
+ * Defined once so a route, a sweep and the summary can never disagree about
+ * which plan is "the plan".
+ */
+export async function activeCurrentPlan(
+  db: Db,
+  companyId: string,
+  projectId: string,
+): Promise<ResourcePlanRow | null> {
+  const rows = await db
+    .select()
+    .from(resourcePlans)
+    .where(
+      and(
+        eq(resourcePlans.companyId, companyId),
+        eq(resourcePlans.projectId, projectId),
+        eq(resourcePlans.status, "active"),
+        eq(resourcePlans.planKind, "current"),
+      ),
+    )
+    .orderBy(resourcePlans.number)
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+/**
+ * The week boundary a PROJECT buckets on — 0 = Sunday … 6 = Saturday.
+ *
+ * Demand and supply must agree on it. If they do not, every histogram cell
+ * reads as BOTH short (demand with no matching supply row) and supply-unknown
+ * (supply with no matching demand row), which is the most misleading state
+ * the chart has.
+ *
+ * The boundary belongs to the PROJECT, not to whichever plan happens to be
+ * active right now: supply is stated long before a plan is activated, and a
+ * Sunday-start plan sitting in draft must not have its supply written on
+ * Mondays and then stranded the moment somebody presses Activate. Resolution
+ * order is therefore:
+ *
+ *   1. the active `current` plan;
+ *   2. otherwise the FIRST plan the project ever had, of any status or kind —
+ *      the one that set the boundary. Deliberately not "the newest": a
+ *      boundary that flips when a plan is archived would strand every row
+ *      already stored under the old one.
+ *   3. otherwise Monday — the ISO-8601 default, used only on a project that
+ *      has never had a plan at all.
+ *
+ * `assertWeekBoundary` (plans.ts) refuses to let a second boundary appear on
+ * a project that already holds rows, so 1 and 2 can never disagree.
+ */
+export async function projectWeekStartsOn(
+  db: Db,
+  companyId: string,
+  projectId: string,
+): Promise<number> {
+  const active = await activeCurrentPlan(db, companyId, projectId);
+  if (active) return active.weekStartsOn;
+  const rows = await db
+    .select({ weekStartsOn: resourcePlans.weekStartsOn })
+    .from(resourcePlans)
+    .where(
+      and(eq(resourcePlans.companyId, companyId), eq(resourcePlans.projectId, projectId)),
+    )
+    .orderBy(resourcePlans.number)
+    .limit(1);
+  return rows[0]?.weekStartsOn ?? 1;
 }
 
 export async function fetchAssignment(
@@ -330,7 +404,10 @@ export async function plannedLinesFor(
         eq(budgetLineItems.companyId, companyId),
         eq(budgetLineItems.projectId, projectId),
       ),
-    );
+    )
+    .limit(MAX_BUDGET_LINES + 1);
+  const truncated = lines.length > MAX_BUDGET_LINES;
+  if (truncated) lines.length = MAX_BUDGET_LINES;
 
   const hoursByLine = new Map<string, number>();
   if (lines.length > 0) {
@@ -380,6 +457,14 @@ export async function plannedLinesFor(
   });
 
   const reasons: string[] = [];
+  if (truncated) {
+    reasons.push(
+      `This project carries more than ${MAX_BUDGET_LINES} budget lines; the planned side of ` +
+        "productivity was computed from the first " +
+        `${MAX_BUDGET_LINES} of them. Earned hours below are therefore an under-count, not a ` +
+        "measurement — narrow the report or split the budget.",
+    );
+  }
   if (fromSchedule > 0) {
     reasons.push(
       `${fromSchedule} budget line(s) take their planned hours from the resource-loaded schedule ` +

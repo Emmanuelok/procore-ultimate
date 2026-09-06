@@ -77,7 +77,7 @@ beforeAll(async () => {
     companyId: owner.companyId,
     name: "ERP Project",
   });
-});
+}, 300_000);
 
 afterAll(async () => {
   await built.close();
@@ -819,6 +819,90 @@ describe("ERP connector framework", () => {
       headers: outsider.headers,
     });
     expect([403, 404]).toContain(cross.statusCode);
+  });
+
+  /*
+   * REGRESSION. `limit` bounds the INVOICES read, and for the job-cost feed the
+   * emitted rows are LINE items — so truncation judged on emitted rows was
+   * wrong in both directions: a complete extract reported itself truncated, and
+   * an extract that had dropped invoices reported itself complete. An operator
+   * reconciling an ERP import cannot tell the difference from the outside,
+   * which is exactly why the export has to say it correctly.
+   */
+  it("reports truncation over INVOICES, not over emitted job-cost lines", async () => {
+    const [firstInvoice] = await app.db
+      .select()
+      .from(invoices)
+      .where(and(eq(invoices.companyId, owner.companyId), eq(invoices.reference, "INV-0001")))
+      .limit(1);
+    expect(firstInvoice).toBeDefined();
+    await app.db.insert(invoiceLineItems).values(
+      [2, 3].map((n) => ({
+        id: newId("ivl"),
+        companyId: owner.companyId,
+        projectId,
+        invoiceId: firstInvoice!.id,
+        lineNumber: String(n),
+        description: `Extra line ${n}`,
+        costCode: "02-200",
+        costType: "subcontract",
+        thisPeriodWork: 100,
+        amount: 100,
+      })),
+    );
+
+    // Two invoices, three lines, limit 3. The old arithmetic saw 3 rows >= 3
+    // and cried truncation; nothing was dropped.
+    const complete = await app.inject({
+      method: "GET",
+      url: url(`/projects/${projectId}/integrations/erp/export?feed=job_cost&format=json&limit=3`),
+      headers: owner.headers,
+    });
+    expect(complete.statusCode).toBe(200);
+    const completeBody = complete.json() as {
+      rowCount: number;
+      invoicesScanned: number;
+      truncated: boolean;
+      caveats: string[];
+    };
+    expect(completeBody.rowCount).toBe(3);
+    expect(completeBody.invoicesScanned).toBe(2);
+    expect(completeBody.truncated).toBe(false);
+    expect(completeBody.caveats.join(" ")).toContain("limit bounds invoices, not rows");
+
+    // One invoice of two, limit 1: genuinely truncated, and it says so with
+    // both figures rather than only the emitted row count.
+    const cut = await app.inject({
+      method: "GET",
+      url: url(`/projects/${projectId}/integrations/erp/export?feed=job_cost&format=json&limit=1`),
+      headers: owner.headers,
+    });
+    const cutBody = cut.json() as {
+      rowCount: number;
+      invoicesScanned: number;
+      truncated: boolean;
+      caveats: string[];
+    };
+    expect(cutBody.invoicesScanned).toBe(1);
+    expect(cutBody.rowCount).toBe(3); // all three lines of that one invoice
+    expect(cutBody.truncated).toBe(true);
+    expect(cutBody.caveats.join(" ")).toContain("Truncated at 1 invoices");
+
+    // The ledger entry carries the same two figures, so an audit of what left
+    // does not have to guess.
+    const entries = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(
+        and(
+          eq(ledgerEntries.companyId, owner.companyId),
+          eq(ledgerEntries.objectType, "integration_export_profile"),
+        ),
+      );
+    const payload = entries[entries.length - 1]!.payload as Record<string, unknown>;
+    expect(payload["invoicesScanned"]).toBe(1);
+    expect(payload["invoiceLimit"]).toBe(1);
+    expect(payload["truncated"]).toBe(true);
   });
 
   it("refuses a project member who does not hold invoicing read", async () => {

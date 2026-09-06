@@ -299,12 +299,16 @@ export const notificationsModule: FastifyPluginAsync = async (app) => {
       run: async ({ db, now }) => {
         let digests = 0;
         let items = 0;
+        // Held notifications taken off hold. Reported so an operator can see
+        // the deferral actually ending rather than inferring it.
+        let released = 0;
         const result = await forEachCompany(db, async (companyId) => {
           const summary = await runDigestForCompany(db, companyId, now);
           digests += summary.digests;
           items += summary.items;
+          released += summary.released;
         });
-        return { ...result, digests, items };
+        return { ...result, digests, items, released };
       },
     });
   }

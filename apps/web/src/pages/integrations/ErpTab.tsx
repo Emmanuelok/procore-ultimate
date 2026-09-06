@@ -80,6 +80,9 @@ interface ExportResult {
   generatedAt: string;
   profile: { id: string | null; name: string; system: string; notes: string | null };
   rowCount: number;
+  /** invoices READ — `limit` bounds these, not the emitted rows */
+  invoicesScanned?: number;
+  invoiceLimit?: number;
   truncated: boolean;
   currencies: string[];
   sandbox: boolean;
@@ -332,6 +335,14 @@ export default function ErpTab({
                 <span>{result.profile.name}</span>
                 <span>·</span>
                 <span>{result.rowCount} row(s)</span>
+                {typeof result.invoicesScanned === "number" ? (
+                  <>
+                    <span>·</span>
+                    <span title="The limit bounds invoices read, not rows emitted">
+                      {result.invoicesScanned} invoice(s) scanned
+                    </span>
+                  </>
+                ) : null}
                 <span>·</span>
                 <span>{formatDateTime(result.generatedAt)}</span>
                 {result.currencies.length > 0 ? (

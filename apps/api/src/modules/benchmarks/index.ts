@@ -1075,16 +1075,17 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
         const rows = await app.db
           .select()
           .from(projectMetricSnapshots)
-          .where(
-            and(
-              eq(projectMetricSnapshots.companyId, companyId),
-              isNull(projectMetricSnapshots.outlierSignalId),
-            ),
-          )
+          .where(eq(projectMetricSnapshots.companyId, companyId))
           .orderBy(desc(projectMetricSnapshots.createdAt), desc(projectMetricSnapshots.id))
           .limit(OUTLIER_SWEEP_LIMIT);
-        // Only the newest snapshot of a (project, metric) is a live figure;
-        // superseded ones are history and must not raise anything.
+        /*
+         * Only the NEWEST snapshot of a (project, metric) is a live figure;
+         * older ones are history and must not raise anything. The signal state
+         * is checked AFTER that reduction, not in the WHERE clause: filtering
+         * unsignalled rows first would surface yesterday's snapshot of a
+         * project whose current one already carries a signal, and raise a
+         * second signal for the same condition.
+         */
         const latest = new Map<string, (typeof rows)[number]>();
         for (const row of rows) {
           const key = `${row.projectId}|${row.metric}`;
@@ -1093,6 +1094,7 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
         let raised = 0;
         let evaluated = 0;
         for (const snapshot of latest.values()) {
+          if (snapshot.outlierSignalId) continue;
           evaluated += 1;
           try {
             const outcome = await evaluateSnapshot(snapshot, null);

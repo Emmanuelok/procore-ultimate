@@ -397,6 +397,8 @@ export interface NotificationRow {
   projectId: string | null;
   recordType?: string | null;
   recordId?: string | null;
+  /** 1 while the row is deferred to the recipient's next digest (#96). */
+  heldForDigest?: number;
 }
 
 export interface UnreadCount {

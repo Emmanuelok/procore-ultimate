@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import { and, asc, count, desc, eq, inArray, notInArray } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, isNotNull, lt, notInArray } from "drizzle-orm";
 import { z } from "zod";
 import {
   affectedPersons,

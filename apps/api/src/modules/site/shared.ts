@@ -20,6 +20,7 @@ import {
   companyMemberships,
   dailyLogs,
   entities,
+  invoices,
   locations,
   paymentApplications,
   scheduleTasks,
@@ -420,25 +421,32 @@ export async function assertClaimSource(
   sourceType: string,
   sourceId: string,
 ): Promise<void> {
-  const found = async (
-    table: typeof valuations | typeof paymentApplications | typeof dailyLogs,
-    label: string,
-  ) => {
+  type SourceTable = typeof valuations | typeof paymentApplications | typeof dailyLogs | typeof invoices;
+  const exists = async (table: SourceTable): Promise<boolean> => {
     const rows = await db
       .select({ id: table.id })
       .from(table)
       .where(and(eq(table.id, sourceId), eq(table.companyId, companyId), eq(table.projectId, projectId)))
       .limit(1);
-    if (!rows[0]) throw badRequest(`${label} ${sourceId} was not found in this project, so it cannot be the source of the claim.`);
+    return Boolean(rows[0]);
+  };
+  const found = async (tables: readonly SourceTable[], label: string) => {
+    for (const table of tables) {
+      if (await exists(table)) return;
+    }
+    throw badRequest(`${label} ${sourceId} was not found in this project, so it cannot be the source of the claim.`);
   };
   switch (sourceType) {
     case "valuation":
-      return found(valuations, "Valuation");
+      return found([valuations], "Valuation");
     case "progress_claim":
+      // A progress claim reaches the platform as a payment application, a
+      // subcontractor invoice or a valuation depending on the contract form.
+      return found([paymentApplications, invoices, valuations], "Progress claim");
     case "application":
-      return found(paymentApplications, "Payment application");
+      return found([paymentApplications, invoices], "Payment application");
     case "daily_log":
-      return found(dailyLogs, "Daily log");
+      return found([dailyLogs], "Daily log");
     case "schedule_update": {
       await assertTask(db, projectId, sourceId);
       return;

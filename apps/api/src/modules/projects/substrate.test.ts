@@ -684,10 +684,40 @@ describe("DELETE /links/:linkId", () => {
 /* ------------------------------------------------------------------ */
 
 describe("comments and mentions", () => {
+  /*
+   * Real RFI rows, not invented ids: the comment route now proves the record
+   * belongs to the project in the URL before writing anything under it.
+   */
+  const mentionRfiB = newId("rfi");
+  const mentionRfiA = newId("rfi");
+
+  beforeAll(async () => {
+    await app.db.insert(rfis).values([
+      {
+        id: mentionRfiB,
+        companyId: owner.companyId,
+        projectId: projectB,
+        number: 8801,
+        subject: "Mention target B",
+        question: "?",
+        createdBy: owner.userId,
+      },
+      {
+        id: mentionRfiA,
+        companyId: owner.companyId,
+        projectId: projectA,
+        number: 8802,
+        subject: "Mention target A",
+        question: "?",
+        createdBy: owner.userId,
+      },
+    ]);
+  });
+
   it("does not notify a company member who cannot open the project", async () => {
     const res = await app.inject({
       method: "POST",
-      url: `/api/v1/projects/${projectB}/records/rfi/r-mention/comments`,
+      url: `/api/v1/projects/${projectB}/records/rfi/${mentionRfiB}/comments`,
       headers: owner.headers,
       payload: { body: "Commercially sensitive detail", mentions: [guest.userId] },
     });
@@ -706,7 +736,7 @@ describe("comments and mentions", () => {
   it("notifies a mention who IS on the project", async () => {
     const res = await app.inject({
       method: "POST",
-      url: `/api/v1/projects/${projectA}/records/rfi/r-mention-2/comments`,
+      url: `/api/v1/projects/${projectA}/records/rfi/${mentionRfiA}/comments`,
       headers: owner.headers,
       payload: { body: "Please look at this", mentions: [member.userId] },
     });

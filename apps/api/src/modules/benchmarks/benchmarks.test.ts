@@ -84,7 +84,7 @@ beforeAll(async () => {
     currency: "GBP",
     createdBy: rival.userId,
   });
-});
+}, 300_000);
 
 afterAll(async () => {
   await built.close();

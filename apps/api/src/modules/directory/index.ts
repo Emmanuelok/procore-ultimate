@@ -14,7 +14,17 @@
  *    device, a live integrity role, and approval chains nobody could decide.
  *  • vendors are soft-deleted and merges re-point every reference they can
  *    reach, recorded in a merge journal that supports an undo.
+ *  • the merge journal records WHICH rows moved, by primary key. It recorded
+ *    only a count per table, so the undo re-pointed every row the surviving
+ *    vendor owned — one click handed a live vendor's whole commercial history
+ *    to the one being restored. A journal without ids is now refused.
+ *  • a soft delete no longer detaches the vendor's contacts. That was the one
+ *    thing a "restorable" delete destroyed for good.
  *  • duplicate detection (dedupe.ts) and a vendor performance view.
+ *  • vendor/contact administration honours a tenant-wide `directory`
+ *    delegation (#27). People administration — company roles, removal,
+ *    session revocation — deliberately does not: a delegate who could demote
+ *    an owner has escaped the bound the delegation exists to impose.
  */
 import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
@@ -762,11 +772,11 @@ export const directoryModule: FastifyPluginAsync = async (app) => {
       await tx
         .update(vendors)
         .set({ status: "active", mergedIntoId: null, updatedAt: now })
-        .where(eq(vendors.id, merge.sourceVendorId));
+        .where(and(eq(vendors.id, merge.sourceVendorId), eq(vendors.companyId, req.companyId!)));
       await tx
         .update(vendorMerges)
         .set({ undoneAt: now, undoneBy: req.user!.id })
-        .where(eq(vendorMerges.id, mergeId));
+        .where(and(eq(vendorMerges.id, mergeId), eq(vendorMerges.companyId, req.companyId!)));
     });
     await appendLedger(app.db, {
       companyId: req.companyId!,

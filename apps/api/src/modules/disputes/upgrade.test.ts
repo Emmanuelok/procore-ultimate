@@ -15,6 +15,7 @@
  * the dispute's currency, accepting one offer lapses the others, and bundle
  * items must belong to the dispute's own project.
  */
+import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, eq, inArray } from "drizzle-orm";
@@ -73,7 +74,10 @@ async function insertFile(pid: string): Promise<string> {
     contentType: "application/pdf",
     sizeBytes: 1024,
     storageKey: `key/${id}`,
-    sha256: `sha-${id}`,
+    // A REAL digest, not a placeholder: a bundle with a single produced
+    // item has that item's own hash as its merkle root, so a fake value here
+    // would hide whether the root is a well-formed sha256.
+    sha256: createHash("sha256").update(id).digest("hex"),
     uploadedBy: owner.userId,
   });
   return id;

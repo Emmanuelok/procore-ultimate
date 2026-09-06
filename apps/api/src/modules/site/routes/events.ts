@@ -253,10 +253,10 @@ export const environmentalRoutes: FastifyPluginAsync = async (app) => {
     const { projectId, id } = req.params as { projectId: string; id: string };
     const companyId = req.companyId!;
     const body = patchSchemaOf(eventBody.omit({ category: true, occurredAt: true })).parse(req.body);
-    notFoundIfMissing(
+    const existing = notFoundIfMissing(
       (
         await app.db
-          .select({ id: siteEnvironmentalEvents.id })
+          .select()
           .from(siteEnvironmentalEvents)
           .where(
             and(
@@ -269,6 +269,21 @@ export const environmentalRoutes: FastifyPluginAsync = async (app) => {
       )[0],
       "Environmental event",
     );
+    // The units are editable; the verdict they produced is not re-run. So the
+    // one-call rule holds on the MERGED record: the platform will not be left
+    // holding a measurement in one unit tested against a limit in another.
+    const mergedMagnitudeUnit = body.magnitudeUnit === undefined ? existing.magnitudeUnit : body.magnitudeUnit;
+    const mergedThresholdUnit = body.thresholdUnit === undefined ? existing.thresholdUnit : body.thresholdUnit;
+    if (
+      existing.thresholdValue !== null &&
+      mergedMagnitudeUnit &&
+      mergedThresholdUnit &&
+      mergedMagnitudeUnit !== mergedThresholdUnit
+    ) {
+      throw badRequest(
+        `That edit would leave a magnitude in ${mergedMagnitudeUnit} tested against a limit in ${mergedThresholdUnit}. The platform will not compare two different units — log a new event instead.`,
+      );
+    }
     const set = patchSet(body as Record<string, unknown>, [
       "detectedVia",
       "durationMinutes",

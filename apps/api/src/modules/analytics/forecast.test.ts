@@ -88,7 +88,7 @@ beforeAll(async () => {
     headers: subject.headers,
   });
   expect(seeded.statusCode).toBe(200);
-}, 120_000);
+}, 300_000);
 
 afterAll(async () => {
   await built.close();

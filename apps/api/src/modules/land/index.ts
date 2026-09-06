@@ -50,9 +50,26 @@ import {
  *    interest mapping and the consultation log carrying feedback
  *    disposition and FPIC consent status.
  *
+ *  - Resettlement DEPTH (safeguards.ts): replacement-cost verification
+ *    (#550), Indigenous Peoples & cultural heritage plans with tracked
+ *    commitments and the chance-find register (PS7/PS8, #575-578),
+ *    livelihood restoration measured as income against the pre-displacement
+ *    baseline (#561), and the RAP completion audit + lender supervision pack
+ *    that freezes both the indicator set and the ledger sequence it was
+ *    built from (#558-560, #568).
+ *
  * Every consequential mutation is appended to the company's hash-chained
- * ledger; compensation payments and closure verifications store their full
- * payload, because those are the records an auditor comes back for.
+ * ledger; compensation payments, acquisitions and closure verifications
+ * store their full payload, because those are the records an auditor comes
+ * back for.
+ *
+ * WHAT THIS MODULE DELIBERATELY DOES NOT DO: raise findings on a read. Every
+ * signal in this area — grievance SLA breach and automatic escalation,
+ * grievance hotspots, IFC PS5 conformance, replacement-cost shortfall,
+ * unnotified chance finds and the consent-to-programme dependency — comes
+ * from the scheduled `land.detectors` job as the SYSTEM actor,
+ * advisory-locked and fingerprinted so a finding is raised once and
+ * auto-closes when its condition clears. Reads report; they do not write.
  */
 export const landModule: FastifyPluginAsync = async (app) => {
   /** Reference data (code-resident, not tenant data) — the published GRM

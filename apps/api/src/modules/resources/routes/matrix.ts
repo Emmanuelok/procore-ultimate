@@ -79,18 +79,28 @@ export const matrixRoutes: FastifyPluginAsync = async (app) => {
 
     if (existing[0]) {
       /* Re-recording a ticket is the renewal path. It resets verification:
-         a new certificate has not been checked just because the old one was. */
+         a new certificate has not been checked just because the old one was.
+
+         Fields merge on `!== undefined`, never on `??`: the schema accepts an
+         explicit null, and a renewal of a ticket that no longer carries an
+         expiry date must CLEAR the old expiry rather than silently keep it —
+         a stale expiry left in place is a date the sweep will happily go on
+         warning about, on a certificate whose real validity is unknown. */
       const at = nowIso();
+      const keep = <T>(sent: T | undefined, held: T): T => (sent !== undefined ? sent : held);
       await app.db
         .update(workerSkills)
         .set({
           level: body.level ?? existing[0].level,
-          certificateRef: body.certificateRef ?? existing[0].certificateRef,
-          issuingBody: body.issuingBody ?? existing[0].issuingBody ?? skill.issuingBody,
-          issuedAt: body.issuedAt ?? existing[0].issuedAt,
-          expiresAt: body.expiresAt ?? existing[0].expiresAt,
+          certificateRef: keep(body.certificateRef, existing[0].certificateRef),
+          issuingBody: keep(
+            body.issuingBody,
+            existing[0].issuingBody ?? skill.issuingBody ?? null,
+          ),
+          issuedAt: keep(body.issuedAt, existing[0].issuedAt),
+          expiresAt: keep(body.expiresAt, existing[0].expiresAt),
           evidenceFileIds: body.evidenceFileIds ?? existing[0].evidenceFileIds,
-          notes: body.notes ?? existing[0].notes,
+          notes: keep(body.notes, existing[0].notes),
           status: "claimed",
           verifiedBy: null,
           verifiedAt: null,
@@ -106,7 +116,8 @@ export const matrixRoutes: FastifyPluginAsync = async (app) => {
         workerReference: worker.reference,
         skillId: body.skillId,
         skillCode: skill.code,
-        expiresAt: body.expiresAt ?? existing[0].expiresAt,
+        expiresAt: keep(body.expiresAt, existing[0].expiresAt),
+        previousExpiresAt: existing[0].expiresAt,
         verificationReset: true,
       });
       return reply.status(200).send(await cellView(existing[0].id));

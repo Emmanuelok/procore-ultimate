@@ -637,8 +637,12 @@ describe("permit detectors", () => {
 
   it("expires a lapsed grant and signals once", async () => {
     const pid = await makeProject("Sweep Expiry");
-    const created = await createPermit(pid, {});
+    // a permit that was never applied for cannot be granted: the state
+    // machine refuses not_started -> granted, because a grant with no
+    // application is a consent nobody asked for
+    const created = await createPermit(pid, { appliedAt: addDaysISO(todayISO(), -220) });
     const permitId = created.json().id as string;
+    expect(created.json().status).toBe("applied");
     await app.inject({
       method: "POST",
       url: `/api/v1/projects/${pid}/permits/${permitId}/status`,

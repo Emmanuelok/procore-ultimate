@@ -2848,6 +2848,21 @@ export const projectsModule: FastifyPluginAsync = async (app) => {
     if (q.projectId) {
       conds.push(or(isNull(savedViews.projectId), eq(savedViews.projectId, q.projectId))!);
     }
+    /*
+     * A company-scoped view attached to a project the caller cannot open is
+     * still that project's business: its name and saved state name cost
+     * codes, vendors and thresholds. Company-wide views (projectId null) are
+     * shared by design; project-scoped ones follow the same membership rule
+     * as the projects themselves (PLAN §6.3).
+     */
+    const visible = await visibleProjectIds(app, req);
+    if (visible !== null) {
+      conds.push(
+        visible.length === 0
+          ? isNull(savedViews.projectId)
+          : or(isNull(savedViews.projectId), inArray(savedViews.projectId, visible))!,
+      );
+    }
     const items = await app.db
       .select()
       .from(savedViews)

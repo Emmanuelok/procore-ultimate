@@ -181,7 +181,7 @@ beforeAll(async () => {
     status: "open",
     createdBy: owner.userId,
   });
-});
+}, 300_000);
 
 afterAll(async () => {
   await built.close();

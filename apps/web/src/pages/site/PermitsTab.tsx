@@ -93,6 +93,8 @@ function PermitsPanel({ base, lookups, onChanged }: { base: string; lookups: Sit
   const list = useResource<ListResponse<PermitRow>>(`${base}/permits?pageSize=200`);
   const [openId, setOpenId] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  /** the permit being corrected before issue — null when raising a new one */
+  const [editing, setEditing] = useState<PermitRow | null>(null);
   const detail = useResource<PermitDetail>(openId ? `${base}/permits/${openId}` : null);
 
   const columns = useMemo<DataColumns<PermitRow>>(
@@ -161,7 +163,14 @@ function PermitsPanel({ base, lookups, onChanged }: { base: string; lookups: Sit
             title="Permits to work"
             hint="A permit is approved by someone other than the person who asked for it, activated only when every required precaution is ticked, and closed only when the space is empty."
             actions={
-              <Button size="sm" icon={IconPlus} onClick={() => setCreateOpen(true)}>
+              <Button
+                size="sm"
+                icon={IconPlus}
+                onClick={() => {
+                  setEditing(null);
+                  setCreateOpen(true);
+                }}
+              >
                 Raise a permit
               </Button>
             }
@@ -179,11 +188,33 @@ function PermitsPanel({ base, lookups, onChanged }: { base: string; lookups: Sit
             searchPlaceholder="Search by reference or work…"
             onRowClick={({ row }) => setOpenId(row.id)}
             rowTone={(row) => (row.status === "expired" ? "danger" : row.status === "active" ? "success" : undefined)}
+            rowActions={(row) =>
+              // Only before issue: the terms of an issued permit are fixed, and
+              // the API refuses to edit them.
+              row.status === "draft" || row.status === "requested" ? (
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  onClick={() => {
+                    setEditing(row);
+                    setCreateOpen(true);
+                  }}
+                >
+                  Edit
+                </Button>
+              ) : null
+            }
             empty={{
               title: "No permits",
               description: "Hot work, confined space, excavation and lifting all start here. A permit raised on the platform is a permit the sweeps can watch.",
               action: (
-                <Button size="sm" onClick={() => setCreateOpen(true)}>
+                <Button
+                  size="sm"
+                  onClick={() => {
+                    setEditing(null);
+                    setCreateOpen(true);
+                  }}
+                >
                   Raise the first permit
                 </Button>
               ),
@@ -195,10 +226,15 @@ function PermitsPanel({ base, lookups, onChanged }: { base: string; lookups: Sit
       <PermitForm
         base={base}
         lookups={lookups}
+        record={editing}
         open={createOpen}
-        onClose={() => setCreateOpen(false)}
-        onCreated={() => {
+        onClose={() => {
           setCreateOpen(false);
+          setEditing(null);
+        }}
+        onSaved={() => {
+          setCreateOpen(false);
+          setEditing(null);
           list.reload();
           onChanged();
         }}
@@ -218,18 +254,32 @@ function PermitsPanel({ base, lookups, onChanged }: { base: string; lookups: Sit
   );
 }
 
+const DEFAULT_PRECAUTIONS = "Extinguisher present\nCombustibles removed\nSignage in place*";
+
+/** `2026-05-04T08:00:00.000Z` → the value a datetime-local input wants. */
+const toLocalInput = (iso: string | null): string => {
+  if (!iso) return "";
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return "";
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}T${pad(at.getHours())}:${pad(at.getMinutes())}`;
+};
+
 function PermitForm({
   base,
   lookups,
+  record,
   open,
   onClose,
-  onCreated,
+  onSaved,
 }: {
   base: string;
   lookups: SiteLookups;
+  /** the permit being corrected before issue, or null for a new one */
+  record: PermitRow | null;
   open: boolean;
   onClose: () => void;
-  onCreated: () => void;
+  onSaved: () => void;
 }) {
   const action = useAction();
   const [permitType, setPermitType] = useState("hot_work");
@@ -239,18 +289,47 @@ function PermitForm({
   const [supervisorName, setSupervisorName] = useState("");
   const [validFrom, setValidFrom] = useState("");
   const [validTo, setValidTo] = useState("");
-  const [precautions, setPrecautions] = useState("Extinguisher present\nCombustibles removed\nSignage in place*");
+  const [precautions, setPrecautions] = useState(DEFAULT_PRECAUTIONS);
   const [maxOccupancy, setMaxOccupancy] = useState("");
   const [fireWatchMinutes, setFireWatchMinutes] = useState("60");
   const [description, setDescription] = useState("");
 
+  // Only a permit still in draft or requested reaches this drawer for editing,
+  // so what is prefilled is what the approver has not yet signed off.
+  useEffect(() => {
+    if (!open) return;
+    setPermitType(record?.permitType ?? "hot_work");
+    setTitle(record?.title ?? "");
+    setLocationDescription(record?.locationDescription ?? "");
+    setVendorId(record?.vendorId ?? "");
+    setSupervisorName(record?.supervisorName ?? "");
+    setValidFrom(toLocalInput(record?.validFrom ?? null));
+    setValidTo(toLocalInput(record?.validTo ?? null));
+    setPrecautions(
+      record
+        ? record.precautions.map((p) => `${p.item}${p.required ? "" : "*"}`).join("\n")
+        : DEFAULT_PRECAUTIONS,
+    );
+    setMaxOccupancy(record?.maxOccupancy === null || record?.maxOccupancy === undefined ? "" : String(record.maxOccupancy));
+    setFireWatchMinutes(
+      record?.fireWatchMinutes === null || record?.fireWatchMinutes === undefined ? (record ? "" : "60") : String(record.fireWatchMinutes),
+    );
+    setDescription(record?.description ?? "");
+  }, [open, record]);
+
   async function submit(e: FormEvent) {
     e.preventDefault();
+    const previous = new Map((record?.precautions ?? []).map((p) => [p.item, p]));
     const list = precautions
       .split("\n")
       .map((p) => p.trim())
       .filter(Boolean)
-      .map((p) => ({ item: p.replace(/\*$/, "").trim(), required: !p.endsWith("*"), done: false }));
+      .map((p) => {
+        const item = p.replace(/\*$/, "").trim();
+        // An edit before issue keeps what has already been ticked; nothing here
+        // ticks a precaution on anybody's behalf.
+        return { item, required: !p.endsWith("*"), done: previous.get(item)?.done ?? false };
+      });
     const payload: Record<string, unknown> = { permitType, title: title.trim(), precautions: list };
     if (description.trim()) payload["description"] = description.trim();
     if (locationDescription.trim()) payload["locationDescription"] = locationDescription.trim();
@@ -260,11 +339,13 @@ function PermitForm({
     if (validTo) payload["validTo"] = new Date(validTo).toISOString();
     if (maxOccupancy.trim()) payload["maxOccupancy"] = Number(maxOccupancy);
     if (permitType === "hot_work" && fireWatchMinutes.trim()) payload["fireWatchMinutes"] = Number(fireWatchMinutes);
-    const r = await action.run("create", () => api.post<PermitRow>(`${base}/permits`, payload));
+    const r = record
+      ? await action.run("save", () => api.patch<PermitRow>(`${base}/permits/${record.id}`, payload))
+      : await action.run("save", () => api.post<PermitRow>(`${base}/permits`, payload));
     if (r) {
-      toast.success(`${r.reference} raised in draft`);
-      setTitle("");
-      onCreated();
+      toast.success(record ? `${r.reference} updated` : `${r.reference} raised in draft`);
+      if (!record) setTitle("");
+      onSaved();
     }
   }
 
@@ -272,8 +353,12 @@ function PermitForm({
     <Drawer
       open={open}
       onClose={onClose}
-      title="Raise a permit to work"
-      description="One precaution per line; end a line with * to make it advisory rather than required. Required precautions must be ticked before the permit goes active."
+      title={record ? `Correct ${record.reference}` : "Raise a permit to work"}
+      description={
+        record
+          ? "The terms of a permit can be corrected until it is issued; after that the platform refuses the edit and the permit must be cancelled and raised again. One precaution per line; end a line with * to make it advisory."
+          : "One precaution per line; end a line with * to make it advisory rather than required. Required precautions must be ticked before the permit goes active."
+      }
       size="md"
     >
       <form onSubmit={(e) => void submit(e)} className="space-y-3">
@@ -336,8 +421,8 @@ function PermitForm({
           <Button type="button" variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button type="submit" loading={action.busy === "create"}>
-            Raise
+          <Button type="submit" loading={action.busy === "save"}>
+            {record ? "Save" : "Raise"}
           </Button>
         </div>
       </form>

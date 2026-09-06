@@ -12,7 +12,7 @@
  * programme does not model must survive the next import.
  */
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, eq, gte, inArray, lte, sql } from "drizzle-orm";
+import { and, asc, count, eq, gte, inArray, lte, ne, sql } from "drizzle-orm";
 import {
   resourceAvailability,
   resourceDemands,
@@ -48,12 +48,14 @@ import {
 } from "../engines/histogram.js";
 import {
   actorOf,
+  activeCurrentPlan,
   companyOf,
   fetchPlan,
   ledgerResources,
   nowIso,
   pad3,
   projectOf,
+  projectWeekStartsOn,
   requireScheduleTask,
   requireTypeForProject,
   resolveSchedule,
@@ -89,6 +91,9 @@ export const planRoutes: FastifyPluginAsync = async (app) => {
       ? await resolveSchedule(app.db, projectId, body.scheduleId)
       : null;
     if (body.supersedesPlanId) await fetchPlan(app.db, body.supersedesPlanId, companyId, projectId);
+    if (body.weekStartsOn !== undefined) {
+      await assertWeekBoundary(companyId, projectId, body.weekStartsOn, null);
+    }
 
     const number = await nextRecordNumber(app.db, projectId, "resource_plan");
     const id = newId("rpl");
@@ -156,6 +161,21 @@ export const planRoutes: FastifyPluginAsync = async (app) => {
       const plan = await fetchPlan(app.db, planId, companyId, projectId);
       assertMutable(plan.status, "edit");
       if (body.scheduleId) await resolveSchedule(app.db, projectId, body.scheduleId);
+      if (body.weekStartsOn !== undefined && body.weekStartsOn !== plan.weekStartsOn) {
+        await assertWeekBoundary(companyId, projectId, body.weekStartsOn, planId);
+        const [ownRows] = await app.db
+          .select({ n: count() })
+          .from(resourceDemands)
+          .where(eq(resourceDemands.planId, planId));
+        if (Number(ownRows?.n ?? 0) > 0) {
+          throw conflict(
+            `${plan.reference} already holds ${ownRows?.n} demand row(s) bucketed on day ` +
+              `${plan.weekStartsOn} (0 = Sunday). Changing the week boundary would leave every ` +
+              "one of them on a week the histogram no longer draws. Clear the demand and " +
+              "re-derive, or make a new plan.",
+          );
+        }
+      }
       const set: Record<string, unknown> = { updatedAt: nowIso() };
       const direct = [
         "name",
@@ -625,7 +645,7 @@ export const planRoutes: FastifyPluginAsync = async (app) => {
     // Supply must bucket on the SAME week boundary as demand, or the histogram
     // compares a Sunday-start supply week against a Monday-start demand week
     // and reports every week as both short and unknown.
-    const weekStart = weekStartOf(body.weekStart, await weekStartsOnFor(companyId, projectId));
+    const weekStart = weekStartOf(body.weekStart, await projectWeekStartsOn(app.db, companyId, projectId));
     const row = await upsertAvailability(
       companyId,
       projectId,
@@ -651,7 +671,7 @@ export const planRoutes: FastifyPluginAsync = async (app) => {
       const projectId = projectOf(req);
       if (body.to < body.from) throw badRequest("`to` must not precede `from`");
       await requireTypeForProject(app.db, body.resourceTypeId, companyId, projectId);
-      const weeks = enumerateWeeks(body.from, body.to, await weekStartsOnFor(companyId, projectId));
+      const weeks = enumerateWeeks(body.from, body.to, await projectWeekStartsOn(app.db, companyId, projectId));
       if (weeks.length > MAX_HISTOGRAM_WEEKS) {
         throw badRequest(
           `That window is ${weeks.length} weeks. Availability is set in windows of at most ` +
@@ -755,7 +775,7 @@ export const planRoutes: FastifyPluginAsync = async (app) => {
 
     const plan = q.planId
       ? await fetchPlan(app.db, q.planId, companyId, projectId)
-      : await activePlan(companyId, projectId);
+      : await activeCurrentPlan(app.db, companyId, projectId);
     const reasons: string[] = [];
     if (!plan) {
       reasons.push(
@@ -897,11 +917,23 @@ export const planRoutes: FastifyPluginAsync = async (app) => {
         })),
         tasks,
       });
-      if (levelling.length === 0 && histogram.totals.overAllocatedCells > 0) {
+      /* Say WHY no activity is named. suggestLevelling always falls back to
+         `add_supply`, so the list is virtually never empty — the honest
+         signal is that not one suggestion could name a task, which happens
+         when the plan's rows carry no sourceTaskId at all. Telling the reader
+         to field more people while silently withholding "this plan lost its
+         per-activity traceability" is the wrong half of the answer. */
+      const tracedContribution = demandRows.some((r) => r.sourceTaskId !== null);
+      const namedAnActivity = levelling.some((l) => l.action === "defer_task");
+      if (!namedAnActivity && histogram.totals.overAllocatedCells > 0) {
         reasons.push(
-          "This plan's demand rows are aggregated per trade-week rather than per activity, so a " +
-            "levelling suggestion cannot name which activity to move. Re-derive with perActivity " +
-            "set to keep the traceability.",
+          tracedContribution
+            ? "No over-allocated week could be levelled by deferring an activity: the contributing " +
+                "activities are critical or carry too little float. The suggestions below ask for " +
+                "more supply because moving the work would move the completion date."
+            : "This plan's demand rows are aggregated per trade-week rather than per activity, so a " +
+                "levelling suggestion cannot name which activity to move. Re-derive with perActivity " +
+                "set to keep the traceability.",
         );
       }
     }
@@ -949,30 +981,65 @@ export const planRoutes: FastifyPluginAsync = async (app) => {
   }
 
   /**
-   * The week boundary this project buckets on: the active plan's, or Monday.
-   * Demand and supply must agree on it — see the comment on the availability
-   * upsert.
+   * A PROJECT buckets on exactly one week boundary, and this refuses to let a
+   * second one appear.
+   *
+   * Changing the boundary after rows exist is the quiet killer: existing
+   * demand rows keep their old `weekStart` while the histogram enumerates
+   * weeks on the new one, so not a single key matches and every cell reports
+   * zero demand while the plan header still shows the full total. The reader
+   * sees a plan with 4,000 hours and a histogram with none. Existing supply
+   * rows are stranded the same way.
+   *
+   * A boundary may still be chosen freely on a project that holds no plan
+   * other than this one and no demand or supply rows at all.
    */
-  async function weekStartsOnFor(companyId: string, projectId: string): Promise<number> {
-    const plan = await activePlan(companyId, projectId);
-    return plan?.weekStartsOn ?? 1;
-  }
+  async function assertWeekBoundary(
+    companyId: string,
+    projectId: string,
+    requested: number,
+    planId: string | null,
+  ): Promise<void> {
+    const current = await projectWeekStartsOn(app.db, companyId, projectId);
+    if (requested === current) return;
 
-  async function activePlan(companyId: string, projectId: string) {
-    const rows = await app.db
-      .select()
+    const planClauses = [
+      eq(resourcePlans.companyId, companyId),
+      eq(resourcePlans.projectId, projectId),
+    ];
+    if (planId) planClauses.push(ne(resourcePlans.id, planId));
+    const [otherPlans] = await app.db
+      .select({ n: count() })
       .from(resourcePlans)
+      .where(and(...planClauses));
+    const [demandRows] = await app.db
+      .select({ n: count() })
+      .from(resourceDemands)
+      .where(
+        and(eq(resourceDemands.companyId, companyId), eq(resourceDemands.projectId, projectId)),
+      );
+    const [supplyRows] = await app.db
+      .select({ n: count() })
+      .from(resourceAvailability)
       .where(
         and(
-          eq(resourcePlans.companyId, companyId),
-          eq(resourcePlans.projectId, projectId),
-          eq(resourcePlans.status, "active"),
-          eq(resourcePlans.planKind, "current"),
+          eq(resourceAvailability.companyId, companyId),
+          eq(resourceAvailability.projectId, projectId),
         ),
-      )
-      .orderBy(asc(resourcePlans.number))
-      .limit(1);
-    return rows[0] ?? null;
+      );
+    const plans = Number(otherPlans?.n ?? 0);
+    const demand = Number(demandRows?.n ?? 0);
+    const supply = Number(supplyRows?.n ?? 0);
+    if (plans === 0 && demand === 0 && supply === 0) return;
+
+    throw conflict(
+      `This project already buckets its weeks from day ${current} (0 = Sunday), and ` +
+        `${demand} demand row(s), ${supply} supply row(s) and ${plans} other plan(s) are stored ` +
+        `on that boundary. Moving to day ${requested} would leave every one of them on a week ` +
+        "the histogram no longer draws — the plan would still show its total while the chart " +
+        "showed nothing. Create a new plan on the existing boundary, or clear the demand and " +
+        "supply rows first and re-derive.",
+    );
   }
 
   async function upsertAvailability(
@@ -1056,40 +1123,37 @@ export const planRoutes: FastifyPluginAsync = async (app) => {
     companyId: string,
     projectId: string,
   ): Promise<void> {
-    const rows = await app.db
+    /* Aggregated in SQL rather than in memory: a per-activity derive over a
+       large programme writes far more demand rows than a roll-up that runs on
+       every add, edit and delete should ever load (master plan §6.4). */
+    const [totals] = await app.db
       .select({
-        weekStart: resourceDemands.weekStart,
-        demandHours: resourceDemands.demandHours,
-        headcount: resourceDemands.headcount,
+        n: count(),
+        hours: sql<number>`coalesce(sum(${resourceDemands.demandHours}), 0)`,
       })
       .from(resourceDemands)
       .where(eq(resourceDemands.planId, planId));
-    const byWeek = new Map<string, { hours: number; headcount: number; complete: boolean }>();
-    let total = 0;
-    for (const row of rows) {
-      total = round2(total + row.demandHours);
-      const held = byWeek.get(row.weekStart) ?? { hours: 0, headcount: 0, complete: true };
-      held.hours = round2(held.hours + row.demandHours);
-      if (row.headcount === null) held.complete = false;
-      else held.headcount = round2(held.headcount + row.headcount);
-      byWeek.set(row.weekStart, held);
-    }
-    let peakWeek: string | null = null;
-    let peakHours = -1;
-    for (const [week, agg] of byWeek) {
-      if (agg.hours > peakHours) {
-        peakHours = agg.hours;
-        peakWeek = week;
-      }
-    }
-    const peak = peakWeek ? byWeek.get(peakWeek)! : null;
+    const [peak] = await app.db
+      .select({
+        weekStart: resourceDemands.weekStart,
+        hours: sql<number>`coalesce(sum(${resourceDemands.demandHours}), 0)`,
+        headcount: sql<number>`coalesce(sum(${resourceDemands.headcount}), 0)`,
+        unknownHeadcounts: sql<number>`count(*) filter (where ${resourceDemands.headcount} is null)`,
+      })
+      .from(resourceDemands)
+      .where(eq(resourceDemands.planId, planId))
+      .groupBy(resourceDemands.weekStart)
+      .orderBy(sql`sum(${resourceDemands.demandHours}) desc`, asc(resourceDemands.weekStart))
+      .limit(1);
+
+    const peakComplete = peak ? Number(peak.unknownHeadcounts ?? 0) === 0 : false;
     await app.db
       .update(resourcePlans)
       .set({
-        demandRowCount: rows.length,
-        totalDemandHours: total,
-        peakWeekStart: peakWeek,
-        peakHeadcount: peak && peak.complete ? peak.headcount : null,
+        demandRowCount: Number(totals?.n ?? 0),
+        totalDemandHours: round2(Number(totals?.hours ?? 0)),
+        peakWeekStart: peak?.weekStart ?? null,
+        peakHeadcount: peak && peakComplete ? round2(Number(peak.headcount ?? 0)) : null,
         updatedAt: nowIso(),
       })
       .where(

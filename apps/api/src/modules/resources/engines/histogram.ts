@@ -87,6 +87,17 @@ export interface HistogramResult {
     availableHours: number | null;
     overAllocatedCells: number;
     unknownSupplyCells: number;
+    /**
+     * Unknown-supply cells that actually have hours in them.
+     *
+     * `unknownSupplyCells` counts every blank cell, including the trade-weeks
+     * where the plan asks for nothing — over a wide type list that number is
+     * driven by how many trades exist in the company library rather than by
+     * anything about the project, which makes it useless as a health input.
+     * This one counts the cells where the answer matters: work is planned and
+     * nobody has said whether it can be fielded.
+     */
+    unknownSupplyDemandCells: number;
     peakWeekStart: string | null;
     peakDemandHours: number;
   };
@@ -132,6 +143,7 @@ export function buildHistogram(input: BuildHistogramInput): HistogramResult {
   const series: HistogramSeries[] = [];
   let overAllocatedCells = 0;
   let unknownSupplyCells = 0;
+  let unknownSupplyDemandCells = 0;
   let totalDemand = 0;
   let anyUnknownSupply = false;
   let grandPeakWeek: string | null = null;
@@ -176,6 +188,7 @@ export function buildHistogram(input: BuildHistogramInput): HistogramResult {
         unknownSupplyCells += 1;
         anyUnknownSupply = true;
         if (demandHours > 0) {
+          unknownSupplyDemandCells += 1;
           cellReasons.push(
             `No availability is recorded for ${type.name} in the week beginning ${week}, so this ` +
               "week's coverage is unknown rather than short. Record what can be fielded to make " +
@@ -298,6 +311,7 @@ export function buildHistogram(input: BuildHistogramInput): HistogramResult {
         : round2(series.reduce((s, x) => s + (x.totalAvailableHours ?? 0), 0)),
       overAllocatedCells,
       unknownSupplyCells,
+      unknownSupplyDemandCells,
       peakWeekStart: grandPeakWeek,
       peakDemandHours: grandPeakHours,
     },

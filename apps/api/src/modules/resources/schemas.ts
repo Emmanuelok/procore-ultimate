@@ -17,6 +17,8 @@ import {
   RESOURCE_PLAN_KINDS,
   RESOURCE_PLAN_STATUSES,
   RESOURCE_TYPE_STATUSES,
+  RESOURCE_UNITS,
+  SHIFTS,
   SKILL_CATEGORIES,
   SKILL_LEVELS,
   WORKER_SKILL_STATUSES,
@@ -44,11 +46,16 @@ export const resourceTypeCreateSchema = z.object({
   kind: z.enum(RESOURCE_KINDS).optional(),
   trade: z.string().max(200).nullable().optional(),
   equipmentCategory: z.string().max(200).nullable().optional(),
-  unit: z.string().max(50).optional(),
+  /** closed vocabulary: a free-text unit produces three spellings of "hours"
+   *  that no roll-up can add together (see RESOURCE_UNITS). */
+  unit: z.enum(RESOURCE_UNITS).optional(),
   standardHoursPerDay: z.number().min(0).max(24).nullable().optional(),
   workingDaysPerWeek: z.number().min(0).max(7).nullable().optional(),
   defaultHourlyCost: z.number().min(0).nullable().optional(),
-  currency: z.string().length(3).optional(),
+  currency: z
+    .string()
+    .regex(/^[A-Z]{3}$/, "expected a three-letter ISO 4217 code, upper case")
+    .optional(),
   requiredSkillIds: z.array(idSchema).max(50).optional(),
   mapsToTrade: z.string().max(200).nullable().optional(),
   /** null keeps the type in the company library */
@@ -180,7 +187,9 @@ export const assignmentCreateSchema = z.object({
   locationId: idSchema.nullable().optional(),
   fromDate: isoDateSchema,
   toDate: isoDateSchema,
-  shift: z.string().max(50).optional(),
+  /** the shared Shift union — the calendar groups bookings by it, and
+   *  "night", "Nights" and "banana" would be three different lanes. */
+  shift: z.enum(SHIFTS).optional(),
   hoursPerDay: z.number().min(0).max(24).nullable().optional(),
   allocationPercent: z.number().min(1).max(100).optional(),
   notes: z.string().max(10_000).nullable().optional(),
@@ -208,6 +217,13 @@ export const assignmentCancelSchema = z.object({
 
 export const assignmentTransitionSchema = z.object({
   note: z.string().max(4000).nullable().optional(),
+});
+
+/** The booking picker: what crews, workers and machines exist to be booked. */
+export const subjectLookupQuery = z.object({
+  kind: z.enum(["crew", "worker", "equipment"]).optional(),
+  q: z.string().max(200).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
 });
 
 export const calendarQuery = z.object({

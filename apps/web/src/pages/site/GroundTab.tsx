@@ -548,6 +548,8 @@ function FindingsPanel({ base, onChanged }: { base: string; onChanged: () => voi
 function UtilitiesPanel({ base, onChanged }: { base: string; onChanged: () => void }) {
   const list = useResource<ListResponse<UtilityRow>>(`${base}/utilities?pageSize=200`);
   const [open, setOpen] = useState(false);
+  /** the service being corrected — null when the drawer is a new one */
+  const [editing, setEditing] = useState<UtilityRow | null>(null);
 
   const columns = useMemo<DataColumns<UtilityRow>>(
     () => [
@@ -583,7 +585,14 @@ function UtilitiesPanel({ base, onChanged }: { base: string; onChanged: () => vo
           title="Buried services"
           hint="A service is only `verified` when a survey verified it. Recording one as verified on the strength of utility records alone is refused — that is how people dig into live cables."
           actions={
-            <Button size="sm" icon={IconPlus} onClick={() => setOpen(true)}>
+            <Button
+              size="sm"
+              icon={IconPlus}
+              onClick={() => {
+                setEditing(null);
+                setOpen(true);
+              }}
+            >
               Record a service
             </Button>
           }
@@ -599,11 +608,29 @@ function UtilitiesPanel({ base, onChanged }: { base: string; onChanged: () => vo
           filterRow
           exportFileName="buried-services"
           rowTone={(row) => (row.confidence === "unknown" && row.status === "live" ? "danger" : undefined)}
+          rowActions={(row) => (
+            <Button
+              size="xs"
+              variant="ghost"
+              onClick={() => {
+                setEditing(row);
+                setOpen(true);
+              }}
+            >
+              Edit
+            </Button>
+          )}
           empty={{
             title: "No buried services recorded",
             description: "Record what is under the ground and how well it is known. An excavation permit will not go active without a survey behind it.",
             action: (
-              <Button size="sm" onClick={() => setOpen(true)}>
+              <Button
+                size="sm"
+                onClick={() => {
+                  setEditing(null);
+                  setOpen(true);
+                }}
+              >
                 Record the first
               </Button>
             ),
@@ -611,10 +638,15 @@ function UtilitiesPanel({ base, onChanged }: { base: string; onChanged: () => vo
         />
         <UtilityForm
           base={base}
+          record={editing}
           open={open}
-          onClose={() => setOpen(false)}
-          onCreated={() => {
+          onClose={() => {
             setOpen(false);
+            setEditing(null);
+          }}
+          onSaved={() => {
+            setOpen(false);
+            setEditing(null);
             list.reload();
             onChanged();
           }}
@@ -624,7 +656,20 @@ function UtilitiesPanel({ base, onChanged }: { base: string; onChanged: () => vo
   );
 }
 
-function UtilityForm({ base, open, onClose, onCreated }: { base: string; open: boolean; onClose: () => void; onCreated: () => void }) {
+function UtilityForm({
+  base,
+  record,
+  open,
+  onClose,
+  onSaved,
+}: {
+  base: string;
+  /** the service being corrected, or null for a new one */
+  record: UtilityRow | null;
+  open: boolean;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
   const action = useAction();
   const [serviceRef, setServiceRef] = useState("");
   const [utilityType, setUtilityType] = useState("electricity");
@@ -635,27 +680,68 @@ function UtilityForm({ base, open, onClose, onCreated }: { base: string; open: b
   const [confidence, setConfidence] = useState("probable");
   const [status, setStatus] = useState("live");
 
+  useEffect(() => {
+    if (!open) return;
+    setServiceRef(record?.serviceRef ?? "");
+    setUtilityType(record?.utilityType ?? "electricity");
+    setOwnerName(record?.ownerName ?? "");
+    setSpecification(record?.specification ?? "");
+    setDepthM(record?.depthM === null || record?.depthM === undefined ? "" : String(record.depthM));
+    setDetectionMethod(record?.detectionMethod ?? "gpr");
+    setConfidence(record?.confidence ?? "probable");
+    setStatus(record?.status ?? "live");
+  }, [open, record]);
+
   async function submit(e: FormEvent) {
     e.preventDefault();
-    const payload: Record<string, unknown> = { serviceRef: serviceRef.trim(), utilityType, detectionMethod, confidence, status };
-    if (ownerName.trim()) payload["ownerName"] = ownerName.trim();
-    if (specification.trim()) payload["specification"] = specification.trim();
-    if (depthM.trim()) payload["depthM"] = Number(depthM);
-    const r = await action.run("create", () => api.post<UtilityRow>(`${base}/utilities`, payload));
+    const payload: Record<string, unknown> = {
+      utilityType,
+      detectionMethod,
+      confidence,
+      status,
+      ownerName: ownerName.trim() || null,
+      specification: specification.trim() || null,
+      depthM: depthM.trim() ? Number(depthM) : null,
+    };
+    if (!record) {
+      payload["serviceRef"] = serviceRef.trim();
+      for (const key of Object.keys(payload)) {
+        if (payload[key] === null) delete payload[key];
+      }
+    }
+    const r = record
+      ? await action.run("save", () => api.patch<UtilityRow>(`${base}/utilities/${record.id}`, payload))
+      : await action.run("save", () => api.post<UtilityRow>(`${base}/utilities`, payload));
     if (r) {
-      toast.success(`${r.serviceRef} recorded`);
-      setServiceRef("");
-      onCreated();
+      toast.success(record ? `${r.serviceRef} updated` : `${r.serviceRef} recorded`);
+      if (!record) setServiceRef("");
+      onSaved();
     }
   }
 
   return (
-    <Drawer open={open} onClose={onClose} title="Record a buried service" size="sm">
+    <Drawer
+      open={open}
+      onClose={onClose}
+      title={record ? `Correct ${record.serviceRef}` : "Record a buried service"}
+      description={
+        record
+          ? "A service may only be marked verified when a survey verified it — records alone are refused, whichever way the record is edited."
+          : undefined
+      }
+      size="sm"
+    >
       <form onSubmit={(e) => void submit(e)} className="space-y-3">
         {action.refusal ? <RefusalNotice refusal={action.refusal} onDismiss={action.clear} /> : null}
         <div className="grid grid-cols-2 gap-3">
-          <Field label="Service reference" required>
-            <Input value={serviceRef} onChange={(e) => setServiceRef(e.target.value)} required maxLength={60} />
+          <Field label="Service reference" required={!record} hint={record ? "Fixed once the service is on the register." : undefined}>
+            <Input
+              value={serviceRef}
+              onChange={(e) => setServiceRef(e.target.value)}
+              required={!record}
+              disabled={Boolean(record)}
+              maxLength={60}
+            />
           </Field>
           <Field label="Type">
             <Select value={utilityType} onChange={(e) => setUtilityType(e.target.value)}>
@@ -707,8 +793,8 @@ function UtilityForm({ base, open, onClose, onCreated }: { base: string; open: b
           <Button type="button" variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button type="submit" loading={action.busy === "create"}>
-            Record
+          <Button type="submit" loading={action.busy === "save"}>
+            {record ? "Save" : "Record"}
           </Button>
         </div>
       </form>

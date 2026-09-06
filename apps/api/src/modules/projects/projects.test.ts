@@ -373,7 +373,19 @@ describe("comments, mentions, watchers, tags", () => {
       userId: member.userId,
       templateKey: "project_manager",
     });
+    // A real record: a comment may only be attached to something that exists
+    // in THIS project, so the stored row cannot be an orphan and the watcher
+    // fan-out cannot cross into another project.
     const rfiId = newId("rfi");
+    await built.app.db.insert(rfis).values({
+      id: rfiId,
+      companyId: actor.companyId,
+      projectId: prj.id,
+      number: 7701,
+      subject: "Comment target",
+      question: "?",
+      createdBy: actor.userId,
+    });
 
     const res = await built.app.inject({
       method: "POST",

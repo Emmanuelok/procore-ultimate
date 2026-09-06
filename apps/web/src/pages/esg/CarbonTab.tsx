@@ -318,6 +318,8 @@ export default function CarbonTab({
   const [boqs, setBoqs] = useState<BoqPickRow[] | null>(null);
   const [iBoqId, setIBoqId] = useState("");
   const [iBudgetId, setIBudgetId] = useState("");
+  /** Re-import a bill under different factors, replacing its prior entries. */
+  const [iReplace, setIReplace] = useState(false);
   const [mappings, setMappings] = useState<MappingDraft[]>([]);
   const [importResult, setImportResult] = useState<BoqImportResult | null>(null);
 
@@ -361,6 +363,7 @@ export default function CarbonTab({
         })),
       };
       if (iBudgetId) payload["budgetId"] = iBudgetId;
+      if (iReplace) payload["mode"] = "replace";
       const res = await api.post<BoqImportResult>(`${base}/carbon-entries/from-boq`, payload);
       setImportResult(res);
       await load();
@@ -432,7 +435,11 @@ export default function CarbonTab({
               <span className="text-base font-medium text-ink-300">GIA not set</span>
             )
           }
-          hint={summary?.gia != null ? `over ${fmtNum(summary.gia, 0)} m² GIA` : "set GIA on the project to report intensity"}
+          hint={
+            summary?.gia != null
+              ? `over ${fmtNum(summary.gia, 0)} m² GIA`
+              : "set GIA on the Options & disclosure tab to report intensity"
+          }
           title={INTENSITY_TOOLTIP}
         />
         <StatCard
@@ -959,7 +966,9 @@ export default function CarbonTab({
                             ? "No unit of measurement"
                             : reason === "unit_mismatch"
                               ? "Unit does not match the factor"
-                              : reason}{" "}
+                              : reason === "already_imported"
+                                ? "Already imported — skipped so the footprint is not doubled"
+                                : reason}{" "}
                         <span className="font-normal">({rows.length})</span>
                       </div>
                       <div className="mt-1 text-[11px] leading-relaxed text-amber-900/80">
@@ -978,6 +987,25 @@ export default function CarbonTab({
               </p>
             )}
 
+            {(importResult.alreadyImported ?? 0) > 0 ? (
+              <p className="rounded-md bg-ink-50 px-3 py-2 text-xs leading-relaxed text-ink-600">
+                <span className="font-medium text-ink-900">
+                  {importResult.alreadyImported} item
+                  {importResult.alreadyImported === 1 ? " was" : "s were"} already imported.
+                </span>{" "}
+                Re-running an import is safe: an item that already carries an entry is skipped
+                rather than counted twice, so the footprint cannot be doubled by a second run. To
+                re-import the bill under different factors, tick “Replace previous import” below —
+                the prior entries for this bill are removed in the same transaction.
+              </p>
+            ) : null}
+            {(importResult.replaced ?? 0) > 0 ? (
+              <p className="rounded-md bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-900 ring-1 ring-amber-200">
+                {importResult.replaced} previously imported entr
+                {importResult.replaced === 1 ? "y was" : "ies were"} removed and replaced.
+              </p>
+            ) : null}
+
             <div className="flex justify-end gap-2">
               <Button variant="secondary" onClick={() => setImportResult(null)}>
                 Run another import
@@ -993,6 +1021,24 @@ export default function CarbonTab({
               Items with no quantity, no unit, or a unit the factor is not published in are
               skipped and listed.
             </p>
+
+            <label className="flex items-start gap-2 text-sm text-ink-700">
+              <input
+                type="checkbox"
+                className="mt-0.5 h-4 w-4 rounded border-ink-300 text-brand-600 focus:ring-brand-500"
+                checked={iReplace}
+                onChange={(e) => setIReplace(e.target.checked)}
+              />
+              <span>
+                <span className="font-medium">Replace this bill's previous import</span>
+                <span className="block text-xs text-ink-500">
+                  Off (the default), an item that already carries an entry is skipped, so
+                  re-running cannot double the footprint. On, the prior entries for this bill's
+                  items are removed and re-created in the same transaction — use it to re-import
+                  under corrected factors.
+                </span>
+              </span>
+            </label>
 
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <Field label="Bill of Quantities">

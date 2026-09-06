@@ -421,6 +421,17 @@ describe("environmental event log", () => {
     expect(mirrored[0]?.detectedOrReported).toBe("detected");
   });
 
+  it("refuses a PATCH that would leave the magnitude and the limit in different units", async () => {
+    const list = await get(`${base()}/environmental-events?pageSize=5`);
+    const id = list.json().items[0].id;
+    const res = await patch(`${base()}/environmental-events/${id}`, { magnitudeUnit: "dB" });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("two different units");
+    const fine = await patch(`${base()}/environmental-events/${id}`, { impact: "Façade monitored; no cracking observed." });
+    expect(fine.statusCode).toBe(200);
+    expect(fine.json().impact).toContain("no cracking");
+  });
+
   it("logs a within-limit event without a signal", async () => {
     const before = (
       await app.db.select().from(signals).where(and(eq(signals.companyId, owner.companyId), eq(signals.detector, "site_environmental_threshold")))

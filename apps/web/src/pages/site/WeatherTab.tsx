@@ -796,6 +796,8 @@ function EventsPanel({ base, onChanged }: { base: string; onChanged: () => void 
   );
   const action = useAction();
   const [open, setOpen] = useState(false);
+  /** the event being corrected — null when the drawer is a new one */
+  const [editing, setEditing] = useState<EnvironmentalEventRow | null>(null);
 
   const columns = useMemo<DataColumns<EnvironmentalEventRow>>(
     () => [
@@ -866,7 +868,14 @@ function EventsPanel({ base, onChanged }: { base: string; onChanged: () => void 
           title="Environmental, seismic and tidal events"
           hint="Everything that happened TO the site. An event with a stated limit is judged against it and raises a signal when it is exceeded; every event is also written to the platform-wide occurrence log."
           actions={
-            <Button size="sm" icon={IconPlus} onClick={() => setOpen(true)}>
+            <Button
+              size="sm"
+              icon={IconPlus}
+              onClick={() => {
+                setEditing(null);
+                setOpen(true);
+              }}
+            >
               Log an event
             </Button>
           }
@@ -882,18 +891,36 @@ function EventsPanel({ base, onChanged }: { base: string; onChanged: () => void 
           filterRow
           exportFileName="environmental-events"
           rowTone={(row) => (row.exceededThreshold === 1 ? "danger" : undefined)}
-          rowActions={(row) =>
-            row.status === "closed" ? null : (
-              <Button size="xs" variant="ghost" onClick={() => void close(row)}>
-                Close
+          rowActions={(row) => (
+            <span className="flex gap-1">
+              <Button
+                size="xs"
+                variant="ghost"
+                onClick={() => {
+                  setEditing(row);
+                  setOpen(true);
+                }}
+              >
+                Edit
               </Button>
-            )
-          }
+              {row.status === "closed" ? null : (
+                <Button size="xs" variant="ghost" onClick={() => void close(row)}>
+                  Close
+                </Button>
+              )}
+            </span>
+          )}
           empty={{
             title: "No environmental events",
             description: "Log tremors, tides, floods, dust and noise exceedances here so the chronology of what the environment did to this site survives the project.",
             action: (
-              <Button size="sm" onClick={() => setOpen(true)}>
+              <Button
+                size="sm"
+                onClick={() => {
+                  setEditing(null);
+                  setOpen(true);
+                }}
+              >
                 Log the first event
               </Button>
             ),
@@ -901,10 +928,15 @@ function EventsPanel({ base, onChanged }: { base: string; onChanged: () => void 
         />
         <EventForm
           base={base}
+          record={editing}
           open={open}
-          onClose={() => setOpen(false)}
-          onCreated={() => {
+          onClose={() => {
             setOpen(false);
+            setEditing(null);
+          }}
+          onSaved={() => {
+            setOpen(false);
+            setEditing(null);
             list.reload();
             onChanged();
           }}
@@ -914,7 +946,20 @@ function EventsPanel({ base, onChanged }: { base: string; onChanged: () => void 
   );
 }
 
-function EventForm({ base, open, onClose, onCreated }: { base: string; open: boolean; onClose: () => void; onCreated: () => void }) {
+function EventForm({
+  base,
+  record,
+  open,
+  onClose,
+  onSaved,
+}: {
+  base: string;
+  /** the event being corrected, or null for a new one */
+  record: EnvironmentalEventRow | null;
+  open: boolean;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
   const action = useAction();
   const [category, setCategory] = useState("vibration");
   const [occurredAt, setOccurredAt] = useState("");
@@ -926,8 +971,39 @@ function EventForm({ base, open, onClose, onCreated }: { base: string; open: boo
   const [impact, setImpact] = useState("");
   const [workStopped, setWorkStopped] = useState(false);
 
+  useEffect(() => {
+    if (!open) return;
+    setCategory(record?.category ?? "vibration");
+    setOccurredAt(record ? record.occurredAt.slice(0, 16) : "");
+    setMagnitude(record?.magnitude === null || record?.magnitude === undefined ? "" : String(record.magnitude));
+    setUnit(record?.magnitudeUnit ?? record?.thresholdUnit ?? "mm/s");
+    setThresholdValue(record?.thresholdValue === null || record?.thresholdValue === undefined ? "" : String(record.thresholdValue));
+    setSeverity(record?.severity ?? "medium");
+    setSensorRef(record?.sensorRef ?? "");
+    setImpact(record?.impact ?? "");
+    setWorkStopped(record?.workStopped === 1);
+  }, [open, record]);
+
   async function submit(e: FormEvent) {
     e.preventDefault();
+    if (record) {
+      // The measurement, its limit and the moment it happened are what was
+      // observed: they are not editable, and the verdict already drawn from
+      // them stands. Everything around them can be corrected.
+      const payload: Record<string, unknown> = {
+        severity,
+        workStopped,
+        detectedVia: sensorRef.trim() ? "sensor" : "observation",
+        sensorRef: sensorRef.trim() || null,
+        impact: impact.trim() || null,
+      };
+      const r = await action.run("save", () => api.patch<EnvironmentalEventRow>(`${base}/environmental-events/${record.id}`, payload));
+      if (r) {
+        toast.success(`${r.reference} updated`);
+        onSaved();
+      }
+      return;
+    }
     const payload: Record<string, unknown> = {
       category,
       occurredAt: occurredAt ? new Date(occurredAt).toISOString() : new Date().toISOString(),
@@ -945,12 +1021,12 @@ function EventForm({ base, open, onClose, onCreated }: { base: string; open: boo
     }
     if (sensorRef.trim()) payload["sensorRef"] = sensorRef.trim();
     if (impact.trim()) payload["impact"] = impact.trim();
-    const r = await action.run("create", () => api.post<EnvironmentalEventRow & { thresholdVerdict: string }>(`${base}/environmental-events`, payload));
+    const r = await action.run("save", () => api.post<EnvironmentalEventRow & { thresholdVerdict: string }>(`${base}/environmental-events`, payload));
     if (r) {
       toast.success(r.thresholdVerdict);
       setMagnitude("");
       setImpact("");
-      onCreated();
+      onSaved();
     }
   }
 
@@ -958,15 +1034,19 @@ function EventForm({ base, open, onClose, onCreated }: { base: string; open: boo
     <Drawer
       open={open}
       onClose={onClose}
-      title="Log an environmental event"
-      description="The measured value and the limit must share a unit — the platform will not compare millimetres per second with decibels."
+      title={record ? `Correct ${record.reference}` : "Log an environmental event"}
+      description={
+        record
+          ? "The category, the moment it happened, the measured value and its limit are what was observed — they stand as logged. Correct the severity, the sensor, the impact and whether work stopped."
+          : "The measured value and the limit must share a unit — the platform will not compare millimetres per second with decibels."
+      }
       size="md"
     >
       <form onSubmit={(e) => void submit(e)} className="space-y-3">
         {action.refusal ? <RefusalNotice refusal={action.refusal} onDismiss={action.clear} /> : null}
         <div className="grid grid-cols-2 gap-3">
-          <Field label="Category" required>
-            <Select value={category} onChange={(e) => setCategory(e.target.value)}>
+          <Field label="Category" required hint={record ? "Fixed once logged." : undefined}>
+            <Select value={category} onChange={(e) => setCategory(e.target.value)} disabled={Boolean(record)}>
               {CATEGORIES.map((c) => (
                 <option key={c} value={c}>
                   {labelize(c)}
@@ -975,16 +1055,33 @@ function EventForm({ base, open, onClose, onCreated }: { base: string; open: boo
             </Select>
           </Field>
           <Field label="Occurred at">
-            <Input type="datetime-local" value={occurredAt} onChange={(e) => setOccurredAt(e.target.value)} />
+            <Input
+              type="datetime-local"
+              value={occurredAt}
+              onChange={(e) => setOccurredAt(e.target.value)}
+              disabled={Boolean(record)}
+            />
           </Field>
           <Field label="Measured value">
-            <Input type="number" step="any" value={magnitude} onChange={(e) => setMagnitude(e.target.value)} />
+            <Input
+              type="number"
+              step="any"
+              value={magnitude}
+              onChange={(e) => setMagnitude(e.target.value)}
+              disabled={Boolean(record)}
+            />
           </Field>
           <Field label="Unit" hint="Used for both the measurement and the limit.">
-            <Input value={unit} onChange={(e) => setUnit(e.target.value)} maxLength={40} />
+            <Input value={unit} onChange={(e) => setUnit(e.target.value)} maxLength={40} disabled={Boolean(record)} />
           </Field>
           <Field label="Limit">
-            <Input type="number" step="any" value={thresholdValue} onChange={(e) => setThresholdValue(e.target.value)} />
+            <Input
+              type="number"
+              step="any"
+              value={thresholdValue}
+              onChange={(e) => setThresholdValue(e.target.value)}
+              disabled={Boolean(record)}
+            />
           </Field>
           <Field label="Severity">
             <Select value={severity} onChange={(e) => setSeverity(e.target.value)}>
@@ -1012,8 +1109,8 @@ function EventForm({ base, open, onClose, onCreated }: { base: string; open: boo
           <Button type="button" variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button type="submit" loading={action.busy === "create"}>
-            Log
+          <Button type="submit" loading={action.busy === "save"}>
+            {record ? "Save" : "Log"}
           </Button>
         </div>
       </form>

@@ -378,6 +378,16 @@ function InboxTab({
                           ) : null}
                         </span>
                         <span className="flex shrink-0 items-center gap-2">
+                          {/*
+                            Deferred, not suppressed: it is in the inbox but
+                            deliberately not in the unread count until the
+                            digest goes out.
+                          */}
+                          {n.heldForDigest === 1 && !n.readAt ? (
+                            <Badge tone="neutral" title="Waiting for your next digest">
+                              Held
+                            </Badge>
+                          ) : null}
                           <Badge tone={kindTone(n.kind)}>{humanize(n.kind)}</Badge>
                           <span
                             className="text-xs text-content-subtle"

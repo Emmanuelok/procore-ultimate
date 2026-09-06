@@ -132,3 +132,16 @@ export const RESOURCE_DETECTORS = [
   "resource_unresourced_work",
 ] as const;
 export type ResourceDetector = (typeof RESOURCE_DETECTORS)[number];
+
+/**
+ * The unit a resource type's demand and supply are stated in.
+ *
+ * Closed on purpose. The histogram, the levelling engine and the productivity
+ * engine all reason in HOURS; a type stated in anything else is stored and
+ * displayed but never converted, because converting "3 shifts" into hours
+ * requires a standard working day this module refuses to invent. A free-text
+ * unit would let "hrs", "Hours" and "man-hours" coexist as three different
+ * things that no roll-up can add together.
+ */
+export const RESOURCE_UNITS = ["hours", "days", "shifts", "each"] as const;
+export type ResourceUnit = (typeof RESOURCE_UNITS)[number];

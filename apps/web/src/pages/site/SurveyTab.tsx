@@ -6,7 +6,7 @@
  * setting-out record is checked by someone other than the person who set the
  * work out, and approved by a third — the platform refuses the shortcuts.
  */
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { toast } from "sonner";
 import { Badge, Button, Card, CardBody, Drawer, Field, Input, Select, Textarea } from "../../ui";
 import { DataTable, type DataColumns } from "../../ui/data";
@@ -36,6 +36,8 @@ export default function SurveyTab({ projectId, lookups, onChanged }: { projectId
   const records = useResource<ListResponse<SettingOutRow>>(`${base}/setting-out?pageSize=200`);
   const action = useAction();
   const [pointOpen, setPointOpen] = useState(false);
+  /** the control point being corrected — null when the drawer is a new one */
+  const [editingPoint, setEditingPoint] = useState<SurveyPointRow | null>(null);
   const [recordOpen, setRecordOpen] = useState(false);
 
   const pointColumns = useMemo<DataColumns<SurveyPointRow>>(
@@ -164,7 +166,14 @@ export default function SurveyTab({ projectId, lookups, onChanged }: { projectId
             title="Survey control"
             hint="The project's spatial truth. A check that exceeds a point's own stated accuracy marks it disturbed, and setting out from a disturbed point is then refused."
             actions={
-              <Button size="sm" icon={IconPlus} onClick={() => setPointOpen(true)}>
+              <Button
+                size="sm"
+                icon={IconPlus}
+                onClick={() => {
+                  setEditingPoint(null);
+                  setPointOpen(true);
+                }}
+              >
                 Add a point
               </Button>
             }
@@ -181,15 +190,33 @@ export default function SurveyTab({ projectId, lookups, onChanged }: { projectId
             exportFileName="survey-control"
             rowTone={(row) => (row.status === "disturbed" ? "warning" : row.status === "destroyed" ? "danger" : undefined)}
             rowActions={(row) => (
-              <Button size="xs" variant="ghost" onClick={() => void checkPoint(row)}>
-                Record a check
-              </Button>
+              <span className="flex gap-1">
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  onClick={() => {
+                    setEditingPoint(row);
+                    setPointOpen(true);
+                  }}
+                >
+                  Edit
+                </Button>
+                <Button size="xs" variant="ghost" onClick={() => void checkPoint(row)}>
+                  Record a check
+                </Button>
+              </span>
             )}
             empty={{
               title: "No control points",
               description: "Enter the control and benchmarks the site is set out from. Without them a setting-out record cites nothing.",
               action: (
-                <Button size="sm" onClick={() => setPointOpen(true)}>
+                <Button
+                  size="sm"
+                  onClick={() => {
+                    setEditingPoint(null);
+                    setPointOpen(true);
+                  }}
+                >
                   Add the first point
                 </Button>
               ),
@@ -255,10 +282,15 @@ export default function SurveyTab({ projectId, lookups, onChanged }: { projectId
 
       <PointForm
         base={base}
+        record={editingPoint}
         open={pointOpen}
-        onClose={() => setPointOpen(false)}
-        onCreated={() => {
+        onClose={() => {
           setPointOpen(false);
+          setEditingPoint(null);
+        }}
+        onSaved={() => {
+          setPointOpen(false);
+          setEditingPoint(null);
           points.reload();
           onChanged();
         }}
@@ -279,7 +311,20 @@ export default function SurveyTab({ projectId, lookups, onChanged }: { projectId
   );
 }
 
-function PointForm({ base, open, onClose, onCreated }: { base: string; open: boolean; onClose: () => void; onCreated: () => void }) {
+function PointForm({
+  base,
+  record,
+  open,
+  onClose,
+  onSaved,
+}: {
+  base: string;
+  /** the point being corrected, or null for a new one */
+  record: SurveyPointRow | null;
+  open: boolean;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
   const action = useAction();
   const [pointRef, setPointRef] = useState("");
   const [kind, setKind] = useState("control");
@@ -292,9 +337,25 @@ function PointForm({ base, open, onClose, onCreated }: { base: string; open: boo
   const [coordinateSystem, setCoordinateSystem] = useState("");
   const [method, setMethod] = useState("gnss");
 
+  const asText = (value: number | null | undefined) => (value === null || value === undefined ? "" : String(value));
+
+  useEffect(() => {
+    if (!open) return;
+    setPointRef(record?.pointRef ?? "");
+    setKind(record?.kind ?? "control");
+    setEasting(asText(record?.easting));
+    setNorthing(asText(record?.northing));
+    setElevation(asText(record?.elevation));
+    setLat(asText(record?.lat));
+    setLon(asText(record?.lon));
+    setAccuracyMm(record ? asText(record.accuracyMm) : "5");
+    setCoordinateSystem(record?.coordinateSystem ?? "");
+    setMethod(record?.method ?? "gnss");
+  }, [open, record]);
+
   async function submit(e: FormEvent) {
     e.preventDefault();
-    const payload: Record<string, unknown> = { pointRef: pointRef.trim(), kind, method };
+    const payload: Record<string, unknown> = { kind, method, coordinateSystem: coordinateSystem.trim() || null };
     for (const [key, value] of [
       ["easting", easting],
       ["northing", northing],
@@ -303,24 +364,47 @@ function PointForm({ base, open, onClose, onCreated }: { base: string; open: boo
       ["lon", lon],
       ["accuracyMm", accuracyMm],
     ] as const) {
-      if (value.trim()) payload[key] = Number(value);
+      payload[key] = value.trim() ? Number(value) : null;
     }
-    if (coordinateSystem.trim()) payload["coordinateSystem"] = coordinateSystem.trim();
-    const r = await action.run("create", () => api.post<SurveyPointRow>(`${base}/survey-points`, payload));
+    if (!record) {
+      payload["pointRef"] = pointRef.trim();
+      for (const key of Object.keys(payload)) {
+        if (payload[key] === null) delete payload[key];
+      }
+    }
+    const r = record
+      ? await action.run("save", () => api.patch<SurveyPointRow>(`${base}/survey-points/${record.id}`, payload))
+      : await action.run("save", () => api.post<SurveyPointRow>(`${base}/survey-points`, payload));
     if (r) {
-      toast.success(`${r.pointRef} recorded`);
-      setPointRef("");
-      onCreated();
+      toast.success(record ? `${r.pointRef} updated` : `${r.pointRef} recorded`);
+      if (!record) setPointRef("");
+      onSaved();
     }
   }
 
   return (
-    <Drawer open={open} onClose={onClose} title="Add a control point" description="Grid coordinates or latitude/longitude — a point with neither cannot be set out from." size="sm">
+    <Drawer
+      open={open}
+      onClose={onClose}
+      title={record ? `Correct ${record.pointRef}` : "Add a control point"}
+      description={
+        record
+          ? "Correcting the recorded position of a control point. Checks already taken against it keep the deltas they were measured with — record a new check to test the corrected position."
+          : "Grid coordinates or latitude/longitude — a point with neither cannot be set out from."
+      }
+      size="sm"
+    >
       <form onSubmit={(e) => void submit(e)} className="space-y-3">
         {action.refusal ? <RefusalNotice refusal={action.refusal} onDismiss={action.clear} /> : null}
         <div className="grid grid-cols-2 gap-3">
-          <Field label="Point reference" required>
-            <Input value={pointRef} onChange={(e) => setPointRef(e.target.value)} required maxLength={60} />
+          <Field label="Point reference" required={!record} hint={record ? "Fixed once the point is on the register." : undefined}>
+            <Input
+              value={pointRef}
+              onChange={(e) => setPointRef(e.target.value)}
+              required={!record}
+              disabled={Boolean(record)}
+              maxLength={60}
+            />
           </Field>
           <Field label="Kind">
             <Select value={kind} onChange={(e) => setKind(e.target.value)}>
@@ -366,8 +450,8 @@ function PointForm({ base, open, onClose, onCreated }: { base: string; open: boo
           <Button type="button" variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button type="submit" loading={action.busy === "create"}>
-            Add
+          <Button type="submit" loading={action.busy === "save"}>
+            {record ? "Save" : "Add"}
           </Button>
         </div>
       </form>

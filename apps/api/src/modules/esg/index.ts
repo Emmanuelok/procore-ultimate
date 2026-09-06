@@ -227,6 +227,21 @@ type EntryRow = typeof carbonEntries.$inferSelect;
  * waste by stream with diversion-from-landfill (#513-514), and UK Social
  * Value Model commitments reconciled tender-promise against delivery, with
  * proxy financial valuation and a shortfall signal (#527-540).
+ *
+ * `routes-environment.ts` adds the environmental half: consent-limit
+ * monitoring points and readings, environmental incidents with the statutory
+ * notification clock, biodiversity net gain, design-option carbon and
+ * marginal abatement cost (#502-504), transport carbon (A4/A5), the ISO
+ * 14001 evidence register, the GIA writer behind the RICS intensity unit
+ * (#491) and period disclosure assembly for CSRD/ESRS, IFRS S2, TCFD, the
+ * GHG Protocol and modern slavery (#541-546).
+ *
+ * WHAT THIS MODULE DELIBERATELY DOES NOT DO: raise findings on a read, or
+ * report an unevidenced figure as zero. Findings come from the scheduled
+ * `esg.detectors` job as the SYSTEM actor — advisory-locked and
+ * fingerprinted, and re-armed rather than silenced when a carbon target is
+ * revised. A datapoint the platform cannot evidence is reported as
+ * unavailable with the reason.
  */
 export const esgModule: FastifyPluginAsync = async (app) => {
   const readGate = [app.authenticate, app.requireCompany, app.requireTool("esg", "read")];

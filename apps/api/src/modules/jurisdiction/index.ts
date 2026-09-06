@@ -238,8 +238,22 @@ const AWAITING_STATUSES = ["applied", "in_review"] as const;
  *    assurance breach, not a chase-up email.
  *
  * Local content and ICV obligations (#612-615) close the loop: a target with
- * a jurisdiction, a series of dated readings, and a signal the moment a
- * reading falls below the contractual floor.
+ * a jurisdiction, a series of dated readings that can be DERIVED from the
+ * invoice and worker registers rather than keyed, corrections that supersede
+ * rather than overwrite, and the ICV certificate register the Gulf and
+ * Nigerian regimes actually run on.
+ *
+ * `group.ts` adds the multi-entity half (#600-606): reporting entities with
+ * an IAS 21 functional currency and, where the economy is hyperinflationary,
+ * the IAS 29 price index; and consolidation runs that translate every entity
+ * into one presentation currency, reporting an entity with no rate on file as
+ * UNPRICED with the reason rather than converting it at a guess.
+ *
+ * WHAT THIS MODULE DELIBERATELY DOES NOT DO: raise findings on a read, let a
+ * contractual base-date quote answer "what is the market rate?" (that would
+ * report every FX exposure as zero), or sum money across currencies.
+ * Findings come from the scheduled `jurisdiction.detectors` job as the
+ * SYSTEM actor.
  */
 export const jurisdictionModule: FastifyPluginAsync = async (app) => {
   const readGate = [app.authenticate, app.requireCompany, app.requireTool("jurisdiction", "read")];

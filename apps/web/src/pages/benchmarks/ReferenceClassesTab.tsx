@@ -16,6 +16,7 @@
  *     outcomes — in which case the uplift is a worked example, not advice.
  */
 import { useCallback, useEffect, useState } from "react";
+import { PROCUREMENT_ROUTES, SIZE_BANDS } from "@constructos/shared";
 import { api } from "../../lib/api";
 import {
   Badge,
@@ -71,6 +72,13 @@ interface ForecastResponse {
   assetClass: string;
   region: string;
   currency: string | null;
+  /** the criteria the QUERY applied — never a criterion it did not */
+  sizeBand: string | null;
+  procurementRoute: string | null;
+  requestedSizeBand: string | null;
+  requestedProcurementRoute: string | null;
+  /** criteria that could not be applied (seed rows carry neither) */
+  narrowingDropped: string[];
   contributors: number;
   sampleSize: number;
   p50Uplift: number | null;
@@ -101,6 +109,14 @@ export default function ReferenceClassesTab() {
   const [region, setRegion] = useState("GB");
   const [budget, setBudget] = useState("");
   const [currency, setCurrency] = useState("");
+  /*
+   * Narrowing the class (#833-838). These are applied to the QUERY and then
+   * published with the figure; a criterion the query could not apply is
+   * reported as dropped rather than asserted, which is why the answer shows
+   * what it was actually drawn from rather than echoing the form.
+   */
+  const [sizeBand, setSizeBand] = useState("");
+  const [procurementRoute, setProcurementRoute] = useState("");
   const [forecast, setForecast] = useState<ForecastResponse | null>(null);
   const [forecastError, setForecastError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
@@ -144,6 +160,8 @@ export default function ReferenceClassesTab() {
       const params = new URLSearchParams({ metric, assetClass, region });
       if (budget.trim() !== "") params.set("budget", budget.trim());
       if (currency.trim() !== "") params.set("currency", currency.trim().toUpperCase());
+      if (sizeBand) params.set("sizeBand", sizeBand);
+      if (procurementRoute) params.set("procurementRoute", procurementRoute);
       setForecast(
         await api.get<ForecastResponse>(
           `/api/v1/benchmarks/reference-classes/forecast?${params.toString()}`,
@@ -165,6 +183,8 @@ export default function ReferenceClassesTab() {
       const body: Record<string, unknown> = { metric, assetClass, region };
       if (budget.trim() !== "") body["budget"] = Number(budget.trim());
       if (currency.trim() !== "") body["currency"] = currency.trim().toUpperCase();
+      if (sizeBand) body["sizeBand"] = sizeBand;
+      if (procurementRoute) body["procurementRoute"] = procurementRoute;
       await api.post(`/api/v1/projects/${projectId}/benchmarks/rcf`, body);
       setStoreNote(
         "Stored against the project. The uplift a contingency decision cites can now be produced " +
@@ -236,7 +256,35 @@ export default function ReferenceClassesTab() {
                 placeholder="GBP"
               />
             </Field>
+            <Field label="Size band" hint="Narrows the class, and is published with it">
+              <Select value={sizeBand} onChange={(e) => setSizeBand(e.target.value)}>
+                <option value="">Any size</option>
+                {SIZE_BANDS.map((b) => (
+                  <option key={b} value={b}>
+                    {label(b)}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Procurement route" hint="Narrows the class, and is published with it">
+              <Select
+                value={procurementRoute}
+                onChange={(e) => setProcurementRoute(e.target.value)}
+              >
+                <option value="">Any route</option>
+                {PROCUREMENT_ROUTES.map((r) => (
+                  <option key={r} value={r}>
+                    {label(r)}
+                  </option>
+                ))}
+              </Select>
+            </Field>
           </div>
+          <p className="text-xs text-ink-400">
+            A narrowing is applied to the query and published with the figure. Narrowing a thin
+            class usually suppresses it — which is the honest answer, and the reason the sample
+            size and contributor count sit next to every number below.
+          </p>
 
           <div className="flex flex-wrap gap-2">
             <Button onClick={() => void onForecast()} disabled={running}>
@@ -264,8 +312,19 @@ export default function ReferenceClassesTab() {
                 <span>
                   {label(forecast.assetClass)} · {forecast.region}
                   {forecast.currency ? ` · ${forecast.currency}` : ""}
+                  {forecast.sizeBand ? ` · ${label(forecast.sizeBand)}` : ""}
+                  {forecast.procurementRoute ? ` · ${label(forecast.procurementRoute)}` : ""}
                 </span>
               </div>
+
+              {forecast.narrowingDropped.length > 0 ? (
+                <div className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  The {forecast.narrowingDropped.join(" and ")} you asked for was NOT applied —
+                  illustrative seed samples carry neither, so this figure describes the whole
+                  class. It is not recorded as a membership criterion of anything stored from
+                  here.
+                </div>
+              ) : null}
 
               {forecast.sampleSize === 0 ? (
                 <EmptyState

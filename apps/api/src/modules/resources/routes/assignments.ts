@@ -19,7 +19,14 @@
  */
 import type { FastifyPluginAsync } from "fastify";
 import { and, asc, count, eq, gte, inArray, lte, ne } from "drizzle-orm";
-import { resourceAssignments, resourceTypes, scheduleTasks } from "@constructos/db";
+import {
+  crews,
+  equipment,
+  resourceAssignments,
+  resourceTypes,
+  scheduleTasks,
+  workers,
+} from "@constructos/db";
 import { ACTIVE_ASSIGNMENT_STATUSES } from "@constructos/shared";
 import { newId } from "../../../lib/ids.js";
 import { nextRecordNumber } from "../../../lib/numbering.js";
@@ -51,6 +58,8 @@ import * as S from "../schemas.js";
 const MAX_ASSIGNMENT_DAYS = 1095; // three years
 /** Bookings scanned in one conflict pass. */
 const MAX_CONFLICT_ROWS = 5000;
+/** Records read per register when filling a booking picker. */
+const MAX_SUBJECT_SCAN = 2000;
 
 export const assignmentRoutes: FastifyPluginAsync = async (app) => {
   const gates = resourceGates(app);
@@ -247,6 +256,21 @@ export const assignmentRoutes: FastifyPluginAsync = async (app) => {
         body.hoursPerDay !== undefined ? body.hoursPerDay : assignment.hoursPerDay;
       const workingDays = workingDaysBetween(fromDate, toDate, pattern);
 
+      /* An approval never stands on numbers nobody approved (master plan
+         §6.2). Somebody confirmed a crew for a WINDOW at an ALLOCATION; move
+         either and the confirmation is about a booking that no longer exists,
+         so it is withdrawn and the booking goes back to planned for
+         re-confirmation. The same rule already governs a certificate whose
+         dates change (matrix.ts). Everything else — the task, the location,
+         the shift, a note — leaves the confirmation standing. */
+      const commitmentChanged =
+        fromDate !== assignment.fromDate ||
+        toDate !== assignment.toDate ||
+        allocationPercent !== assignment.allocationPercent ||
+        hoursPerDay !== assignment.hoursPerDay;
+      const wasCommitted = assignment.status === "confirmed" || assignment.status === "in_progress";
+      const confirmationReset = commitmentChanged && wasCommitted;
+
       const set: Record<string, unknown> = {
         updatedAt: nowIso(),
         fromDate,
@@ -258,6 +282,11 @@ export const assignmentRoutes: FastifyPluginAsync = async (app) => {
             ? round2(hoursPerDay * workingDays * (allocationPercent / 100))
             : null,
       };
+      if (confirmationReset) {
+        set["status"] = "planned";
+        set["confirmedBy"] = null;
+        set["confirmedAt"] = null;
+      }
       if (body.resourceTypeId !== undefined) set["resourceTypeId"] = body.resourceTypeId;
       if (body.scheduleTaskId !== undefined) {
         set["scheduleTaskId"] = body.scheduleTaskId;
@@ -279,12 +308,37 @@ export const assignmentRoutes: FastifyPluginAsync = async (app) => {
         changed: Object.keys(body),
         fromDate,
         toDate,
+        allocationPercent,
+        hoursPerDay,
+        ...(confirmationReset
+          ? {
+              confirmationReset: true,
+              statusFrom: assignment.status,
+              statusTo: "planned",
+              previousWindow: { fromDate: assignment.fromDate, toDate: assignment.toDate },
+              previousAllocationPercent: assignment.allocationPercent,
+              previousHoursPerDay: assignment.hoursPerDay,
+              withdrawnConfirmedBy: assignment.confirmedBy,
+              withdrawnConfirmedAt: assignment.confirmedAt,
+            }
+          : {}),
       });
       const updated = await fetchAssignment(app.db, assignmentId, companyId, projectId);
       const conflicts = (
         await conflictsForSubject(companyId, projectId, updated.subjectKind, subjectIdOf(updated))
       ).filter((c) => c.participants.some((p) => p.assignmentId === assignmentId));
-      return { ...updated, conflicts };
+      return {
+        ...updated,
+        conflicts,
+        confirmationReset,
+        confirmationResetReason: confirmationReset
+          ? `${assignment.reference} was ${assignment.status} for ${assignment.fromDate} → ` +
+            `${assignment.toDate} at ${assignment.allocationPercent}%. The window or the ` +
+            "allocation has changed, so the confirmation was withdrawn and the booking is back " +
+            "to planned: an approval must never stand on numbers nobody approved. Confirm it " +
+            "again if the new window is agreed."
+          : null,
+      };
     },
   );
 
@@ -495,6 +549,144 @@ export const assignmentRoutes: FastifyPluginAsync = async (app) => {
             ]
           : [],
     };
+  });
+
+  /**
+   * WHAT CAN BE BOOKED — a lookup, not a register.
+   *
+   * A booking names a crew, a worker or a machine by its id in ITS OWN
+   * register, and this module deliberately keeps no second copy of those
+   * records. That left the create form asking a human to type an internal id
+   * it had no way to discover, which is not a create path anybody can use.
+   * This reads the three registers directly and returns only what a picker
+   * needs — id, reference and a label — so the booking form can offer real
+   * choices while the records stay owned by workforce, timecards and
+   * equipment.
+   */
+  app.get("/projects/:projectId/resources/subjects", { preHandler: gates.read }, async (req) => {
+    const q = S.subjectLookupQuery.parse(req.query);
+    const companyId = companyOf(req);
+    const projectId = projectOf(req);
+    const limit = q.limit ?? 100;
+    const term = q.q?.trim().toLowerCase() ?? "";
+    const kinds: Array<"crew" | "worker" | "equipment"> = q.kind
+      ? [q.kind]
+      : ["crew", "worker", "equipment"];
+
+    const items: Array<{
+      kind: "crew" | "worker" | "equipment";
+      id: string;
+      reference: string;
+      label: string;
+      sublabel: string | null;
+    }> = [];
+    const reasons: string[] = [];
+
+    if (kinds.includes("crew")) {
+      const rows = await app.db
+        .select({
+          id: crews.id,
+          reference: crews.reference,
+          name: crews.name,
+          trade: crews.trade,
+          status: crews.status,
+        })
+        .from(crews)
+        .where(and(eq(crews.companyId, companyId), eq(crews.projectId, projectId)))
+        .orderBy(asc(crews.reference))
+        .limit(MAX_SUBJECT_SCAN);
+      for (const row of rows) {
+        if (row.status === "inactive" || row.status === "disbanded") continue;
+        items.push({
+          kind: "crew",
+          id: row.id,
+          reference: row.reference,
+          label: row.name,
+          sublabel: row.trade,
+        });
+      }
+    }
+
+    if (kinds.includes("worker")) {
+      const rows = await app.db
+        .select({
+          id: workers.id,
+          reference: workers.reference,
+          fullName: workers.fullName,
+          trade: workers.trade,
+          status: workers.status,
+          demobilisedAt: workers.demobilisedAt,
+        })
+        .from(workers)
+        .where(and(eq(workers.companyId, companyId), eq(workers.projectId, projectId)))
+        .orderBy(asc(workers.reference))
+        .limit(MAX_SUBJECT_SCAN);
+      let demobilised = 0;
+      for (const row of rows) {
+        if (row.demobilisedAt !== null || row.status !== "active") {
+          demobilised += 1;
+          continue;
+        }
+        items.push({
+          kind: "worker",
+          id: row.id,
+          reference: row.reference,
+          label: row.fullName,
+          sublabel: row.trade,
+        });
+      }
+      if (demobilised > 0) {
+        reasons.push(
+          `${demobilised} worker(s) on this project's register are demobilised or inactive and are ` +
+            "not offered for booking. Re-enrol them in the workforce register first.",
+        );
+      }
+    }
+
+    if (kinds.includes("equipment")) {
+      /* Company fleet included: plant is booked TO a project, so a machine
+         not yet assigned to one is exactly what somebody is looking for. */
+      const rows = await app.db
+        .select({
+          id: equipment.id,
+          reference: equipment.reference,
+          name: equipment.name,
+          category: equipment.category,
+          projectId: equipment.projectId,
+          status: equipment.status,
+        })
+        .from(equipment)
+        .where(eq(equipment.companyId, companyId))
+        .orderBy(asc(equipment.reference))
+        .limit(MAX_SUBJECT_SCAN);
+      for (const row of rows) {
+        if (row.projectId !== null && row.projectId !== projectId) continue;
+        if (row.status === "disposed" || row.status === "lost_or_stolen") continue;
+        items.push({
+          kind: "equipment",
+          id: row.id,
+          reference: row.reference,
+          label: row.name,
+          sublabel: row.projectId === null ? `${row.category} · company fleet` : row.category,
+        });
+      }
+    }
+
+    const filtered = term
+      ? items.filter(
+          (i) =>
+            i.reference.toLowerCase().includes(term) ||
+            i.label.toLowerCase().includes(term) ||
+            (i.sublabel ?? "").toLowerCase().includes(term),
+        )
+      : items;
+    if (filtered.length > limit) {
+      reasons.push(
+        `${filtered.length} matches; the first ${limit} are listed. Type more of the name or ` +
+          "reference to narrow it.",
+      );
+    }
+    return { items: filtered.slice(0, limit), total: filtered.length, reasons };
   });
 
   app.get("/projects/:projectId/resources/utilisation", { preHandler: gates.read }, async (req) => {

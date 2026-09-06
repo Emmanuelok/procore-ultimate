@@ -87,11 +87,34 @@ const MAX_PROJECTS = 500;
 const severityForShortfall = (percent: number): "critical" | "high" | "medium" =>
   percent >= 50 ? "critical" : percent >= 20 ? "high" : "medium";
 
-async function activeProjects(db: Db, companyId: string) {
+/**
+ * Which projects a sweep visits.
+ *
+ * The scheduler runs every sweep across the whole company; the manual
+ * `POST .../sweeps/run` route runs it over the ONE project whose `resources`
+ * permission the caller was gated on. A project-scoped admin gate must not
+ * fan signals and notifications out across a portfolio the caller may not
+ * even be a member of (master plan §6.3), so the scope is threaded all the
+ * way through — including into the auto-close pass, which would otherwise
+ * close another project's still-live findings simply because this run did not
+ * look at them.
+ */
+export interface SweepScope {
+  projectIds?: string[];
+}
+
+async function activeProjects(db: Db, companyId: string, scope: SweepScope = {}) {
+  if (scope.projectIds && scope.projectIds.length === 0) return [];
   return db
     .select({ id: projects.id, name: projects.name })
     .from(projects)
-    .where(and(eq(projects.companyId, companyId), eq(projects.isTemplate, 0)))
+    .where(
+      and(
+        eq(projects.companyId, companyId),
+        eq(projects.isTemplate, 0),
+        ...(scope.projectIds ? [inArray(projects.id, scope.projectIds)] : []),
+      ),
+    )
     .limit(MAX_PROJECTS);
 }
 
@@ -119,6 +142,7 @@ export async function sweepPlanCoverage(
   db: Db,
   companyId: string,
   now: Date,
+  scope: SweepScope = {},
 ): Promise<CoverageResult> {
   const result: CoverageResult = {
     projects: 0,
@@ -132,7 +156,7 @@ export async function sweepPlanCoverage(
   const liveOverAllocation = new Set<string>();
   const liveUnresourced = new Set<string>();
 
-  for (const project of await activeProjects(db, companyId)) {
+  for (const project of await activeProjects(db, companyId, scope)) {
     const planRows = await db
       .select()
       .from(resourcePlans)
@@ -360,6 +384,7 @@ export async function sweepPlanCoverage(
     "resource_over_allocation",
     liveOverAllocation,
     now,
+    scope,
   );
   result.signalsClosed += await closeSignalsNotIn(
     db,
@@ -367,6 +392,7 @@ export async function sweepPlanCoverage(
     "resource_unresourced_work",
     liveUnresourced,
     now,
+    scope,
   );
   return result;
 }
@@ -390,6 +416,7 @@ export async function sweepAssignmentConflicts(
   db: Db,
   companyId: string,
   now: Date,
+  scope: SweepScope = {},
 ): Promise<ConflictSweepResult> {
   const result: ConflictSweepResult = {
     projects: 0,
@@ -401,7 +428,7 @@ export async function sweepAssignmentConflicts(
   const horizon = addDays(today, 180);
   const live = new Set<string>();
 
-  for (const project of await activeProjects(db, companyId)) {
+  for (const project of await activeProjects(db, companyId, scope)) {
     const rows = await db
       .select()
       .from(resourceAssignments)
@@ -489,6 +516,7 @@ export async function sweepAssignmentConflicts(
     "resource_assignment_conflict",
     live,
     now,
+    scope,
   );
   return result;
 }
@@ -514,6 +542,7 @@ export async function sweepCertificationExpiry(
   db: Db,
   companyId: string,
   now: Date,
+  scope: SweepScope = {},
 ): Promise<CertificationSweepResult> {
   const result: CertificationSweepResult = {
     projects: 0,
@@ -525,7 +554,7 @@ export async function sweepCertificationExpiry(
   const today = todayIso(now);
   const horizon = addDays(today, CERT_WARN_DAYS);
 
-  for (const project of await activeProjects(db, companyId)) {
+  for (const project of await activeProjects(db, companyId, scope)) {
     const rows = await db
       .select({
         cell: workerSkills,
@@ -655,6 +684,7 @@ export async function sweepProductivity(
   db: Db,
   companyId: string,
   now: Date,
+  scope: SweepScope = {},
 ): Promise<ProductivitySweepResult> {
   const result: ProductivitySweepResult = {
     projects: 0,
@@ -665,7 +695,7 @@ export async function sweepProductivity(
   const today = todayIso(now);
   const from = addDays(today, -182);
 
-  for (const project of await activeProjects(db, companyId)) {
+  for (const project of await activeProjects(db, companyId, scope)) {
     const lastRows = await db
       .select({ createdAt: resourceProductivitySnapshots.createdAt })
       .from(resourceProductivitySnapshots)
@@ -776,7 +806,9 @@ async function closeSignalsNotIn(
   detector: string,
   live: Set<string>,
   now: Date,
+  scope: SweepScope = {},
 ): Promise<number> {
+  if (scope.projectIds && scope.projectIds.length === 0) return 0;
   const open = await db
     .select({ id: signals.id, fingerprint: signals.fingerprint })
     .from(signals)
@@ -785,6 +817,10 @@ async function closeSignalsNotIn(
         eq(signals.companyId, companyId),
         eq(signals.detector, detector),
         inArray(signals.disposition, ["new", "under_review", "confirmed", "escalated"]),
+        /* A run scoped to one project may only close THAT project's findings.
+           The others were never looked at, and "not seen this run" is not the
+           same as "resolved". */
+        ...(scope.projectIds ? [inArray(signals.projectId, scope.projectIds)] : []),
       ),
     )
     .limit(2000);
@@ -794,12 +830,17 @@ async function closeSignalsNotIn(
   return closeSignals(db, companyId, detector, stale, now);
 }
 
-export async function runResourceSweeps(db: Db, companyId: string, now: Date) {
+export async function runResourceSweeps(
+  db: Db,
+  companyId: string,
+  now: Date,
+  scope: SweepScope = {},
+) {
   return {
-    coverage: await sweepPlanCoverage(db, companyId, now),
-    conflicts: await sweepAssignmentConflicts(db, companyId, now),
-    certifications: await sweepCertificationExpiry(db, companyId, now),
-    productivity: await sweepProductivity(db, companyId, now),
+    coverage: await sweepPlanCoverage(db, companyId, now, scope),
+    conflicts: await sweepAssignmentConflicts(db, companyId, now, scope),
+    certifications: await sweepCertificationExpiry(db, companyId, now, scope),
+    productivity: await sweepProductivity(db, companyId, now, scope),
   };
 }
 

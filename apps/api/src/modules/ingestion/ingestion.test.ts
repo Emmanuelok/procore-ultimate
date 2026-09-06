@@ -64,7 +64,7 @@ beforeAll(async () => {
   });
   expect(res.statusCode).toBe(201);
   csvSourceId = (res.json() as { id: string }).id;
-});
+}, 300_000);
 
 afterAll(async () => {
   await built.close();

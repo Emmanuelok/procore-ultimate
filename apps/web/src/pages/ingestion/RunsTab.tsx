@@ -28,6 +28,7 @@ import { formatDateTime, humanize } from "../format";
 import {
   Caveat,
   CountStat,
+  DiffCell,
   Drawer,
   PayloadCell,
   RECORD_STATUS_LABELS,

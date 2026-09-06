@@ -240,11 +240,25 @@ describe("retention and legal hold", () => {
       headers: owner.headers,
     });
     expect(res.statusCode).toBe(200);
-    const items = res.json().items as Array<{ objectType: string; enforced: boolean; note: string }>;
-    expect(items.find((i) => i.objectType === "project")!.enforced).toBe(true);
+    const items = res.json().items as Array<{
+      objectType: string;
+      counted: boolean;
+      executed: boolean;
+      dueForAction: number | null;
+      note: string;
+    }>;
+    // `counted` is what the flag now says: the substrate can count what the
+    // policy WOULD act on. It never claimed to enforce it, and no longer says
+    // it does.
+    const project = items.find((i) => i.objectType === "project")!;
+    expect(project.counted).toBe(true);
+    expect(project.executed).toBe(false);
+    expect(typeof project.dueForAction).toBe("number");
     const documents = items.find((i) => i.objectType === "document")!;
-    expect(documents.enforced).toBe(false);
-    expect(documents.note).toContain("does not delete records it does not own");
+    expect(documents.counted).toBe(false);
+    // Not countable is null, never 0.
+    expect(documents.dueForAction).toBeNull();
+    expect(documents.note).toContain("cannot count or act on records it does not own");
   });
 
   it("blocks and then permits a delete around a hold's lifecycle", async () => {

@@ -133,6 +133,12 @@ export interface BoqImportResult {
   createdIds: string[];
   skipped: BoqImportSkip[];
   totalTco2e: number;
+  /** "append" skips already-imported items; "replace" re-imports the bill */
+  mode?: "append" | "replace";
+  /** entries removed by a replace run */
+  replaced?: number;
+  /** bill items skipped because they already carry an entry in this project */
+  alreadyImported?: number;
 }
 
 export interface SeedResult {

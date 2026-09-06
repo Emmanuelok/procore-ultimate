@@ -687,13 +687,14 @@ describe("project affected persons", () => {
     expect(rap.vulnerableHouseholds).toBe(2);
     expect(rap.byVulnerability.elderly).toBe(2);
     expect(rap.byVulnerability.landless).toBe(1);
-    // 3 parcels compensated at 1200 + 1 valued at 1000; households committed 2000
+    // 3 parcels compensated at 1200 + 1 valued at 1000; two households
+    // determined and paid — 2,000 (economic) and 5,000 (physical + economic)
     expect(rap.compensation.parcels.committed).toBe(4600);
     expect(rap.compensation.parcels.paid).toBe(3600);
-    expect(rap.compensation.paps.committed).toBe(2000);
-    expect(rap.compensation.paps.paid).toBe(2000);
-    expect(rap.compensationCommitted).toBe(6600);
-    expect(rap.compensationPaid).toBe(5600);
+    expect(rap.compensation.paps.committed).toBe(7000);
+    expect(rap.compensation.paps.paid).toBe(7000);
+    expect(rap.compensationCommitted).toBe(11600);
+    expect(rap.compensationPaid).toBe(10600);
     expect(rap.compensationOutstanding).toBe(1000);
     expect(rap.livelihoodRequired).toBe(2);
     expect(rap.livelihoodRestored).toBe(1);
@@ -989,7 +990,10 @@ describe("grievance redress mechanism", () => {
       url: `/api/v1/projects/${pid}/grievances?overdue=true`,
       headers: owner.headers,
     });
-    expect(overdueOnly.json().total).toBe(1); // the medium one is still open
+    expect(overdueOnly.statusCode).toBe(200);
+    // the medium one is still open — escalated by the detector, but escalation
+    // is not settlement, so it is still an overdue case
+    expect(overdueOnly.json().total).toBe(1);
   });
 
   it("reports GRM analytics including medians, anonymous share and satisfaction", async () => {
