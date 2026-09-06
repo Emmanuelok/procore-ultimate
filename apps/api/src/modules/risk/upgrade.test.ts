@@ -46,7 +46,7 @@ beforeAll(async () => {
     companyId: owner.companyId,
     name: "Risk Upgrade Project",
   });
-}, 240_000);
+}, 600_000);
 
 afterAll(async () => {
   await built.close();

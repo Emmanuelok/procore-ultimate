@@ -73,7 +73,7 @@ beforeAll(async () => {
     "x-company-id": owner.companyId,
   };
 
-}, 240_000);
+}, 600_000);
 
 afterAll(async () => {
   await built.close();

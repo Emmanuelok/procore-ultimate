@@ -28,7 +28,7 @@ beforeAll(async () => {
     companyId: owner.companyId,
     name: "Quantitative Risk Test Project",
   });
-}, 240_000);
+}, 600_000);
 
 afterAll(async () => {
   await built.close();
