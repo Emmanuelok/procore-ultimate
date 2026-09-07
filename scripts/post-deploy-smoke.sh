@@ -62,14 +62,14 @@ printf '%s' "$HDRS" | grep -qi '^strict-transport-security:' && ok "HSTS header 
 # --- 3. auth ----------------------------------------------------------------
 EMAIL="smoke-$(date +%s)@example.com"
 REG="$(curl -sf -X POST "$BASE/api/v1/auth/register" -H 'content-type: application/json' \
-  -d "{\"email\":\"$EMAIL\",\"password\":\"smoke-Passw0rd!\",\"name\":\"Smoke Test\",\"companyName\":\"Smoke Co\"}" || true)"
+  -d "{\"email\":\"$EMAIL\",\"password\":\"Gantry-Lintel-Crane-7!\",\"name\":\"Smoke Test\",\"companyName\":\"Smoke Co\"}" || true)"
 TOKEN="$(printf '%s' "$REG" | jget accessToken)"
 COMPANY="$(printf '%s' "$REG" | jget company.id)"
 [ -n "$TOKEN" ] && [ -n "$COMPANY" ] && ok "registration issues tokens + company" || bad "registration failed: $REG"
 AUTH=(-H "authorization: Bearer $TOKEN" -H "x-company-id: $COMPANY")
 
 LOGIN_CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/auth/login" \
-  -H 'content-type: application/json' -d "{\"email\":\"$EMAIL\",\"password\":\"smoke-Passw0rd!\"}")"
+  -H 'content-type: application/json' -d "{\"email\":\"$EMAIL\",\"password\":\"Gantry-Lintel-Crane-7!\"}")"
 [ "$LOGIN_CODE" = 200 ] && ok "login works" || bad "login returned $LOGIN_CODE"
 
 # --- 4. project -------------------------------------------------------------

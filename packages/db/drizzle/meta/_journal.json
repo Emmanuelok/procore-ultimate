@@ -85,6 +85,13 @@
       "when": 1788787093923,
       "tag": "0011_platform_upgrade",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1788791391989,
+      "tag": "0012_currency_backfill",
+      "breakpoints": true
     }
   ]
 }

@@ -462,6 +462,22 @@ environment variable, the platform default is "keep", and only an owner can chan
   `success`, then checks out `workflow_run.head_sha` — the exact commit CI tested, not
   whatever the branch tip has become since. A manual `workflow_dispatch` is an operator's
   deliberate act and is not gated.
+- **Railway's own GitHub integration is NOT gated by any of that until you tell it to
+  be.** The integration builds every push to the tracked branch the moment it lands,
+  independently of GitHub Actions. That is how two unverified merges reached the build
+  queue (§4.11). Enable **Wait for CI** on the service (§4.11, Control 1) so the
+  integration waits for the `CI` workflow on that commit and never builds a red one.
+- **Applied migrations are immutable.** `0011_platform_upgrade` was regenerated from
+  scratch while unreleased (`scripts/regen-migration.sh`); it ships with the first deploy
+  after this text and is frozen by `packages/db/drizzle/.frozen`, which makes that script
+  refuse. Every schema change from here on is appended
+  (`pnpm --filter @constructos/db generate --name <what_changed>`): a rewritten,
+  already-applied migration gets a new journal timestamp, the boot-time migrator treats
+  it as new, and the deploy dies re-creating tables that exist. CI's schema-drift step
+  fails any commit whose schema edit has no migration. `0012_currency_backfill` is
+  data-only: 0011 stamps every pre-existing valuation, variation and payment certificate
+  `USD`; 0012 restores each row's currency from its contract, BoQ or project in the same
+  boot, before any request can read the wrong value.
 - **Migrations are forward-only and run at boot** (`lib/db.ts`). Write additive
   migrations: rolling back the *app image* does not roll back the *schema*, so an old
   image must tolerate the new schema. This repo's drizzle migrations are committed under
@@ -493,6 +509,7 @@ environment variable, the platform default is "keep", and only an owner can chan
 | Everyone hits 429 at once | `TRUST_PROXY` not `true` → all traffic keyed on the proxy's IP for rate limiting | Keep the image default `TRUST_PROXY=true`; don't override it |
 | Upload fails `EACCES` (volume mode only) | Railway mounts volumes as root; image runs as `USER node` | Set `RAILWAY_RUN_UID=0` on the service (§1.1) |
 | AI routes return `503 AiDisabled` | No `ANTHROPIC_API_KEY` | Intentional degradation; set the key to enable |
+| Deployment **Failed** at `RUN pnpm build` with TypeScript errors in the deploy log; the previous deployment stays **Active** | A commit CI had not passed reached the tracked branch — a merge of a branch carrying "WIP checkpoint" commits, built by Railway's integration the moment it was pushed | Nothing is down. Fix the errors on the branch (CI shows them), push, and enable **Wait for CI** (§4.11) so the next such commit is stopped on GitHub instead of on Railway |
 | SSO sign-in fails ~half the time with "this sign-in link is not valid any more" | More than one replica **and** `DATABASE_URL` unset, so the authorization-code state lives in one process's memory and the callback lands on another | Set `DATABASE_URL`. With a shared Postgres the SSO flow/ticket store is a table (`sso_flows`, `sso_tickets`) and any replica can complete any sign-in. |
 | Everyone in a company is refused with "your organisation only permits sign-in from approved networks" | An IP allowlist was set to `enforce` with the wrong ranges, or `TRUST_PROXY` is off so every request appears to come from the proxy | An owner on the break-glass list can still sign in and fix it (`ipAllowlistBreakGlassUserIds`). Otherwise set `ipAllowlistMode` back to `off` in `company_security_policies`. Introduce allowlists in `monitor` mode first. |
 | A SIEM stops receiving security webhooks and nothing is logged | 20 consecutive delivery failures disabled the endpoint | The row carries `disabledReason`. Fix the destination, then re-enable it — re-enabling clears the failure count. |
@@ -617,6 +634,52 @@ challenge minted a minute earlier is authority issued on the strength of the fac
 removed. Spent and expired rows are deleted by the `mfa.challenge-sweep` job an hour after
 expiry; the grace exists so a replay of a just-expired token is still answered with
 "already used" rather than silently treated as a first use.
+
+### 4.11 Deploy gating — the incident, twice, and the two controls only the dashboard can add
+
+**What happened.** On 2 September a pull request merged `main` into the branch Railway
+tracks. `main` was, byte for byte, another working branch at a commit whose own message
+was *"WIP checkpoint"*. Railway's GitHub integration built the merge the moment it was
+pushed and `RUN pnpm build` failed on TypeScript errors. Nothing was down — the previous
+deployment stayed **Active** — but the dashboard showed a failed deploy, and had the tree
+compiled it would have shipped with 39 failing tests, several of them regressions of
+controls (a CSV import stranded in `committing` after a refused commit, a benchmark
+outlier signal that no longer fired, a lapsed time bar that stayed `open`). On 7 September,
+while the repair was being gated locally, the same thing happened again: the upstream
+wave (PR #5, whose own description said *"do not merge yet"*) was merged into `main` and
+`main` into the tracked branch (PR #6), and Railway built that immediately too.
+
+**Root cause, stated plainly:** the deploy was conditioned on a push, not on
+verification. CI existed and ran; nothing consumed its result before the build started.
+The healthcheck-gated cutover and forward-only migrations kept production up — but they
+only check that a build *boots*, never that it is *correct*.
+
+**What the repository can do is done.** `ci.yml` runs `verify` (build, typecheck,
+schema drift, tests, detector eval) and `image` (this Dockerfile, booted against a real
+Postgres until readiness answers) on every push and pull request, and
+`deploy-railway.yml` — the CLI path, inert until a `RAILWAY_TOKEN` secret exists — only
+runs on a successful CI conclusion for the tested commit. None of that reaches the
+integration that actually deployed both failures. Two settings do, and both live outside
+the repo:
+
+**Control 1 — make Railway's integration wait for CI (one toggle).** Service →
+**Settings** → **Deploy** → **Wait for CI** (as of writing; Railway's label) → enable. From
+then on a push to the tracked branch is *queued* until the commit's GitHub check suite
+succeeds and is never built if it fails. The checks it waits for are the `CI` workflow's
+jobs — nothing more to configure on the GitHub side. Confirm it took: the next
+deployment's card reads "Waiting for CI" before "Building".
+
+**Control 2 — branch protection (once).** Repo → **Settings** → **Branches** → add a rule
+for the tracked branch and for `main`: *Require a pull request before merging*, *Require
+status checks to pass before merging* → select **`Build, typecheck and test`** and
+**`Container smoke boot`**, and *Require branches to be up to date before merging*. This
+closes the path both incidents took — a merge made in the GitHub UI cannot complete
+until the merge result itself is green.
+
+**Working rule that follows:** never merge a branch carrying *WIP*, *checkpoint* or
+otherwise unverified commits into a tracked branch, from any tool or session. Open a pull
+request into it and let the checks decide. The two controls make that the only path that
+works.
 
 ---
 

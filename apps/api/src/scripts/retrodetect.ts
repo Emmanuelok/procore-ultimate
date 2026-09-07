@@ -590,9 +590,17 @@ async function plantColludingVendors(): Promise<void> {
 
 async function plantMissedTimeBar(): Promise<void> {
   // FIDIC 20.2 carries a 28-day notice time bar. An event dated 90 days ago
-  // with no notice served is 62 days past its deadline; the lazy time-bar
-  // sweep (triggered by the events list read in the run phase) raises the
-  // signal. The API accepts past event dates, so no DB work is needed.
+  // with no notice served is 62 days past its deadline; the time-bar sweep
+  // raises the signal. The API accepts past event dates, so no DB work is
+  // needed.
+  //
+  // TRIGGER CONTRACT: the sweep has two triggers — the hourly scheduler job
+  // (contracts.time-bars) and the register's ordinary read paths, which run
+  // the same atomic sweep for the contract being read. This harness, like
+  // every test, boots with NODE_ENV=test, where the scheduler is disabled, so
+  // the events list read in the run phase is the trigger this scheme relies
+  // on. Taking the sweep off the read path blanks this scheme (it did: 23/24)
+  // without failing any unit test that calls scheduler.runNow() directly.
   await post(
     ctx.ownerA,
     `/projects/${ctx.plantedProjectId}/contracts/${ctx.plantedContractId}/events`,
@@ -1237,21 +1245,39 @@ async function seedCleanControl(): Promise<void> {
 /* Setup: personas + projects, all via the API                         */
 /* ------------------------------------------------------------------ */
 
-/** Invite a user into owner A's company via the API and log them in. */
+/** A policy-compliant password for harness personas; never contains an email local-part. */
+const HARNESS_INVITEE_PASSWORD = "retrodetect-gantry-lintel-2026";
+
+/**
+ * Invite a user into owner A's company via the API and sign them in.
+ *
+ * An invitation hands the inviter no credential: the invitee sets their own
+ * password through the single-use link. The harness runs with no email
+ * transport, so the API returns that link for hand delivery — and the
+ * harness, standing in for the invitee, follows it. Nothing here is a
+ * shortcut around the real flow.
+ */
 async function inviteAndLogin(name: string, email: string): Promise<Actor> {
   const invited = (await post(ctx.ownerA, "/company/users/invite", {
     email,
     name,
     role: "member",
-  })) as unknown as { user: { id: string }; tempPassword: string };
-  const login = (await api({ userId: "", headers: {} }, "POST", "/auth/login", {
-    email,
-    password: invited.tempPassword,
-  })) as unknown as { accessToken: string };
+  })) as unknown as { acceptUrl: string | null };
+  if (!invited.acceptUrl) {
+    throw new Error(
+      `invite for ${email} returned no acceptUrl; the harness needs the link to accept as the invitee`,
+    );
+  }
+  const token = new URL(invited.acceptUrl).searchParams.get("token") ?? "";
+  const accepted = (await api({ userId: "", headers: {} }, "POST", "/auth/invitations/accept", {
+    token,
+    password: HARNESS_INVITEE_PASSWORD,
+    name,
+  })) as unknown as { user: { id: string }; accessToken: string };
   return {
-    userId: invited.user.id,
+    userId: accepted.user.id,
     headers: {
-      authorization: `Bearer ${login.accessToken}`,
+      authorization: `Bearer ${accepted.accessToken}`,
       "x-company-id": ctx.companyId,
     },
   };

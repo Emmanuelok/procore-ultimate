@@ -1,0 +1,9 @@
+0011_platform_upgrade has been applied to a database that matters (the Railway
+production service, first boot of the deploy that added this file). From here
+on it is immutable: scripts/regen-migration.sh refuses to regenerate it, and
+every schema change is appended as 0012+ with
+
+    pnpm --filter @constructos/db generate --name <what_changed>
+
+A regenerated 0011 gets a new journal timestamp, the migrator at boot treats
+it as unapplied, and the deploy dies re-creating tables that already exist.
