@@ -248,6 +248,9 @@ interface ExperienceReport {
   byPolicyType: ExperienceByType[];
   currencyMismatches: { premiumId: string; policyId: string }[];
   note: string | null;
+  /** the bounded window the figures cover — never "everything ever recorded" */
+  window: { from: string; to: string; years: number };
+  windowNote: string;
   inputs: { premiumRows: number; claimRows: number };
 }
 
@@ -1384,17 +1387,22 @@ function RenewalForm({
 
 /* ============================== Experience ================================ */
 
+const EXPERIENCE_WINDOWS = [3, 5, 6, 10] as const;
+
 function ExperiencePanel({ projectId }: { projectId: string }) {
   const [data, setData] = useState<ExperienceReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [windowYears, setWindowYears] = useState<number>(6);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       setData(
-        await api.get<ExperienceReport>(`/api/v1/projects/${projectId}/insurance/experience`),
+        await api.get<ExperienceReport>(
+          `/api/v1/projects/${projectId}/insurance/experience?windowYears=${windowYears}`,
+        ),
       );
     } catch (err) {
       setData(null);
@@ -1402,7 +1410,7 @@ function ExperiencePanel({ projectId }: { projectId: string }) {
     } finally {
       setLoading(false);
     }
-  }, [projectId]);
+  }, [projectId, windowYears]);
 
   useEffect(() => {
     void load();
@@ -1414,12 +1422,30 @@ function ExperiencePanel({ projectId }: { projectId: string }) {
 
   return (
     <div className="space-y-4">
-      <p className="max-w-3xl text-sm leading-relaxed text-ink-500">
-        Claims incurred over premium earned is the number that decides next year's renewal. It is
-        computed per currency and never across, from {fmtNum(data.inputs.premiumRows)} premium
-        movement{data.inputs.premiumRows === 1 ? "" : "s"} and {fmtNum(data.inputs.claimRows)} claim
-        {data.inputs.claimRows === 1 ? "" : "s"}.
-      </p>
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <p className="max-w-3xl text-sm leading-relaxed text-ink-500">
+          Claims incurred over premium earned is the number that decides next year's renewal. It is
+          computed per currency and never across, from {fmtNum(data.inputs.premiumRows)} premium
+          movement{data.inputs.premiumRows === 1 ? "" : "s"} and {fmtNum(data.inputs.claimRows)}{" "}
+          claim{data.inputs.claimRows === 1 ? "" : "s"}.
+        </p>
+        <label className="block">
+          <span className="mb-1 block text-xs font-medium text-ink-600">Window</span>
+          <Select
+            value={String(windowYears)}
+            onChange={(e) => setWindowYears(Number(e.target.value))}
+            className="w-40"
+          >
+            {EXPERIENCE_WINDOWS.map((y) => (
+              <option key={y} value={y}>
+                Last {y} years
+              </option>
+            ))}
+          </Select>
+        </label>
+      </div>
+
+      <p className="max-w-3xl text-xs leading-relaxed text-ink-400">{data.windowNote}</p>
 
       {data.byCurrency.length === 0 ? (
         <EmptyState

@@ -173,6 +173,58 @@ export interface BondExposure {
   unparsableSteps: number;
 }
 
+/**
+ * The bonding line a bond draws on (#796).
+ *
+ * `utilisation` is derived server-side from the live bonds against the line,
+ * so the headroom shown beside a bond is the same figure the facilities
+ * register shows — there is no second arithmetic here to drift from it.
+ */
+export interface BondFacilityUtilisation {
+  facilityId: string;
+  currency: string;
+  limitAmount: number;
+  drawnAmount: number;
+  headroom: number | null;
+  utilisationPct: number | null;
+  bondCount: number;
+  excludedForeignCurrency: { bondId: string; currency: string; amount: number }[];
+  outsidePermittedTypes: string[];
+  inForce: boolean | null;
+  daysToReview: number | null;
+  reasons: string[];
+}
+
+/** What the list route attaches to each bond: the line's identity, not its maths. */
+export interface BondFacilityLite {
+  id: string;
+  number: string;
+  name: string;
+  provider: string;
+  currency: string;
+  limitAmount: number;
+  status: string;
+}
+
+/** What the detail route attaches: identity plus the live line state. */
+export interface BondFacilitySummary extends BondFacilityLite {
+  utilisation: BondFacilityUtilisation;
+}
+
+/** A pickable line, from GET /insurance/facilities. */
+export interface FacilityOption {
+  id: string;
+  number: string;
+  name: string;
+  provider: string;
+  currency: string;
+  limitAmount: number;
+  status: string;
+  projectId: string | null;
+  permittedBondTypes: string[];
+  utilisation: BondFacilityUtilisation;
+}
+
 export interface BondRow {
   id: string;
   companyId: string;
@@ -196,6 +248,8 @@ export interface BondRow {
   status: string;
   documentId: string | null;
   releasedAt: string | null;
+  /** the line this bond draws on, when it draws on one */
+  facilityId: string | null;
   createdBy: string;
   createdAt: string;
   updatedAt: string;
@@ -204,6 +258,7 @@ export interface BondRow {
   daysToDemandDeadline: number | null;
   daysToExpiry: number | null;
   demandStillPossible: boolean | null;
+  facility?: BondFacilityLite | null;
 }
 
 export interface BondCallRow {
@@ -223,6 +278,8 @@ export interface BondCallRow {
 
 export interface BondDetail extends BondRow {
   calls: BondCallRow[];
+  facility?: BondFacilitySummary | null;
+  facilityWarnings?: string[];
 }
 
 export interface BondCallResult {

@@ -221,11 +221,27 @@ export function MinutesDocumentPanel({
     if (typeof html === "string") setPreview(html);
   }
 
-  async function acknowledge(deliveryId: string) {
+  /*
+   * Two different acts, one route.
+   *
+   * A PLATFORM recipient confirms their own copy — no note, nothing to
+   * explain. An EXTERNAL recipient (userId null) has no login, so what is
+   * being recorded is that somebody HERE received their confirmation; the API
+   * requires standard access and a note saying how it arrived, because that
+   * acknowledgement is what anchors the deemed-acceptance clock.
+   */
+  const [ackNotes, setAckNotes] = useState<Record<string, string>>({});
+  const [ackOpen, setAckOpen] = useState<string | null>(null);
+
+  async function acknowledge(deliveryId: string, note?: string) {
     const done = await run(`ack:${deliveryId}`, () =>
-      api.post(`${base}/deliveries/${deliveryId}/acknowledge`, {}),
+      api.post(`${base}/deliveries/${deliveryId}/acknowledge`, note ? { note } : {}),
     );
-    if (done !== null) onMutated();
+    if (done !== null) {
+      setAckOpen(null);
+      setAckNotes((n) => ({ ...n, [deliveryId]: "" }));
+      onMutated();
+    }
   }
 
   return (
@@ -349,9 +365,52 @@ export function MinutesDocumentPanel({
                         </div>
                       ) : null}
                     </Td>
-                    <Td className="text-meta">{d.deliveredAt ? dateTime(d.deliveredAt) : "—"}</Td>
+                    <Td className="text-meta">
+                      {d.deliveredAt ? dateTime(d.deliveredAt) : "—"}
+                      {d.acknowledgedById ? (
+                        <div className="text-2xs text-content-subtle">
+                          logged on their behalf
+                          {d.acknowledgementNote ? `: ${d.acknowledgementNote}` : ""}
+                        </div>
+                      ) : null}
+                    </Td>
                     <Td>
-                      {d.status !== "acknowledged" ? (
+                      {d.status === "acknowledged" ? null : d.userId === null ? (
+                        ackOpen === d.id ? (
+                          <div className="w-64 space-y-1">
+                            <Textarea
+                              rows={2}
+                              value={ackNotes[d.id] ?? ""}
+                              placeholder="How did their confirmation reach you? (reply email, call, signed return)"
+                              onChange={(e) =>
+                                setAckNotes((n) => ({ ...n, [d.id]: e.target.value }))
+                              }
+                            />
+                            <div className="flex gap-1">
+                              <Button
+                                size="xs"
+                                disabled={busy !== null || !(ackNotes[d.id] ?? "").trim()}
+                                loading={busy === `ack:${d.id}`}
+                                onClick={() => void acknowledge(d.id, (ackNotes[d.id] ?? "").trim())}
+                              >
+                                Log it
+                              </Button>
+                              <Button size="xs" variant="ghost" onClick={() => setAckOpen(null)}>
+                                Cancel
+                              </Button>
+                            </div>
+                          </div>
+                        ) : (
+                          <Button
+                            size="xs"
+                            variant="ghost"
+                            disabled={busy !== null}
+                            onClick={() => setAckOpen(d.id)}
+                          >
+                            Log their confirmation
+                          </Button>
+                        )
+                      ) : (
                         <Button
                           size="xs"
                           variant="ghost"
@@ -361,7 +420,7 @@ export function MinutesDocumentPanel({
                         >
                           Acknowledge
                         </Button>
-                      ) : null}
+                      )}
                     </Td>
                   </tr>
                 ))}
@@ -369,7 +428,9 @@ export function MinutesDocumentPanel({
             </Table>
             <p className="text-2xs text-content-subtle">
               Only the recipient may acknowledge their own copy — an acknowledgement somebody else
-              pressed is not evidence of anything.
+              pressed is not evidence of anything. A recipient who is not a platform user cannot
+              press anything, so their confirmation is LOGGED instead: that needs standard access
+              and a note saying how it reached you, and the record names who logged it.
             </p>
           </div>
         ) : meeting.minutesIssuedAt ? (

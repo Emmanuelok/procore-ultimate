@@ -1381,6 +1381,228 @@ describe("bonding line facilities (#796)", () => {
   });
 });
 
+/*
+ * THE JOIN THAT MAKES HEADROOM REAL (#796).
+ *
+ * The facility engine, the column, the index and the panel all existed, but
+ * no route ever WROTE `bonds.facilityId`, so `facilityUtilisation` always
+ * reported the whole limit as available and the one question a facility
+ * exists to answer had no answer any user could produce. These tests drive
+ * the whole drawdown through the API — never by inserting a row — because
+ * that is exactly the gap the unit tests could not see.
+ */
+describe("bonds draw on a bonding line through the API (#796)", () => {
+  let lineProject: string;
+  let otherLineProject: string;
+  let facId: string;
+  let bondId: string;
+
+  const bondPayload = (over: Record<string, unknown> = {}) => ({
+    bondType: "performance",
+    guarantor: "Surety Co",
+    amount: 250_000,
+    currency: "GBP",
+    issuedAt: daysFromToday(-1),
+    expiryAt: daysFromToday(300),
+    demandDeadline: daysFromToday(280),
+    ...over,
+  });
+
+  it("records a bond against a line, and a draft bond consumes none of it", async () => {
+    lineProject = await makeProject("Bonding line — drawdown");
+    otherLineProject = await makeProject("Bonding line — ring fence");
+    const fac = await post("/insurance/facilities", {
+      name: "Performance line",
+      provider: "Surety Co",
+      limitAmount: 1_000_000,
+      currency: "GBP",
+      permittedBondTypes: ["performance"],
+    });
+    expect(fac.statusCode).toBe(201);
+    facId = fac.json().id as string;
+    expect((await post(`/insurance/facilities/${facId}/status`, { status: "active" })).statusCode)
+      .toBe(200);
+
+    const res = await post(`/projects/${lineProject}/insurance/bonds`, bondPayload({ facilityId: facId }));
+    expect(res.statusCode).toBe(201);
+    bondId = res.json().id as string;
+    expect(res.json().facilityId).toBe(facId);
+    expect(res.json().facility.number).toBe(fac.json().number);
+    expect(res.json().facilityWarnings).toEqual([]);
+
+    /* draft is not drawn: the line is untouched until the bond is issued */
+    const line = await get(`/insurance/facilities/${facId}`);
+    expect(line.json().utilisation.drawnAmount).toBe(0);
+    expect(line.json().utilisation.headroom).toBe(1_000_000);
+    expect(line.json().bonds).toHaveLength(1);
+  });
+
+  it("consumes line on issue, reports it everywhere, and ledgers the headroom", async () => {
+    const issued = await post(`/projects/${lineProject}/insurance/bonds/${bondId}/status`, {
+      status: "issued",
+    });
+    expect(issued.statusCode).toBe(200);
+    expect(issued.json().facility.utilisation.drawnAmount).toBe(250_000);
+    expect(issued.json().facility.utilisation.headroom).toBe(750_000);
+
+    const line = await get(`/insurance/facilities/${facId}`);
+    expect(line.json().utilisation.drawnAmount).toBe(250_000);
+    expect(line.json().utilisation.headroom).toBe(750_000);
+    expect(line.json().utilisation.utilisationPct).toBe(25);
+
+    const list = await get("/insurance/facilities?pageSize=100");
+    const gbp = (list.json().headroomByCurrency as { currency: string; drawn: number }[]).find(
+      (h) => h.currency === "GBP",
+    );
+    expect(gbp!.drawn).toBeGreaterThanOrEqual(250_000);
+
+    /* the bond register names the line beside every bond */
+    const bondList = await get(`/projects/${lineProject}/insurance/bonds`);
+    expect(bondList.json().items[0].facility.number).toBe(line.json().number);
+
+    const ledger = await get(`/ledger?objectType=bond&pageSize=100`);
+    const entry = (ledger.json().items as Array<Record<string, unknown>>).find(
+      (e) => e["objectId"] === bondId && (e["payload"] as Record<string, unknown>)?.["headroom"] !== undefined,
+    );
+    expect(entry).toBeDefined();
+    expect((entry!["payload"] as Record<string, unknown>)["headroom"]).toBe(750_000);
+  });
+
+  it("refuses a drawdown that would over-draw the line, and prints the arithmetic", async () => {
+    const big = await post(
+      `/projects/${lineProject}/insurance/bonds`,
+      bondPayload({ facilityId: facId, amount: 800_000 }),
+    );
+    expect(big.statusCode).toBe(201);
+    const res = await post(
+      `/projects/${lineProject}/insurance/bonds/${big.json().id}/status`,
+      { status: "issued" },
+    );
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toMatch(/over-draw/i);
+    expect(res.json().message).toContain("1000000");
+
+    /* refused means refused: the line has not moved */
+    const line = await get(`/insurance/facilities/${facId}`);
+    expect(line.json().utilisation.drawnAmount).toBe(250_000);
+  });
+
+  it("gives the line back on release and records the freed headroom", async () => {
+    const active = await post(`/projects/${lineProject}/insurance/bonds/${bondId}/status`, {
+      status: "active",
+    });
+    expect(active.statusCode).toBe(200);
+    expect(active.json().facility.utilisation.drawnAmount).toBe(250_000);
+
+    const released = await post(`/projects/${lineProject}/insurance/bonds/${bondId}/release`, {
+      reason: "Works complete",
+    });
+    expect(released.statusCode).toBe(200);
+    expect(released.json().facility.utilisation.drawnAmount).toBe(0);
+    expect(released.json().facility.utilisation.headroom).toBe(1_000_000);
+
+    const line = await get(`/insurance/facilities/${facId}`);
+    expect(line.json().utilisation.drawnAmount).toBe(0);
+    expect(line.json().utilisation.headroom).toBe(1_000_000);
+  });
+
+  it("warns, but does not refuse, a foreign-currency or off-type drawdown", async () => {
+    const foreign = await post(
+      `/projects/${lineProject}/insurance/bonds`,
+      bondPayload({ facilityId: facId, currency: "USD", amount: 100_000 }),
+    );
+    expect(foreign.statusCode).toBe(201);
+    expect((foreign.json().facilityWarnings as string[]).join(" ")).toMatch(/EXCLUDED|rate/i);
+
+    const offType = await post(
+      `/projects/${lineProject}/insurance/bonds`,
+      bondPayload({ facilityId: facId, bondType: "advance_payment", amount: 10_000 }),
+    );
+    expect(offType.statusCode).toBe(201);
+    expect((offType.json().facilityWarnings as string[]).join(" ")).toMatch(/permits/i);
+
+    /* the foreign-currency bond consumes no GBP line even once issued */
+    expect(
+      (await post(`/projects/${lineProject}/insurance/bonds/${foreign.json().id}/status`, {
+        status: "issued",
+      })).statusCode,
+    ).toBe(200);
+    const line = await get(`/insurance/facilities/${facId}`);
+    expect(line.json().utilisation.drawnAmount).toBe(0);
+    expect(line.json().utilisation.excludedForeignCurrency).toHaveLength(1);
+  });
+
+  it("refuses a line that is closed, and one ring-fenced to another project", async () => {
+    const ring = await post("/insurance/facilities", {
+      name: "Ring-fenced line",
+      provider: "Bank Co",
+      limitAmount: 500_000,
+      projectId: otherLineProject,
+    });
+    expect(ring.statusCode).toBe(201);
+    const res = await post(
+      `/projects/${lineProject}/insurance/bonds`,
+      bondPayload({ facilityId: ring.json().id }),
+    );
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toMatch(/ring-fenced/i);
+
+    const dead = await post("/insurance/facilities", {
+      name: "Withdrawn line",
+      provider: "Surety Co",
+      limitAmount: 100_000,
+    });
+    await post(`/insurance/facilities/${dead.json().id}/status`, { status: "active" });
+    await post(`/insurance/facilities/${dead.json().id}/status`, { status: "closed" });
+    const closed = await post(
+      `/projects/${lineProject}/insurance/bonds`,
+      bondPayload({ facilityId: dead.json().id }),
+    );
+    expect(closed.statusCode).toBe(409);
+    expect(closed.json().message).toMatch(/closed/i);
+  });
+
+  it("attaches and detaches a line through PATCH, checking headroom before it writes", async () => {
+    const orphan = await post(`/projects/${lineProject}/insurance/bonds`, bondPayload({ amount: 400_000 }));
+    expect(orphan.json().facilityId).toBeNull();
+    const id = orphan.json().id as string;
+    await post(`/projects/${lineProject}/insurance/bonds/${id}/status`, { status: "issued" });
+
+    const attached = await patch(`/projects/${lineProject}/insurance/bonds/${id}`, {
+      facilityId: facId,
+    });
+    expect(attached.statusCode).toBe(200);
+    expect(attached.json().facility.utilisation.drawnAmount).toBe(400_000);
+
+    const detached = await patch(`/projects/${lineProject}/insurance/bonds/${id}`, {
+      facilityId: null,
+    });
+    expect(detached.statusCode).toBe(200);
+    expect(detached.json().facility).toBeNull();
+    const line = await get(`/insurance/facilities/${facId}`);
+    expect(line.json().utilisation.drawnAmount).toBe(0);
+  });
+
+  it("will not attach a live bond to a line it would over-draw", async () => {
+    const heavy = await post(`/projects/${lineProject}/insurance/bonds`, bondPayload({ amount: 1_200_000 }));
+    const id = heavy.json().id as string;
+    await post(`/projects/${lineProject}/insurance/bonds/${id}/status`, { status: "issued" });
+    const res = await patch(`/projects/${lineProject}/insurance/bonds/${id}`, { facilityId: facId });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toMatch(/over-draw/i);
+    const after = await get(`/projects/${lineProject}/insurance/bonds/${id}`);
+    expect(after.json().facilityId).toBeNull();
+  });
+
+  it("does not let a bond name another tenant's line", async () => {
+    const foreign = await post(
+      `/projects/${lineProject}/insurance/bonds`,
+      bondPayload({ facilityId: newId("fac") }),
+    );
+    expect(foreign.statusCode).toBe(404);
+  });
+});
+
 describe("insurance requirements — a requirement belongs to a scope", () => {
   let reqProject: string;
   let otherProject: string;
@@ -2014,6 +2236,41 @@ describe("audit bug fixes", () => {
 
     const seenFromB = await get(`/projects/${b}/insurance/policies/${masterId}`);
     expect((seenFromB.json().claims as unknown[]).length).toBe(1);
+  });
+
+  it("[#20b] does not return another project's certificates through a company-level policy", async () => {
+    const a = await makeProject("OCIP certs A");
+    const b = await makeProject("OCIP certs B");
+    const master = await post(
+      "/insurance/policies",
+      policyPayload({ policyType: "third_party_liability", policyNumber: "OCIP/CERTS" }),
+    );
+    expect(master.statusCode).toBe(201);
+    const masterId = master.json().id as string;
+    await post(`/insurance/policies/${masterId}/status`, { status: "active" });
+
+    const certB = await post(`/projects/${b}/insurance/certificates`, {
+      policyId: masterId,
+      vendorId,
+      subjectName: "Groundworks Ltd",
+      policyType: "third_party_liability",
+      insurer: "Confidential Re",
+      limitOfIndemnity: 12_345_678,
+      validFrom: daysFromToday(-10),
+      validTo: daysFromToday(300),
+    });
+    expect(certB.statusCode).toBe(201);
+
+    /* A member of project A must not be handed project B's vendor evidence:
+       insurer, limit of indemnity, validity and verification state. */
+    const seenFromA = await get(`/projects/${a}/insurance/policies/${masterId}`);
+    expect(seenFromA.statusCode).toBe(200);
+    expect(seenFromA.json().certificates).toEqual([]);
+    expect(seenFromA.json().certificatesScope).toBe("this_project_and_company_wide");
+    expect(JSON.stringify(seenFromA.json())).not.toContain("Confidential Re");
+
+    const seenFromB = await get(`/projects/${b}/insurance/policies/${masterId}`);
+    expect((seenFromB.json().certificates as unknown[]).length).toBe(1);
   });
 
   it("[#6] keeps an ordinary member out of the company-level policy programme", async () => {

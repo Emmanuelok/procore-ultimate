@@ -320,6 +320,9 @@ export interface MinuteDelivery {
   status: string;
   deliveredAt: string | null;
   acknowledgedAt: string | null;
+  /** set only when somebody logged a NON-user recipient's confirmation */
+  acknowledgedById: string | null;
+  acknowledgementNote: string | null;
   failureReason: string | null;
   documentSha256: string | null;
 }

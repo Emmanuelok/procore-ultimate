@@ -36,6 +36,7 @@ import {
   fmtMoney,
   fmtPct,
   type BondRow,
+  type FacilityOption,
   type FocusRequest,
   type ListResponse,
   type ReductionStep,
@@ -60,6 +61,7 @@ export default function BondsTab({
   const [total, setTotal] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [vendors, setVendors] = useState<VendorLite[]>([]);
+  const [facilities, setFacilities] = useState<FacilityOption[] | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -96,6 +98,36 @@ export default function BondsTab({
     };
   }, []);
 
+  /* The bonding lines this bond could draw on. A failure here leaves the
+     picker empty with a reason rather than pretending no line exists. */
+  const [facilityError, setFacilityError] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await api.get<ListResponse<FacilityOption>>(
+          "/api/v1/insurance/facilities?pageSize=100",
+        );
+        if (!cancelled) setFacilities(res.items);
+      } catch (err) {
+        if (!cancelled) {
+          setFacilities([]);
+          setFacilityError(errMsg(err, "The bonding lines could not be loaded"));
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const drawableFacilities = (facilities ?? []).filter(
+    (f) =>
+      f.status !== "closed" &&
+      f.status !== "expired" &&
+      (f.projectId === null || f.projectId === projectId),
+  );
+
   useEffect(() => {
     if (focus?.recordId) setSelectedId(focus.recordId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -119,6 +151,7 @@ export default function BondsTab({
     issuedAt: "",
     expiryAt: "",
     demandDeadline: "",
+    facilityId: "",
   });
   const [steps, setSteps] = useState<ReductionStep[]>([]);
 
@@ -137,6 +170,7 @@ export default function BondsTab({
       issuedAt: "",
       expiryAt: "",
       demandDeadline: "",
+      facilityId: "",
     });
     setSteps([]);
     setCreateOpen(true);
@@ -160,6 +194,7 @@ export default function BondsTab({
         issuedAt: form.issuedAt || null,
         expiryAt: form.expiryAt || null,
         demandDeadline: form.demandDeadline || null,
+        facilityId: form.facilityId || null,
         reductionSchedule: steps
           .filter((s) => s.trigger.trim())
           .map((s) => ({
@@ -179,6 +214,9 @@ export default function BondsTab({
       setBusy(false);
     }
   }
+
+  const selectedFacility = drawableFacilities.find((f) => f.id === form.facilityId) ?? null;
+  const facilityCurrency = form.currency.trim().toUpperCase() || "GBP";
 
   const deadlineAfterExpiry =
     form.expiryAt !== "" && form.demandDeadline !== "" && form.demandDeadline > form.expiryAt;
@@ -246,6 +284,7 @@ export default function BondsTab({
                 <Th>No.</Th>
                 <Th>Type</Th>
                 <Th>Guarantor</Th>
+                <Th>Bonding line</Th>
                 <Th className="text-right">Exposure</Th>
                 <Th>Demand deadline</Th>
                 <Th>Expiry</Th>
@@ -272,6 +311,23 @@ export default function BondsTab({
                       {b.bondNumber ? (
                         <div className="font-mono text-[11px] text-ink-400">{b.bondNumber}</div>
                       ) : null}
+                    </Td>
+                    <Td className="whitespace-nowrap">
+                      {b.facility ? (
+                        <div>
+                          <div className="text-xs font-medium text-ink-800">
+                            {b.facility.number}
+                          </div>
+                          <div className="text-[11px] text-ink-400">{b.facility.provider}</div>
+                        </div>
+                      ) : (
+                        <span
+                          className="text-[11px] text-ink-400"
+                          title="This bond names no facility, so it does not net off any line. Headroom cannot account for it."
+                        >
+                          outside any line
+                        </span>
+                      )}
                     </Td>
                     <Td className="whitespace-nowrap text-right tabular-nums">
                       <div className="font-medium">
@@ -412,6 +468,54 @@ export default function BondsTab({
               </Select>
             </Field>
           </div>
+
+          <Field
+            label="Bonding line"
+            hint="Name the facility this bond draws on and it nets off the line. Leave it unset for a bond issued outside any facility — but then nothing can tell you how much line is left."
+          >
+            <Select
+              value={form.facilityId}
+              onChange={(e) => setForm({ ...form, facilityId: e.target.value })}
+            >
+              <option value="">Outside any facility</option>
+              {drawableFacilities.map((f) => (
+                <option key={f.id} value={f.id}>
+                  {f.number} · {f.provider} · {f.currency}{" "}
+                  {f.utilisation.headroom === null
+                    ? "(no limit recorded)"
+                    : `(${fmtMoney(f.utilisation.headroom, f.currency, 0)} left)`}
+                </option>
+              ))}
+            </Select>
+          </Field>
+
+          {facilityError ? (
+            <div className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-900 ring-1 ring-amber-200">
+              {facilityError} — the bond can still be recorded, but it cannot be attached to a line
+              until this loads.
+            </div>
+          ) : facilities !== null && drawableFacilities.length === 0 ? (
+            <div className="rounded-md bg-ink-50 px-3 py-2 text-xs leading-relaxed text-ink-600">
+              No bonding line is recorded for this company, so this bond cannot be netted off one.
+              Record the facility your surety or bank has agreed under Programme control → Bonding
+              lines, and headroom becomes computable.
+            </div>
+          ) : selectedFacility && selectedFacility.currency !== facilityCurrency ? (
+            <div className="rounded-md bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-900 ring-1 ring-amber-200">
+              This bond is in {facilityCurrency} and {selectedFacility.number} is a{" "}
+              {selectedFacility.currency} line. It will be recorded against the line but excluded
+              from its utilisation figure: netting two currencies needs a rate, and none is held.
+            </div>
+          ) : selectedFacility &&
+            selectedFacility.permittedBondTypes.length > 0 &&
+            !selectedFacility.permittedBondTypes.includes(form.bondType) ? (
+            <div className="rounded-md bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-900 ring-1 ring-amber-200">
+              {selectedFacility.number} permits{" "}
+              {selectedFacility.permittedBondTypes.map(bondTypeLabel).join(", ")}. This is a{" "}
+              {bondTypeLabel(form.bondType)} bond: it still consumes line, so it is counted, but the
+              provider may refuse to issue it.
+            </div>
+          ) : null}
 
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
             <Field label="Issued at" hint="Required before the bond can be marked issued.">
