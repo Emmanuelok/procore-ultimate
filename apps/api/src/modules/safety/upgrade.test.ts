@@ -1304,8 +1304,9 @@ describe("reportability reassessment", () => {
     // and the incident cannot be closed while it stands
     await post(`/projects/${gbProject}/safety/incidents/${id}/investigation`, {
       investigationLeadId: member.userId,
-      rootCauseMethod: "five_why",
+      rootCauseMethod: "five_whys",
       rootCause: "Blade guard removed to speed up cutting; the change was never challenged.",
+      contributingFactors: [{ factor: "No pre-use check of the saw was recorded" }],
       investigationFindings: "The guard had been off for a fortnight.",
     });
     await post(`/projects/${gbProject}/safety/incidents/${id}/investigation/complete`, {});

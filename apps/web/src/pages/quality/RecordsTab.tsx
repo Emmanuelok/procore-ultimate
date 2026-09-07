@@ -2215,6 +2215,8 @@ function WeldModal({
             onDone={reload}
           />
 
+          <HeatCheck projectId={projectId} heatNumbers={w.heatNumbers} />
+
           <EditModal
             open={editOpen}
             onClose={() => setEditOpen(false)}
@@ -3623,5 +3625,99 @@ function CreateInstrument({
         </p>
       </div>
     </Modal>
+  );
+}
+
+/**
+ * DOES THE MATERIAL IN THIS JOINT HAVE A CERTIFICATE?
+ *
+ * The weld map records heat numbers and the certificate register records
+ * heat numbers, and until this panel existed nothing in the product put the
+ * two lists side by side — so a joint could be welded from a cast with no
+ * mill certificate on the project and nobody would find out until the dossier
+ * was assembled, by which time the joint was buried.
+ *
+ * The API answers with the certificates it found AND the heats it did not,
+ * which is the half that matters: a missing certificate is not an empty
+ * result, it is a named cast nobody can vouch for.
+ */
+function HeatCheck({ projectId, heatNumbers }: { projectId: string; heatNumbers: string[] }) {
+  const { busy, refusal, clear, run } = useAction();
+  const [answer, setAnswer] = useState<{
+    items: MaterialCertificate[];
+    missing: string[];
+  } | null>(null);
+
+  if (heatNumbers.length === 0) {
+    return (
+      <div className="rounded-md border border-border-subtle p-2.5 text-2xs text-content-subtle">
+        No heat number is recorded against this joint, so its material cannot be traced to a
+        certificate at all. That is a gap in the record rather than a clean result.
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-md border border-border-subtle p-2.5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-label uppercase tracking-wide text-content-subtle">
+          Material behind this joint
+        </div>
+        <Button
+          size="xs"
+          variant="secondary"
+          loading={busy === "lookup"}
+          onClick={async () => {
+            const found = await run("lookup", () =>
+              api.post<{ items: MaterialCertificate[]; missing: string[] }>(
+                `/api/v1/projects/${projectId}/material-certificates/lookup`,
+                { heatNumbers },
+              ),
+            );
+            if (found) setAnswer(found);
+          }}
+        >
+          Check the certificates
+        </Button>
+      </div>
+      <RefusalNotice refusal={refusal} onDismiss={clear} />
+      <p className="mt-1 text-2xs text-content-subtle">
+        Heats on this joint: {heatNumbers.join(", ")}
+      </p>
+      {answer ? (
+        <div className="mt-1.5 space-y-1 text-meta">
+          {answer.missing.length > 0 ? (
+            <Alert tone="danger" size="sm" title="No certificate on this project for:">
+              {answer.missing.join(", ")}. Either the material arrived without one, or the
+              certificate was filed without its heat number — both leave this joint unvouched for.
+            </Alert>
+          ) : (
+            <p className="text-2xs font-medium text-success-fg">
+              Every heat on this joint has a certificate on this project.
+            </p>
+          )}
+          {answer.items.map((c) => (
+            <div key={c.id} className="flex flex-wrap items-center gap-1.5">
+              <span className="font-mono text-2xs">{c.reference}</span>
+              <span className="text-content-muted">{c.materialDescription}</span>
+              <Badge
+                tone={
+                  c.verificationStatus === "verified"
+                    ? "success"
+                    : c.verificationStatus === "failed"
+                      ? "danger"
+                      : "warning"
+                }
+                size="xs"
+                dot
+              >
+                {labelize(c.verificationStatus)}
+              </Badge>
+              <span className="text-2xs text-content-subtle">heat {c.heatNumber ?? EM_DASH}</span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
   );
 }
