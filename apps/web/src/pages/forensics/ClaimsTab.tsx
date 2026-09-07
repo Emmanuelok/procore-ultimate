@@ -793,6 +793,20 @@ export default function ClaimsTab({
                 </Button>
               ) : null}
             </div>
+            {selected.totals ? (
+              <p className="mb-1 text-[11px] text-ink-500">
+                Modelled delay:{" "}
+                <span className="font-medium text-ink-800">
+                  {selected.totals.tiaDeltaDays === null
+                    ? "not measured"
+                    : `${selected.totals.tiaDeltaDays} d`}
+                </span>{" "}
+                · {selected.totals.tiaBasis}
+                {selected.totals.staleTia > 0
+                  ? ` · ${selected.totals.staleTia} analysis/analyses are stale since the programme was recomputed`
+                  : ""}
+              </p>
+            ) : null}
             {selected.status !== "draft" ? (
               <p className="mb-1 text-[11px] text-ink-400">
                 Frozen — the set of events a {humanize(selected.status)} claim rests on is part of

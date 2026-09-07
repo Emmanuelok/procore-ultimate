@@ -379,8 +379,12 @@ export const observationRoutes: FastifyPluginAsync = async (app) => {
       } else set[k] = v;
     }
     const changed = Object.keys(body).filter((k) => body[k as keyof typeof body] !== undefined);
+    // The drawing pin lives in three columns; snapshot those, or a moved pin
+    // would be ledgered as the bare word "pin" with no before/after — exactly
+    // the unrecoverable-edit gap the audit raised for RFI questions.
+    const snapshotKeys = changed.flatMap((k) => (k === "pin" ? ["sheetId", "pinX", "pinY"] : [k]));
     await app.db.update(fieldObservations).set(set).where(eq(fieldObservations.id, observationId));
-    await ledger("update", observationId, req, { changed, before: pick(row, changed), after: pick(set, changed) }, true);
+    await ledger("update", observationId, req, { changed, before: pick(row, snapshotKeys), after: pick(set, snapshotKeys) }, true);
     if (body.assigneeId && body.assigneeId !== row.assigneeId) {
       await notifyAssignment(req, row, [body.assigneeId]);
     }

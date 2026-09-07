@@ -126,10 +126,19 @@ const RULE_LABEL: Record<ConcurrencyRule, string> = {
   apportionment: "City Inn v Shepherd (apportionment) — time and money are apportioned between the causes",
 };
 
+/**
+ * @param declaredPacing eventId -> the eventId it was contemporaneously
+ *   recorded as pacing. A declaration is evidence the numbers cannot supply —
+ *   pacing is a CHOICE to slow down because another delay already controls
+ *   completion, and only the party that made the choice can state it — so a
+ *   declared pair is classified as pacing whatever the float arithmetic says,
+ *   and the rationale reports whether the programme supports the declaration.
+ */
 export function analyseConcurrency(
   network: ForensicNetwork,
   events: ForensicEvent[],
   rules: FloatRules = DEFAULT_FLOAT_RULES,
+  declaredPacing: ReadonlyMap<string, string> = new Map(),
 ): ConcurrencyResult | MethodFailure {
   const base = computeCpm2(network.tasks, network.deps, {
     projectStart: network.projectStart,
@@ -214,7 +223,24 @@ export function analyseConcurrency(
       let classification: ConcurrencyClassification = "independent";
       let rationale: string;
 
-      if (overlap < rules.concurrencyThresholdDays) {
+      const declared =
+        declaredPacing.get(a.id) === b.id
+          ? { pacer: ia, driver: ib, pacerTitle: a.title, driverTitle: b.title }
+          : declaredPacing.get(b.id) === a.id
+            ? { pacer: ib, driver: ia, pacerTitle: b.title, driverTitle: a.title }
+            : null;
+
+      if (declared) {
+        classification = "pacing";
+        pacingOf.set(declared.pacer.eventId, declared.driver.eventId);
+        const driverDelta = declared.driver.deltaAlone;
+        rationale =
+          `"${declared.pacerTitle}" is recorded as pacing "${declared.driverTitle}". ` +
+          (declared.driver.driving
+            ? `The programme supports the declaration: "${declared.driverTitle}" moves completion by ${driverDelta}d on its own.`
+            : `The programme does NOT support the declaration: "${declared.driverTitle}" does not move completion on its own, ` +
+              "so the pacing case rests on the contemporaneous record rather than on the critical path.");
+      } else if (overlap < rules.concurrencyThresholdDays) {
         classification = "independent";
         rationale = `The events overlap by ${overlap} day(s), below the project's ${rules.concurrencyThresholdDays}-day concurrency threshold.`;
       } else if (ia.driving && ib.driving) {

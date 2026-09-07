@@ -25,7 +25,7 @@ import type { BuiltApp } from "../../app.js";
 import { newId } from "../../lib/ids.js";
 import { addDaysISO, todayISO } from "./dates.js";
 import { listZip } from "./zip.js";
-import { jpegWithExif, multipartBody, tinyPng } from "./testFixtures.js";
+import { jpegWithExif, multipartBody, tinyJpeg, tinyPng } from "./testFixtures.js";
 
 let built: BuiltApp;
 let owner: TestActor;
@@ -355,6 +355,47 @@ describe("Observations", () => {
     const detail = await inject("GET", api(`/observations/${id}`), H(engineer));
     expect(detail.json().convertedToId).toBe(items[0]!.id);
   });
+
+  it("edits a finding after it is raised, and keeps the moved pin recoverable from the ledger", async () => {
+    const o = await inject("POST", api("/observations"), H(engineer), { title: "Damp patch", observationType: "quality", assigneeId: sub.userId, verifierId: pm.userId, priority: "low" });
+    const id = o.json().id as string;
+    const patched = await inject("PATCH", api(`/observations/${id}`), H(engineer), {
+      description: "Spreading on the north face",
+      priority: "high",
+      assigneeId: engineer.userId,
+      dueDate: addDaysISO(todayISO(), 5),
+      vendorId,
+      locationId: locA3,
+      pin: { sheetId: "sht_a3", x: 0.4, y: 0.6 },
+    });
+    expect(patched.statusCode).toBe(200);
+    expect(patched.json().priority).toBe("high");
+    expect(patched.json().assigneeId).toBe(engineer.userId);
+    expect(patched.json().vendorId).toBe(vendorId);
+    expect(patched.json().sheetId).toBe("sht_a3");
+    expect(patched.json().pinY).toBeCloseTo(0.6);
+    // Reassignment notifies the new assignee rather than silently moving work.
+    const notes = await built.app.db.select().from(notifications).where(and(eq(notifications.userId, engineer.userId), eq(notifications.recordId, id)));
+    expect(notes.length).toBeGreaterThan(0);
+    // Segregation of duties survives an edit…
+    const clash = await inject("PATCH", api(`/observations/${id}`), H(engineer), { verifierId: engineer.userId });
+    expect(clash.statusCode).toBe(400);
+    // …and references are validated, not stored on trust.
+    expect((await inject("PATCH", api(`/observations/${id}`), H(engineer), { vendorId: "ven_nope" })).statusCode).toBe(400);
+    // The pin lives in three columns: the ledger must carry their before/after,
+    // not just the word "pin", or a moved pin is unrecoverable from the record.
+    const entries = await built.app.db
+      .select()
+      .from(ledgerEntries)
+      .where(and(eq(ledgerEntries.objectType, "observation"), eq(ledgerEntries.objectId, id), eq(ledgerEntries.action, "update")));
+    const payload = (entries[0]!.payload ?? {}) as { changed?: string[]; before?: Record<string, unknown>; after?: Record<string, unknown> };
+    expect(payload.changed).toContain("pin");
+    expect(payload.before?.["sheetId"]).toBeNull();
+    expect(payload.after?.["sheetId"]).toBe("sht_a3");
+    // Cross-tenant negative on the edit path.
+    const S = { authorization: `Bearer ${stranger.accessToken}`, "x-company-id": stranger.companyId };
+    expect((await inject("PATCH", api(`/observations/${id}`), S, { priority: "low" })).statusCode).toBe(403);
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -505,5 +546,55 @@ describe("Photos", () => {
     const del = await inject("DELETE", `/api/v1/photos/${photoId}`, H(engineer)); // uploader
     expect(del.statusCode).toBe(200);
     expect((await inject("GET", api(`/photos/${photoId}`), H(engineer))).statusCode).toBe(404);
+  });
+
+  it("serves the camera's own thumbnail as the gallery tile and says when it sent the original instead", async () => {
+    const thumbBytes = tinyJpeg(0x2a);
+    const created = await upload(engineer, { caption: "Rebar" }, jpegWithExif({ thumbnail: thumbBytes }), "rebar.jpg");
+    expect(created.statusCode).toBe(201);
+    const id = created.json().id as string;
+    expect(created.json().variants).toEqual(["thumb"]);
+    // Storage keys are server-side plumbing and must not ride out on the wire.
+    expect(JSON.stringify(created.json())).not.toContain("storageKey");
+
+    const variant = await inject("GET", api(`/photos/${id}/variant/thumb`), H(engineer));
+    expect(variant.statusCode).toBe(200);
+    expect(variant.headers["x-photo-variant"]).toBe("thumb");
+    expect(variant.headers["content-type"]).toBe("image/jpeg");
+    // Byte-identical to what the camera embedded: the tile is a derivative of
+    // the stored evidence, not a separately supplied image.
+    expect(Buffer.from(variant.rawPayload).equals(thumbBytes)).toBe(true);
+    const full = await inject("GET", api(`/photos/${id}/content`), H(engineer));
+    expect(variant.rawPayload.length).toBeLessThan(full.rawPayload.length);
+
+    // A PNG carries no rendition: fall back to the original and say so.
+    const png = await upload(engineer, { caption: "Screenshot" }, tinyPng(), "shot.png");
+    expect(png.json().variants).toEqual([]);
+    const fallback = await inject("GET", api(`/photos/${png.json().id}/variant/thumb`), H(engineer));
+    expect(fallback.statusCode).toBe(200);
+    expect(fallback.headers["x-photo-variant"]).toBe("original");
+
+    expect((await inject("GET", api(`/photos/${id}/variant/4k`), H(engineer))).statusCode).toBe(400);
+    // Tiles stay un-ledgered — a page of 48 is not 48 access events.
+    const access = await built.app.db
+      .select()
+      .from(ledgerEntries)
+      .where(and(eq(ledgerEntries.objectType, "photo"), eq(ledgerEntries.objectId, id), eq(ledgerEntries.action, "access")));
+    expect(access).toHaveLength(0);
+    // The id-addressed twin resolves the project and enforces the tool level.
+    const S = { authorization: `Bearer ${stranger.accessToken}`, "x-company-id": stranger.companyId };
+    expect((await inject("GET", `/api/v1/photos/${id}/variant/thumb`, S)).statusCode).toBe(404);
+    expect((await inject("GET", `/api/v1/photos/${id}/variant/thumb`, H(nobody))).statusCode).toBe(403);
+    expect((await inject("GET", `/api/v1/photos/${id}/variant/thumb`, H(pm))).statusCode).toBe(200);
+  });
+
+  it("refuses a bulk selection past the cap rather than reading it", async () => {
+    const rows = (await inject("GET", api("/photos?pageSize=50"), H(engineer))).json().items as Array<{ id: string; fileId: string; file: { sizeBytes: number } }>;
+    const target = rows[0]!;
+    await built.app.db.update(files).set({ sizeBytes: 600 * 1024 * 1024 }).where(eq(files.id, target.fileId));
+    const res = await built.app.inject({ method: "POST", url: api("/photos/bulk-download"), headers: H(engineer), payload: { photoIds: [target.id] } });
+    expect(res.statusCode).toBe(413);
+    expect(res.json().message).toContain("bulk-download limit");
+    await built.app.db.update(files).set({ sizeBytes: target.file.sizeBytes }).where(eq(files.id, target.fileId));
   });
 });

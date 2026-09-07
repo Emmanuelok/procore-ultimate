@@ -941,6 +941,16 @@ describe("claims", () => {
     expect(one.statusCode).toBe(200);
     expect(one.json().delayEvents).toHaveLength(1);
     expect(one.json().delayEvents[0].id).toBe(ev1Id);
+    /* No time impact analysis has been run for this event, so the claim's
+       modelled delay is NOT MEASURED — it used to report 0 days, which reads
+       as "modelled and found to have no impact". */
+    expect(one.json().totals).toMatchObject({
+      liveEvents: 1,
+      tiaDeltaDays: null,
+      tiaMeasuredEvents: 0,
+      tiaUnmeasuredEvents: 1,
+    });
+    expect(one.json().totals.tiaBasis).toMatch(/no linked event carries a current time impact/i);
   });
 
   it("walks the lifecycle and forbids self-assessment (403)", async () => {
@@ -1738,6 +1748,66 @@ describe("float doctrine and concurrency (#278-281)", () => {
       headers: owner.headers,
     });
     expect(after.json().basis).toMatch(/8.4/);
+  });
+
+  it("refuses a pacing declaration that points back at the declaring event", async () => {
+    /* Pacing runs one way: the pacing party slows down BECAUSE the other event
+       already controls completion. Two events pacing each other says neither
+       controls, which no doctrine can act on. */
+    const a = await createDelayEvent(projectId, {
+      title: "Pacing A",
+      cause: "other",
+      excusable: false,
+      compensable: false,
+      startDate: "2026-03-01",
+      durationDays: 4,
+    });
+    const b = await createDelayEvent(projectId, {
+      title: "Pacing B",
+      cause: "other",
+      excusable: false,
+      compensable: false,
+      startDate: "2026-03-02",
+      durationDays: 4,
+    });
+    const aId = a.json().id as string;
+    const bId = b.json().id as string;
+
+    const self = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}/delay-events/${aId}`,
+      headers: owner.headers,
+      payload: { pacingOfEventId: aId },
+    });
+    expect(self.statusCode).toBe(400);
+
+    const first = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}/delay-events/${aId}`,
+      headers: owner.headers,
+      payload: { pacingOfEventId: bId },
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json().pacingOfEventId).toBe(bId);
+
+    const mutual = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}/delay-events/${bId}`,
+      headers: owner.headers,
+      payload: { pacingOfEventId: aId },
+    });
+    expect(mutual.statusCode).toBe(400);
+    expect(mutual.json().message).toMatch(/pacing runs one way/i);
+
+    // clear it again so the register is left as the other tests expect
+    const cleared = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}/delay-events/${aId}`,
+      headers: owner.headers,
+      payload: { pacingOfEventId: null },
+    });
+    expect(cleared.statusCode).toBe(200);
+    expect(cleared.json().pacingOfEventId).toBeNull();
   });
 
   it("runs a concurrency analysis that cites the project doctrine", async () => {

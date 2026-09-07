@@ -2052,3 +2052,101 @@ describe("AI minutes drafting", () => {
     expect(res.json().message).toMatch(/minutes\/correct/);
   });
 });
+
+/* ================================================================== */
+/* Verifier regression: the series state machine                       */
+/* ================================================================== */
+
+describe("closing a series is an admin act, not a PATCH", () => {
+  let standardOnly: TestActor;
+  let hStandard: Record<string, string>;
+
+  beforeAll(async () => {
+    standardOnly = await registerActor(built.app);
+    await built.app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: chair.companyId,
+      userId: standardOnly.userId,
+      role: "member",
+    });
+    await built.app.db.insert(projectMemberships).values({
+      id: newId("pm"),
+      companyId: chair.companyId,
+      projectId,
+      userId: standardOnly.userId,
+      templateKey: "read_only",
+      overrides: { meetings: "standard" },
+    });
+    hStandard = {
+      authorization: `Bearer ${standardOnly.accessToken}`,
+      "x-company-id": chair.companyId,
+    };
+  }, 60_000);
+
+  it("refuses PATCH { status: 'closed' } to the same user /close refuses", async () => {
+    const created = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meeting-series`,
+      hStandard,
+      { title: "Standard-user series", meetingType: "progress", recurrence: "weekly" },
+    );
+    expect(created.statusCode).toBe(201);
+    const seriesId = created.json().id as string;
+
+    // The dedicated route is admin-gated.
+    const viaRoute = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meeting-series/${seriesId}/close`,
+      hStandard,
+      { reason: "no longer required" },
+    );
+    expect(viaRoute.statusCode).toBe(403);
+
+    // ...so the generic PATCH must not reach the same end state, with none of
+    // the record the close route writes (reason, closedAt, open-action count,
+    // state_change ledger entry).
+    const viaPatch = await inject(
+      "PATCH",
+      `/api/v1/projects/${projectId}/meeting-series/${seriesId}`,
+      hStandard,
+      { status: "closed" },
+    );
+    expect(viaPatch.statusCode).toBe(400);
+
+    // Pause and resume stay patchable — they carry no such record.
+    const paused = await inject(
+      "PATCH",
+      `/api/v1/projects/${projectId}/meeting-series/${seriesId}`,
+      hStandard,
+      { status: "paused" },
+    );
+    expect(paused.statusCode).toBe(200);
+    expect(paused.json().status).toBe("paused");
+  });
+
+  it("refuses to edit a series back to life once it is closed", async () => {
+    const created = await inject("POST", `/api/v1/projects/${projectId}/meeting-series`, chair.headers, {
+      title: "Series to close",
+      meetingType: "progress",
+      recurrence: "weekly",
+    });
+    const seriesId = created.json().id as string;
+    const closed = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meeting-series/${seriesId}/close`,
+      chair.headers,
+      { reason: "works complete" },
+    );
+    expect(closed.statusCode).toBe(200);
+    expect(closed.json().status).toBe("closed");
+
+    const reopen = await inject(
+      "PATCH",
+      `/api/v1/projects/${projectId}/meeting-series/${seriesId}`,
+      chair.headers,
+      { status: "active" },
+    );
+    expect(reopen.statusCode).toBe(409);
+    expect(reopen.json().message ?? reopen.json().error).toMatch(/closed/i);
+  });
+});

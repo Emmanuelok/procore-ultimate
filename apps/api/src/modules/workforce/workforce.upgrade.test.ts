@@ -357,6 +357,58 @@ describe("worker voice", () => {
     expect(again.json().breached).toBe(0);
   });
 
+  /*
+   * The SLA is the only thing that makes an employer-independent channel
+   * worth having, and `sweepGrievanceSla` reads nothing but
+   * `firstRespondedAt`. An internal note the worker cannot see must not stop
+   * the clock, or the control is satisfied by writing to oneself.
+   */
+  it("does not treat an internal note as the first response to the reporter", async () => {
+    const raised = await app.inject({
+      method: "POST",
+      url: "/api/v1/worker-voice/reports",
+      headers: { "x-intake-token": token },
+      payload: { category: "other", summary: "Internal note must not close the SLA" },
+    });
+    expect(raised.statusCode).toBe(201);
+    const rows = await app.db
+      .select()
+      .from(workerGrievances)
+      .where(eq(workerGrievances.summary, "Internal note must not close the SLA"));
+    const id = rows[0]!.id;
+
+    const noted = await post(`/projects/${projectId}/worker-grievances/${id}/updates`, {
+      kind: "note",
+      text: "Internal: chased the employer by phone",
+      visibleToReporter: false,
+    });
+    expect(noted.statusCode, noted.body).toBe(201);
+    const afterNote = await app.db
+      .select()
+      .from(workerGrievances)
+      .where(eq(workerGrievances.id, id));
+    expect(afterNote[0]?.firstRespondedAt).toBeNull();
+
+    await app.db
+      .update(workerGrievances)
+      .set({ responseDueAt: new Date(Date.now() - 3_600_000).toISOString() })
+      .where(eq(workerGrievances.id, id));
+    const swept = await post(`/projects/${projectId}/worker-grievances/sweep`, {});
+    expect(swept.json().breached).toBe(1);
+
+    const answered = await post(`/projects/${projectId}/worker-grievances/${id}/updates`, {
+      kind: "response",
+      text: "We have asked the employer to answer you directly",
+      visibleToReporter: true,
+    });
+    expect(answered.statusCode, answered.body).toBe(201);
+    const afterAnswer = await app.db
+      .select()
+      .from(workerGrievances)
+      .where(eq(workerGrievances.id, id));
+    expect(afterAnswer[0]?.firstRespondedAt).toBeTruthy();
+  });
+
   it("refuses the grievance register to another company", async () => {
     const res = await get(`/projects/${projectId}/worker-grievances`, stranger.headers);
     expect(res.statusCode).toBe(403);

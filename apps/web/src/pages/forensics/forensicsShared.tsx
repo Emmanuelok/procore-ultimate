@@ -144,6 +144,18 @@ export interface ClaimEventLite {
 
 export interface ClaimDetail extends ClaimRow {
   delayEvents: ClaimEventLite[];
+  totals?: {
+    liveEvents: number;
+    withdrawnEvents: number;
+    compensableDays: number;
+    excusableDays: number;
+    /** null when no linked event carries a current TIA — never 0 */
+    tiaDeltaDays: number | null;
+    tiaMeasuredEvents: number;
+    tiaUnmeasuredEvents: number;
+    staleTia: number;
+    tiaBasis: string;
+  };
 }
 
 export interface ScheduleRow {

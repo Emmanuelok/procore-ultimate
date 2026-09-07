@@ -5531,6 +5531,15 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         })
         .parse(req.body);
       const companyId = req.companyId!;
+      /*
+       * THE MACHINE IS NAMED IN THE BODY, so `machineScopeGate` (which reads
+       * `:equipmentId` off the params) never sees it. Without this, `equipment`
+       * admin on one job was enough to bind a telematics device to a machine on
+       * a job the caller cannot see — and the device feed is the independent
+       * evidence the hours reconciliation is built on, so mis-binding it is how
+       * that control is defeated from outside its own project.
+       */
+      await assertMachineVisible(req, body.equipmentId);
       const machine = await fetchEquipment(body.equipmentId, companyId);
       const clash = await app.db
         .select({ id: equipment.id, reference: equipment.reference })
@@ -7404,7 +7413,11 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           photoFileIds: z.array(idRef).max(50).optional(),
         }),
       )
-      .min(1),
+      .min(1)
+      // Bounded so a body cannot be arbitrarily large. Generous on purpose: a
+      // delivery is built up 500 lines at a time and a long steel schedule can
+      // legitimately run to thousands, so the cap must not refuse a real one.
+      .max(5000),
   });
 
   /**
@@ -7442,12 +7455,29 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       }
       const lines = await deliveryLines(deliveryId);
       const byId = new Map(lines.map((l) => [l.id, l] as const));
+      /*
+       * ONE LINE, ONE ENTRY. The same lineId twice in one body was accepted:
+       * the item roll-up summed both copies and `insertStockMovement` ran
+       * twice for the one pallet, so a single request booked the material
+       * into stock twice — exactly what the "receiving it twice" guard above
+       * exists to stop, reached through the body instead of through a second
+       * request.
+       */
+      const seenLineIds = new Set<string>();
       for (const entry of body.lines) {
         if (!byId.has(entry.lineId)) {
           throw badRequest(
             `line ${entry.lineId} does not belong to delivery ${delivery.reference}`,
           );
         }
+        if (seenLineIds.has(entry.lineId)) {
+          throw badRequest(
+            `line ${entry.lineId} ("${byId.get(entry.lineId)!.description}") appears more than ` +
+              "once in this receipt. Each line is received once, at the quantity that came off " +
+              "the lorry; two entries for one line would book the same material into stock twice.",
+          );
+        }
+        seenLineIds.add(entry.lineId);
       }
       const receivedAt = body.receivedAt
         ? new Date(body.receivedAt).toISOString()

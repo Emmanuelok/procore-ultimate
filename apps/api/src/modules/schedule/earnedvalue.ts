@@ -8,8 +8,9 @@
  *   PV (planned value)  = Σ BAC × plannedFraction(dataDate)
  *   EV (earned value)   = Σ BAC × percentComplete/100
  *   AC (actual cost)    = Σ booked cost (from resources, or the budget line)
- *   SV = EV − PV,  SPI = EV / PV,  CV = EV − AC
- *   CPI = EV(costed) / AC   — over the activities that actually carry a cost
+ *   SV = EV − PV,  SPI = EV / PV
+ *   CV  = EV(costed) − AC,  CPI = EV(costed) / AC
+ *         — both over the activities that actually carry a booked cost
  *   EAC = BAC(costed) / CPI + BAC(uncosted)   (cost-performance EAC)
  *   Schedule EAC (time) = plannedDuration / SPI, reported in days
  *
@@ -23,7 +24,7 @@
  *    `unpriced` and named in `reasons`), it is never treated as zero;
  *  - a priced activity whose ACTUAL COST is unknown does not contribute a
  *    zero to AC either: it is counted in `costUnknown`, its earned value is
- *    kept out of the CPI numerator so CPI stays EV(costed) / AC(costed), and
+ *    kept out of the CV and CPI numerator so both stay EV(costed) vs AC, and
  *    once the unknown share of BAC passes `COST_COVERAGE_FLOOR` CPI/EAC are
  *    returned as null with the reason, because a cost index measured over a
  *    minority of the work is not a cost index;
@@ -76,7 +77,14 @@ export interface EvResult {
   ev: number;
   ac: number;
   sv: number;
-  cv: number;
+  /**
+   * costed EV − AC. Null when no activity carries a booked cost, or when the
+   * costed share is below COST_COVERAGE_FLOOR. It is NEVER `ev - ac`: the
+   * earned value of an activity whose cost is unknown has no actual to be
+   * compared with, and counting it would report a favourable variance that
+   * only means the invoices have not arrived.
+   */
+  cv: number | null;
   /** null when PV is 0 — a ratio against nothing is not 1 */
   spi: number | null;
   cpi: number | null;
@@ -226,7 +234,7 @@ export function computeEarnedValue(input: EvInput): EvResult {
     ev: round2(ev),
     ac: round2(ac),
     sv: round2(ev - pv),
-    cv: round2(ev - ac),
+    cv: ac > 0 && !coverageTooThin ? round2(costedEv - ac) : null,
     spi,
     cpi,
     eac,

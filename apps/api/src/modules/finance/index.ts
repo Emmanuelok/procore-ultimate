@@ -38,6 +38,7 @@ import {
   INELIGIBLE_RECOVERY_STATUSES,
   type DayCountConvention,
 } from "@constructos/shared";
+import type { Db } from "../../lib/db.js";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
@@ -874,7 +875,7 @@ export const financeModule: FastifyPluginAsync = async (app) => {
         status: "open",
         obligationId,
       });
-      await appendLedger(tx as never, {
+      await appendLedger(tx as Db, {
         companyId: req.companyId!,
         actorId: req.user!.id,
         action: "create",
@@ -955,7 +956,7 @@ export const financeModule: FastifyPluginAsync = async (app) => {
             .set({ status: "satisfied", satisfiedEvidenceId: body.evidenceIds[0] })
             .where(and(eq(obligations.id, cond.obligationId), eq(obligations.status, "open")));
         }
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "state_change",
@@ -998,7 +999,7 @@ export const financeModule: FastifyPluginAsync = async (app) => {
               ),
             );
         }
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "state_change",
@@ -1231,7 +1232,7 @@ export const financeModule: FastifyPluginAsync = async (app) => {
           .update(disbursements)
           .set({ status: "submitted", submittedAt: verifiedAt, submittedBy: req.user!.id })
           .where(and(eq(disbursements.id, disbursementId), eq(disbursements.status, "draft")));
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "state_change",
@@ -1297,7 +1298,7 @@ export const financeModule: FastifyPluginAsync = async (app) => {
           .update(disbursements)
           .set({ status: "approved", approvedAt: now, approvedBy: req.user!.id, updatedAt: now })
           .where(and(eq(disbursements.id, disbursementId), eq(disbursements.status, "submitted")));
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "state_change",
@@ -1440,7 +1441,7 @@ export const financeModule: FastifyPluginAsync = async (app) => {
           .update(disbursements)
           .set({ status: "disbursed", disbursedAt, updatedAt: new Date().toISOString() })
           .where(and(eq(disbursements.id, disbursementId), eq(disbursements.status, "approved")));
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "state_change",
@@ -1902,7 +1903,7 @@ export const financeModule: FastifyPluginAsync = async (app) => {
           // A covenant breach is a lender event-of-default risk — critical
           // signal, no obligation (the covenant is continuous, not dated).
           const opText = covenant.operator === "gte" ? "≥" : "≤";
-          await raiseSignalOnce(tx as never, {
+          await raiseSignalOnce(tx as Db, {
             companyId: req.companyId!,
             projectId: req.projectId!,
             detector: "covenant_breach",
@@ -1930,14 +1931,14 @@ export const financeModule: FastifyPluginAsync = async (app) => {
           });
         } else {
           await closeSignalByKey(
-            tx as never,
+            tx as Db,
             req.companyId!,
             "covenant_breach",
             `${covenantId}:${body.readingDate}`,
             "The reading recorded for this test date complies with the covenant.",
           );
         }
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: existing ? "update" : "create",
@@ -3291,7 +3292,7 @@ export const financeModule: FastifyPluginAsync = async (app) => {
           assuranceReconciliationId: assuranceRecId,
           reconciledBy: req.user!.id,
         });
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "create",

@@ -34,6 +34,7 @@ import {
 import type { DataColumns, Tone } from "../../ui";
 import { IconCheck, IconPlus, IconWarning } from "../../ui/icons";
 import { api } from "../../lib/api";
+import { useAuth } from "../../lib/auth";
 import {
   LoadError,
   LoadingBlock,
@@ -1103,6 +1104,13 @@ export function LicenceRegisterView() {
       : `${BASE}/licences?pageSize=200&expiringWithinDays=${horizon}`;
   const licences = useResource<Paginated<PrequalLicence>>(path);
   const action = useAction();
+  /*
+   * The sweep writes: it expires licences and raises signals against vendors,
+   * so the route is behind `bidding:admin`. A button every member can press
+   * and nobody but an admin can use is a 403 waiting to happen.
+   */
+  const { company } = useAuth();
+  const maySweep = company?.role === "owner" || company?.role === "admin";
 
   const columns: DataColumns<PrequalLicence> = [
     {
@@ -1166,18 +1174,24 @@ export function LicenceRegisterView() {
             <option value="365">Expiring within a year</option>
             <option value="all">Every licence</option>
           </Select>
-          <Button
-            size="sm"
-            variant="secondary"
-            loading={action.busy === "sweep"}
-            onClick={() =>
-              void action
-                .run("sweep", () => api.post(`${BASE}/licences/sweep`, {}))
-                .then((ok) => ok && licences.reload())
-            }
-          >
-            Run the sweep now
-          </Button>
+          {maySweep ? (
+            <Button
+              size="sm"
+              variant="secondary"
+              loading={action.busy === "sweep"}
+              onClick={() =>
+                void action
+                  .run("sweep", () => api.post(`${BASE}/licences/sweep`, {}))
+                  .then((ok) => ok && licences.reload())
+              }
+            >
+              Run the sweep now
+            </Button>
+          ) : (
+            <span className="text-2xs text-content-subtle">
+              The sweep runs on its own schedule; running it by hand is an admin act.
+            </span>
+          )}
         </div>
       </div>
       <RefusalPanel refusal={action.refusal} onDismiss={action.clear} />

@@ -94,6 +94,16 @@ import { submissionRoutes } from "./submissions.js";
  *     costs are captured against the pursuit so "what does a win cost" is a
  *     figure rather than a feeling.
  *
+ * COMPANY-LEVEL AUTHORISATION (access.ts). `requireTool` resolves a project
+ * from `:projectId` and therefore cannot guard a `/companies/current/...`
+ * route. `requireBiddingScope` resolves the same `bidding` permission across
+ * the caller's project memberships instead, and the analytics filter their
+ * rows to that scope: the per-vendor pricing history is the most
+ * commercially sensitive data this module holds, and it is not reachable
+ * with plain company membership by somebody who is refused the tabulation of
+ * a single package. The opportunity pipeline carries the same permission —
+ * read to read it, standard to move it.
+ *
  * Money discipline throughout: figures in different currencies are never
  * summed and never ranked against each other, and anything the platform
  * cannot derive is `{ value: null, reasons: [...] }` rather than a zero that
@@ -105,6 +115,9 @@ import { submissionRoutes } from "./submissions.js";
  *     bonds, integrity, scope-gaps, document-access, publish, health-inputs,
  *     evaluation/propose — the AI levelling assistant, which PROPOSES cited
  *     drafts and writes nothing; 503 AiDisabled with no key)
+ *   /projects/:projectId/bidding/budget-lines   (the lines an approved award
+ *     may charge its committed cost to — a package that names none produces
+ *     a commitment the project budget never sees)
  *   /bid-invitations/:invitationId/...      /bid-portal/...   (hashed token)
  *   /bid-submissions/:submissionId/...      /bid-levelling-*  /bid-awards/...
  *   /bid-bonds/:bondId/status

@@ -20,7 +20,7 @@
  * contracting businesses; the cost-of-sale panel turns "we spend a fortune on
  * bids we lose" into a figure with a currency on it.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Alert,
   Badge,
@@ -79,6 +79,16 @@ const STAGES = [
   "no_bid",
   "abandoned",
 ] as const;
+
+/** The stages where a pursuit is still live — mirrors LIVE_OPPORTUNITY_STAGES. */
+const LIVE_STAGES: readonly string[] = [
+  "identified",
+  "qualifying",
+  "bid_no_bid",
+  "bidding",
+  "submitted",
+  "shortlisted",
+];
 
 const FACTORS = [
   "client_relationship",
@@ -614,6 +624,131 @@ function CreateOpportunityModal({
 }
 
 /* ================================================================== */
+/* Correcting a pursuit                                                */
+/* ================================================================== */
+
+interface EditForm {
+  title: string;
+  description: string;
+  clientName: string;
+  sector: string;
+  workType: string;
+  tradeCode: string;
+  region: string;
+  source: string;
+  estimatedValue: string;
+  currency: string;
+  expectedMarginPercent: string;
+  submissionDueAt: string;
+  decisionExpectedAt: string;
+  peakResourceUnits: string;
+  resourceUnitLabel: string;
+}
+
+const EMPTY_EDIT: EditForm = {
+  title: "",
+  description: "",
+  clientName: "",
+  sector: "",
+  workType: "",
+  tradeCode: "",
+  region: "",
+  source: "other",
+  estimatedValue: "",
+  currency: "USD",
+  expectedMarginPercent: "",
+  submissionDueAt: "",
+  decisionExpectedAt: "",
+  peakResourceUnits: "",
+  resourceUnitLabel: "",
+};
+
+/** ISO → the value a `datetime-local` input expects, in the viewer's zone. */
+function localInput(iso: string | null | undefined): string {
+  if (!iso) return "";
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return "";
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function isoFromLocal(value: string): string | null {
+  if (!value.trim()) return null;
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? null : new Date(ms).toISOString();
+}
+
+function numOrNull(value: string): number | null {
+  if (!value.trim()) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function editFromOpportunity(o: Opportunity): EditForm {
+  return {
+    title: o.title,
+    description: o.description ?? "",
+    clientName: o.clientName ?? "",
+    sector: o.sector ?? "",
+    workType: o.workType ?? "",
+    tradeCode: o.tradeCode ?? "",
+    region: o.region ?? "",
+    source: o.source,
+    estimatedValue: o.estimatedValue === null ? "" : String(o.estimatedValue),
+    currency: o.currency,
+    expectedMarginPercent:
+      o.expectedMarginPercent === null ? "" : String(o.expectedMarginPercent),
+    submissionDueAt: localInput(o.submissionDueAt),
+    // `decisionExpectedAt` is an isoDateSchema field on the API, not a
+    // timestamp: it goes back exactly as it came, YYYY-MM-DD.
+    decisionExpectedAt: (o.decisionExpectedAt ?? "").slice(0, 10),
+    peakResourceUnits: o.peakResourceUnits === null ? "" : String(o.peakResourceUnits),
+    resourceUnitLabel: o.resourceUnitLabel ?? "",
+  };
+}
+
+/** Only what actually moved is sent, so an untouched field is never rewritten. */
+function editBody(next: EditForm, prev: EditForm): Record<string, unknown> {
+  const body: Record<string, unknown> = {};
+  const put = (key: string, a: unknown, b: unknown) => {
+    if (JSON.stringify(a) !== JSON.stringify(b)) body[key] = a;
+  };
+  put("title", next.title.trim(), prev.title.trim());
+  put("description", next.description.trim() || null, prev.description.trim() || null);
+  put("clientName", next.clientName.trim() || null, prev.clientName.trim() || null);
+  put("sector", next.sector.trim() || null, prev.sector.trim() || null);
+  put("workType", next.workType.trim() || null, prev.workType.trim() || null);
+  put("tradeCode", next.tradeCode.trim() || null, prev.tradeCode.trim() || null);
+  put("region", next.region.trim() || null, prev.region.trim() || null);
+  put("source", next.source, prev.source);
+  put("estimatedValue", numOrNull(next.estimatedValue), numOrNull(prev.estimatedValue));
+  put("currency", next.currency.trim().toUpperCase(), prev.currency.trim().toUpperCase());
+  put(
+    "expectedMarginPercent",
+    numOrNull(next.expectedMarginPercent),
+    numOrNull(prev.expectedMarginPercent),
+  );
+  put(
+    "submissionDueAt",
+    isoFromLocal(next.submissionDueAt),
+    isoFromLocal(prev.submissionDueAt),
+  );
+  put(
+    "decisionExpectedAt",
+    next.decisionExpectedAt || null,
+    prev.decisionExpectedAt || null,
+  );
+  put("peakResourceUnits", numOrNull(next.peakResourceUnits), numOrNull(prev.peakResourceUnits));
+  put(
+    "resourceUnitLabel",
+    next.resourceUnitLabel.trim() || null,
+    prev.resourceUnitLabel.trim() || null,
+  );
+  return body;
+}
+
+/* ================================================================== */
 /* The drawer: gate, probability, outcome, costs                       */
 /* ================================================================== */
 
@@ -644,6 +779,19 @@ function OpportunityDrawer({
   const [costHours, setCostHours] = useState("");
   const [costRate, setCostRate] = useState("");
   const [costDescription, setCostDescription] = useState("");
+  /* stage + correction */
+  const [stage, setStage] = useState("");
+  const [stageNote, setStageNote] = useState("");
+  const [editOpen, setEditOpen] = useState(false);
+  const [edit, setEdit] = useState<EditForm>(EMPTY_EDIT);
+
+  useEffect(() => {
+    if (!opportunity) return;
+    setStage(opportunity.stage);
+    setStageNote("");
+    setEditOpen(false);
+    setEdit(editFromOpportunity(opportunity));
+  }, [opportunity]);
 
   const scored = useMemo(
     () =>
@@ -667,6 +815,51 @@ function OpportunityDrawer({
     );
     if (res) {
       setProbability(res);
+      onChanged();
+    }
+  }
+
+  /**
+   * MOVING THE PURSUIT ALONG.
+   *
+   * `decide` and `outcome` between them reach only four of the ten stages:
+   * `qualifying`, `bid_no_bid`, `submitted` and `shortlisted` are computed
+   * from, filtered on and charged for capacity by this very screen and could
+   * not be reached from a browser at all. The API has always had the route.
+   */
+  async function moveStage() {
+    if (!opportunity || stage === opportunity.stage) return;
+    const res = await action.run("stage", () =>
+      api.post(`/api/v1/companies/current/opportunities/${opportunity.id}/stage`, {
+        stage,
+        ...(stageNote.trim() ? { note: stageNote.trim() } : {}),
+      }),
+    );
+    if (res) {
+      setStageNote("");
+      onChanged();
+    }
+  }
+
+  /**
+   * CORRECTING WHAT WAS TYPED.
+   *
+   * A mistyped client, value, currency or submission date could never be
+   * fixed, and the `bidding.opportunities` sweep raises "submission date
+   * passed with no outcome" against a date nobody could reach. PATCH is
+   * refused outright once an outcome is recorded — a decided pursuit is the
+   * history the win model is fitted on — so the form is hidden there and
+   * says why.
+   */
+  async function saveEdit() {
+    if (!opportunity) return;
+    const body = editBody(edit, editFromOpportunity(opportunity));
+    if (Object.keys(body).length === 0) return;
+    const res = await action.run("edit", () =>
+      api.patch(`/api/v1/companies/current/opportunities/${opportunity.id}`, body),
+    );
+    if (res) {
+      setEditOpen(false);
       onChanged();
     }
   }
@@ -755,6 +948,186 @@ function OpportunityDrawer({
               }
             />
           </div>
+
+          {/* ---------------------------------------------------- */}
+          {/* Stage, and correcting what was typed                  */}
+          {/* ---------------------------------------------------- */}
+          <section className="rounded-lg border border-border bg-surface-sunken p-3">
+            <div className="flex flex-wrap items-end justify-between gap-2">
+              <Field
+                label="Stage"
+                className="min-w-[14rem] flex-1"
+                hint={
+                  opportunity.outcome
+                    ? `Closed as "${titleCase(opportunity.outcome)}" — reopening a decided pursuit would silently change the outcome history the win model learns from.`
+                    : "Bidding requires the bid/no-bid gate to have been passed first."
+                }
+              >
+                <Select value={stage} onChange={(e) => setStage(e.target.value)}>
+                  {/*
+                   * Once an outcome is recorded the LIVE stages disappear
+                   * rather than being offered and refused: reopening a decided
+                   * pursuit would silently change the history the win model is
+                   * fitted on. Moving between terminal stages is still a
+                   * correction somebody may legitimately need.
+                   */}
+                  {STAGES.filter(
+                    (st) => !opportunity.outcome || !LIVE_STAGES.includes(st),
+                  ).map((st) => (
+                    <option key={st} value={st}>
+                      {titleCase(st)}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              <Field label="Note" optional className="min-w-[14rem] flex-[2]">
+                <Input
+                  value={stageNote}
+                  onChange={(e) => setStageNote(e.target.value)}
+                  placeholder="What moved it"
+                />
+              </Field>
+              <Button
+                size="sm"
+                variant="secondary"
+                loading={action.busy === "stage"}
+                disabled={stage === opportunity.stage}
+                onClick={() => void moveStage()}
+              >
+                Move stage
+              </Button>
+              {opportunity.outcome ? null : (
+                <Button size="sm" variant="ghost" onClick={() => setEditOpen((v) => !v)}>
+                  {editOpen ? "Cancel edit" : "Correct details"}
+                </Button>
+              )}
+            </div>
+
+            {editOpen ? (
+              <div className="mt-3 space-y-3 border-t border-border pt-3">
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <Field label="Title" required>
+                    <Input
+                      value={edit.title}
+                      onChange={(e) => setEdit({ ...edit, title: e.target.value })}
+                    />
+                  </Field>
+                  <Field label="Client">
+                    <Input
+                      value={edit.clientName}
+                      onChange={(e) => setEdit({ ...edit, clientName: e.target.value })}
+                    />
+                  </Field>
+                  <Field label="Estimated value">
+                    <Input
+                      type="number"
+                      inputMode="decimal"
+                      value={edit.estimatedValue}
+                      onChange={(e) => setEdit({ ...edit, estimatedValue: e.target.value })}
+                    />
+                  </Field>
+                  <Field label="Currency">
+                    <Input
+                      value={edit.currency}
+                      maxLength={8}
+                      onChange={(e) => setEdit({ ...edit, currency: e.target.value })}
+                    />
+                  </Field>
+                  <Field label="Submission due">
+                    <Input
+                      type="datetime-local"
+                      value={edit.submissionDueAt}
+                      onChange={(e) => setEdit({ ...edit, submissionDueAt: e.target.value })}
+                    />
+                  </Field>
+                  <Field label="Decision expected" hint="A date — this is when the client says they will decide.">
+                    <Input
+                      type="date"
+                      value={edit.decisionExpectedAt}
+                      onChange={(e) => setEdit({ ...edit, decisionExpectedAt: e.target.value })}
+                    />
+                  </Field>
+                  <Field label="Sector">
+                    <Input
+                      value={edit.sector}
+                      onChange={(e) => setEdit({ ...edit, sector: e.target.value })}
+                    />
+                  </Field>
+                  <Field label="Work type">
+                    <Input
+                      value={edit.workType}
+                      onChange={(e) => setEdit({ ...edit, workType: e.target.value })}
+                    />
+                  </Field>
+                  <Field label="Trade code">
+                    <Input
+                      value={edit.tradeCode}
+                      onChange={(e) => setEdit({ ...edit, tradeCode: e.target.value })}
+                    />
+                  </Field>
+                  <Field label="Region">
+                    <Input
+                      value={edit.region}
+                      onChange={(e) => setEdit({ ...edit, region: e.target.value })}
+                    />
+                  </Field>
+                  <Field label="Source">
+                    <Select
+                      value={edit.source}
+                      onChange={(e) => setEdit({ ...edit, source: e.target.value })}
+                    >
+                      {SOURCES.map((src) => (
+                        <option key={src} value={src}>
+                          {titleCase(src)}
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                  <Field label="Expected margin %">
+                    <Input
+                      type="number"
+                      inputMode="decimal"
+                      value={edit.expectedMarginPercent}
+                      onChange={(e) =>
+                        setEdit({ ...edit, expectedMarginPercent: e.target.value })
+                      }
+                    />
+                  </Field>
+                  <Field label="Peak resource units">
+                    <Input
+                      type="number"
+                      inputMode="decimal"
+                      value={edit.peakResourceUnits}
+                      onChange={(e) => setEdit({ ...edit, peakResourceUnits: e.target.value })}
+                    />
+                  </Field>
+                  <Field label="Resource unit">
+                    <Input
+                      value={edit.resourceUnitLabel}
+                      onChange={(e) => setEdit({ ...edit, resourceUnitLabel: e.target.value })}
+                    />
+                  </Field>
+                </div>
+                <Field label="Description" optional>
+                  <Textarea
+                    rows={2}
+                    value={edit.description}
+                    onChange={(e) => setEdit({ ...edit, description: e.target.value })}
+                  />
+                </Field>
+                <div className="flex justify-end">
+                  <Button
+                    size="sm"
+                    loading={action.busy === "edit"}
+                    disabled={edit.title.trim().length === 0}
+                    onClick={() => void saveEdit()}
+                  >
+                    Save corrections
+                  </Button>
+                </div>
+              </div>
+            ) : null}
+          </section>
 
           {/* ---------------------------------------------------- */}
           {/* The gate                                              */}

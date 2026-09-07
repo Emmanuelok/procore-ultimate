@@ -14,13 +14,19 @@
  * record-level PATCH/DELETE that resolve the photo's project and enforce
  * the `photos` tool level (audit: photos.ts:175).
  *
- * Deliberately NOT here: image resizing (no image library in the runtime —
- * the content route serves the original with cache headers and says so),
+ * Variants: `GET .../photos/:id/variant/:size` serves the camera's own EXIF
+ * thumbnail when the uploaded file carried one, so a 48-tile gallery moves
+ * kilobytes per tile instead of full-resolution originals, and otherwise
+ * falls back to the original and says which it sent in `x-photo-variant`.
+ *
+ * Deliberately NOT here: generated renditions at arbitrary sizes (there is no
+ * image library in the runtime, and a client-supplied "thumbnail" would be an
+ * image the uploader chose rather than a derivative of the stored evidence),
  * and the daily-log agent's consumption of tags (modules/ai).
  */
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 import type { Readable } from "node:stream";
-import { and, asc, count, desc, eq, gte, ilike, inArray, isNotNull, isNull, lte, ne, or, type SQL } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, ilike, inArray, isNotNull, isNull, lte, ne, or, sql, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import { fileVersions, files, photoAlbums, photos, signals } from "@constructos/db";
 import { SIGNAL_SEVERITIES } from "@constructos/shared";
@@ -41,6 +47,7 @@ import {
   BULK_DOWNLOAD_MAX_BYTES,
   PHOTO_MAX_BYTES,
   extractExif,
+  extractExifThumbnail,
   isValidPin,
   sniffMediaType,
 } from "./photoEngine.js";
@@ -97,6 +104,13 @@ const albumSchema = z.object({
 });
 
 const bulkDownloadSchema = z.object({ photoIds: z.array(z.string().min(1)).min(1).max(100) });
+
+/**
+ * Rendition keys the variant route understands. Only `thumb` has a generator
+ * today (the EXIF-embedded rendition); a second key would need a real image
+ * library in the API runtime, which this package deliberately does not add.
+ */
+const PHOTO_VARIANT_SIZES = ["thumb"] as const;
 
 const AI_IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"] as const;
 type AiImageType = (typeof AI_IMAGE_TYPES)[number];
@@ -193,9 +207,19 @@ export const photoRoutes: FastifyPluginAsync = async (app) => {
     return { id: f.id, name: f.name, contentType: f.contentType, sizeBytes: f.sizeBytes };
   }
 
+  /**
+   * Wire shape of a photo. `variants` is reduced to the size keys that exist:
+   * storage keys are internal plumbing, and the client only needs to know
+   * whether `/variant/thumb` will be a real rendition or a fallback.
+   */
+  function presentPhoto<T extends PhotoRow>(row: T) {
+    const { variants, ...rest } = row;
+    return { ...rest, variants: Object.keys(variants ?? {}) };
+  }
+
   async function withFile(row: PhotoRow) {
     const f = (await app.db.select().from(files).where(eq(files.id, row.fileId)).limit(1))[0];
-    return { ...row, file: f ? fileMeta(f) : null };
+    return { ...presentPhoto(row), file: f ? fileMeta(f) : null };
   }
 
   /* ---------------------------------------------------------------- */
@@ -345,6 +369,10 @@ export const photoRoutes: FastifyPluginAsync = async (app) => {
       pin = parsed;
     }
     const exif = mediaType === "image/jpeg" ? extractExif(fileBuf) : null;
+    // The camera's own rendition, taken out of the uploaded bytes. Only JPEGs
+    // written by a camera or phone carry one; everything else has no variant
+    // and the variant route falls back to the original rather than faking it.
+    const embeddedThumb = mediaType === "image/jpeg" ? extractExifThumbnail(fileBuf) : null;
     const takenAt = parseTakenAt(meta.takenAt) ?? exif?.takenAt ?? null;
     const latitude = meta.latitude ?? exif?.latitude ?? null;
     const longitude = meta.longitude ?? exif?.longitude ?? null;
@@ -354,6 +382,18 @@ export const photoRoutes: FastifyPluginAsync = async (app) => {
     // Was this blob already stored? Content addressing dedupes identical
     // payloads, so a rollback must only remove a blob nobody else references.
     const saved = await app.storage.saveBuffer(req.companyId!, fileBuf);
+    const savedThumb = embeddedThumb ? await app.storage.saveBuffer(req.companyId!, embeddedThumb) : null;
+    const variants: PhotoRow["variants"] = savedThumb
+      ? {
+          thumb: {
+            storageKey: savedThumb.storageKey,
+            sizeBytes: savedThumb.sizeBytes,
+            sha256: savedThumb.sha256,
+            contentType: "image/jpeg",
+            source: "exif_ifd1",
+          },
+        }
+      : {};
     const fileId = newId("fil");
     const photoId = newId("pho");
     const aiStatus = aiEnabled(app) ? "pending" : "skipped";
@@ -398,6 +438,7 @@ export const photoRoutes: FastifyPluginAsync = async (app) => {
           is360,
           pin,
           exif: exif ? { ...exif, source: "jpeg_app1" } : null,
+          variants,
           aiStatus,
           aiError: aiStatus === "skipped" ? "AI is not configured (ANTHROPIC_API_KEY unset)" : null,
           contentType: mediaType,
@@ -412,6 +453,17 @@ export const photoRoutes: FastifyPluginAsync = async (app) => {
         .where(and(eq(files.storageKey, saved.storageKey), ne(files.id, fileId)))
         .limit(1);
       if (others.length === 0) await app.storage.remove(saved.storageKey).catch(() => undefined);
+      if (savedThumb) {
+        // Same rule for the rendition: content addressing means an identical
+        // thumbnail may already belong to another photo, so only remove a key
+        // no surviving photo row points at.
+        const sharing = await app.db
+          .select({ id: photos.id })
+          .from(photos)
+          .where(sql`${photos.variants} -> 'thumb' ->> 'storageKey' = ${savedThumb.storageKey}`)
+          .limit(1);
+        if (sharing.length === 0) await app.storage.remove(savedThumb.storageKey).catch(() => undefined);
+      }
       throw err;
     }
     // Outside the rollback guard on purpose: the rows above are committed, so a
@@ -431,6 +483,7 @@ export const photoRoutes: FastifyPluginAsync = async (app) => {
         takenAt,
         hasGps: latitude !== null && longitude !== null,
         exif: Boolean(exif),
+        variants: Object.keys(variants),
       },
       projectId: req.projectId!,
     });
@@ -444,7 +497,7 @@ export const photoRoutes: FastifyPluginAsync = async (app) => {
         });
       });
     }
-    return reply.status(201).send({ ...row, file: fileMeta({ id: fileId, name: filename, contentType: mediaType, sizeBytes: saved.sizeBytes }) });
+    return reply.status(201).send({ ...presentPhoto(row), file: fileMeta({ id: fileId, name: filename, contentType: mediaType, sizeBytes: saved.sizeBytes }) });
   });
 
   /* ---------------------------------------------------------------- */
@@ -500,7 +553,7 @@ export const photoRoutes: FastifyPluginAsync = async (app) => {
       .offset(pageOffset(q));
     return paginate(
       rows.map((r) => ({
-        ...r.photo,
+        ...presentPhoto(r.photo),
         albumIsPrivate: r.albumPrivate === 1,
         file: fileMeta({ id: r.photo.fileId, name: r.fileName, contentType: r.contentType, sizeBytes: r.sizeBytes }),
       })),
@@ -713,6 +766,38 @@ export const photoRoutes: FastifyPluginAsync = async (app) => {
     return sendContent(req, reply, row);
   });
 
+  /**
+   * A derived rendition for gallery tiles. `x-photo-variant` says what was
+   * actually sent: `thumb` when the file carried a camera thumbnail we
+   * extracted at upload, `original` when it did not — the client is never
+   * told it received a rendition it did not receive. Like /content this is
+   * deliberately un-ledgered: a page of tiles is not a page of access events.
+   */
+  async function sendVariant(req: FastifyRequest, reply: FastifyReply, row: PhotoRow, size: string) {
+    const v = row.variants?.[size];
+    if (!v) {
+      void reply.header("x-photo-variant", "original");
+      return sendContent(req, reply, row);
+    }
+    void reply.header("x-photo-variant", size);
+    return sendRanged(
+      app.storage,
+      req,
+      reply,
+      { storageKey: v.storageKey, sizeBytes: v.sizeBytes, contentType: v.contentType, filename: `${row.id}-${size}.jpg`, sha256: v.sha256 },
+      { disposition: "inline" },
+    );
+  }
+
+  app.get("/projects/:projectId/photos/:photoId/variant/:size", { preHandler: readGate }, async (req, reply) => {
+    const { photoId, size } = req.params as { photoId: string; size: string };
+    if (!(PHOTO_VARIANT_SIZES as readonly string[]).includes(size)) {
+      throw badRequest(`Unknown variant "${size}" — available: ${PHOTO_VARIANT_SIZES.join(", ")}`);
+    }
+    const row = await loadPhotoForLevel(req, photoId, "read");
+    return sendVariant(req, reply, row, size);
+  });
+
   app.post("/projects/:projectId/photos/:photoId/analyse", { preHandler: standardGate }, async (req) => {
     const { photoId } = req.params as { photoId: string };
     const row = await loadPhotoForLevel(req, photoId, "standard");
@@ -791,5 +876,13 @@ export const photoRoutes: FastifyPluginAsync = async (app) => {
     const { photoId } = req.params as { photoId: string };
     const row = await loadPhotoForLevel(req, photoId, "read");
     return sendContent(req, reply, row);
+  });
+  app.get("/photos/:photoId/variant/:size", { preHandler: companyGate }, async (req, reply) => {
+    const { photoId, size } = req.params as { photoId: string; size: string };
+    if (!(PHOTO_VARIANT_SIZES as readonly string[]).includes(size)) {
+      throw badRequest(`Unknown variant "${size}" — available: ${PHOTO_VARIANT_SIZES.join(", ")}`);
+    }
+    const row = await loadPhotoForLevel(req, photoId, "read");
+    return sendVariant(req, reply, row, size);
   });
 };

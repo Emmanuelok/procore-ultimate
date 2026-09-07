@@ -77,7 +77,7 @@ export async function sweepMissedDeadlines(
             .set({ status: "breached" })
             .where(and(eq(obligations.id, step.obligationId), eq(obligations.status, "open")));
         }
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId,
           actorId: null,
           action: "state_change",

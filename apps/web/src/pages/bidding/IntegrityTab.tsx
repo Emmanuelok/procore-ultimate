@@ -150,10 +150,13 @@ export default function IntegrityTab({
       description:
         "A dismissal with a stated reason is what makes the detector's precision measurable: a " +
         "detector whose findings are always dismissed should be re-tuned or retired, and that " +
-        "only becomes visible if the dismissals are counted.",
+        "only becomes visible if the dismissals are counted. It also switches off the " +
+        "written-acknowledgement gate on the next recommendation, so it takes an integrity " +
+        "reviewer or a company admin — and a finding you dismissed yourself still has to be " +
+        "acknowledged in your own recommendation.",
       label: "What was checked, and what was found",
       confirmLabel: "Dismiss",
-      minLength: 3,
+      minLength: 20,
     });
     if (!text) return;
     const res = await action.run(signalId, () =>

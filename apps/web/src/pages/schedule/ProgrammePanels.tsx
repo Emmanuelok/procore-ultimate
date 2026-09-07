@@ -36,6 +36,7 @@ import type {
   MilestoneRow,
   NarrativeRow,
   ResourcesResponse,
+  ResourceRow,
   RevisionCompareResponse,
   RevisionDiffSummary,
   ScheduleRow,
@@ -54,6 +55,14 @@ function Value({ value, suffix }: { value: number | null | undefined; suffix?: s
       {suffix ?? ""}
     </span>
   );
+}
+
+/** Free-typed ISO dates → the array the API expects; anything else is dropped. */
+function parseDates(raw: string): string[] {
+  return raw
+    .split(/[\s,]+/)
+    .map((h) => h.trim())
+    .filter((h) => /^\d{4}-\d{2}-\d{2}$/.test(h));
 }
 
 function money(value: number | null | undefined, currency: string): string {
@@ -164,6 +173,30 @@ export function EarnedValuePanel({ base, scheduleId }: { base: string; scheduleI
           label="Schedule EAC"
           value={data.scheduleEacDays === null ? "—" : `${data.scheduleEacDays} d`}
           hint={data.plannedDurationDays === null ? "no planned duration" : `planned ${data.plannedDurationDays} d`}
+        />
+      </div>
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <Stat label="Schedule variance" value={money(data.sv, c)} hint="earned − planned" />
+        <Stat
+          label="Cost variance"
+          value={data.cv === null ? "—" : money(data.cv, c)}
+          hint={
+            data.cv === null
+              ? data.costUnknown > 0
+                ? "too little of the budget carries a booked cost"
+                : "no cost has been booked"
+              : "costed earned value − actual cost"
+          }
+        />
+        <Stat
+          label="Cost to complete"
+          value={money(data.etc, c)}
+          hint={data.etc === null ? "no forecast at completion" : "forecast − actual"}
+        />
+        <Stat
+          label="Variance at completion"
+          value={money(data.vac, c)}
+          hint={data.vac === null ? "no forecast at completion" : "budget − forecast"}
         />
       </div>
 
@@ -556,7 +589,7 @@ export function ConstraintsPanel({
 
 const DAY_LABELS = ["S", "M", "T", "W", "T", "F", "S"];
 
-export function CalendarsPanel({ base }: { base: string }) {
+export function CalendarsPanel({ base, onChanged }: { base: string; onChanged?: () => void }) {
   const { data, loading, error, reload } = useResource<{ items: CalendarRow[] }>(
     `${base}/schedule-calendars`,
   );
@@ -566,6 +599,86 @@ export function CalendarsPanel({ base }: { base: string }) {
   const [holidays, setHolidays] = useState("");
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const [editId, setEditId] = useState<string | null>(null);
+  const [editName, setEditName] = useState("");
+  const [editWorkdays, setEditWorkdays] = useState<number[]>([0, 1, 1, 1, 1, 1, 0]);
+  const [editHours, setEditHours] = useState("8");
+  const [editHolidays, setEditHolidays] = useState("");
+
+  function refresh() {
+    reload();
+    onChanged?.();
+  }
+
+  function beginEdit(c: CalendarRow) {
+    setFormError(null);
+    setEditId(c.id);
+    setEditName(c.name);
+    setEditWorkdays([...c.workdays]);
+    setEditHours(String(c.hoursPerDay));
+    setEditHolidays(c.holidays.join(", "));
+  }
+
+  /**
+   * Changing a working week or a holiday list moves every date on every
+   * programme that uses the calendar — the API recomputes them and says how
+   * many, so the panel reloads the workspace rather than leaving stale dates
+   * on screen.
+   */
+  async function saveEdit(e: FormEvent) {
+    e.preventDefault();
+    if (!editId) return;
+    if (editWorkdays.every((d) => d === 0)) {
+      setFormError("A calendar must have at least one working day.");
+      return;
+    }
+    setBusy(true);
+    setFormError(null);
+    try {
+      await api.patch(`${base}/schedule-calendars/${editId}`, {
+        name: editName.trim(),
+        workdays: editWorkdays,
+        hoursPerDay: Number(editHours) || 8,
+        holidays: parseDates(editHolidays),
+      });
+      setEditId(null);
+      refresh();
+    } catch (err) {
+      setFormError(errMessage(err, "The calendar could not be saved."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function makeDefault(c: CalendarRow) {
+    setBusy(true);
+    setFormError(null);
+    try {
+      await api.patch(`${base}/schedule-calendars/${c.id}`, { isDefault: true });
+      refresh();
+    } catch (err) {
+      setFormError(errMessage(err, "The default calendar could not be changed."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /* The API refuses while activities or a programme default still point at the
+     calendar — a dangling id would silently revert those durations to calendar
+     days — so its 409 message is shown verbatim. */
+  async function removeCalendar(c: CalendarRow) {
+    setBusy(true);
+    setFormError(null);
+    try {
+      await api.del(`${base}/schedule-calendars/${c.id}`);
+      if (editId === c.id) setEditId(null);
+      refresh();
+    } catch (err) {
+      setFormError(errMessage(err, "The calendar could not be deleted."));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function onCreate(e: FormEvent) {
     e.preventDefault();
@@ -577,14 +690,11 @@ export function CalendarsPanel({ base }: { base: string }) {
         name: name.trim(),
         workdays,
         hoursPerDay: Number(hoursPerDay) || 8,
-        holidays: holidays
-          .split(/[\s,]+/)
-          .map((h) => h.trim())
-          .filter((h) => /^\d{4}-\d{2}-\d{2}$/.test(h)),
+        holidays: parseDates(holidays),
       });
       setName("");
       setHolidays("");
-      reload();
+      refresh();
     } catch (err) {
       setFormError(errMessage(err, "The calendar could not be created."));
     } finally {
@@ -652,22 +762,85 @@ export function CalendarsPanel({ base }: { base: string }) {
                 <span className="text-sm font-medium text-ink-900">{c.name}</span>
                 {c.isDefault === 1 ? <Badge tone="blue">default</Badge> : null}
               </div>
-              <div className="flex gap-1">
-                {DAY_LABELS.map((d, i) => (
-                  <span
-                    key={`${c.id}-${i}`}
-                    className={`flex h-6 w-6 items-center justify-center rounded text-[11px] ${
-                      c.workdays[i] === 1 ? "bg-emerald-100 text-emerald-700" : "bg-ink-100 text-ink-400"
-                    }`}
-                  >
-                    {d}
-                  </span>
-                ))}
-              </div>
-              <div className="text-xs text-ink-500">
-                {c.hoursPerDay} h/day · {c.holidays.length} holiday{c.holidays.length === 1 ? "" : "s"}
-                {c.scheduleId ? " · schedule-specific" : " · project-wide"}
-              </div>
+              {editId === c.id ? (
+                <form className="space-y-2" onSubmit={saveEdit}>
+                  <Field label="Name">
+                    <Input value={editName} onChange={(e) => setEditName(e.target.value)} required />
+                  </Field>
+                  <Field label="Working week">
+                    <div className="flex gap-1">
+                      {DAY_LABELS.map((d, i) => (
+                        <button
+                          key={`edit-${c.id}-${i}`}
+                          type="button"
+                          aria-pressed={editWorkdays[i] === 1}
+                          onClick={() =>
+                            setEditWorkdays((prev) =>
+                              prev.map((v, idx) => (idx === i ? (v === 1 ? 0 : 1) : v)),
+                            )
+                          }
+                          className={`h-7 w-7 rounded text-xs font-medium ${
+                            editWorkdays[i] === 1 ? "bg-brand-600 text-white" : "bg-ink-100 text-ink-500"
+                          }`}
+                        >
+                          {d}
+                        </button>
+                      ))}
+                    </div>
+                  </Field>
+                  <div className="grid grid-cols-2 gap-2">
+                    <Field label="Hours per day">
+                      <Input value={editHours} onChange={(e) => setEditHours(e.target.value)} inputMode="decimal" />
+                    </Field>
+                    <Field label="Holidays (ISO dates)">
+                      <Input value={editHolidays} onChange={(e) => setEditHolidays(e.target.value)} />
+                    </Field>
+                  </div>
+                  <p className="text-[11px] text-ink-400">
+                    Saving recomputes every programme that uses this calendar.
+                  </p>
+                  <div className="flex gap-2">
+                    <Button type="submit" size="xs" disabled={busy}>
+                      Save
+                    </Button>
+                    <Button type="button" size="xs" variant="ghost" onClick={() => setEditId(null)}>
+                      Cancel
+                    </Button>
+                  </div>
+                </form>
+              ) : (
+                <>
+                  <div className="flex gap-1">
+                    {DAY_LABELS.map((d, i) => (
+                      <span
+                        key={`${c.id}-${i}`}
+                        className={`flex h-6 w-6 items-center justify-center rounded text-[11px] ${
+                          c.workdays[i] === 1 ? "bg-emerald-100 text-emerald-700" : "bg-ink-100 text-ink-400"
+                        }`}
+                      >
+                        {d}
+                      </span>
+                    ))}
+                  </div>
+                  <div className="text-xs text-ink-500">
+                    {c.hoursPerDay} h/day · {c.holidays.length} holiday{c.holidays.length === 1 ? "" : "s"}
+                    {c.scheduleId ? " · schedule-specific" : " · project-wide"}
+                  </div>
+                  <div className="flex flex-wrap gap-1 pt-1">
+                    <Button size="xs" variant="ghost" disabled={busy} onClick={() => beginEdit(c)}>
+                      Edit
+                    </Button>
+                    {c.isDefault === 1 ? null : (
+                      <Button size="xs" variant="ghost" disabled={busy} onClick={() => void makeDefault(c)}>
+                        Make default
+                      </Button>
+                    )}
+                    <Button size="xs" variant="ghost" disabled={busy} onClick={() => void removeCalendar(c)}>
+                      Delete
+                    </Button>
+                  </div>
+                </>
+              )}
             </CardBody>
           </Card>
         ))}
@@ -1010,6 +1183,11 @@ export function ResourcesPanel({
   const [unitRate, setUnitRate] = useState("");
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const [editId, setEditId] = useState<string | null>(null);
+  const [editBudgetedUnits, setEditBudgetedUnits] = useState("");
+  const [editActualUnits, setEditActualUnits] = useState("");
+  const [editRate, setEditRate] = useState("");
+  const [editActualCost, setEditActualCost] = useState("");
 
   const taskName = new Map(tasks.map((t) => [t.id, t.name] as const));
 
@@ -1045,9 +1223,63 @@ export function ResourcesPanel({
     setFormError(null);
     try {
       await api.del(`${base}/schedule-task-resources/${id}`);
+      if (editId === id) setEditId(null);
       reload();
     } catch (err) {
       setFormError(errMessage(err, "The assignment could not be removed."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function beginEdit(r: ResourceRow) {
+    setFormError(null);
+    setEditId(r.id);
+    setEditBudgetedUnits(String(r.budgetedUnits));
+    setEditActualUnits(String(r.actualUnits));
+    setEditRate(r.unitRate === null ? "" : String(r.unitRate));
+    /* Left blank on purpose: cost is DERIVED from rate x units, and sending a
+       figure here pins it and stops the derivation. The field is an override,
+       so it starts empty and shows what is currently stored as its placeholder. */
+    setEditActualCost("");
+  }
+
+  /**
+   * Recording progress against an assignment is what turns earned value's
+   * actual cost from "not available" into a figure: the CPI denominator is
+   * built from booked resource cost, so without this the index was withheld
+   * on every programme forever. An empty rate clears it (cost unknown) rather
+   * than booking zero.
+   */
+  async function saveEdit(e: FormEvent) {
+    e.preventDefault();
+    if (!editId) return;
+    const num = (raw: string): number | null | undefined => {
+      if (raw.trim() === "") return null;
+      const n = Number(raw);
+      return Number.isFinite(n) && n >= 0 ? n : undefined;
+    };
+    const budgeted = num(editBudgetedUnits);
+    const actualUnits = num(editActualUnits);
+    const rate = num(editRate);
+    const actualCost = num(editActualCost);
+    if (budgeted === undefined || actualUnits === undefined || rate === undefined || actualCost === undefined) {
+      setFormError("Units, rate and cost must be numbers of 0 or more.");
+      return;
+    }
+    setBusy(true);
+    setFormError(null);
+    try {
+      await api.patch(`${base}/schedule-task-resources/${editId}`, {
+        budgetedUnits: budgeted ?? 0,
+        actualUnits: actualUnits ?? 0,
+        unitRate: rate,
+        ...(actualCost === null ? {} : { actualCost }),
+      });
+      setEditId(null);
+      reload();
+    } catch (err) {
+      setFormError(errMessage(err, "The assignment could not be updated."));
     } finally {
       setBusy(false);
     }
@@ -1206,33 +1438,97 @@ export function ResourcesPanel({
                 </tr>
               </thead>
               <tbody>
-                {items.map((r) => (
-                  <tr key={r.id} className="border-t border-ink-100">
-                    <td className="px-3 py-1.5 text-ink-700">{taskName.get(r.taskId) ?? r.taskId}</td>
-                    <td className="px-3 py-1.5 text-ink-900">{r.name}</td>
-                    <td className="px-3 py-1.5 text-ink-500">{r.resourceType}</td>
-                    <td className="px-3 py-1.5 text-right tabular-nums">
-                      {r.budgetedUnits} {r.unit ?? ""}
-                    </td>
-                    <td className="px-3 py-1.5 text-right tabular-nums">
-                      {r.actualUnits} {r.unit ?? ""}
-                    </td>
-                    <td className="px-3 py-1.5 text-right tabular-nums">
-                      {r.unitRate === null ? (
-                        <span className="text-ink-400" title="No rate recorded — cost is not available">
-                          —
-                        </span>
-                      ) : (
-                        money(r.unitRate, currency)
-                      )}
-                    </td>
-                    <td className="px-3 py-1.5 text-right">
-                      <Button size="xs" variant="ghost" disabled={busy} onClick={() => void onDelete(r.id)}>
-                        Remove
-                      </Button>
-                    </td>
-                  </tr>
-                ))}
+                {items.map((r) =>
+                  editId === r.id ? (
+                    <tr key={r.id} className="border-t border-ink-100 bg-ink-50/70">
+                      <td className="px-3 py-2 text-ink-700">{taskName.get(r.taskId) ?? r.taskId}</td>
+                      <td className="px-3 py-2 text-ink-900" colSpan={5}>
+                        <form className="flex flex-wrap items-end gap-2" onSubmit={saveEdit}>
+                          <Field label={`Budgeted (${r.unit ?? "units"})`}>
+                            <Input
+                              type="number"
+                              min="0"
+                              step="any"
+                              className="w-24"
+                              value={editBudgetedUnits}
+                              onChange={(e) => setEditBudgetedUnits(e.target.value)}
+                            />
+                          </Field>
+                          <Field label={`Actual (${r.unit ?? "units"})`}>
+                            <Input
+                              type="number"
+                              min="0"
+                              step="any"
+                              className="w-24"
+                              value={editActualUnits}
+                              onChange={(e) => setEditActualUnits(e.target.value)}
+                            />
+                          </Field>
+                          <Field label={`Rate (${currency})`}>
+                            <Input
+                              type="number"
+                              min="0"
+                              step="any"
+                              className="w-24"
+                              placeholder="unknown"
+                              value={editRate}
+                              onChange={(e) => setEditRate(e.target.value)}
+                            />
+                          </Field>
+                          <Field
+                            label={`Actual cost (${currency})`}
+                            hint="Override — leave blank to keep it derived from rate × actual units."
+                          >
+                            <Input
+                              type="number"
+                              min="0"
+                              step="any"
+                              className="w-28"
+                              placeholder={r.actualCost === 0 ? "rate × actual" : String(r.actualCost)}
+                              value={editActualCost}
+                              onChange={(e) => setEditActualCost(e.target.value)}
+                            />
+                          </Field>
+                          <Button type="submit" size="xs" disabled={busy}>
+                            Save
+                          </Button>
+                          <Button type="button" size="xs" variant="ghost" onClick={() => setEditId(null)}>
+                            Cancel
+                          </Button>
+                        </form>
+                      </td>
+                    </tr>
+                  ) : (
+                    <tr key={r.id} className="border-t border-ink-100">
+                      <td className="px-3 py-1.5 text-ink-700">{taskName.get(r.taskId) ?? r.taskId}</td>
+                      <td className="px-3 py-1.5 text-ink-900">{r.name}</td>
+                      <td className="px-3 py-1.5 text-ink-500">{r.resourceType}</td>
+                      <td className="px-3 py-1.5 text-right tabular-nums">
+                        {r.budgetedUnits} {r.unit ?? ""}
+                      </td>
+                      <td className="px-3 py-1.5 text-right tabular-nums">
+                        {r.actualUnits} {r.unit ?? ""}
+                      </td>
+                      <td className="px-3 py-1.5 text-right tabular-nums">
+                        {r.unitRate === null ? (
+                          <span className="text-ink-400" title="No rate recorded — cost is not available">
+                            —
+                          </span>
+                        ) : (
+                          money(r.unitRate, currency)
+                        )}
+                      </td>
+                      <td className="px-3 py-1.5 text-right">
+                        <Button size="xs" variant="ghost" disabled={busy} onClick={() => beginEdit(r)}>
+                          Progress
+                        </Button>
+                        <Button size="xs" variant="ghost" disabled={busy} onClick={() => void onDelete(r.id)}>
+                          Remove
+                        </Button>
+                      </td>
+                    </tr>
+                  ),
+                )}
               </tbody>
             </table>
           </CardBody>

@@ -1113,7 +1113,17 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
     if (body.pacingOfEventId !== undefined) {
       if (body.pacingOfEventId) {
         if (body.pacingOfEventId === eventId) throw badRequest("An event cannot pace itself");
-        await fetchDelayEvent(body.pacingOfEventId, req.companyId!, req.projectId!);
+        const target = await fetchDelayEvent(body.pacingOfEventId, req.companyId!, req.projectId!);
+        /* Pacing is one-directional by definition: the pacing party slows down
+           BECAUSE the other event already controls completion. Two events
+           pacing each other says neither controls, which is not a statement
+           the concurrency engine (or a tribunal) can act on. */
+        if (target.pacingOfEventId === eventId) {
+          throw badRequest(
+            `DE-${target.number} is already recorded as pacing this event — pacing runs one way. ` +
+              "Clear that declaration first if the direction is wrong.",
+          );
+        }
       }
       set["pacingOfEventId"] = body.pacingOfEventId;
     }
@@ -1717,7 +1727,14 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
         `${res.windows.reduce((s, w) => s + w.attributedDays, 0)} day(s) are attributable to driving delay events.`;
     } else if (body.method === "concurrency") {
       const rules = await loadFloatRules(req.companyId!, req.projectId!);
-      const res = analyseConcurrency(asBuilt, events, rules);
+      /* A contemporaneously declared pacing relationship is evidence the float
+         arithmetic cannot supply, so it is handed to the engine rather than
+         left as write-only data on the event. */
+      const declaredPacing = new Map<string, string>();
+      for (const row of eventRows) {
+        if (row.pacingOfEventId) declaredPacing.set(row.id, row.pacingOfEventId);
+      }
+      const res = analyseConcurrency(asBuilt, events, rules, declaredPacing);
       if (!res.ok) throw badRequest(res.reason, { cycle: res.cycle });
       output = { ...res, rulesConfigured: rules.configured } as unknown as Record<string, unknown>;
       summary =
@@ -2848,16 +2865,34 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
       quantumCalculations: quantum,
       disruptionAnalyses: disruption,
       /* Withdrawn events are excluded from the totals; the count says so. */
-      totals: {
-        liveEvents: live.length,
-        withdrawnEvents: enriched.length - live.length,
-        compensableDays: live.filter((e) => e.compensable === 1).reduce((s, e) => s + e.durationDays, 0),
-        excusableDays: live
-          .filter((e) => e.excusable === 1 && e.compensable !== 1)
-          .reduce((s, e) => s + e.durationDays, 0),
-        tiaDeltaDays: live.reduce((s, e) => s + (e.tia.deltaDays ?? 0), 0),
-        staleTia: live.filter((e) => e.tia.stale).length,
-      },
+      totals: (() => {
+        /* An event with no current time impact analysis — never run, or stale
+           since the programme was recomputed — has NO delta. It used to be
+           added as 0, so a claim whose events had never been modelled reported
+           a modelled impact of "0 days" instead of "not measured". */
+        const measured = live.filter((e) => e.tia.deltaDays !== null);
+        const unmeasured = live.length - measured.length;
+        return {
+          liveEvents: live.length,
+          withdrawnEvents: enriched.length - live.length,
+          compensableDays: live.filter((e) => e.compensable === 1).reduce((s, e) => s + e.durationDays, 0),
+          excusableDays: live
+            .filter((e) => e.excusable === 1 && e.compensable !== 1)
+            .reduce((s, e) => s + e.durationDays, 0),
+          tiaDeltaDays:
+            measured.length > 0 ? measured.reduce((s, e) => s + (e.tia.deltaDays ?? 0), 0) : null,
+          tiaMeasuredEvents: measured.length,
+          tiaUnmeasuredEvents: unmeasured,
+          staleTia: live.filter((e) => e.tia.stale).length,
+          tiaBasis:
+            live.length === 0
+              ? "No live delay event is linked to this claim"
+              : measured.length === 0
+                ? "No linked event carries a current time impact analysis — run one before relying on a modelled delay figure"
+                : `Modelled over the ${measured.length} of ${live.length} linked event(s) with a current analysis` +
+                  (unmeasured > 0 ? `; ${unmeasured} carry none and are not counted` : ""),
+        };
+      })(),
       editable: claim.status === "draft",
     };
   });

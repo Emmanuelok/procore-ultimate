@@ -14,7 +14,7 @@
  * approval the award creates the COMMITMENT in the commitments module, with
  * `bid_awards.commitmentId` as the seam.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Alert,
   Badge,
@@ -50,6 +50,7 @@ import {
 } from "./biddingShared";
 import type {
   BidAward,
+  BudgetLineOptions,
   LevellingGrid,
   ListResponse,
   PackageDetail,
@@ -116,6 +117,7 @@ export default function AwardTab({
   const { ask, dialog } = useReason();
   const nameOf = useNames();
   const [recommendOpen, setRecommendOpen] = useState(false);
+  const [approving, setApproving] = useState<BidAward | null>(null);
 
   function refresh() {
     setVersion((n) => n + 1);
@@ -362,10 +364,22 @@ export default function AwardTab({
               busy={action.busy}
               onAct={act}
               onAsk={ask}
+              onApprove={() => setApproving(award)}
             />
           ))}
         </div>
       )}
+
+      <ApproveModal
+        award={approving}
+        projectId={projectId}
+        packageBudgetLineIds={pkg?.budgetLineItemIds ?? []}
+        onClose={() => setApproving(null)}
+        onDone={() => {
+          setApproving(null);
+          refresh();
+        }}
+      />
 
       <RecommendModal
         open={recommendOpen}
@@ -388,6 +402,188 @@ export default function AwardTab({
 }
 
 /* ================================================================== */
+/* Approval — and the budget line the commitment charges                */
+/* ================================================================== */
+
+/**
+ * APPROVAL IS WHERE THE MONEY BECOMES REAL, SO IT NAMES WHERE IT LANDS.
+ *
+ * Approving an award creates the commitment, writes its schedule-of-values
+ * line and runs `syncBudgetCommitted` — but only against a budget line. The
+ * API resolves one from `bid_packages.budgetLineItemIds` or from an explicit
+ * `budgetLineItemId` on this call; approving with an empty body on a package
+ * that names no line produced a commitment with nowhere to land, and the
+ * awarded value never reached the project budget's committed cost. Nobody
+ * saw that happen, which is the worst property a money bug can have.
+ *
+ * So the approver chooses the line, with the package's own choice preselected
+ * and the consequence of leaving it blank stated rather than implied.
+ */
+function ApproveModal({
+  award,
+  projectId,
+  packageBudgetLineIds,
+  onClose,
+  onDone,
+}: {
+  award: BidAward | null;
+  projectId: string;
+  packageBudgetLineIds: string[];
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const action = useAction();
+  const [lines, setLines] = useState<BudgetLineOptions | null>(null);
+  const [linesError, setLinesError] = useState<string | null>(null);
+  const [budgetLineItemId, setBudgetLineItemId] = useState("");
+  const [approvalAuthority, setApprovalAuthority] = useState("");
+  const [approvalReference, setApprovalReference] = useState("");
+  const [contractDate, setContractDate] = useState("");
+  const [note, setNote] = useState("");
+
+  const open = award !== null;
+
+  useEffect(() => {
+    if (!open) return;
+    setBudgetLineItemId(packageBudgetLineIds[0] ?? "");
+    setApprovalAuthority("");
+    setApprovalReference("");
+    setContractDate("");
+    setNote("");
+    let live = true;
+    setLinesError(null);
+    api
+      .get<BudgetLineOptions>(`/api/v1/projects/${projectId}/bidding/budget-lines`)
+      .then((res) => {
+        if (live) setLines(res);
+      })
+      .catch((e: unknown) => {
+        if (live) setLinesError(e instanceof Error ? e.message : "Budget lines unavailable.");
+      });
+    return () => {
+      live = false;
+    };
+    // packageBudgetLineIds is a fresh array each render; its first entry is
+    // the only part this effect reads.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, projectId, packageBudgetLineIds[0]]);
+
+  async function submit() {
+    if (!award) return;
+    const body: Record<string, unknown> = {};
+    if (budgetLineItemId) body["budgetLineItemId"] = budgetLineItemId;
+    if (approvalAuthority.trim()) body["approvalAuthority"] = approvalAuthority.trim();
+    if (approvalReference.trim()) body["approvalReference"] = approvalReference.trim();
+    if (contractDate) body["contractDate"] = contractDate;
+    if (note.trim()) body["note"] = note.trim();
+    const done = await action.run("approve", () =>
+      api.post(`/api/v1/bid-awards/${award.id}/approve`, body),
+    );
+    if (done) onDone();
+  }
+
+  const chosen = (lines?.items ?? []).find((l) => l.id === budgetLineItemId) ?? null;
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      size="md"
+      title={award ? `Approve ${award.reference}` : "Approve the award"}
+      description="Approval creates the commitment. It is given by somebody who is neither the author nor the recommender, and it is subject to that person's own delegated limit."
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button onClick={() => void submit()} loading={action.busy === "approve"}>
+            Approve and commit
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-4">
+        <RefusalPanel refusal={action.refusal} onDismiss={action.clear} />
+
+        {award ? (
+          <div className="rounded-lg border border-border bg-surface-sunken p-3 text-meta">
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="text-content-muted">Contract sum</span>
+              <span className="font-semibold tabular-nums">
+                {money(award.awardAmount, award.currency)}
+              </span>
+            </div>
+            <p className="mt-1 text-2xs leading-snug text-content-subtle">
+              {award.audit.awardAmountBasis ??
+                "The figure the commitment will be raised for."}
+            </p>
+          </div>
+        ) : null}
+
+        <Field
+          label="Budget line this charges to"
+          hint={
+            chosen
+              ? `${chosen.budgetName}${chosen.isActiveBudget ? " (active budget)" : ""} · revised ${money(chosen.revisedBudget, chosen.currency)} · committed ${money(chosen.committedCost, chosen.currency)}`
+              : "Without one, the commitment is still created but the project budget will not see the committed value."
+          }
+        >
+          <Select
+            value={budgetLineItemId}
+            onChange={(e) => setBudgetLineItemId(e.target.value)}
+            disabled={(lines?.items ?? []).length === 0}
+          >
+            <option value="">— none: the budget will not see this commitment —</option>
+            {(lines?.items ?? []).map((line) => (
+              <option key={line.id} value={line.id}>
+                {line.label}
+                {line.isActiveBudget ? "" : ` (${line.budgetName})`}
+              </option>
+            ))}
+          </Select>
+        </Field>
+        {linesError ? (
+          <Alert tone="warning">
+            The project's budget lines could not be read ({linesError}). The approval will use
+            whatever the package already names.
+          </Alert>
+        ) : lines && lines.items.length === 0 ? (
+          <Alert tone="warning" title="This project has no budget lines">
+            {lines.note}
+          </Alert>
+        ) : null}
+
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Approval authority" optional hint="Recorded automatically where a delegation covers you.">
+            <Input
+              value={approvalAuthority}
+              onChange={(e) => setApprovalAuthority(e.target.value)}
+              placeholder="Board minute, delegation, scheme of authority"
+            />
+          </Field>
+          <Field label="Approval reference" optional>
+            <Input
+              value={approvalReference}
+              onChange={(e) => setApprovalReference(e.target.value)}
+            />
+          </Field>
+          <Field label="Contract date" optional hint="Carried onto the commitment.">
+            <Input
+              type="date"
+              value={contractDate}
+              onChange={(e) => setContractDate(e.target.value)}
+            />
+          </Field>
+        </div>
+        <Field label="Note" optional>
+          <Textarea rows={2} value={note} onChange={(e) => setNote(e.target.value)} />
+        </Field>
+      </div>
+    </Modal>
+  );
+}
+
+/* ================================================================== */
 /* One award                                                           */
 /* ================================================================== */
 
@@ -397,11 +593,14 @@ function AwardCard({
   busy,
   onAct,
   onAsk,
+  onApprove,
 }: {
   award: BidAward;
   nameOf: (id: string | null | undefined) => string;
   busy: string | null;
   onAct: (key: string, awardId: string, path: string, body?: unknown) => Promise<void>;
+  /** opens the approval dialog — approval names the budget line it charges */
+  onApprove: () => void;
   onAsk: (req: {
     title: string;
     description?: string;
@@ -629,11 +828,7 @@ function AwardCard({
         <div className="flex flex-wrap gap-2 border-t border-border pt-3">
           {award.status === "recommended" || award.status === "pending_approval" ? (
             <>
-              <Button
-                size="sm"
-                loading={busy === `approve:${award.id}`}
-                onClick={() => void onAct("approve", award.id, "approve")}
-              >
+              <Button size="sm" loading={busy === `approve:${award.id}`} onClick={onApprove}>
                 Approve — and create the commitment
               </Button>
               <Button

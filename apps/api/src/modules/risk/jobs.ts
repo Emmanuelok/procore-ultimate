@@ -144,7 +144,7 @@ export function expectedValueOf(risk: {
   if (risk.occurrenceProbability == null || risk.costImpact == null) return null;
   const parsed = distributionSchema.safeParse(risk.costImpact);
   if (!parsed.success) return null;
-  return risk.occurrenceProbability * analyticMean(parsed.data as never);
+  return risk.occurrenceProbability * analyticMean(parsed.data);
 }
 
 export function toAppetiteRiskInput(row: typeof risks.$inferSelect): AppetiteRiskInput {

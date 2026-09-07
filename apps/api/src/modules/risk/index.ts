@@ -29,6 +29,7 @@ import {
   type RiskStatus,
   type TaskConstraintType,
 } from "@constructos/shared";
+import type { Db } from "../../lib/db.js";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
@@ -1415,7 +1416,7 @@ export const riskModule: FastifyPluginAsync = async (app) => {
         subjectId: args.contingencyId,
       });
     }
-    await appendLedger(tx as never, {
+    await appendLedger(tx as Db, {
       companyId: args.companyId,
       actorId: args.approvedBy,
       action: "create",
@@ -1646,7 +1647,7 @@ export const riskModule: FastifyPluginAsync = async (app) => {
             updatedAt: now,
           })
           .where(eq(contingencyReleases.id, releaseId));
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "state_change",
@@ -1777,7 +1778,7 @@ export const riskModule: FastifyPluginAsync = async (app) => {
             })),
           );
         }
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "update",

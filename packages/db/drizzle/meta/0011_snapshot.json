@@ -1,5 +1,5 @@
 {
-  "id": "7ebff26d-6fd6-49fd-91e8-5dfa864a65d5",
+  "id": "788f4d2f-6c3b-47c9-9a5a-573471e82329",
   "prevId": "340cf323-a4ed-4b81-8d6c-8f3e94b698e3",
   "version": "7",
   "dialect": "postgresql",
@@ -10047,6 +10047,13 @@
           "type": "jsonb",
           "primaryKey": false,
           "notNull": false
+        },
+        "variants": {
+          "name": "variants",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'{}'::jsonb"
         },
         "ai_status": {
           "name": "ai_status",

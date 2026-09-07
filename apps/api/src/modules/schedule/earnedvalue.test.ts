@@ -119,6 +119,33 @@ describe("computeEarnedValue", () => {
     expect(res.activities.find((a) => a.id === "c")?.ac).toBeNull();
     expect(res.activities.find((a) => a.id === "c")?.cv).toBeNull();
     expect(res.reasons.join(" ")).toContain("no booked cost");
+    /* Cost variance follows the same rule as CPI: EV 3000 − AC 1900 would show
+       a 1,100 underspend that is only the invoices not yet arrived. */
+    expect(res.cv).toBe(100); // costed EV 2000 − AC 1900
+  });
+
+  it("withholds cost variance, not just CPI, when the costed share is too thin", () => {
+    const res = computeEarnedValue({
+      dataDate: "2026-01-10",
+      currency: "GBP",
+      activities: [
+        act("a", { percentComplete: 100, actualCost: 900 }),
+        act("b", { percentComplete: 100, actualCost: null }),
+        act("c", { percentComplete: 100, actualCost: null }),
+      ],
+    });
+    expect(res.cv).toBeNull();
+  });
+
+  it("reports no cost variance at all when nothing carries a booked cost", () => {
+    const res = computeEarnedValue({
+      dataDate: "2026-01-10",
+      currency: "GBP",
+      activities: [act("a", { percentComplete: 50, actualCost: null })],
+    });
+    expect(res.ac).toBe(0);
+    expect(res.cv).toBeNull();
+    expect(res.cpi).toBeNull();
   });
 
   it("withholds CPI and EAC when most of the priced budget has no booked cost", () => {

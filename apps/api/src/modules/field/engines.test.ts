@@ -43,7 +43,7 @@ import {
   toCsv,
   validateVerifierChange,
 } from "./punchEngine.js";
-import { exifDateToIso, extractExif, haversineKm, isValidPin, sniffMediaType } from "./photoEngine.js";
+import { EXIF_THUMBNAIL_MAX_BYTES, exifDateToIso, extractExif, extractExifThumbnail, haversineKm, isValidPin, sniffMediaType } from "./photoEngine.js";
 import { buildZip, listZip, uniqueZipNames, zipStream } from "./zip.js";
 import {
   detectCoApprovalPattern,
@@ -57,7 +57,7 @@ import {
 } from "./integrityEngine.js";
 import { cleanSubject, detectRfiReference, htmlToText, parseAddress, parseInboundRfiEmail, stripQuotedReply } from "./emailIngest.js";
 import { ballInCourtSummary, cycleTimeStats } from "./rfiEngine.js";
-import { jpegWithExif } from "./testFixtures.js";
+import { jpegWithExif, tinyJpeg, tinyPng } from "./testFixtures.js";
 
 describe("ageing engine", () => {
   it("buckets ages and computes overdue days", () => {
@@ -466,6 +466,24 @@ describe("photo engine", () => {
     expect(extractExif(jpegWithExif().subarray(0, 40))).toBeNull();
     expect(exifDateToIso("0000:00:00 00:00:00")).toBeUndefined();
     expect(exifDateToIso("2026:01:02 03:04:05", "+02:00")).toBe("2026-01-02T01:04:05.000Z");
+  });
+
+  it("lifts the camera's own thumbnail out of EXIF IFD1, and never invents one", () => {
+    const thumb = tinyJpeg(0x2a);
+    const withThumb = extractExifThumbnail(jpegWithExif({ thumbnail: thumb }));
+    expect(withThumb).not.toBeNull();
+    // byte-identical to what the camera wrote — a derivative of the uploaded
+    // file, not something reconstructed
+    expect(withThumb!.equals(thumb)).toBe(true);
+    expect(withThumb!.length).toBeLessThan(EXIF_THUMBNAIL_MAX_BYTES);
+    // no IFD1 at all: honest null rather than a fabricated rendition
+    expect(extractExifThumbnail(jpegWithExif())).toBeNull();
+    expect(extractExifThumbnail(tinyPng())).toBeNull();
+    expect(extractExifThumbnail(Buffer.from("not a jpeg"))).toBeNull();
+    // a truncated file must not throw and must not return partial bytes
+    expect(extractExifThumbnail(jpegWithExif({ thumbnail: thumb }).subarray(0, 60))).toBeNull();
+    // IFD1 present but the payload is not a JPEG: refused by the magic bytes
+    expect(extractExifThumbnail(jpegWithExif({ thumbnail: Buffer.from([1, 2, 3, 4, 5, 6]) }))).toBeNull();
   });
 
   it("measures distance and validates pins", () => {

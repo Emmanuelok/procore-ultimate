@@ -87,6 +87,61 @@ describe("concurrency classification", () => {
     expect(rec.rule).toMatch(/pacing/i);
   });
 
+  it("honours a contemporaneously declared pacing relationship the float arithmetic would have missed", () => {
+    /* Two overlapping critical events read as true concurrency from the
+       numbers alone. Pacing is a CHOICE, and only the party that made it can
+       state it — a declared pair is classified as pacing and the rationale
+       says whether the programme supports the declaration. */
+    const events = [
+      ev("owner", { struckTaskId: "a", party: "owner", startDate: "2026-01-10", durationDays: 10 }),
+      ev("contractor", {
+        struckTaskId: "a",
+        party: "contractor",
+        startDate: "2026-01-12",
+        durationDays: 10,
+        compensable: false,
+      }),
+    ];
+    const undeclared = analyseConcurrency(network(), events);
+    expect(undeclared.ok).toBe(true);
+    if (!undeclared.ok) return;
+    expect(undeclared.pairs[0]!.classification).toBe("true_concurrency");
+
+    const declared = analyseConcurrency(
+      network(),
+      events,
+      DEFAULT_FLOAT_RULES,
+      new Map([["contractor", "owner"]]),
+    );
+    expect(declared.ok).toBe(true);
+    if (!declared.ok) return;
+    expect(declared.pairs[0]!.classification).toBe("pacing");
+    expect(declared.pairs[0]!.rationale).toMatch(/recorded as pacing/);
+    expect(declared.pairs[0]!.rationale).toMatch(/supports the declaration/);
+    const rec = declared.recommendations.find((r) => r.eventId === "contractor")!;
+    expect(rec.classification).toBe("pacing");
+    expect(rec.time).toBe("no");
+    expect(rec.money).toBe("no");
+  });
+
+  it("says so when the programme does not support a declared pacing claim", () => {
+    // "p" sits on float and drives nothing, so declaring the driver a pacer of
+    // it is unsupported — the analysis must not pretend otherwise.
+    const res = analyseConcurrency(
+      network(),
+      [
+        ev("driver", { struckTaskId: "a", durationDays: 10, party: "owner" }),
+        ev("passive", { struckTaskId: "p", durationDays: 3, party: "contractor", compensable: false }),
+      ],
+      DEFAULT_FLOAT_RULES,
+      new Map([["driver", "passive"]]),
+    );
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.pairs[0]!.classification).toBe("pacing");
+    expect(res.pairs[0]!.rationale).toMatch(/does NOT support the declaration/);
+  });
+
   it("reports events it cannot model rather than scoring them", () => {
     const res = analyseConcurrency(network(), [ev("bad", { struckTaskId: "ghost" })]);
     expect(res.ok).toBe(true);

@@ -101,7 +101,7 @@ export async function sweepOverdueConditions(
           .set({ status: "breached" })
           .where(and(eq(obligations.id, cond.obligationId), eq(obligations.status, "open")));
       }
-      await appendLedger(tx as never, {
+      await appendLedger(tx as Db, {
         companyId,
         actorId: null,
         action: "state_change",

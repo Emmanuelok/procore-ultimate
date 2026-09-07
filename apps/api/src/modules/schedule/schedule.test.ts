@@ -1101,6 +1101,53 @@ describe("work calendars", () => {
     });
     expect(del.statusCode).toBe(409);
   });
+
+  it("refuses to delete the calendar a programme uses as its default", async () => {
+    /* A dangling defaultCalendarId is silent: the engine finds no calendar for
+       the id and reverts the whole programme to a seven-day week on the next
+       recompute, moving every date with nothing said. */
+    const cal = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/schedule-calendars`,
+      headers: owner.headers,
+      payload: { name: "Programme default", workdays: [0, 1, 1, 1, 1, 1, 0], hoursPerDay: 8 },
+    });
+    expect(cal.statusCode).toBe(201);
+    const calendarId = (cal.json() as { id: string }).id;
+
+    const schedule = await createSchedule("Default calendar programme", "2026-01-05");
+    const patched = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}/schedules/${schedule.id}`,
+      headers: owner.headers,
+      payload: { defaultCalendarId: calendarId },
+    });
+    expect(patched.statusCode).toBe(200);
+
+    // no activity carries the calendar id — only the schedule header does
+    const del = await app.inject({
+      method: "DELETE",
+      url: `/api/v1/projects/${projectId}/schedule-calendars/${calendarId}`,
+      headers: owner.headers,
+    });
+    expect(del.statusCode).toBe(409);
+    expect((del.json() as { message: string }).message).toContain("Default calendar programme");
+
+    // clear the reference and the calendar goes
+    const cleared = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}/schedules/${schedule.id}`,
+      headers: owner.headers,
+      payload: { defaultCalendarId: null },
+    });
+    expect(cleared.statusCode).toBe(200);
+    const del2 = await app.inject({
+      method: "DELETE",
+      url: `/api/v1/projects/${projectId}/schedule-calendars/${calendarId}`,
+      headers: owner.headers,
+    });
+    expect(del2.statusCode).toBe(204);
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -1163,6 +1210,67 @@ describe("resource-loaded activities", () => {
     });
     expect(del.statusCode).toBe(204);
   });
+
+  it("re-derives the assignment's cost when units or the rate are patched", async () => {
+    /* Cost is derived from rate x units on create; the patch used to write the
+       new units and leave the cost describing the assignment as it was on the
+       day it was created — the roll-up and earned value read that stale cost. */
+    const schedule = await createSchedule("Resource progress");
+    const task = await addTask(schedule.id, { name: "Blockwork", durationDays: 10 });
+    const created = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/schedule-tasks/${task.id}/resources`,
+      headers: owner.headers,
+      payload: { name: "Bricklayers", resourceType: "labour", budgetedUnits: 100, unitRate: 50 },
+    });
+    expect(created.statusCode).toBe(201);
+    const res = created.json() as { id: string; budgetedCost: number; actualCost: number };
+    expect(res.budgetedCost).toBe(5000);
+    expect(res.actualCost).toBe(0);
+
+    const progressed = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}/schedule-task-resources/${res.id}`,
+      headers: owner.headers,
+      payload: { actualUnits: 60 },
+    });
+    expect(progressed.statusCode).toBe(200);
+    /* `.partial()` keeps a zod default, so this patch used to arrive carrying
+       budgetedUnits: 0 and resourceType: "labour" and wipe both. */
+    expect(progressed.json()).toMatchObject({
+      actualUnits: 60,
+      actualCost: 3000,
+      budgetedUnits: 100,
+      budgetedCost: 5000,
+      unitRate: 50,
+    });
+
+    const repriced = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}/schedule-task-resources/${res.id}`,
+      headers: owner.headers,
+      payload: { unitRate: 60 },
+    });
+    expect(repriced.json()).toMatchObject({ budgetedCost: 6000, actualCost: 3600 });
+
+    // an explicit cost still wins over the derivation
+    const stated = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}/schedule-task-resources/${res.id}`,
+      headers: owner.headers,
+      payload: { actualCost: 4111 },
+    });
+    expect(stated.json()).toMatchObject({ actualCost: 4111 });
+
+    // withdrawing the rate withdraws the derived cost — it is not left floating
+    const unpriced = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}/schedule-task-resources/${res.id}`,
+      headers: owner.headers,
+      payload: { unitRate: null },
+    });
+    expect(unpriced.json()).toMatchObject({ unitRate: null, budgetedCost: 0, actualCost: 0 });
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -1197,6 +1305,12 @@ describe("lookahead constraints log", () => {
     });
     expect(cleared.statusCode).toBe(200);
     expect(cleared.json()).toMatchObject({ status: "cleared", clearedBy: owner.userId });
+    /* Clearing must not re-categorise: the patch schema used to carry the
+       create schema's default and silently rewrote the category to "other". */
+    expect(cleared.json()).toMatchObject({
+      category: "permit_or_approval",
+      description: "Crane permit outstanding",
+    });
 
     const illegal = await app.inject({
       method: "PATCH",
@@ -1322,6 +1436,45 @@ describe("key milestones and slip alerts", () => {
   it("the scheduler job is registered and runs", async () => {
     const result = await app.scheduler.runNow("schedule.milestone-slip");
     expect(result).toBeDefined();
+  });
+
+  it("refuses a contractual date on an activity that is not a key milestone", async () => {
+    /* The slip sweep only ever reads key milestones, so a contractual date on
+       an ordinary activity is a promise nobody checks. */
+    const schedule = await createSchedule("Promise programme");
+    const bad = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/schedules/${schedule.id}/tasks`,
+      headers: owner.headers,
+      payload: { name: "Ordinary work", durationDays: 5, contractualDate: "2026-02-01" },
+    });
+    expect(bad.statusCode).toBe(400);
+    expect((bad.json() as { message: string }).message).toContain("key milestone");
+
+    const ok = await addTask(schedule.id, {
+      name: "Sectional completion",
+      durationDays: 0,
+      isKeyMilestone: true,
+      contractualDate: "2026-02-01",
+    });
+
+    // un-ticking the milestone while the date is still stored is refused too
+    const unticked = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}/schedule-tasks/${ok.id}`,
+      headers: owner.headers,
+      payload: { isKeyMilestone: false },
+    });
+    expect(unticked.statusCode).toBe(400);
+
+    const cleared = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${projectId}/schedule-tasks/${ok.id}`,
+      headers: owner.headers,
+      payload: { isKeyMilestone: false, contractualDate: null },
+    });
+    expect(cleared.statusCode).toBe(200);
+    expect(cleared.json()).toMatchObject({ isKeyMilestone: 0, contractualDate: null });
   });
 });
 

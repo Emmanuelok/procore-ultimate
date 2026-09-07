@@ -7852,6 +7852,7 @@ ALTER TABLE "photos" ADD COLUMN "tags" jsonb DEFAULT '[]'::jsonb NOT NULL;--> st
 ALTER TABLE "photos" ADD COLUMN "is_360" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
 ALTER TABLE "photos" ADD COLUMN "pin" jsonb;--> statement-breakpoint
 ALTER TABLE "photos" ADD COLUMN "exif" jsonb;--> statement-breakpoint
+ALTER TABLE "photos" ADD COLUMN "variants" jsonb DEFAULT '{}'::jsonb NOT NULL;--> statement-breakpoint
 ALTER TABLE "photos" ADD COLUMN "ai_status" text;--> statement-breakpoint
 ALTER TABLE "photos" ADD COLUMN "ai_error" text;--> statement-breakpoint
 ALTER TABLE "photos" ADD COLUMN "content_type" text;--> statement-breakpoint

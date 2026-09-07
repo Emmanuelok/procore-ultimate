@@ -38,6 +38,7 @@ import {
 } from "../../ui";
 import { IconProcurement, IconTarget, IconVendor, IconWarning } from "../../ui/icons";
 import { api } from "../../lib/api";
+import { useAuth } from "../../lib/auth";
 import {
   Figure,
   LoadError,
@@ -975,6 +976,14 @@ const PATTERN_SEVERITY_TONE: Record<string, "danger" | "warning" | "info" | "neu
  * the detectors are any good: how many of their findings survived review.
  */
 function PatternsSection() {
+  /*
+   * Running the cross-package detectors WRITES signals, so the route is
+   * `requireCompanyRole(["owner","admin"])`. A button that renders for
+   * everybody and answers a plain member with a 403 is not a control, it is a
+   * trap: the control is not showing it.
+   */
+  const { company } = useAuth();
+  const isCompanyAdmin = company?.role === "owner" || company?.role === "admin";
   const [version, setVersion] = useState(0);
   const [openOnly, setOpenOnly] = useState(true);
   const register = useResource<CompanyIntegrityRegister>(
@@ -1002,11 +1011,11 @@ function PatternsSection() {
       title: kind === "confirm" ? "Confirm this pattern" : "Dismiss this pattern",
       description:
         kind === "confirm"
-          ? "Confirming records that the pattern was real and what was found. It stays open: a real pattern still bears on the next recommendation."
-          : "A finding is a question, not an accusation, and the ordinary answer is an innocent explanation. Recording it is what makes this detector's precision measurable.",
+          ? "Confirming records that the pattern was real and what was found. It stays open: a real pattern still bears on the next recommendation. Dispositioning is for an integrity reviewer or a company admin — the person recommending the winner does not clear the finding that stands in their own way."
+          : "A dismissal switches off the written-acknowledgement gate on the next award, so it is held to the same length as the justification it replaces. A finding is a question, not an accusation, and the ordinary answer is an innocent explanation — recorded, which is what makes this detector's precision measurable. Dispositioning is for an integrity reviewer or a company admin, and a finding you dismissed yourself still has to be acknowledged in your own recommendation.",
       label: "What was checked, and what was found",
       confirmLabel: kind === "confirm" ? "Confirm" : "Dismiss",
-      minLength: 3,
+      minLength: kind === "dismiss" ? 20 : 3,
     });
     if (!text) return;
     const res = await action.run(`${signalId}:${kind}`, () =>
@@ -1040,9 +1049,15 @@ function PatternsSection() {
                   { value: "all", label: "All" },
                 ]}
               />
-              <Button size="sm" loading={action.busy === "run"} onClick={() => void run()}>
-                Run detectors
-              </Button>
+              {isCompanyAdmin ? (
+                <Button size="sm" loading={action.busy === "run"} onClick={() => void run()}>
+                  Run detectors
+                </Button>
+              ) : (
+                <span className="text-2xs text-content-subtle">
+                  Running the detectors is an owner/admin act.
+                </span>
+              )}
             </div>
           }
         />

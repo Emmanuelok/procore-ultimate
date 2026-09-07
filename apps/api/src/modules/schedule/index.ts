@@ -174,7 +174,25 @@ const resourceCreateSchema = z.object({
   budgetedCost: z.number().min(0).optional(),
   actualCost: z.number().min(0).optional(),
 });
-const resourcePatchSchema = resourceCreateSchema.partial();
+/*
+ * NOT `resourceCreateSchema.partial()`. `.partial()` makes a field optional but
+ * KEEPS its `.default(...)`, so a patch that sent only `{ actualUnits }` parsed
+ * as `{ actualUnits, resourceType: "labour", budgetedUnits: 0 }` and the
+ * handler wrote all three: recording progress against an assignment silently
+ * wiped its budgeted units (and with them the cost roll-up and the earned
+ * value built on it) and reset its class. The patch shape is written out.
+ */
+const resourcePatchSchema = z.object({
+  name: z.string().min(1).max(200).optional(),
+  resourceType: z.enum(SCHEDULE_RESOURCE_TYPES).optional(),
+  unit: z.string().max(30).nullable().optional(),
+  budgetedUnits: z.number().min(0).optional(),
+  actualUnits: z.number().min(0).optional(),
+  remainingUnits: z.number().min(0).nullable().optional(),
+  unitRate: z.number().min(0).nullable().optional(),
+  budgetedCost: z.number().min(0).optional(),
+  actualCost: z.number().min(0).optional(),
+});
 
 const constraintCreateSchema = z.object({
   scheduleId: z.string().min(1),
@@ -184,10 +202,17 @@ const constraintCreateSchema = z.object({
   ownerId: z.string().min(1).nullable().optional(),
   needByDate: isoDateSchema.nullable().optional(),
 });
-const constraintPatchSchema = constraintCreateSchema
-  .omit({ scheduleId: true })
-  .partial()
-  .extend({ status: z.enum(CONSTRAINT_LOG_STATUSES).optional(), resolution: z.string().max(2000).nullable().optional() });
+/* Written out for the same reason as resourcePatchSchema: `.partial()` keeps
+   `category`'s default, so clearing a constraint re-categorised it as "other". */
+const constraintPatchSchema = z.object({
+  taskId: z.string().min(1).nullable().optional(),
+  description: z.string().min(1).max(2000).optional(),
+  category: z.enum(CONSTRAINT_LOG_CATEGORIES).optional(),
+  ownerId: z.string().min(1).nullable().optional(),
+  needByDate: isoDateSchema.nullable().optional(),
+  status: z.enum(CONSTRAINT_LOG_STATUSES).optional(),
+  resolution: z.string().max(2000).nullable().optional(),
+});
 
 const narrativeCreateSchema = z.object({
   title: z.string().min(1).max(300),
@@ -855,6 +880,24 @@ export const scheduleModule: FastifyPluginAsync = async (app) => {
     }
   }
 
+  /**
+   * A contractual date is a promise the milestone sweep checks. It only ever
+   * looks at activities flagged `isKeyMilestone`, so a date recorded on an
+   * ordinary activity is a promise nobody watches — it is refused rather than
+   * stored and silently ignored.
+   */
+  function validateMilestonePromise(
+    isKeyMilestone: boolean,
+    contractualDate: string | null,
+  ): void {
+    if (contractualDate && !isKeyMilestone) {
+      throw badRequest(
+        "A contractual date belongs to a key milestone — set isKeyMilestone, or clear contractualDate. " +
+          "Milestone slip is only ever measured against key milestones, so a date recorded here would never be checked.",
+      );
+    }
+  }
+
   async function validateTaskRefs(
     body: { responsibleId?: string | null; locationId?: string | null; calendarId?: string | null; budgetLineItemId?: string | null },
     companyId: string,
@@ -874,6 +917,7 @@ export const scheduleModule: FastifyPluginAsync = async (app) => {
       const body = taskCreateSchema.parse(req.body);
       const schedule = await fetchSchedule(scheduleId, req.companyId!, req.projectId!);
       validateConstraint(body.constraintType, body.constraintDate);
+      validateMilestonePromise(body.isKeyMilestone === true, body.contractualDate ?? null);
       await validateTaskRefs(body, req.companyId!, req.projectId!);
       let sortOrder = body.sortOrder;
       if (sortOrder === undefined) {
@@ -950,6 +994,11 @@ export const scheduleModule: FastifyPluginAsync = async (app) => {
       const nextConstraintDate =
         body.constraintDate !== undefined ? body.constraintDate : task.constraintDate;
       validateConstraint(nextConstraintType, nextConstraintDate);
+      const nextIsMilestone =
+        body.isKeyMilestone !== undefined ? body.isKeyMilestone : task.isKeyMilestone === 1;
+      const nextContractualDate =
+        body.contractualDate !== undefined ? body.contractualDate : task.contractualDate;
+      validateMilestonePromise(nextIsMilestone, nextContractualDate);
       await validateTaskRefs(body, req.companyId!, req.projectId!);
 
       const nextActualStart = body.actualStart !== undefined ? body.actualStart : task.actualStart;
@@ -1882,6 +1931,14 @@ export const scheduleModule: FastifyPluginAsync = async (app) => {
     },
   );
 
+  /**
+   * Deleting a calendar is refused while anything still points at it. A
+   * dangling `calendarId` on an activity — or `defaultCalendarId` on a
+   * schedule — is invisible: the CPM engine simply finds no calendar for the
+   * id and falls back to a continuous seven-day week, so every duration on
+   * the programme silently becomes calendar days and the dates move on the
+   * next recompute with nothing said. Both references are counted and named.
+   */
   app.delete(
     "/projects/:projectId/schedule-calendars/:calendarId",
     { preHandler: standardGate },
@@ -1896,6 +1953,23 @@ export const scheduleModule: FastifyPluginAsync = async (app) => {
         );
       if (Number(used?.n ?? 0) > 0) {
         throw conflict(`${used?.n} activit${Number(used?.n) === 1 ? "y uses" : "ies use"} this calendar — reassign them first`);
+      }
+      const defaultFor = await app.db
+        .select({ id: schedules.id, name: schedules.name })
+        .from(schedules)
+        .where(
+          and(
+            eq(schedules.companyId, req.companyId!),
+            eq(schedules.projectId, req.projectId!),
+            eq(schedules.defaultCalendarId, calendarId),
+          ),
+        );
+      if (defaultFor.length > 0) {
+        throw conflict(
+          `${defaultFor.length} programme${defaultFor.length === 1 ? "" : "s"} use this calendar as the default (${defaultFor
+            .map((s) => s.name)
+            .join(", ")}) — choose another default first`,
+        );
       }
       await app.db.delete(scheduleCalendars).where(eq(scheduleCalendars.id, calendarId));
       await appendLedger(app.db, {
@@ -2038,6 +2112,28 @@ export const scheduleModule: FastifyPluginAsync = async (app) => {
       await fetchSchedule(row.scheduleId, req.companyId!, req.projectId!);
       const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
       for (const [k, v] of Object.entries(body)) if (v !== undefined) set[k] = v;
+      /*
+       * budgetedCost/actualCost are DERIVED from rate × units on create. The
+       * patch used to write the new units and the new rate and leave the two
+       * costs exactly as they were, so booking progress against an assignment
+       * left the roll-up (and the earned-value actual cost built from it)
+       * describing the figures the assignment had on the day it was created.
+       * They are re-derived here unless the caller states them, and a rate
+       * that is withdrawn takes its derived cost with it rather than leaving a
+       * number with no basis.
+       */
+      const nextRate = body.unitRate !== undefined ? body.unitRate : row.unitRate;
+      const nextBudgetedUnits =
+        body.budgetedUnits !== undefined ? body.budgetedUnits : row.budgetedUnits;
+      const nextActualUnits = body.actualUnits !== undefined ? body.actualUnits : row.actualUnits;
+      if (body.budgetedCost === undefined) {
+        if (nextRate != null) set["budgetedCost"] = nextRate * nextBudgetedUnits;
+        else if (body.unitRate === null) set["budgetedCost"] = 0;
+      }
+      if (body.actualCost === undefined) {
+        if (nextRate != null) set["actualCost"] = nextRate * nextActualUnits;
+        else if (body.unitRate === null) set["actualCost"] = 0;
+      }
       await app.db.update(scheduleTaskResources).set(set).where(eq(scheduleTaskResources.id, resourceId));
       await appendLedger(app.db, {
         companyId: req.companyId!,

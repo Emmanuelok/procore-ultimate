@@ -198,8 +198,21 @@ const seriesCreateSchema = z.object({
   quorumRequired: z.number().int().min(1).max(200).nullable().optional(),
 });
 
+/*
+ * `closed` is NOT patchable, and that is the point.
+ *
+ * Closing a series is an admin act with its own route: it counts the open
+ * action items being left behind, records who closed it and why, and writes a
+ * `state_change` to the ledger. `PATCH { status: "closed" }` did all of that
+ * without any of it — at STANDARD level, so a user refused 403 by
+ * `/meeting-series/:id/close` reached the same end state by choosing a
+ * different URL, and the same PATCH reopened a closed series afterwards.
+ * Pause/resume stay here because they carry no such record.
+ */
+const PATCHABLE_SERIES_STATUSES = ["active", "paused"] as const;
+
 const seriesPatchSchema = seriesCreateSchema.partial().extend({
-  status: z.enum(MEETING_SERIES_STATUSES).optional(),
+  status: z.enum(PATCHABLE_SERIES_STATUSES).optional(),
 });
 
 const meetingCreateSchema = z.object({
@@ -1228,6 +1241,13 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       const { seriesId } = req.params as { seriesId: string };
       const body = seriesPatchSchema.parse(req.body);
       const series = await fetchSeries(req, seriesId);
+      if (series.status === "closed") {
+        throw conflict(
+          "This series is closed. A closed series is part of the record: its history stays " +
+            "readable but it does not generate occurrences and it is not edited back to life. " +
+            "Start a new series if the meeting is resuming.",
+        );
+      }
       const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
       for (const [k, v] of Object.entries(body)) {
         if (v === undefined) continue;

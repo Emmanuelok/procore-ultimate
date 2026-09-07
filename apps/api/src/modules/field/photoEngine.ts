@@ -8,7 +8,13 @@
  *
  * Deliberately does NOT resize or transcode: there is no image library in
  * the runtime, and pretending to make thumbnails would be a lie the UI
- * would then tell. Variants are documented as future work.
+ * would then tell. What it CAN do without one is take the thumbnail the
+ * camera already wrote into the file: `extractExifThumbnail` lifts the
+ * JPEG-compressed rendition out of EXIF IFD1 (#428/PhotosPage.tsx:73). That
+ * covers phone and camera captures — a gallery tile then costs ~10 KB
+ * instead of ~4 MB — and honestly returns null for anything else (PNG
+ * screenshots, stripped JPEGs, video), which the variant route reports as a
+ * fallback to the original rather than hiding.
  */
 
 export const PHOTO_MAX_BYTES = 50 * 1024 * 1024;
@@ -77,6 +83,8 @@ interface TiffReader {
   u16(off: number): number;
   u32(off: number): number;
   ascii(off: number, len: number): string;
+  /** raw bytes at a TIFF-relative offset (used for the embedded thumbnail) */
+  bytes(off: number, len: number): Buffer;
   rational(off: number): number;
   length: number;
 }
@@ -88,6 +96,7 @@ function makeReader(buf: Buffer, tiffStart: number, littleEndian: boolean): Tiff
     u16: (off) => (littleEndian ? slice.readUInt16LE(off) : slice.readUInt16BE(off)),
     u32: (off) => (littleEndian ? slice.readUInt32LE(off) : slice.readUInt32BE(off)),
     ascii: (off, len) => slice.subarray(off, off + len).toString("latin1").replace(/\0+$/, ""),
+    bytes: (off, len) => slice.subarray(off, off + len),
     rational: (off) => {
       const n = littleEndian ? slice.readUInt32LE(off) : slice.readUInt32BE(off);
       const d = littleEndian ? slice.readUInt32LE(off + 4) : slice.readUInt32BE(off + 4);
@@ -154,79 +163,137 @@ export function exifDateToIso(value: string | undefined, offset?: string): strin
 }
 
 /**
+ * Locate the APP1/Exif segment of a JPEG and return a bounds-checked reader
+ * over its TIFF block plus the offset of IFD0. Null for non-JPEGs, for JPEGs
+ * with no APP1/Exif segment and for a malformed TIFF header.
+ */
+function findExifBlock(buf: Buffer): { r: TiffReader; ifd0Offset: number } | null {
+  if (!(buf[0] === 0xff && buf[1] === 0xd8)) return null;
+  let off = 2;
+  while (off + 4 <= buf.length) {
+    if (buf[off] !== 0xff) return null;
+    const marker = buf[off + 1]!;
+    if (marker === 0xd9 || marker === 0xda) return null; // EOI / SOS: no EXIF before image data
+    const segLen = buf.readUInt16BE(off + 2);
+    if (marker === 0xe1 && buf.subarray(off + 4, off + 10).toString("latin1") === "Exif\0\0") {
+      const tiffStart = off + 10;
+      if (tiffStart + 8 > buf.length) return null;
+      const bom = buf.subarray(tiffStart, tiffStart + 2).toString("latin1");
+      const littleEndian = bom === "II";
+      if (!littleEndian && bom !== "MM") return null;
+      // Clamp to the segment: everything EXIF addresses, thumbnail included,
+      // lives inside APP1, so a hostile offset cannot read the image data.
+      const r = makeReader(buf.subarray(0, Math.min(buf.length, off + 2 + segLen)), tiffStart, littleEndian);
+      if (r.u16(2) !== 0x2a) return null;
+      return { r, ifd0Offset: r.u32(4) };
+    }
+    off += 2 + segLen;
+  }
+  return null;
+}
+
+/**
  * Extract the EXIF fields the field record cares about from a JPEG. Returns
  * null for non-JPEGs and for JPEGs with no APP1/Exif segment. Never throws on
  * a truncated or hostile file — every read is bounds-checked.
  */
 export function extractExif(buf: Buffer): ExifSummary | null {
   try {
-    if (!(buf[0] === 0xff && buf[1] === 0xd8)) return null;
-    let off = 2;
-    while (off + 4 <= buf.length) {
-      if (buf[off] !== 0xff) return null;
-      const marker = buf[off + 1]!;
-      if (marker === 0xd9 || marker === 0xda) return null; // EOI / SOS: no EXIF before image data
-      const segLen = buf.readUInt16BE(off + 2);
-      if (marker === 0xe1 && buf.subarray(off + 4, off + 10).toString("latin1") === "Exif\0\0") {
-        const tiffStart = off + 10;
-        if (tiffStart + 8 > buf.length) return null;
-        const bom = buf.subarray(tiffStart, tiffStart + 2).toString("latin1");
-        const littleEndian = bom === "II";
-        if (!littleEndian && bom !== "MM") return null;
-        const r = makeReader(buf.subarray(0, Math.min(buf.length, off + 2 + segLen)), tiffStart, littleEndian);
-        if (r.u16(2) !== 0x2a) return null;
-        const ifd0 = readIfd(r, r.u32(4));
-        const out: ExifSummary = {};
-        let exifIfdOffset: number | undefined;
-        let gpsIfdOffset: number | undefined;
-        for (const e of ifd0) {
-          if (e.tag === 0x0112) {
-            const v = readShort(r, e);
-            if (v !== undefined) out.orientation = v;
-          } else if (e.tag === 0x010f) {
-            const v = readAscii(r, e);
-            if (v !== undefined) out.make = v;
-          } else if (e.tag === 0x0110) {
-            const v = readAscii(r, e);
-            if (v !== undefined) out.model = v;
-          } else if (e.tag === 0x8769) exifIfdOffset = readShort(r, e);
-          else if (e.tag === 0x8825) gpsIfdOffset = readShort(r, e);
-        }
-        if (exifIfdOffset !== undefined) {
-          let dateTime: string | undefined;
-          let offsetTime: string | undefined;
-          for (const e of readIfd(r, exifIfdOffset)) {
-            if (e.tag === 0x9003) dateTime = readAscii(r, e);
-            else if (e.tag === 0x9011) offsetTime = readAscii(r, e);
-          }
-          const iso = exifDateToIso(dateTime, offsetTime);
-          if (iso) out.takenAt = iso;
-        }
-        if (gpsIfdOffset !== undefined) {
-          let latRef: string | undefined;
-          let lngRef: string | undefined;
-          let lat: number | undefined;
-          let lng: number | undefined;
-          for (const e of readIfd(r, gpsIfdOffset)) {
-            if (e.tag === 0x0001) latRef = readAscii(r, e);
-            else if (e.tag === 0x0002) lat = readCoordinate(r, e);
-            else if (e.tag === 0x0003) lngRef = readAscii(r, e);
-            else if (e.tag === 0x0004) lng = readCoordinate(r, e);
-          }
-          if (lat !== undefined && lng !== undefined && Number.isFinite(lat) && Number.isFinite(lng)) {
-            const latitude = latRef === "S" ? -lat : lat;
-            const longitude = lngRef === "W" ? -lng : lng;
-            if (Math.abs(latitude) <= 90 && Math.abs(longitude) <= 180 && !(latitude === 0 && longitude === 0)) {
-              out.latitude = Math.round(latitude * 1e6) / 1e6;
-              out.longitude = Math.round(longitude * 1e6) / 1e6;
-            }
-          }
-        }
-        return Object.keys(out).length > 0 ? out : null;
-      }
-      off += 2 + segLen;
+    const block = findExifBlock(buf);
+    if (!block) return null;
+    const r = block.r;
+    const ifd0 = readIfd(r, block.ifd0Offset);
+    const out: ExifSummary = {};
+    let exifIfdOffset: number | undefined;
+    let gpsIfdOffset: number | undefined;
+    for (const e of ifd0) {
+      if (e.tag === 0x0112) {
+        const v = readShort(r, e);
+        if (v !== undefined) out.orientation = v;
+      } else if (e.tag === 0x010f) {
+        const v = readAscii(r, e);
+        if (v !== undefined) out.make = v;
+      } else if (e.tag === 0x0110) {
+        const v = readAscii(r, e);
+        if (v !== undefined) out.model = v;
+      } else if (e.tag === 0x8769) exifIfdOffset = readShort(r, e);
+      else if (e.tag === 0x8825) gpsIfdOffset = readShort(r, e);
     }
+    if (exifIfdOffset !== undefined) {
+      let dateTime: string | undefined;
+      let offsetTime: string | undefined;
+      for (const e of readIfd(r, exifIfdOffset)) {
+        if (e.tag === 0x9003) dateTime = readAscii(r, e);
+        else if (e.tag === 0x9011) offsetTime = readAscii(r, e);
+      }
+      const iso = exifDateToIso(dateTime, offsetTime);
+      if (iso) out.takenAt = iso;
+    }
+    if (gpsIfdOffset !== undefined) {
+      let latRef: string | undefined;
+      let lngRef: string | undefined;
+      let lat: number | undefined;
+      let lng: number | undefined;
+      for (const e of readIfd(r, gpsIfdOffset)) {
+        if (e.tag === 0x0001) latRef = readAscii(r, e);
+        else if (e.tag === 0x0002) lat = readCoordinate(r, e);
+        else if (e.tag === 0x0003) lngRef = readAscii(r, e);
+        else if (e.tag === 0x0004) lng = readCoordinate(r, e);
+      }
+      if (lat !== undefined && lng !== undefined && Number.isFinite(lat) && Number.isFinite(lng)) {
+        const latitude = latRef === "S" ? -lat : lat;
+        const longitude = lngRef === "W" ? -lng : lng;
+        if (Math.abs(latitude) <= 90 && Math.abs(longitude) <= 180 && !(latitude === 0 && longitude === 0)) {
+          out.latitude = Math.round(latitude * 1e6) / 1e6;
+          out.longitude = Math.round(longitude * 1e6) / 1e6;
+        }
+      }
+    }
+    return Object.keys(out).length > 0 ? out : null;
+  } catch {
     return null;
+  }
+}
+
+/** Ceiling on an embedded thumbnail; real ones are 5–30 KB. */
+export const EXIF_THUMBNAIL_MAX_BYTES = 256 * 1024;
+
+/**
+ * The camera's own thumbnail, lifted out of EXIF IFD1 (JPEGInterchangeFormat
+ * 0x0201 / …Length 0x0202). It is a derivative of the very bytes that were
+ * uploaded — not something a client supplied separately — so serving it as a
+ * gallery tile shows the same evidence as the original, only smaller.
+ * Returns null unless the file really carries one as JPEG-compressed data.
+ */
+export function extractExifThumbnail(buf: Buffer): Buffer | null {
+  try {
+    const block = findExifBlock(buf);
+    if (!block) return null;
+    const { r, ifd0Offset } = block;
+    if (ifd0Offset + 2 > r.length) return null;
+    const entryCount = r.u16(ifd0Offset);
+    const nextPointer = ifd0Offset + 2 + entryCount * 12;
+    if (nextPointer + 4 > r.length) return null;
+    const ifd1Offset = r.u32(nextPointer);
+    if (ifd1Offset === 0 || ifd1Offset >= r.length) return null;
+    let start: number | undefined;
+    let length: number | undefined;
+    let compression: number | undefined;
+    for (const e of readIfd(r, ifd1Offset)) {
+      if (e.tag === 0x0201) start = readShort(r, e);
+      else if (e.tag === 0x0202) length = readShort(r, e);
+      else if (e.tag === 0x0103) compression = readShort(r, e);
+    }
+    if (start === undefined || length === undefined) return null;
+    // 6 = JPEG (old-style), 7 = JPEG. Anything else is an uncompressed or
+    // TIFF-tiled thumbnail we would have to transcode, which we will not fake.
+    if (compression !== undefined && compression !== 6 && compression !== 7) return null;
+    if (length <= 0 || length > EXIF_THUMBNAIL_MAX_BYTES) return null;
+    if (start + length > r.length) return null;
+    const thumb = r.bytes(start, length);
+    if (thumb.length !== length) return null;
+    if (!(thumb[0] === 0xff && thumb[1] === 0xd8 && thumb[2] === 0xff)) return null;
+    return Buffer.from(thumb);
   } catch {
     return null;
   }

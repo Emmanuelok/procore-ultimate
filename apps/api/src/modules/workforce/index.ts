@@ -2634,7 +2634,16 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
           updates,
           status:
             body.status ?? (grievance.status === "received" ? "acknowledged" : grievance.status),
-          firstRespondedAt: grievance.firstRespondedAt ?? now,
+          /*
+           * AN INTERNAL NOTE IS NOT A RESPONSE. `sweepGrievanceSla` reads
+           * nothing but `firstRespondedAt`, so stamping it from an update the
+           * reporter cannot see closed the SLA and suppressed the
+           * `worker_voice_unanswered` signal without anybody having answered
+           * the worker — the one control this channel exists to provide. Only
+           * an update the reporter can actually read counts as the response.
+           */
+          firstRespondedAt:
+            grievance.firstRespondedAt ?? (body.visibleToReporter ? now : null),
           closedAt: closing ? now : grievance.closedAt,
           outcome: body.outcome ?? grievance.outcome,
           updatedAt: now,

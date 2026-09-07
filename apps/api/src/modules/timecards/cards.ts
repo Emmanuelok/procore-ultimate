@@ -2027,16 +2027,26 @@ export async function attachAccessLinks(
     .where(and(...clauses))
     .limit(500);
   if (orphans.length === 0) return { examined: 0, linked: 0 };
+  /*
+   * BOUNDED BY THE ORPHANS' OWN DATE RANGE, not by the workers' whole
+   * history: the match key is (workerId, workDate), so a record outside the
+   * span of the cards in hand can never match one, and loading a two-year
+   * turnstile feed to find last week's shifts is how this job stops finishing.
+   */
+  const orphanDates = orphans.map((o) => o.workDate).sort();
   const access = await db
     .select()
     .from(siteAccessRecords)
     .where(
       and(
+        eq(siteAccessRecords.companyId, companyId),
         eq(siteAccessRecords.projectId, projectId),
         inArray(
           siteAccessRecords.workerId,
           [...new Set(orphans.map((o) => o.workerId))],
         ),
+        gte(siteAccessRecords.accessDate, orphanDates[0]!),
+        lte(siteAccessRecords.accessDate, orphanDates[orphanDates.length - 1]!),
       ),
     );
   const byKey = new Map(access.map((a) => [`${a.workerId}|${a.accessDate}`, a]));

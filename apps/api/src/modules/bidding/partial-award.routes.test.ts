@@ -529,6 +529,89 @@ describe("partial award — approval", () => {
     expect(voidsAfter).toBe(voidsBefore + 1);
   });
 
+  /**
+   * An alternate accepted while a live award stands on the same package moves
+   * a bidder's compared total and nulls their levelling — the figures the
+   * live award was measured against. The route refused only `awarded` and
+   * `cancelled`, so a SPLIT package (which sits at `partially_awarded` while
+   * one part is bought) went straight through.
+   */
+  it("refuses an alternate acceptance while a live award stands on the package", async () => {
+    const pkg = await createPackage({ title: "Alternate under a live partial" });
+    await issuePackage(pkg.id);
+    receiptOffset += 1;
+    const withAlternate = await post(
+      `/projects/${projectA}/bid-packages/${pkg.id}/submissions`,
+      {
+        vendorId: alpha,
+        baseBidAmount: 180_000,
+        currency: "GBP",
+        receivedAt: isoIn(-3 * HOUR),
+        alternates: [
+          { label: "A1", description: "Galvanised handrail in lieu of painted", amount: 12_000 },
+        ],
+      },
+    );
+    expect(withAlternate.statusCode).toBe(201);
+    const bidB = await submitBid(pkg.id, bravo, 175_000);
+
+    // Before any award the alternate can be accepted and released again.
+    const accepted = await post(
+      `/bid-submissions/${withAlternate.json().id}/alternates/A1/accept`,
+      { accepted: true, reason: "The client chose the galvanised handrail." },
+    );
+    expect(accepted.statusCode).toBe(200);
+    const released = await post(
+      `/bid-submissions/${withAlternate.json().id}/alternates/A1/accept`,
+      { accepted: false, reason: "Reversed: the client reverted to the painted specification." },
+    );
+    expect(released.statusCode).toBe(200);
+
+    const items = await post(`/projects/${projectA}/bid-packages/${pkg.id}/levelling/items`, {
+      items: [
+        { itemCode: "G10", description: "Groundworks" },
+        { itemCode: "F10", description: "Frame" },
+      ],
+    });
+    expect(items.statusCode).toBe(201);
+    const rows: Array<{ id: string; itemCode: string }> = items.json().items;
+    const row = (code: string) => rows.find((r) => r.itemCode === code)!.id;
+    const entries = await post(`/projects/${projectA}/bid-packages/${pkg.id}/levelling/entries`, {
+      entries: [
+        { levellingItemId: row("G10"), submissionId: withAlternate.json().id, includedStatus: "included", asBidAmount: 80_000 },
+        { levellingItemId: row("F10"), submissionId: withAlternate.json().id, includedStatus: "included", asBidAmount: 100_000 },
+        { levellingItemId: row("G10"), submissionId: bidB.id, includedStatus: "included", asBidAmount: 95_000 },
+        { levellingItemId: row("F10"), submissionId: bidB.id, includedStatus: "included", asBidAmount: 80_000 },
+      ],
+    });
+    expect(entries.statusCode).toBe(201);
+
+    const first = await post(`/projects/${projectA}/bid-packages/${pkg.id}/award/recommend`, {
+      submissionId: bidB.id,
+      recommendationBasis: BASIS,
+      scopeLevellingItemIds: [row("F10")],
+    });
+    expect(first.statusCode).toBe(201);
+    expect(
+      (
+        await post(
+          `/bid-awards/${first.json().id}/approve`,
+          { budgetLineItemId: budgetLineId },
+          approver.headers,
+        )
+      ).statusCode,
+    ).toBe(200);
+    const [pkgRow] = await app.db.select().from(bidPackages).where(eq(bidPackages.id, pkg.id));
+    expect(pkgRow?.status).toBe("partially_awarded");
+
+    const refused = await post(
+      `/bid-submissions/${withAlternate.json().id}/alternates/A1/accept`,
+      { accepted: true, reason: "Trying to move a compared total after part of the job is let." },
+    );
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json().message).toMatch(/live award|carries award/i);
+  });
+
   it("frees the scope again when a partial award is withdrawn", async () => {
     const { pkg, bidA, bidB, row } = await splitPackage("Withdraw a part");
     const first = await post(`/projects/${projectA}/bid-packages/${pkg.id}/award/recommend`, {

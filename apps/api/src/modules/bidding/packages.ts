@@ -10,6 +10,7 @@ import {
   bidSubmissionLines,
   bidSubmissions,
   budgetLineItems,
+  budgets,
   signals,
   vendors,
 } from "@constructos/db";
@@ -680,6 +681,72 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
       return packageDetail(app.db, pkg);
     },
   );
+
+  /**
+   * THE BUDGET LINES THIS PROJECT'S AWARDS CAN CHARGE TO.
+   *
+   * `bid_packages.budgetLineItemIds` decides where an approved award's
+   * committed cost lands: `awards.ts` takes the first of them (or an explicit
+   * `budgetLineItemId` on the approval), writes the schedule-of-values line
+   * against it and runs `syncBudgetCommitted`. Without a way to SEE the
+   * project's budget lines, every package created from a browser carried an
+   * empty list, every award resolved `budgetLineItemId = null`, and the
+   * awarded value never reached the project's committed cost.
+   *
+   * This is a deliberately small read — id, code, description, the budget it
+   * belongs to and that budget's currency — so the package editor and the
+   * approval dialog can name a line rather than ask somebody to paste an id.
+   * The budget module owns everything else about these rows.
+   */
+  app.get(
+    "/projects/:projectId/bidding/budget-lines",
+    { preHandler: readGate },
+    async (req) => {
+      const rows = await app.db
+        .select({
+          id: budgetLineItems.id,
+          budgetId: budgetLineItems.budgetId,
+          costCode: budgetLineItems.costCode,
+          costType: budgetLineItems.costType,
+          description: budgetLineItems.description,
+          status: budgetLineItems.status,
+          revisedBudget: budgetLineItems.revisedBudget,
+          committedCost: budgetLineItems.committedCost,
+          pendingCommitments: budgetLineItems.pendingCommitments,
+          budgetName: budgets.name,
+          budgetIsActive: budgets.isActive,
+          currency: budgets.currency,
+        })
+        .from(budgetLineItems)
+        .innerJoin(budgets, eq(budgets.id, budgetLineItems.budgetId))
+        .where(
+          and(
+            eq(budgetLineItems.companyId, req.companyId!),
+            eq(budgetLineItems.projectId, req.projectId!),
+          ),
+        )
+        .orderBy(desc(budgets.isActive), asc(budgetLineItems.costCode))
+        .limit(500);
+      return {
+        items: rows.map(({ budgetIsActive, ...r }) => ({
+          ...r,
+          isActiveBudget: budgetIsActive === 1,
+          label: `${r.costCode} — ${r.description}`,
+        })),
+        total: rows.length,
+        note:
+          rows.length === 0
+            ? "This project has no budget lines, so an award made here has nowhere to charge its " +
+              "committed cost. The commitment is still created; the budget simply will not see " +
+              "it until a line exists and the package names one."
+            : "An award charges its committed cost to the FIRST line named on the package (or " +
+              "to the line chosen at approval). Lines are shown with the budget they belong to " +
+              "because a project may hold more than one and only the active budget drives the " +
+              "cost report.",
+      };
+    },
+  );
+
 
   app.patch(
     "/projects/:projectId/bid-packages/:packageId",

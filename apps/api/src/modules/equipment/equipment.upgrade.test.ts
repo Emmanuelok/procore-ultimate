@@ -467,6 +467,44 @@ describe("regressions", () => {
     expect(a2?.quantityOnHand).toBe(10);
   });
 
+  it("refuses a receipt that names the same delivery line twice", async () => {
+    const item = await post(`/projects/${projectA}/materials`, {
+      name: "Duplicate-entry blocks",
+      unit: "no",
+      quantityRequired: 100,
+      isTracked: true,
+    });
+    expect(item.statusCode).toBe(201);
+    const itemId = item.json().id as string;
+
+    // Deliberately no supplierVendorId: this delivery exists to test the
+    // receipt, and attributing it to a vendor would move that vendor's
+    // scorecard sample size under the supplier-scorecard test below.
+    const delivery = await post(`/projects/${projectA}/material-deliveries`, {
+      lines: [
+        { materialItemId: itemId, description: "One pallet", quantityExpected: 10, unit: "no" },
+      ],
+    });
+    expect(delivery.statusCode).toBe(201);
+    const deliveryId = delivery.json().id as string;
+    const lineId = (delivery.json().lines as Array<{ id: string }>)[0]!.id;
+
+    const res = await post(`/projects/${projectA}/material-deliveries/${deliveryId}/receive`, {
+      createStockMovements: true,
+      lines: [
+        { lineId, quantityReceived: 10, quantityAccepted: 10, quantityRejected: 0 },
+        { lineId, quantityReceived: 10, quantityAccepted: 10, quantityRejected: 0 },
+      ],
+    });
+    expect(res.statusCode, res.body).toBe(400);
+    expect(res.json().message).toContain("more than");
+
+    // Nothing was booked: one pallet cannot enter the compound twice.
+    const [after] = await app.db.select().from(materialItems).where(eq(materialItems.id, itemId));
+    expect(after?.quantityOnHand).toBe(0);
+    expect(after?.quantityDelivered).toBe(0);
+  });
+
   it("adds up two lines of the same material rather than losing one", async () => {
     const item = await post(`/projects/${projectA}/materials`, {
       name: "Two-pallet rebar",

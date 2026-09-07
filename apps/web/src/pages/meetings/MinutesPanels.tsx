@@ -43,8 +43,11 @@ import {
 interface Objection {
   id?: string;
   note?: string;
-  raisedBy?: string;
-  raisedAt?: string;
+  /* The API writes the objection as { id, by, at, note, ... }; `raisedBy` /
+     `raisedAt` are not fields it has ever returned, so reading them meant the
+     "raised <date>" line never rendered. */
+  by?: string;
+  at?: string;
   resolvedAt?: string | null;
   resolvedBy?: string | null;
   resolutionNote?: string | null;
@@ -113,7 +116,7 @@ export function ObjectionsPanel({
                 <Badge tone="warning" size="xs">
                   unresolved
                 </Badge>
-                {o.raisedAt ? <span>raised {dateTime(str(o.raisedAt))}</span> : null}
+                {o.at ? <span>raised {dateTime(str(o.at))}</span> : null}
               </div>
               <p className="mt-1 whitespace-pre-wrap text-sm text-content">
                 {str(o.note) ?? "(no note recorded)"}

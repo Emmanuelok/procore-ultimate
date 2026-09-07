@@ -236,7 +236,8 @@ export interface EarnedValueResponse {
   ev: number;
   ac: number;
   sv: number;
-  cv: number;
+  /** costed EV − AC; null when too little of the budget carries a booked cost */
+  cv: number | null;
   spi: number | null;
   cpi: number | null;
   eac: number | null;

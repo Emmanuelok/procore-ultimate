@@ -751,3 +751,251 @@ describe("runCompanyIntegrity", () => {
     expect(runCompanyIntegrity(history, names)).toHaveLength(0);
   });
 });
+
+/* ================================================================== */
+/* A LABELLED CORPUS — measured precision and recall per detector      */
+/* ================================================================== */
+
+/**
+ * THE DETECTORS ARE MEASURED AGAINST GROUND TRUTH, NOT AGAINST OPINION.
+ *
+ * The live register reports each detector's precision from what reviewers
+ * dispositioned (`GET /companies/current/bid-integrity/precision`). That
+ * measures REVIEWER behaviour, which is worth knowing and is not the same
+ * question as "is this detector any good": a company that dismisses
+ * everything drives every detector to zero, and a company that confirms
+ * everything drives every detector to one.
+ *
+ * This is the other measurement. Each fixture below is a package whose truth
+ * is known because it was constructed: `schemes` names the pattern that was
+ * planted in it, and a clean package names none. Precision is then
+ *
+ *     TP / (TP + FP)  over the corpus, per detector
+ *
+ * where a firing is a true positive only on a package labelled with that
+ * scheme. A threshold change that starts firing the clustering detector on
+ * an honest 8%-spread field, or that stops it firing on a 0.3% cluster,
+ * fails here — which is the point: it is a test that a tuning change cannot
+ * quietly pass.
+ *
+ * The corpus is deliberately small and deliberately explicit. A fixture whose
+ * label is arguable is worse than no fixture, so every package here is one
+ * a quantity surveyor would label the same way without hesitating.
+ */
+interface LabelledPackage {
+  name: string;
+  /** the patterns actually planted — empty means an honest tender */
+  schemes: string[];
+  facts: PackageFacts;
+  contenders: ContenderFacts[];
+  lines: RateFacts[];
+}
+
+/** Rates that differ item by item, as two independent estimators' rates do. */
+function independentRates(
+  submissionId: string,
+  vendorId: string,
+  rates: readonly number[],
+): RateFacts[] {
+  return rates.map((r, i) => rate(submissionId, vendorId, `I${i + 1}`, i + 1, r));
+}
+
+const day = (n: number, hour = 9, minute = 0) =>
+  `2026-03-${String(n).padStart(2, "0")}T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00.000Z`;
+
+const facts = (packageId: string, estimate: number | null = null): PackageFacts => ({
+  packageId,
+  reference: packageId.toUpperCase(),
+  title: "Corpus package",
+  currency: "GBP",
+  engineersEstimate: estimate,
+  tradeCode: "GROUNDWORKS",
+  comparisonBasis: "levelled",
+});
+
+const CORPUS: LabelledPackage[] = [
+  /* ---------------- planted: complementary bidding ---------------- */
+  {
+    name: "rigged: three totals inside 0.4% of each other",
+    schemes: ["bid_integrity_price_clustering"],
+    facts: facts("rig1"),
+    contenders: [
+      contender("r1a", "v1", 300_000, { receivedAt: day(2, 9) }),
+      contender("r1b", "v2", 301_200, { receivedAt: day(4, 11) }),
+      contender("r1c", "v3", 302_100, { receivedAt: day(6, 15) }),
+    ],
+    lines: [],
+  },
+  /* ---------------- planted: one priced document, shared ---------- */
+  {
+    name: "rigged: two bidders quoting the same rates across the bill",
+    schemes: ["bid_integrity_identical_rates"],
+    facts: facts("rig2"),
+    contenders: [
+      contender("r2a", "v1", 210_000, { receivedAt: day(2, 9) }),
+      contender("r2b", "v2", 244_000, { receivedAt: day(5, 16) }),
+    ],
+    lines: [
+      ...independentRates("r2a", "v1", [40, 55, 70, 85, 100, 120]),
+      // Four of the six rates are identical to the cent.
+      ...independentRates("r2b", "v2", [40, 55, 70, 85, 133, 151]),
+    ],
+  },
+  /* ---------------- planted: a cover price with a margin ---------- */
+  {
+    name: "rigged: one bill priced, the other the same bill times 1.12",
+    schemes: ["bid_integrity_constant_ratio"],
+    facts: facts("rig3"),
+    contenders: [
+      contender("r3a", "v1", 220_000, { receivedAt: day(3, 10) }),
+      contender("r3b", "v2", 246_400, { receivedAt: day(7, 14) }),
+    ],
+    lines: [
+      ...independentRates("r3a", "v1", [40, 57, 73, 88, 104, 121]),
+      ...independentRates(
+        "r3b",
+        "v2",
+        [40, 57, 73, 88, 104, 121].map((r) => Math.round(r * 1.12 * 100) / 100),
+      ),
+    ],
+  },
+  /* ---------------- planted: one person sent them all ------------- */
+  {
+    name: "rigged: three bids inside four minutes at the end of a six-week tender",
+    schemes: ["bid_integrity_submission_clustering"],
+    facts: facts("rig4"),
+    contenders: [
+      contender("r4a", "v1", 180_000, { receivedAt: day(9, 16, 2) }),
+      contender("r4b", "v2", 205_000, { receivedAt: day(9, 16, 4) }),
+      contender("r4c", "v3", 231_000, { receivedAt: day(9, 16, 6) }),
+    ],
+    lines: [],
+  },
+  /* ---------------- honest tenders -------------------------------- */
+  {
+    name: "clean: four independent bids spread 9% about the median",
+    schemes: [],
+    facts: facts("cln1"),
+    contenders: [
+      contender("c1a", "v1", 200_000, { receivedAt: day(2, 9) }),
+      contender("c1b", "v2", 214_000, { receivedAt: day(4, 14) }),
+      contender("c1c", "v3", 228_000, { receivedAt: day(6, 10) }),
+      contender("c1d", "v4", 243_000, { receivedAt: day(8, 17) }),
+    ],
+    lines: [],
+  },
+  {
+    name: "clean: three bidders whose rates differ item by item",
+    schemes: [],
+    facts: facts("cln2"),
+    contenders: [
+      contender("c2a", "v1", 150_000, { receivedAt: day(3, 9) }),
+      contender("c2b", "v2", 163_000, { receivedAt: day(5, 13) }),
+      contender("c2c", "v3", 177_000, { receivedAt: day(7, 11) }),
+    ],
+    lines: [
+      ...independentRates("c2a", "v1", [40, 57, 73, 88, 104, 121]),
+      ...independentRates("c2b", "v2", [44, 55, 79, 84, 113, 118]),
+      ...independentRates("c2c", "v3", [37, 61, 70, 95, 99, 130]),
+    ],
+  },
+  {
+    name: "clean: a couple of coincidental round rates on a six-line bill",
+    schemes: [],
+    facts: facts("cln3"),
+    contenders: [
+      contender("c3a", "v1", 190_000, { receivedAt: day(2, 10) }),
+      contender("c3b", "v2", 208_000, { receivedAt: day(6, 15) }),
+    ],
+    lines: [
+      // Two of six rates coincide — the round numbers a common supplier sets.
+      ...independentRates("c3a", "v1", [50, 100, 73, 88, 104, 121]),
+      ...independentRates("c3b", "v2", [50, 100, 81, 79, 117, 133]),
+    ],
+  },
+  {
+    name: "clean: two bidders — a quotation, not a market",
+    schemes: [],
+    facts: facts("cln4"),
+    contenders: [
+      contender("c4a", "v1", 120_000, { receivedAt: day(4, 9) }),
+      contender("c4b", "v2", 121_000, { receivedAt: day(9, 16) }),
+    ],
+    lines: [],
+  },
+];
+
+describe("detector precision against a labelled corpus", () => {
+  const fired = new Map<string, { tp: number; fp: number; packages: string[] }>();
+  const missed: string[] = [];
+
+  for (const item of CORPUS) {
+    const result = runPackageIntegrity(item.facts, item.contenders, item.lines);
+    const detectors = new Set(result.findings.map((f) => f.detector));
+    for (const detector of detectors) {
+      const row = fired.get(detector) ?? { tp: 0, fp: 0, packages: [] };
+      if (item.schemes.includes(detector)) row.tp += 1;
+      else {
+        row.fp += 1;
+        row.packages.push(item.name);
+      }
+      fired.set(detector, row);
+    }
+    for (const scheme of item.schemes) {
+      if (!detectors.has(scheme)) missed.push(`${item.name} → ${scheme}`);
+    }
+  }
+
+  it("fires on every planted scheme — recall is 1.00 across the corpus", () => {
+    expect(missed).toEqual([]);
+  });
+
+  it("fires on nothing else — precision is 1.00 across the corpus", () => {
+    const falsePositives = [...fired.entries()]
+      .filter(([, v]) => v.fp > 0)
+      .map(([detector, v]) => `${detector} on ${v.packages.join(", ")}`);
+    expect(falsePositives).toEqual([]);
+  });
+
+  it("leaves an honest tender with a completely empty register", () => {
+    for (const item of CORPUS.filter((c) => c.schemes.length === 0)) {
+      const result = runPackageIntegrity(item.facts, item.contenders, item.lines);
+      expect({ name: item.name, findings: result.findings.map((f) => f.detector) }).toEqual({
+        name: item.name,
+        findings: [],
+      });
+    }
+  });
+
+  it("reports a measured precision of 1.00 per detector, from counts rather than opinion", () => {
+    const measured = [...fired.entries()]
+      .map(([detector, v]) => ({
+        detector,
+        tp: v.tp,
+        fp: v.fp,
+        precision: v.tp / (v.tp + v.fp),
+      }))
+      .sort((a, b) => a.detector.localeCompare(b.detector));
+    // Every planted scheme is represented, and nothing else fired at all.
+    expect(measured.map((m) => m.detector)).toEqual([
+      "bid_integrity_constant_ratio",
+      "bid_integrity_identical_rates",
+      "bid_integrity_price_clustering",
+      "bid_integrity_submission_clustering",
+    ]);
+    for (const m of measured) expect(m.precision).toBe(1);
+  });
+
+  it("says which detectors could not run rather than reporting a clean package", () => {
+    const twoBidders = CORPUS.find((c) => c.facts.packageId === "cln4")!;
+    const result = runPackageIntegrity(
+      twoBidders.facts,
+      twoBidders.contenders,
+      twoBidders.lines,
+    );
+    expect(result.findings).toEqual([]);
+    // Two bids are a quotation, not a market: the dispersion detectors are
+    // NOT reported as having found nothing.
+    expect(result.notRun.map((n) => n.detector)).toContain("bid_integrity_price_clustering");
+  });
+});

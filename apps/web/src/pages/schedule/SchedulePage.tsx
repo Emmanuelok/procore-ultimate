@@ -25,9 +25,11 @@ import {
   type KeyboardEvent,
 } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
+import { toast } from "sonner";
 import { DEPENDENCY_TYPES, SCHEDULE_TASK_TYPES, TASK_CONSTRAINT_TYPES } from "@constructos/shared";
 import { api, ApiClientError } from "../../lib/api";
 import {
+  Alert,
   Badge,
   Button,
   Card,
@@ -742,6 +744,8 @@ export default function SchedulePage() {
 
   // schedule settings modal (#361 data date, #363-366 default calendar)
   const [settingsOpen, setSettingsOpen] = useState(false);
+  /** null = not asked for; string = the API's 409, which names what still points here */
+  const [deleteBlocked, setDeleteBlocked] = useState<string | null>(null);
   const [settingsName, setSettingsName] = useState("");
   const [settingsStart, setSettingsStart] = useState("");
   const [settingsDataDate, setSettingsDataDate] = useState("");
@@ -1081,6 +1085,33 @@ export default function SchedulePage() {
       flashRecomputed();
     } catch (err) {
       setModalError(errMessage(err, "Failed to save the schedule settings."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /**
+   * Deleting a programme. The API refuses (409) while delay events or risks
+   * still point at it, naming the counts, because a silent delete orphaned
+   * them and left the forensic TIA presenting cached numbers for a programme
+   * that no longer existed. `?detach=true` severs the references explicitly
+   * and ledgers each severance — so the confirmation shows the refusal first
+   * and only then offers the severing delete.
+   */
+  async function onDeleteSchedule(detach: boolean) {
+    if (!selectedId) return;
+    setModalError(null);
+    setBusy(true);
+    try {
+      await api.del(`${base}/schedules/${selectedId}${detach ? "?detach=true" : ""}`);
+      setDeleteBlocked(null);
+      setSettingsOpen(false);
+      setSelectedId(null);
+      bump();
+      toast.success(detach ? "Schedule deleted and references severed" : "Schedule deleted");
+    } catch (err) {
+      if (err instanceof ApiClientError && err.status === 409) setDeleteBlocked(err.message);
+      else setModalError(errMessage(err, "Failed to delete the schedule."));
     } finally {
       setBusy(false);
     }
@@ -2025,7 +2056,11 @@ export default function SchedulePage() {
                   tasks={tasks.map((t) => ({ id: t.id, name: t.name }))}
                 />
               ) : null}
-              {panel === "calendars" ? <CalendarsPanel base={base} /> : null}
+              {panel === "calendars" ? (
+                /* a calendar edit moves dates on every programme that uses it,
+                   and the calendar picker on the activity editor must follow */
+                <CalendarsPanel base={base} onChanged={bump} />
+              ) : null}
               {panel === "narratives" ? (
                 <NarrativesPanel base={base} scheduleId={selectedId} />
               ) : null}
@@ -2152,6 +2187,43 @@ export default function SchedulePage() {
             </Button>
           </div>
         </form>
+
+        <div className="mt-6 space-y-2 border-t border-ink-100 pt-4">
+          <h4 className="text-xs font-semibold uppercase tracking-wide text-ink-500">
+            Delete this programme
+          </h4>
+          <p className="text-xs text-ink-500">
+            Removes the programme, its activities, logic, baselines, resources, constraints and
+            narratives. Delay events and risks that point at it are refused first.
+          </p>
+          {deleteBlocked ? (
+            <Alert tone="warning" title="Still referenced">
+              <p className="text-xs">{deleteBlocked}</p>
+              <div className="mt-2 flex gap-2">
+                <Button
+                  size="xs"
+                  variant="danger"
+                  disabled={busy}
+                  onClick={() => void onDeleteSchedule(true)}
+                >
+                  Sever the references and delete
+                </Button>
+                <Button size="xs" variant="ghost" onClick={() => setDeleteBlocked(null)}>
+                  Keep the programme
+                </Button>
+              </div>
+            </Alert>
+          ) : (
+            <Button
+              size="sm"
+              variant="danger"
+              disabled={busy || !selectedId}
+              onClick={() => void onDeleteSchedule(false)}
+            >
+              Delete schedule
+            </Button>
+          )}
+        </div>
       </Modal>
 
       <Modal open={baselineOpen} title="Capture baseline" onClose={() => setBaselineOpen(false)}>

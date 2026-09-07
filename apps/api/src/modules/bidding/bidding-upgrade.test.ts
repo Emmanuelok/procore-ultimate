@@ -2852,27 +2852,327 @@ describe("levelling scope row maintenance", () => {
     const removed = await del(`/bid-levelling-items/${itemId}`);
     expect(removed.statusCode).toBe(409);
   });
-  it("freezes the scope rows once a live award exists", async () => {
-    const pkg = await createPackage(projectA, { title: "Scope frozen by award" });
+  /**
+   * The audit's fix for the frozen-scope bug covered the EDIT and DELETE
+   * paths and the entry/auto-map/complete routes, but not CREATE: a new
+   * mandatory row could still be added under a live partial award, moving
+   * what `planAwardScope` reports as remaining with nothing on the record to
+   * say the scope had moved.
+   */
+  it("refuses a NEW scope row once a live award exists", async () => {
+    const pkg = await createPackage(projectA, { title: "Scope added after the award" });
     await issuePackage(projectA, pkg.id);
     const created = await post(`/projects/${projectA}/bid-packages/${pkg.id}/levelling/items`, {
-      items: [{ description: "All works", itemCode: "F10", isMandatory: false }],
+      items: [{ description: "All works", itemCode: "G20", isMandatory: false }],
     });
-    const itemId = created.json().items[0].id as string;
-    const winner = await submitBid(projectA, pkg.id, bravo, { baseBidAmount: 260_000 });
+    expect(created.statusCode).toBe(201);
+    const winner = await submitBid(projectA, pkg.id, charlie, { baseBidAmount: 265_000 });
     const rec = await post(`/projects/${projectA}/bid-packages/${pkg.id}/award/recommend`, {
       submissionId: winner.id,
       recommendationBasis: "The only compliant bid received against this enquiry.",
     });
     expect(rec.statusCode).toBe(201);
 
-    const renamed = await patch(`/bid-levelling-items/${itemId}`, {
-      description: "Rewritten after the award",
+    const added = await post(`/projects/${projectA}/bid-packages/${pkg.id}/levelling/items`, {
+      items: [{ description: "Extra scope nobody priced", itemCode: "G30", isMandatory: true }],
     });
-    expect(renamed.statusCode).toBe(409);
-    expect(renamed.json().message).toMatch(/scope row/i);
+    expect(added.statusCode).toBe(409);
+    expect(added.json().message).toMatch(/live award|scope row/i);
+  });
+});
 
-    const removed = await del(`/bid-levelling-items/${itemId}`);
-    expect(removed.statusCode).toBe(409);
+/* ================================================================== */
+/* THE COMPANY SURFACE IS NOT THE MODULE'S BACK DOOR                   */
+/* ================================================================== */
+
+/**
+ * `requireTool` resolves a project from `:projectId`, so it cannot guard a
+ * `/companies/current/...` route — and for a while nothing did. The most
+ * commercially sensitive data this module holds (every amount a named
+ * supplier has bid us, their rank in each field, their deviation from the
+ * pre-tender estimate) was reachable with plain company membership by a user
+ * whose `bidding` level is `none` and who is refused the tabulation of a
+ * single package. The pipeline was worse: every mutation, including the
+ * bid/no-bid decision the win model is fitted on, had no permission check
+ * at all behind an alias that read like one.
+ */
+describe("regression: company-level bidding routes carry the bidding permission", () => {
+  /** A company member with no project membership at all: `bidding` is none. */
+  async function memberWithNoProjects(): Promise<Record<string, string>> {
+    const actor = await registerActor(app);
+    await app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: actor.userId,
+      role: "member",
+    });
+    return {
+      authorization: actor.headers["authorization"]!,
+      "x-company-id": owner.companyId,
+    };
+  }
+
+  it("refuses competitor pricing and vendor bid history to a member who holds bidding nowhere", async () => {
+    const headers = await memberWithNoProjects();
+    for (const path of [
+      "/companies/current/bid-coverage",
+      "/companies/current/bid-pricing",
+      `/companies/current/vendors/${alpha}/bid-history`,
+    ]) {
+      const res = await get(path, headers);
+      expect(res.statusCode).toBe(403);
+      expect(res.json().message).toMatch(/bidding/i);
+    }
+  });
+
+  it("admits a project member at their own level and says which projects the figures cover", async () => {
+    const res = await get("/companies/current/bid-pricing", viewerHeaders);
+    expect(res.statusCode).toBe(200);
+    // read_only on projectA only — the answer states the scope it was computed over.
+    expect(res.json().scopeBasis).toMatch(/project/i);
+    const history = await get(`/companies/current/vendors/${alpha}/bid-history`, viewerHeaders);
+    expect(history.statusCode).toBe(200);
+    for (const row of history.json().rows as Array<{ projectId: string }>) {
+      expect(row.projectId).toBe(projectA);
+    }
+  });
+
+  it("keeps the opportunity pipeline behind the same permission — read to read, write to standard", async () => {
+    const headers = await memberWithNoProjects();
+    expect((await get("/companies/current/opportunities", headers)).statusCode).toBe(403);
+    const created = await post(
+      "/companies/current/opportunities",
+      { title: "Should never land", currency: "GBP" },
+      headers,
+    );
+    expect(created.statusCode).toBe(403);
+
+    // A read-only project member may READ the pipeline and may not move it.
+    expect((await get("/companies/current/opportunities", viewerHeaders)).statusCode).toBe(200);
+    const write = await post(
+      "/companies/current/opportunities",
+      { title: "Read-only member should not create", currency: "GBP" },
+      viewerHeaders,
+    );
+    expect(write.statusCode).toBe(403);
+    const cost = await post(
+      "/companies/current/tender-costs",
+      { kind: "estimating_labour", description: "Should be refused", incurredOn: dateIn(0) },
+      viewerHeaders,
+    );
+    expect(cost.statusCode).toBe(403);
+  });
+
+  it("says how much of the register the win rate and the cost of sale were computed from", async () => {
+    const rate = await get("/companies/current/win-rate");
+    expect(rate.statusCode).toBe(200);
+    expect(rate.json().coverage.complete).toBe(true);
+    expect(rate.json().coverage.read).toBe(rate.json().coverage.total);
+    const cos = await get("/companies/current/cost-of-sale");
+    expect(cos.statusCode).toBe(200);
+    expect(cos.json().coverage.complete).toBe(true);
+  });
+});
+
+/* ================================================================== */
+/* DISPOSITIONING A FINDING IS A SEGREGATED ACT                        */
+/* ================================================================== */
+
+describe("regression: nobody clears the integrity finding that stands in their own way", () => {
+  /** Raise a clustering finding on a fresh package and return its signal id. */
+  async function clusteredPackageWithFinding(title: string) {
+    const pkg = await createPackage(projectA, { title });
+    await issuePackage(projectA, pkg.id);
+    const a = await submitBid(projectA, pkg.id, alpha, { baseBidAmount: 400_000 });
+    await submitBid(projectA, pkg.id, bravo, { baseBidAmount: 401_500 });
+    await submitBid(projectA, pkg.id, charlie, { baseBidAmount: 402_400 });
+    const run = await post(`/projects/${projectA}/bid-packages/${pkg.id}/integrity/run`);
+    expect(run.statusCode).toBe(200);
+    const findings = await get(`/projects/${projectA}/bid-packages/${pkg.id}/integrity`);
+    expect(findings.statusCode).toBe(200);
+    const signalId = (
+      findings.json().signals as Array<{ id: string; detector: string; severity: string }>
+    ).find((s) => s.detector === "bid_integrity_price_clustering")?.id;
+    expect(signalId).toBeTruthy();
+    return { pkg, winner: a, signalId: signalId as string };
+  }
+
+  it("refuses a dismissal or a confirmation by a plain company member", async () => {
+    const { signalId } = await clusteredPackageWithFinding("Disposition gate");
+    const dismissed = await post(
+      `/companies/current/bid-integrity/${signalId}/dismiss`,
+      { reason: "A plain member should not be able to switch off an award control." },
+      viewerHeaders,
+    );
+    expect(dismissed.statusCode).toBe(403);
+    const confirmed = await post(
+      `/companies/current/bid-integrity/${signalId}/confirm`,
+      { reason: "Nor confirm it." },
+      viewerHeaders,
+    );
+    expect(confirmed.statusCode).toBe(403);
+  });
+
+  it("refuses a three-character dismissal reason on a control that switches off an award gate", async () => {
+    const { signalId } = await clusteredPackageWithFinding("Disposition reason length");
+    const res = await post(`/companies/current/bid-integrity/${signalId}/dismiss`, {
+      reason: "n/a",
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("still demands an acknowledgement from the recommender who dismissed the finding", async () => {
+    const { pkg, winner, signalId } = await clusteredPackageWithFinding("Self-cleared finding");
+    const dismissed = await post(`/companies/current/bid-integrity/${signalId}/dismiss`, {
+      reason:
+        "Published schedule of rates on this framework; the cluster is explained by the rates " +
+        "themselves and no further action is proposed.",
+    });
+    expect(dismissed.statusCode).toBe(200);
+    expect(dismissed.json().disposition).toBe("false_positive");
+
+    // The SAME actor now recommends. Their own dismissal does not clear it.
+    const refused = await post(`/projects/${projectA}/bid-packages/${pkg.id}/award/recommend`, {
+      submissionId: winner.id,
+      recommendationBasis: "Lowest comparable bid on a field of three.",
+    });
+    expect(refused.statusCode).toBe(400);
+    expect(refused.json().details.control).toBe("integrity_findings_require_acknowledgement");
+    expect(refused.json().details.selfClearedSignalIds).toContain(signalId);
+    expect(refused.json().message).toMatch(/dismissed yourself/i);
+
+    const accepted = await post(`/projects/${projectA}/bid-packages/${pkg.id}/award/recommend`, {
+      submissionId: winner.id,
+      recommendationBasis: "Lowest comparable bid on a field of three.",
+      integrityAcknowledgement:
+        "The clustering was checked against the published framework rates every bidder prices " +
+        "from; the three totals differ only in preliminaries and the finding is explained.",
+    });
+    expect(accepted.statusCode).toBe(201);
+  });
+
+  it("clears normally when somebody else dismissed it", async () => {
+    const { pkg, winner, signalId } = await clusteredPackageWithFinding("Cleared by another");
+    // The APPROVER (a company admin, and not the recommender) dismisses it.
+    const dismissed = await post(
+      `/companies/current/bid-integrity/${signalId}/dismiss`,
+      {
+        reason:
+          "Checked with the estimators: all three price from the same published framework " +
+          "rates, so the cluster is a property of the rates rather than of the bidders.",
+      },
+      approver.headers,
+    );
+    expect(dismissed.statusCode).toBe(200);
+    const accepted = await post(`/projects/${projectA}/bid-packages/${pkg.id}/award/recommend`, {
+      submissionId: winner.id,
+      recommendationBasis: "Lowest comparable bid on a field of three.",
+    });
+    expect(accepted.statusCode).toBe(201);
+  });
+});
+
+/* ================================================================== */
+/* THE ESTIMATE IS FROZEN ONCE A PRICE IS IN THE ROOM                  */
+/* ================================================================== */
+
+describe("regression: the pre-tender estimate cannot move after the bids are in", () => {
+  it("refuses a change to engineersEstimate or currency once a bid exists, and allows it before", async () => {
+    const pkg = await createPackage(projectA, {
+      title: "Estimate freeze",
+      engineersEstimate: 200_000,
+    });
+    // Before any bid the estimate is exactly what it should be: editable.
+    const early = await patch(`/projects/${projectA}/bid-packages/${pkg.id}`, {
+      engineersEstimate: 210_000,
+    });
+    expect(early.statusCode).toBe(200);
+    expect(early.json().engineersEstimate).toBe(210_000);
+
+    await issuePackage(projectA, pkg.id);
+    await submitBid(projectA, pkg.id, alpha, { baseBidAmount: 170_000 });
+    await submitBid(projectA, pkg.id, bravo, { baseBidAmount: 240_000 });
+
+    // 170,000 against a 210,000 estimate is -19%: abnormally low, and the
+    // award route will demand a written explanation. Moving the estimate down
+    // to 190,000 would put it inside the -15% threshold and switch the
+    // control off after the prices were in the room.
+    const refused = await patch(`/projects/${projectA}/bid-packages/${pkg.id}`, {
+      engineersEstimate: 190_000,
+    });
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json().message).toMatch(/engineersEstimate/);
+    expect(refused.json().message).toMatch(/abnormally-low/i);
+
+    const currency = await patch(`/projects/${projectA}/bid-packages/${pkg.id}`, {
+      currency: "EUR",
+    });
+    expect(currency.statusCode).toBe(409);
+
+    // Sending the SAME value is not a change and is not refused.
+    const unchanged = await patch(`/projects/${projectA}/bid-packages/${pkg.id}`, {
+      engineersEstimate: 210_000,
+      scopeDescription: "The narrative may still be corrected.",
+    });
+    expect(unchanged.statusCode).toBe(200);
+    expect(unchanged.json().scopeDescription).toMatch(/narrative/);
+  });
+});
+
+/* ================================================================== */
+/* WHERE AN AWARD'S COMMITTED COST LANDS                               */
+/* ================================================================== */
+
+/**
+ * `bid_packages.budgetLineItemIds` decides where an approved award charges
+ * its committed cost, and there was no way for a browser user to see the
+ * project's budget lines — so every package created from the UI named none,
+ * every award resolved `budgetLineItemId = null`, and the awarded value never
+ * reached the project budget.
+ */
+describe("the budget lines an award can charge to", () => {
+  it("lists the project's lines with the budget they belong to, and keeps another tenant out", async () => {
+    const budgetId = newId("bdg");
+    await app.db.insert(budgets).values({
+      id: budgetId,
+      companyId: owner.companyId,
+      projectId: projectB,
+      number: 900,
+      reference: "BUD-0900",
+      name: "Primary",
+      status: "active",
+      isActive: 1,
+      currency: "GBP",
+      createdBy: owner.userId,
+    });
+    const lineId = newId("bli");
+    await app.db.insert(budgetLineItems).values({
+      id: lineId,
+      budgetId,
+      companyId: owner.companyId,
+      projectId: projectB,
+      costCode: "05-100",
+      description: "Structural steel",
+      originalBudget: 750_000,
+      revisedBudget: 750_000,
+      createdBy: owner.userId,
+    });
+
+    const res = await get(`/projects/${projectB}/bidding/budget-lines`);
+    expect(res.statusCode).toBe(200);
+    const row = (res.json().items as Array<{ id: string; label: string; currency: string; isActiveBudget: boolean }>).find(
+      (r) => r.id === lineId,
+    );
+    expect(row).toBeTruthy();
+    expect(row!.label).toBe("05-100 — Structural steel");
+    expect(row!.currency).toBe("GBP");
+    expect(row!.isActiveBudget).toBe(true);
+
+    // A project with no budget says so rather than returning an empty answer.
+    const empty = await get(`/projects/${projectA}/bidding/budget-lines`);
+    expect(empty.statusCode).toBe(200);
+
+    const outsider = await get(`/projects/${projectB}/bidding/budget-lines`, stranger.headers);
+    expect([403, 404]).toContain(outsider.statusCode);
   });
 });

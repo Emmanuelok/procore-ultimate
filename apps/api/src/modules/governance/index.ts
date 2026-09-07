@@ -30,6 +30,7 @@ import {
   RAG_RATINGS,
   type BenefitDependencyType,
 } from "@constructos/shared";
+import type { Db } from "../../lib/db.js";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
@@ -1142,7 +1143,7 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
           });
         }
 
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "create",
@@ -1160,7 +1161,7 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
           storePayload: true,
           projectId: req.projectId!,
         });
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "state_change",
@@ -1224,7 +1225,7 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
           .update(obligations)
           .set({ status: "satisfied" })
           .where(and(eq(obligations.id, condition.obligationId), eq(obligations.status, "open")));
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "state_change",
@@ -1812,7 +1813,7 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
               })
               .where(eq(businessCases.id, bc.id));
           }
-          await appendLedger(tx as never, {
+          await appendLedger(tx as Db, {
             companyId: req.companyId!,
             actorId: req.user!.id,
             action: "state_change",
@@ -2202,7 +2203,7 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
           obligationId,
           createdBy: req.user!.id,
         });
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "create",
@@ -2311,7 +2312,7 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
               ),
             );
         }
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "update",
@@ -2372,7 +2373,7 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
             })
             .where(and(eq(obligations.id, action.obligationId), eq(obligations.status, "open")));
         }
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "state_change",

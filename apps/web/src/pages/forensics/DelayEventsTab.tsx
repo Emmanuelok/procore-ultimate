@@ -143,6 +143,8 @@ interface CreateForm {
   contractEventId: string;
   noticeDueDate: string;
   party: string;
+  /** the critical event this one is pacing (#278-281) — "" = not pacing */
+  pacingOfEventId: string;
   evidenceIds: string[];
 }
 
@@ -160,6 +162,7 @@ const emptyForm: CreateForm = {
   contractEventId: "",
   noticeDueDate: "",
   party: "neither",
+  pacingOfEventId: "",
   evidenceIds: [],
 };
 
@@ -174,6 +177,8 @@ export default function DelayEventsTab({
   const base = `/api/v1/projects/${projectId}`;
 
   const [items, setItems] = useState<DelayEventRow[] | null>(null);
+  /** every live event on the project — the candidates a pacing event can pace */
+  const [pacingPool, setPacingPool] = useState<DelayEventRow[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [error, setError] = useState<string | null>(null);
@@ -190,6 +195,14 @@ export default function DelayEventsTab({
     } catch (err) {
       setItems([]);
       setError(err instanceof Error ? err.message : "Failed to load delay events");
+    }
+    /* The register is paged; the pacing pool is every live event, so a declared
+       relationship reads as "DE-7 · Late steel" on any page rather than an id. */
+    try {
+      const all = await api.get<ListResponse<DelayEventRow>>(`${base}/delay-events?pageSize=200`);
+      setPacingPool(all.items);
+    } catch {
+      setPacingPool([]);
     }
   }, [base, page]);
 
@@ -253,14 +266,16 @@ export default function DelayEventsTab({
 
   async function loadPickers(): Promise<void> {
     try {
-      const [sch, con, ev] = await Promise.all([
+      const [sch, con, ev, events] = await Promise.all([
         api.get<ListResponse<ScheduleRow>>(`${base}/schedules?pageSize=100`),
         api.get<ListResponse<ContractLite>>(`${base}/contracts?pageSize=100`),
         api.get<ListResponse<EvidenceLite>>(`${base}/evidence?pageSize=100`),
+        api.get<ListResponse<DelayEventRow>>(`${base}/delay-events?pageSize=200`),
       ]);
       setSchedules(sch.items);
       setContracts(con.items);
       setEvidencePool(ev.items);
+      setPacingPool(events.items);
     } catch {
       // pickers stay empty; the event can still be saved without links
     }
@@ -304,6 +319,7 @@ export default function DelayEventsTab({
       contractEventId: ev.contractEventId ?? "",
       noticeDueDate: ev.noticeDueDate ?? "",
       party: ev.party ?? "neither",
+      pacingOfEventId: ev.pacingOfEventId ?? "",
       evidenceIds: ev.evidenceIds ?? [],
     });
     setTasks([]);
@@ -384,6 +400,7 @@ export default function DelayEventsTab({
           taskId: form.taskId === "" ? null : form.taskId,
           contractEventId: form.contractEventId === "" ? null : form.contractEventId,
           noticeDueDate: form.noticeDueDate === "" ? null : form.noticeDueDate,
+          pacingOfEventId: form.pacingOfEventId === "" ? null : form.pacingOfEventId,
           evidenceIds: form.evidenceIds,
         });
         setCreateOpen(false);
@@ -405,6 +422,7 @@ export default function DelayEventsTab({
       if (form.taskId) payload["taskId"] = form.taskId;
       if (form.contractEventId) payload["contractEventId"] = form.contractEventId;
       if (form.noticeDueDate) payload["noticeDueDate"] = form.noticeDueDate;
+      if (form.pacingOfEventId) payload["pacingOfEventId"] = form.pacingOfEventId;
       if (form.party) payload["party"] = form.party;
       if (form.evidenceIds.length > 0) payload["evidenceIds"] = form.evidenceIds;
       await api.post<DelayEventRow>(`${base}/delay-events`, payload);
@@ -793,6 +811,30 @@ export default function DelayEventsTab({
             </Field>
           </div>
 
+          <Field
+            label="Pacing which event?"
+            hint="Declare this a pacing delay — a deliberate slowdown taken because another event already controls completion. The concurrency engine treats a declared pacing event differently from a true concurrent one, and it cannot infer the declaration."
+          >
+            <Select
+              value={form.pacingOfEventId}
+              onChange={(e) => set("pacingOfEventId", e.target.value)}
+            >
+              <option value="">Not a pacing delay</option>
+              {pacingPool
+                .filter((e) => e.id !== editId && e.status !== "withdrawn")
+                .map((e) => (
+                  <option key={e.id} value={e.id}>
+                    DE-{e.number} · {e.title}
+                  </option>
+                ))}
+            </Select>
+            {pacingPool.length === 0 ? (
+              <p className="mt-0.5 text-[11px] text-ink-400">
+                No other delay event is registered yet.
+              </p>
+            ) : null}
+          </Field>
+
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <Field label="Contract" hint="To link a contract event (notice).">
               <Select
@@ -947,6 +989,16 @@ export default function DelayEventsTab({
               </DetailRow>
               <DetailRow label="Culpable party">
                 {selected.party ? humanize(selected.party) : "— not classified —"}
+              </DetailRow>
+              <DetailRow label="Pacing">
+                {selected.pacingOfEventId
+                  ? (() => {
+                      const target = pacingPool.find((e) => e.id === selected.pacingOfEventId);
+                      return target
+                        ? `Declared as pacing DE-${target.number} · ${target.title}`
+                        : `Declared as pacing ${selected.pacingOfEventId}`;
+                    })()
+                  : "— not declared as a pacing delay —"}
               </DetailRow>
               <DetailRow label="Contract event">
                 {selected.contractEvent

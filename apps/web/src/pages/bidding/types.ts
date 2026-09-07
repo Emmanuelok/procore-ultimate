@@ -122,6 +122,8 @@ export interface BidPackage {
   procurementRoute: string;
   tradeCode: string | null;
   csiDivision: string | null;
+  /** where an approved award charges its committed cost — the first is used */
+  budgetLineItemIds: string[];
   estimatedValue: number | null;
   engineersEstimate: number | null;
   currency: string;
@@ -196,6 +198,32 @@ export interface PackageDetail extends BidPackage {
     againstEstimatePercent: Unknowable;
   };
   awards: BidAwardRow[];
+}
+
+/**
+ * A project budget line an award can charge to
+ * (GET /projects/:projectId/bidding/budget-lines).
+ */
+export interface BudgetLineOption {
+  id: string;
+  budgetId: string;
+  costCode: string;
+  costType: string;
+  description: string;
+  status: string;
+  revisedBudget: number;
+  committedCost: number;
+  pendingCommitments: number;
+  budgetName: string;
+  currency: string;
+  isActiveBudget: boolean;
+  label: string;
+}
+
+export interface BudgetLineOptions {
+  items: BudgetLineOption[];
+  total: number;
+  note: string;
 }
 
 /* ================================================================== */

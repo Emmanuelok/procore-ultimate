@@ -40,6 +40,7 @@ import {
   type DisputeStatus,
 } from "@constructos/shared";
 import { hashPayload, merkleRoot } from "@constructos/ledger";
+import type { Db } from "../../lib/db.js";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
@@ -893,7 +894,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
         governingClause: body.governingClause ?? null,
         createdBy: req.user!.id,
       });
-      await appendLedger(tx as never, {
+      await appendLedger(tx as Db, {
         companyId: req.companyId!,
         actorId: req.user!.id,
         action: "create",
@@ -1161,7 +1162,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
     }
 
     await tx.update(disputes).set(set).where(eq(disputes.id, disputeId));
-    await appendLedger(tx as never, {
+    await appendLedger(tx as Db, {
       companyId: req.companyId!,
       actorId: req.user!.id,
       action: "update",
@@ -1246,7 +1247,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
         await tx.update(disputes).set(set).where(eq(disputes.id, disputeId));
 
         if (terminal) {
-          closed = await closeTimetableObligations(tx as never, {
+          closed = await closeTimetableObligations(tx as Db, {
             companyId: req.companyId!,
             projectId: req.projectId!,
             actorId: req.user!.id,
@@ -1268,7 +1269,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
             );
         }
 
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "state_change",
@@ -1320,7 +1321,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
           .update(disputes)
           .set({ timetable: steps, updatedAt: now })
           .where(eq(disputes.id, disputeId));
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "state_change",
@@ -1711,7 +1712,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
             })),
           );
         }
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "state_change",
@@ -2189,7 +2190,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
           .update(settlementOffers)
           .set({ status: body.status, updatedAt: now })
           .where(and(eq(settlementOffers.id, offerId), eq(settlementOffers.status, "open")));
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "state_change",
@@ -2225,7 +2226,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
               ),
             )
             .returning({ id: settlementOffers.id });
-          closed = await closeTimetableObligations(tx as never, {
+          closed = await closeTimetableObligations(tx as Db, {
             companyId: req.companyId!,
             projectId: req.projectId!,
             actorId: req.user!.id,
@@ -2233,7 +2234,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
             steps,
             terminalStatus: "settled",
           });
-          await appendLedger(tx as never, {
+          await appendLedger(tx as Db, {
             companyId: req.companyId!,
             actorId: req.user!.id,
             action: "state_change",
@@ -2406,7 +2407,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
             updatedAt: now,
           })
           .where(eq(disputes.id, disputeId));
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "update",
@@ -3123,7 +3124,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
           productionDueDate: body.productionDueDate ?? null,
           createdBy: req.user!.id,
         });
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "create",
@@ -3316,7 +3317,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
             updatedAt: new Date().toISOString(),
           })
           .where(eq(documentProductionRequests.id, requestId));
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "state_change",
@@ -3387,7 +3388,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
               and(eq(obligations.id, existing.obligationId), eq(obligations.status, "open")),
             );
         }
-        await appendLedger(tx as never, {
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
           actorId: req.user!.id,
           action: "update",
