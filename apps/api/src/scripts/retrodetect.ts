@@ -1452,6 +1452,13 @@ async function runDetectorsAndSweeps(): Promise<void> {
   // claims (deemed liability), grievances (GRM SLA breach), land schedule
   // risk (un-acquired land blocking works) and permits (lapsed consents,
   // overdue determinations). Every one is hit on BOTH projects.
+  //
+  // TRIGGER CONTRACT (see plantMissedTimeBar): each of these reads runs the
+  // SAME atomic sweep function the module's hourly scheduler job runs, scoped
+  // to the project/contract being read. The scheduler is disabled under
+  // NODE_ENV=test, so these reads are the only trigger here; a module that
+  // moves its sweep onto the scheduler alone blanks its scheme in this report
+  // without failing any unit test that calls scheduler.runNow() directly.
   for (const [projectId, contractId] of [
     [ctx.plantedProjectId, ctx.plantedContractId],
     [ctx.cleanProjectId, ctx.cleanContractId],

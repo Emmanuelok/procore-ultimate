@@ -26,6 +26,7 @@ import {
 } from "./reference.js";
 import { GRIEVANCE_TIER_LABELS, MAX_GRIEVANCE_TIER } from "./grievance-engine.js";
 import { syncPapGrievanceStatus } from "./pap-grievance.js";
+import { sweepGrievances } from "./detectors.js";
 import {
   daysFromDateToInstant,
   daysUntil,
@@ -90,7 +91,9 @@ const SETTLED: readonly string[] = GRIEVANCE_SETTLED_STATUSES;
  * Community grievance redress mechanism — spec Domain J #569-574. Intake by
  * every channel including anonymous, severity-driven SLA materialized as an
  * assurance Obligation, escalation, closure verified WITH the complainant,
- * a lazy breach sweep and the analytics a lender's E&S supervision asks for.
+ * the breach sweep (run on the register read AND by the scheduled
+ * `land.detectors` job — the same function either way) and the analytics a
+ * lender's E&S supervision asks for.
  */
 export async function registerGrievanceRoutes(app: FastifyInstance): Promise<void> {
   const readGate = [app.authenticate, app.requireCompany, app.requireTool("land", "read")];
@@ -293,6 +296,18 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
 
   app.get("/projects/:projectId/grievances", { preHandler: readGate }, async (req) => {
     const q = grievanceListQuery.parse(req.query);
+    /*
+     * Route-side trigger of the grievance sweep (#572). The scheduled job
+     * (land.detectors) runs the same function hourly for every tenant; the
+     * register read runs it for THIS project first, so a case past its SLA
+     * is already breached, escalated and on the signal register by the time
+     * the list answers — and a deployment whose scheduler is off
+     * (SCHEDULER_ENABLED=false, NODE_ENV=test, the retrodetect harness) is
+     * still policed. Advisory-locked, fingerprinted, system actor: two
+     * triggers, one claim, and whoever opened the page is never the ledger
+     * actor for a finding they did not make.
+     */
+    await sweepGrievances(app.db, req.companyId!, req.projectId!);
     const clauses = [
       eq(grievances.companyId, req.companyId!),
       eq(grievances.projectId, req.projectId!),

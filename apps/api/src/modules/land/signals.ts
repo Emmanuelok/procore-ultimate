@@ -29,6 +29,12 @@
  *
  * Detectors run as the SYSTEM actor (`actorId: null`), because the person who
  * happened to open a page did not make the finding.
+ *
+ * The lock and the fingerprint are also what make it safe for a REGISTER READ
+ * to be a second trigger of the same sweep the scheduler runs (the grievance,
+ * land schedule-risk and permit list reads do this, scoped to their project):
+ * the two triggers claim each finding once, and a deployment whose scheduler
+ * is off is still policed.
  */
 
 import { and, eq, inArray, sql } from "drizzle-orm";

@@ -568,15 +568,30 @@ describe("land / schedule risk", () => {
     expect(risk.items[0].daysAtRisk).toBeGreaterThanOrEqual(0);
     expect(risk.items[0].expectedResolutionDate).toBeTruthy();
 
-    // the READ is pure: it raises nothing at all
+    // TRIGGER CONTRACT: the read ran the same consent sweep the scheduled job
+    // runs, scoped to this project, so the imminent finding is already on the
+    // register — exactly once. The scheduler is disabled under NODE_ENV=test,
+    // so nothing else could have raised it.
     const fromRead = await app.db
       .select()
       .from(signals)
       .where(
         and(eq(signals.projectId, pid), eq(signals.detector, "land_blocks_programme")),
       );
-    expect(fromRead).toHaveLength(0);
+    expect(fromRead).toHaveLength(1);
+    expect(fromRead[0]!.severity).toBe("high");
+    expect(fromRead[0]!.title).toContain("RISK-1");
+    // the SYSTEM raised it, not whoever opened the page
+    expect(fromRead[0]!.disposition).toBe("new");
+    const [ledgered] = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(
+        and(eq(ledgerEntries.objectType, "signal"), eq(ledgerEntries.objectId, fromRead[0]!.id)),
+      );
+    expect(ledgered!.actorId).toBeNull();
 
+    // the scheduled detector cycle afterwards claims nothing new
     await runDetectors(pid);
     const raised = await app.db
       .select()
@@ -585,10 +600,7 @@ describe("land / schedule risk", () => {
         and(eq(signals.projectId, pid), eq(signals.detector, "land_blocks_programme")),
       );
     expect(raised).toHaveLength(1);
-    expect(raised[0]!.severity).toBe("high");
-    expect(raised[0]!.title).toContain("RISK-1");
-    // the SYSTEM raised it, not whoever opened the page
-    expect(raised[0]!.disposition).toBe("new");
+    expect(raised[0]!.id).toBe(fromRead[0]!.id);
 
     // repeated reads AND repeated detector cycles must not duplicate it
     await app.inject({
@@ -1259,21 +1271,32 @@ describe("grievance redress mechanism", () => {
     expect(rows.find((r) => r.id === overdueCritical.id)!.daysOverdue).toBe(23);
     expect(rows.find((r) => r.id === inTime.id)!.overdue).toBe(false);
 
-    // the register read raises nothing — findings are the detector's job
+    // TRIGGER CONTRACT: the list read ran the same grievance sweep the
+    // scheduled job runs, scoped to this project, so both breaches are
+    // already on the register — exactly once each, raised by the system.
     const fromRead = await app.db
       .select()
       .from(signals)
       .where(and(eq(signals.projectId, pid), eq(signals.detector, "grievance_sla_breach")));
-    expect(fromRead).toHaveLength(0);
+    expect(fromRead).toHaveLength(2);
+    expect(fromRead.filter((s) => s.severity === "critical")).toHaveLength(1);
+    expect(fromRead.filter((s) => s.severity === "high")).toHaveLength(1);
+    for (const s of fromRead) {
+      const [ledgered] = await app.db
+        .select()
+        .from(ledgerEntries)
+        .where(and(eq(ledgerEntries.objectType, "signal"), eq(ledgerEntries.objectId, s.id)));
+      expect(ledgered!.actorId).toBeNull();
+    }
 
+    // the scheduled detector cycle afterwards claims nothing new
     await runDetectors(pid);
     const breached = await app.db
       .select()
       .from(signals)
       .where(and(eq(signals.projectId, pid), eq(signals.detector, "grievance_sla_breach")));
     expect(breached).toHaveLength(2);
-    expect(breached.filter((s) => s.severity === "critical")).toHaveLength(1);
-    expect(breached.filter((s) => s.severity === "high")).toHaveLength(1);
+    expect(breached.map((s) => s.id).sort()).toEqual(fromRead.map((s) => s.id).sort());
 
     for (const id of [overdueCritical.obligationId, overdueMedium.obligationId]) {
       const [o] = await app.db.select().from(obligations).where(eq(obligations.id, id));

@@ -4,6 +4,7 @@ import { and, eq } from "drizzle-orm";
 import {
   contracts,
   obligations,
+  permits,
   projects,
   schedules,
   scheduleTasks,
@@ -586,9 +587,14 @@ describe("permits", () => {
 /* ------------------------------------------------------------------ */
 
 /**
- * These findings used to be raised as a side effect of the permit list read,
- * which duplicated them whenever the workspace loaded its two panels in
- * parallel. They are now a scheduled job; a test triggers a cycle explicitly.
+ * TRIGGER CONTRACT. These findings are raised by `sweepPermits`, which has
+ * two triggers running the same locked, fingerprinted function: the
+ * scheduled `jurisdiction.detectors` job and the permit list read, scoped to
+ * the project being read. Before the lock and the fingerprint the read-time
+ * sweep duplicated findings whenever the workspace loaded its two panels in
+ * parallel; the fix was the lock, not a pure read. The scheduler is disabled
+ * under NODE_ENV=test, so in these tests the list read is the first trigger
+ * and this explicit cycle is the second — which must find nothing to claim.
  */
 async function runJurisdictionCycle(pid: string): Promise<void> {
   const res = await app.inject({
@@ -612,19 +618,18 @@ describe("permit detectors", () => {
 
     const first = await listPermits(pid);
     expect(first.statusCode).toBe(200);
-    // the READ reports the fact without writing anything
     expect(first.json().items[0].overdue).toBe(true);
     expect(first.json().items[0].daysToDue).toBeLessThan(0);
-    expect(await signalsFor(pid, "permit_determination_overdue")).toHaveLength(0);
-
-    await runJurisdictionCycle(pid);
+    // the first read ran the sweep: the obligation is breached and the
+    // finding is on the register — once, raised by the system
     const [obl] = await app.db.select().from(obligations).where(eq(obligations.id, obligationId));
     expect(obl?.status).toBe("breached");
     let sigs = await signalsFor(pid, "permit_determination_overdue");
     expect(sigs).toHaveLength(1);
     expect(sigs[0]?.severity).toBe("medium");
 
-    // idempotent: neither re-reading nor re-running re-raises
+    // idempotent: neither the scheduled cycle nor re-reading re-raises
+    await runJurisdictionCycle(pid);
     await listPermits(pid);
     await listPermits(pid, "?overdue=true");
     await runJurisdictionCycle(pid);
@@ -654,17 +659,20 @@ describe("permit detectors", () => {
       },
     });
 
-    const beforeCycle = await listPermits(pid);
-    expect(beforeCycle.json().items[0].status).toBe("granted");
+    // the grant is recorded as stated; nothing sweeps on a write
+    const [asGranted] = await app.db.select().from(permits).where(eq(permits.id, permitId));
+    expect(asGranted?.status).toBe("granted");
     expect(await signalsFor(pid, "permit_expired")).toHaveLength(0);
 
-    await runJurisdictionCycle(pid);
+    // the first read flips the lapsed grant and raises the finding, once
     const first = await listPermits(pid);
     expect(first.json().items[0].status).toBe("expired");
     let sigs = await signalsFor(pid, "permit_expired");
     expect(sigs).toHaveLength(1);
     expect(sigs[0]?.severity).toBe("high");
 
+    // the scheduled cycle and a second read add nothing
+    await runJurisdictionCycle(pid);
     await listPermits(pid);
     await runJurisdictionCycle(pid);
     sigs = await signalsFor(pid, "permit_expired");
@@ -678,6 +686,8 @@ describe("permit detectors", () => {
     const created = await createPermit(pid, { blockingTaskIds: [soon, later] });
     const permitId = created.json().id as string;
 
+    // the permit list read sweeps the permit findings only (determination,
+    // expiry); the consent-to-programme finding is not its to raise
     await listPermits(pid);
     expect(await signalsFor(pid, "permit_blocks_programme")).toHaveLength(0);
 

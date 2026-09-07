@@ -1,11 +1,17 @@
 /**
  * Land & resettlement scheduled detectors.
  *
- * Everything in this file used to run lazily inside a GET handler. It does
- * not any more: reads are pure, these run on the platform scheduler (and can
- * be triggered on demand at POST /projects/:id/land/detectors/run), each pass
- * takes a per-(company, project, detector) advisory lock, and every finding
- * is fingerprinted so a second pass over unchanged data raises nothing.
+ * Everything in this file used to run lazily inside a GET handler with no
+ * lock and no unique key. Now every pass takes a per-(company, project,
+ * detector) advisory lock and every finding is fingerprinted, so a second
+ * pass over unchanged data raises nothing — which is what lets each sweep
+ * have TWO triggers running the same function: the platform scheduler
+ * (`land.detectors`, hourly, every tenant, so a project nobody opens is still
+ * policed; on demand at POST /projects/:id/land/detectors/run) and the
+ * register read the finding is about, scoped to that project —
+ * `GET /grievances` runs `sweepGrievances`, `GET /land/schedule-risk` runs
+ * `sweepConsent`. The scheduler is disabled under NODE_ENV=test and by
+ * SCHEDULER_ENABLED=false, so there the read is the only trigger.
  *
  * Detector families here:
  *
