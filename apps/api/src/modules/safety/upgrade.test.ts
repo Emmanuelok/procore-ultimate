@@ -23,6 +23,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, eq } from "drizzle-orm";
 import {
+  aiRuns,
   companyMemberships,
   obligations,
   prequalificationQuestionnaires,
@@ -842,6 +843,8 @@ let owner: TestActor;
 let second: TestActor;
 /** an ordinary company member, no safety admin */
 let member: TestActor;
+/** a company member who is on no project at all */
+let outsider: TestActor;
 /** a different company entirely */
 let stranger: TestActor;
 
@@ -913,6 +916,9 @@ beforeAll(async () => {
   };
   second = await join("admin");
   member = await join("member");
+  /* A company member who is on NO project. The programme register is
+   * company-scoped, so this is the caller §6.3 is about. */
+  outsider = await join("member");
   stranger = await registerActor(app);
 
   gbProject = await makeProject("Upgrade — GB site", "GB");
@@ -1699,6 +1705,53 @@ describe("device and lone-worker alarms", () => {
     expect(twice.statusCode).toBe(409);
   });
 
+  it("links an alarm to a record that already exists, and refuses one from another project", async () => {
+    const alarm = await post(`/projects/${gbProject}/safety/sensor-events`, {
+      kind: "impact",
+      source: "wearable",
+      deviceId: "LW-9002",
+      occurredAt: hoursAgo(2),
+      receivedAt: hoursAgo(2),
+    });
+    const linkable = alarm.json().events[0].id as string;
+
+    const incident = await post(`/projects/${gbProject}/safety/incidents`, {
+      incidentType: "near_miss",
+      title: "Operative clipped by a swinging bucket",
+      description: "No injury; the wearable registered the impact on the hoarding.",
+      occurredAt: hoursAgo(2),
+      severity: "minor",
+    });
+    expect(incident.statusCode).toBe(201);
+
+    const empty = await post(
+      `/projects/${gbProject}/safety/sensor-events/${linkable}/link`,
+      {},
+    );
+    expect(empty.statusCode).toBe(400);
+
+    const linked = await post(
+      `/projects/${gbProject}/safety/sensor-events/${linkable}/link`,
+      { incidentId: incident.json().id },
+    );
+    expect(linked.statusCode).toBe(200);
+    expect(linked.json().incidentId).toBe(incident.json().id);
+
+    // an alarm on this project cannot be linked to another project's incident
+    const foreign = await post(`/projects/${usProject}/safety/incidents`, {
+      incidentType: "near_miss",
+      title: "Different job entirely",
+      description: "Nothing to do with the GB site.",
+      occurredAt: hoursAgo(2),
+      severity: "minor",
+    });
+    const crossed = await post(
+      `/projects/${gbProject}/safety/sensor-events/${linkable}/link`,
+      { incidentId: foreign.json().id },
+    );
+    expect(crossed.statusCode).toBe(404);
+  });
+
   it("raises a critical signal for a life-safety alarm nobody answered", async () => {
     const res = await post(`/projects/${gbProject}/safety/sensor-events`, {
       kind: "gas_alarm",
@@ -2052,7 +2105,7 @@ describe("predictive index, under-reporting and health inputs", () => {
 describe("investigation assistant", () => {
   let incidentId: string;
 
-  it("degrades to the deterministic assembly when the AI layer is not configured", async () => {
+  it("refuses with 503 AiDisabled and still hands over the deterministic assembly", async () => {
     const created = await post(`/projects/${gbProject}/safety/incidents`, {
       incidentType: "injury",
       title: "Struck by a swinging load",
@@ -2068,23 +2121,76 @@ describe("investigation assistant", () => {
     expect(created.statusCode).toBe(201);
     incidentId = created.json().id as string;
 
+    /* The platform convention for an AI endpoint with no key, not a 200
+     * carrying `available: false` that a client reads as a real answer. */
     const res = await post(
       `/projects/${gbProject}/safety/incidents/${incidentId}/assist`,
       {},
     );
-    expect(res.statusCode).toBe(200);
-    expect(res.json().available).toBe(false);
-    expect(res.json().reason).toContain("ANTHROPIC_API_KEY");
-    expect(res.json().assist).toBeNull();
-    // the useful half is deterministic and is still returned
-    expect(res.json().context).toHaveProperty("priorObservations");
-    expect(res.json().context.witnesses[0].name).toBe("T. Byrne");
+    expect(res.statusCode).toBe(503);
+    expect(res.json().error).toBe("AiDisabled");
+
+    // the useful half is deterministic, has its own route and does not care
+    const ctx = await get(
+      `/projects/${gbProject}/safety/incidents/${incidentId}/assist/context`,
+    );
+    expect(ctx.statusCode).toBe(200);
+    expect(ctx.json().aiAvailable).toBe(false);
+    expect(ctx.json().context).toHaveProperty("priorObservations");
+    expect(ctx.json().context.witnesses[0].name).toBe("T. Byrne");
+  });
+
+  it("refuses an acceptance whose run id names no assistant run on this incident", async () => {
+    const bogus = await post(
+      `/projects/${gbProject}/safety/incidents/${incidentId}/assist/accept`,
+      {
+        runId: "airun_never_happened",
+        contributingFactors: [
+          { factor: "Somebody typed a run id", category: "immediate", sourceIds: [] },
+        ],
+      },
+    );
+    expect(bogus.statusCode).toBe(400);
+    expect(bogus.json().message).toContain("does not name an investigation-assistant run");
+
+    // a real run, but on a DIFFERENT incident, is refused too
+    const otherRun = newId("airun");
+    await app.db.insert(aiRuns).values({
+      id: otherRun,
+      companyId: owner.companyId,
+      projectId: gbProject,
+      agentKind: "incident_investigation_assistant",
+      model: "test",
+      requestedBy: owner.userId,
+      inputRefs: [{ type: "safety_incident", id: "inc_somebody_else" }],
+    });
+    const wrongIncident = await post(
+      `/projects/${gbProject}/safety/incidents/${incidentId}/assist/accept`,
+      {
+        runId: otherRun,
+        contributingFactors: [
+          { factor: "Run from another case", category: "immediate", sourceIds: [] },
+        ],
+      },
+    );
+    expect(wrongIncident.statusCode).toBe(400);
   });
 
   it("writes nothing unless a human accepts it, and ledgers the run id when they do", async () => {
+    const runId = newId("airun");
+    await app.db.insert(aiRuns).values({
+      id: runId,
+      companyId: owner.companyId,
+      projectId: gbProject,
+      agentKind: "incident_investigation_assistant",
+      model: "test",
+      requestedBy: owner.userId,
+      inputRefs: [{ type: "safety_incident", id: incidentId }],
+    });
+
     const empty = await post(
       `/projects/${gbProject}/safety/incidents/${incidentId}/assist/accept`,
-      { runId: "airun_test" },
+      { runId },
     );
     expect(empty.statusCode).toBe(400);
     expect(empty.json().message).toContain("Nothing was accepted");
@@ -2092,7 +2198,7 @@ describe("investigation assistant", () => {
     const accepted = await post(
       `/projects/${gbProject}/safety/incidents/${incidentId}/assist/accept`,
       {
-        runId: "airun_test",
+        runId,
         contributingFactors: [
           {
             factor: "Load slewed over an occupied laydown area",
@@ -2119,7 +2225,7 @@ describe("investigation assistant", () => {
     const factors = detail.json().investigation.contributingFactors as Array<
       Record<string, unknown>
     >;
-    expect(factors.at(-1)?.["agentRunId"]).toBe("airun_test");
+    expect(factors.at(-1)?.["agentRunId"]).toBe(runId);
     expect(factors.at(-1)?.["acceptedBy"]).toBe(owner.userId);
   });
 
@@ -2129,6 +2235,372 @@ describe("investigation assistant", () => {
       {},
       stranger.headers,
     );
+    expect(res.statusCode).toBe(403);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* VERIFIER 1 — the company programme register is scoped to the        */
+/* caller's projects (PLAN §6.3)                                       */
+/* ------------------------------------------------------------------ */
+
+describe("company programme register scoping", () => {
+  let projectRecordId: string;
+  let companyRecordId: string;
+
+  it("creates one project-scoped record and one company-wide one", async () => {
+    const test = await post(`/companies/current/safety/programme-records`, {
+      recordKind: "drug_alcohol_test",
+      title: "Post-incident screen — A. Doyle",
+      projectId: gbProject,
+      workerId,
+      drugAlcoholResult: "non_negative_pending_confirmation",
+      drugAlcoholReason: "post_incident",
+    });
+    expect(test.statusCode).toBe(201);
+    projectRecordId = test.json().id as string;
+
+    const policy = await post(`/companies/current/safety/programme-records`, {
+      recordKind: "drug_alcohol_policy",
+      title: "Company drug and alcohol policy",
+      version: "3.0",
+    });
+    expect(policy.statusCode).toBe(201);
+    companyRecordId = policy.json().id as string;
+  });
+
+  it("hides another project's records from a member who is not on it", async () => {
+    const res = await get(
+      `/companies/current/safety/programme-records?pageSize=200`,
+      outsider.headers,
+    );
+    expect(res.statusCode).toBe(200);
+    const ids = (res.json().items as Array<{ id: string }>).map((r) => r.id);
+    // the company-wide programme is everybody's
+    expect(ids).toContain(companyRecordId);
+    // a named worker's test result on a project they are not on is not
+    expect(ids).not.toContain(projectRecordId);
+    expect(res.json().total).toBe(ids.length);
+  });
+
+  it("still shows the whole company to an owner", async () => {
+    const res = await get(`/companies/current/safety/programme-records?pageSize=200`);
+    const ids = (res.json().items as Array<{ id: string }>).map((r) => r.id);
+    expect(ids).toContain(companyRecordId);
+    expect(ids).toContain(projectRecordId);
+  });
+
+  it("refuses the detail, the patch and the approval of a record on a project the caller is not on", async () => {
+    const detail = await get(
+      `/companies/current/safety/programme-records/${projectRecordId}`,
+      outsider.headers,
+    );
+    expect(detail.statusCode).toBe(403);
+    expect(detail.json().message).toContain("safety");
+
+    const patched = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/companies/current/safety/programme-records/${projectRecordId}`,
+      headers: outsider.headers,
+      payload: { title: "Renamed by somebody with no business here" },
+    });
+    expect(patched.statusCode).toBe(403);
+
+    const approved = await post(
+      `/companies/current/safety/programme-records/${projectRecordId}/approve`,
+      {},
+      outsider.headers,
+    );
+    expect(approved.statusCode).toBe(403);
+  });
+
+  it("refuses a record filed against a project the caller is not on", async () => {
+    const res = await post(
+      `/companies/current/safety/programme-records`,
+      { recordKind: "jha", title: "JHA on somebody else's job", projectId: gbProject },
+      outsider.headers,
+    );
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("refuses a projectId filter naming a project the caller is not on", async () => {
+    const res = await get(
+      `/companies/current/safety/programme-records?projectId=${gbProject}`,
+      outsider.headers,
+    );
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("lets the company-wide record be read and acknowledged by anybody in the company", async () => {
+    const detail = await get(
+      `/companies/current/safety/programme-records/${companyRecordId}`,
+      outsider.headers,
+    );
+    expect(detail.statusCode).toBe(200);
+  });
+
+  it("keeps another company out entirely", async () => {
+    const res = await get(
+      `/companies/current/safety/programme-records`,
+      stranger.headers,
+    );
+    const ids = (res.json().items as Array<{ id: string }>).map((r) => r.id);
+    expect(ids).not.toContain(companyRecordId);
+    expect(ids).not.toContain(projectRecordId);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* VERIFIER 2 — the expiry horizon is a WHERE clause, so the pager's   */
+/* total describes the rows it is paging                               */
+/* ------------------------------------------------------------------ */
+
+describe("programme register expiry filter", () => {
+  it("counts and pages the same set", async () => {
+    for (let i = 0; i < 4; i += 1) {
+      const created = await post(`/companies/current/safety/programme-records`, {
+        recordKind: "competency_card",
+        title: `Card ${i} — expiring soon`,
+        projectId: usProject,
+        workerId: usWorkerId,
+        expiresAt: addDaysISO(todayISO(), 5 + i),
+      });
+      expect(created.statusCode).toBe(201);
+    }
+    for (let i = 0; i < 3; i += 1) {
+      const created = await post(`/companies/current/safety/programme-records`, {
+        recordKind: "competency_card",
+        title: `Card ${i} — expiring much later`,
+        projectId: usProject,
+        workerId: usWorkerId,
+        expiresAt: addDaysISO(todayISO(), 400 + i),
+      });
+      expect(created.statusCode).toBe(201);
+    }
+
+    const page = await get(
+      `/projects/${usProject}/safety/programme-records?expiringWithinDays=30&recordKind=competency_card&pageSize=2`,
+    );
+    expect(page.statusCode).toBe(200);
+    const body = page.json();
+    expect(body.total).toBe(4);
+    expect(body.items).toHaveLength(2);
+    const second = await get(
+      `/projects/${usProject}/safety/programme-records?expiringWithinDays=30&recordKind=competency_card&pageSize=2&page=2`,
+    );
+    expect(second.json().items).toHaveLength(2);
+    for (const r of [...body.items, ...second.json().items] as Array<{ title: string }>) {
+      expect(r.title).toContain("expiring soon");
+    }
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* VERIFIER 3 — a legacy duty with no establishable deadline           */
+/* ------------------------------------------------------------------ */
+
+describe("a statutory duty whose deadline cannot be established", () => {
+  let legacyId: string;
+
+  it("is not treated as a live clock, and refuses closure with a reason a human can act on", async () => {
+    const created = await post(`/projects/${quietProject}/safety/incidents`, {
+      incidentType: "injury",
+      title: "Legacy row from the old register",
+      description: "Imported before the reportability engine existed.",
+      occurredAt: hoursAgo(72),
+      injuredPersonName: "Unknown",
+      severity: "minor",
+    });
+    expect(created.statusCode).toBe(201);
+    legacyId = created.json().id as string;
+
+    /* What an imported row looks like: a regime, no deadline, no stored
+     * determination. The engine never produces this; the old register did. */
+    await app.db
+      .update(safetyIncidents)
+      .set({
+        isReportable: 1,
+        reportableRegimes: ["riddor"],
+        reportDueAt: null,
+        detail: {},
+      })
+      .where(eq(safetyIncidents.id, legacyId));
+
+    const detail = await get(`/projects/${quietProject}/safety/incidents/${legacyId}`);
+    const duties = detail.json().notification.duties as Array<{ state: string; regime: string }>;
+    expect(duties).toHaveLength(1);
+    expect(duties[0]?.state).toBe("deadline_unknown");
+    expect(detail.json().notification.needsReviewRegimes).toEqual(["riddor"]);
+    // it is not outstanding: an outstanding duty has a clock that expires
+    expect(detail.json().notification.outstandingRegimes).toEqual([]);
+    expect(detail.json().notification.allDischarged).toBe(false);
+
+    await post(`/projects/${quietProject}/safety/incidents/${legacyId}/investigation`, {
+      investigationLeadId: member.userId,
+      rootCauseMethod: "five_whys",
+      rootCause: "Imported record; cause never established beyond the paper file.",
+      contributingFactors: [{ factor: "Record imported without its investigation" }],
+      investigationFindings: "Nothing further can be established from the import.",
+    });
+    const complete = await post(
+      `/projects/${quietProject}/safety/incidents/${legacyId}/investigation/complete`,
+      {},
+    );
+    expect(complete.statusCode).toBe(200);
+    const approved = await post(
+      `/projects/${quietProject}/safety/incidents/${legacyId}/investigation/approve`,
+      {},
+      second.headers,
+    );
+    expect(approved.statusCode).toBe(200);
+
+    const refused = await post(`/projects/${quietProject}/safety/incidents/${legacyId}/close`, {
+      note: "Nothing further to do.",
+    });
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json().message).toContain("deadline cannot be established");
+
+    const closed = await post(`/projects/${quietProject}/safety/incidents/${legacyId}/close`, {
+      note: "Nothing further to do.",
+      statutoryOverrideReason:
+        "Imported from the previous register; the F2508 was filed by the site in 2019 and the " +
+        "acknowledgement is in the paper file. No deadline was ever recorded here.",
+    });
+    expect(closed.statusCode).toBe(200);
+    expect(closed.json().status).toBe("closed");
+  });
+
+  it("still refuses closure when a REAL clock is unmet, whatever reason is sent", async () => {
+    const created = await post(`/projects/${quietProject}/safety/incidents`, {
+      incidentType: "injury",
+      title: "Amputation at the bench saw",
+      description: "Operative lost two fingers.",
+      occurredAt: hoursAgo(4),
+      injuredPersonName: "Unrecorded",
+      injuredPersonType: "employee",
+      severity: "serious",
+      injuryNature: "amputation",
+    });
+    const id = created.json().id as string;
+    expect(created.json().notification.required).toBe(true);
+    await post(`/projects/${quietProject}/safety/incidents/${id}/investigation`, {
+      investigationLeadId: member.userId,
+      rootCauseMethod: "five_whys",
+      rootCause: "Guard removed to clear a jam.",
+      contributingFactors: [{ factor: "Production pressure on the cutting bay" }],
+      investigationFindings: "Guard removed to clear a jam and not replaced.",
+    });
+    await post(`/projects/${quietProject}/safety/incidents/${id}/investigation/complete`, {});
+    await post(
+      `/projects/${quietProject}/safety/incidents/${id}/investigation/approve`,
+      {},
+      second.headers,
+    );
+    const res = await post(`/projects/${quietProject}/safety/incidents/${id}/close`, {
+      note: "Closing it anyway.",
+      statutoryOverrideReason:
+        "We would simply prefer not to notify the Health and Safety Executive about this one.",
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toContain("undischarged");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* VERIFIER 4 — a concurrent second-regime filing is not lost          */
+/* ------------------------------------------------------------------ */
+
+describe("concurrent statutory notifications", () => {
+  it("keeps every notification that succeeded", async () => {
+    const created = await post(`/projects/${gbProject}/safety/incidents`, {
+      incidentType: "injury",
+      title: "Crush injury at the delivery gate",
+      description: "Operative crushed between a reversing wagon and the gate frame.",
+      occurredAt: hoursAgo(3),
+      workerId,
+      injuredPersonType: "employee",
+      severity: "serious",
+      injuryNature: "crush",
+      isFatality: true,
+      regimes: ["riddor", "osha"],
+    });
+    expect(created.statusCode).toBe(201);
+    const id = created.json().id as string;
+
+    const results = await Promise.allSettled([
+      post(`/projects/${gbProject}/safety/incidents/${id}/notify-regulator`, {
+        regime: "riddor",
+        reference: "HSE/CONC/1",
+        method: "online_form",
+      }),
+      post(`/projects/${gbProject}/safety/incidents/${id}/notify-regulator`, {
+        regime: "osha",
+        reference: "OSHA/CONC/1",
+        method: "telephone",
+      }),
+    ]);
+    const filed = results
+      .filter(
+        (r): r is PromiseFulfilledResult<Awaited<ReturnType<typeof post>>> =>
+          r.status === "fulfilled" && r.value.statusCode === 200,
+      )
+      .map((r) => r.value.json().notificationResult.regime as string);
+    expect(filed.length).toBeGreaterThan(0);
+
+    const detail = await get(`/projects/${gbProject}/safety/incidents/${id}`);
+    const stored = (detail.json().notification.notifications as Array<{ regime: string }>).map(
+      (n) => n.regime,
+    );
+    // nothing that reported success may have been overwritten by the other
+    for (const regime of filed) expect(stored).toContain(regime);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* VERIFIER 5 — the summary's statutory standing is bounded            */
+/* ------------------------------------------------------------------ */
+
+describe("statutory standing is bounded to what can still be live", () => {
+  it("drops closed incidents and says what it scanned", async () => {
+    const before = await get(`/projects/${quietProject}/safety/summary`);
+    expect(before.statusCode).toBe(200);
+    const standing = before.json().statutory;
+    expect(standing.scope).toContain("not closed");
+    expect(standing.truncated).toBe(false);
+    expect(standing.scanned).toBe(standing.openReportableTotal);
+    // the legacy row closed under the override above is reportable AND closed
+    expect(
+      (standing.missedRefs as Array<{ reference: string }>).every(
+        (r) => typeof r.reference === "string",
+      ),
+    ).toBe(true);
+    const closedOnes = await get(
+      `/projects/${quietProject}/safety/incidents?status=closed&pageSize=100`,
+    );
+    const closedIds = (closedOnes.json().items as Array<{ id: string }>).map((r) => r.id);
+    expect(closedIds.length).toBeGreaterThan(0);
+    for (const ref of standing.awaitingRefs as Array<{ id: string }>) {
+      expect(closedIds).not.toContain(ref.id);
+    }
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* VERIFIER 6 — the worker picker's register                           */
+/* ------------------------------------------------------------------ */
+
+describe("safety worker register", () => {
+  it("names the people a safety form has to reference", async () => {
+    const res = await get(`/projects/${gbProject}/safety/workers`);
+    expect(res.statusCode).toBe(200);
+    const items = res.json().items as Array<{ id: string; fullName: string }>;
+    expect(items.some((w) => w.id === workerId && w.fullName === "Aidan Doyle")).toBe(true);
+    // the other project's register is not this one
+    expect(items.some((w) => w.id === usWorkerId)).toBe(false);
+  });
+
+  it("shuts another company out", async () => {
+    const res = await get(`/projects/${gbProject}/safety/workers`, stranger.headers);
     expect(res.statusCode).toBe(403);
   });
 });

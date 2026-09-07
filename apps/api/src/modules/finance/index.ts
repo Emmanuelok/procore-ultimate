@@ -22,7 +22,6 @@ import {
   projects,
   reconciliations,
   scheduleTasks,
-  signals,
 } from "@constructos/db";
 import {
   AVAILABILITY_PERIOD_STATUSES,
@@ -2450,6 +2449,39 @@ export const financeModule: FastifyPluginAsync = async (app) => {
             computedFrom: { inputs: result.used, basis: result.basis, cashflowId: id },
             recordedBy: req.user!.id,
           });
+        }
+        // Same fingerprint the scheduled recompute uses, so a breach found
+        // here and a breach found by the sweep are ONE finding, and a
+        // corrected cashflow closes it instead of leaving it open forever.
+        // (The sweep skips periods that already have a reading, so without
+        // this the breach recorded here would never be signalled at all.)
+        if (!compliant) {
+          await raiseSignalOnce(app.db, {
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            detector: "covenant_breach",
+            key: `${cov.id}:${body.periodEnd}`,
+            severity: "critical",
+            confidence: 1,
+            title: `Covenant breach — ${cov.name} at ${body.periodEnd}`,
+            explanation:
+              `The computed ${formulaSpec(cov.formula)?.label ?? cov.formula} for the period ending ` +
+              `${body.periodEnd} is ${result.value} against a required level of ` +
+              `${cov.operator === "gte" ? "≥" : "≤"} ${cov.threshold}. ${result.basis} ` +
+              `A financial covenant breach is a draw-stop event: further disbursements are refused ` +
+              `until the breach clears or a lender waiver is recorded.`,
+            subjectType: "covenant",
+            subjectId: cov.id,
+            evidenceRefs: { covenantId: cov.id, periodEnd: body.periodEnd, inputs: result.used },
+          });
+        } else {
+          await closeSignalByKey(
+            app.db,
+            req.companyId!,
+            "covenant_breach",
+            `${cov.id}:${body.periodEnd}`,
+            "The recomputed reading for this period complies.",
+          );
         }
       }
       const [row] = await app.db

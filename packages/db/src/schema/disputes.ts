@@ -159,9 +159,6 @@ export const bundleSnapshots = pgTable(
     sha256: text("sha256").notNull(),
     /** canonical JSON of the record at generation; null for file-backed items */
     snapshot: jsonb("snapshot").$type<Record<string, unknown>>(),
-    /** page span within the produced bundle, when paginated */
-    startPage: integer("start_page"),
-    endPage: integer("end_page"),
     createdAt: createdAt(),
   },
   (t) => [

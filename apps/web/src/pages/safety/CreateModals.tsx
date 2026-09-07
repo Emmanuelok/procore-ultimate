@@ -28,12 +28,17 @@ import {
   Select,
   Textarea,
 } from "../../ui";
-import { SAFETY_RECORD_KINDS_ALL } from "@constructos/shared";
+import {
+  DRUG_ALCOHOL_TEST_REASONS,
+  DRUG_ALCOHOL_TEST_RESULTS,
+  SAFETY_RECORD_KINDS_ALL,
+} from "@constructos/shared";
 import { api } from "../../lib/api";
 import {
   RefusalNotice,
   labelize,
   useMutation,
+  useWorkers,
   type InspectionTemplate,
   type Paged,
   type Resource,
@@ -90,6 +95,20 @@ const CATEGORIES = [
  * register's own filter lists.
  */
 const RECORD_KINDS: readonly string[] = SAFETY_RECORD_KINDS_ALL;
+
+/**
+ * Kinds whose SUBJECT is a person. A competency card filed against nobody is a
+ * card nobody can produce at a gate; a drug or alcohol test result filed
+ * against nobody is a personal determination that cannot be challenged or
+ * deleted, which is why the API refuses that one outright.
+ */
+const PERSONAL_RECORD_KINDS = new Set([
+  "drug_alcohol_test",
+  "competency_card",
+  "orientation_record",
+  "training_matrix",
+  "wellbeing_record",
+]);
 
 const SCORING_METHODS = ["percentage", "weighted", "points", "pass_fail", "none"];
 const ITEM_TYPES = ["pass_fail", "pass_fail_na", "text", "long_text", "number", "photo", "section_header"];
@@ -711,6 +730,10 @@ export function NewProgrammeRecordModal({
   const [requiredAcknowledgementCount, setRequiredAcknowledgementCount] = useState("");
   const [sitePermitId, setSitePermitId] = useState("");
   const [description, setDescription] = useState("");
+  const [workerId, setWorkerId] = useState("");
+  const [drugAlcoholResult, setDrugAlcoholResult] = useState("negative");
+  const [drugAlcoholReason, setDrugAlcoholReason] = useState("random");
+  const workerRegister = useWorkers(open ? projectId : "");
 
   useEffect(() => {
     if (!open) {
@@ -719,6 +742,7 @@ export function NewProgrammeRecordModal({
       setDescription("");
       setRequiredAcknowledgementCount("");
       setSitePermitId("");
+      setWorkerId("");
       mutation.clear();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -728,6 +752,12 @@ export function NewProgrammeRecordModal({
     recordKind === "permit_to_work" ||
     recordKind === "competency_card" ||
     recordKind === "temporary_works_design";
+  const isDrugAlcoholTest = recordKind === "drug_alcohol_test";
+  const isPersonalKind = PERSONAL_RECORD_KINDS.has(recordKind);
+  /* A worker belongs to a project's register, so a personal record cannot be
+   * company-wide: the API refuses `workerId` without a `projectId`. */
+  const scopeForced = isPersonalKind && workerId !== "";
+  const effectiveScope = scopeForced ? "project" : scope;
 
   return (
     <Modal
@@ -741,7 +771,7 @@ export function NewProgrammeRecordModal({
             Cancel
           </Button>
           <Button
-            disabled={title.trim() === ""}
+            disabled={title.trim() === "" || (isDrugAlcoholTest && workerId === "")}
             loading={mutation.busy !== null}
             onClick={() =>
               void mutation.run("create", "This record could not be created", async () => {
@@ -750,7 +780,11 @@ export function NewProgrammeRecordModal({
                   {
                     recordKind,
                     title: title.trim(),
-                    projectId: scope === "project" ? projectId : null,
+                    projectId: effectiveScope === "project" ? projectId : null,
+                    ...(workerId ? { workerId } : {}),
+                    ...(isDrugAlcoholTest
+                      ? { drugAlcoholResult, drugAlcoholReason }
+                      : {}),
                     ...(version.trim() ? { version: version.trim() } : {}),
                     ...(description.trim() ? { description: description.trim() } : {}),
                     ...(effectiveFrom ? { effectiveFrom } : {}),
@@ -796,9 +830,17 @@ export function NewProgrammeRecordModal({
               ))}
             </Select>
           </Field>
-          <Field label="Scope">
+          <Field
+            label="Scope"
+            hint={
+              scopeForced
+                ? "A record about a named worker belongs to the project whose register holds them."
+                : undefined
+            }
+          >
             <Select
-              value={scope}
+              value={effectiveScope}
+              disabled={scopeForced}
               onChange={(e) => setScope(e.target.value === "company" ? "company" : "project")}
             >
               <option value="project">This project</option>
@@ -806,6 +848,77 @@ export function NewProgrammeRecordModal({
             </Select>
           </Field>
         </div>
+
+        {isPersonalKind ? (
+          <Field
+            label="Worker"
+            required={isDrugAlcoholTest}
+            hint={
+              workerRegister.error
+                ? workerRegister.error
+                : "From this project's worker register — the same one that carries induction, identity verification and site access. A personal record filed against nobody cannot be produced, challenged or deleted."
+            }
+          >
+            <Select
+              value={workerId}
+              disabled={workerRegister.loading}
+              onChange={(e) => setWorkerId(e.target.value)}
+            >
+              <option value="">
+                {workerRegister.loading
+                  ? "Loading the worker register…"
+                  : isDrugAlcoholTest
+                    ? "Choose the worker this concerns"
+                    : "Not about a specific worker"}
+              </option>
+              {workerRegister.workers.map((w) => (
+                <option key={w.id} value={w.id}>
+                  {w.fullName}
+                  {w.reference ? ` · ${w.reference}` : ""}
+                  {w.trade ? ` · ${w.trade}` : ""}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        ) : null}
+
+        {isDrugAlcoholTest ? (
+          <>
+            <Alert tone="warning" title="Two facts an appeal turns on">
+              A result with no recorded reason for testing is the one an employment tribunal
+              discounts, and a bare <code>positive</code> with no confirmation stage recorded is the
+              one that gets a dismissal overturned. Use{" "}
+              <code>non_negative_pending_confirmation</code> where only the screening test has been
+              done.
+            </Alert>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field label="Result" required>
+                <Select
+                  value={drugAlcoholResult}
+                  onChange={(e) => setDrugAlcoholResult(e.target.value)}
+                >
+                  {DRUG_ALCOHOL_TEST_RESULTS.map((r) => (
+                    <option key={r} value={r}>
+                      {labelize(r)}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              <Field label="Why the test was carried out" required>
+                <Select
+                  value={drugAlcoholReason}
+                  onChange={(e) => setDrugAlcoholReason(e.target.value)}
+                >
+                  {DRUG_ALCOHOL_TEST_REASONS.map((r) => (
+                    <option key={r} value={r}>
+                      {labelize(r)}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+            </div>
+          </>
+        ) : null}
 
         <Field label="Title" required>
           <Input

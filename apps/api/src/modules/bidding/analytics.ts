@@ -24,6 +24,12 @@ import { batchVendorPrequalStatus } from "./prequal-status.js";
 import { sealState } from "./sealing.js";
 import { competitorProfiles, type PricingObservation } from "./analytics-math.js";
 import { medianUnsorted } from "./integrity.js";
+import {
+  biddingScopeOf,
+  requireBiddingScope,
+  scopeToProjects,
+  type BiddingScope,
+} from "./access.js";
 
 /**
  * COMPANY-LEVEL PROCUREMENT ANALYTICS.
@@ -81,11 +87,21 @@ async function loadObservations(
   db: Db,
   companyId: string,
   sinceIso: string,
+  scope: BiddingScope,
 ): Promise<PackageObservation[]> {
   const packages = await db
     .select()
     .from(bidPackages)
-    .where(and(eq(bidPackages.companyId, companyId), gte(bidPackages.createdAt, sinceIso)))
+    .where(
+      and(
+        eq(bidPackages.companyId, companyId),
+        gte(bidPackages.createdAt, sinceIso),
+        // The caller reads the projects they hold `bidding:read` on and no
+        // others; a market aggregate over packages they cannot open is the
+        // same disclosure with a percentage sign in front of it.
+        scopeToProjects(scope, bidPackages.projectId),
+      ),
+    )
     .orderBy(desc(bidPackages.createdAt))
     .limit(400);
   if (packages.length === 0) return [];
@@ -182,7 +198,13 @@ export function pricingObservations(
 }
 
 export const analyticsRoutes: FastifyPluginAsync = async (app) => {
-  const memberGate = [app.authenticate, app.requireCompany];
+  /*
+   * These are the module's most sensitive reads — every amount a named
+   * supplier has bid us — so they carry the same permission as the package
+   * screens they aggregate, resolved across the caller's projects rather
+   * than from a `:projectId` the route does not have. See access.ts.
+   */
+  const readGate = [app.authenticate, app.requireCompany, requireBiddingScope(app, "read")];
 
   async function namesFor(db: Db, companyId: string, ids: readonly string[]) {
     const unique = [...new Set(ids.filter(Boolean))];
@@ -204,11 +226,12 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
   /* Bid coverage by trade (#158, #159, #161, #162)                    */
   /* ---------------------------------------------------------------- */
 
-  app.get("/companies/current/bid-coverage", { preHandler: memberGate }, async (req) => {
+  app.get("/companies/current/bid-coverage", { preHandler: readGate }, async (req) => {
     const q = z
       .object({ warnDays: z.coerce.number().int().min(0).max(60).default(5) })
       .parse(req.query ?? {});
     const companyId = req.companyId!;
+    const scope = biddingScopeOf(req);
     const live = await app.db
       .select()
       .from(bidPackages)
@@ -216,6 +239,7 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
         and(
           eq(bidPackages.companyId, companyId),
           inArray(bidPackages.status, ["invitations_sent", "open", "closed"]),
+          scopeToProjects(scope, bidPackages.projectId),
         ),
       )
       .limit(300);
@@ -224,9 +248,12 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
         trades: [],
         packages: [],
         total: 0,
+        scopeBasis: scope.basis,
         note:
-          "No tender is currently out to market. Coverage is a statement about live packages: " +
-          "how many bidders were asked, how many said they would bid, and how many did.",
+          "No tender is currently out to market" +
+          (scope.all ? "" : " on the projects you may read") +
+          ". Coverage is a statement about live packages: how many bidders were asked, how " +
+          "many said they would bid, and how many did.",
       };
     }
     const packageIds = live.map((p) => p.id);
@@ -327,6 +354,7 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
       atRisk: packageRows.filter((r) => r.coverageFlag !== "ok").length,
       warnDays: q.warnDays,
       asOf: todayIso(),
+      scopeBasis: scope.basis,
       note:
         "Coverage counts intentions, not invitations. Six invitations and two intending bidders " +
         "is a package with two bidders, and the moment to discover that is before the deadline.",
@@ -337,7 +365,7 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
   /* Competitor pricing intelligence (#1050)                           */
   /* ---------------------------------------------------------------- */
 
-  app.get("/companies/current/bid-pricing", { preHandler: memberGate }, async (req) => {
+  app.get("/companies/current/bid-pricing", { preHandler: readGate }, async (req) => {
     const q = z
       .object({
         tradeCode: z.string().max(60).optional(),
@@ -345,7 +373,8 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
       })
       .parse(req.query ?? {});
     const companyId = req.companyId!;
-    const packages = await loadObservations(app.db, companyId, windowStart(q.months));
+    const scope = biddingScopeOf(req);
+    const packages = await loadObservations(app.db, companyId, windowStart(q.months), scope);
     const scoped = q.tradeCode ? packages.filter((p) => p.tradeCode === q.tradeCode) : packages;
     const names = await namesFor(
       app.db,
@@ -364,6 +393,7 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
     return {
       windowMonths: q.months,
       tradeCode: q.tradeCode ?? null,
+      scopeBasis: scope.basis,
       packagesExamined: scoped.length,
       observations: observations.length,
       vendors: profiles,
@@ -419,10 +449,11 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
 
   app.get(
     "/companies/current/vendors/:vendorId/bid-history",
-    { preHandler: memberGate },
+    { preHandler: readGate },
     async (req) => {
       const { vendorId } = req.params as { vendorId: string };
       const companyId = req.companyId!;
+      const scope = biddingScopeOf(req);
       const [vendor] = await app.db
         .select({ id: vendors.id, name: vendors.name })
         .from(vendors)
@@ -434,7 +465,11 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
         .select()
         .from(bidInvitations)
         .where(
-          and(eq(bidInvitations.companyId, companyId), eq(bidInvitations.vendorId, vendorId)),
+          and(
+            eq(bidInvitations.companyId, companyId),
+            eq(bidInvitations.vendorId, vendorId),
+            scopeToProjects(scope, bidInvitations.projectId),
+          ),
         )
         .orderBy(desc(bidInvitations.createdAt))
         .limit(300);
@@ -442,14 +477,24 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
         .select()
         .from(bidSubmissions)
         .where(
-          and(eq(bidSubmissions.companyId, companyId), eq(bidSubmissions.vendorId, vendorId)),
+          and(
+            eq(bidSubmissions.companyId, companyId),
+            eq(bidSubmissions.vendorId, vendorId),
+            scopeToProjects(scope, bidSubmissions.projectId),
+          ),
         )
         .orderBy(desc(bidSubmissions.createdAt))
         .limit(300);
       const awards = await app.db
         .select()
         .from(bidAwards)
-        .where(and(eq(bidAwards.companyId, companyId), eq(bidAwards.vendorId, vendorId)))
+        .where(
+          and(
+            eq(bidAwards.companyId, companyId),
+            eq(bidAwards.vendorId, vendorId),
+            scopeToProjects(scope, bidAwards.projectId),
+          ),
+        )
         .limit(300);
       const packageIds = [
         ...new Set([
@@ -566,6 +611,7 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
       return {
         vendor,
         prequalification: standing.get(vendorId) ?? null,
+        scopeBasis: scope.basis,
         rows,
         summary: {
           invitations: invites.length,
@@ -609,7 +655,8 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
         ].map(([reason, count]) => ({ reason, count })),
         note:
           invites.length === 0
-            ? `${vendor.name} has never been invited to tender by this company.`
+            ? `${vendor.name} has never been invited to tender by this company` +
+              (scope.all ? "." : " on the projects you may read.")
             : `${vendor.name} has been invited ${invites.length} time(s) and bid ` +
               `${submittedRows.length} time(s). A supplier who is invited constantly and bids ` +
               "rarely is either wrong for the work or too busy for it, and both are worth " +

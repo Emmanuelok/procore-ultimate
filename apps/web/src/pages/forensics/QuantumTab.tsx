@@ -75,6 +75,9 @@ interface SeriesResponse {
   points: { weekStart: string; hours: number; quantity: number }[];
   suggestedBaseline: { from: string; to: string; productivity: number; weeks: number } | null;
   sources: { timecards: number; dailyLogQuantities: number };
+  /** the record set hit a scan cap — the series is a subset of the window */
+  truncated?: boolean;
+  window?: { from: string | null; to: string | null };
   reasons: string[];
 }
 
@@ -426,7 +429,9 @@ export default function QuantumTab({ projectId }: { projectId: string }) {
                       {series.sources.dailyLogQuantities === 1 ? "y" : "ies"}.
                       {series.suggestedBaseline
                         ? ` Best unimpacted run: ${series.suggestedBaseline.from} → ${series.suggestedBaseline.to} (${series.suggestedBaseline.weeks} weeks).`
-                        : ""}
+                        : series.truncated
+                          ? " No baseline is suggested: the record set was capped, so the best run cannot be identified from it."
+                          : ""}
                     </div>
                     {series.reasons.length > 0 ? (
                       <Alert tone="warning" title="What the records do not support">
@@ -549,7 +554,20 @@ export default function QuantumTab({ projectId }: { projectId: string }) {
                         </Badge>
                       </td>
                       <td className="px-3 py-2 text-right tabular-nums">
-                        {d.lostHours === null ? <span className="text-ink-400">—</span> : d.lostHours}
+                        {d.lostHours === null ? (
+                          <span
+                            className="text-ink-400"
+                            title={
+                              d.output && (d.output as { recordsTruncated?: boolean }).recordsTruncated
+                                ? "The record set was capped, so lost hours were withheld — narrow the window or the trade and run it again"
+                                : "The records do not support a figure"
+                            }
+                          >
+                            —
+                          </span>
+                        ) : (
+                          d.lostHours
+                        )}
                       </td>
                       <td className="px-3 py-2 text-right tabular-nums">{money(d.amount, d.currency)}</td>
                       <td className="px-3 py-2 text-xs text-ink-500">{formatDateTime(d.createdAt)}</td>

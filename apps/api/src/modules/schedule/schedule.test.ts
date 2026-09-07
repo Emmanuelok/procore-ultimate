@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, eq } from "drizzle-orm";
 import {
+  budgets,
   delayEvents,
   ledgerEntries,
   locations,
@@ -1540,6 +1541,96 @@ describe("earned value", () => {
     expect(ev.unpriced).toBe(1);
     expect(ev.reasons.join(" ")).toMatch(/no budget line/);
     expect(ev.basis).toBe("baseline dates");
+  });
+
+  it("never counts a priced activity with no booked cost as zero cost", async () => {
+    const schedule = await createSchedule("EV cost coverage", "2026-01-01");
+    const costed = await addTask(schedule.id, {
+      name: "Costed",
+      durationDays: 10,
+      budgetedCost: 1000,
+    });
+    await addTask(schedule.id, { name: "Priced, no cost source", durationDays: 10, budgetedCost: 400 });
+    await patchTask(costed.id, { percentComplete: 100 });
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/schedule-tasks/${costed.id}/resources`,
+      headers: owner.headers,
+      payload: { name: "Gang", resourceType: "labour", budgetedUnits: 0, actualUnits: 0, actualCost: 800 },
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/schedules/${schedule.id}/earned-value?dataDate=2026-01-20`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const ev = res.json() as {
+      ac: number;
+      cpi: number | null;
+      costUnknown: number;
+      costCoverage: number | null;
+      reasons: string[];
+      activities: { name: string; ac: number | null; cv: number | null }[];
+    };
+    expect(ev.costUnknown).toBe(1);
+    expect(ev.ac).toBe(800); // the uncosted activity adds nothing, not 0
+    expect(ev.costCoverage).toBeCloseTo(0.714, 2);
+    // CPI over the costed activity alone (1000/800), not EV 1400 / AC 800
+    expect(ev.cpi).toBeCloseTo(1.25, 2);
+    expect(ev.reasons.join(" ")).toMatch(/no booked cost/);
+    expect(ev.activities.find((a) => a.name === "Priced, no cost source")?.ac).toBeNull();
+  });
+});
+
+describe("resource cost currency", () => {
+  it("reports resource cost in the project's active budget currency", async () => {
+    const schedule = await createSchedule("Resource currency", "2026-01-01");
+    const task = await addTask(schedule.id, { name: "Loaded", durationDays: 5 });
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/schedule-tasks/${task.id}/resources`,
+      headers: owner.headers,
+      payload: {
+        name: "Steel gang",
+        resourceType: "labour",
+        budgetedUnits: 100,
+        unitRate: 45,
+        actualUnits: 40,
+      },
+    });
+
+    const before = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/schedules/${schedule.id}/resources`,
+      headers: owner.headers,
+    });
+    expect(before.statusCode).toBe(200);
+    expect((before.json() as { currency: string }).currency).toBe("USD");
+    expect((before.json() as { reasons: string[] }).reasons.join(" ")).toMatch(/No active budget/);
+
+    await app.db.insert(budgets).values({
+      id: newId("bud"),
+      companyId: owner.companyId,
+      projectId,
+      number: 1,
+      reference: "BUD-1",
+      name: "Control budget",
+      status: "locked",
+      isActive: 1,
+      currency: "GBP",
+      createdBy: owner.userId,
+    });
+
+    const after = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/schedules/${schedule.id}/resources`,
+      headers: owner.headers,
+    });
+    expect(after.statusCode).toBe(200);
+    const body = after.json() as { currency: string; reasons: string[] };
+    expect(body.currency).toBe("GBP");
+    expect(body.reasons.join(" ")).not.toMatch(/No active budget/);
   });
 });
 

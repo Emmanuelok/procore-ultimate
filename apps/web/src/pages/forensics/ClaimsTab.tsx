@@ -204,6 +204,7 @@ export default function ClaimsTab({
     try {
       const detail = await api.get<ClaimDetail>(`${base}/claims/${id}`);
       setSelected(detail);
+      setLinkEditing(false);
       setChain({
         cause: detail.chain.cause ?? "",
         effect: detail.chain.effect ?? "",
@@ -270,6 +271,49 @@ export default function ClaimsTab({
     }
   }
 
+  /*
+   * The set of events a claim is built on is editable only while the claim is
+   * in draft — after that the API freezes it, and rightly so. Nothing in the
+   * product reached that window: delayEventIds could be chosen in the create
+   * modal and never again, so a claim raised against the wrong event had to be
+   * withdrawn and re-raised.
+   */
+  const [linkEditing, setLinkEditing] = useState(false);
+  const [linkIds, setLinkIds] = useState<string[]>([]);
+  const [linkBusy, setLinkBusy] = useState(false);
+
+  async function openLinkEditor() {
+    if (!selected) return;
+    setDrawerError(null);
+    setLinkIds(selected.delayEventIds ?? selected.delayEvents.map((e) => e.id));
+    setLinkEditing(true);
+    if (eventPool.length === 0) {
+      try {
+        const ev = await api.get<ListResponse<DelayEventRow>>(`${base}/delay-events?pageSize=100`);
+        setEventPool(ev.items);
+      } catch {
+        // the picker stays empty; the current links are still listed
+      }
+    }
+  }
+
+  async function saveLinks() {
+    if (!selected) return;
+    setDrawerError(null);
+    setLinkBusy(true);
+    try {
+      await api.patch(`${base}/claims/${selected.id}`, { delayEventIds: linkIds });
+      setLinkEditing(false);
+      await refresh();
+    } catch (err) {
+      setDrawerError(
+        err instanceof ApiClientError ? err.message : "Failed to save the linked delay events.",
+      );
+    } finally {
+      setLinkBusy(false);
+    }
+  }
+
   async function calcProlongation() {
     if (!selected) return;
     setProError(null);
@@ -317,8 +361,15 @@ export default function ClaimsTab({
     setDrawerError(null);
     setChronoBusy(true);
     try {
-      await api.post(`${base}/claims/${selected.id}/chronology`);
+      const res = await api.post<{ persisted?: boolean; count?: number }>(
+        `${base}/claims/${selected.id}/chronology`,
+      );
+      const note =
+        res.persisted === false
+          ? `Assembled ${res.count ?? 0} entr${res.count === 1 ? "y" : "ies"} for reading — a ${humanize(selected.status)} claim's chronology is part of the closed record and was not overwritten.`
+          : null;
       await refresh();
+      if (note) setDrawerInfo(note);
     } catch (err) {
       setDrawerError(
         err instanceof ApiClientError ? err.message : "Chronology generation failed.",
@@ -333,9 +384,16 @@ export default function ClaimsTab({
     setDrawerError(null);
     setSufficiencyBusy(true);
     try {
-      const res = await api.post<SufficiencyResult>(`${base}/claims/${selected.id}/sufficiency`);
+      const res = await api.post<SufficiencyResult & { persisted?: boolean }>(
+        `${base}/claims/${selected.id}/sufficiency`,
+      );
       setSufficiency(res);
+      const note =
+        res.persisted === false
+          ? `Scored for reading — a ${humanize(selected.status)} claim's sufficiency score is part of the closed record and was not overwritten.`
+          : null;
       await refresh();
+      if (note) setDrawerInfo(note);
     } catch (err) {
       setDrawerError(err instanceof ApiClientError ? err.message : "Record scoring failed.");
     } finally {
@@ -368,8 +426,12 @@ export default function ClaimsTab({
     setDrawerError(null);
     setScottBusy(true);
     try {
-      await api.post(`${base}/claims/${selected.id}/scott-schedule`);
+      const res = await api.post<{ persisted?: boolean; notPersistedReason?: string | null }>(
+        `${base}/claims/${selected.id}/scott-schedule`,
+      );
+      const note = res.persisted === false ? res.notPersistedReason : null;
       await refresh();
+      if (note) setDrawerInfo(note);
     } catch (err) {
       setDrawerError(err instanceof ApiClientError ? err.message : "The Scott Schedule could not be generated.");
     } finally {
@@ -723,8 +785,61 @@ export default function ClaimsTab({
 
           {/* Linked delay events */}
           <div className="mb-4">
-            <SectionTitle>Linked delay events ({selected.delayEvents.length})</SectionTitle>
-            {selected.delayEvents.length === 0 ? (
+            <div className="flex items-center justify-between gap-3">
+              <SectionTitle>Linked delay events ({selected.delayEvents.length})</SectionTitle>
+              {selected.status === "draft" && !linkEditing ? (
+                <Button size="sm" variant="secondary" onClick={() => void openLinkEditor()}>
+                  Edit links
+                </Button>
+              ) : null}
+            </div>
+            {selected.status !== "draft" ? (
+              <p className="mb-1 text-[11px] text-ink-400">
+                Frozen — the set of events a {humanize(selected.status)} claim rests on is part of
+                the case that was submitted. Revise the claim back to draft to change it.
+              </p>
+            ) : null}
+            {linkEditing ? (
+              <div className="rounded-md border border-ink-200 p-3">
+                {eventPool.length === 0 ? (
+                  <p className="text-xs text-ink-400">
+                    No live delay events in this project — a withdrawn event cannot be linked.
+                  </p>
+                ) : (
+                  <div className="max-h-48 space-y-1 overflow-y-auto">
+                    {eventPool.map((ev) => (
+                      <label key={ev.id} className="flex items-center gap-2 text-sm text-ink-700">
+                        <input
+                          type="checkbox"
+                          checked={linkIds.includes(ev.id)}
+                          onChange={() =>
+                            setLinkIds((cur) =>
+                              cur.includes(ev.id)
+                                ? cur.filter((x) => x !== ev.id)
+                                : [...cur, ev.id],
+                            )
+                          }
+                          className="h-4 w-4 rounded border-ink-300 text-brand-600 focus:ring-brand-500"
+                        />
+                        <span className="font-mono text-xs text-ink-400">{deLabel(ev.number)}</span>
+                        <span className="max-w-64 truncate">{ev.title}</span>
+                        <span className="text-xs text-ink-400">
+                          {ev.durationDays}d from {formatDate(ev.startDate)}
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                )}
+                <div className="mt-3 flex justify-end gap-2">
+                  <Button size="sm" variant="secondary" onClick={() => setLinkEditing(false)}>
+                    Cancel
+                  </Button>
+                  <Button size="sm" disabled={linkBusy} onClick={() => void saveLinks()}>
+                    {linkBusy ? "Saving…" : "Save links"}
+                  </Button>
+                </div>
+              </div>
+            ) : selected.delayEvents.length === 0 ? (
               <p className="text-xs text-ink-400">No delay events linked.</p>
             ) : (
               <div className="flex flex-wrap gap-2">

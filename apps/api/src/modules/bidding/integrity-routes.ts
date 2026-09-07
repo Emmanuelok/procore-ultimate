@@ -1,10 +1,10 @@
-import type { FastifyPluginAsync } from "fastify";
+import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 import { and, desc, eq, inArray, like } from "drizzle-orm";
 import { z } from "zod";
 import { bidPackages, signals } from "@constructos/db";
 import { badRequest, notFound } from "../../lib/errors.js";
 import { appendLedger } from "../../lib/ledger.js";
-import { fetchPackage, reasonSchema } from "./shared.js";
+import { fetchPackage, justificationSchema, reasonSchema } from "./shared.js";
 import { sealState } from "./sealing.js";
 import {
   DEFAULT_INTEGRITY_THRESHOLDS,
@@ -54,6 +54,32 @@ export const integrityRoutes: FastifyPluginAsync = async (app) => {
     app.requireTool("bidding", "standard"),
   ];
   const companyGate = [app.authenticate, app.requireCompany];
+
+  /*
+   * DISPOSITIONING A FINDING IS A SEGREGATED ACT, NOT AN ORDINARY EDIT.
+   *
+   * `signals.disposition` is the same column the assurance register guards
+   * with `requireAssuranceRole(["integrity_reviewer"])`, for the stated
+   * reason that operational owners must not clear findings about their own
+   * records. Bidding writes into that column too, and awards.ts derives the
+   * award's written-acknowledgement gate from it — so a route open to plain
+   * company membership was a second, unguarded way to switch the gate off.
+   *
+   * The gate here admits an integrity reviewer FIRST (the platform's own
+   * segregated role) and falls back to owner/admin, because a tenant that has
+   * granted nobody the assurance role must still be able to work its
+   * register. Whichever way the caller got in, `reviewerId` records who it
+   * was, and awards.ts refuses to treat a finding the RECOMMENDER cleared as
+   * cleared.
+   */
+  const dispositionGate = [
+    app.authenticate,
+    app.requireCompany,
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      if (req.companyRole === "owner" || req.companyRole === "admin") return;
+      await app.requireAssuranceRole(["integrity_reviewer"])(req, reply);
+    },
+  ];
 
   const openSignals = (rows: Array<typeof signals.$inferSelect>) =>
     rows.filter(
@@ -377,10 +403,15 @@ export const integrityRoutes: FastifyPluginAsync = async (app) => {
    */
   app.post(
     "/companies/current/bid-integrity/:signalId/dismiss",
-    { preHandler: companyGate },
+    { preHandler: dispositionGate },
     async (req) => {
       const { signalId } = req.params as { signalId: string };
-      const { reason } = z.object({ reason: reasonSchema }).parse(req.body);
+      /*
+       * A dismissal switches off an award's acknowledgement gate, so it is
+       * held to the same length as the justification it replaces: three
+       * characters ("n/a") is not a reason, it is a way past a control.
+       */
+      const { reason } = z.object({ reason: justificationSchema }).parse(req.body);
       const [row] = await app.db
         .select()
         .from(signals)
@@ -443,7 +474,7 @@ export const integrityRoutes: FastifyPluginAsync = async (app) => {
    */
   app.post(
     "/companies/current/bid-integrity/:signalId/confirm",
-    { preHandler: companyGate },
+    { preHandler: dispositionGate },
     async (req) => {
       const { signalId } = req.params as { signalId: string };
       const { reason, escalate } = z

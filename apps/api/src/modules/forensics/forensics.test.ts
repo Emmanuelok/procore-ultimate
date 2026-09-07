@@ -1119,14 +1119,33 @@ describe("chronology", () => {
       createdBy: owner.userId,
     });
 
+    /* A determined claim's artefacts are the record as it stood at
+       determination, so the chronology is assembled on a live claim linked to
+       the same event. */
+    const liveClaim = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims`,
+      headers: owner.headers,
+      payload: {
+        title: "EOT — chronology subject",
+        kind: "delay",
+        contractId,
+        delayEventIds: [ev1Id],
+        daysClaimed: 3,
+      },
+    });
+    expect(liveClaim.statusCode).toBe(201);
+    const chronoClaimId = liveClaim.json().id as string;
+
     const res = await app.inject({
       method: "POST",
-      url: `/api/v1/projects/${projectId}/claims/${claim1Id}/chronology`,
+      url: `/api/v1/projects/${projectId}/claims/${chronoClaimId}/chronology`,
       headers: owner.headers,
     });
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body.count).toBe(body.items.length);
+    expect(body.persisted).toBe(true);
     expect(body.chronologyAt).toBeTruthy();
 
     const items = body.items as { date: string; source: string; ref: string; title: string }[];
@@ -1149,7 +1168,7 @@ describe("chronology", () => {
     // persisted on the claim
     const one = await app.inject({
       method: "GET",
-      url: `/api/v1/projects/${projectId}/claims/${claim1Id}`,
+      url: `/api/v1/projects/${projectId}/claims/${chronoClaimId}`,
       headers: owner.headers,
     });
     expect(one.json().chronology).toHaveLength(body.count);

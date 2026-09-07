@@ -19,8 +19,12 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, eq, inArray } from "drizzle-orm";
+import { merkleRoot } from "@constructos/ledger";
 import {
   companyMemberships,
+  disputeBundles,
+  disputeCosts,
+  evidence,
   files,
   obligations,
   projectMemberships,
@@ -451,6 +455,98 @@ describe("dispute cost ledger", () => {
     });
     expect(after.json().costOfRecovery.ratio).toBeCloseTo(0.25, 4);
   });
+
+  it("REGRESSION: the dispute currency cannot be relabelled once money is denominated in it", async () => {
+    const pid = await makeProject("Currency Guard Project");
+    const dispute = await createDispute(pid, { currency: "GBP", amountInDispute: 400_000 });
+
+    // Before anything is denominated, a correction is allowed.
+    const early = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${pid}/disputes/${dispute.id}`,
+      headers: owner.headers,
+      payload: { currency: "USD" },
+    });
+    expect(early.statusCode).toBe(200);
+    expect(early.json().currency).toBe("USD");
+    await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${pid}/disputes/${dispute.id}`,
+      headers: owner.headers,
+      payload: { currency: "GBP" },
+    });
+
+    // Two GBP offers and a GBP cost row.
+    for (const amount of [250_000, 275_000]) {
+      const offer = await app.inject({
+        method: "POST",
+        url: `/api/v1/projects/${pid}/disputes/${dispute.id}/offers`,
+        headers: owner.headers,
+        payload: {
+          direction: "received",
+          amount,
+          currency: "GBP",
+          offeredAt: todayISO(),
+          basis: "without_prejudice_save_as_to_costs",
+        },
+      });
+      expect(offer.statusCode).toBe(201);
+    }
+    const cost = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/disputes/${dispute.id}/costs`,
+      headers: owner.headers,
+      payload: {
+        category: "legal",
+        description: "Preparation",
+        incurredAt: todayISO(),
+        actualAmount: 20_000,
+        recoverable: true,
+      },
+    });
+    expect(cost.statusCode).toBe(201);
+
+    // Flipping the currency now would relabel the claim and silently drop
+    // every offer and cost from the settlement analysis.
+    const flip = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${pid}/disputes/${dispute.id}`,
+      headers: owner.headers,
+      payload: { currency: "USD" },
+    });
+    expect(flip.statusCode).toBe(409);
+    expect(flip.json().message).toMatch(/settlement offer/i);
+
+    // Nothing changed, so the analysis still sees both offers.
+    const dsp = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/disputes/${dispute.id}`,
+      headers: owner.headers,
+    });
+    expect(dsp.json().currency).toBe("GBP");
+    const analysis = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/disputes/${dispute.id}/settlement-analysis`,
+      headers: owner.headers,
+    });
+    expect(analysis.statusCode).toBe(200);
+    expect(analysis.json().bestOpenOffer?.amount).toBe(275_000);
+
+    // Other edits still work — the guard is on the currency alone.
+    const rename = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${pid}/disputes/${dispute.id}`,
+      headers: owner.headers,
+      payload: { title: "Interim payment application 14 (revised)" },
+    });
+    expect(rename.statusCode).toBe(200);
+
+    const costRows = await app.db
+      .select()
+      .from(disputeCosts)
+      .where(eq(disputeCosts.disputeId, dispute.id));
+    expect(costRows).toHaveLength(1);
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -795,6 +891,167 @@ describe("hearing bundle upgrades", () => {
     });
     expect(verified.statusCode).toBe(200);
     expect(verified.json().intact).toBe(true);
+  });
+
+  it("REGRESSION: a manifest rewritten with a recomputed root is caught by the snapshots", async () => {
+    const pid = await makeProject("Manifest Rewrite Project");
+    const dispute = await createDispute(pid);
+    const f1 = await insertFile(pid);
+    const f2 = await insertFile(pid);
+    const bundleId = (
+      await app.inject({
+        method: "POST",
+        url: `/api/v1/projects/${pid}/disputes/${dispute.id}/bundles`,
+        headers: owner.headers,
+        payload: { name: "Served bundle" },
+      })
+    ).json().id as string;
+    await app.inject({
+      method: "PUT",
+      url: `/api/v1/projects/${pid}/dispute-bundles/${bundleId}/items`,
+      headers: owner.headers,
+      payload: {
+        items: [
+          { title: "Damaging exhibit", fileId: f1 },
+          { title: "Programme", fileId: f2 },
+        ],
+      },
+    });
+    const generated = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/dispute-bundles/${bundleId}/generate`,
+      headers: owner.headers,
+      payload: {},
+    });
+    expect(generated.statusCode).toBe(200);
+
+    // Someone with database access swaps the damaging exhibit's hash in the
+    // manifest AND recomputes the Merkle root over the edited index, which
+    // defeats a check that only recomputes the root from the manifest.
+    const row = (
+      await app.db.select().from(disputeBundles).where(eq(disputeBundles.id, bundleId))
+    )[0]!;
+    const manifest = row.manifest as unknown as {
+      index: { tab: string; sha256: string }[];
+      merkleRoot: string;
+    };
+    const forgedHash = createHash("sha256").update("a document nobody produced").digest("hex");
+    const forgedIndex = manifest.index.map((e, i) =>
+      i === 0 ? { ...e, sha256: forgedHash } : e,
+    );
+    await app.db
+      .update(disputeBundles)
+      .set({
+        manifest: {
+          ...manifest,
+          index: forgedIndex,
+          merkleRoot: merkleRoot(forgedIndex.map((e) => e.sha256)),
+        } as unknown as Record<string, unknown>,
+      })
+      .where(eq(disputeBundles.id, bundleId));
+
+    const verified = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/dispute-bundles/${bundleId}/verify`,
+      headers: owner.headers,
+      payload: {},
+    });
+    expect(verified.statusCode).toBe(200);
+    const body = verified.json() as {
+      intact: boolean;
+      manifestIntact: boolean;
+      rewrittenCount: number;
+      recomputedRoot: string;
+      merkleRoot: string;
+      findings: { tab: string; state: string; expected: string; actual: string | null }[];
+      statement: string;
+    };
+    // The root still recomputes — that is what a deliberate rewrite looks
+    // like — but the independent snapshot disagrees, so the bundle is not
+    // reported intact.
+    expect(body.recomputedRoot).toBe(body.merkleRoot);
+    expect(body.manifestIntact).toBe(false);
+    expect(body.intact).toBe(false);
+    expect(body.rewrittenCount).toBe(1);
+    const finding = body.findings.find((f) => f.state === "manifest_rewritten")!;
+    expect(finding.actual).toBe(forgedHash);
+    expect(finding.expected).not.toBe(forgedHash);
+    expect(body.statement).toMatch(/rewritten/i);
+  });
+
+  it("produces the served document itself: cover, hyperlinked index and snapshot sections", async () => {
+    const pid = await makeProject("Produced Document Project");
+    const dispute = await createDispute(pid);
+    const f1 = await insertFile(pid);
+    const evidenceId = newId("evd");
+    await app.db.insert(evidence).values({
+      id: evidenceId,
+      companyId: owner.companyId,
+      projectId: pid,
+      kind: "photo",
+      source: "Site photograph of the excavation",
+      contentHash: `hash-${evidenceId}`,
+      submittedBy: owner.userId,
+    });
+    const bundleId = (
+      await app.inject({
+        method: "POST",
+        url: `/api/v1/projects/${pid}/disputes/${dispute.id}/bundles`,
+        headers: owner.headers,
+        payload: { name: "Hearing bundle B" },
+      })
+    ).json().id as string;
+    await app.inject({
+      method: "PUT",
+      url: `/api/v1/projects/${pid}/dispute-bundles/${bundleId}/items`,
+      headers: owner.headers,
+      payload: {
+        items: [
+          { title: "Site diary", fileId: f1 },
+          { title: "Contemporaneous evidence", recordType: "evidence", recordId: evidenceId },
+        ],
+      },
+    });
+
+    const before = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/dispute-bundles/${bundleId}/document.html`,
+      headers: owner.headers,
+    });
+    expect(before.statusCode).toBe(400); // nothing produced yet
+
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/dispute-bundles/${bundleId}/generate`,
+      headers: owner.headers,
+      payload: {},
+    });
+    const doc = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/dispute-bundles/${bundleId}/document.html`,
+      headers: owner.headers,
+    });
+    expect(doc.statusCode).toBe(200);
+    expect(doc.headers["content-type"]).toContain("text/html");
+    expect(doc.body).toContain("Hearing bundle B");
+    // hyperlinked index → the section it names
+    expect(doc.body).toContain('href="#tab-A1"');
+    expect(doc.body).toContain('id="tab-A1"');
+    expect(doc.body).toContain('id="tab-A2"');
+    expect(doc.body).toContain("Site diary");
+    // the record section is rendered FROM THE SNAPSHOT, not re-read live
+    expect(doc.body).toContain("Contemporaneous evidence");
+    expect(doc.body).toContain("Site photograph of the excavation");
+    // and it claims no page numbers it cannot know
+    expect(doc.body).not.toMatch(/page \d+/i);
+
+    const stranger = await registerActor(app);
+    const foreign = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/dispute-bundles/${bundleId}/document.html`,
+      headers: stranger.headers,
+    });
+    expect([403, 404]).toContain(foreign.statusCode);
   });
 });
 

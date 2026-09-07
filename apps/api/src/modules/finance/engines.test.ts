@@ -20,6 +20,11 @@ import {
   compareForecast,
   singleCurrencyTotal,
 } from "./money.js";
+import {
+  renderWithdrawalApplicationHtml,
+  withdrawalApplicationCsv,
+  type WithdrawalApplicationDocument,
+} from "./withdrawal.js";
 
 /* ------------------------------------------------------------------ */
 /* Per-currency money (production blocker regression)                  */
@@ -476,5 +481,149 @@ describe("disbursement forecast vs actual (#745-746)", () => {
       "2026-06-30",
     );
     expect(c.milestoneBreaches).toEqual([]);
+  });
+});
+
+
+/* ------------------------------------------------------------------ */
+/* Withdrawal application renderings (#732, #735)                      */
+/* ------------------------------------------------------------------ */
+
+function applicationDoc(
+  over: Partial<WithdrawalApplicationDocument> = {},
+): WithdrawalApplicationDocument {
+  return {
+    header: {
+      applicationNumber: 7,
+      project: "Northern Bypass",
+      borrowerReference: "IFI Loan 2026-A",
+      lender: "Development Bank",
+      instrument: "loan",
+      currency: "USD",
+      committedAmount: 10_000_000,
+      availabilityEndDate: "2028-12-31",
+      category: { id: "c1", name: "Civil works", limit: 4_000_000 },
+    },
+    application: {
+      amount: 1_234_567.5,
+      purpose: "Interim payment certificate 3",
+      status: "submitted",
+      submittedAt: "2026-04-01T09:00:00.000Z",
+      approvedAt: null,
+      disbursedAt: null,
+    },
+    statementOfExpenditure: [
+      {
+        evidenceId: "evd_1",
+        kind: "document",
+        source: "Contractor invoice pack",
+        capturedAt: "2026-03-30T00:00:00.000Z",
+        contentHash: "a".repeat(64),
+        eligibility: "eligible",
+        reason: null,
+        amount: 1_000_000,
+      },
+      {
+        evidenceId: "evd_2",
+        kind: "document",
+        source: 'Hospitality, "entertainment"',
+        capturedAt: null,
+        contentHash: null,
+        eligibility: "ineligible",
+        reason: "Not an eligible expenditure category",
+        amount: 5_000,
+      },
+    ],
+    eligibility: {
+      total: 2,
+      eligible: 1,
+      ineligible: 1,
+      unassessed: 0,
+      ineligibleAmount: 5_000,
+      submittable: false,
+      reasons: ["1 attached item(s) are classified ineligible"],
+    },
+    certification: {
+      certified: false,
+      certifiedAt: null,
+      certifiedBy: null,
+      note: null,
+      evidenceIds: [],
+      requiredForInstrument: true,
+    },
+    conditionality: null,
+    warnings: ["This application has NOT been certified by the independent engineer."],
+    basis: "Assembled from recorded rows only.",
+    ...over,
+  };
+}
+
+describe("withdrawalApplicationCsv", () => {
+  it("emits the header block, the SoE schedule and the warnings, escaping commas and quotes", () => {
+    const csv = withdrawalApplicationCsv(applicationDoc());
+    const lines = csv.trim().split("\n");
+    expect(lines[0]).toBe("field,value");
+    expect(csv).toContain("Application number,7");
+    expect(csv).toContain(
+      "evidenceId,kind,source,capturedAt,contentHash,eligibility,reason,amount",
+    );
+    // a source containing a comma and quotes stays one field
+    expect(csv).toContain('"Hospitality, ""entertainment"""');
+    expect(csv).toContain("WARNING");
+  });
+
+  it("does not invent an amount for an item that carries none", () => {
+    const csv = withdrawalApplicationCsv(
+      applicationDoc({
+        statementOfExpenditure: [
+          {
+            evidenceId: "evd_9",
+            kind: "photo",
+            source: "Site record",
+            capturedAt: null,
+            contentHash: null,
+            eligibility: "unassessed",
+            reason: null,
+            amount: null,
+          },
+        ],
+      }),
+    );
+    // trailing empty field, never a 0
+    expect(csv).toContain("evd_9,photo,Site record,,,unassessed,,\n");
+  });
+});
+
+describe("renderWithdrawalApplicationHtml", () => {
+  it("lays the form out in the lender's three sections with the money formatted once", () => {
+    const html = renderWithdrawalApplicationHtml(applicationDoc());
+    expect(html).toContain("Section 1 — Application");
+    expect(html).toContain("Section 2 — Statement of expenditure");
+    expect(html).toContain("Section 3 — Certification");
+    expect(html).toContain("USD 1,234,567.50");
+    expect(html).toContain("NOT CERTIFIED — required for this instrument");
+    expect(html).toContain("1 of 2 item(s) classified eligible");
+  });
+
+  it("escapes content rather than letting a record title inject markup", () => {
+    const html = renderWithdrawalApplicationHtml(
+      applicationDoc({
+        application: {
+          amount: 1,
+          purpose: '<script>alert("x")</script>',
+          status: "draft",
+          submittedAt: null,
+          approvedAt: null,
+          disbursedAt: null,
+        },
+      }),
+    );
+    expect(html).not.toContain("<script>");
+    expect(html).toContain("&lt;script&gt;");
+  });
+
+  it("says the statement is empty rather than printing an empty table", () => {
+    const html = renderWithdrawalApplicationHtml(applicationDoc({ statementOfExpenditure: [] }));
+    expect(html).toContain("No evidence is attached");
   });
 });

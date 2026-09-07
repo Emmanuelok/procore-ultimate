@@ -20,6 +20,11 @@ import {
   outcomeAnalytics,
   type DisputeOutcomeRow,
 } from "./analytics.js";
+import {
+  renderBundleDocumentHtml,
+  renderSnapshotRow,
+  type BundleDocumentInput,
+} from "./bundle.js";
 
 /* ------------------------------------------------------------------ */
 /* Regimes                                                             */
@@ -484,5 +489,118 @@ describe("drafting recommendations (#357)", () => {
       row({ id: `d${i}`, governingClause: `cl. ${i}`, rootCause: "other" }),
     );
     expect(draftingRecommendations(rows, { minDisputes: 1, limit: 3 })).toHaveLength(3);
+  });
+});
+
+
+/* ------------------------------------------------------------------ */
+/* Produced bundle document (#343)                                     */
+/* ------------------------------------------------------------------ */
+
+function bundleDoc(over: Partial<BundleDocumentInput> = {}): BundleDocumentInput {
+  return {
+    bundleName: "Hearing bundle A",
+    disputeReference: "Dispute #4",
+    disputeTitle: "Interim payment application 14",
+    projectName: "Northern Bypass",
+    generatedAt: "2026-05-01T10:00:00.000Z",
+    merkleRoot: "f".repeat(64),
+    statement: "2 item(s) produced under Merkle root …",
+    items: [
+      {
+        tab: "A1",
+        title: "Site diary",
+        date: "2026-02-01",
+        source: "file:fil_1",
+        sha256: "a".repeat(64),
+        kind: "file",
+        snapshot: { fileId: "fil_1", name: "site-diary.pdf", sha256: "a".repeat(64) },
+      },
+      {
+        tab: "A2",
+        title: "RFI-12",
+        date: "2026-03-04",
+        source: "rfi:rfi_1",
+        sha256: "b".repeat(64),
+        kind: "record",
+        snapshot: {
+          recordType: "rfi",
+          recordId: "rfi_1",
+          row: { subject: "Pile cap reinforcement", status: "answered", number: 12 },
+        },
+      },
+    ],
+    privilegeLog: [
+      {
+        title: "Counsel advice",
+        date: "2026-03-20",
+        privilege: "legal_advice",
+        reason: "Advice from counsel — not produced.",
+      },
+    ],
+    ...over,
+  };
+}
+
+describe("renderSnapshotRow", () => {
+  it("labels fields and renders nested values as JSON", () => {
+    const html = renderSnapshotRow({ subjectLine: "Pile cap", meta: { a: 1 }, empty: "" });
+    expect(html).toContain("Subject Line");
+    expect(html).toContain("Pile cap");
+    expect(html).toContain("<pre>");
+    // an empty field is dropped rather than rendered as a blank claim
+    expect(html).not.toContain("Empty");
+  });
+
+  it("says so when a snapshot has nothing to show", () => {
+    expect(renderSnapshotRow({})).toContain("no populated fields");
+  });
+});
+
+describe("renderBundleDocumentHtml", () => {
+  it("hyperlinks the index to a section per tab and renders records from the snapshot", () => {
+    const html = renderBundleDocumentHtml(bundleDoc());
+    expect(html).toContain('href="#tab-A1"');
+    expect(html).toContain('id="tab-A1"');
+    expect(html).toContain('id="tab-A2"');
+    expect(html).toContain("Tab A2 — RFI-12");
+    expect(html).toContain("Pile cap reinforcement");
+    expect(html).toContain("site-diary.pdf");
+    // the privilege log travels with the bundle
+    expect(html).toContain("Privilege log");
+    expect(html).toContain("Advice from counsel");
+  });
+
+  it("claims no page numbers it cannot know", () => {
+    const html = renderBundleDocumentHtml(bundleDoc());
+    expect(html).not.toMatch(/page \d+/i);
+    expect(html).toContain("Each tab begins on a new page");
+  });
+
+  it("is honest about an item with no snapshot", () => {
+    const html = renderBundleDocumentHtml(
+      bundleDoc({
+        items: [
+          {
+            tab: "A1",
+            title: "Lost exhibit",
+            date: null,
+            source: "rfi:rfi_9",
+            sha256: "c".repeat(64),
+            kind: null,
+            snapshot: null,
+          },
+        ],
+      }),
+    );
+    expect(html).toContain("No snapshot was taken");
+  });
+
+  it("escapes titles rather than letting them inject markup", () => {
+    const html = renderBundleDocumentHtml(
+      bundleDoc({ bundleName: '<img src=x onerror="alert(1)">' }),
+    );
+    expect(html).not.toContain("<img src=x");
+    expect(html).toContain("&lt;img");
   });
 });

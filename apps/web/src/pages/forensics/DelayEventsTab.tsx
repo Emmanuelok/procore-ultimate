@@ -246,12 +246,12 @@ export default function DelayEventsTab({
     setForm((f) => ({ ...f, [key]: value }));
   }
 
-  async function openCreate() {
-    setCreateError(null);
-    setForm(emptyForm);
-    setTasks([]);
-    setContractEvents([]);
-    setCreateOpen(true);
+  /** null = the form is registering a new event; an id = it is editing that one. */
+  const [editId, setEditId] = useState<string | null>(null);
+  /** label of the contract event already linked, so editing never hides it */
+  const [editContractEventLabel, setEditContractEventLabel] = useState<string | null>(null);
+
+  async function loadPickers(): Promise<void> {
     try {
       const [sch, con, ev] = await Promise.all([
         api.get<ListResponse<ScheduleRow>>(`${base}/schedules?pageSize=100`),
@@ -262,7 +262,63 @@ export default function DelayEventsTab({
       setContracts(con.items);
       setEvidencePool(ev.items);
     } catch {
-      // pickers stay empty; the event can still be created without links
+      // pickers stay empty; the event can still be saved without links
+    }
+  }
+
+  async function openCreate() {
+    setCreateError(null);
+    setEditId(null);
+    setEditContractEventLabel(null);
+    setForm(emptyForm);
+    setTasks([]);
+    setContractEvents([]);
+    setCreateOpen(true);
+    await loadPickers();
+  }
+
+  /**
+   * Editing an event used to be impossible in the product: a delay event
+   * captured with the wrong duration or the wrong notice date could only be
+   * withdrawn (which drops it from every aggregation) and re-raised under a new
+   * number. The API has always supported it — including clearing a stale TIA
+   * and waiving an obligation raised against a superseded notice date.
+   */
+  async function openEdit(ev: DelayEventDetail) {
+    setCreateError(null);
+    setEditId(ev.id);
+    setEditContractEventLabel(
+      ev.contractEvent ? `CE-${ev.contractEvent.number} · ${ev.contractEvent.title}` : null,
+    );
+    setForm({
+      title: ev.title,
+      description: ev.description ?? "",
+      cause: ev.cause,
+      excusable: ev.excusable === 1,
+      compensable: ev.compensable === 1,
+      scheduleId: ev.scheduleId ?? "",
+      taskId: ev.taskId ?? "",
+      startDate: ev.startDate,
+      durationDays: String(ev.durationDays),
+      contractId: "",
+      contractEventId: ev.contractEventId ?? "",
+      noticeDueDate: ev.noticeDueDate ?? "",
+      party: ev.party ?? "neither",
+      evidenceIds: ev.evidenceIds ?? [],
+    });
+    setTasks([]);
+    setContractEvents([]);
+    setCreateOpen(true);
+    await loadPickers();
+    if (ev.scheduleId) {
+      try {
+        const detail = await api.get<{ tasks: ScheduleTaskLite[] }>(
+          `${base}/schedules/${ev.scheduleId}`,
+        );
+        setTasks(detail.tasks ?? []);
+      } catch {
+        setTasks([]);
+      }
     }
   }
 
@@ -311,13 +367,38 @@ export default function DelayEventsTab({
     setBusy(true);
     try {
       const duration = Number(form.durationDays);
+      const durationDays = Number.isFinite(duration) ? Math.round(duration) : 1;
+      if (editId) {
+        /* On an edit every field is sent, cleared ones as null, so unticking a
+           link actually removes it instead of silently leaving the old value. */
+        await api.patch<DelayEventRow>(`${base}/delay-events/${editId}`, {
+          title: form.title.trim(),
+          description: form.description.trim() === "" ? null : form.description.trim(),
+          cause: form.cause,
+          excusable: form.excusable,
+          compensable: form.excusable ? form.compensable : false,
+          party: form.party,
+          startDate: form.startDate,
+          durationDays,
+          scheduleId: form.scheduleId === "" ? null : form.scheduleId,
+          taskId: form.taskId === "" ? null : form.taskId,
+          contractEventId: form.contractEventId === "" ? null : form.contractEventId,
+          noticeDueDate: form.noticeDueDate === "" ? null : form.noticeDueDate,
+          evidenceIds: form.evidenceIds,
+        });
+        setCreateOpen(false);
+        await load();
+        if (selected?.id === editId) await openDrawer(editId);
+        setEditId(null);
+        return;
+      }
       const payload: Record<string, unknown> = {
         title: form.title.trim(),
         cause: form.cause,
         excusable: form.excusable,
         compensable: form.excusable ? form.compensable : false,
         startDate: form.startDate,
-        durationDays: Number.isFinite(duration) ? Math.round(duration) : 1,
+        durationDays,
       };
       if (form.description.trim()) payload["description"] = form.description.trim();
       if (form.scheduleId) payload["scheduleId"] = form.scheduleId;
@@ -332,7 +413,11 @@ export default function DelayEventsTab({
       await load();
     } catch (err) {
       setCreateError(
-        err instanceof ApiClientError ? err.message : "Failed to register the delay event.",
+        err instanceof ApiClientError
+          ? err.message
+          : editId
+            ? "Failed to save the delay event."
+            : "Failed to register the delay event.",
       );
     } finally {
       setBusy(false);
@@ -561,8 +646,11 @@ export default function DelayEventsTab({
       {/* ------------------------------ create modal ------------------------------ */}
       <Modal
         open={createOpen}
-        title="Register delay event"
-        onClose={() => setCreateOpen(false)}
+        title={editId ? "Edit delay event" : "Register delay event"}
+        onClose={() => {
+          setCreateOpen(false);
+          setEditId(null);
+        }}
         wide
       >
         <ErrorAlert message={createError} />
@@ -719,13 +807,27 @@ export default function DelayEventsTab({
                 ))}
               </Select>
             </Field>
-            <Field label="Contract event">
+            <Field
+              label="Contract event"
+              hint={
+                editId && editContractEventLabel && !form.contractId
+                  ? "Pick a contract to change the link; leaving it alone keeps the one below."
+                  : undefined
+              }
+            >
               <Select
                 value={form.contractEventId}
-                disabled={!form.contractId}
+                disabled={!form.contractId && !editContractEventLabel}
                 onChange={(e) => set("contractEventId", e.target.value)}
               >
                 <option value="">None</option>
+                {/* the already-linked event stays selectable even before a
+                    contract is chosen, so editing never silently drops it */}
+                {editContractEventLabel &&
+                form.contractEventId &&
+                !contractEvents.some((ev) => ev.id === form.contractEventId) ? (
+                  <option value={form.contractEventId}>{editContractEventLabel}</option>
+                ) : null}
                 {contractEvents.map((ev) => (
                   <option key={ev.id} value={ev.id}>
                     CE-{ev.number} — {ev.title}
@@ -760,12 +862,31 @@ export default function DelayEventsTab({
             )}
           </fieldset>
 
-          <div className="flex justify-end gap-2">
-            <Button variant="secondary" onClick={() => setCreateOpen(false)}>
+          <div className="flex items-center justify-end gap-2">
+            {editId ? (
+              <p className="mr-auto text-xs text-ink-400">
+                Changing the start date, duration or the struck activity clears the cached time
+                impact analysis; moving the notice date waives the obligation raised against the
+                old one and opens a fresh one on the next sweep.
+              </p>
+            ) : null}
+            <Button
+              variant="secondary"
+              onClick={() => {
+                setCreateOpen(false);
+                setEditId(null);
+              }}
+            >
               Cancel
             </Button>
             <Button type="submit" disabled={busy}>
-              {busy ? "Registering…" : "Register event"}
+              {busy
+                ? editId
+                  ? "Saving…"
+                  : "Registering…"
+                : editId
+                  ? "Save changes"
+                  : "Register event"}
             </Button>
           </div>
         </form>
@@ -783,14 +904,29 @@ export default function DelayEventsTab({
               </div>
               <h2 className="text-base font-semibold text-ink-900">{selected.title}</h2>
             </div>
-            <button
-              type="button"
-              onClick={() => setSelected(null)}
-              className="rounded p-1 text-ink-400 hover:bg-ink-100 hover:text-ink-700"
-              aria-label="Close"
-            >
-              ✕
-            </button>
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={selected.status === "withdrawn" || selected.status === "closed"}
+                title={
+                  selected.status === "withdrawn" || selected.status === "closed"
+                    ? `A ${selected.status} event cannot be edited — reopen it first`
+                    : "Correct the record instead of withdrawing and re-raising it"
+                }
+                onClick={() => void openEdit(selected)}
+              >
+                Edit
+              </Button>
+              <button
+                type="button"
+                onClick={() => setSelected(null)}
+                className="rounded p-1 text-ink-400 hover:bg-ink-100 hover:text-ink-700"
+                aria-label="Close"
+              >
+                ✕
+              </button>
+            </div>
           </div>
 
           <ErrorAlert message={drawerError} />

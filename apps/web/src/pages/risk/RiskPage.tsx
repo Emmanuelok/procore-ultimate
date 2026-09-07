@@ -402,7 +402,9 @@ function SimulationTab({
 
   const [history, setHistory] = useState<SimListItem[] | null>(null);
   const [histError, setHistError] = useState<string | null>(null);
-  const [verify, setVerify] = useState<Record<string, "running" | "yes" | "no">>({});
+  const [verify, setVerify] = useState<
+    Record<string, "running" | "yes" | "no" | "denied" | "error">
+  >({});
 
   const loadHistory = useCallback(async () => {
     setHistError(null);
@@ -466,13 +468,20 @@ function SimulationTab({
     }
   }
 
+  /**
+   * A rerun replays the whole simulation, so it is a standard-level action
+   * queued behind the same runner as a fresh run. A refusal is NOT a
+   * mismatch — reporting "MISMATCH" because the caller lacked permission
+   * would accuse a clean record of tampering.
+   */
   async function onVerify(id: string) {
     setVerify((m) => ({ ...m, [id]: "running" }));
     try {
       const res = await api.post<RerunResult>(`${base}/risk-simulations/${id}/rerun`);
       setVerify((m) => ({ ...m, [id]: res.reproduced ? "yes" : "no" }));
-    } catch {
-      setVerify((m) => ({ ...m, [id]: "no" }));
+    } catch (err) {
+      const denied = err instanceof ApiClientError && (err.status === 403 || err.status === 401);
+      setVerify((m) => ({ ...m, [id]: denied ? "denied" : "error" }));
     }
   }
 
@@ -779,6 +788,15 @@ function SimulationTab({
                             <Badge tone="green">Reproduced exactly</Badge>
                           ) : v === "no" ? (
                             <Badge tone="red">MISMATCH</Badge>
+                          ) : v === "denied" ? (
+                            <span
+                              className="text-xs text-ink-400"
+                              title="A rerun re-runs the simulation, so it needs standard access to the risk tool."
+                            >
+                              Not permitted
+                            </span>
+                          ) : v === "error" ? (
+                            <span className="text-xs text-ink-400">Verification unavailable</span>
                           ) : v === "running" ? (
                             <span className="text-xs text-ink-400">Verifying…</span>
                           ) : (

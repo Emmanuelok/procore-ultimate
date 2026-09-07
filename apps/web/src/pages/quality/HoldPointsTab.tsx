@@ -96,7 +96,7 @@ export default function HoldPointsTab({
   const surveillance = useResource<SurveillanceRegister>(
     (signal) =>
       api.get<SurveillanceRegister>(
-        `/api/v1/projects/${projectId}/surveillance?openOnly=true`,
+        `/api/v1/projects/${projectId}/surveillance?openOnly=true&page=1&pageSize=200`,
         { signal },
       ),
     [projectId, holdPoints.data],
@@ -522,6 +522,11 @@ function ThirdPartyPanel({
         </ul>
         <ReasonList
           reasons={[
+            ...(data.total > data.items.length
+              ? [
+                  `The breakdown above is drawn from the first ${data.items.length} of ${data.total} outstanding legs; the head-line count is the register's own total, so the two are not the same number and are not meant to be.`,
+                ]
+              : []),
             "A surveillance leg is held by an organisation outside this company. It cannot be released from here, and marking it released without their signature is the one thing this register exists to make impossible.",
           ]}
         />

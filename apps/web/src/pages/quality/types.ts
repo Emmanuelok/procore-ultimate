@@ -1358,6 +1358,11 @@ export interface CalibrationRecord {
   notes: string | null;
 }
 
+/** GET /projects/:projectId/instruments/:id — the row plus its certificates. */
+export interface InstrumentDetail extends Instrument {
+  history: CalibrationRecord[];
+}
+
 export interface InstrumentSummary {
   total: number;
   byStatus: Record<string, number>;

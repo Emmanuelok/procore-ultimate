@@ -24,6 +24,7 @@
  */
 import { useMemo, useState } from "react";
 import {
+  Alert,
   Badge,
   Button,
   DataTable,
@@ -52,6 +53,7 @@ import {
   num,
   plural,
   useAction,
+  useReason,
   useResource,
   type Resource,
 } from "./qualityShared";
@@ -553,6 +555,10 @@ function DlpDetailModal({
   const [defectTitle, setDefectTitle] = useState("");
   const [severity, setSeverity] = useState("minor");
   const [reportedBy, setReportedBy] = useState("");
+  const [extendTo, setExtendTo] = useState("");
+  const [extendReason, setExtendReason] = useState("");
+  const [finalCertificateDate, setFinalCertificateDate] = useState("");
+  const [closureNote, setClosureNote] = useState("");
   const detail = useResource<DlpDetail>(
     (signal) => api.get<DlpDetail>(`${base}/dlps/${id}`, { signal }),
     [base, id, version],
@@ -662,6 +668,126 @@ function DlpDetailModal({
             </div>
           </div>
 
+          {row.status !== "closed" ? (
+            <div className="grid gap-2 lg:grid-cols-2">
+              {/* ---- extend ---- */}
+              <div className="rounded-md border border-border-subtle p-2.5">
+                <div className="text-label uppercase tracking-wide text-content-subtle">
+                  Extend the period
+                </div>
+                <p className="mt-0.5 text-2xs text-content-subtle">
+                  Rectified work usually carries its own liability period. Extending moves the
+                  obligation's deadline with it, so the reminder follows the new date rather than
+                  the original one.
+                </p>
+                <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                  <Field label="Extended to" required>
+                    <Input
+                      type="date"
+                      value={extendTo}
+                      onChange={(e) => setExtendTo(e.target.value)}
+                    />
+                  </Field>
+                  <Field label="Why" required>
+                    <Input
+                      value={extendReason}
+                      onChange={(e) => setExtendReason(e.target.value)}
+                      placeholder="Roof recovered 2031-02; 12 months from completion"
+                    />
+                  </Field>
+                </div>
+                <div className="mt-2 flex justify-end">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    loading={busy === "extend"}
+                    disabled={extendTo === "" || extendReason.trim() === ""}
+                    onClick={async () => {
+                      const done = await run("extend", () =>
+                        api.post(`${base}/dlps/${id}/extend`, {
+                          extendedToDate: extendTo,
+                          reason: extendReason.trim(),
+                        }),
+                      );
+                      if (done) {
+                        setExtendTo("");
+                        setExtendReason("");
+                        detail.reload();
+                        onMutated();
+                      }
+                    }}
+                  >
+                    Extend it
+                  </Button>
+                </div>
+              </div>
+
+              {/* ---- close ---- */}
+              <div className="rounded-md border border-border-subtle p-2.5">
+                <div className="text-label uppercase tracking-wide text-content-subtle">
+                  Close the period
+                </div>
+                <p className="mt-0.5 text-2xs text-content-subtle">
+                  Closing releases the retention and issues the final certificate. Over open defects
+                  the API refuses unless the closure states why, and the reason is written into the
+                  record and the ledger.
+                </p>
+                <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                  <Field label="Final certificate date">
+                    <Input
+                      type="date"
+                      value={finalCertificateDate}
+                      onChange={(e) => setFinalCertificateDate(e.target.value)}
+                    />
+                  </Field>
+                  <Field
+                    label="Note"
+                    hint={
+                      row.openDefectCount > 0
+                        ? `Required: ${row.openDefectCount} defect(s) are still open.`
+                        : "Optional."
+                    }
+                  >
+                    <Input value={closureNote} onChange={(e) => setClosureNote(e.target.value)} />
+                  </Field>
+                </div>
+                <div className="mt-2 flex justify-end">
+                  <Button
+                    size="sm"
+                    variant={row.openDefectCount > 0 ? "danger" : "primary"}
+                    loading={busy === "close"}
+                    disabled={row.openDefectCount > 0 && closureNote.trim().length < 10}
+                    onClick={async () => {
+                      const done = await run("close", () =>
+                        api.post(`${base}/dlps/${id}/close`, {
+                          finalCertificateDate:
+                            finalCertificateDate === "" ? null : finalCertificateDate,
+                          note: closureNote.trim() === "" ? null : closureNote.trim(),
+                          ...(row.openDefectCount > 0 ? { force: true } : {}),
+                        }),
+                      );
+                      if (done) {
+                        setClosureNote("");
+                        detail.reload();
+                        onMutated();
+                      }
+                    }}
+                  >
+                    {row.openDefectCount > 0
+                      ? `Close over ${row.openDefectCount} open ${row.openDefectCount === 1 ? "defect" : "defects"}`
+                      : "Close the period"}
+                  </Button>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <Alert tone="info" title="This period is closed">
+              The retention was released and the final certificate issued
+              {row.finalCertificateDate ? ` on ${isoDate(row.finalCertificateDate)}` : ""}. A defect
+              reported now is reported outside the period, and the register says so on the row.
+            </Alert>
+          )}
+
           {row.defects.length === 0 ? (
             <p className="text-2xs text-content-subtle">
               No defect has been reported in this period. That is a fact about the reporting, not
@@ -767,6 +893,7 @@ function GuaranteePanel({
   const [createOpen, setCreateOpen] = useState(false);
   const [measuring, setMeasuring] = useState<PerformanceGuarantee | null>(null);
   const { busy, refusal, clear, run } = useAction();
+  const { ask, dialog } = useReason();
   const guarantees = useResource<Paged<PerformanceGuarantee>>(
     (signal) =>
       api.get<Paged<PerformanceGuarantee>>(`${base}/performance-guarantees?page=1&pageSize=200`, {
@@ -780,6 +907,31 @@ function GuaranteePanel({
   async function verify(id: string) {
     const done = await run(`verify-${id}`, () =>
       api.post(`${base}/performance-guarantees/${id}/verify`, {}),
+    );
+    if (done) {
+      guarantees.reload();
+      onMutated();
+    }
+  }
+
+  /**
+   * Waiving a guarantee removes its shortfall from the project's damages
+   * exposure, so it is segregated from the person who declared it and it
+   * carries a written reason — the register is asked afterwards why the money
+   * was not claimed.
+   */
+  async function waive(row: PerformanceGuarantee) {
+    const reason = await ask({
+      title: `Waive ${row.reference}`,
+      description:
+        "A waived guarantee stops counting towards liquidated damages. Say what was agreed and by whom — a waiver with no reason is indistinguishable from a guarantee nobody chased.",
+      label: "What was agreed?",
+      confirmLabel: "Record the waiver",
+      destructive: true,
+    });
+    if (!reason) return;
+    const done = await run(`waive-${row.id}`, () =>
+      api.post(`${base}/performance-guarantees/${row.id}/waive`, { reason }),
     );
     if (done) {
       guarantees.reload();
@@ -885,6 +1037,16 @@ function GuaranteePanel({
                 Verify
               </Button>
             ) : null}
+            {row.status !== "waived" ? (
+              <Button
+                size="xs"
+                variant="ghost"
+                loading={busy === `waive-${row.id}`}
+                onClick={() => waive(row)}
+              >
+                Waive
+              </Button>
+            ) : null}
           </div>
         ),
       },
@@ -895,6 +1057,7 @@ function GuaranteePanel({
 
   return (
     <div className="space-y-3">
+      {dialog}
       <RefusalNotice refusal={refusal} onDismiss={clear} />
 
       {exposure ? (

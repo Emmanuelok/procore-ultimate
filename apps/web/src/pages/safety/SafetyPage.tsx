@@ -330,6 +330,11 @@ export default function SafetyPage() {
       unsettled: standing?.reviewRefs ?? [],
       awaiting: standing?.awaitingRefs ?? [],
       outstandingDuties: standing?.outstandingDuties ?? 0,
+      deadlineUnknownDuties: standing?.deadlineUnknownDuties ?? 0,
+      truncated: standing?.truncated === true,
+      scanned: standing?.scanned ?? 0,
+      openReportableTotal: standing?.openReportableTotal ?? 0,
+      scope: standing?.scope ?? null,
     };
   }, [summary.data]);
 
@@ -412,6 +417,16 @@ export default function SafetyPage() {
         </div>
       ) : null}
 
+      {alarm.truncated ? (
+        <div className="mb-3">
+          <Alert tone="info" title="The statutory standing above reads a capped slice of the register">
+            {alarm.scope ?? ""} {count(alarm.scanned)} of {count(alarm.openReportableTotal)} open
+            reportable incidents were read. Anything older than that slice is not counted in these
+            banners — open the incident register to see it.
+          </Alert>
+        </div>
+      ) : null}
+
       {alarm.unsettled.length > 0 ? (
         <div className="mb-3">
           <Alert
@@ -420,7 +435,7 @@ export default function SafetyPage() {
           >
             <p>
               The reportability engine could not decide at least one statutory test on the facts
-              held for{" "}
+              held — or the record names a regime with no deadline against it at all — for{" "}
               {alarm.unsettled
                 .slice(0, 4)
                 .map((i) => i.reference)
@@ -428,6 +443,9 @@ export default function SafetyPage() {
               {alarm.unsettled.length > 4 ? ` and ${alarm.unsettled.length - 4} more` : ""}. An
               undecided test is not a negative result: answer the open questions on the incident
               before treating any of these as not reportable.
+              {alarm.deadlineUnknownDuties > 0
+                ? ` ${alarm.deadlineUnknownDuties} duty/duties carry a regime with no deadline recorded against it — reassess those incidents to get the real clock and the rule behind it.`
+                : ""}
             </p>
           </Alert>
         </div>
@@ -499,6 +517,16 @@ export default function SafetyPage() {
           filters={deviceFilters}
           onFilters={withPageReset(deviceFilters, setDeviceFilters)}
           users={users}
+          incidents={(incidents.data?.items ?? []).map((i) => ({
+            id: i.id,
+            reference: i.reference,
+            title: i.title,
+          }))}
+          observations={(observations.data?.items ?? []).map((o) => ({
+            id: o.id,
+            reference: o.reference,
+            title: o.title,
+          }))}
           onMutated={refresh}
         />
       ) : tab === "statutory" ? (
@@ -600,6 +628,7 @@ export default function SafetyPage() {
       />
 
       <ProgrammeDrawer
+        projectId={projectKey}
         recordId={openProgrammeRecord}
         users={users}
         vendors={vendors}

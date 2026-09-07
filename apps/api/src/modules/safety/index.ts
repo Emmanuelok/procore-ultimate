@@ -926,7 +926,20 @@ const PRIORITY_TO_SIGNAL_SEVERITY: Record<string, string> = {
  * the records around an incident and cites the id behind every suggestion,
  * dropping any citation that was not in the prompt. Nothing it returns is
  * written until a human accepts it, and acceptance is a separate ledgered act
- * carrying the run id.
+ * carrying the run id — which is CHECKED against `ai_runs` for this company
+ * and this incident, because provenance nobody can resolve is worse than no
+ * provenance at all. The assembly and the model are split across two routes:
+ * `GET .../assist/context` is deterministic and always answers, and `POST
+ * .../assist` refuses with 503 AiDisabled when no key is configured, exactly
+ * like every other AI endpoint on the platform.
+ *
+ * WHO MAY READ THE PROGRAMME. The register is company-scoped but most of what
+ * is in it belongs to a project — a RAMS, a permit, a named worker's drug and
+ * alcohol test result. `requireTool` cannot gate a route with no `:projectId`
+ * in its path, so those routes resolve the record's project and enforce the
+ * safety tool level on it (PLAN §6.3); the list filters to the projects the
+ * caller is on, and a record with no project (the policy, the training
+ * matrix) stays visible to the whole company.
  *
  * AND THE SWEEPS MOVED. They used to run on every list AND every detail read,
  * each loading every signal the company had ever raised for a detector. They
@@ -6013,31 +6026,54 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
         }
       }
 
-      const acks = [...(row.acknowledgements ?? [])] as Array<Record<string, unknown>>;
       const subject = body.workerId ?? body.userId ?? req.user!.id;
-      if (acks.some((a) => (a["workerId"] ?? a["userId"]) === subject)) {
-        throw conflict(`${subject} has already acknowledged ${row.reference}.`);
-      }
       const selfRecorded = !body.workerId && (!body.userId || body.userId === req.user!.id);
-      acks.push({
-        workerId: body.workerId ?? null,
-        userId: body.workerId ? null : (body.userId ?? req.user!.id),
-        acknowledgedAt: body.acknowledgedAt ?? new Date().toISOString(),
-        method: body.method ?? "on_device_signature",
-        recordedBy: req.user!.id,
-        /** false when somebody recorded this for somebody else */
-        selfRecorded,
-        recordedOnBehalf: selfRecorded ? null : { by: req.user!.id, role: req.companyRole ?? null },
-        attestation: body.attestation ?? null,
+
+      /* Read-modify-write of a jsonb array under a row lock. A briefing where
+       * forty people sign in on forty phones at the gate is exactly the case
+       * that loses entries to last-write-wins, and the count this feeds is the
+       * evidence an inspector asks for. */
+      const acks = await app.db.transaction(async (tx) => {
+        const locked = (
+          await tx
+            .select()
+            .from(safetyProgrammeRecords)
+            .where(
+              and(
+                eq(safetyProgrammeRecords.id, recordId),
+                eq(safetyProgrammeRecords.companyId, req.companyId!),
+              ),
+            )
+            .for("update")
+        )[0];
+        if (!locked) throw notFound("Programme record not found");
+        const next = [...(locked.acknowledgements ?? [])] as Array<Record<string, unknown>>;
+        if (next.some((a) => (a["workerId"] ?? a["userId"]) === subject)) {
+          throw conflict(`${subject} has already acknowledged ${locked.reference}.`);
+        }
+        next.push({
+          workerId: body.workerId ?? null,
+          userId: body.workerId ? null : (body.userId ?? req.user!.id),
+          acknowledgedAt: body.acknowledgedAt ?? new Date().toISOString(),
+          method: body.method ?? "on_device_signature",
+          recordedBy: req.user!.id,
+          /** false when somebody recorded this for somebody else */
+          selfRecorded,
+          recordedOnBehalf: selfRecorded
+            ? null
+            : { by: req.user!.id, role: req.companyRole ?? null },
+          attestation: body.attestation ?? null,
+        });
+        await tx
+          .update(safetyProgrammeRecords)
+          .set({
+            acknowledgements: next,
+            acknowledgementCount: next.length,
+            updatedAt: new Date().toISOString(),
+          })
+          .where(eq(safetyProgrammeRecords.id, recordId));
+        return next;
       });
-      await app.db
-        .update(safetyProgrammeRecords)
-        .set({
-          acknowledgements: acks,
-          acknowledgementCount: acks.length,
-          updatedAt: new Date().toISOString(),
-        })
-        .where(eq(safetyProgrammeRecords.id, recordId));
       await appendLedger(app.db, {
         companyId: req.companyId!,
         projectId: row.projectId,
@@ -6175,6 +6211,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     let missed = 0;
     let outstandingDuties = 0;
     let missedDuties = 0;
+    let deadlineUnknownDuties = 0;
     const missedRefs: Array<{ id: string; reference: string; regimes: string[] }> = [];
     const awaitingRefs: Array<{ id: string; reference: string; regimes: string[] }> = [];
     const reviewRefs: Array<{ id: string; reference: string }> = [];
@@ -6188,6 +6225,10 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       const rowOutstanding = state.duties.filter((d) => d.state === "outstanding");
       missedDuties += rowMissed.length;
       outstandingDuties += rowOutstanding.length;
+      deadlineUnknownDuties += state.duties.filter((d) => d.state === "deadline_unknown").length;
+      if (state.needsReview.length > 0 && !reviewRefs.some((r) => r.id === row.id)) {
+        reviewRefs.push({ id: row.id, reference: row.reference });
+      }
       if (rowMissed.length > 0) {
         missed += 1;
         missedRefs.push({
@@ -6213,6 +6254,8 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       missedNotification: missed,
       outstandingDuties,
       missedDuties,
+      /** duties owed whose deadline the record cannot establish — reassess */
+      deadlineUnknownDuties,
       needsHumanReview: reviewRefs.length,
       missedRefs,
       awaitingRefs,
@@ -9485,24 +9528,43 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
         );
       }
       const now = new Date().toISOString();
-      const existingFactors = [...(row.contributingFactors as unknown[])];
-      for (const f of factors) {
-        existingFactors.push({
-          factor: f.factor,
-          category: f.category,
-          note: f.note ?? null,
-          sourceIds: f.sourceIds ?? [],
-          proposedBy: "incident_investigation_assistant",
-          agentRunId: body.runId,
-          acceptedBy: req.user!.id,
-          acceptedAt: now,
-        });
-      }
+      /* Read-modify-write of a jsonb array under a row lock: two investigators
+       * accepting from two runs at once would otherwise leave one set of
+       * contributing factors — and its provenance — overwritten. */
       if (factors.length > 0) {
-        await app.db
-          .update(safetyIncidents)
-          .set({ contributingFactors: existingFactors, updatedAt: now })
-          .where(eq(safetyIncidents.id, incidentId));
+        await app.db.transaction(async (tx) => {
+          const locked = (
+            await tx
+              .select({ contributingFactors: safetyIncidents.contributingFactors })
+              .from(safetyIncidents)
+              .where(
+                and(
+                  eq(safetyIncidents.id, incidentId),
+                  eq(safetyIncidents.companyId, req.companyId!),
+                  eq(safetyIncidents.projectId, req.projectId!),
+                ),
+              )
+              .for("update")
+          )[0];
+          if (!locked) throw notFound("Incident not found");
+          const next = [...((locked.contributingFactors ?? []) as unknown[])];
+          for (const f of factors) {
+            next.push({
+              factor: f.factor,
+              category: f.category,
+              note: f.note ?? null,
+              sourceIds: f.sourceIds ?? [],
+              proposedBy: "incident_investigation_assistant",
+              agentRunId: body.runId,
+              acceptedBy: req.user!.id,
+              acceptedAt: now,
+            });
+          }
+          await tx
+            .update(safetyIncidents)
+            .set({ contributingFactors: next, updatedAt: now })
+            .where(eq(safetyIncidents.id, incidentId));
+        });
       }
 
       const created: Array<{ id: string; title: string; hierarchyOfControl: string }> = [];

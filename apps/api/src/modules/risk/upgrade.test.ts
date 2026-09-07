@@ -11,7 +11,15 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, eq } from "drizzle-orm";
-import { companyMemberships, contingencyDrawdowns, projects, signals } from "@constructos/db";
+import {
+  companyMemberships,
+  contingencies,
+  contingencyDrawdowns,
+  projectMemberships,
+  projects,
+  signals,
+  simulationJobs,
+} from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
 import { newId } from "../../lib/ids.js";
 import { addDaysISO, todayISO } from "../field/dates.js";
@@ -737,6 +745,160 @@ describe("risk health inputs", () => {
     expect(filled.metrics["openRisks"]).toBe(1);
     expect(filled.metrics["quantifiedRisks"]).toBe(1);
     expect(filled.metrics["appetiteBreaches"]).toBeNull();
+  });
+
+  it("REGRESSION: refuses a cover percentage derived from a cross-currency sum", async () => {
+    const pid = await makeProject("Two-currency cover");
+    const gbp = await createContingency(pid, { name: "GBP pot", amount: 1_000_000, currency: "GBP" });
+    const eur = await createContingency(pid, { name: "EUR pot", amount: 100_000, currency: "EUR" });
+    // The EUR pot is 90% gone; the GBP pot is untouched. A single percentage
+    // over the raw amounts reads 91.8% remaining and hides the exhausted pot.
+    await post(`/projects/${pid}/contingencies/${eur.id as string}/drawdowns`, {
+      amount: 90_000,
+      reason: "EUR spend",
+      drawnAt: todayISO(),
+    });
+    const body = (await get(`/projects/${pid}/risk/health-inputs`)).json() as {
+      metrics: Record<string, number | null>;
+      reasons: string[];
+    };
+    expect(body.metrics["contingencyRemainingPercent"]).toBeNull();
+    expect(body.reasons.join(" ")).toMatch(/cross-currency/i);
+    expect(body.reasons.join(" ")).toContain("EUR");
+
+    // With one currency the metric comes back, so the null above is the
+    // currency rule and not an empty register.
+    await app.db.delete(contingencies).where(eq(contingencies.id, eur.id as string));
+    const single = (await get(`/projects/${pid}/risk/health-inputs`)).json() as {
+      metrics: Record<string, number | null>;
+    };
+    expect(single.metrics["contingencyRemainingPercent"]).toBe(100);
+    expect(gbp.id).toBeTruthy();
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Simulation execution discipline (verifier regressions)              */
+/* ------------------------------------------------------------------ */
+
+describe("simulation execution discipline", () => {
+  it("REGRESSION: the reproducibility rerun is a standard-level write, not a read-gated CPU burn", async () => {
+    const pid = await makeProject("Rerun gate");
+    await createQuantifiedRisk(pid);
+    const sync = await post(`/projects/${pid}/risk/simulations/qcra`, {
+      iterations: 500,
+      seed: 11,
+    });
+    expect(sync.statusCode).toBe(201);
+    const simId = (sync.json() as Json).simulationId as string;
+
+    // A read-only member can READ the simulation …
+    const reader = await registerActor(app);
+    await app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: reader.userId,
+      role: "member",
+    });
+    await app.db.insert(projectMemberships).values({
+      id: newId("pm"),
+      companyId: owner.companyId,
+      projectId: pid,
+      userId: reader.userId,
+      templateKey: "read_only",
+    });
+    const readerHeaders = {
+      authorization: reader.headers["authorization"]!,
+      "x-company-id": owner.companyId,
+    };
+    const read = await get(`/projects/${pid}/risk-simulations/${simId}`, readerHeaders);
+    expect(read.statusCode).toBe(200);
+
+    // … but cannot make the process run a fresh Monte Carlo. The rerun is a
+    // full simulation; on readGate a read-only auditor could trigger N of
+    // them concurrently, which is the very thing the job queue exists to stop.
+    const rerunAsReader = await post(
+      `/projects/${pid}/risk-simulations/${simId}/rerun`,
+      undefined,
+      readerHeaders,
+    );
+    expect(rerunAsReader.statusCode).toBe(403);
+
+    const rerun = await post(`/projects/${pid}/risk-simulations/${simId}/rerun`);
+    expect(rerun.statusCode).toBe(200);
+    const body = rerun.json() as Json;
+    expect(body.reproduced).toBe(true);
+    expect(body.expected).toEqual(body.actual);
+  });
+
+  it("REGRESSION: concurrent reruns are serialised by the simulation queue and still reproduce", async () => {
+    const pid = await makeProject("Rerun concurrency");
+    await createQuantifiedRisk(pid);
+    const simId = (
+      (
+        await post(`/projects/${pid}/risk/simulations/qcra`, { iterations: 500, seed: 5 })
+      ).json() as Json
+    ).simulationId as string;
+
+    // Five at once: without the queue these each allocate their own sample
+    // arrays and interleave; through it they run one at a time and every
+    // answer still matches the stored percentiles.
+    const results = await Promise.all(
+      Array.from({ length: 5 }, () =>
+        post(`/projects/${pid}/risk-simulations/${simId}/rerun`),
+      ),
+    );
+    for (const res of results) {
+      expect(res.statusCode).toBe(200);
+      expect((res.json() as Json).reproduced).toBe(true);
+    }
+  });
+
+  it("REGRESSION: draining the queue runs only the caller's company's jobs", async () => {
+    // Company B has a job sitting in the queue. It is inserted directly so
+    // nothing kicks the process-wide queue: the question under test is what
+    // ANOTHER tenant's drain does to it.
+    const otherOwner = await registerActor(app);
+    const otherPid = newId("prj");
+    await app.db.insert(projects).values({
+      id: otherPid,
+      companyId: otherOwner.companyId,
+      name: "Other company sim",
+    });
+    const theirJobId = newId("sjb");
+    await app.db.insert(simulationJobs).values({
+      id: theirJobId,
+      companyId: otherOwner.companyId,
+      projectId: otherPid,
+      kind: "qcra",
+      status: "queued",
+      params: {
+        kind: "qcra",
+        riskIds: [],
+        risks: [
+          {
+            id: "r1",
+            name: "Their risk",
+            probability: 0.5,
+            impact: { kind: "triangular", min: 1000, mode: 2000, max: 3000 },
+          },
+        ],
+      },
+      seed: 3,
+      iterations: 500,
+      requestedBy: otherOwner.userId,
+    });
+
+    // Company A drains: it must neither run nor count company B's work.
+    const pid = await makeProject("Own drain");
+    const drained = await post(`/projects/${pid}/risk/simulation-jobs/run`);
+    expect(drained.statusCode).toBe(200);
+    expect((drained.json() as { ran: number }).ran).toBe(0);
+
+    const still = (
+      await app.db.select().from(simulationJobs).where(eq(simulationJobs.id, theirJobId))
+    )[0]!;
+    expect(still.status).toBe("queued");
   });
 });
 

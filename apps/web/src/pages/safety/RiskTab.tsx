@@ -48,8 +48,11 @@ import {
   isoDate,
   labelize,
   useMutation,
+  useProjectNames,
   useResource,
+  type CompanyScorecardResponse,
   type RiskIndex,
+  type ScorecardPublishResult,
   type ScorecardResponse,
   type UnderReportingResult,
   type VendorScorecard,
@@ -91,6 +94,20 @@ export default function RiskTab({
     [projectId, version, localVersion],
     projectId !== "",
   );
+
+  /* The company roll-up is the figure a prequalification team holds beside the
+   * questionnaire answers, and it is scoped server-side to the projects the
+   * caller is on unless they are an owner or admin. */
+  const companyScorecards = useResource<CompanyScorecardResponse>(
+    (signal) =>
+      api.get<CompanyScorecardResponse>(`/api/v1/companies/current/safety/vendor-scorecard`, {
+        signal,
+      }),
+    [version, localVersion],
+    true,
+  );
+  const [publishResult, setPublishResult] = useState<ScorecardPublishResult | null>(null);
+  const projectNames = useProjectNames();
 
   const mutation = useMutation(() => {
     setLocalVersion((n) => n + 1);
@@ -319,11 +336,101 @@ export default function RiskTab({
           )
         ) : null}
       </section>
+
+      {/* ---------------------------------------------------------------- */}
+      <section className="space-y-3">
+        <SectionHeading
+          title="The same suppliers, across every project you can see"
+          hint="A supplier's record on one job is a small sample. This is the roll-up a bid evaluation should read — and publishing it writes it onto their live prequalification submission so the evaluator does not have to know it exists."
+          actions={
+            <Button
+              size="xs"
+              variant="secondary"
+              loading={mutation.busy === "publish"}
+              onClick={() =>
+                void mutation.run(
+                  "publish",
+                  "The observed record could not be published",
+                  async () => {
+                    const res = await api.post<ScorecardPublishResult>(
+                      `/api/v1/companies/current/safety/vendor-scorecard/publish`,
+                      {},
+                    );
+                    setPublishResult(res);
+                  },
+                )
+              }
+            >
+              Publish to prequalification
+            </Button>
+          }
+        />
+        {mutation.refusal ? (
+          <RefusalNotice refusal={mutation.refusal} onDismiss={mutation.clear} />
+        ) : null}
+
+        {publishResult ? (
+          <Alert
+            tone={publishResult.published.length > 0 ? "success" : "info"}
+            title={`${count(publishResult.published.length)} supplier record(s) published`}
+            onDismiss={() => setPublishResult(null)}
+          >
+            <p>
+              Written onto each vendor's live prequalification submission as an OBSERVED record,
+              clearly separated from the assessed answers. No assessor's score was altered.
+            </p>
+            {publishResult.skipped.length > 0 ? (
+              <ReasonList
+                className="mt-2"
+                reasons={publishResult.skipped.map((s) => `${s.vendorId}: ${s.reason}`)}
+              />
+            ) : null}
+          </Alert>
+        ) : null}
+
+        {companyScorecards.error ? (
+          <LoadError
+            message={companyScorecards.error}
+            onRetry={companyScorecards.reload}
+            title="The company roll-up could not be computed"
+          />
+        ) : companyScorecards.loading && !companyScorecards.data ? (
+          <Skeleton height={180} />
+        ) : companyScorecards.data ? (
+          <div className="space-y-2">
+            <p className="text-2xs text-content-muted">
+              {companyScorecards.data.scope.all
+                ? "Every project in the company."
+                : `Scoped to the ${count(companyScorecards.data.scope.projects ?? 0)} project(s) you are a member of — one scorecard per project, not a company total.`}{" "}
+              {companyScorecards.data.note}
+            </p>
+            {companyScorecards.data.scorecards.length === 0 ? (
+              <Alert tone="info" size="sm" title="No supplier appears in these registers">
+                <ReasonList reasons={companyScorecards.data.reasons} />
+              </Alert>
+            ) : (
+              <ScorecardTable
+                scorecards={companyScorecards.data.scorecards}
+                projectNames={projectNames}
+              />
+            )}
+          </div>
+        ) : null}
+      </section>
     </div>
   );
 }
 
-function ScorecardTable({ scorecards }: { scorecards: VendorScorecard[] }) {
+const rowKey = (row: VendorScorecard): string => `${row.vendorId}:${row.projectId ?? "company"}`;
+
+function ScorecardTable({
+  scorecards,
+  projectNames,
+}: {
+  scorecards: VendorScorecard[];
+  /** supplied on the company roll-up, where one vendor has a row per project */
+  projectNames?: Map<string, string>;
+}) {
   const [openVendor, setOpenVendor] = useState<string | null>(null);
   const columns: DataColumns<VendorScorecard> = [
     {
@@ -334,6 +441,19 @@ function ScorecardTable({ scorecards }: { scorecards: VendorScorecard[] }) {
       sticky: "start",
       width: 220,
     },
+    ...(projectNames
+      ? ([
+          {
+            id: "project",
+            header: "Project",
+            accessor: (row: VendorScorecard) =>
+              row.projectId ? (projectNames.get(row.projectId) ?? row.projectId) : "Whole company",
+            type: "text" as const,
+            width: 200,
+            groupable: true,
+          },
+        ] as DataColumns<VendorScorecard>)
+      : []),
     {
       id: "grade",
       header: "Grade",
@@ -405,15 +525,15 @@ function ScorecardTable({ scorecards }: { scorecards: VendorScorecard[] }) {
     },
   ];
 
-  const open = scorecards.find((s) => s.vendorId === openVendor) ?? null;
+  const open = scorecards.find((s) => rowKey(s) === openVendor) ?? null;
 
   return (
     <div className="space-y-2">
       <DataTable
         data={scorecards}
         columns={columns}
-        getRowId={(row) => row.vendorId}
-        onRowClick={({ row }) => setOpenVendor(row.vendorId === openVendor ? null : row.vendorId)}
+        getRowId={(row) => rowKey(row)}
+        onRowClick={({ row }) => setOpenVendor(rowKey(row) === openVendor ? null : rowKey(row))}
         empty={{ icon: IconVendor, title: "No supplier record" }}
         aria-label="Subcontractor safety scorecards"
       />

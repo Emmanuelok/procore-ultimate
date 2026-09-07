@@ -122,6 +122,8 @@ export default function DevicesTab({
   filters,
   onFilters,
   users,
+  incidents,
+  observations,
   onMutated,
 }: {
   projectId: string;
@@ -129,6 +131,9 @@ export default function DevicesTab({
   filters: DeviceFilters;
   onFilters: (next: DeviceFilters) => void;
   users: Map<string, string>;
+  /** the registers an alarm can be linked to, for the drawer's link control */
+  incidents: Array<{ id: string; reference: string; title: string }>;
+  observations: Array<{ id: string; reference: string; title: string }>;
   onMutated: () => void;
 }) {
   const rows = events.data?.items ?? [];
@@ -375,6 +380,8 @@ export default function DevicesTab({
         projectId={projectId}
         eventId={openId}
         users={users}
+        incidents={incidents}
+        observations={observations}
         onClose={() => setOpenId(null)}
         onMutated={onMutated}
       />
@@ -400,12 +407,16 @@ function AlarmDrawer({
   projectId,
   eventId,
   users,
+  incidents,
+  observations,
   onClose,
   onMutated,
 }: {
   projectId: string;
   eventId: string | null;
   users: Map<string, string>;
+  incidents: Array<{ id: string; reference: string; title: string }>;
+  observations: Array<{ id: string; reference: string; title: string }>;
   onClose: () => void;
   onMutated: () => void;
 }) {
@@ -414,6 +425,8 @@ function AlarmDrawer({
   const [outcome, setOutcome] = useState("");
   const [resolveStatus, setResolveStatus] = useState("resolved");
   const [observationTitle, setObservationTitle] = useState("");
+  const [linkKind, setLinkKind] = useState<"incident" | "observation">("incident");
+  const [linkId, setLinkId] = useState("");
 
   const detail = useResource<SensorEventDetail>(
     (signal) =>
@@ -603,6 +616,77 @@ function AlarmDrawer({
               </Card>
             </section>
           ) : null}
+
+          <section>
+            <SectionHeading
+              title="Link it to a record that already exists"
+              hint="An alarm and the incident it belongs to are two different records: the alarm is what a device measured, the incident is what a human determined. Linking says they are about the same event without collapsing one into the other."
+            />
+            <Card>
+              <CardBody className="space-y-2">
+                {alarm.incidentId ? (
+                  <Alert tone="info" size="sm" title="Linked to an incident">
+                    <span className="font-mono text-2xs">{alarm.incidentId}</span>
+                  </Alert>
+                ) : null}
+                {alarm.observationId ? (
+                  <Alert tone="info" size="sm" title="Linked to an observation">
+                    <span className="font-mono text-2xs">{alarm.observationId}</span>
+                  </Alert>
+                ) : null}
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <Field label="Register">
+                    <Select
+                      value={linkKind}
+                      onChange={(e) => {
+                        setLinkKind(e.target.value === "observation" ? "observation" : "incident");
+                        setLinkId("");
+                      }}
+                    >
+                      <option value="incident">Incident</option>
+                      <option value="observation">Observation</option>
+                    </Select>
+                  </Field>
+                  <Field
+                    label={linkKind === "incident" ? "Incident" : "Observation"}
+                    hint={
+                      (linkKind === "incident" ? incidents : observations).length === 0
+                        ? "Nothing is loaded in that register on the current page of the workspace."
+                        : undefined
+                    }
+                  >
+                    <Select value={linkId} onChange={(e) => setLinkId(e.target.value)}>
+                      <option value="">Choose one</option>
+                      {(linkKind === "incident" ? incidents : observations).map((r) => (
+                        <option key={r.id} value={r.id}>
+                          {r.reference} — {r.title}
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={linkId === ""}
+                  loading={mutation.busy === "link"}
+                  onClick={() =>
+                    void mutation.run("link", "That link could not be recorded", async () => {
+                      await api.post(
+                        `/api/v1/projects/${projectId}/safety/sensor-events/${alarm.id}/link`,
+                        linkKind === "incident"
+                          ? { incidentId: linkId }
+                          : { observationId: linkId },
+                      );
+                      setLinkId("");
+                    })
+                  }
+                >
+                  Link it
+                </Button>
+              </CardBody>
+            </Card>
+          </section>
 
           <section>
             <SectionHeading

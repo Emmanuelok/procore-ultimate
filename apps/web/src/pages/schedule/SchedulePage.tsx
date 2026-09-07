@@ -25,7 +25,7 @@ import {
   type KeyboardEvent,
 } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
-import { DEPENDENCY_TYPES, TASK_CONSTRAINT_TYPES } from "@constructos/shared";
+import { DEPENDENCY_TYPES, SCHEDULE_TASK_TYPES, TASK_CONSTRAINT_TYPES } from "@constructos/shared";
 import { api, ApiClientError } from "../../lib/api";
 import {
   Badge,
@@ -56,6 +56,7 @@ import {
   ResourcesPanel,
   RevisionsPanel,
 } from "./ProgrammePanels";
+import { useTaskOptions, type OptionList, type TaskOptions } from "./taskOptions";
 import {
   shortDate,
   type BaselineDetail,
@@ -205,13 +206,63 @@ function InlineNumber({
 /* Expanded task row — constraint + actual dates, draft with Save      */
 /* ------------------------------------------------------------------ */
 
+function OptionSelect({
+  label,
+  hint,
+  value,
+  options,
+  placeholder,
+  onChange,
+}: {
+  label: string;
+  hint?: string;
+  value: string;
+  options: OptionList;
+  placeholder: string;
+  onChange: (next: string) => void;
+}) {
+  /* A value the record still holds but the list no longer offers must remain
+     visible — otherwise saving the form would silently clear it. */
+  const missing = value !== "" && !options.items.some((o) => o.id === value);
+  return (
+    <Field label={label} hint={hint}>
+      <Select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="py-1.5 text-xs"
+        disabled={options.loading}
+      >
+        <option value="">{options.loading ? "Loading…" : placeholder}</option>
+        {options.items.map((o) => (
+          <option key={o.id} value={o.id}>
+            {o.label}
+          </option>
+        ))}
+        {missing ? <option value={value}>{value} (no longer listed)</option> : null}
+      </Select>
+      {options.reason ? <p className="mt-0.5 text-[11px] text-ink-400">{options.reason}</p> : null}
+    </Field>
+  );
+}
+
+/**
+ * Everything about one activity that is not editable inline on the row.
+ * Every field here is validated server-side against a real record, so the form
+ * offers the real records: #360 responsible (a company member) and location (a
+ * project location), #361 remaining duration, #362 key milestone + contractual
+ * date, #363-366 the work calendar the activity is scheduled on, #370 the cost
+ * basis (budget line, budgeted cost and hours) that earned value and the
+ * earned-value disruption method read.
+ */
 function TaskDetailsEditor({
   task,
   busy,
+  options,
   onSave,
 }: {
   task: TaskRow;
   busy: boolean;
+  options: TaskOptions;
   onSave: (patch: Record<string, unknown>) => Promise<boolean>;
 }) {
   const [constraintType, setConstraintType] = useState(task.constraintType ?? "");
@@ -220,6 +271,24 @@ function TaskDetailsEditor({
   const [actualFinish, setActualFinish] = useState(task.actualFinish ?? "");
   const [isKeyMilestone, setIsKeyMilestone] = useState(task.isKeyMilestone === 1);
   const [contractualDate, setContractualDate] = useState(task.contractualDate ?? "");
+  const [taskType, setTaskType] = useState(task.taskType ?? "task");
+  const [responsibleId, setResponsibleId] = useState(task.responsibleId ?? "");
+  const [locationId, setLocationId] = useState(task.locationId ?? "");
+  const [calendarId, setCalendarId] = useState(task.calendarId ?? "");
+  const [remaining, setRemaining] = useState(
+    task.remainingDurationDays === null || task.remainingDurationDays === undefined
+      ? ""
+      : String(task.remainingDurationDays),
+  );
+  const [wbsPath, setWbsPath] = useState(task.wbsPath ?? "");
+  const [budgetLineItemId, setBudgetLineItemId] = useState(task.budgetLineItemId ?? "");
+  const [budgetedCost, setBudgetedCost] = useState(
+    task.budgetedCost === null || task.budgetedCost === undefined ? "" : String(task.budgetedCost),
+  );
+  const [budgetedHours, setBudgetedHours] = useState(
+    task.budgetedHours === null || task.budgetedHours === undefined ? "" : String(task.budgetedHours),
+  );
+  const [notes, setNotes] = useState(task.notes ?? "");
   const [localError, setLocalError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -229,16 +298,58 @@ function TaskDetailsEditor({
     setActualFinish(task.actualFinish ?? "");
     setIsKeyMilestone(task.isKeyMilestone === 1);
     setContractualDate(task.contractualDate ?? "");
+    setTaskType(task.taskType ?? "task");
+    setResponsibleId(task.responsibleId ?? "");
+    setLocationId(task.locationId ?? "");
+    setCalendarId(task.calendarId ?? "");
+    setRemaining(
+      task.remainingDurationDays === null || task.remainingDurationDays === undefined
+        ? ""
+        : String(task.remainingDurationDays),
+    );
+    setWbsPath(task.wbsPath ?? "");
+    setBudgetLineItemId(task.budgetLineItemId ?? "");
+    setBudgetedCost(
+      task.budgetedCost === null || task.budgetedCost === undefined ? "" : String(task.budgetedCost),
+    );
+    setBudgetedHours(
+      task.budgetedHours === null || task.budgetedHours === undefined
+        ? ""
+        : String(task.budgetedHours),
+    );
+    setNotes(task.notes ?? "");
     setLocalError(null);
   }, [task]);
 
+  const numText = (n: number | null | undefined) => (n === null || n === undefined ? "" : String(n));
   const dirty =
     constraintType !== (task.constraintType ?? "") ||
     constraintDate !== (task.constraintDate ?? "") ||
     actualStart !== (task.actualStart ?? "") ||
     actualFinish !== (task.actualFinish ?? "") ||
     isKeyMilestone !== (task.isKeyMilestone === 1) ||
-    contractualDate !== (task.contractualDate ?? "");
+    contractualDate !== (task.contractualDate ?? "") ||
+    taskType !== (task.taskType ?? "task") ||
+    responsibleId !== (task.responsibleId ?? "") ||
+    locationId !== (task.locationId ?? "") ||
+    calendarId !== (task.calendarId ?? "") ||
+    remaining !== numText(task.remainingDurationDays) ||
+    wbsPath !== (task.wbsPath ?? "") ||
+    budgetLineItemId !== (task.budgetLineItemId ?? "") ||
+    budgetedCost !== numText(task.budgetedCost) ||
+    budgetedHours !== numText(task.budgetedHours) ||
+    notes !== (task.notes ?? "");
+
+  /** "" → null (clear the field); a non-number is refused, never sent as 0. */
+  function numberOrNull(raw: string, label: string): number | null | undefined {
+    if (raw.trim() === "") return null;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0) {
+      setLocalError(`${label} must be a number of 0 or more.`);
+      return undefined;
+    }
+    return n;
+  }
 
   async function save() {
     setLocalError(null);
@@ -258,6 +369,17 @@ function TaskDetailsEditor({
       setLocalError("Only a key milestone carries a contractual date — tick “Key milestone” first.");
       return;
     }
+    const remainingValue = numberOrNull(remaining, "Remaining duration");
+    if (remainingValue === undefined) return;
+    if (remainingValue !== null && !Number.isInteger(remainingValue)) {
+      setLocalError("Remaining duration is a whole number of working days.");
+      return;
+    }
+    const costValue = numberOrNull(budgetedCost, "Budgeted cost");
+    if (costValue === undefined) return;
+    const hoursValue = numberOrNull(budgetedHours, "Budgeted hours");
+    if (hoursValue === undefined) return;
+
     await onSave({
       constraintType: constraintType || null,
       constraintDate: constraintType && constraintDate ? constraintDate : null,
@@ -265,13 +387,26 @@ function TaskDetailsEditor({
       actualFinish: actualFinish || null,
       isKeyMilestone,
       contractualDate: isKeyMilestone && contractualDate ? contractualDate : null,
+      taskType,
+      responsibleId: responsibleId || null,
+      locationId: locationId || null,
+      calendarId: calendarId || null,
+      remainingDurationDays: remainingValue,
+      wbsPath: wbsPath.trim() === "" ? null : wbsPath.trim(),
+      budgetLineItemId: budgetLineItemId || null,
+      budgetedCost: costValue,
+      budgetedHours: hoursValue,
+      notes: notes.trim() === "" ? null : notes.trim(),
     });
   }
 
+  const currency = options.budgetCurrency;
   return (
-    <div className="space-y-2 bg-ink-50/70 px-4 py-3">
+    <div className="space-y-3 bg-ink-50/70 px-4 py-3">
       {localError ? <div className="text-xs text-red-600">{localError}</div> : null}
-      <div className="grid grid-cols-2 items-end gap-3 lg:grid-cols-4 xl:grid-cols-7">
+
+      {/* dates, constraints and the milestone pair */}
+      <div className="grid grid-cols-2 items-end gap-3 lg:grid-cols-4 xl:grid-cols-6">
         <Field label="Constraint">
           <Select
             value={constraintType}
@@ -330,17 +465,128 @@ function TaskDetailsEditor({
             disabled={!isKeyMilestone}
           />
         </Field>
-        <div className="flex items-center gap-2 pb-0.5">
-          <Button size="sm" disabled={busy || !dirty} onClick={() => void save()}>
-            Save details
-          </Button>
+      </div>
+
+      {/* assignment, calendar, remaining duration and activity type */}
+      <div className="grid grid-cols-2 items-start gap-3 lg:grid-cols-4 xl:grid-cols-6">
+        <OptionSelect
+          label="Responsible"
+          hint="#360 — drives the slip notification"
+          value={responsibleId}
+          options={options.users}
+          placeholder="Unassigned"
+          onChange={setResponsibleId}
+        />
+        <OptionSelect
+          label="Location"
+          hint="#360"
+          value={locationId}
+          options={options.locations}
+          placeholder="No location"
+          onChange={setLocationId}
+        />
+        <OptionSelect
+          label="Work calendar"
+          hint="#363-366 — blank uses the programme default"
+          value={calendarId}
+          options={options.calendars}
+          placeholder="Programme default"
+          onChange={setCalendarId}
+        />
+        <Field label="Remaining duration" hint="#361 — working days left from the data date">
+          <Input
+            type="number"
+            min={0}
+            value={remaining}
+            onChange={(e) => setRemaining(e.target.value)}
+            className="py-1.5 text-xs"
+            placeholder="from % complete"
+          />
+        </Field>
+        <Field label="Activity type">
+          <Select
+            value={taskType}
+            onChange={(e) => setTaskType(e.target.value)}
+            className="py-1.5 text-xs"
+          >
+            {SCHEDULE_TASK_TYPES.map((t) => (
+              <option key={t} value={t}>
+                {humanize(t)}
+              </option>
+            ))}
+          </Select>
+        </Field>
+        <Field label="WBS path" hint="Hierarchy from the imported programme">
+          <Input
+            value={wbsPath}
+            onChange={(e) => setWbsPath(e.target.value)}
+            className="py-1.5 text-xs"
+            placeholder="Substructure / Piling"
+          />
+        </Field>
+      </div>
+
+      {/* cost basis (#370) — what earned value and disruption read */}
+      <div className="grid grid-cols-2 items-start gap-3 lg:grid-cols-4 xl:grid-cols-6">
+        <div className="col-span-2">
+          <OptionSelect
+            label="Budget line"
+            hint="#370 — the cost basis for earned value"
+            value={budgetLineItemId}
+            options={options.budgetLines}
+            placeholder="Not mapped"
+            onChange={setBudgetLineItemId}
+          />
+        </div>
+        <Field
+          label={`Budgeted cost${currency ? ` (${currency})` : ""}`}
+          hint="Overrides the budget line for this activity"
+        >
+          <Input
+            type="number"
+            min={0}
+            step="0.01"
+            value={budgetedCost}
+            onChange={(e) => setBudgetedCost(e.target.value)}
+            className="py-1.5 text-xs"
+            placeholder="—"
+          />
+        </Field>
+        <Field label="Budgeted hours" hint="Earned-value disruption needs these">
+          <Input
+            type="number"
+            min={0}
+            step="0.5"
+            value={budgetedHours}
+            onChange={(e) => setBudgetedHours(e.target.value)}
+            className="py-1.5 text-xs"
+            placeholder="—"
+          />
+        </Field>
+        <div className="col-span-2">
+          <Field label="Notes">
+            <Input
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              className="py-1.5 text-xs"
+              placeholder="Planning assumption, method, sequence note…"
+            />
+          </Field>
         </div>
       </div>
-      <p className="text-[11px] text-ink-400">
-        Actuals pin the CPM pass — actual start pins the start, actual finish pins the finish and
-        overrides duration. Duration 0 renders as a milestone. A key milestone with a contractual
-        date is swept for slip and raises an attention signal when it moves past it (#362).
-      </p>
+
+      <div className="flex items-center gap-3">
+        <Button size="sm" disabled={busy || !dirty} onClick={() => void save()}>
+          Save details
+        </Button>
+        <p className="text-[11px] text-ink-400">
+          Actuals pin the CPM pass — actual start pins the start, actual finish pins the finish and
+          overrides duration. Duration 0 renders as a milestone. A key milestone with a contractual
+          date is swept for slip and raises an attention signal when it moves past it (#362). An
+          activity with no budget line, budgeted cost or resource cost is left out of earned value
+          rather than counted as zero.
+        </p>
+      </div>
     </div>
   );
 }
@@ -491,7 +737,15 @@ export default function SchedulePage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [schedName, setSchedName] = useState("");
   const [schedStart, setSchedStart] = useState("");
+  const [schedDataDate, setSchedDataDate] = useState("");
   const [modalError, setModalError] = useState<string | null>(null);
+
+  // schedule settings modal (#361 data date, #363-366 default calendar)
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsName, setSettingsName] = useState("");
+  const [settingsStart, setSettingsStart] = useState("");
+  const [settingsDataDate, setSettingsDataDate] = useState("");
+  const [settingsCalendarId, setSettingsCalendarId] = useState("");
 
   // capture-baseline modal
   const [baselineOpen, setBaselineOpen] = useState(false);
@@ -533,6 +787,9 @@ export default function SchedulePage() {
   const [qualityBaselineId, setQualityBaselineId] = useState("");
 
   const bump = useCallback(() => setVersion((v) => v + 1), []);
+
+  /** Real records behind responsible / location / calendar / budget line. */
+  const taskOptions = useTaskOptions(base, projectId, version);
 
   /* ------------------------------ loading ------------------------------ */
 
@@ -784,14 +1041,46 @@ export default function SchedulePage() {
       const created = await api.post<ScheduleRow>(`${base}/schedules`, {
         name: schedName.trim(),
         projectStart: schedStart,
+        dataDate: schedDataDate === "" ? null : schedDataDate,
       });
       setCreateOpen(false);
       setSchedName("");
       setSchedStart("");
+      setSchedDataDate("");
       setSelectedId(created.id);
       bump();
     } catch (err) {
       setModalError(errMessage(err, "Failed to create the schedule."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /**
+   * #351 rename / #361 data date / #363-366 default calendar. Nothing in the
+   * product used to reach PATCH /schedules/:id, so a programme built here
+   * (rather than imported) could never be given a data date — which left the
+   * DCMA data-date checks and BEI permanently "could not run", and CPM2's
+   * data-date pinning and remaining-duration forecasting never engaged.
+   * Moving day 0, the data date or the calendar recomputes server-side.
+   */
+  async function onSaveSettings(e: FormEvent) {
+    e.preventDefault();
+    if (!selectedId) return;
+    setModalError(null);
+    setBusy(true);
+    try {
+      await api.patch<ScheduleRow>(`${base}/schedules/${selectedId}`, {
+        name: settingsName.trim(),
+        projectStart: settingsStart,
+        dataDate: settingsDataDate === "" ? null : settingsDataDate,
+        defaultCalendarId: settingsCalendarId === "" ? null : settingsCalendarId,
+      });
+      setSettingsOpen(false);
+      bump();
+      flashRecomputed();
+    } catch (err) {
+      setModalError(errMessage(err, "Failed to save the schedule settings."));
     } finally {
       setBusy(false);
     }
@@ -995,6 +1284,21 @@ export default function SchedulePage() {
           <>
             {selectedId ? (
               <>
+                <Button
+                  variant="secondary"
+                  disabled={busy || !selectedSchedule}
+                  onClick={() => {
+                    if (!selectedSchedule) return;
+                    setModalError(null);
+                    setSettingsName(selectedSchedule.name);
+                    setSettingsStart(selectedSchedule.projectStart);
+                    setSettingsDataDate(selectedSchedule.dataDate ?? "");
+                    setSettingsCalendarId(selectedSchedule.defaultCalendarId ?? "");
+                    setSettingsOpen(true);
+                  }}
+                >
+                  Settings
+                </Button>
                 <Button variant="secondary" disabled={busy} onClick={() => void onRecompute()}>
                   Recompute
                 </Button>
@@ -1077,6 +1381,20 @@ export default function SchedulePage() {
                 <span className="rounded-full bg-white px-2.5 py-1 ring-1 ring-ink-200">
                   Finish <strong>{formatDate(detail.computedFinish)}</strong>
                 </span>
+                <span
+                  className={`rounded-full px-2.5 py-1 ring-1 ${
+                    detail.dataDate
+                      ? "bg-white ring-ink-200"
+                      : "bg-amber-50 text-amber-800 ring-amber-200"
+                  }`}
+                  title={
+                    detail.dataDate
+                      ? "Work before the data date is actual, after it is forecast"
+                      : "No data date is set — the DCMA data-date checks and the Baseline Execution Index cannot run, and remaining durations are not forecast from it. Set one in Settings."
+                  }
+                >
+                  Data date <strong>{detail.dataDate ? formatDate(detail.dataDate) : "not set"}</strong>
+                </span>
                 <span className="rounded-full bg-white px-2.5 py-1 ring-1 ring-ink-200">
                   <strong>{detail.computedDurationDays ?? "—"}</strong> days
                 </span>
@@ -1151,6 +1469,7 @@ export default function SchedulePage() {
                             selected={selectedTaskId === t.id}
                             expanded={expandedTaskId === t.id}
                             busy={busy}
+                            options={taskOptions}
                             onSelect={() => setSelectedTaskId(t.id)}
                             onToggleExpand={() =>
                               setExpandedTaskId((cur) => (cur === t.id ? null : t.id))
@@ -1746,12 +2065,90 @@ export default function SchedulePage() {
               onChange={(e) => setSchedStart(e.target.value)}
             />
           </Field>
+          <Field
+            label="Data date (optional)"
+            hint="Progress cut-off: work before it is actual, after it is forecast. Without one the DCMA data-date checks and the Baseline Execution Index cannot run."
+          >
+            <Input
+              type="date"
+              value={schedDataDate}
+              onChange={(e) => setSchedDataDate(e.target.value)}
+            />
+          </Field>
           <div className="flex justify-end gap-2">
             <Button variant="secondary" onClick={() => setCreateOpen(false)}>
               Cancel
             </Button>
             <Button type="submit" disabled={busy}>
               {busy ? "Creating…" : "Create schedule"}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+
+      <Modal
+        open={settingsOpen}
+        title="Schedule settings"
+        onClose={() => setSettingsOpen(false)}
+      >
+        <ErrorAlert message={modalError} />
+        <form onSubmit={onSaveSettings} className="space-y-4">
+          <Field label="Schedule name">
+            <Input
+              required
+              value={settingsName}
+              onChange={(e) => setSettingsName(e.target.value)}
+            />
+          </Field>
+          <Field
+            label="Project start (CPM day 0)"
+            hint="Moving day 0 recomputes every date on the programme."
+          >
+            <Input
+              required
+              type="date"
+              value={settingsStart}
+              onChange={(e) => setSettingsStart(e.target.value)}
+            />
+          </Field>
+          <Field
+            label="Data date"
+            hint="Progress cut-off (#361). It pins the forward pass, drives remaining-duration forecasting, and is what the DCMA invalid-dates check and the Baseline Execution Index measure against. Clear it to remove it."
+          >
+            <Input
+              type="date"
+              value={settingsDataDate}
+              onChange={(e) => setSettingsDataDate(e.target.value)}
+            />
+          </Field>
+          <Field
+            label="Default work calendar"
+            hint="Applied to every activity that does not name its own calendar (#363-366)."
+          >
+            <Select
+              value={settingsCalendarId}
+              onChange={(e) => setSettingsCalendarId(e.target.value)}
+              disabled={taskOptions.calendars.loading}
+            >
+              <option value="">
+                {taskOptions.calendars.loading ? "Loading…" : "Platform default (Mon–Fri)"}
+              </option>
+              {taskOptions.calendars.items.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.label}
+                </option>
+              ))}
+            </Select>
+            {taskOptions.calendars.reason ? (
+              <p className="mt-0.5 text-[11px] text-ink-400">{taskOptions.calendars.reason}</p>
+            ) : null}
+          </Field>
+          <div className="flex justify-end gap-2">
+            <Button variant="secondary" onClick={() => setSettingsOpen(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={busy}>
+              {busy ? "Saving…" : "Save settings"}
             </Button>
           </div>
         </form>
@@ -1796,6 +2193,7 @@ function SchedTaskRow({
   selected,
   expanded,
   busy,
+  options,
   onSelect,
   onToggleExpand,
   onPatch,
@@ -1808,6 +2206,7 @@ function SchedTaskRow({
   selected: boolean;
   expanded: boolean;
   busy: boolean;
+  options: TaskOptions;
   onSelect: () => void;
   onToggleExpand: () => void;
   onPatch: (patch: Record<string, unknown>) => Promise<boolean>;
@@ -1956,7 +2355,7 @@ function SchedTaskRow({
       {expanded ? (
         <tr>
           <td colSpan={9} className="p-0">
-            <TaskDetailsEditor task={t} busy={busy} onSave={onPatch} />
+            <TaskDetailsEditor task={t} busy={busy} options={options} onSave={onPatch} />
           </td>
         </tr>
       ) : null}

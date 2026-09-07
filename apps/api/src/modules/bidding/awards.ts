@@ -722,6 +722,23 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
       );
 
       /*
+       * NOBODY CLEARS THE FINDING THAT STANDS IN THEIR OWN WAY.
+       *
+       * Dismissal now needs an integrity reviewer or a company admin, but the
+       * person recommending a winner may hold either. A finding this actor
+       * dispositioned away is therefore NOT treated as cleared for this
+       * actor's own recommendation: it comes back into the acknowledgement
+       * set, so the recommender still has to write down what was checked.
+       * Somebody else's dismissal clears it normally — that is the whole
+       * point of the separation.
+       */
+      const selfCleared = integritySignals.filter(
+        (sig) =>
+          (sig.disposition === "false_positive" || sig.disposition === "closed") &&
+          sig.reviewerId === req.user!.id,
+      );
+
+      /*
        * AN ABNORMALLY LOW BID CANNOT BE RECOMMENDED UNTIL IT HAS EXPLAINED
        * ITSELF. Public procurement everywhere requires the buyer to ASK, and
        * the asking is worthless unless the answer is on the record. The
@@ -755,7 +772,7 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
        * blocker: it is information about the field, and blocking on it would
        * teach people to dismiss findings to get their work done.
        */
-      const blocking = open.filter(
+      const blocking = [...open, ...selfCleared].filter(
         (sig) =>
           (sig.severity === "critical" || sig.severity === "high") &&
           !(
@@ -772,11 +789,20 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
             ". A finding is a question rather than an accusation, and the ordinary answer is an " +
             "innocent explanation — but the explanation has to exist somewhere, and afterwards " +
             "is too late. Supply integrityAcknowledgement saying what was checked and what was " +
-            "found.",
+            "found." +
+            (blocking.some((sig) => selfCleared.includes(sig))
+              ? " Note that " +
+                blocking.filter((sig) => selfCleared.includes(sig)).length +
+                " of these you dismissed yourself; a finding cleared by the person recommending " +
+                "the winner still has to be acknowledged by them here."
+              : ""),
           {
             control: "integrity_findings_require_acknowledgement",
             signalIds: blocking.map((sig) => sig.id),
             detectors: blocking.map((sig) => sig.detector),
+            selfClearedSignalIds: blocking
+              .filter((sig) => selfCleared.includes(sig))
+              .map((sig) => sig.id),
           },
         );
       }

@@ -451,6 +451,23 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
     "requiresOpeningWitness",
   ] as const;
 
+  /**
+   * A SECOND FREEZE, ON THE FIGURE THE ABNORMALITY TEST IS MEASURED AGAINST.
+   *
+   * `engineersEstimate` is not part of the evaluation basis, so it stays
+   * editable while the package is being prepared — that is the whole point of
+   * an estimate. The moment a price is in the room it becomes something else:
+   * on a field of fewer than three bids the abnormally-low control is
+   * measured against the ESTIMATE alone (integrity.ts picks the median only
+   * from three or more), so a standard user could PATCH the estimate
+   * downwards after the opening until the low bid was no longer -15% and the
+   * award route stopped demanding a justification. It also silently rewrites
+   * `savingAgainstEstimate` and the "against estimate" market tile after the
+   * fact. `currency` is frozen with it: changing it once amounts exist would
+   * relabel every recorded price.
+   */
+  const PRICED_BASIS_FIELDS = ["engineersEstimate", "currency"] as const;
+
   const ISSUED_STATUSES = [
     "invitations_sent",
     "open",
@@ -689,6 +706,21 @@ export const packageRoutes: FastifyPluginAsync = async (app) => {
        * lock on the same door.
        */
       const issued = ISSUED_STATUSES.includes(pkg.status) || bidsRecorded > 0;
+      if (bidsRecorded > 0) {
+        const touched = PRICED_BASIS_FIELDS.filter(
+          (f) => body[f] !== undefined && (body[f] ?? null) !== (pkg[f] ?? null),
+        );
+        if (touched.length > 0) {
+          throw conflict(
+            `${touched.join(" and ")} cannot be changed once bids have been recorded — ` +
+              `${bidsRecorded} bid(s) are on this package. The pre-tender estimate is what the ` +
+              "abnormally-low control is measured against on a field of fewer than three bids, " +
+              "and what every saving-against-estimate figure is computed from; moving it after " +
+              "the prices are in the room moves the control rather than the estimate. Record a " +
+              "revised estimate in the evaluation record instead.",
+          );
+        }
+      }
       if (issued) {
         const touched = BASIS_FIELDS.filter((f) => body[f] !== undefined);
         if (touched.length > 0) {

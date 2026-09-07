@@ -449,6 +449,7 @@ function TestCard({
   onMutated: () => void;
 }) {
   const { busy, refusal, clear, run } = useAction();
+  const { ask, dialog } = useReason();
   const [resultOpen, setResultOpen] = useState(false);
   const [witnessOpen, setWitnessOpen] = useState(false);
   const [result, setResult] = useState("pass");
@@ -488,6 +489,19 @@ function TestCard({
 
   async function accept() {
     const done = await run("accept", () => api.post(`${base}/accept`, {}));
+    if (done) onMutated();
+  }
+
+  async function retest() {
+    const reason = await ask({
+      title: `Raise a retest of ${test.reference}`,
+      description:
+        "The failed run stays on the record; the retest is a new one that names it. Say what was put right before it is run again — a retest with no intervention between is the same test twice.",
+      label: "What changed before the retest?",
+      confirmLabel: "Raise the retest",
+    });
+    if (!reason) return;
+    const done = await run("retest", () => api.post(`${base}/retest`, { reason }));
     if (done) onMutated();
   }
 
@@ -628,6 +642,21 @@ function TestCard({
           onClick={accept}
         >
           Accept
+        </Button>
+        {/*
+          A RETEST IS A NEW RECORD, not an edit of this one. The failed run
+          stays exactly as it was recorded — that is the history a witness
+          signed — and the retest carries its own instruments, readings and
+          signature, naming what it supersedes.
+        */}
+        <Button
+          size="sm"
+          variant="ghost"
+          loading={busy === "retest"}
+          disabled={test.result === null}
+          onClick={retest}
+        >
+          Raise a retest
         </Button>
       </div>
 

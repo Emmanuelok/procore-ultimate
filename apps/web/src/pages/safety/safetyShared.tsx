@@ -201,6 +201,12 @@ export interface IncidentNotification {
   duties: RegimeDutyState[];
   outstandingRegimes: string[];
   missedRegimes: string[];
+  /**
+   * Regimes owed but with no establishable deadline — a row written before the
+   * rules engine. Not a live clock and not discharged: reassess it, or close
+   * the incident with a recorded override.
+   */
+  needsReviewRegimes?: string[];
   allDischarged: boolean;
   reasons: string[];
 }
@@ -215,7 +221,13 @@ export interface RegimeDutyState {
   immediateNotificationRequired: boolean;
   notificationMethod: string | null;
   consequenceIfMissed: string | null;
-  state: "not_required" | "outstanding" | "notified" | "notified_late" | "missed";
+  state:
+    | "not_required"
+    | "outstanding"
+    | "notified"
+    | "notified_late"
+    | "missed"
+    | "deadline_unknown";
   notifiedAt: string | null;
   reference: string | null;
   method: string | null;
@@ -709,10 +721,17 @@ export interface StatutoryStanding {
   missedNotification: number;
   outstandingDuties: number;
   missedDuties: number;
+  /** duties owed whose deadline the record cannot establish */
+  deadlineUnknownDuties?: number;
   needsHumanReview: number;
   missedRefs: StatutoryRef[];
   awaitingRefs: StatutoryRef[];
   reviewRefs: StatutoryRef[];
+  /** how many open reportable incidents were read, and the cap that applied */
+  scanned?: number;
+  openReportableTotal?: number;
+  truncated?: boolean;
+  scope?: string;
   note: string;
 }
 
@@ -1168,6 +1187,78 @@ export function useVendors(): Map<string, string> {
     };
   }, []);
   return byId;
+}
+
+/** Project id → name, so a company-level roll-up names its rows. */
+export function useProjectNames(): Map<string, string> {
+  const [byId, setById] = useState<Map<string, string>>(() => new Map());
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .get<Paged<{ id: string; name: string }>>("/api/v1/projects?page=1&pageSize=200")
+      .then((res) => {
+        if (cancelled) return;
+        setById(new Map(res.items.map((p) => [p.id, p.name])));
+      })
+      .catch(() => {
+        /* names are a courtesy; ids still render */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return byId;
+}
+
+export interface WorkerRef {
+  id: string;
+  reference: string | null;
+  fullName: string;
+  trade: string | null;
+  vendorId: string | null;
+  status: string;
+}
+
+/**
+ * The project's worker register.
+ *
+ * Every personal safety record names a worker from the workforce register —
+ * an injury, a briefing attendance, a competency card, a drug or alcohol test
+ * result — and a form that asks for a `wkr_` id in a text box is a form that
+ * will be filled in wrongly. Read through the SAFETY route so a co-ordinator
+ * who may record an injury does not also need the workforce tool.
+ */
+export function useWorkers(projectId: string): {
+  workers: WorkerRef[];
+  loading: boolean;
+  error: string | null;
+} {
+  const [workers, setWorkers] = useState<WorkerRef[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!projectId) return;
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    api
+      .get<{ items: WorkerRef[] }>(`/api/v1/projects/${projectId}/safety/workers`)
+      .then((res) => {
+        if (cancelled) return;
+        setWorkers(res.items);
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setError(errorMessage(err, "The worker register could not be read"));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+  return { workers, loading, error };
 }
 
 /** Actor id → name, falling back to the id so a row is never blank. */
@@ -2233,3 +2324,103 @@ export const REGULATORY_STATUS_TONE: Record<string, Tone> = {
   superseded: "neutral",
   void: "neutral",
 };
+
+/* ================================================================== */
+/* The investigation assistant (Vol I §6.4, Vol II X #1017–1019)       */
+/* ================================================================== */
+
+export interface AssistRecordRef {
+  type: string;
+  id: string;
+  reference: string;
+  label: string;
+  summary: string;
+  occurredAt: string | null;
+}
+
+/** The deterministic assembly — no model in it, and it always answers. */
+export interface AssistContextResponse {
+  incidentId: string;
+  reference: string;
+  aiAvailable: boolean;
+  context: {
+    priorObservations: AssistRecordRef[];
+    priorIncidents: AssistRecordRef[];
+    inspections: AssistRecordRef[];
+    briefings: AssistRecordRef[];
+    openActions: AssistRecordRef[];
+    programmeRecords: AssistRecordRef[];
+    witnesses: Array<{ name: string; organisation: string | null; statement: string | null }>;
+    openQuestions: string[];
+  };
+  note: string;
+}
+
+export interface AssistCitation {
+  sourceIds: string[];
+  droppedIds: string[];
+  unsourced: boolean;
+}
+
+export interface AssistFactor extends AssistCitation {
+  factor: string;
+  category: "immediate" | "underlying" | "organisational";
+  note?: string | null;
+}
+
+export interface AssistHypothesis extends AssistCitation {
+  hypothesis: string;
+  rank?: number;
+  reasoning?: string | null;
+  testableBy?: string | null;
+}
+
+export interface AssistDraftAction extends AssistCitation {
+  title: string;
+  description?: string | null;
+  hierarchyOfControl: HierarchyOfControl | null;
+  hierarchyReason: string | null;
+  targetDays?: number;
+}
+
+export interface AssistBody {
+  contributingFactors: AssistFactor[];
+  rootCauseHypotheses: AssistHypothesis[];
+  openQuestions: Array<{ question: string; why?: string | null }>;
+  draftActions: AssistDraftAction[];
+  weakControlNote: string | null;
+  summary: string | null;
+  confidence: number | null;
+  droppedCitations: number;
+  onlyWeakControls: boolean;
+  notes: string[];
+}
+
+export interface AssistResponse {
+  available: boolean;
+  runId?: string;
+  incidentId?: string;
+  reference?: string;
+  assist: AssistBody | null;
+  reason?: string;
+  grounding?: unknown;
+  context?: { recordsOffered?: number; openQuestions?: string[] };
+  note?: string;
+}
+
+/* ================================================================== */
+/* The company supplier roll-up (#646/#661/#1100)                      */
+/* ================================================================== */
+
+export interface CompanyScorecardResponse extends ScorecardResponse {
+  companyId: string;
+  scope: { all: boolean; projects: number | null };
+}
+
+export interface ScorecardPublishResult {
+  from: string;
+  to: string;
+  published: Array<{ vendorId: string; submissionId: string; score: number | null }>;
+  skipped: Array<{ vendorId: string; reason: string }>;
+  scorecards: VendorScorecard[];
+}

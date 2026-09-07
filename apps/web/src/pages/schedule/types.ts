@@ -43,8 +43,11 @@ export interface TaskRow {
   contractualDate?: string | null;
   budgetedCost?: number | null;
   budgetedHours?: number | null;
+  budgetLineItemId?: string | null;
   responsibleId?: string | null;
   locationId?: string | null;
+  wbsPath?: string | null;
+  notes?: string | null;
 }
 
 export interface DepRow {

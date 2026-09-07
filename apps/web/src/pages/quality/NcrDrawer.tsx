@@ -171,6 +171,38 @@ function NcrBody({
     if (done) onMutated();
   }
 
+  /**
+   * SEND BACK is not a rejection of the non-conformance; it is a rejection of
+   * the DISPOSITION. It clears the proposal and the approval together, because
+   * an approval belongs to the disposition it approved.
+   */
+  async function sendBack() {
+    const reason = await ask({
+      title: `Send the disposition on ${ncr.reference} back`,
+      description:
+        "The proposal returns to under review and both signatures are cleared. Say what is wrong with it — the person re-proposing reads this and nothing else.",
+      label: "What needs rethinking?",
+      confirmLabel: "Send it back",
+    });
+    if (!reason) return;
+    const done = await run("send-back", () => api.post(`${base}/send-back`, { reason }));
+    if (done) onMutated();
+  }
+
+  async function voidNcr() {
+    const reason = await ask({
+      title: `Void ${ncr.reference}`,
+      description:
+        "Voiding says the non-conformance should never have been raised — a duplicate, a mistake, work that was compliant after all. It is not the same as closing it, and the register keeps the two apart.",
+      label: "Why was it raised in error?",
+      confirmLabel: "Void it",
+      destructive: true,
+    });
+    if (!reason) return;
+    const done = await run("void", () => api.post(`${base}/void`, { reason }));
+    if (done) onMutated();
+  }
+
   async function reopen() {
     const reason = await ask({
       title: `Reopen ${ncr.reference}`,
@@ -380,6 +412,19 @@ function NcrBody({
           >
             Decide on the proposal
           </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            loading={busy === "send-back"}
+            disabled={
+              !["disposition_proposed", "disposition_approved", "action_in_progress"].includes(
+                ncr.status,
+              )
+            }
+            onClick={sendBack}
+          >
+            Send the disposition back
+          </Button>
         </div>
       </section>
 
@@ -420,6 +465,7 @@ function NcrBody({
           </p>
         )}
         <ActionList actions={ncr.correctiveActions} users={users} />
+        <RaiseAction base={base} onDone={onMutated} />
       </section>
 
       {/* -------- closeout -------- */}
@@ -486,7 +532,43 @@ function NcrBody({
           >
             Reopen
           </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            loading={busy === "void"}
+            disabled={ncr.status === "closed" || ncr.status === "void"}
+            onClick={voidNcr}
+          >
+            Void — it should not have been raised
+          </Button>
         </div>
+      </section>
+
+      {/* -------- recovering the cost -------- */}
+      <section className="space-y-2.5">
+        <SectionTitle
+          title="Recovering the cost"
+          hint="A backcharge is a change event against the responsible subcontractor, raised in the project's own commercial register rather than a quality-only note."
+        />
+        {ncr.isBackcharged === 1 ? (
+          <Alert tone="info" size="sm" variant="subtle" title="Backcharged">
+            <p>
+              {ncr.backchargeReference
+                ? `Reference ${ncr.backchargeReference}. `
+                : ""}
+              A change event carries the recovery; the amount is argued there, on the evidence in
+              this record.
+            </p>
+          </Alert>
+        ) : ncr.raisedAgainstVendorId === null ? (
+          <p className="text-meta text-content-subtle">
+            This NCR names no responsible vendor, so there is nobody to backcharge. Record the
+            subcontractor it is raised against first — the API refuses otherwise, and it is right
+            to: a backcharge with no counterparty is a number with nobody to send it to.
+          </p>
+        ) : (
+          <Backcharge base={base} ncr={ncr} onDone={onMutated} />
+        )}
       </section>
 
       <ProposeModal
@@ -975,5 +1057,170 @@ function RootCauseModal({
         </Field>
       </div>
     </Modal>
+  );
+}
+
+/* ================================================================== */
+/* Raising a corrective action                                         */
+/* ================================================================== */
+
+/**
+ * The action goes into the PROJECT's one corrective-action register — the same
+ * table safety writes to — rather than a second quality-only list, so an
+ * overdue action is overdue in one place and chased once.
+ */
+function RaiseAction({ base, onDone }: { base: string; onDone: () => void }) {
+  const { busy, refusal, clear, run } = useAction();
+  const [open, setOpen] = useState(false);
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [kind, setKind] = useState("corrective");
+  const [priority, setPriority] = useState("medium");
+  const [ownerName, setOwnerName] = useState("");
+  const [dueDate, setDueDate] = useState("");
+
+  async function create() {
+    const done = await run("action", () =>
+      api.post(`${base}/actions`, {
+        title: title.trim(),
+        description: description.trim() === "" ? null : description.trim(),
+        actionKind: kind,
+        priority,
+        ownerName: ownerName.trim() === "" ? null : ownerName.trim(),
+        dueDate,
+      }),
+    );
+    if (done) {
+      setOpen(false);
+      setTitle("");
+      setDescription("");
+      setOwnerName("");
+      onDone();
+    }
+  }
+
+  return (
+    <>
+      <Button size="sm" variant="secondary" onClick={() => setOpen(true)}>
+        Raise a corrective action
+      </Button>
+      <Modal
+        open={open}
+        onClose={() => setOpen(false)}
+        title="Raise a corrective action"
+        description="A corrective action fixes this occurrence; a preventive one stops the next. The distinction is the difference between a register that closes NCRs and one that reduces them."
+        footer={
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" onClick={() => setOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              variant="primary"
+              loading={busy === "action"}
+              disabled={title.trim() === "" || dueDate === ""}
+              onClick={create}
+            >
+              Raise it
+            </Button>
+          </div>
+        }
+      >
+        <div className="space-y-3">
+          <RefusalNotice refusal={refusal} onDismiss={clear} />
+          <Field label="What has to be done" required>
+            <Input value={title} onChange={(e) => setTitle(e.target.value)} autoFocus />
+          </Field>
+          <Field label="Detail">
+            <Textarea
+              rows={2}
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+            />
+          </Field>
+          <div className="grid gap-3 sm:grid-cols-3">
+            <Field label="Kind">
+              <Select value={kind} onChange={(e) => setKind(e.target.value)}>
+                <option value="corrective">Corrective — fix this one</option>
+                <option value="preventive">Preventive — stop the next</option>
+                <option value="containment">Containment — stop it spreading</option>
+              </Select>
+            </Field>
+            <Field label="Priority">
+              <Select value={priority} onChange={(e) => setPriority(e.target.value)}>
+                {["low", "medium", "high", "urgent"].map((p) => (
+                  <option key={p} value={p}>
+                    {labelize(p)}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Due" required hint="An action with no date is a wish.">
+              <Input type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} />
+            </Field>
+          </div>
+          <Field label="Owner" hint="Who is actually going to do it.">
+            <Input value={ownerName} onChange={(e) => setOwnerName(e.target.value)} />
+          </Field>
+        </div>
+      </Modal>
+    </>
+  );
+}
+
+/* ================================================================== */
+/* Backcharge                                                          */
+/* ================================================================== */
+
+function Backcharge({
+  base,
+  ncr,
+  onDone,
+}: {
+  base: string;
+  ncr: NcrDetail;
+  onDone: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [amount, setAmount] = useState(ncr.costImpact === null ? "" : String(ncr.costImpact));
+  const [reference, setReference] = useState("");
+
+  const parsed = amount.trim() === "" ? null : Number(amount);
+
+  return (
+    <div className="rounded-md border border-border-subtle p-2.5">
+      <RefusalNotice refusal={refusal} onDismiss={clear} />
+      <p className="text-2xs text-content-subtle">
+        Raising the backcharge creates a change event of type backcharge against the responsible
+        subcontractor, carrying this NCR as its origin. The amount defaults to the cost impact
+        recorded here — {ncr.costImpact === null ? "which is unmeasured, so type one" : "change it if the recovery differs"}.
+      </p>
+      <div className="mt-2 grid gap-2 sm:grid-cols-3">
+        <Field label={`Amount (${ncr.currency})`}>
+          <Input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} />
+        </Field>
+        <Field label="Backcharge reference">
+          <Input value={reference} onChange={(e) => setReference(e.target.value)} />
+        </Field>
+        <div className="flex items-end">
+          <Button
+            size="sm"
+            variant="secondary"
+            loading={busy === "backcharge"}
+            disabled={parsed !== null && !Number.isFinite(parsed)}
+            onClick={async () => {
+              const done = await run("backcharge", () =>
+                api.post(`${base}/backcharge`, {
+                  ...(parsed !== null && Number.isFinite(parsed) ? { amount: parsed } : {}),
+                  ...(reference.trim() === "" ? {} : { backchargeReference: reference.trim() }),
+                }),
+              );
+              if (done) onDone();
+            }}
+          >
+            Raise the backcharge
+          </Button>
+        </div>
+      </div>
+    </div>
   );
 }

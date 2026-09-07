@@ -48,6 +48,7 @@ import {
   nameOf,
   useMutation,
   useResource,
+  useWorkers,
   type ProgrammeRecord,
 } from "./safetyShared";
 
@@ -68,12 +69,14 @@ const ATTESTABLE_METHODS = [
 const SELF_METHODS = ["on_device_signature", "wet_signature", "biometric", "qr_scan", "badge_scan"];
 
 export default function ProgrammeDrawer({
+  projectId,
   recordId,
   users,
   vendors,
   onClose,
   onMutated,
 }: {
+  projectId: string;
   recordId: string | null;
   users: Map<string, string>;
   vendors: Map<string, string>;
@@ -84,6 +87,7 @@ export default function ProgrammeDrawer({
   const [subject, setSubject] = useState<"me" | "user" | "worker">("me");
   const [subjectUserId, setSubjectUserId] = useState("");
   const [workerId, setWorkerId] = useState("");
+  const workerRegister = useWorkers(recordId ? projectId : "");
   const [method, setMethod] = useState("on_device_signature");
   const [attestation, setAttestation] = useState("");
   const [newVersion, setNewVersion] = useState("");
@@ -299,14 +303,30 @@ export default function ProgrammeDrawer({
                 {subject === "worker" ? (
                   <>
                     <Field
-                      label="Worker id"
-                      hint="From the workforce register — the same one that carries induction and site access."
+                      label="Worker"
+                      hint={
+                        workerRegister.error ??
+                        "From the workforce register — the same one that carries induction and site access."
+                      }
                     >
-                      <Input
+                      <Select
                         value={workerId}
-                        placeholder="wkr_…"
+                        disabled={workerRegister.loading}
                         onChange={(e) => setWorkerId(e.target.value)}
-                      />
+                      >
+                        <option value="">
+                          {workerRegister.loading
+                            ? "Loading the worker register…"
+                            : "Choose a worker"}
+                        </option>
+                        {workerRegister.workers.map((w) => (
+                          <option key={w.id} value={w.id}>
+                            {w.fullName}
+                            {w.reference ? ` · ${w.reference}` : ""}
+                            {w.trade ? ` · ${w.trade}` : ""}
+                          </option>
+                        ))}
+                      </Select>
                     </Field>
                     {method === "supervisor_attested" ? (
                       <Field
@@ -362,7 +382,10 @@ export default function ProgrammeDrawer({
                     className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border bg-surface-raised px-2.5 py-1.5"
                   >
                     <span className="text-meta text-content">
-                      {a.workerId ? `Worker ${a.workerId}` : nameOf(users, a.userId)}
+                      {a.workerId
+                        ? (workerRegister.workers.find((w) => w.id === a.workerId)?.fullName ??
+                          `Worker ${a.workerId}`)
+                        : nameOf(users, a.userId)}
                       <span className="block text-2xs text-content-subtle">
                         {dateTime(a.acknowledgedAt)} · {labelize(a.method)}
                         {a.attestation ? ` · "${a.attestation}"` : ""}

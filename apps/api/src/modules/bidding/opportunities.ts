@@ -50,6 +50,7 @@ import {
   type OutcomeRow,
   type TrainingRow,
 } from "./analytics-math.js";
+import { requireBiddingScope } from "./access.js";
 
 /**
  * THE OPPORTUNITY PIPELINE AND THE BID/NO-BID DECISION (#1048, #1051, #1052).
@@ -340,9 +341,118 @@ export function capacityView(
 /* ------------------------------------------------------------------ */
 
 export const opportunityRoutes: FastifyPluginAsync = async (app) => {
-  const memberGate = [app.authenticate, app.requireCompany];
-  const writeGate = [app.authenticate, app.requireCompany];
+  /*
+   * THE PIPELINE CARRIES THE SAME PERMISSION AS THE TENDERS IT FEEDS.
+   *
+   * `memberGate` and `writeGate` used to be the same array — plain company
+   * membership — which reads like a control while being none: every mutation
+   * here, including the bid/no-bid decision the module's own header calls
+   * "the decision that costs most" and the outcomes the win model is fitted
+   * on, was open to any member with `bidding: none`.
+   *
+   * These are company-level routes, so `requireTool` (which needs a
+   * `:projectId`) cannot guard them. `requireBiddingScope` resolves the same
+   * `bidding` permission across the caller's project memberships: a company
+   * owner/admin passes, and so does anyone holding the level on at least one
+   * project. Opportunity rows are a COMPANY register — most exist before any
+   * project does — so the scope gates entry rather than filtering rows; the
+   * project-keyed analytics in analytics.ts filter as well.
+   */
+  const memberGate = [app.authenticate, app.requireCompany, requireBiddingScope(app, "read")];
+  const writeGate = [app.authenticate, app.requireCompany, requireBiddingScope(app, "standard")];
   const BASE = "/companies/current/opportunities";
+
+  /*
+   * BOUNDED READS THAT SAY WHEN THEY WERE BOUNDED.
+   *
+   * `.limit(2000)` with no `orderBy` computed the win rate from an
+   * arbitrary, non-reproducible subset the moment a tenant passed the cap —
+   * two consecutive reads could return different rates, and the response
+   * said nothing. These page deterministically to a hard ceiling and report
+   * `coverage`, so a truncated read is visible rather than silent.
+   */
+  const PAGE = 1000;
+  const OPPORTUNITY_CEILING = 20_000;
+  const COST_CEILING = 50_000;
+
+  interface Coverage {
+    complete: boolean;
+    read: number;
+    total: number;
+    reason: string | null;
+  }
+
+  async function loadAllOpportunities(
+    companyId: string,
+    ceiling = OPPORTUNITY_CEILING,
+  ): Promise<{ rows: Array<typeof bidOpportunities.$inferSelect>; coverage: Coverage }> {
+    const [totalRow] = await app.db
+      .select({ n: count() })
+      .from(bidOpportunities)
+      .where(eq(bidOpportunities.companyId, companyId));
+    const total = Number(totalRow?.n ?? 0);
+    const rows: Array<typeof bidOpportunities.$inferSelect> = [];
+    while (rows.length < ceiling) {
+      const batch = await app.db
+        .select()
+        .from(bidOpportunities)
+        .where(eq(bidOpportunities.companyId, companyId))
+        // createdAt alone is not unique; id breaks the tie so paging is stable.
+        .orderBy(asc(bidOpportunities.createdAt), asc(bidOpportunities.id))
+        .limit(Math.min(PAGE, ceiling - rows.length))
+        .offset(rows.length);
+      rows.push(...batch);
+      if (batch.length < PAGE) break;
+    }
+    const complete = rows.length >= total;
+    return {
+      rows,
+      coverage: {
+        complete,
+        read: rows.length,
+        total,
+        reason: complete
+          ? null
+          : `More pursuits exist (${total}) than this report reads (${rows.length}). Rates ` +
+            "computed from part of a register are not rates, so they are withheld.",
+      },
+    };
+  }
+
+  async function loadAllTenderCosts(
+    companyId: string,
+    ceiling = COST_CEILING,
+  ): Promise<{ rows: Array<typeof tenderCosts.$inferSelect>; coverage: Coverage }> {
+    const [totalRow] = await app.db
+      .select({ n: count() })
+      .from(tenderCosts)
+      .where(eq(tenderCosts.companyId, companyId));
+    const total = Number(totalRow?.n ?? 0);
+    const rows: Array<typeof tenderCosts.$inferSelect> = [];
+    while (rows.length < ceiling) {
+      const batch = await app.db
+        .select()
+        .from(tenderCosts)
+        .where(eq(tenderCosts.companyId, companyId))
+        .orderBy(asc(tenderCosts.createdAt), asc(tenderCosts.id))
+        .limit(Math.min(PAGE, ceiling - rows.length))
+        .offset(rows.length);
+      rows.push(...batch);
+      if (batch.length < PAGE) break;
+    }
+    const complete = rows.length >= total;
+    return {
+      rows,
+      coverage: {
+        complete,
+        read: rows.length,
+        total,
+        reason: complete
+          ? null
+          : `More tender-cost entries exist (${total}) than this report reads (${rows.length}).`,
+      },
+    };
+  }
 
   async function fetchOpportunity(id: string, companyId: string) {
     const rows = await app.db
@@ -1080,16 +1190,9 @@ export const opportunityRoutes: FastifyPluginAsync = async (app) => {
    */
   app.get("/companies/current/cost-of-sale", { preHandler: memberGate }, async (req) => {
     const companyId = req.companyId!;
-    const costRows = await app.db
-      .select()
-      .from(tenderCosts)
-      .where(eq(tenderCosts.companyId, companyId))
-      .limit(5000);
-    const opps = await app.db
-      .select()
-      .from(bidOpportunities)
-      .where(eq(bidOpportunities.companyId, companyId))
-      .limit(2000);
+    const { rows: costRows, coverage: costCoverage } = await loadAllTenderCosts(companyId);
+    const { rows: opps, coverage: oppCoverage } = await loadAllOpportunities(companyId);
+    const complete = costCoverage.complete && oppCoverage.complete;
     const outcomeById = new Map(opps.map((o) => [o.id, o.outcome ?? "pending"] as const));
 
     const rows: CostRow[] = costRows.map((c) => {
@@ -1115,11 +1218,17 @@ export const opportunityRoutes: FastifyPluginAsync = async (app) => {
     }
     const summaries = costOfSale(rows, wonValue, winsBy);
     return {
-      currencies: summaries,
+      // A cost of sale computed from part of the register is not a cost of
+      // sale; it is withheld with the reason rather than shown as a figure.
+      currencies: complete ? summaries : [],
       entries: costRows.length,
       pursuits: opps.length,
-      note:
-        summaries.length === 0
+      coverage: { costs: costCoverage, pursuits: oppCoverage, complete },
+      note: !complete
+        ? [costCoverage.reason, oppCoverage.reason].filter(Boolean).join(" ") +
+          " Narrow the window or export the register; a partial cost of sale reads like an " +
+          "answer and is not one."
+        : summaries.length === 0
           ? "No tender costs are recorded. Until they are, the cost of winning work is an " +
             "overhead line rather than a figure attributable to the tenders that produced it."
           : "Cost of sale belongs in the margin expectation of every bid. A business that does " +
@@ -1137,11 +1246,7 @@ export const opportunityRoutes: FastifyPluginAsync = async (app) => {
         by: z.enum(["client", "workType", "sector", "source", "region", "competitor"]).default("client"),
       })
       .parse(req.query ?? {});
-    const opps = await app.db
-      .select()
-      .from(bidOpportunities)
-      .where(eq(bidOpportunities.companyId, req.companyId!))
-      .limit(2000);
+    const { rows: opps, coverage } = await loadAllOpportunities(req.companyId!);
 
     const keyOf = (o: (typeof opps)[number]): { key: string; label: string } => {
       switch (q.by) {
@@ -1177,13 +1282,32 @@ export const opportunityRoutes: FastifyPluginAsync = async (app) => {
       };
     });
     const result = winRates(rows);
+    /*
+     * A rate over a truncated register is a rate over an arbitrary subset.
+     * The groups still show their COUNTS — those are facts about what was
+     * read — but every percentage becomes Unknowable with the reason.
+     */
+    const withheld = coverage.complete
+      ? result
+      : {
+          groups: result.groups.map((g) => ({
+            ...g,
+            winRatePercent: unknowable<number>(coverage.reason ?? "Register truncated."),
+          })),
+          overall: {
+            ...result.overall,
+            winRatePercent: unknowable<number>(coverage.reason ?? "Register truncated."),
+          },
+        };
     const { rows: history } = await trainingHistory(app.db, req.companyId!);
     return {
       by: q.by,
-      ...result,
+      ...withheld,
+      coverage,
       modelSampleSize: history.length,
-      note:
-        opps.length === 0
+      note: !coverage.complete
+        ? coverage.reason
+        : opps.length === 0
           ? "No pursuits are recorded, so there is no win rate. A win rate is a property of " +
             "recorded outcomes, and this register is where they are recorded."
           : `Win rate is computed over decided pursuits only — pending ones are counted neither ` +

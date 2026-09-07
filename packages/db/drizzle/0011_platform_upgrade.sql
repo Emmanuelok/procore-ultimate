@@ -1648,8 +1648,6 @@ CREATE TABLE "bundle_snapshots" (
 	"kind" text NOT NULL,
 	"sha256" text NOT NULL,
 	"snapshot" jsonb,
-	"start_page" integer,
-	"end_page" integer,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint

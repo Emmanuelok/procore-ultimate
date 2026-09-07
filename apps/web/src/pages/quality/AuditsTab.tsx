@@ -39,6 +39,7 @@ import {
   num,
   plural,
   useAction,
+  useReason,
   useResource,
   type Resource,
 } from "./qualityShared";
@@ -457,6 +458,7 @@ function AuditModal({
   onMutated: () => void;
 }) {
   const { busy, refusal, clear, run } = useAction();
+  const { ask, dialog } = useReason();
   const [addOpen, setAddOpen] = useState(false);
   const base = `/api/v1/projects/${projectId}/quality-audits/${auditId ?? ""}`;
   const audit = useResource<QualityAuditDetail>(
@@ -500,19 +502,41 @@ function AuditModal({
               >
                 Issue the report
               </Button>
+              {/*
+                Closing over open non-conformities is a decision, not a
+                default: the API refuses it unless the closure states why, and
+                asking for the reason here is how that refusal stops being a
+                dead end.
+              */}
               <Button
                 size="sm"
-                variant="primary"
+                variant={a.openFindingCount > 0 ? "danger" : "primary"}
                 loading={busy === "close"}
                 onClick={async () => {
-                  const done = await run("close", () => api.post(`${base}/close`, {}));
+                  let note: string | null = null;
+                  if (a.openFindingCount > 0) {
+                    note = await ask({
+                      title: `Close ${a.reference} over ${a.openFindingCount} open ${a.openFindingCount === 1 ? "finding" : "findings"}`,
+                      description:
+                        "Closing an audit over open non-conformities is how they stop being tracked. Say what happened to them — the note is written into the record and the ledger, and it is what the next auditor reads.",
+                      label: "Why is it being closed with findings open?",
+                      confirmLabel: "Close it anyway",
+                      destructive: true,
+                    });
+                    if (!note || note.trim().length < 10) return;
+                  }
+                  const done = await run("close", () =>
+                    api.post(`${base}/close`, note ? { force: true, note } : {}),
+                  );
                   if (done) {
                     audit.reload();
                     onMutated();
                   }
                 }}
               >
-                Close the audit
+                {a.openFindingCount > 0
+                  ? `Close over ${a.openFindingCount} open ${a.openFindingCount === 1 ? "finding" : "findings"}`
+                  : "Close the audit"}
               </Button>
             </>
           ) : null}
@@ -525,6 +549,7 @@ function AuditModal({
         <p className="text-meta text-content-muted">Loading…</p>
       ) : (
         <div className="space-y-3 text-meta">
+          {dialog}
           <RefusalNotice refusal={refusal} onDismiss={clear} />
           <div className="flex flex-wrap gap-1.5">
             <Badge tone="neutral" size="xs" dot>

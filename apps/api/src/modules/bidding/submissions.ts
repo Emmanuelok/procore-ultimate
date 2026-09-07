@@ -2,6 +2,7 @@ import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import { and, asc, count, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import {
+  bidAwards,
   bidInvitations,
   bidLevellingItems,
   bidPackages,
@@ -1499,6 +1500,28 @@ export const submissionRoutes: FastifyPluginAsync = async (app) => {
           `${pkg.reference} is ${pkg.status}. An alternate accepted after the award changes the ` +
             "contract sum without a change instruction — that belongs in the commitment, not " +
             "in the bid.",
+        );
+      }
+      /*
+       * A package status of `awarded` is not the only way an award can be
+       * live: a SPLIT package sits at `partially_awarded` while one or more
+       * approved awards hold a commitment against it. Accepting an alternate
+       * there moves a bidder's compared total and voids their levelling
+       * while a live award stands on the same scope, so the test is the
+       * award rather than the package's headline status.
+       */
+      const liveAwards = await app.db
+        .select({ id: bidAwards.id, reference: bidAwards.reference, status: bidAwards.status })
+        .from(bidAwards)
+        .where(and(eq(bidAwards.companyId, req.companyId!), eq(bidAwards.packageId, pkg.id)));
+      const live = liveAwards.find(
+        (a) => !["rejected", "withdrawn", "cancelled"].includes(a.status),
+      );
+      if (live) {
+        throw conflict(
+          `${pkg.reference} carries award ${live.reference} at status "${live.status}". ` +
+            "Accepting an alternate now would move a compared total and void a levelling that " +
+            "a live award was measured against. Withdraw or reject the award first.",
         );
       }
       const seal = sealState(pkg);

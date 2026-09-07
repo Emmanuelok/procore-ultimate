@@ -401,6 +401,40 @@ export default function FacilityDetail({
   const [applicationFor, setApplicationFor] = useState<DisbursementRow | null>(null);
   const [applicationError, setApplicationError] = useState<string | null>(null);
 
+  /** The same application rendered as the lender's printable form. */
+  async function openApplicationForm() {
+    if (!applicationFor) return;
+    setApplicationError(null);
+    try {
+      const url = await fetchBlobUrl(
+        `${base}/disbursements/${applicationFor.id}/application.html`,
+      );
+      window.open(url, "_blank", "noopener");
+    } catch (err) {
+      setApplicationError(
+        err instanceof Error ? err.message : "Could not open the printable application",
+      );
+    }
+  }
+
+  /** The statement of expenditure for the lender's own system. */
+  async function downloadApplicationCsv() {
+    if (!applicationFor) return;
+    setApplicationError(null);
+    try {
+      const url = await fetchBlobUrl(`${base}/disbursements/${applicationFor.id}/application.csv`);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `withdrawal-application-${applicationFor.number}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setApplicationError(err instanceof Error ? err.message : "Could not export the application");
+    }
+  }
+
   async function openApplication(d: DisbursementRow) {
     setApplicationFor(d);
     setApplication(null);
@@ -1455,8 +1489,28 @@ export default function FacilityDetail({
               )}
             </div>
 
-            <p className="border-t border-ink-100 pt-2 text-xs text-ink-500">
-              {application.basis}
+            <div className="flex flex-wrap gap-2 border-t border-ink-100 pt-3">
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => void openApplicationForm()}
+              >
+                Open printable form
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => void downloadApplicationCsv()}
+              >
+                Download SoE (.csv)
+              </Button>
+            </div>
+
+            <p className="text-xs text-ink-500">{application.basis}</p>
+            <p className="text-xs text-ink-400">
+              The printable form is the lender's layout (application, statement of expenditure,
+              certification); print it to PDF to send. No PDF is generated on the server, so
+              nothing here claims a signature or pagination the platform did not produce.
             </p>
           </div>
         ) : null}

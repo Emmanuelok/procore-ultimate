@@ -41,6 +41,7 @@ import {
 } from "../../ui";
 import { IconPlus, IconSafety, IconWarning } from "../../ui/icons";
 import { api } from "../../lib/api";
+import AssistPanel from "./AssistPanel";
 import ActionList from "./ActionList";
 import {
   EM_DASH,
@@ -69,12 +70,19 @@ import {
   type ReportabilityResponse,
 } from "./safetyShared";
 
-type Section = "record" | "reportability" | "investigation" | "actions" | "briefings";
+type Section =
+  | "record"
+  | "reportability"
+  | "investigation"
+  | "assistant"
+  | "actions"
+  | "briefings";
 
 const SECTIONS: Array<{ value: Section; label: string }> = [
   { value: "record", label: "Record" },
   { value: "reportability", label: "Reportability" },
   { value: "investigation", label: "Investigation" },
+  { value: "assistant", label: "Assistant" },
   { value: "actions", label: "Actions" },
   { value: "briefings", label: "Briefings" },
 ];
@@ -247,6 +255,15 @@ export default function IncidentDrawer({
               incident={incident}
               users={users}
               mutation={mutation}
+            />
+          ) : section === "assistant" ? (
+            <AssistPanel
+              projectId={projectId}
+              incident={incident}
+              onMutated={() => {
+                setVersion((n) => n + 1);
+                onMutated();
+              }}
             />
           ) : section === "actions" ? (
             <ActionsSection projectId={projectId} incident={incident} mutation={mutation} />
@@ -794,7 +811,7 @@ function ReportabilitySection({
                   "rounded-md border px-2.5 py-2",
                   duty.state === "missed"
                     ? "border-danger-border bg-danger-subtle/50"
-                    : duty.state === "notified_late"
+                    : duty.state === "notified_late" || duty.state === "deadline_unknown"
                       ? "border-warning-border bg-warning-subtle/40"
                       : "border-border bg-surface-raised",
                 )}
@@ -815,7 +832,7 @@ function ReportabilitySection({
                     tone={
                       duty.state === "missed"
                         ? "danger"
-                        : duty.state === "notified_late"
+                        : duty.state === "notified_late" || duty.state === "deadline_unknown"
                           ? "warning"
                           : duty.state === "notified"
                             ? "success"
@@ -840,7 +857,9 @@ function ReportabilitySection({
                               ? ` · ${duty.hoursLate} hour(s) past it`
                               : ""
                         }`
-                      : "No deadline is recorded against this regime."}
+                      : "No deadline can be established from the record. The duty is real; the " +
+                        "clock is not knowable. Reassess the incident to get the deadline and the " +
+                        "rule behind it."}
                 </p>
                 {duty.state === "missed" && duty.consequenceIfMissed ? (
                   <p className="mt-1 text-2xs text-danger-fg">{duty.consequenceIfMissed}</p>
@@ -1334,6 +1353,7 @@ function LifecycleFooter({
   mutation: Mutation;
 }) {
   const [closeNote, setCloseNote] = useState("");
+  const [overrideReason, setOverrideReason] = useState("");
   const [reopenReason, setReopenReason] = useState("");
 
   const blockers: string[] = [];
@@ -1364,6 +1384,14 @@ function LifecycleFooter({
       `${count(incident.openActionCount)} corrective action(s) are still open against it.`,
     );
   }
+
+  /* A duty whose deadline the record cannot establish is not a live clock and
+   * never becomes one, so it is not a blocker — it is a demand for a reason
+   * that goes on the file. */
+  const unknownDuties = (incident.notification.duties ?? []).filter(
+    (d) => d.state === "deadline_unknown",
+  );
+  const needsOverride = incident.isReportable && unknownDuties.length > 0;
 
   const closed = incident.status === "closed";
 
@@ -1423,14 +1451,39 @@ function LifecycleFooter({
                 onChange={(e) => setCloseNote(e.target.value)}
               />
             </Field>
+            {needsOverride ? (
+              <>
+                <Alert tone="warning" size="sm" title="A statutory duty here has no establishable deadline">
+                  {unknownDuties.map((d) => d.regime).join(", ")} —{" "}
+                  {unknownDuties.length === 1 ? "this regime is" : "these regimes are"} recorded
+                  against the incident but no deadline is. That is what a row written before the
+                  reportability engine looks like. Reassess it to get the real deadline and the rule
+                  behind it, or say here why the duty does not apply or was discharged outside the
+                  platform. What you write is stored on the incident and in the ledger.
+                </Alert>
+                <Field label="Why this can be closed with that duty unresolved" required>
+                  <Textarea
+                    rows={2}
+                    value={overrideReason}
+                    placeholder="The F2508 was filed by the site in 2019; the acknowledgement is in the paper file."
+                    onChange={(e) => setOverrideReason(e.target.value)}
+                  />
+                </Field>
+              </>
+            ) : null}
             <Button
               size="sm"
-              disabled={closeNote.trim() === ""}
+              disabled={
+                closeNote.trim() === "" || (needsOverride && overrideReason.trim().length < 20)
+              }
               loading={mutation.busy === "close"}
               onClick={() =>
                 void mutation.run("close", "This incident could not be closed", () =>
                   api.post(`/api/v1/projects/${projectId}/safety/incidents/${incident.id}/close`, {
                     note: closeNote.trim(),
+                    ...(needsOverride
+                      ? { statutoryOverrideReason: overrideReason.trim() }
+                      : {}),
                   }),
                 )
               }

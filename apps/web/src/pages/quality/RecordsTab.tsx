@@ -45,6 +45,7 @@ import {
   num,
   plural,
   useAction,
+  useReason,
   useResource,
   type Resource,
 } from "./qualityShared";
@@ -53,6 +54,7 @@ import type {
   ConcretePourDetail,
   ConcreteSummary,
   Instrument,
+  InstrumentDetail,
   InstrumentSummary,
   MaterialCertificate,
   CertificateSummary,
@@ -63,6 +65,50 @@ import type {
   WeldingProcedure,
   WeldingSummary,
 } from "./types";
+
+/* ------------------------------------------------------------------ */
+/* Vocabularies the API validates against — never free text in a form  */
+/* ------------------------------------------------------------------ */
+
+const WELD_PROCESSES = ["smaw", "gmaw", "fcaw", "gtaw", "saw", "esw", "stud", "resistance", "other"];
+const NDT_METHODS = ["vt", "pt", "mt", "rt", "ut", "paut", "tofd", "et", "hardness", "ferrite", "leak"];
+const CERTIFICATE_TYPES = [
+  "en_10204_3_1",
+  "en_10204_3_2",
+  "en_10204_2_2",
+  "en_10204_2_1",
+  "mill_certificate",
+  "conformity_declaration",
+  "test_report",
+  "other",
+];
+const CERTIFICATE_TYPE_LABEL: Record<string, string> = {
+  en_10204_2_1: "EN 10204 2.1 — declaration of compliance (no test results)",
+  en_10204_2_2: "EN 10204 2.2 — test report, NOT specific to the delivered lot",
+  en_10204_3_1: "EN 10204 3.1 — manufacturer's certificate, lot specific",
+  en_10204_3_2: "EN 10204 3.2 — countersigned by an independent inspector",
+  mill_certificate: "Mill certificate",
+  conformity_declaration: "Declaration of conformity",
+  test_report: "Test report",
+  other: "Other",
+};
+const CALIBRATION_RESULTS = ["pass", "adjusted", "fail", "limited_use"];
+const INSTRUMENT_STATUSES = ["in_service", "out_of_service", "under_calibration", "lost", "retired"];
+
+/** "a, b, c" or "a b c" → ["a","b","c"]; an empty box means "not recorded". */
+function splitList(value: string): string[] {
+  return value
+    .split(/[,\n]+|\s{2,}/)
+    .map((v) => v.trim())
+    .filter((v) => v !== "");
+}
+
+/** A number box that has not been filled in is null — never 0. */
+function numOrNull(value: string): number | null {
+  if (value.trim() === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
 
 export type RecordsSection = "concrete" | "welding" | "certificates" | "calibration";
 
@@ -637,14 +683,169 @@ function PourModal({
           </div>
 
           {!p.pouredAt ? (
-            <Alert tone="info" title="Not yet recorded as poured">
-              Record the pour from site with its tickets and fresh tests. If its pre-pour hold point
-              is unreleased the API refuses, and the refusal names the point.
-            </Alert>
-          ) : null}
+            <RecordPour
+              base={base}
+              onRecorded={() => {
+                pour.reload();
+                onMutated();
+              }}
+            />
+          ) : (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border-subtle p-2.5">
+              <p className="text-2xs text-content-subtle">
+                Poured {isoDate(p.pouredAt)}
+                {p.slumpMm !== null ? ` · slump ${num(p.slumpMm, 0)} mm` : " · no slump recorded"}
+                {p.batchNumbers && p.batchNumbers.length > 0
+                  ? ` · batches ${p.batchNumbers.join(", ")}`
+                  : " · no batch numbers recorded"}
+              </p>
+              <Button
+                size="xs"
+                variant="secondary"
+                loading={busy === "assess"}
+                onClick={async () => {
+                  const done = await run("assess", () => api.post(`${base}/assess`, {}));
+                  if (done) {
+                    pour.reload();
+                    onMutated();
+                  }
+                }}
+              >
+                Re-run the acceptance test
+              </Button>
+            </div>
+          )}
         </div>
       )}
     </Modal>
+  );
+}
+
+/**
+ * RECORDING THE POUR. Everything on this form is knowable for about two hours
+ * and then only from this record — which is why the register refuses to let a
+ * pour be "recorded" by ticking a box: the tickets, the fresh tests and the
+ * ambient temperature are the pour.
+ *
+ * The pre-pour hold point is checked by the API, not here. If it is unreleased
+ * the refusal names the point, and pouring anyway is a deliberate, reasoned act
+ * (`proceedWithoutRelease`) rather than a silent one.
+ */
+function RecordPour({ base, onRecorded }: { base: string; onRecorded: () => void }) {
+  const { busy, refusal, clear, run } = useAction();
+  const [pouredAt, setPouredAt] = useState(new Date().toISOString().slice(0, 10));
+  const [volume, setVolume] = useState("");
+  const [slump, setSlump] = useState("");
+  const [air, setAir] = useState("");
+  const [concreteTemp, setConcreteTemp] = useState("");
+  const [ambientTemp, setAmbientTemp] = useState("");
+  const [batches, setBatches] = useState("");
+  const [tickets, setTickets] = useState("");
+  const [curing, setCuring] = useState("");
+  const [proceed, setProceed] = useState(false);
+  const [proceedReason, setProceedReason] = useState("");
+
+  async function record() {
+    const ticketRefs = splitList(tickets);
+    const done = await run("pour", () =>
+      api.post(`${base}/pour`, {
+        pouredAt: `${pouredAt}T12:00:00.000Z`,
+        volumeM3: numOrNull(volume),
+        slumpMm: numOrNull(slump),
+        airContentPct: numOrNull(air),
+        concreteTempC: numOrNull(concreteTemp),
+        ambientTempC: numOrNull(ambientTemp),
+        batchNumbers: splitList(batches),
+        deliveryTickets: ticketRefs.map((ticketNumber) => ({ ticketNumber })),
+        curingMethod: curing.trim() === "" ? null : curing.trim(),
+        ...(proceed
+          ? { proceedWithoutRelease: true, proceedReason: proceedReason.trim() || null }
+          : {}),
+      }),
+    );
+    if (done) onRecorded();
+  }
+
+  return (
+    <div className="rounded-md border border-warning/40 bg-warning/5 p-2.5">
+      <div className="text-label uppercase tracking-wide text-content-subtle">Record the pour</div>
+      <p className="mt-0.5 text-2xs text-content-subtle">
+        Fresh tests and delivery tickets are knowable at the pour and never again. A pour recorded
+        without them can be shown to have happened, but not to have complied.
+      </p>
+      <RefusalNotice refusal={refusal} onDismiss={clear} />
+      <div className="mt-2 grid gap-2 sm:grid-cols-3">
+        <Field label="Poured on" required>
+          <Input type="date" value={pouredAt} onChange={(e) => setPouredAt(e.target.value)} />
+        </Field>
+        <Field label="Volume placed (m³)">
+          <Input type="number" value={volume} onChange={(e) => setVolume(e.target.value)} />
+        </Field>
+        <Field label="Slump (mm)" hint="Judged against the specified window.">
+          <Input type="number" value={slump} onChange={(e) => setSlump(e.target.value)} />
+        </Field>
+        <Field label="Air content (%)">
+          <Input type="number" value={air} onChange={(e) => setAir(e.target.value)} />
+        </Field>
+        <Field label="Concrete temperature (°C)">
+          <Input
+            type="number"
+            value={concreteTemp}
+            onChange={(e) => setConcreteTemp(e.target.value)}
+          />
+        </Field>
+        <Field label="Ambient temperature (°C)">
+          <Input
+            type="number"
+            value={ambientTemp}
+            onChange={(e) => setAmbientTemp(e.target.value)}
+          />
+        </Field>
+      </div>
+      <div className="mt-2 grid gap-2 sm:grid-cols-3">
+        <Field label="Delivery tickets" hint="Comma separated.">
+          <Input value={tickets} onChange={(e) => setTickets(e.target.value)} placeholder="T-4412, T-4413" />
+        </Field>
+        <Field label="Batch numbers" hint="Traceability back to the plant.">
+          <Input value={batches} onChange={(e) => setBatches(e.target.value)} placeholder="B-9001" />
+        </Field>
+        <Field label="Curing method">
+          <Input value={curing} onChange={(e) => setCuring(e.target.value)} placeholder="Polythene, 7 days" />
+        </Field>
+      </div>
+      <label className="mt-2 flex items-start gap-2 text-2xs text-content-muted">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={proceed}
+          onChange={(e) => setProceed(e.target.checked)}
+        />
+        <span>
+          The pre-pour hold point is not released and the pour went ahead anyway. The API refuses
+          otherwise; ticking this records the decision rather than hiding it.
+        </span>
+      </label>
+      {proceed ? (
+        <Field label="Why did the pour proceed?" required className="mt-1">
+          <Textarea
+            rows={2}
+            value={proceedReason}
+            onChange={(e) => setProceedReason(e.target.value)}
+          />
+        </Field>
+      ) : null}
+      <div className="mt-2 flex justify-end">
+        <Button
+          size="sm"
+          variant="primary"
+          loading={busy === "pour"}
+          disabled={proceed && proceedReason.trim() === ""}
+          onClick={record}
+        >
+          Record the pour
+        </Button>
+      </div>
+    </div>
   );
 }
 
@@ -684,8 +885,18 @@ function WeldingPanel({
     [base, version],
   );
 
+  const [createOpen, setCreateOpen] = useState(false);
   const rows = welds.data?.items ?? [];
   const s = summary.data;
+  const procedureRows = procedures.data?.items ?? [];
+  const qualRows = quals.data?.items ?? [];
+  const reloadAll = () => {
+    welds.reload();
+    summary.reload();
+    quals.reload();
+    procedures.reload();
+    onMutated();
+  };
 
   const columns = useMemo<DataColumns<Weld>>(
     () => [
@@ -867,12 +1078,23 @@ function WeldingPanel({
         <QualificationList projectId={projectId} quals={quals} onMutated={onMutated} />
       </div>
 
+      <div className="flex justify-end">
+        <Button size="sm" icon={IconPlus} onClick={() => setCreateOpen(true)}>
+          Add a joint
+        </Button>
+      </div>
+
       {welds.error ? (
         <LoadError message={welds.error} onRetry={welds.reload} />
       ) : rows.length === 0 ? (
         <NothingHere
           title="The weld map is empty"
           reason="One row per joint, naming the procedure it was welded to and the welder who made it — so that when an examination rejects one, what else that welder made is a query rather than an afternoon."
+          action={
+            <Button size="sm" icon={IconPlus} onClick={() => setCreateOpen(true)}>
+              Add the first joint
+            </Button>
+          }
         />
       ) : (
         <DataTable<Weld>
@@ -900,14 +1122,177 @@ function WeldingPanel({
       <WeldModal
         weldId={openId}
         projectId={projectId}
+        procedures={procedureRows}
+        qualifications={qualRows}
         onClose={() => setOpenId(null)}
-        onMutated={() => {
-          welds.reload();
-          summary.reload();
-          onMutated();
+        onMutated={reloadAll}
+      />
+      <CreateWeld
+        open={createOpen}
+        projectId={projectId}
+        procedures={procedureRows}
+        onClose={() => setCreateOpen(false)}
+        onCreated={() => {
+          setCreateOpen(false);
+          reloadAll();
         }}
       />
     </div>
+  );
+}
+
+/**
+ * A JOINT IS PLANNED BEFORE IT IS WELDED. The map row exists first — the
+ * isometric, the material, the required examination percentage — so that the
+ * welder and the procedure are recorded against something, and so that a joint
+ * nobody welded is visible as an omission rather than absent.
+ */
+function CreateWeld({
+  open,
+  onClose,
+  projectId,
+  procedures,
+  onCreated,
+}: {
+  open: boolean;
+  onClose: () => void;
+  projectId: string;
+  procedures: WeldingProcedure[];
+  onCreated: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [jointReference, setJointReference] = useState("");
+  const [weldMapRef, setWeldMapRef] = useState("");
+  const [jointType, setJointType] = useState("");
+  const [isometricRef, setIsometricRef] = useState("");
+  const [materialSpec, setMaterialSpec] = useState("");
+  const [thickness, setThickness] = useState("");
+  const [diameter, setDiameter] = useState("");
+  const [heats, setHeats] = useState("");
+  const [wpsId, setWpsId] = useState("");
+  const [ndtPercent, setNdtPercent] = useState("");
+  const [ndtMethods, setNdtMethods] = useState<string[]>([]);
+
+  async function create() {
+    const done = await run("create", () =>
+      api.post(`/api/v1/projects/${projectId}/welds`, {
+        jointReference: jointReference.trim() === "" ? null : jointReference.trim(),
+        weldMapRef: weldMapRef.trim() === "" ? null : weldMapRef.trim(),
+        jointType: jointType.trim() === "" ? null : jointType.trim(),
+        isometricRef: isometricRef.trim() === "" ? null : isometricRef.trim(),
+        materialSpec: materialSpec.trim() === "" ? null : materialSpec.trim(),
+        thicknessMm: numOrNull(thickness),
+        diameterMm: numOrNull(diameter),
+        heatNumbers: splitList(heats),
+        wpsId: wpsId === "" ? null : wpsId,
+        ndtRequiredPercent: numOrNull(ndtPercent),
+        ndtMethodsRequired: ndtMethods,
+      }),
+    );
+    if (done) {
+      setJointReference("");
+      setWeldMapRef("");
+      setHeats("");
+      onCreated();
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Add a joint to the weld map"
+      description="The required examination percentage is recorded here because it is a specification fact, not an opinion formed later: a joint buried before it is examined cannot be examined at all."
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            variant="primary"
+            loading={busy === "create"}
+            disabled={jointReference.trim() === "" && weldMapRef.trim() === ""}
+            onClick={create}
+          >
+            Add the joint
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        <RefusalNotice refusal={refusal} onDismiss={clear} />
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Joint reference" hint="As it is called on the isometric.">
+            <Input
+              value={jointReference}
+              onChange={(e) => setJointReference(e.target.value)}
+              placeholder="FW-114"
+              autoFocus
+            />
+          </Field>
+          <Field label="Weld map reference">
+            <Input value={weldMapRef} onChange={(e) => setWeldMapRef(e.target.value)} />
+          </Field>
+          <Field label="Joint type">
+            <Input value={jointType} onChange={(e) => setJointType(e.target.value)} placeholder="Butt, full penetration" />
+          </Field>
+          <Field label="Isometric / line">
+            <Input value={isometricRef} onChange={(e) => setIsometricRef(e.target.value)} />
+          </Field>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-3">
+          <Field label="Material specification">
+            <Input value={materialSpec} onChange={(e) => setMaterialSpec(e.target.value)} placeholder="P355NH" />
+          </Field>
+          <Field label="Thickness (mm)" hint="Checked against the qualified envelope.">
+            <Input type="number" value={thickness} onChange={(e) => setThickness(e.target.value)} />
+          </Field>
+          <Field label="Diameter (mm)">
+            <Input type="number" value={diameter} onChange={(e) => setDiameter(e.target.value)} />
+          </Field>
+        </div>
+        <Field label="Heat numbers" hint="Comma separated — this is how a recall reaches the joint.">
+          <Input value={heats} onChange={(e) => setHeats(e.target.value)} placeholder="H-4471, H-4472" />
+        </Field>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Procedure (WPS)" hint="Approved procedures only; the API checks the envelope.">
+            <Select value={wpsId} onChange={(e) => setWpsId(e.target.value)}>
+              <option value="">Not yet decided</option>
+              {procedures.map((w) => (
+                <option key={w.id} value={w.id}>
+                  {w.wpsNumber} — {w.title}
+                  {w.status === "approved" ? "" : ` (${w.status})`}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field label="NDT required (%)" hint="0 is a decision; blank is an unanswered question.">
+            <Input type="number" value={ndtPercent} onChange={(e) => setNdtPercent(e.target.value)} />
+          </Field>
+        </div>
+        <Field label="Required examination methods">
+          <div className="flex flex-wrap gap-1.5">
+            {NDT_METHODS.map((m) => (
+              <label
+                key={m}
+                className="flex items-center gap-1 rounded-md border border-border-subtle px-1.5 py-0.5 text-2xs"
+              >
+                <input
+                  type="checkbox"
+                  checked={ndtMethods.includes(m)}
+                  onChange={(e) =>
+                    setNdtMethods((prev) =>
+                      e.target.checked ? [...prev, m] : prev.filter((x) => x !== m),
+                    )
+                  }
+                />
+                {m.toUpperCase()}
+              </label>
+            ))}
+          </div>
+        </Field>
+      </div>
+    </Modal>
   );
 }
 
@@ -921,11 +1306,17 @@ function ProcedureList({
   onMutated: () => void;
 }) {
   const { busy, refusal, clear, run } = useAction();
+  const [createOpen, setCreateOpen] = useState(false);
   const rows = procedures.data?.items ?? [];
   return (
     <div className="rounded-md border border-border-subtle p-2.5">
-      <div className="text-label uppercase tracking-wide text-content-subtle">
-        Welding procedures
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-label uppercase tracking-wide text-content-subtle">
+          Welding procedures
+        </div>
+        <Button size="xs" variant="ghost" icon={IconPlus} onClick={() => setCreateOpen(true)}>
+          Add a WPS
+        </Button>
       </div>
       <RefusalNotice refusal={refusal} onDismiss={clear} />
       {rows.length === 0 ? (
@@ -968,7 +1359,151 @@ function ProcedureList({
           ))}
         </ul>
       )}
+      <CreateWps
+        open={createOpen}
+        projectId={projectId}
+        onClose={() => setCreateOpen(false)}
+        onCreated={() => {
+          setCreateOpen(false);
+          procedures.reload();
+          onMutated();
+        }}
+      />
     </div>
+  );
+}
+
+/**
+ * A WPS is a range, not a document: process, material group, thickness and
+ * diameter bounds. The joint is checked against those bounds, so a WPS filed
+ * with no envelope can never confirm anything about a weld — which is why the
+ * envelope fields are here rather than left to an attachment.
+ */
+function CreateWps({
+  open,
+  onClose,
+  projectId,
+  onCreated,
+}: {
+  open: boolean;
+  onClose: () => void;
+  projectId: string;
+  onCreated: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [wpsNumber, setWpsNumber] = useState("");
+  const [title, setTitle] = useState("");
+  const [standard, setStandard] = useState("");
+  const [process, setProcess] = useState("gtaw");
+  const [baseMaterialGroup, setBaseMaterialGroup] = useState("");
+  const [thicknessMin, setThicknessMin] = useState("");
+  const [thicknessMax, setThicknessMax] = useState("");
+  const [diameterMin, setDiameterMin] = useState("");
+  const [diameterMax, setDiameterMax] = useState("");
+  const [positions, setPositions] = useState("");
+  const [pqr, setPqr] = useState("");
+
+  async function create() {
+    const done = await run("create", () =>
+      api.post(`/api/v1/projects/${projectId}/welding-procedures`, {
+        wpsNumber: wpsNumber.trim(),
+        title: title.trim(),
+        standard: standard.trim() === "" ? null : standard.trim(),
+        process,
+        baseMaterialGroup: baseMaterialGroup.trim() === "" ? null : baseMaterialGroup.trim(),
+        thicknessMinMm: numOrNull(thicknessMin),
+        thicknessMaxMm: numOrNull(thicknessMax),
+        diameterMinMm: numOrNull(diameterMin),
+        diameterMaxMm: numOrNull(diameterMax),
+        positions: splitList(positions),
+        pqrReference: pqr.trim() === "" ? null : pqr.trim(),
+      }),
+    );
+    if (done) {
+      setWpsNumber("");
+      setTitle("");
+      setPqr("");
+      onCreated();
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Add a welding procedure"
+      description="Recorded as an envelope so a joint can be checked against it. A procedure with no PQR reference is a draft nobody qualified, and the register says so on the row."
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            variant="primary"
+            loading={busy === "create"}
+            disabled={wpsNumber.trim() === "" || title.trim() === ""}
+            onClick={create}
+          >
+            Add the procedure
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        <RefusalNotice refusal={refusal} onDismiss={clear} />
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="WPS number" required>
+            <Input value={wpsNumber} onChange={(e) => setWpsNumber(e.target.value)} autoFocus />
+          </Field>
+          <Field label="Title" required>
+            <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Butt weld, P355NH, 8–20mm" />
+          </Field>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-3">
+          <Field label="Process">
+            <Select value={process} onChange={(e) => setProcess(e.target.value)}>
+              {WELD_PROCESSES.map((p) => (
+                <option key={p} value={p}>
+                  {p.toUpperCase()}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field label="Standard">
+            <Input value={standard} onChange={(e) => setStandard(e.target.value)} placeholder="ISO 15614-1" />
+          </Field>
+          <Field label="PQR reference" hint="What qualified it.">
+            <Input value={pqr} onChange={(e) => setPqr(e.target.value)} />
+          </Field>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Base material group">
+            <Input
+              value={baseMaterialGroup}
+              onChange={(e) => setBaseMaterialGroup(e.target.value)}
+              placeholder="1.2"
+            />
+          </Field>
+          <Field label="Positions" hint="Comma separated, e.g. PA, PC, PF.">
+            <Input value={positions} onChange={(e) => setPositions(e.target.value)} />
+          </Field>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-4">
+          <Field label="Thickness min (mm)">
+            <Input type="number" value={thicknessMin} onChange={(e) => setThicknessMin(e.target.value)} />
+          </Field>
+          <Field label="Thickness max (mm)">
+            <Input type="number" value={thicknessMax} onChange={(e) => setThicknessMax(e.target.value)} />
+          </Field>
+          <Field label="Diameter min (mm)">
+            <Input type="number" value={diameterMin} onChange={(e) => setDiameterMin(e.target.value)} />
+          </Field>
+          <Field label="Diameter max (mm)">
+            <Input type="number" value={diameterMax} onChange={(e) => setDiameterMax(e.target.value)} />
+          </Field>
+        </div>
+      </div>
+    </Modal>
   );
 }
 
@@ -982,11 +1517,19 @@ function QualificationList({
   onMutated: () => void;
 }) {
   const { busy, refusal, clear, run } = useAction();
+  const { ask, dialog } = useReason();
+  const [createOpen, setCreateOpen] = useState(false);
   const rows = quals.data?.items ?? [];
   return (
     <div className="rounded-md border border-border-subtle p-2.5">
-      <div className="text-label uppercase tracking-wide text-content-subtle">
-        Welder qualifications
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-label uppercase tracking-wide text-content-subtle">
+          Welder qualifications
+        </div>
+        {dialog}
+        <Button size="xs" variant="ghost" icon={IconPlus} onClick={() => setCreateOpen(true)}>
+          Add a welder
+        </Button>
       </div>
       <RefusalNotice refusal={refusal} onDismiss={clear} />
       {rows.length === 0 ? (
@@ -1034,31 +1577,235 @@ function QualificationList({
                     Confirm continuity
                   </Button>
                 ) : null}
+                {q.status !== "suspended" && q.status !== "revoked" ? (
+                  <Button
+                    size="xs"
+                    variant="ghost"
+                    loading={busy === `suspend-${q.id}`}
+                    onClick={async () => {
+                      const reason = await ask({
+                        title: `Suspend ${q.welderName}`,
+                        description:
+                          "A suspension stops this welder being recorded against new joints. It says nothing about the joints already made — those stay attributed, which is the point.",
+                        label: "Why is the qualification suspended?",
+                        confirmLabel: "Suspend it",
+                        destructive: true,
+                      });
+                      if (!reason) return;
+                      const done = await run(`suspend-${q.id}`, () =>
+                        api.post(
+                          `/api/v1/projects/${projectId}/welder-qualifications/${q.id}/suspend`,
+                          { reason },
+                        ),
+                      );
+                      if (done) {
+                        quals.reload();
+                        onMutated();
+                      }
+                    }}
+                  >
+                    Suspend
+                  </Button>
+                ) : null}
               </div>
               <ReasonList reasons={q.standing?.reasons ?? []} />
             </li>
           ))}
         </ul>
       )}
+      <CreateQualification
+        open={createOpen}
+        projectId={projectId}
+        onClose={() => setCreateOpen(false)}
+        onCreated={() => {
+          setCreateOpen(false);
+          quals.reload();
+          onMutated();
+        }}
+      />
     </div>
+  );
+}
+
+/**
+ * A qualification lapses on CONTINUITY as well as on date: a welder who has not
+ * used the process for six months is no longer qualified in it whatever the
+ * certificate says. Both dates are captured, because the register is asked
+ * afterwards whether the person who made a joint was qualified on the day.
+ */
+function CreateQualification({
+  open,
+  onClose,
+  projectId,
+  onCreated,
+}: {
+  open: boolean;
+  onClose: () => void;
+  projectId: string;
+  onCreated: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [welderName, setWelderName] = useState("");
+  const [welderStamp, setWelderStamp] = useState("");
+  const [certificateNumber, setCertificateNumber] = useState("");
+  const [standard, setStandard] = useState("");
+  const [processes, setProcesses] = useState<string[]>([]);
+  const [positions, setPositions] = useState("");
+  const [thicknessMin, setThicknessMin] = useState("");
+  const [thicknessMax, setThicknessMax] = useState("");
+  const [qualifiedFrom, setQualifiedFrom] = useState("");
+  const [expiryDate, setExpiryDate] = useState("");
+  const [continuityMonths, setContinuityMonths] = useState("6");
+
+  async function create() {
+    const months = numOrNull(continuityMonths);
+    const done = await run("create", () =>
+      api.post(`/api/v1/projects/${projectId}/welder-qualifications`, {
+        welderName: welderName.trim(),
+        welderStamp: welderStamp.trim() === "" ? null : welderStamp.trim(),
+        certificateNumber: certificateNumber.trim() === "" ? null : certificateNumber.trim(),
+        qualificationStandard: standard.trim() === "" ? null : standard.trim(),
+        processes,
+        positions: splitList(positions),
+        thicknessMinMm: numOrNull(thicknessMin),
+        thicknessMaxMm: numOrNull(thicknessMax),
+        qualifiedFrom: qualifiedFrom === "" ? null : qualifiedFrom,
+        expiryDate: expiryDate === "" ? null : expiryDate,
+        ...(months !== null ? { continuityMonths: Math.round(months) } : {}),
+      }),
+    );
+    if (done) {
+      setWelderName("");
+      setWelderStamp("");
+      setCertificateNumber("");
+      onCreated();
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Record a welder qualification"
+      description="The stamp is what appears on the joint, so it is the field that makes a rejection traceable to everything else that welder made."
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            variant="primary"
+            loading={busy === "create"}
+            disabled={welderName.trim() === ""}
+            onClick={create}
+          >
+            Record it
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        <RefusalNotice refusal={refusal} onDismiss={clear} />
+        <div className="grid gap-3 sm:grid-cols-3">
+          <Field label="Welder" required>
+            <Input value={welderName} onChange={(e) => setWelderName(e.target.value)} autoFocus />
+          </Field>
+          <Field label="Stamp" hint="As struck on the joint.">
+            <Input value={welderStamp} onChange={(e) => setWelderStamp(e.target.value)} />
+          </Field>
+          <Field label="Certificate number">
+            <Input
+              value={certificateNumber}
+              onChange={(e) => setCertificateNumber(e.target.value)}
+            />
+          </Field>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Qualification standard">
+            <Input value={standard} onChange={(e) => setStandard(e.target.value)} placeholder="ISO 9606-1" />
+          </Field>
+          <Field label="Positions" hint="Comma separated.">
+            <Input value={positions} onChange={(e) => setPositions(e.target.value)} />
+          </Field>
+        </div>
+        <Field label="Qualified processes">
+          <div className="flex flex-wrap gap-1.5">
+            {WELD_PROCESSES.map((pr) => (
+              <label
+                key={pr}
+                className="flex items-center gap-1 rounded-md border border-border-subtle px-1.5 py-0.5 text-2xs"
+              >
+                <input
+                  type="checkbox"
+                  checked={processes.includes(pr)}
+                  onChange={(e) =>
+                    setProcesses((prev) =>
+                      e.target.checked ? [...prev, pr] : prev.filter((x) => x !== pr),
+                    )
+                  }
+                />
+                {pr.toUpperCase()}
+              </label>
+            ))}
+          </div>
+        </Field>
+        <div className="grid gap-3 sm:grid-cols-4">
+          <Field label="Thickness min (mm)">
+            <Input type="number" value={thicknessMin} onChange={(e) => setThicknessMin(e.target.value)} />
+          </Field>
+          <Field label="Thickness max (mm)">
+            <Input type="number" value={thicknessMax} onChange={(e) => setThicknessMax(e.target.value)} />
+          </Field>
+          <Field label="Qualified from">
+            <Input type="date" value={qualifiedFrom} onChange={(e) => setQualifiedFrom(e.target.value)} />
+          </Field>
+          <Field label="Expires">
+            <Input type="date" value={expiryDate} onChange={(e) => setExpiryDate(e.target.value)} />
+          </Field>
+        </div>
+        <Field
+          label="Continuity period (months)"
+          hint="A qualification lapses if the process is not used within this period, whatever the expiry date says."
+        >
+          <Input
+            type="number"
+            value={continuityMonths}
+            onChange={(e) => setContinuityMonths(e.target.value)}
+          />
+        </Field>
+      </div>
+    </Modal>
   );
 }
 
 function WeldModal({
   weldId,
   projectId,
+  procedures,
+  qualifications,
   onClose,
   onMutated,
 }: {
   weldId: string | null;
   projectId: string;
+  procedures: WeldingProcedure[];
+  qualifications: WelderQualification[];
   onClose: () => void;
   onMutated: () => void;
 }) {
   const { busy, refusal, clear, run } = useAction();
   const [method, setMethod] = useState("rt");
+  const [ndtOrganisation, setNdtOrganisation] = useState("");
+  const [resultFor, setResultFor] = useState<string | null>(null);
+  const [ndtResult, setNdtResult] = useState("accept");
+  const [defectType, setDefectType] = useState("");
+  const [reportNumber, setReportNumber] = useState("");
   const base = `/api/v1/projects/${projectId}/welds/${weldId ?? ""}`;
   const weld = useResource<WeldDetail>((signal) => api.get<WeldDetail>(base, { signal }), [base], weldId !== null);
+  const reload = () => {
+    weld.reload();
+    onMutated();
+  };
   if (!weldId) return null;
   const w = weld.data;
 
@@ -1159,31 +1906,97 @@ function WeldModal({
                     {r.defectType ? (
                       <span className="text-2xs text-danger">{r.defectType}</span>
                     ) : null}
+                    {r.result === "pending" ? (
+                      resultFor === r.id ? (
+                        <span className="flex flex-wrap items-end gap-1.5">
+                          <Field label="Result" className="w-32">
+                            <Select value={ndtResult} onChange={(e) => setNdtResult(e.target.value)}>
+                              <option value="accept">Accept</option>
+                              <option value="reject">Reject</option>
+                              <option value="inconclusive">Inconclusive</option>
+                            </Select>
+                          </Field>
+                          <Field label="Defect" className="w-40">
+                            <Input
+                              value={defectType}
+                              onChange={(e) => setDefectType(e.target.value)}
+                              placeholder="Lack of fusion"
+                            />
+                          </Field>
+                          <Field label="Report no." className="w-32">
+                            <Input
+                              value={reportNumber}
+                              onChange={(e) => setReportNumber(e.target.value)}
+                            />
+                          </Field>
+                          <Button
+                            size="xs"
+                            variant="primary"
+                            loading={busy === `ndt-result-${r.id}`}
+                            onClick={async () => {
+                              const done = await run(`ndt-result-${r.id}`, () =>
+                                api.post(`${base}/ndt/${r.id}/result`, {
+                                  result: ndtResult,
+                                  defectType:
+                                    ndtResult === "accept" || defectType.trim() === ""
+                                      ? null
+                                      : defectType.trim(),
+                                  reportNumber:
+                                    reportNumber.trim() === "" ? null : reportNumber.trim(),
+                                }),
+                              );
+                              if (done) {
+                                setResultFor(null);
+                                setDefectType("");
+                                setReportNumber("");
+                                reload();
+                              }
+                            }}
+                          >
+                            Record
+                          </Button>
+                        </span>
+                      ) : (
+                        <Button size="xs" variant="ghost" onClick={() => setResultFor(r.id)}>
+                          Record the examination result
+                        </Button>
+                      )
+                    ) : null}
                   </li>
                 ))}
               </ul>
             )}
             {w.weldedAt ? (
-              <div className="mt-2 flex items-end gap-2">
+              <div className="mt-2 flex flex-wrap items-end gap-2">
                 <Field label="Request an examination" className="w-40">
                   <Select value={method} onChange={(e) => setMethod(e.target.value)}>
-                    {["vt", "pt", "mt", "rt", "ut", "paut", "hardness"].map((m) => (
+                    {NDT_METHODS.map((m) => (
                       <option key={m} value={m}>
                         {m.toUpperCase()}
                       </option>
                     ))}
                   </Select>
                 </Field>
+                <Field label="Examining organisation" className="w-56">
+                  <Input
+                    value={ndtOrganisation}
+                    onChange={(e) => setNdtOrganisation(e.target.value)}
+                    placeholder="Who carries it out"
+                  />
+                </Field>
                 <Button
                   size="sm"
                   variant="secondary"
                   loading={busy === "ndt"}
                   onClick={async () => {
-                    const done = await run("ndt", () => api.post(`${base}/ndt`, { method }));
-                    if (done) {
-                      weld.reload();
-                      onMutated();
-                    }
+                    const done = await run("ndt", () =>
+                      api.post(`${base}/ndt`, {
+                        method,
+                        performedByOrganisation:
+                          ndtOrganisation.trim() === "" ? null : ndtOrganisation.trim(),
+                      }),
+                    );
+                    if (done) reload();
                   }}
                 >
                   Request
@@ -1191,9 +2004,249 @@ function WeldModal({
               </div>
             ) : null}
           </div>
+
+          <WeldLifecycle
+            weld={w}
+            base={base}
+            qualifications={qualifications}
+            procedures={procedures}
+            onDone={reload}
+          />
         </div>
       )}
     </Modal>
+  );
+}
+
+/**
+ * THE JOINT'S OWN LIFECYCLE: welded → visually inspected → examined → accepted,
+ * or rejected and repaired. Each step names the person and the procedure,
+ * because "the weld was fine" is not a record and a repair with no welder
+ * against it re-creates the problem the map exists to solve.
+ */
+function WeldLifecycle({
+  weld,
+  base,
+  qualifications,
+  procedures,
+  onDone,
+}: {
+  weld: WeldDetail;
+  base: string;
+  qualifications: WelderQualification[];
+  procedures: WeldingProcedure[];
+  onDone: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [welderId, setWelderId] = useState(weld.welderQualificationId ?? "");
+  const [wpsId, setWpsId] = useState(weld.wpsId ?? "");
+  const [weldedAt, setWeldedAt] = useState(new Date().toISOString().slice(0, 10));
+  const [heats, setHeats] = useState(weld.heatNumbers.join(", "));
+  const [nonCompliant, setNonCompliant] = useState(false);
+  const [nonComplianceReason, setNonComplianceReason] = useState("");
+  const [visualNote, setVisualNote] = useState("");
+  const [repairNote, setRepairNote] = useState("");
+  const [cutOut, setCutOut] = useState(false);
+
+  return (
+    <div className="space-y-2">
+      <RefusalNotice refusal={refusal} onDismiss={clear} />
+
+      {!weld.weldedAt ? (
+        <div className="rounded-md border border-border-subtle p-2.5">
+          <div className="text-label uppercase tracking-wide text-content-subtle">
+            Record the weld
+          </div>
+          <p className="mt-0.5 text-2xs text-content-subtle">
+            The welder and the procedure are checked against the qualified envelope. A joint made
+            outside it can still be recorded — knowingly, with a reason — because pretending it was
+            compliant is worse than recording that it was not.
+          </p>
+          <div className="mt-2 grid gap-2 sm:grid-cols-2">
+            <Field label="Welder" required>
+              <Select value={welderId} onChange={(e) => setWelderId(e.target.value)}>
+                <option value="">Choose the welder</option>
+                {qualifications.map((q) => (
+                  <option key={q.id} value={q.id}>
+                    {q.welderName}
+                    {q.welderStamp ? ` (${q.welderStamp})` : ""} — {q.status}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Procedure (WPS)">
+              <Select value={wpsId} onChange={(e) => setWpsId(e.target.value)}>
+                <option value="">Use the one on the joint</option>
+                {procedures.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.wpsNumber} — {p.title}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Welded on">
+              <Input type="date" value={weldedAt} onChange={(e) => setWeldedAt(e.target.value)} />
+            </Field>
+            <Field label="Heat numbers" hint="Comma separated.">
+              <Input value={heats} onChange={(e) => setHeats(e.target.value)} />
+            </Field>
+          </div>
+          <label className="mt-2 flex items-start gap-2 text-2xs text-content-muted">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={nonCompliant}
+              onChange={(e) => setNonCompliant(e.target.checked)}
+            />
+            <span>
+              Record it even though it falls outside the qualified envelope. The API refuses
+              otherwise, and the reason is stored on the joint.
+            </span>
+          </label>
+          {nonCompliant ? (
+            <Field label="Why was it welded outside the envelope?" required className="mt-1">
+              <Textarea
+                rows={2}
+                value={nonComplianceReason}
+                onChange={(e) => setNonComplianceReason(e.target.value)}
+              />
+            </Field>
+          ) : null}
+          <div className="mt-2 flex justify-end">
+            <Button
+              size="sm"
+              variant="primary"
+              loading={busy === "weld"}
+              disabled={welderId === "" || (nonCompliant && nonComplianceReason.trim() === "")}
+              onClick={async () => {
+                const done = await run("weld", () =>
+                  api.post(`${base}/weld`, {
+                    welderQualificationId: welderId,
+                    ...(wpsId === "" ? {} : { wpsId }),
+                    weldedAt,
+                    heatNumbers: splitList(heats),
+                    ...(nonCompliant
+                      ? {
+                          recordNonCompliant: true,
+                          nonComplianceReason: nonComplianceReason.trim(),
+                        }
+                      : {}),
+                  }),
+                );
+                if (done) onDone();
+              }}
+            >
+              Record the weld
+            </Button>
+          </div>
+        </div>
+      ) : null}
+
+      {weld.weldedAt && weld.visualResult === null ? (
+        <div className="rounded-md border border-border-subtle p-2.5">
+          <div className="text-label uppercase tracking-wide text-content-subtle">
+            Visual inspection
+          </div>
+          <p className="mt-0.5 text-2xs text-content-subtle">
+            Every code requires the visual before any other examination; it is also the one that
+            catches most of what is wrong.
+          </p>
+          <Field label="Note" className="mt-2">
+            <Input
+              value={visualNote}
+              onChange={(e) => setVisualNote(e.target.value)}
+              placeholder="Profile, undercut, spatter…"
+            />
+          </Field>
+          <div className="mt-2 flex justify-end gap-2">
+            <Button
+              size="sm"
+              variant="danger"
+              loading={busy === "visual-reject"}
+              onClick={async () => {
+                const done = await run("visual-reject", () =>
+                  api.post(`${base}/visual`, {
+                    result: "reject",
+                    note: visualNote.trim() === "" ? null : visualNote.trim(),
+                  }),
+                );
+                if (done) onDone();
+              }}
+            >
+              Reject
+            </Button>
+            <Button
+              size="sm"
+              variant="primary"
+              loading={busy === "visual-accept"}
+              onClick={async () => {
+                const done = await run("visual-accept", () =>
+                  api.post(`${base}/visual`, {
+                    result: "accept",
+                    note: visualNote.trim() === "" ? null : visualNote.trim(),
+                  }),
+                );
+                if (done) onDone();
+              }}
+            >
+              Accept
+            </Button>
+          </div>
+        </div>
+      ) : null}
+
+      {weld.status === "rejected" ? (
+        <div className="rounded-md border border-danger/40 bg-danger/5 p-2.5">
+          <div className="text-label uppercase tracking-wide text-content-subtle">
+            Repair or cut out
+          </div>
+          <p className="mt-0.5 text-2xs text-content-subtle">
+            A repair is counted in the repair rate for this welder, which is what drives the
+            examination percentage upwards. Cutting the joint out is not a repair: the joint was
+            removed and re-made.
+          </p>
+          <div className="mt-2 grid gap-2 sm:grid-cols-2">
+            <Field label="Welder making the repair">
+              <Select value={welderId} onChange={(e) => setWelderId(e.target.value)}>
+                <option value="">Same as the original</option>
+                {qualifications.map((q) => (
+                  <option key={q.id} value={q.id}>
+                    {q.welderName}
+                    {q.welderStamp ? ` (${q.welderStamp})` : ""}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Note">
+              <Input value={repairNote} onChange={(e) => setRepairNote(e.target.value)} />
+            </Field>
+          </div>
+          <label className="mt-2 flex items-center gap-2 text-2xs text-content-muted">
+            <input type="checkbox" checked={cutOut} onChange={(e) => setCutOut(e.target.checked)} />
+            The joint was cut out and re-made rather than repaired.
+          </label>
+          <div className="mt-2 flex justify-end">
+            <Button
+              size="sm"
+              variant="primary"
+              loading={busy === "repair"}
+              onClick={async () => {
+                const done = await run("repair", () =>
+                  api.post(`${base}/repair`, {
+                    ...(welderId === "" ? {} : { welderQualificationId: welderId }),
+                    cutOut,
+                    note: repairNote.trim() === "" ? null : repairNote.trim(),
+                  }),
+                );
+                if (done) onDone();
+              }}
+            >
+              {cutOut ? "Record the cut-out" : "Record the repair"}
+            </Button>
+          </div>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -1212,6 +2265,7 @@ function CertificatePanel({
 }) {
   const base = `/api/v1/projects/${projectId}`;
   const { busy, refusal, clear, run } = useAction();
+  const [createOpen, setCreateOpen] = useState(false);
   const certificates = useResource<Paged<MaterialCertificate>>(
     (signal) =>
       api.get<Paged<MaterialCertificate>>(`${base}/material-certificates?page=1&pageSize=200`, {
@@ -1340,12 +2394,23 @@ function CertificatePanel({
       )}
       {s ? <ReasonList reasons={s.reasons} /> : null}
 
+      <div className="flex justify-end">
+        <Button size="sm" icon={IconPlus} onClick={() => setCreateOpen(true)}>
+          File a certificate
+        </Button>
+      </div>
+
       {certificates.error ? (
         <LoadError message={certificates.error} onRetry={certificates.reload} />
       ) : rows.length === 0 ? (
         <NothingHere
           title="No material test certificate is recorded"
           reason="The register holds the certificate and the act of reading it: somebody has to compare the yield strength on the mill certificate with the one the specification demanded, and record that they did."
+          action={
+            <Button size="sm" icon={IconPlus} onClick={() => setCreateOpen(true)}>
+              File the first one
+            </Button>
+          }
         />
       ) : (
         <DataTable<MaterialCertificate>
@@ -1369,7 +2434,242 @@ function CertificatePanel({
           }
         />
       )}
+
+      <CreateCertificate
+        open={createOpen}
+        projectId={projectId}
+        onClose={() => setCreateOpen(false)}
+        onCreated={() => {
+          setCreateOpen(false);
+          certificates.reload();
+          summary.reload();
+          onMutated();
+        }}
+      />
     </div>
+  );
+}
+
+/**
+ * FILING A CERTIFICATE is two acts, and the form keeps them apart: what the
+ * SPECIFICATION demands, and what the CERTIFICATE says. Verification then
+ * compares the two and is refused to the person who filed it. Without the
+ * required properties there is nothing to compare, so the register would hold a
+ * PDF and call it evidence.
+ */
+function CreateCertificate({
+  open,
+  onClose,
+  projectId,
+  onCreated,
+}: {
+  open: boolean;
+  onClose: () => void;
+  projectId: string;
+  onCreated: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [certificateNumber, setCertificateNumber] = useState("");
+  const [certificateType, setCertificateType] = useState("en_10204_3_1");
+  const [materialDescription, setMaterialDescription] = useState("");
+  const [materialGrade, setMaterialGrade] = useState("");
+  const [standard, setStandard] = useState("");
+  const [heatNumber, setHeatNumber] = useState("");
+  const [batchNumber, setBatchNumber] = useState("");
+  const [manufacturer, setManufacturer] = useState("");
+  const [quantity, setQuantity] = useState("");
+  const [unit, setUnit] = useState("");
+  const [issuedAt, setIssuedAt] = useState("");
+  const [properties, setProperties] = useState<
+    Array<{ property: string; min: string; max: string; measured: string; unit: string }>
+  >([{ property: "", min: "", max: "", measured: "", unit: "" }]);
+
+  const filled = properties.filter((p) => p.property.trim() !== "");
+
+  async function create() {
+    const done = await run("create", () =>
+      api.post(`/api/v1/projects/${projectId}/material-certificates`, {
+        certificateNumber: certificateNumber.trim(),
+        certificateType,
+        materialDescription: materialDescription.trim(),
+        materialGrade: materialGrade.trim() === "" ? null : materialGrade.trim(),
+        standard: standard.trim() === "" ? null : standard.trim(),
+        heatNumber: heatNumber.trim() === "" ? null : heatNumber.trim(),
+        batchNumber: batchNumber.trim() === "" ? null : batchNumber.trim(),
+        manufacturer: manufacturer.trim() === "" ? null : manufacturer.trim(),
+        quantity: numOrNull(quantity),
+        unit: unit.trim() === "" ? null : unit.trim(),
+        issuedAt: issuedAt === "" ? null : issuedAt,
+        requiredProperties: filled.map((p) => ({
+          property: p.property.trim(),
+          min: numOrNull(p.min),
+          max: numOrNull(p.max),
+          unit: p.unit.trim() === "" ? null : p.unit.trim(),
+        })),
+        measuredProperties: filled
+          .filter((p) => p.measured.trim() !== "")
+          .map((p) => ({
+            property: p.property.trim(),
+            value: numOrNull(p.measured),
+            unit: p.unit.trim() === "" ? null : p.unit.trim(),
+          })),
+      }),
+    );
+    if (done) {
+      setCertificateNumber("");
+      setMaterialDescription("");
+      setHeatNumber("");
+      setBatchNumber("");
+      setProperties([{ property: "", min: "", max: "", measured: "", unit: "" }]);
+      onCreated();
+    }
+  }
+
+  function setRow(index: number, patch: Partial<(typeof properties)[number]>) {
+    setProperties((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)));
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      size="lg"
+      title="File a material test certificate"
+      description="A 2.2 document is a test report on the grade, not on the delivered cast; a 3.1 is specific to the lot and a 3.2 is countersigned by somebody independent. The register records which one arrived, because the three are not interchangeable."
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            variant="primary"
+            loading={busy === "create"}
+            disabled={certificateNumber.trim() === "" || materialDescription.trim() === ""}
+            onClick={create}
+          >
+            File it
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        <RefusalNotice refusal={refusal} onDismiss={clear} />
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Certificate number" required>
+            <Input
+              value={certificateNumber}
+              onChange={(e) => setCertificateNumber(e.target.value)}
+              autoFocus
+            />
+          </Field>
+          <Field label="Document type" hint="Traceability to the delivered lot depends on it.">
+            <Select value={certificateType} onChange={(e) => setCertificateType(e.target.value)}>
+              {CERTIFICATE_TYPES.map((t) => (
+                <option key={t} value={t}>
+                  {CERTIFICATE_TYPE_LABEL[t] ?? labelize(t)}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        </div>
+        <Field label="Material" required>
+          <Input
+            value={materialDescription}
+            onChange={(e) => setMaterialDescription(e.target.value)}
+            placeholder="S355J2 plate, 20mm"
+          />
+        </Field>
+        <div className="grid gap-3 sm:grid-cols-3">
+          <Field label="Grade">
+            <Input value={materialGrade} onChange={(e) => setMaterialGrade(e.target.value)} />
+          </Field>
+          <Field label="Standard">
+            <Input value={standard} onChange={(e) => setStandard(e.target.value)} placeholder="EN 10025-2" />
+          </Field>
+          <Field label="Manufacturer / mill">
+            <Input value={manufacturer} onChange={(e) => setManufacturer(e.target.value)} />
+          </Field>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-4">
+          <Field label="Heat / cast number" hint="What a recall is traced by.">
+            <Input value={heatNumber} onChange={(e) => setHeatNumber(e.target.value)} />
+          </Field>
+          <Field label="Batch number">
+            <Input value={batchNumber} onChange={(e) => setBatchNumber(e.target.value)} />
+          </Field>
+          <Field label="Quantity">
+            <Input type="number" value={quantity} onChange={(e) => setQuantity(e.target.value)} />
+          </Field>
+          <Field label="Unit">
+            <Input value={unit} onChange={(e) => setUnit(e.target.value)} placeholder="t" />
+          </Field>
+        </div>
+        <Field label="Issued">
+          <Input type="date" value={issuedAt} onChange={(e) => setIssuedAt(e.target.value)} />
+        </Field>
+
+        <div className="rounded-md border border-border-subtle p-2.5">
+          <div className="text-label uppercase tracking-wide text-content-subtle">
+            What the specification demands, and what the certificate says
+          </div>
+          <p className="mt-0.5 text-2xs text-content-subtle">
+            Verification compares the two, so a certificate filed with no required properties can
+            never be verified — it can only be stored.
+          </p>
+          <div className="mt-2 space-y-2">
+            {properties.map((row, i) => (
+              <div key={i} className="grid gap-2 sm:grid-cols-5">
+                <Field label={i === 0 ? "Property" : ""}>
+                  <Input
+                    value={row.property}
+                    onChange={(e) => setRow(i, { property: e.target.value })}
+                    placeholder="Yield strength"
+                  />
+                </Field>
+                <Field label={i === 0 ? "Min" : ""}>
+                  <Input
+                    type="number"
+                    value={row.min}
+                    onChange={(e) => setRow(i, { min: e.target.value })}
+                  />
+                </Field>
+                <Field label={i === 0 ? "Max" : ""}>
+                  <Input
+                    type="number"
+                    value={row.max}
+                    onChange={(e) => setRow(i, { max: e.target.value })}
+                  />
+                </Field>
+                <Field label={i === 0 ? "Measured" : ""}>
+                  <Input
+                    type="number"
+                    value={row.measured}
+                    onChange={(e) => setRow(i, { measured: e.target.value })}
+                  />
+                </Field>
+                <Field label={i === 0 ? "Unit" : ""}>
+                  <Input value={row.unit} onChange={(e) => setRow(i, { unit: e.target.value })} />
+                </Field>
+              </div>
+            ))}
+          </div>
+          <Button
+            size="xs"
+            variant="ghost"
+            icon={IconPlus}
+            className="mt-1"
+            onClick={() =>
+              setProperties((prev) => [
+                ...prev,
+                { property: "", min: "", max: "", measured: "", unit: "" },
+              ])
+            }
+          >
+            Add a property
+          </Button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 
@@ -1388,6 +2688,7 @@ function CalibrationPanel({
 }) {
   const base = `/api/v1/projects/${projectId}`;
   const [createOpen, setCreateOpen] = useState(false);
+  const [openId, setOpenId] = useState<string | null>(null);
   const instruments = useResource<Paged<Instrument>>(
     (signal) => api.get<Paged<Instrument>>(`${base}/instruments?page=1&pageSize=200`, { signal }),
     [base, version],
@@ -1401,7 +2702,23 @@ function CalibrationPanel({
 
   const columns = useMemo<DataColumns<Instrument>>(
     () => [
-      { id: "reference", header: "Ref", accessor: "reference", type: "text", sticky: "start", width: 100 },
+      {
+        id: "reference",
+        header: "Ref",
+        accessor: "reference",
+        type: "text",
+        sticky: "start",
+        width: 100,
+        cell: ({ row }) => (
+          <button
+            type="button"
+            className="font-mono text-2xs font-semibold text-accent underline-offset-2 hover:underline"
+            onClick={() => setOpenId(row.id)}
+          >
+            {row.reference}
+          </button>
+        ),
+      },
       { id: "name", header: "Instrument", accessor: "name", type: "text", width: 220 },
       {
         id: "serial",
@@ -1553,7 +2870,285 @@ function CalibrationPanel({
           onMutated();
         }}
       />
+      <InstrumentModal
+        instrumentId={openId}
+        projectId={projectId}
+        onClose={() => setOpenId(null)}
+        onMutated={() => {
+          instruments.reload();
+          summary.reload();
+          onMutated();
+        }}
+      />
     </div>
+  );
+}
+
+/**
+ * ONE INSTRUMENT, its certificates and its standing.
+ *
+ * Recording a calibration is the only way an instrument comes back into
+ * service after a failure: the API refuses a bare status change, because an
+ * instrument returned to service on somebody's say-so reads afterwards as a
+ * calibrated one, and every reading taken with it inherits a certificate that
+ * does not exist.
+ */
+function InstrumentModal({
+  instrumentId,
+  projectId,
+  onClose,
+  onMutated,
+}: {
+  instrumentId: string | null;
+  projectId: string;
+  onClose: () => void;
+  onMutated: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const base = `/api/v1/projects/${projectId}/instruments/${instrumentId ?? ""}`;
+  const instrument = useResource<InstrumentDetail>(
+    (signal) => api.get<InstrumentDetail>(base, { signal }),
+    [base],
+    instrumentId !== null,
+  );
+  const [calibratedAt, setCalibratedAt] = useState(new Date().toISOString().slice(0, 10));
+  const [result, setResult] = useState("pass");
+  const [certificateNumber, setCertificateNumber] = useState("");
+  const [organisation, setOrganisation] = useState("");
+  const [technician, setTechnician] = useState("");
+  const [asFound, setAsFound] = useState("");
+  const [asLeft, setAsLeft] = useState("");
+  const [status, setStatus] = useState("out_of_service");
+  const [statusReason, setStatusReason] = useState("");
+  if (!instrumentId) return null;
+  const row = instrument.data;
+
+  const reload = () => {
+    instrument.reload();
+    onMutated();
+  };
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      size="lg"
+      title={row ? `${row.reference} — ${row.name}` : "Instrument"}
+      description="Its certificates, its standing today, and the two acts that change either."
+      footer={
+        <div className="flex justify-end">
+          <Button variant="ghost" onClick={onClose}>
+            Close
+          </Button>
+        </div>
+      }
+    >
+      {instrument.error ? (
+        <LoadError message={instrument.error} onRetry={instrument.reload} />
+      ) : !row ? (
+        <p className="text-meta text-content-muted">Loading…</p>
+      ) : (
+        <div className="space-y-3 text-meta">
+          <RefusalNotice refusal={refusal} onDismiss={clear} />
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Badge
+              tone={
+                row.standing.status === "in_service"
+                  ? "success"
+                  : row.standing.status === "due_soon"
+                    ? "warning"
+                    : "danger"
+              }
+              size="xs"
+              dot
+            >
+              {labelize(row.standing.status)}
+            </Badge>
+            {!row.standing.usable ? (
+              <Badge tone="danger" size="xs" variant="solid">
+                not usable for a reading today
+              </Badge>
+            ) : null}
+            <span className="font-mono text-2xs">{row.serialNumber}</span>
+            <span className="text-2xs text-content-subtle">
+              due {isoDate(row.calibrationDueDate)} · every {row.calibrationIntervalMonths} months
+            </span>
+          </div>
+          <ReasonList reasons={row.standing.reasons} />
+          {row.outOfServiceReason ? (
+            <Alert tone="warning" title="Out of service">
+              {row.outOfServiceReason}
+            </Alert>
+          ) : null}
+
+          <div className="rounded-md border border-border-subtle p-2.5">
+            <div className="text-label uppercase tracking-wide text-content-subtle">
+              Calibration history
+            </div>
+            {row.history.length === 0 ? (
+              <p className="mt-1 text-content-muted">
+                None recorded. An instrument with no calibration behind it is treated as overdue
+                rather than as in service, because nothing shows it was ever calibrated.
+              </p>
+            ) : (
+              <ul className="mt-1 space-y-1">
+                {row.history.map((h) => (
+                  <li key={h.id} className="flex flex-wrap items-center gap-1.5">
+                    <span className="tabular-nums">{isoDate(h.calibratedAt)}</span>
+                    <Badge
+                      tone={
+                        h.result === "pass"
+                          ? "success"
+                          : h.result === "fail"
+                            ? "danger"
+                            : "warning"
+                      }
+                      size="xs"
+                      dot
+                    >
+                      {labelize(h.result)}
+                    </Badge>
+                    <span className="text-2xs text-content-subtle">
+                      {h.certificateNumber ?? "no certificate number"}
+                      {h.calibratedByOrganisation ? ` · ${h.calibratedByOrganisation}` : ""}
+                      {h.calibrationDueDate ? ` · next due ${isoDate(h.calibrationDueDate)}` : ""}
+                    </span>
+                    {h.asFoundCondition ? (
+                      <span className="text-2xs text-content-muted">
+                        as found: {h.asFoundCondition}
+                      </span>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          <div className="rounded-md border border-border-subtle p-2.5">
+            <div className="text-label uppercase tracking-wide text-content-subtle">
+              Record a calibration
+            </div>
+            <p className="mt-0.5 text-2xs text-content-subtle">
+              A FAIL takes the instrument out of service and names the window of readings its
+              failure puts in doubt — which is the answer to the question an auditor actually asks.
+            </p>
+            <div className="mt-2 grid gap-2 sm:grid-cols-3">
+              <Field label="Calibrated on" required>
+                <Input
+                  type="date"
+                  value={calibratedAt}
+                  onChange={(e) => setCalibratedAt(e.target.value)}
+                />
+              </Field>
+              <Field label="Result">
+                <Select value={result} onChange={(e) => setResult(e.target.value)}>
+                  {CALIBRATION_RESULTS.map((r) => (
+                    <option key={r} value={r}>
+                      {labelize(r)}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              <Field label="Certificate number">
+                <Input
+                  value={certificateNumber}
+                  onChange={(e) => setCertificateNumber(e.target.value)}
+                />
+              </Field>
+              <Field label="Calibrated by">
+                <Input value={organisation} onChange={(e) => setOrganisation(e.target.value)} />
+              </Field>
+              <Field label="Technician">
+                <Input value={technician} onChange={(e) => setTechnician(e.target.value)} />
+              </Field>
+              <Field label="As found" hint="What the instrument read before adjustment.">
+                <Input value={asFound} onChange={(e) => setAsFound(e.target.value)} />
+              </Field>
+            </div>
+            <Field label="As left" className="mt-2">
+              <Input value={asLeft} onChange={(e) => setAsLeft(e.target.value)} />
+            </Field>
+            <div className="mt-2 flex justify-end">
+              <Button
+                size="sm"
+                variant="primary"
+                loading={busy === "calibrate"}
+                onClick={async () => {
+                  const done = await run("calibrate", () =>
+                    api.post(`${base}/calibrate`, {
+                      calibratedAt,
+                      result,
+                      certificateNumber:
+                        certificateNumber.trim() === "" ? null : certificateNumber.trim(),
+                      calibratedByOrganisation:
+                        organisation.trim() === "" ? null : organisation.trim(),
+                      technicianName: technician.trim() === "" ? null : technician.trim(),
+                      asFoundCondition: asFound.trim() === "" ? null : asFound.trim(),
+                      asLeftCondition: asLeft.trim() === "" ? null : asLeft.trim(),
+                    }),
+                  );
+                  if (done) {
+                    setCertificateNumber("");
+                    setAsFound("");
+                    setAsLeft("");
+                    reload();
+                  }
+                }}
+              >
+                Record the calibration
+              </Button>
+            </div>
+          </div>
+
+          <div className="rounded-md border border-border-subtle p-2.5">
+            <div className="text-label uppercase tracking-wide text-content-subtle">
+              Change its standing
+            </div>
+            <p className="mt-0.5 text-2xs text-content-subtle">
+              Withdrawing an instrument affects every reading it was used for, so it carries a
+              reason. Returning one to service after a failed calibration is refused: record the
+              passing calibration instead.
+            </p>
+            <div className="mt-2 grid gap-2 sm:grid-cols-2">
+              <Field label="Standing">
+                <Select value={status} onChange={(e) => setStatus(e.target.value)}>
+                  {INSTRUMENT_STATUSES.map((st) => (
+                    <option key={st} value={st}>
+                      {labelize(st)}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              <Field label="Reason" hint="Required for anything but a return to service.">
+                <Input value={statusReason} onChange={(e) => setStatusReason(e.target.value)} />
+              </Field>
+            </div>
+            <div className="mt-2 flex justify-end">
+              <Button
+                size="sm"
+                variant="secondary"
+                loading={busy === "status"}
+                disabled={status !== "in_service" && statusReason.trim() === ""}
+                onClick={async () => {
+                  const done = await run("status", () =>
+                    api.post(`${base}/status`, {
+                      status,
+                      reason: statusReason.trim() === "" ? null : statusReason.trim(),
+                    }),
+                  );
+                  if (done) {
+                    setStatusReason("");
+                    reload();
+                  }
+                }}
+              >
+                Record it
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+    </Modal>
   );
 }
 

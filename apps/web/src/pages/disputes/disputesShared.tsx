@@ -92,9 +92,6 @@ export interface BundleItem {
   /** BundleItemPrivilege — anything other than "none" is withheld (#340-342) */
   privilege?: string;
   privilegeReason?: string | null;
-  /** page span in the produced bundle, assigned at generation */
-  startPage?: number | null;
-  endPage?: number | null;
 }
 
 export interface ManifestIndexEntry {
@@ -118,8 +115,6 @@ export interface BundleManifest {
     privilege: string;
     reason: string | null;
   }>;
-  /** total pages including the cover and the hyperlinked index */
-  pages?: number;
   statement?: string;
 }
 
@@ -160,9 +155,24 @@ export interface DisputeDetail extends DisputeRow {
 
 export interface VerifyResult {
   intact: boolean;
+  /** false when the index was rewritten — either the root no longer recomputes
+   *  or an entry disagrees with the snapshot written at generation */
+  manifestIntact: boolean;
   merkleRoot: string;
+  recomputedRoot: string;
   itemCount: number;
+  snapshotCount: number;
+  rewrittenCount: number;
+  findings: {
+    tab: string;
+    title: string;
+    state: "intact" | "changed" | "missing" | "unsnapshotted" | "manifest_rewritten";
+    expected: string;
+    actual: string | null;
+    note: string;
+  }[];
   mismatches: { tab: string; title: string; expected: string; actual: string | null }[];
+  statement: string;
 }
 
 export interface SettlementAnalysisResult {

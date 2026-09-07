@@ -646,6 +646,80 @@ describe("computed covenants", () => {
     });
     expect(after.json().items).toHaveLength(1);
     expect(after.json().items[0].compliant).toBe(1);
+
+    // The breach found on the first save is signalled once and closed by the
+    // corrected period — one finding, not one per save, and never a stale
+    // open breach against a compliant reading.
+    const breachSignals = await app.db
+      .select()
+      .from(signals)
+      .where(and(eq(signals.projectId, pid), eq(signals.detector, "covenant_breach")));
+    expect(breachSignals).toHaveLength(1);
+    expect(breachSignals[0]!.disposition).toBe("closed");
+  });
+
+  it("REGRESSION: a corrected manual reading replaces the old one and closes its breach signal", async () => {
+    const pid = await makeProject("Covenant Correction");
+    const facility = await createFacility(pid);
+    const covenant = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/facilities/${facility.id}/covenants`,
+      headers: owner.headers,
+      payload: { name: "DSCR", operator: "gte", threshold: 1.2, unit: "x" },
+    });
+    const covenantId = covenant.json().id as string;
+    const readingDate = todayISO();
+    const postReading = (value: number) =>
+      app.inject({
+        method: "POST",
+        url: `/api/v1/projects/${pid}/covenants/${covenantId}/readings`,
+        headers: owner.headers,
+        payload: { readingDate, value },
+      });
+
+    // A mistyped ratio, posted twice.
+    expect((await postReading(0.9)).statusCode).toBe(201);
+    const second = await postReading(0.95);
+    expect(second.statusCode).toBe(200); // corrected, not stacked
+
+    const afterBreaches = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/covenants/${covenantId}/readings`,
+      headers: owner.headers,
+    });
+    expect(afterBreaches.json().items).toHaveLength(1);
+    expect(afterBreaches.json().items[0].value).toBe(0.95);
+
+    const openBreaches = async () =>
+      (
+        await app.db
+          .select()
+          .from(signals)
+          .where(and(eq(signals.projectId, pid), eq(signals.detector, "covenant_breach")))
+      ).filter((sig) => sig.disposition !== "closed");
+    // One event, one signal — not one per re-post.
+    expect(await openBreaches()).toHaveLength(1);
+
+    // The compliant correction closes it rather than leaving it to rot.
+    const corrected = await postReading(1.5);
+    expect(corrected.statusCode).toBe(200);
+    expect(await openBreaches()).toHaveLength(0);
+    const finalSeries = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/covenants/${covenantId}/readings`,
+      headers: owner.headers,
+    });
+    expect(finalSeries.json().items).toHaveLength(1);
+    expect(finalSeries.json().items[0].compliant).toBe(1);
+
+    // A different test date is still its own reading.
+    const nextPeriod = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/covenants/${covenantId}/readings`,
+      headers: owner.headers,
+      payload: { readingDate: addDaysISO(readingDate, 90), value: 1.4 },
+    });
+    expect(nextPeriod.statusCode).toBe(201);
   });
 
   it("reports the missing input rather than a zero when a formula cannot be computed", async () => {
@@ -746,6 +820,55 @@ describe("withdrawal application", () => {
     expect(body.certification.certified).toBe(false);
     expect(body.certification.requiredForInstrument).toBe(true);
     expect(body.warnings.join(" ")).toMatch(/NOT been certified/i);
+  });
+
+  it("REGRESSION: the application can actually be sent — printable form and SoE export", async () => {
+    const pid = await makeProject("Application Export");
+    const facility = await createFacility(pid);
+    const ev = await insertEvidence(pid);
+    const created = await createRequest(pid, facility.id, { amount: 42_500, evidenceIds: [ev] });
+    const id = created.json().id as string;
+    await classifyAllEligible(pid, id, [ev]);
+
+    const form = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/disbursements/${id}/application.html`,
+      headers: owner.headers,
+    });
+    expect(form.statusCode).toBe(200);
+    expect(form.headers["content-type"]).toContain("text/html");
+    // The lender's three sections, the money and the certification position.
+    expect(form.body).toContain("Section 1 — Application");
+    expect(form.body).toContain("Section 2 — Statement of expenditure");
+    expect(form.body).toContain("Section 3 — Certification");
+    expect(form.body).toContain("Development Bank");
+    expect(form.body).toContain("42,500.00");
+    expect(form.body).toContain("NOT CERTIFIED");
+
+    const csv = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/disbursements/${id}/application.csv`,
+      headers: owner.headers,
+    });
+    expect(csv.statusCode).toBe(200);
+    expect(csv.headers["content-type"]).toContain("text/csv");
+    expect(csv.headers["content-disposition"]).toContain("withdrawal-application-");
+    const lines = csv.body.trim().split("\n");
+    expect(lines[0]).toBe("field,value");
+    expect(csv.body).toContain("evidenceId,kind,source,capturedAt,contentHash,eligibility,reason,amount");
+    expect(csv.body).toContain(ev);
+    expect(csv.body).toContain("eligible");
+
+    // and another company cannot pull either rendering
+    const stranger = await registerActor(app);
+    for (const suffix of ["application.html", "application.csv"]) {
+      const res = await app.inject({
+        method: "GET",
+        url: `/api/v1/projects/${pid}/disbursements/${id}/${suffix}`,
+        headers: stranger.headers,
+      });
+      expect([403, 404]).toContain(res.statusCode);
+    }
   });
 });
 
@@ -952,6 +1075,30 @@ describe("designated accounts", () => {
       payload,
     });
   }
+
+  it("REGRESSION: a status given at creation is applied, not silently discarded", async () => {
+    const pid = await makeProject("Historic Account");
+    const facility = await createFacility(pid);
+    // A historical account recorded as already closed must not come back
+    // active, accept entries or land in the unreconciled sweep.
+    const account = await createAccount(pid, facility.id, {
+      name: "Closed predecessor account",
+      status: "closed",
+    });
+    expect((account as unknown as { status: string }).status).toBe("closed");
+
+    const entry = await addEntry(pid, account.id, {
+      entryDate: todayISO(),
+      kind: "advance",
+      amount: 1_000,
+      description: "Should be refused on a closed account",
+    });
+    expect(entry.statusCode).toBe(400);
+
+    // and the default is still active
+    const live = await createAccount(pid, facility.id, { name: "Live account" });
+    expect((live as unknown as { status: string }).status).toBe("active");
+  });
 
   it("keeps a signed ledger and reports the outstanding advance", async () => {
     const pid = await makeProject("Designated Account Project");

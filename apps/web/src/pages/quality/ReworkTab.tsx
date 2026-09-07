@@ -13,7 +13,7 @@
  * and appraisal are COUNTED rather than costed, because the platform does not
  * hold the inspection hours and a £0 would make the ratio flattering and false.
  */
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import {
   Badge,
   Button,
@@ -39,6 +39,7 @@ import {
   num,
   plural,
   useAction,
+  useReason,
   type Resource,
 } from "./qualityShared";
 import type { CostOfQuality, FirstTimeRight, Paged, ReworkItem, ReworkSummary } from "./types";
@@ -81,10 +82,61 @@ export default function ReworkTab({
   onMutated: () => void;
 }) {
   const [createOpen, setCreateOpen] = useState(false);
+  const { busy, refusal, clear, run } = useAction();
+  const { ask, dialog } = useReason();
   const rows = rework.data?.items ?? [];
   const s = summary.data;
   const coq = costOfQuality.data;
   const ftr = firstTimeRight.data;
+  const base = `/api/v1/projects/${projectId}/rework-items`;
+
+  /**
+   * The rework item's own lifecycle. It was unreachable from this screen: an
+   * item could be raised and never progressed, so the register filled with
+   * "raised" rows and the verified-rework figure stayed at zero for ever.
+   *
+   * Cancelling removes a cost from the project's failure record, so the API
+   * demands a reason and this asks for one before calling.
+   */
+  const advance = useCallback(
+    async (item: ReworkItem, status: string) => {
+      let note: string | null = null;
+      if (status === "cancelled") {
+        note = await ask({
+          title: `Cancel ${item.reference}`,
+          description:
+            "Cancelling removes this cost from the project's record of what failure cost. Say why it is not rework after all — the note is stored on the item and in the ledger.",
+          label: "Why is it being cancelled?",
+          confirmLabel: "Cancel the item",
+          destructive: true,
+        });
+        if (!note) return;
+      }
+      const done = await run(`${item.id}-${status}`, () =>
+        api.post(`${base}/${item.id}/status`, { status, note }),
+      );
+      if (done) onMutated();
+    },
+    [ask, base, onMutated, run],
+  );
+
+  const verify = useCallback(
+    async (item: ReworkItem) => {
+      const note = await ask({
+        title: `Verify ${item.reference}`,
+        description:
+          "Verification is segregated: the person who recorded the rework may not be the one who confirms it was put right. Say what was checked.",
+        label: "What was checked?",
+        confirmLabel: "Record the verification",
+      });
+      if (!note) return;
+      const done = await run(`${item.id}-verify`, () =>
+        api.post(`${base}/${item.id}/verify`, { note }),
+      );
+      if (done) onMutated();
+    },
+    [ask, base, onMutated, run],
+  );
 
   const columns = useMemo<DataColumns<ReworkItem>>(
     () => [
@@ -166,12 +218,82 @@ export default function ReworkTab({
         width: 120,
         cell: ({ row }) => <span className="text-2xs tabular-nums">{isoDate(row.discoveredAt)}</span>,
       },
+      {
+        id: "progress",
+        header: "Move it on",
+        headerTooltip:
+          "Approve → start → complete → verify. Verification is refused to the person who recorded the item.",
+        accessor: (r) => r.status,
+        type: "text",
+        width: 260,
+        cell: ({ row }) => (
+          <div className="flex flex-wrap items-center gap-1 py-0.5">
+            {row.status === "raised" ? (
+              <Button
+                size="xs"
+                variant="ghost"
+                loading={busy === `${row.id}-approved`}
+                onClick={() => advance(row, "approved")}
+              >
+                Approve
+              </Button>
+            ) : null}
+            {row.status === "raised" || row.status === "approved" ? (
+              <Button
+                size="xs"
+                variant="ghost"
+                loading={busy === `${row.id}-in_progress`}
+                onClick={() => advance(row, "in_progress")}
+              >
+                Start
+              </Button>
+            ) : null}
+            {row.status === "in_progress" || row.status === "approved" ? (
+              <Button
+                size="xs"
+                variant="ghost"
+                loading={busy === `${row.id}-complete`}
+                onClick={() => advance(row, "complete")}
+              >
+                Complete
+              </Button>
+            ) : null}
+            {row.status === "complete" ? (
+              <Button
+                size="xs"
+                variant="primary"
+                loading={busy === `${row.id}-verify`}
+                onClick={() => verify(row)}
+              >
+                Verify
+              </Button>
+            ) : null}
+            {row.status !== "verified" && row.status !== "cancelled" ? (
+              <Button
+                size="xs"
+                variant="ghost"
+                loading={busy === `${row.id}-cancelled`}
+                onClick={() => advance(row, "cancelled")}
+              >
+                Cancel
+              </Button>
+            ) : null}
+            {row.status === "verified" ? (
+              <span className="text-2xs text-content-subtle">
+                verified {isoDate(row.verifiedAt)}
+              </span>
+            ) : null}
+          </div>
+        ),
+      },
     ],
-    [],
+    [advance, busy, verify],
   );
 
   return (
     <div className="space-y-4">
+      {dialog}
+      <RefusalNotice refusal={refusal} onDismiss={clear} />
       {summary.error ? (
         <LoadError message={summary.error} onRetry={summary.reload} />
       ) : (

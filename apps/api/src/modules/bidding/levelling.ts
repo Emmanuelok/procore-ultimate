@@ -242,6 +242,14 @@ export const levellingRoutes: FastifyPluginAsync = async (app) => {
       const parsed = itemsCreateSchema.parse(req.body);
       const wanted = "items" in parsed ? parsed.items : [parsed];
       const pkg = await fetchPackage(app.db, packageId, req.companyId!, req.projectId!);
+      /*
+       * ADDING a scope row under a live award moves what the award covers.
+       * `planAwardScope` reports "remaining" from these rows, so a new
+       * mandatory row after a partial award silently changes what the
+       * platform believes was bought, with no record that the scope moved.
+       * The edit and delete paths were already frozen; this is the third.
+       */
+      await assertNoLiveAward(packageId, "Adding a levelling scope row");
       const existing = await app.db
         .select({ position: bidLevellingItems.position, itemCode: bidLevellingItems.itemCode })
         .from(bidLevellingItems)

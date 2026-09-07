@@ -1,5 +1,5 @@
 {
-  "id": "b9e96ffc-3a14-4504-ba50-c040c565f900",
+  "id": "7ebff26d-6fd6-49fd-91e8-5dfa864a65d5",
   "prevId": "340cf323-a4ed-4b81-8d6c-8f3e94b698e3",
   "version": "7",
   "dialect": "postgresql",
@@ -29188,18 +29188,6 @@
         "snapshot": {
           "name": "snapshot",
           "type": "jsonb",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "start_page": {
-          "name": "start_page",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "end_page": {
-          "name": "end_page",
-          "type": "integer",
           "primaryKey": false,
           "notNull": false
         },

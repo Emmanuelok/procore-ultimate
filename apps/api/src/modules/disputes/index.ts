@@ -75,6 +75,7 @@ import {
   sweepMissedDeadlines as sweepDeadlinesShared,
 } from "./jobs.js";
 import { companyToolGate, visibleProjectIds } from "../governance/gates.js";
+import { renderBundleDocumentHtml } from "./bundle.js";
 
 /* ------------------------------------------------------------------ */
 /* Shapes                                                              */
@@ -115,9 +116,6 @@ interface BundleItem {
   /** BundleItemPrivilege — "none" for anything produced (#340-342) */
   privilege?: string;
   privilegeReason?: string | null;
-  /** page span in the produced bundle, assigned at generation */
-  startPage?: number | null;
-  endPage?: number | null;
 }
 
 interface ManifestIndexEntry {
@@ -141,8 +139,6 @@ interface BundleManifest {
     privilege: string;
     reason: string | null;
   }>;
-  /** total pages in the produced bundle including cover and index */
-  pages?: number;
   statement?: string;
 }
 
@@ -1006,6 +1002,37 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
     if (TERMINAL.includes(dispute.status as DisputeStatus)) {
       throw badRequest(`A ${dispute.status} dispute can no longer be edited`);
     }
+    // A dispute's currency denominates amountInDispute, amountClaimed,
+    // amountAwarded and costsAwarded, and it decides which offers and cost
+    // rows are "comparable" in the settlement analysis and the company
+    // outcome database. Relabelling it once money exists restates the claim
+    // and silently drops or admits rows, so it is refused — the same rule
+    // the module already applies to a terminal dispute.
+    if (body.currency !== undefined && body.currency !== dispute.currency) {
+      const [offerCount] = await app.db
+        .select({ n: count() })
+        .from(settlementOffers)
+        .where(eq(settlementOffers.disputeId, disputeId));
+      const [costCount] = await app.db
+        .select({ n: count() })
+        .from(disputeCosts)
+        .where(eq(disputeCosts.disputeId, disputeId));
+      const blockers: string[] = [];
+      if (Number(offerCount?.n ?? 0) > 0) blockers.push(`${offerCount!.n} settlement offer(s)`);
+      if (Number(costCount?.n ?? 0) > 0) blockers.push(`${costCount!.n} recorded cost(s)`);
+      if (dispute.amountAwarded != null) blockers.push("an award");
+      if (dispute.costsAwarded != null) blockers.push("a costs award");
+      if (blockers.length > 0) {
+        throw conflict(
+          `The currency of this dispute cannot be changed from ${dispute.currency} to ${body.currency}: ` +
+            `it already holds ${blockers.join(", ")} denominated in ${dispute.currency}. ` +
+            `Changing it would relabel every recorded amount and change which offers and costs the ` +
+            `settlement analysis treats as comparable. Correct the amounts on a new dispute, or ` +
+            `record the conversion explicitly.`,
+        );
+      }
+    }
+
     const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
     if (body.title !== undefined) set["title"] = body.title;
     if (body.forum !== undefined) set["forum"] = body.forum;
@@ -1502,8 +1529,6 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
           sha256: null,
           privilege: raw.privilege,
           privilegeReason: raw.privilegeReason ?? null,
-          startPage: null,
-          endPage: null,
         });
       }
       const now = new Date().toISOString();
@@ -1604,11 +1629,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
         kind: "record" | "file";
         sha256: string;
         snapshot: Record<string, unknown> | null;
-        startPage: number;
-        endPage: number;
       }> = [];
-      // Page 1 is the cover, page 2 the index; content starts at page 3.
-      let page = 3;
       for (const [i, item] of produced.entries()) {
         const resolved = await itemContent(item, req.companyId!, req.projectId!);
         if (!resolved) {
@@ -1618,13 +1639,6 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
         }
         item.tab = `A${i + 1}`;
         item.sha256 = resolved.sha256;
-        // A record renders on one page; a file's extent is unknown to the
-        // platform, so it is reserved one page and the span is honest about
-        // being a placeholder for the real page count at print time.
-        const pages = 1;
-        item.startPage = page;
-        item.endPage = page + pages - 1;
-        page += pages;
         index.push({
           tab: item.tab,
           title: item.title,
@@ -1638,16 +1652,12 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
           kind: resolved.kind,
           sha256: resolved.sha256,
           snapshot: resolved.snapshot,
-          startPage: item.startPage,
-          endPage: item.endPage,
         });
       }
       // Withheld items keep no tab and no hash — they are not in the bundle.
       for (const item of withheld) {
         item.tab = null;
         item.sha256 = null;
-        item.startPage = null;
-        item.endPage = null;
       }
 
       const root = merkleRoot(index.map((e) => e.sha256));
@@ -1664,15 +1674,15 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
           privilege: i.privilege ?? "none",
           reason: i.privilegeReason ?? null,
         })),
-        pages: page - 1,
         statement:
           `${index.length} item(s) produced under Merkle root ${root}; ` +
           (withheld.length > 0
             ? `${withheld.length} item(s) withheld on grounds of privilege and listed in the privilege log. `
             : "nothing withheld. ") +
           `Each produced item's content is snapshotted at generation, so verification distinguishes ` +
-          `tampering from an ordinary later change to the source record. Page numbers assume one ` +
-          `page per item plus a cover and index; the real extent of attached files is set at print.`,
+          `tampering from an ordinary later change to the source record. Items are addressed by tab: ` +
+          `page numbers are set by the printer, because the extent of an attached file is not ` +
+          `something this platform holds.`,
       };
 
       await app.db.transaction(async (tx) => {
@@ -1698,8 +1708,6 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
               kind: snap.kind,
               sha256: snap.sha256,
               snapshot: snap.snapshot,
-              startPage: snap.startPage,
-              endPage: snap.endPage,
             })),
           );
         }
@@ -1773,17 +1781,11 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
       const bundle = await fetchBundle(bundleId, req.companyId!, req.projectId!);
       const manifest = bundle.manifest as BundleManifest | null;
       if (!manifest) throw badRequest("Bundle has not been generated yet");
-      const snaps = await app.db
-        .select()
-        .from(bundleSnapshots)
-        .where(eq(bundleSnapshots.bundleId, bundleId));
-      const pageByTab = new Map(snaps.map((s) => [s.tab, s.startPage]));
-      const lines = ["tab,page,title,date,source,sha256"];
+      const lines = ["tab,title,date,source,sha256"];
       for (const e of manifest.index) {
         lines.push(
           [
             csvCell(e.tab),
-            csvCell(String(pageByTab.get(e.tab) ?? "")),
             csvCell(e.title),
             csvCell(e.date),
             csvCell(e.source),
@@ -1795,6 +1797,69 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
         .header("content-type", "text/csv; charset=utf-8")
         .header("content-disposition", `attachment; filename="bundle-${bundle.id}-manifest.csv"`)
         .send(lines.join("\n") + "\n");
+    },
+  );
+
+  /**
+   * The produced bundle itself (#343): cover, hyperlinked index, one section
+   * per item rendered FROM THE SNAPSHOT, and the privilege log — print-ready,
+   * so the browser's "save as PDF" produces the served document. There is no
+   * PDF writer in this runtime, so the platform renders the document rather
+   * than claiming a PDF it cannot produce, and addresses items by tab rather
+   * than printing page numbers it cannot know.
+   */
+  app.get(
+    "/projects/:projectId/dispute-bundles/:bundleId/document.html",
+    { preHandler: readGate },
+    async (req, reply) => {
+      const { bundleId } = req.params as { bundleId: string };
+      const bundle = await fetchBundle(bundleId, req.companyId!, req.projectId!);
+      const manifest = bundle.manifest as BundleManifest | null;
+      if (!manifest) throw badRequest("Bundle has not been generated yet");
+      const dispute = await fetchDispute(bundle.disputeId, req.companyId!, req.projectId!);
+      const projectRow = (
+        await app.db
+          .select({ name: projects.name })
+          .from(projects)
+          .where(eq(projects.id, req.projectId!))
+          .limit(1)
+      )[0];
+      const snaps = await app.db
+        .select()
+        .from(bundleSnapshots)
+        .where(eq(bundleSnapshots.bundleId, bundleId));
+      const snapByTab = new Map(snaps.map((sn) => [sn.tab, sn]));
+      const html = renderBundleDocumentHtml({
+        bundleName: bundle.name,
+        disputeReference: `Dispute #${dispute.number}`,
+        disputeTitle: dispute.title,
+        projectName: projectRow?.name ?? null,
+        generatedAt: manifest.generatedAt,
+        merkleRoot: manifest.merkleRoot,
+        statement: manifest.statement ?? "",
+        items: manifest.index.map((e) => {
+          const snap = snapByTab.get(e.tab);
+          return {
+            tab: e.tab,
+            title: e.title,
+            date: e.date,
+            source: e.source,
+            sha256: e.sha256,
+            kind: (snap?.kind as "record" | "file" | undefined) ?? null,
+            snapshot: (snap?.snapshot as Record<string, unknown> | null) ?? null,
+          };
+        }),
+        privilegeLog: (manifest.privilegeLog ?? []).map((p) => ({
+          title: p.title,
+          date: p.date,
+          privilege: p.privilege,
+          reason: p.reason,
+        })),
+      });
+      return reply
+        .type("text/html; charset=utf-8")
+        .header("content-disposition", `inline; filename="bundle-${bundle.id}.html"`)
+        .send(html);
     },
   );
 
@@ -1827,7 +1892,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
       const findings: Array<{
         tab: string;
         title: string;
-        state: "intact" | "changed" | "missing" | "unsnapshotted";
+        state: "intact" | "changed" | "missing" | "unsnapshotted" | "manifest_rewritten";
         expected: string;
         actual: string | null;
         note: string;
@@ -1836,6 +1901,29 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
         const item = byTab.get(entry.tab);
         const resolved = item ? await itemContent(item, req.companyId!, req.projectId!) : null;
         const snap = snapByTab.get(entry.tab);
+        // FIRST: does the manifest still agree with the INDEPENDENT record?
+        // Recomputing the Merkle root from the manifest's own index only
+        // catches an index edited without recomputing the root. bundle_
+        // snapshots was written in the generation transaction and is not
+        // reachable from the manifest, so a coordinated rewrite of index +
+        // root shows up here and nowhere else.
+        if (snap && snap.sha256 !== entry.sha256) {
+          findings.push({
+            tab: entry.tab,
+            title: entry.title,
+            state: "manifest_rewritten",
+            expected: snap.sha256,
+            actual: entry.sha256,
+            note:
+              `The manifest now records ${entry.sha256} for this tab, but the snapshot written ` +
+              `when the bundle was produced records ${snap.sha256}. The manifest has been rewritten ` +
+              `since generation` +
+              (resolved
+                ? `; the source currently hashes to ${resolved.sha256}.`
+                : `, and the source no longer resolves.`),
+          });
+          continue;
+        }
         if (!resolved) {
           findings.push({
             tab: entry.tab,
@@ -1873,7 +1961,12 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
       }
 
       const recomputedRoot = merkleRoot(manifest.index.map((e) => e.sha256));
-      const manifestIntact = recomputedRoot === manifest.merkleRoot;
+      const rewritten = findings.filter((f) => f.state === "manifest_rewritten");
+      // The manifest is intact only when it recomputes AND agrees with the
+      // independent snapshot record. A rewrite of index+root passes the
+      // first test and fails the second — which is the whole point of
+      // keeping the snapshots outside the manifest.
+      const manifestIntact = recomputedRoot === manifest.merkleRoot && rewritten.length === 0;
       const changed = findings.filter((f) => f.state === "changed" || f.state === "unsnapshotted");
       const missing = findings.filter((f) => f.state === "missing");
       const intact = manifestIntact && changed.length === 0 && missing.length === 0;
@@ -1889,6 +1982,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
           manifestIntact,
           changed: changed.length,
           missing: missing.length,
+          rewritten: rewritten.length,
         },
         projectId: req.projectId!,
       });
@@ -1899,20 +1993,25 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
         recomputedRoot,
         itemCount: manifest.itemCount,
         snapshotCount: snaps.length,
+        rewrittenCount: rewritten.length,
         findings,
         // kept for the existing UI: a plain mismatch list
-        mismatches: [...changed, ...missing].map((f) => ({
+        mismatches: [...rewritten, ...changed, ...missing].map((f) => ({
           tab: f.tab,
           title: f.title,
           expected: f.expected,
           actual: f.actual,
         })),
-        statement:
-          manifestIntact
-            ? `The manifest's Merkle root recomputes to the value recorded at generation, so the ` +
-              `index itself has not been rewritten. ${changed.length} source record(s) have changed ` +
-              `since production and ${missing.length} no longer resolve; the snapshots taken at ` +
-              `generation hold what was actually served.`
+        statement: manifestIntact
+          ? `The manifest's Merkle root recomputes to the value recorded at generation and every ` +
+            `index entry matches the snapshot written when the bundle was produced, so the index ` +
+            `itself has not been rewritten. ${changed.length} source record(s) have changed since ` +
+            `production and ${missing.length} no longer resolve; the snapshots taken at generation ` +
+            `hold what was actually served.`
+          : rewritten.length > 0
+            ? `${rewritten.length} index entr(y/ies) disagree with the snapshot written when the ` +
+              `bundle was produced. The manifest has been rewritten since generation — the Merkle ` +
+              `root ${recomputedRoot === manifest.merkleRoot ? "was recomputed to match, which is what a deliberate rewrite looks like" : "no longer recomputes either"} — and this bundle cannot be relied on.`
             : `The manifest's Merkle root does NOT recompute to the recorded value. The index has ` +
               `been altered since generation and this bundle cannot be relied on.`,
       };

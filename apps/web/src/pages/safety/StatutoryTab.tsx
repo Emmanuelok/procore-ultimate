@@ -48,11 +48,15 @@ import {
   SectionHeading,
   count,
   dateTime,
+  errorMessage,
+  errorReasons,
+  isRefusal,
   labelize,
   nameOf,
   useMutation,
   useResource,
   type Paged,
+  type Refusal,
   type RegulatoryPreview,
   type RegulatoryReportRow,
   type SafetyIncident,
@@ -81,6 +85,11 @@ export default function StatutoryTab({
   const [incidentId, setIncidentId] = useState("");
   const [preview, setPreview] = useState<RegulatoryPreview | null>(null);
   const [previewBusy, setPreviewBusy] = useState(false);
+  const [previewRefusal, setPreviewRefusal] = useState<Refusal | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [submitFor, setSubmitFor] = useState<RegulatoryReportRow | null>(null);
+  const [submissionReference, setSubmissionReference] = useState("");
+  const [submittedAt, setSubmittedAt] = useState("");
   const [certifyFor, setCertifyFor] = useState<RegulatoryReportRow | null>(null);
   const [certifierTitle, setCertifierTitle] = useState("");
   const [viewing, setViewing] = useState<RegulatoryReportRow | null>(null);
@@ -104,8 +113,16 @@ export default function StatutoryTab({
   const reportableIncidents = (incidents.data?.items ?? []).filter((i) => i.isReportable);
   const ready = isYearForm ? year !== "" : incidentId !== "";
 
+  /**
+   * A failed preview says WHY. It used to `catch { setPreview(null) }`, so a
+   * 403, a 400 from the form's own refinements or an incident the register
+   * cannot resolve all cleared the panel silently and the button read as
+   * broken rather than as refused.
+   */
   async function runPreview() {
     setPreviewBusy(true);
+    setPreviewRefusal(null);
+    setPreviewError(null);
     try {
       const params = new URLSearchParams({ form });
       if (isYearForm) params.set("year", year);
@@ -115,8 +132,17 @@ export default function StatutoryTab({
           `/api/v1/projects/${projectId}/safety/regulatory/preview?${params.toString()}`,
         ),
       );
-    } catch {
+    } catch (err: unknown) {
       setPreview(null);
+      if (isRefusal(err)) {
+        setPreviewRefusal({
+          title: "That form could not be built from the records held",
+          message: errorMessage(err, "This form could not be built"),
+          reasons: errorReasons(err),
+        });
+      } else {
+        setPreviewError(errorMessage(err, "This form could not be built"));
+      }
     } finally {
       setPreviewBusy(false);
     }
@@ -263,6 +289,18 @@ export default function StatutoryTab({
               {mutation.error}
             </Alert>
           ) : null}
+          {previewRefusal ? (
+            <RefusalNotice refusal={previewRefusal} onDismiss={() => setPreviewRefusal(null)} />
+          ) : null}
+          {previewError ? (
+            <Alert
+              tone="danger"
+              title="That form could not be previewed"
+              onDismiss={() => setPreviewError(null)}
+            >
+              {previewError}
+            </Alert>
+          ) : null}
 
           <div className="grid gap-3 sm:grid-cols-3">
             <Field label="Form">
@@ -357,21 +395,37 @@ export default function StatutoryTab({
           columns={columns}
           getRowId={(row) => row.id}
           onRowClick={({ row }) => setViewing(row)}
-          rowActions={(row) =>
-            row.form === "osha_300a" && !row.certifiedAt && row.status === "generated" ? (
-              <Button
-                size="xs"
-                variant="outline"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setCertifyFor(row);
-                  setCertifierTitle("");
-                }}
-              >
-                Certify
-              </Button>
-            ) : null
-          }
+          rowActions={(row) => (
+            <span className="flex items-center gap-1">
+              {row.form === "osha_300a" && !row.certifiedAt && row.status === "generated" ? (
+                <Button
+                  size="xs"
+                  variant="outline"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setCertifyFor(row);
+                    setCertifierTitle("");
+                  }}
+                >
+                  Certify
+                </Button>
+              ) : null}
+              {row.status === "generated" ? (
+                <Button
+                  size="xs"
+                  variant="outline"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setSubmitFor(row);
+                    setSubmissionReference("");
+                    setSubmittedAt("");
+                  }}
+                >
+                  Mark submitted
+                </Button>
+              ) : null}
+            </span>
+          )}
           empty={{
             icon: IconStamp,
             title: "No statutory form has been generated for this project",
@@ -427,6 +481,73 @@ export default function StatutoryTab({
               onChange={(e) => setCertifierTitle(e.target.value)}
             />
           </Field>
+        </div>
+      </Modal>
+
+      {/* ------------------------------------------------------------ */}
+      <Modal
+        open={submitFor !== null}
+        onClose={() => setSubmitFor(null)}
+        title="Record that this artefact was filed"
+        size="md"
+        footer={
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" onClick={() => setSubmitFor(null)}>
+              Cancel
+            </Button>
+            <Button
+              loading={mutation.busy === "submit"}
+              onClick={() =>
+                void mutation.run("submit", "This artefact could not be marked submitted", async () => {
+                  await api.post(
+                    `/api/v1/projects/${projectId}/safety/regulatory/reports/${submitFor?.id}/submit`,
+                    {
+                      ...(submissionReference.trim()
+                        ? { submissionReference: submissionReference.trim() }
+                        : {}),
+                      ...(submittedAt ? { submittedAt: new Date(submittedAt).toISOString() } : {}),
+                    },
+                  );
+                  setSubmitFor(null);
+                })
+              }
+            >
+              Mark it submitted
+            </Button>
+          </div>
+        }
+      >
+        <div className="space-y-3">
+          <Alert tone="info" title="Nothing is transmitted from here">
+            The platform does not file with any authority. This records that the artefact
+            {submitFor ? ` ${submitFor.reference}` : ""} — frozen and hashed as it stands — is the one
+            that was submitted, when, and under what reference the authority gave back. That is the
+            fact somebody has to produce later; the artefact itself is unchanged.
+          </Alert>
+          {submitFor && submitFor.caveats.length > 0 ? (
+            <Alert tone="warning" size="sm" title="This artefact carries caveats">
+              <ReasonList reasons={submitFor.caveats} />
+            </Alert>
+          ) : null}
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field
+              label="The authority's reference"
+              hint="What came back from the HSE online form or the OSHA submission. Leave blank if none was issued."
+            >
+              <Input
+                value={submissionReference}
+                placeholder="HSE/2026/9001"
+                onChange={(e) => setSubmissionReference(e.target.value)}
+              />
+            </Field>
+            <Field label="Filed at" hint="Defaults to now.">
+              <Input
+                type="datetime-local"
+                value={submittedAt}
+                onChange={(e) => setSubmittedAt(e.target.value)}
+              />
+            </Field>
+          </div>
         </div>
       </Modal>
 

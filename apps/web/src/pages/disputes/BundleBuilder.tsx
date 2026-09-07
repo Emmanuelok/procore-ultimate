@@ -265,6 +265,18 @@ export default function BundleBuilder({
     }
   }
 
+  /** Open the produced bundle (cover + hyperlinked index + snapshot sections). */
+  async function openDocument() {
+    if (!bundle) return;
+    setError(null);
+    try {
+      const url = await fetchBlobUrl(`${base}/dispute-bundles/${bundle.id}/document.html`);
+      window.open(url, "_blank", "noopener");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not open the produced bundle");
+    }
+  }
+
   async function downloadManifest() {
     if (!bundle) return;
     setError(null);
@@ -668,6 +680,9 @@ export default function BundleBuilder({
                 <Button size="sm" variant="secondary" disabled={busy} onClick={() => void onVerify()}>
                   {busy ? "Checking…" : "Verify integrity"}
                 </Button>
+                <Button size="sm" variant="secondary" onClick={() => void openDocument()}>
+                  Open produced bundle
+                </Button>
                 <Button size="sm" variant="secondary" onClick={() => void downloadManifest()}>
                   Download manifest.csv
                 </Button>
@@ -682,22 +697,48 @@ export default function BundleBuilder({
                 verify.intact ? (
                   <div className="mt-3 rounded-md bg-emerald-50 px-3 py-2 text-sm text-emerald-800 ring-1 ring-emerald-200">
                     <strong>Bundle intact.</strong> All {verify.itemCount} content hashes match the
-                    frozen manifest and the Merkle root recomputes exactly.
+                    frozen manifest, every entry agrees with the snapshot taken at generation, and
+                    the Merkle root recomputes exactly.
                   </div>
                 ) : (
-                  <div className="mt-3 rounded-md bg-red-50 px-3 py-2 text-sm text-red-800 ring-1 ring-red-200">
-                    <strong>Integrity failure.</strong> {verify.mismatches.length} item
-                    {verify.mismatches.length === 1 ? "" : "s"} no longer match the frozen manifest:
+                  <div
+                    className={
+                      verify.manifestIntact
+                        ? "mt-3 rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-900 ring-1 ring-amber-200"
+                        : "mt-3 rounded-md bg-red-50 px-3 py-2 text-sm text-red-800 ring-1 ring-red-200"
+                    }
+                  >
+                    <strong>
+                      {verify.manifestIntact
+                        ? "Sources have moved on."
+                        : verify.rewrittenCount > 0
+                          ? "Manifest rewritten."
+                          : "Integrity failure."}
+                    </strong>{" "}
+                    {verify.statement}
                     <ul className="mt-1 space-y-1">
-                      {verify.mismatches.map((m) => (
-                        <li key={m.tab} className="text-xs">
-                          <span className="font-mono font-semibold">{m.tab}</span> {m.title} —
-                          expected <code className="font-mono">{shortHash(m.expected)}</code>, got{" "}
-                          <code className="font-mono">
-                            {m.actual ? shortHash(m.actual) : "missing"}
-                          </code>
-                        </li>
-                      ))}
+                      {verify.findings
+                        .filter((f) => f.state !== "intact")
+                        .map((f) => (
+                          <li key={f.tab} className="text-xs">
+                            <span className="font-mono font-semibold">{f.tab}</span> {f.title} —{" "}
+                            <span className="font-semibold">
+                              {f.state === "manifest_rewritten"
+                                ? "index entry disagrees with the generation snapshot"
+                                : f.state === "changed"
+                                  ? "source changed since production"
+                                  : f.state === "missing"
+                                    ? "source no longer resolves"
+                                    : "changed with no snapshot"}
+                            </span>{" "}
+                            (expected <code className="font-mono">{shortHash(f.expected)}</code>,
+                            got{" "}
+                            <code className="font-mono">
+                              {f.actual ? shortHash(f.actual) : "missing"}
+                            </code>
+                            ). <span className="text-ink-600">{f.note}</span>
+                          </li>
+                        ))}
                     </ul>
                   </div>
                 )
