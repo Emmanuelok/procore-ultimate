@@ -125,7 +125,7 @@ async function contributeSnapshot(projectId: string): Promise<string> {
 /* ------------------------------------------------------------------ */
 
 describe("assessCounts", () => {
-  it("counts distinct contributors and excludes the caller's own samples", () => {
+  it("counts the whole cell and keeps the caller's own samples off the k floor", () => {
     const v = assessCounts(
       [
         { contributorCompanyId: "me", samples: 4 },
@@ -134,11 +134,18 @@ describe("assessCounts", () => {
       ],
       "me",
     );
+    // SELF-KNOWLEDGE (pool.ts): the caller's samples are part of the cell — in
+    // n and among its contributors — and disclosed as its own; they do not
+    // lift the cell over the contributor floor, which only OTHER contributors
+    // can satisfy. Holding four of six, the caller also dominates the cell.
     expect(v.ownSamples).toBe(4);
-    expect(v.sampleSize).toBe(2);
-    expect(v.contributors).toBe(2);
+    expect(v.sampleSize).toBe(6);
+    expect(v.contributors).toBe(3);
     expect(v.describable).toBe(false);
-    expect(v.reasons.join(" ")).toContain(`${MIN_SAMPLE_N} are required`);
+    const reasons = v.reasons.join(" ");
+    expect(reasons).toContain("Only 2 distinct contributing companies other than yours");
+    expect(reasons).toContain(`${MIN_SAMPLE_N} are required`);
+    expect(reasons).toContain("holds 67% of the samples");
   });
 
   it("refuses a cell one contributor dominates", () => {
@@ -189,7 +196,8 @@ describe("reference-class membership criteria", () => {
     });
     expect(wide.statusCode).toBe(200);
     const wideBody = wide.json() as { sampleSize: number; sizeBand: string | null };
-    expect(wideBody.sampleSize).toBe(5);
+    // five others plus the caller's own contributed sample: the cell's n
+    expect(wideBody.sampleSize).toBe(6);
     expect(wideBody.sizeBand).toBeNull();
 
     const narrow = await app.inject({
@@ -244,7 +252,7 @@ describe("reference-class membership criteria", () => {
     };
     expect(body.forecast.sizeBand).toBeNull();
     expect(body.forecast.procurementRoute).toBeNull();
-    expect(body.forecast.sampleSize).toBe(5);
+    expect(body.forecast.sampleSize).toBe(6);
     expect(body.narrowingDropped).toEqual([]);
     expect(body.forecast.disclosures.join(" ")).toContain("Membership criteria applied");
   });
@@ -284,7 +292,7 @@ describe("reference-class register", () => {
         metric: string;
         contributors: number;
         sampleSize: number;
-        ownSamplesExcluded: number;
+        ownSamples: number;
         describable: boolean;
         reasons: string[];
       }[];
@@ -294,11 +302,12 @@ describe("reference-class register", () => {
     expect(body.truncated).toBe(false);
     const cell = body.classes.find((c) => c.id.startsWith("punch_open_rate|commercial|GB"));
     expect(cell).toBeDefined();
-    // Five other contributors; the caller's own contributed sample is excluded
-    // from the n it is shown, and counted separately.
-    expect(cell!.contributors).toBe(5);
-    expect(cell!.sampleSize).toBe(5);
-    expect(cell!.ownSamplesExcluded).toBe(1);
+    // Five other contributors plus the caller: its own contributed sample is
+    // in n and among the contributors and disclosed as its own, and it is the
+    // five OTHERS that make the cell describable.
+    expect(cell!.contributors).toBe(6);
+    expect(cell!.sampleSize).toBe(6);
+    expect(cell!.ownSamples).toBe(1);
     expect(cell!.describable).toBe(true);
     // The register no longer promises a narrowing it might not apply.
     expect(body.membership).toContain("applied to the query");
@@ -450,14 +459,15 @@ describe("contribution supersede", () => {
       );
     expect(live).toHaveLength(1);
 
-    // …and the distribution the platform describes still counts five others.
+    // …and the distribution the platform describes counts the five others plus
+    // this project's ONE live sample — not one per contribution.
     const dist = await app.inject({
       method: "GET",
       url: url("/benchmarks/distributions?metric=punch_open_rate&assetClass=commercial&region=GB"),
       headers: owner.headers,
     });
     expect(dist.statusCode).toBe(200);
-    expect((dist.json() as { distribution: { n: number } }).distribution.n).toBe(5);
+    expect((dist.json() as { distribution: { n: number } }).distribution.n).toBe(6);
   });
 
   it("a superseded snapshot keeps its own contributed sample id for the record", async () => {

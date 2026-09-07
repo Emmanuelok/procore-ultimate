@@ -139,6 +139,16 @@ describe("projects CRUD + stages", () => {
     // it can be restored, and every read path filters `deletedAt` — so the
     // answer is "no such project", not the old requireTool 403.
     expect(gone.statusCode).toBe(404);
+    // ...and the same gate hides everything hanging off it: sub-routes that
+    // never re-read the project row must not go on serving a deleted one.
+    for (const child of ["summary", "locations"]) {
+      const goneChild = await built.app.inject({
+        method: "GET",
+        url: `/api/v1/projects/${created.id}/${child}`,
+        headers: actor.headers,
+      });
+      expect(goneChild.statusCode, `/${child} of a soft-deleted project`).toBe(404);
+    }
     const stillListed = await built.app.inject({
       method: "GET",
       url: "/api/v1/projects",

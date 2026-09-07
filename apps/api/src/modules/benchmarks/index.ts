@@ -571,7 +571,7 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
         procurementRoute: body.procurementRoute ?? null,
         source: "contributed",
         // Kept ONLY for contribute-to-access enforcement, contributor counting
-        // and self-exclusion; no read path returns these (see viewSample).
+        // and own-sample disclosure; no read path returns these (see viewSample).
         contributorCompanyId: req.companyId!,
         contributorProjectId: req.projectId!,
         dataYear: body.dataYear ?? new Date(snapshot.createdAt).getUTCFullYear(),
@@ -679,8 +679,9 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
         sample: viewSample(created!),
         anonymity:
           `Your project now holds exactly one live sample in ${body.assetClass}/${region}. A cell ` +
-          `is described only once ${MIN_SAMPLE_N} distinct companies have contributed to it and ` +
-          `no one of them holds ${Math.round(MAX_CONTRIBUTOR_SHARE * 100)}% or more of it.`,
+          `is described to a viewer only once ${MIN_SAMPLE_N} distinct companies other than the ` +
+          `viewer have contributed to it and no contributor holds ` +
+          `${Math.round(MAX_CONTRIBUTOR_SHARE * 100)}% or more of it.`,
       });
     },
   );
@@ -725,7 +726,7 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
       minSampleN: MIN_SAMPLE_N,
       maxContributorShare: MAX_CONTRIBUTOR_SHARE,
       contributors: verdict.contributors,
-      ownSamplesExcluded: verdict.ownSamples,
+      ownSamples: verdict.ownSamples,
       ...(accessLevel === "seed_only" ? { note: UPGRADE_NOTE } : {}),
       distribution: computable
         ? computeStats(verdict.values)
@@ -879,7 +880,7 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
       accessLevel: c.accessLevel,
       minSampleN: MIN_SAMPLE_N,
       contributors: c.verdict.contributors,
-      ownSamplesExcluded: c.verdict.ownSamples,
+      ownSamples: c.verdict.ownSamples,
       percentile: c.percentile,
       distribution: c.distribution,
       ...(c.computable
@@ -984,9 +985,9 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
           c.metric.higherIsBetter ? "10th" : "90th"
         } percentile (${c.threshold} ${c.metric.unit}) of the contributed ` +
         `${c.assetClass}/${c.region} distribution (n=${c.verdict.values.length} from ` +
-        `${c.verdict.contributors} distinct contributors, median ${c.median} ${c.metric.unit}; ` +
-        "your own samples excluded). Investigate whether the figure reflects scope, data " +
-        "quality, or genuine adverse performance.",
+        `${c.verdict.contributors} distinct contributors, ${c.verdict.ownSamples} of the samples ` +
+        `your own, median ${c.median} ${c.metric.unit}). Investigate whether the figure reflects ` +
+        "scope, data quality, or genuine adverse performance.",
       evidenceRefs: {
         snapshotId: snapshot.id,
         metric: c.metric.key,
@@ -998,6 +999,7 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
         side: c.side,
         n: c.verdict.values.length,
         contributors: c.verdict.contributors,
+        ownSamples: c.verdict.ownSamples,
         percentile: c.percentile,
       },
     });
@@ -1195,7 +1197,7 @@ export const benchmarksModule: FastifyPluginAsync = async (app) => {
         ...m,
         contributors: verdict.contributors,
         sampleSize: verdict.sampleSize,
-        ownSamplesExcluded: verdict.ownSamples,
+        ownSamples: verdict.ownSamples,
         describable: verdict.describable,
         reasons: verdict.reasons,
       };

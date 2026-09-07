@@ -295,7 +295,10 @@ function deliveryNotice(app: { appConfig: { EMAIL_PROVIDER: string } }) {
   const provider = app.appConfig.EMAIL_PROVIDER;
   const dispatches = provider !== "none";
   return {
-    enabled: true,
+    // "enabled" is whether a report will LEAVE this deployment, not whether
+    // the job runs: the web caveat (DeliveryNote) and clients branch on it.
+    // The job runs either way and is named below.
+    enabled: dispatches,
     dispatches,
     provider,
     job: "analytics.report-delivery",

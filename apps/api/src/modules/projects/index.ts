@@ -318,10 +318,22 @@ export const projectsModule: FastifyPluginAsync = async (app) => {
     app.requireCompany,
     app.requireCompanyRole(["owner"]),
   ];
+  /**
+   * Deletion is soft (#78) and a deleted project must disappear behind every
+   * gate in this module. `requireTool` is a shared plugin this package does
+   * not own and resolves the project without a `deleted_at` filter, so the
+   * row is still "in the tenant" and that gate passes; this last step answers
+   * 404 for a soft-deleted project on every project-addressed route here,
+   * rather than only in the handlers that happened to re-read the row.
+   */
+  const liveProjectGate = async (req: FastifyRequest) => {
+    await liveProject(req.companyId!, req.projectId!);
+  };
   const tool = (level: "read" | "standard" | "admin") => [
     app.authenticate,
     app.requireCompany,
     app.requireTool("projects", level),
+    liveProjectGate,
   ];
 
   /* ---------------------------------------------------------------- */
@@ -552,9 +564,8 @@ export const projectsModule: FastifyPluginAsync = async (app) => {
   });
 
   app.get("/projects/:projectId", { preHandler: tool("read") }, async (req) => {
-    // `requireTool` lives in a shared plugin this package does not own and
-    // resolves the project without a deleted_at filter, so every route here
-    // checks it for itself.
+    // The gate has already refused a soft-deleted project (liveProjectGate);
+    // this read is for the row itself.
     const project = await liveProject(req.companyId!, req.projectId!);
     const access = await loadProjectAccess(app, req);
     return {
